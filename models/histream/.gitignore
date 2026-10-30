@@ -205,3 +205,6 @@ cmake-build-debug-visual-studio/CMakeFiles/field.dir/src/voxeleb/pipeline.cpp.ob
 cmake-build-debug-visual-studio/CMakeFiles/field.dir/src/voxeleb/voxeleb.cpp.obj
 cmake-build-debug-visual-studio/CMakeFiles/field.dir/src/voxeleb/voxelebio.cpp.obj
 *.obj
+
+# Keep the engine build entry point in fresh source repositories.
+!CMakeLists.txt
