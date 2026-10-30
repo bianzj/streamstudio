@@ -1,0 +1,257 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#define VOXELLST
+#include "../bindinglayout.h"
+#include "../global.glsl"
+#include "fluid_common.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+
+const ivec3 D3Q19_C[19] = ivec3[19](
+    ivec3(0,0,0),
+    ivec3(1,0,0), ivec3(-1,0,0),
+    ivec3(0,1,0), ivec3(0,-1,0),
+    ivec3(0,0,1), ivec3(0,0,-1),
+    ivec3(1,1,0), ivec3(-1,-1,0),
+    ivec3(1,-1,0), ivec3(-1,1,0),
+    ivec3(1,0,1), ivec3(-1,0,-1),
+    ivec3(1,0,-1), ivec3(-1,0,1),
+    ivec3(0,1,1), ivec3(0,-1,-1),
+    ivec3(0,1,-1), ivec3(0,-1,1));
+
+const int D3Q19_OPPOSITE[19] = int[19](
+    0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9,
+    12, 11, 14, 13, 16, 15, 18, 17);
+
+const float D3Q19_W[19] = float[19](
+    1.0 / 3.0,
+    1.0 / 18.0, 1.0 / 18.0, 1.0 / 18.0,
+    1.0 / 18.0, 1.0 / 18.0, 1.0 / 18.0,
+    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,
+    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,
+    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,
+    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0);
+
+uint populationIndex(uint cellIndex, int direction)
+{
+    return cellIndex * 19u + uint(direction);
+}
+
+vec3 limitedLatticeVelocity(vec3 velocity)
+{
+    float limit = clamp(fluidParameters.sources.y, 0.01, 0.18);
+    float speed = length(velocity);
+    return speed > limit ? velocity * (limit / speed) : velocity;
+}
+
+float equilibrium(int direction, float density, vec3 velocity)
+{
+    float cu = dot(vec3(D3Q19_C[direction]), velocity);
+    float uu = dot(velocity, velocity);
+    return D3Q19_W[direction] * density
+        * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * uu);
+}
+
+vec3 ambientLatticeVelocity()
+{
+    float velocityScale = max(fluidParameters.sources.w, 1.0);
+    return limitedLatticeVelocity(fluidParameters.ambientWind.xyz / velocityScale);
+}
+
+float pullPopulation(uint index, ivec3 cell, int direction)
+{
+    ivec3 sourceCell = cell - D3Q19_C[direction];
+    int sourceIndex = fluidLinearIndex(sourceCell);
+    if (sourceIndex >= 0) {
+        if (fluidMeta[sourceIndex].kind == 1) {
+            return fluidLbmA[populationIndex(index, D3Q19_OPPOSITE[direction])];
+        }
+        return fluidLbmA[populationIndex(uint(sourceIndex), direction)];
+    }
+
+    // Bottom and tangential horizontal boundaries bounce back. The top and
+    // downstream boundaries use a zero-gradient population extrapolation.
+    if (sourceCell.y < 0) {
+        return fluidLbmA[populationIndex(index, D3Q19_OPPOSITE[direction])];
+    }
+    if (sourceCell.y >= fluidParameters.grid.y) {
+        return fluidLbmA[populationIndex(index, direction)];
+    }
+    vec2 normal = fluidOutsideHorizontalNormal(sourceCell);
+    float ambientNormal = fluidAmbientNormalSpeed(normal);
+    if (ambientNormal < -1e-5) {
+        return equilibrium(direction, 1.0, ambientLatticeVelocity());
+    }
+    if (ambientNormal > 1e-5) {
+        return fluidLbmA[populationIndex(index, direction)];
+    }
+    return fluidLbmA[populationIndex(index, D3Q19_OPPOSITE[direction])];
+}
+
+vec4 advectScalar(ivec3 cell, vec3 physicalVelocity, FluidCellMeta meta)
+{
+    float dt = max(fluidParameters.spacingTime.w, 0.001);
+    vec3 spacing = max(fluidParameters.spacingTime.xyz, vec3(0.001));
+    vec3 departure = vec3(cell) - physicalVelocity * dt / spacing;
+    vec4 scalar = sampleFluidField(departure, false);
+    if (scalar.x < 150.0 || isnan(scalar.x) || isinf(scalar.x)) {
+        scalar = fluidScalarA[fluidLinearIndex(cell)];
+    }
+
+    vec4 sum = vec4(0.0);
+    float neighbours = 0.0;
+    const ivec3 offsets[6] = ivec3[6](
+        ivec3(1,0,0), ivec3(-1,0,0), ivec3(0,1,0),
+        ivec3(0,-1,0), ivec3(0,0,1), ivec3(0,0,-1));
+    for (int i = 0; i < 6; ++i) {
+        int neighbour = fluidLinearIndex(cell + offsets[i]);
+        if (neighbour >= 0 && fluidMeta[neighbour].kind != 1) {
+            sum += fluidScalarA[neighbour];
+            neighbours += 1.0;
+        }
+    }
+    if (neighbours > 0.0) {
+        float h = min(spacing.x, min(spacing.y, spacing.z));
+        float diffusion = clamp(
+            fluidParameters.physics.w * dt / max(h * h, 0.001), 0.0, 0.25);
+        scalar = mix(scalar, sum / neighbours, diffusion);
+    }
+
+    if (meta.surfaceIndex >= 0) {
+        float surfaceTemperature = coupledSurfaceTemperature(meta.surfaceIndex, scalar.x);
+        float exchange = 1.0 - exp(
+            -max(fluidParameters.physics.z, 0.0) * dt / 60.0);
+        scalar.x = mix(scalar.x, surfaceTemperature, clamp(exchange, 0.0, 1.0));
+    }
+    if (meta.kind == 3) {
+        scalar.x = fixedMediumTemperature(meta.surfaceIndex, max(scalar.x, 900.0));
+        scalar.y += max(fluidParameters.sources.x, 0.0) * dt;
+    } else if (meta.kind == 4) {
+        scalar.x = fixedMediumTemperature(meta.surfaceIndex, scalar.x);
+        scalar.y = max(scalar.y, 0.35);
+    }
+    if (fluidIsInlet(cell)) {
+        float height = (float(cell.y) + 0.5) * spacing.y;
+        scalar.x = terrainBackgroundTemperatureC(height) + 273.15;
+        scalar.y = 0.0;
+        scalar.z = terrainBackgroundVaporHpa(height, scalar.x - 273.15);
+    }
+    if (fluidParameters.heightProfile.x > 0.5)
+        scalar.z = clamp(scalar.z, 0.0, terrainSaturationHpa(scalar.x - 273.15));
+    scalar.y = clamp(scalar.y, 0.0, 1.0);
+    return scalar;
+}
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    uint count = uint(fluidParameters.grid.x * fluidParameters.grid.y
+                      * fluidParameters.grid.z);
+    if (index >= count || fluidParameters.grid.w == 0) return;
+
+    ivec3 cell = fluidCellFromLinear(index);
+    FluidCellMeta meta = fluidMeta[index];
+    if (meta.kind == 1) {
+        for (int direction = 0; direction < 19; ++direction) {
+            fluidLbmB[populationIndex(index, direction)] =
+                equilibrium(direction, 1.0, vec3(0.0));
+        }
+        fluidDensity[index] = 1.0;
+        fluidVelocityB[index] = vec4(0.0);
+        float temperature = coupledSurfaceTemperature(
+            meta.surfaceIndex, fluidScalarA[index].x);
+        fluidScalarB[index] = vec4(temperature, fluidScalarA[index].yzw);
+        return;
+    }
+
+    float populations[19];
+    float density = 0.0;
+    vec3 momentum = vec3(0.0);
+    for (int direction = 0; direction < 19; ++direction) {
+        populations[direction] = pullPopulation(index, cell, direction);
+        density += populations[direction];
+        momentum += populations[direction] * vec3(D3Q19_C[direction]);
+    }
+    if (isnan(density) || isinf(density) || density < 0.2 || density > 5.0) {
+        density = 1.0;
+        vec3 resetVelocity = ambientLatticeVelocity();
+        for (int direction = 0; direction < 19; ++direction) {
+            populations[direction] = equilibrium(direction, density, resetVelocity);
+        }
+        momentum = density * resetVelocity;
+    }
+
+    vec3 spacing = max(fluidParameters.spacingTime.xyz, vec3(0.001));
+    float dt = max(fluidParameters.spacingTime.w, 0.001);
+    vec3 latticeVelocity = limitedLatticeVelocity(momentum / density);
+    float velocityScale = max(fluidParameters.sources.w, 1.0);
+    vec3 physicalVelocity = latticeVelocity * velocityScale;
+    vec4 scalar = advectScalar(cell, physicalVelocity, meta);
+
+    vec3 physicalAcceleration = vec3(
+        0.0,
+        max(fluidParameters.physics.x, 0.0)
+            * (scalar.x - (terrainBackgroundTemperatureC(
+                (float(cell.y) + 0.5) * spacing.y) + 273.15)),
+        0.0);
+    if (meta.kind == 2) {
+        physicalAcceleration -= max(fluidParameters.physics.y, 0.0)
+            * max(meta.lad, 0.0) * length(physicalVelocity) * physicalVelocity;
+    }
+    vec3 latticeAcceleration = physicalAcceleration * spacing
+        / (velocityScale * velocityScale);
+    float accelerationLimit = 0.25 * max(fluidParameters.sources.y, 0.01);
+    float accelerationMagnitude = length(latticeAcceleration);
+    if (accelerationMagnitude > accelerationLimit) {
+        latticeAcceleration *= accelerationLimit / accelerationMagnitude;
+    }
+    latticeVelocity = limitedLatticeVelocity(
+        momentum / density + 0.5 * latticeAcceleration);
+
+    if (fluidIsInlet(cell)) {
+        density = 1.0;
+        latticeVelocity = ambientLatticeVelocity();
+    } else {
+        vec2 boundaryNormal = fluidHorizontalBoundaryNormal(cell);
+        if (length(boundaryNormal) > 0.0 && !fluidIsOutlet(cell)) {
+            float normalSpeed = dot(latticeVelocity.xz, boundaryNormal);
+            latticeVelocity.xz -= normalSpeed * boundaryNormal;
+        }
+    }
+
+    physicalVelocity = latticeVelocity * velocityScale;
+    float maximumPhysicalSpeed = max(fluidParameters.sources.z, 0.1);
+    float physicalSpeed = length(physicalVelocity);
+    if (physicalSpeed > maximumPhysicalSpeed) {
+        physicalVelocity *= maximumPhysicalSpeed / physicalSpeed;
+        latticeVelocity = physicalVelocity / velocityScale;
+    }
+
+    float latticeViscosity = max(fluidParameters.physics.w, 0.0)
+        / max(velocityScale * spacing.x, 0.001);
+    float relaxationTime = clamp(0.5 + 3.0 * latticeViscosity, 0.52, 1.95);
+    float omega = 1.0 / relaxationTime;
+    vec3 forceDensity = density * latticeAcceleration;
+    for (int direction = 0; direction < 19; ++direction) {
+        vec3 c = vec3(D3Q19_C[direction]);
+        float forcing = D3Q19_W[direction] * (1.0 - 0.5 * omega)
+            * (3.0 * dot(c - latticeVelocity, forceDensity)
+               + 9.0 * dot(c, latticeVelocity) * dot(c, forceDensity));
+        float value = fluidIsInlet(cell)
+            ? equilibrium(direction, density, latticeVelocity)
+            : populations[direction]
+                - omega * (populations[direction]
+                           - equilibrium(direction, density, latticeVelocity))
+                + forcing;
+        fluidLbmB[populationIndex(index, direction)] = value;
+    }
+    fluidDensity[index] = density;
+    fluidVelocityB[index] = vec4(physicalVelocity, 0.0);
+    fluidScalarB[index] = scalar;
+}

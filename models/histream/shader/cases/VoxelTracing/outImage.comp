@@ -1,0 +1,130 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXELTRACING 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../bsdf.glsl"
+#include "../functions.glsl"
+#include "../nanovdb_info.glsl"
+// #include "../shade_state_voxel.glsl"
+#include "../random.glsl"
+
+PtPayload        prd;
+ShadowHitPayload shadow_payload;
+
+#include "../traceray_comp.glsl"
+
+layout(local_size_x = GROUP_SIZEXY, local_size_y = GROUP_SIZEXY) in;
+#define MAXSTEP   100
+#define DIFFUSE_ANGLE_NUM 32
+#define MAXBAND    25
+float Radiance[MAXBAND];
+float RadianceSum[MAXBAND];
+
+void samplePixel(vec2 imageCoords,vec2 sizeImage,int smpl)
+{
+    for(int kband = 0;kband < sensorMatrix.waveNum; kband++)
+	{
+		Radiance[kband] = 0.0;
+	}
+
+    // 每次光线的随机/波动进行光滑
+    // vec2 subpixel_jitter = smpl == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
+    vec2 subpixel_jitter = vec2(0.5f, 0.5f) ;
+	// 计算样本的波动，范围 [-1 .. 1]
+	const vec2 pixelCenter = vec2(imageCoords) + subpixel_jitter;
+	const vec2 inUV        = pixelCenter / vec2(sizeImage.xy);
+	vec2       d           = inUV * 2.0 - 1.0;
+
+	// 计算光线的初始化和方向
+	vec4 origin    = sensorMatrix.viewInverse * vec4(0, 0, 0, 1);
+	vec4 target    = sensorMatrix.projInverse * vec4(d.x, d.y, 1, 1);
+	// target    = sensorMatrix.projInverse * vec4(d.x, d.y, 0, 1);
+	vec4 direction = sensorMatrix.viewInverse * vec4(normalize(target.xyz), 0);
+
+	// 景深-平行投影还是中心投影
+	vec3  focalPoint        = sensorMatrix.focalDist * direction.xyz;
+	float cam_r1            = rand(prd.seed) * M_TWO_PI;
+	float cam_r2            = rand(prd.seed) * sensorMatrix.aperture;
+	vec4  cam_right         = sensorMatrix.viewInverse * vec4(1, 0, 0, 0);
+	vec4  cam_up            = sensorMatrix.viewInverse * vec4(0, 1, 0, 0);
+	vec3  randomAperturePos = (cos(cam_r1) * cam_right.xyz + sin(cam_r1) * cam_up.xyz) * sqrt(cam_r2);
+	vec3  finalRayDir       = normalize(focalPoint - randomAperturePos);
+    NanoVDBLink nanoVDBLink = nanovdbInit();
+
+	// 光线位置和方向
+	//Ray ray = Ray(origin.xyz + randomAperturePos, finalRayDir);
+    vec3 directionv = normalize(direction.xyz);
+	Ray ray = Ray(origin.xyz, directionv);
+
+    ClosestHit(ray);
+
+    for(int kband = 0; kband < sensorMatrix.waveNum; kband++)
+	{
+		if(prd.hitT == INFINITY)
+		{
+			Radiance[kband] = -1;
+		}
+		else
+		{
+			Radiance[kband] = prd.hitT;
+		}
+	}
+
+  
+}
+
+
+
+void main()
+{
+    // image imageSize
+	vec2 imageRes    = settingxml.imageSize;
+    // image coordinate from 1-imageSize
+    ivec2 imageCoords = ivec2(gl_GlobalInvocationID.xy);  //SampleSizzled();
+	int bufferId = int(sensorMatrix.waveNum * (imageCoords.y*imageRes.x + imageCoords.x));
+    uint temp = uint(settingxml.imageSize.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x);
+    // random
+    prd.seed = tea(temp,settingxml.frame * settingxml.maxSample);
+
+
+	samplePixel(imageCoords, imageRes, 0);
+
+
+
+for(int kband = 0; kband < sensorMatrix.waveNum;kband++)
+{
+	//Radiance[kband] = prd.primitiveID;
+	float abc = 9;//Radiance[kband];
+	atomicStore(outImage[bufferId+kband],abc,gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+}
+
+
+
+// // IntResult = loc;
+
+// // 	atomicStore(outImage[0],IntResult,gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+
+
+    
+}

@@ -1,0 +1,405 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_atomic_float : require
+
+#define VOXELLST 1
+#include "../bindinglayout.h"
+#include "../global.glsl"
+#include "../nanovdb_info.glsl"
+#include "../functions.glsl"
+#include "../surface_brdf.glsl"
+#include "../shade_state_voxel.glsl"
+#include "scatter_stats.glsl"
+
+PtPayload prd;
+ShadowHitPayload shadow_payload;
+#include "../traceray_comp.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+
+// Exactly 16 KiB shared memory, Vulkan's minimum supported workgroup limit.
+// Columns are normalized over outgoing directions: each incident leaf beam
+// scatters exactly rho+tau in the discrete quadrature (no high-order gain).
+shared float leafReflectionKernel[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
+
+float sphericalLeafReflection(float cosine) {
+    float c = clamp(cosine, -1.0, 1.0);
+    float angle = acos(c);
+    return max(sqrt(max(1.0 - c*c, 0.0)) + (PI - angle)*c, 0.0);
+}
+
+void initializeLeafKernel() {
+    uint incoming = gl_LocalInvocationID.x;
+    float normalization = 0.0;
+    for(uint outgoing = 0; outgoing < DIFFUSE_ANGLE_NUM; ++outgoing) {
+        float value = sphericalLeafReflection(dot(
+            DIFFUSE_DIRECTIONS[incoming], DIFFUSE_DIRECTIONS[outgoing]));
+        leafReflectionKernel[outgoing*DIFFUSE_ANGLE_NUM + incoming] = value;
+        normalization += value;
+    }
+    for(uint outgoing = 0; outgoing < DIFFUSE_ANGLE_NUM; ++outgoing)
+        leafReflectionKernel[outgoing*DIFFUSE_ANGLE_NUM + incoming]
+            /= max(normalization, 1.0e-12);
+    barrier();
+}
+
+vec2 boundedLeafOptics(uint meshId, int band) {
+    SpectralMaterial material = spectralMaterials[meshLinks[meshId].spectralId*NBAND + band];
+    vec2 optics = max(vec2(material.reflectance, material.transmittance), vec2(0.0));
+    return optics / max(optics.x + optics.y, 1.0);
+}
+
+// Illumination-weighted optics of the current spectral group, so the group
+// absorbs what its bands absorb (a centre sample misses e.g. the red edge).
+// x = reflectance, y = transmittance, z = absorption-weighted wavelength (nm).
+vec3 groupOptics(uint meshId) {
+    float weightSum = 0.0;
+    vec2 optics = vec2(0.0);
+    float absorbedSum = 0.0;
+    float absorbedWavelength = 0.0;
+    for(int band = setting.scatteringBandStart; band < setting.scatteringBandEnd; ++band) {
+        float weight = max(atomConds[band].direct + atomConds[band].diffuse, 0.0);
+        vec2 bandOptics = boundedLeafOptics(meshId, band);
+        weightSum += weight;
+        optics += weight * bandOptics;
+        float absorbed = weight * max(1.0 - bandOptics.x - bandOptics.y, 0.0);
+        absorbedSum += absorbed;
+        absorbedWavelength += absorbed * atomConds[band].wavelength;
+    }
+    int centre = (setting.scatteringBandStart + setting.scatteringBandEnd - 1) / 2;
+    if(weightSum <= 0.0)
+        return vec3(boundedLeafOptics(meshId, centre), atomConds[centre].wavelength);
+    return vec3(optics / weightSum, absorbedSum > 0.0
+        ? absorbedWavelength / absorbedSum : atomConds[centre].wavelength);
+}
+
+float groupIllumination(bool direct) {
+    float result = 0.0;
+    for(int band = setting.scatteringBandStart; band < setting.scatteringBandEnd; ++band)
+        result += max(ubom.meteo.Rin, 0.0) * 0.001
+            * (direct ? atomConds[band].direct : atomConds[band].diffuse);
+    return max(result, 0.0);
+}
+
+void buildSource(uint voxel, uint mesh) {
+    if(meshLinks[mesh].type != TYPE_VEGETATION) {
+        // OBJ surface normals belong to the actual intersection, not to a
+        // cell. Keep incoming data; the terminal surface hit integrates BRDF.
+        for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle) {
+            uint index = voxel*DIFFUSE_ANGLE_NUM + angle;
+            voxelRads[index].induced = checkedScatteringRadiance(voxelRads[index].cumulated);
+        }
+        return;
+    }
+
+    Canopy canopy = canopies[meshLinks[mesh].canopyId];
+    bool medium = isParticipatingMedium(canopy);
+    vec2 optics = groupOptics(mesh).xy;
+    float incident[DIFFUSE_ANGLE_NUM];
+    float phaseNormalization[DIFFUSE_ANGLE_NUM];
+    for(uint incoming = 0; incoming < DIFFUSE_ANGLE_NUM; ++incoming) {
+        incident[incoming] = checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + incoming].cumulated);
+        if(medium) {
+            float sum = 0.0;
+            for(uint outgoing = 0; outgoing < DIFFUSE_ANGLE_NUM; ++outgoing)
+                sum += mediumPhaseHG(canopy, dot(-DIFFUSE_DIRECTIONS[incoming],
+                                                  DIFFUSE_DIRECTIONS[outgoing]));
+            phaseNormalization[incoming] = max(sum, 1.0e-12);
+        }
+    }
+
+    vec3 solar = normalize(lightSet.direction);
+    float primary = setting.scatteringOrder == 1 && solar.y > 0.01
+        ? groupIllumination(true) * clamp(voxelDirs[voxel].solar, 0.0, 1.0)
+            / max(abs(solar.y), 0.001) : 0.0;
+    float sunNormalization = 0.0;
+    if(primary > 0.0) {
+        for(uint outgoing = 0; outgoing < DIFFUSE_ANGLE_NUM; ++outgoing)
+            sunNormalization += medium
+                ? mediumPhaseHG(canopy, dot(-solar, DIFFUSE_DIRECTIONS[outgoing]))
+                : sphericalLeafReflection(dot(solar, DIFFUSE_DIRECTIONS[outgoing]));
+        sunNormalization = max(sunNormalization, 1.0e-12);
+    }
+
+    for(uint outgoing = 0; outgoing < DIFFUSE_ANGLE_NUM; ++outgoing) {
+        float source = 0.0;
+        float correction = 0.0;
+        for(uint incoming = 0; incoming < DIFFUSE_ANGLE_NUM; ++incoming) {
+            float kernel;
+            if(medium) {
+                kernel = clamp(canopy.scatteringAlbedo, 0.0, 1.0)
+                    * mediumPhaseHG(canopy, dot(-DIFFUSE_DIRECTIONS[incoming],
+                                                 DIFFUSE_DIRECTIONS[outgoing]))
+                    / phaseNormalization[incoming];
+            } else {
+                // Exact antipodal pairs let transmission reuse reflection.
+                kernel = optics.x * leafReflectionKernel[outgoing*DIFFUSE_ANGLE_NUM + incoming]
+                    + optics.y * leafReflectionKernel[outgoing*DIFFUSE_ANGLE_NUM + (incoming ^ 1u)];
+            }
+            compensatedAdd(source, correction, incident[incoming] * kernel);
+        }
+        if(primary > 0.0) {
+            float cosine = dot(solar, DIFFUSE_DIRECTIONS[outgoing]);
+            float kernel = medium
+                ? clamp(canopy.scatteringAlbedo, 0.0, 1.0)
+                    * mediumPhaseHG(canopy, -cosine) / sunNormalization
+                : (optics.x*sphericalLeafReflection(cosine)
+                    + optics.y*sphericalLeafReflection(-cosine)) / sunNormalization;
+            // Fields are pi*L; DeltaOmega=4*pi/N, so pi*p = (N/4)*probability.
+            source += primary * (float(DIFFUSE_ANGLE_NUM) / 4.0) * kernel;
+        }
+        voxelRads[voxel*DIFFUSE_ANGLE_NUM + outgoing].induced = checkedScatteringRadiance(source);
+    }
+}
+
+float surfaceSource(uint voxel, uint mesh, vec3 outgoing, vec3 normal) {
+    vec3 n = normalize(normal);
+    if(dot(n, outgoing) < 0.0) n = -n;
+    float reflectance = groupOptics(mesh).x;
+    uint type = meshLinks[mesh].type;
+    uint bio = meshLinks[mesh].bioId;
+    float result = 0.0;
+    float correction = 0.0;
+    for(uint incoming = 0; incoming < DIFFUSE_ANGLE_NUM; ++incoming) {
+        vec3 wi = DIFFUSE_DIRECTIONS[incoming];
+        float cosine = max(dot(n, wi), 0.0);
+        if(cosine <= 0.0) continue;
+        float weight = surfaceReflectanceWeight(type, bio, reflectance, wi,
+            outgoing, n, meshLinks[mesh].angularEffectStrength);
+        compensatedAdd(result, correction,
+            checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + incoming].induced)
+                * weight * cosine * (4.0 / float(DIFFUSE_ANGLE_NUM)));
+    }
+    vec3 solar = normalize(lightSet.direction);
+    if(setting.scatteringOrder == 1 && solar.y > 0.01 && dot(n, solar) > 0.0) {
+        // Beam irradiance on the facet: the group illumination is horizontal.
+        result += groupIllumination(true) * clamp(voxelDirs[voxel].solar, 0.0, 1.0)
+            * dot(n, solar) / solar.y
+            * surfaceReflectanceWeight(type, bio, reflectance, solar,
+                outgoing, n, meshLinks[mesh].angularEffectStrength);
+    }
+    return checkedScatteringRadiance(result);
+}
+
+// After the last hit the ray still crosses turbid cells up to the domain
+// boundary (at least the far half of the last hit cell). Each crossed cell
+// attenuates the field and contributes its own scattering source.
+float escapeSegmentSource(vec3 start, vec3 direction, uint angle, bool skyZero,
+                          inout float throughput) {
+    vec3 semi = vec3(floor(setting.voxelSize.x * 0.5 + 0.5), 0.0,
+                     floor(setting.voxelSize.z * 0.5 + 0.5));
+    vec3 a = start + semi;
+    vec3 dir = normalize(direction);
+    vec3 hi = vec3(setting.voxelSize);
+    float t0 = 0.0;
+    float t1 = 4096.0;
+    for(int axis = 0; axis < 3; ++axis) {
+        if(abs(dir[axis]) < 1.0e-9) {
+            if(a[axis] < 0.0 || a[axis] > hi[axis]) return 0.0;
+        } else {
+            float ta = -a[axis] / dir[axis];
+            float tb = (hi[axis] - a[axis]) / dir[axis];
+            t0 = max(t0, min(ta, tb));
+            t1 = min(t1, max(ta, tb));
+        }
+    }
+    if(t1 <= t0) return 0.0;
+
+    vec3 p = a + dir * t0;
+    ivec3 cell = ivec3(floor(p + dir * 1.0e-5));
+    ivec3 stepCell = ivec3(sign(dir));
+    vec3 tMax = vec3(1.0e30);
+    vec3 tDelta = vec3(1.0e30);
+    for(int axis = 0; axis < 3; ++axis) {
+        if(abs(dir[axis]) >= 1.0e-9) {
+            float boundary = float(cell[axis] + (dir[axis] > 0.0 ? 1 : 0));
+            tMax[axis] = t0 + (boundary - p[axis]) / dir[axis];
+            tDelta[axis] = 1.0 / abs(dir[axis]);
+        }
+    }
+    float incoming = 0.0;
+    float correction = 0.0;
+    float t = t0;
+    for(int i = 0; i < 1024 && t < t1; ++i) {
+        float segmentEnd = min(min(min(tMax.x, tMax.y), tMax.z), t1);
+        int id = nanovdbGet(turbidGridLink, cell);
+        float extinction = TurbidCellExtinction(id, cell, dir);
+        if(extinction > 0.0 && segmentEnd > t) {
+            float transmittance = exp(-extinction * (segmentEnd - t));
+            if(!skyZero) {
+                float source = voxelRads[uint(id)*DIFFUSE_ANGLE_NUM + (angle ^ 1u)].induced;
+                compensatedAdd(incoming, correction,
+                    throughput * (1.0 - transmittance) * checkedScatteringRadiance(source));
+            }
+            throughput *= transmittance;
+        }
+        t = segmentEnd;
+        if(t >= t1) break;
+        if(tMax.x <= tMax.y && tMax.x <= tMax.z) { cell.x += stepCell.x; tMax.x += tDelta.x; }
+        else if(tMax.y <= tMax.z) { cell.y += stepCell.y; tMax.y += tDelta.y; }
+        else { cell.z += stepCell.z; tMax.z += tDelta.z; }
+    }
+    return incoming;
+}
+
+float traceIncoming(uint voxel0, uint angle, vec3 origin, NanoVDBLink nano) {
+    bool skyZero = setting.scatteringStage == 1;
+    vec3 direction = DIFFUSE_DIRECTIONS[angle];
+    vec3 semiRange = vec3(floor(setting.voxelSize.x/2.0 + 0.5), 0.0,
+                         floor(setting.voxelSize.z/2.0 + 0.5));
+    ResetHexRay();
+    ConfigureCone(origin, direction, 0.0, 0.0);
+    Ray ray = Ray(origin, direction);
+    float throughput = 1.0;
+    float incoming = 0.0;
+    float correction = 0.0;
+    int termination = 2; // limit reached; never invent a sky connection.
+    for(int step = 0; step < setting.maxStep; ++step) {
+        ClosestHit(ray, 0.00001);
+        if(prd.hitT == INFINITY) {
+            compensatedAdd(incoming, correction, escapeSegmentSource(
+                ray.origin, ray.direction, angle, skyZero, throughput));
+            if(skyZero && direction.y > 0.0)
+                compensatedAdd(incoming, correction, throughput*groupIllumination(false));
+            termination = 0;
+            break;
+        }
+        ShadeState state = GetShadeState(prd);
+        ivec3 aligned;
+        ivec3 id = getVoxelIdSemi(state.position, semiRange, setting.scale, direction, aligned);
+        int voxel = nanovdbGet(nano, id);
+        if(voxel >= 0 && voxel < setting.voxelCount) {
+            uint mesh = instanceLinks[voxelLinks[voxel].instanceId].meshId;
+            if(meshLinks[mesh].type == TYPE_VEGETATION) {
+                uint canopyId = meshLinks[mesh].canopyId;
+                Canopy canopy = canopies[canopyId];
+                float density = ResolveTurbidDensity(voxel, canopyId, id, setting.voxelSize);
+                float transmittance = isParticipatingMedium(canopy)
+                    ? canopyVoxelTransmittance(canopy, density, canopy.G,
+                        length(state.position - state.lastPosition), setting.scale)
+                    : ResolveSpatialInteraction(voxel, density, canopy.G,
+                        state.lastPosition, state.position, setting.scale).x;
+                transmittance = clamp(transmittance, 0.0, 1.0);
+                if(!skyZero) {
+                    // Ray travels toward the source, photons travel oppositely.
+                    float source = voxelRads[uint(voxel)*DIFFUSE_ANGLE_NUM + (angle ^ 1u)].induced;
+                    compensatedAdd(incoming, correction,
+                        throughput * (1.0 - transmittance) * checkedScatteringRadiance(source));
+                }
+                throughput *= transmittance;
+                if(throughput < 0.01) {
+                    termination = 1;
+                    break;
+                }
+            }
+        }
+        int surface = nanovdbGet(nano, aligned);
+        if(surface >= 0 && surface < setting.voxelCount) {
+            surface = ResolveVoxelSurfaceState(surface, state.normal);
+            uint mesh = instanceLinks[voxelLinks[surface].instanceId].meshId;
+            if(meshLinks[mesh].type != TYPE_VEGETATION) {
+                // A cell's own boundary is the point where its incident field
+                // is sampled, not an external reflector or blocker.
+                bool ownCell = voxelLinks[surface].instanceId == voxelLinks[voxel0].instanceId
+                    && all(equal(voxelLinks[surface].voxelId, voxelLinks[voxel0].voxelId));
+                if(!ownCell) {
+                    if(!skyZero)
+                        compensatedAdd(incoming, correction, throughput
+                            * surfaceSource(surface, mesh, -direction, state.normal));
+                    throughput = 0.0;
+                    termination = 0;
+                    break;
+                }
+            }
+        }
+        ray.origin = OffsetRay(state.position,
+            dot(direction, state.normal) > 0.0 ? state.normal : -state.normal);
+    }
+    recordScatteringRay(scatteringStatsSlot(), termination, throughput);
+    return checkedScatteringRadiance(incoming);
+}
+
+void accumulateAbsorption(uint voxel, uint mesh) {
+    bool vegetation = meshLinks[mesh].type == TYPE_VEGETATION;
+    float radiation = 0.0;
+    float correction = 0.0;
+    if(vegetation) {
+        // Randomly oriented two-faced foliage: (1/2) of the full-sphere integral.
+        for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
+            compensatedAdd(radiation, correction,
+                checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + angle].cumulated));
+        radiation *= DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+    } else {
+        // A solid facet receives cosine-weighted irradiance over its own hemisphere.
+        vec3 normal = solidSurfaceNormal(int(voxel));
+        float cosineSum = 0.0;
+        for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle) {
+            float cosine = dot(normal, DIFFUSE_DIRECTIONS[angle]);
+            if(cosine <= 0.0) continue;
+            compensatedAdd(radiation, correction, cosine *
+                checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + angle].cumulated));
+            cosineSum += cosine;
+        }
+        radiation = cosineSum > 0.0 ? radiation / cosineSum : 0.0;
+    }
+    if(setting.scatteringStage == 1) {
+        // The uncollided sky field is gap geometry only, hence spectrally neutral.
+        float sky = groupIllumination(false);
+        if(sky > 0.0) voxelDirs[voxel].skyDiffuse = radiation / sky;
+    }
+    vec3 optics = groupOptics(mesh);
+    float absorption = 1.0 - optics.x - optics.y;
+    if(vegetation) {
+        Canopy canopy = canopies[meshLinks[mesh].canopyId];
+        if(isParticipatingMedium(canopy))
+            absorption = (1.0 - canopyVoxelTransmittance(canopy, 0.0, 0.0, 1.0, setting.scale))
+                * (1.0 - clamp(canopy.scatteringAlbedo, 0.0, 1.0));
+        else if(setting.scatteringStage == 3 && setting.scatteringOrder >= setting.scatteringOrders) {
+            // Orders beyond the last explicit one: each further collision
+            // re-intercepts q = p*w of the scattered light (spectral invariants,
+            // as the VoxelRT last-order tail), absorbing a geometric series.
+            float q = min(calReCor(canopy.lai) * (optics.x + optics.y), 0.9);
+            absorption /= (1.0 - q);
+        }
+    }
+    radiation *= max(absorption, 0.0);
+    float wavelength = optics.z;
+    float par = setting.scatteringBandEnd <= 301
+        ? absorbedParPhotonFlux(radiation, wavelength) : 0.0;
+    // Exactly one invocation owns this voxel; no cross-voxel atomic is needed.
+    voxelNetRads[voxel].diffuseVrad += radiation;
+    voxelPnets[voxel].diffusePnet += par;
+    recordScatteringAbsorption(scatteringStatsSlot(), radiation, par);
+}
+
+void main() {
+    // All workgroup lanes must participate before invalid/tail lanes return.
+    if(setting.scatteringStage == 2) initializeLeafKernel();
+    uint voxel = gl_GlobalInvocationID.x;
+    if(voxel >= uint(setting.voxelCount) || voxelLinks[voxel].isValid == 0) return;
+    if(setting.scatteringStage == 0) {
+        voxelNetRads[voxel].diffuseVrad = 0.0;
+        voxelPnets[voxel].diffusePnet = 0.0;
+        return;
+    }
+    uint mesh = instanceLinks[voxelLinks[voxel].instanceId].meshId;
+    if(setting.scatteringStage == 2) {
+        buildSource(voxel, mesh);
+        return;
+    }
+    vec3 semiRange = vec3(floor(setting.voxelSize.x/2.0 + 0.5), 0.0,
+                         floor(setting.voxelSize.z/2.0 + 0.5));
+    vec3 origin = vec3(voxelLinks[voxel].voxelId) - semiRange;
+    getFacetIdPos(voxelLinks[voxel].faceId, origin);
+    NanoVDBLink nano = nanovdbInit();
+    ConfigureTurbidGrid(nano);
+    for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
+        voxelRads[voxel*DIFFUSE_ANGLE_NUM + angle].cumulated
+            = traceIncoming(voxel, angle, origin, nano);
+    accumulateAbsorption(voxel, mesh);
+}

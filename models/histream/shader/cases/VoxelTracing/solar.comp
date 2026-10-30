@@ -1,0 +1,489 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXELTRACING 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../bsdf.glsl"
+#include "../functions.glsl"
+#include "../nanovdb_info.glsl"
+// #include "../shade_state_voxel.glsl"
+#include "../random.glsl"
+
+PtPayload        prd;
+ShadowHitPayload shadow_payload;
+
+#include "../traceray_comp.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+#define MAXSTEP   100
+#define DIFFUSE_ANGLE_NUM 32
+#define MAXBAND    25
+#define NUM_VNIR 2001 // number of VNIR bands
+#define NUM_BAND 2162 // number of VNIR+TIR bands
+#define NUM_TIR 162  // number of TIR bands
+
+// calculate the transmittance from voxel to solar
+// To check the access of a voxel to a long distance along a direction
+bool traversalDirection(vec3 direction)
+{
+    //////////////////////////////////////////////
+    // This is a original position and direction
+    //////////////////////////////////////////////
+    uint bufferId0 = uint(gl_GlobalInvocationID.x);     // 当前的体素处理单元index
+    ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;     // 当前体素处理单元的空间位置坐标（int类型）
+    uint instanceId0 = voxelLinks[bufferId0].instanceId;// 当前体素处理单元的instance index
+    uint typeId0 = instanceLinks[instanceId0].type;     // 当前体素所属的地物类型
+    // Get nanoVDBLink: from voxelId to bufferId
+    NanoVDBLink nanoVDBLink = nanovdbInit();            // 得到 nano VDB 存储的数据集，其内部存储voxelLinks的index，可以通过空间位置查询其所属位置的属性和地物类型
+
+    float scale = settingxml.scale;
+    vec3 semiRange = scale * settingxml.voxelSize/2.0;
+    ivec3 voxelId,alignVoxelId;
+    float alpha_toSolar = 1.0,alpha_voxel = 1.0;
+    int bufferId,alignBufferId;
+    uint instanceId, alignInstanceId,canopyId,lastInstanceId,typeId;
+    VoxelInstanceLink instanceLink;
+    Canopy canopy;
+    float shortDistance = SHORTDISTANCE*scale;
+    // the center position of a voxel 
+    vec3 voxelPos0 =  vec3((voxelId0.x)*scale-semiRange.x, (voxelId0.y)*scale,(voxelId0.z)*scale-semiRange.z ); 
+    // if type is soil, the position is located at bottom facet center.
+    if(typeId0 == TYPE_SOIL)
+    {
+        voxelPos0 =  vec3((voxelId0.x+1)*scale-semiRange.x, (voxelId0.y)*scale,(voxelId0.z+1)*scale-semiRange.z ); 
+    }
+
+    // ray cast from the center position of a voxel along a specific direction
+    Ray originalRay = Ray(voxelPos0, normalize(direction));
+    Ray ray = originalRay;
+
+    // This is a process toward direction step by step 
+    int kstep = 0;
+    vec3 ffnormal;
+  for(kstep = 0;kstep<settingxml.maxStep;kstep++)
+  {
+    // the transmittance inside a voxel 
+    alpha_voxel = 1.0;
+    // avoid hit itself for the original voxel
+    // ClosestHit(ray, shortDistance);
+    ClosestHit(ray);
+    if(prd.hitT == INFINITY)
+    {
+      // hit nothing and return 
+      voxelDirs[bufferId0].solar = alpha_toSolar; 
+      return false;
+    }
+
+    // // get hit information
+    // ShadeState sstate = GetShadeState(prd);
+    vec3 hitPos = ray.origin + ray.direction * prd.hitT;
+    voxelId = getVoxelId(hitPos, semiRange, settingxml.scale, normalize(direction));
+
+
+  //   // voxel object
+  //   if(sstate.typeId == TYPE_VEGETATION)
+  //   {
+  //     // get voxelId and alignVoxelId
+  //     voxelId = getVoxelIdSemi(sstate.position, semiRange, settingxml.scale, normalize(direction), alignVoxelId);
+  //     // get bufferId and alignBufferId;
+  //     // if bufferId/alignBufferId = -1, this voxel is blank;
+  //     bufferId = nanovdbGet(nanoVDBLink,voxelId);
+  //     alignBufferId = nanovdbGet(nanoVDBLink,alignVoxelId);
+      
+  //     if(kstep == 0) {lastInstanceId = instanceId0; alignInstanceId = instanceId0;}
+  //     if(bufferId >= 0)
+  //     {
+  //       // a valid voxel and get voxel information 
+  //       // such as instanceId, typeId, spectralId, thermalId, canopyId
+  //       instanceId = bufferVoxelLinks[bufferId].instanceId;
+  //       instanceLink = instanceLinks[instanceId];
+  //       canopyId = instanceLink.canopyId;
+  //       typeId = instanceLink.typeId;
+  //       // if(typeId == TYPE_SOIL) continue;
+  //       // the condition (instanceId == lastInstanceId) for path from penetrating part 
+  //       // the condition (instanceId == alignInstanceId) due to a face corresponding to two facets belong to two align voxels, respectively
+  //       // if((alignInstanceId == lastInstanceId || instanceId == alignInstanceId))
+  //       // {
+  //       //   // get the pathLength from 
+  //         float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
+  //         canopy = canopies[canopyId];
+  //         alpha_voxel = exp(-canopy.density * canopy.G * pathLength);
+  //       // }
+  //     }
+  //     alpha_toSolar = alpha_voxel * alpha_toSolar;
+  //   }
+  //   else
+  //   {
+  //     // if it hit itself in the firest ray cast, continue 
+  //     // length check
+  //     if(kstep == 0  && sstate.instanceId == instanceId0)
+  //     {
+  //       continue;
+  //     } else
+  //     {
+  //       alpha_toSolar = 0;
+  //       break;
+  //     }
+  //   }
+  //   // a threshold to stop 
+  //   if(alpha_toSolar <= 0.01) break; 
+  //   // prepare for the next ray cast
+  //   ray = Ray(sstate.position,direction);
+  //   ffnormal  = sstate.normal;
+  //   ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
+  // }
+
+  // voxelDirs[bufferId0].solar = alpha_toSolar; 
+  return true;
+}
+
+// // It is used for single-scattering term. Solar term to scatter term
+// bool voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0,uint typeId0, NanoVDBLink nanoVDBLink)
+// {
+//   vec3 semiRange = settingxml.scale * settingxml.voxelSize/2.0;
+//   vec3 directioni,directioni0; // induced direction for the selected voxel; 0 original
+//   vec3 directions = normalize(lightSet.direction); // solar direction/ induced direction for the traveled voxel
+//   uint bufferId,spectralId,thermalId,alignBufferId,canopyId;
+//   vec2 gammart;
+//   uint instanceId,lastInstanceId,alignInstanceId,typeId,lastType;
+//   ivec3 voxelId,voxelId,alignVoxelId;
+//   float pl_toSolar,pl_toVoxel,alpha_toSolar,alpha_toVoxel,alpha_voxel;
+//   float wavelength;
+//   InstanceLink instanceLink;
+//   Canopy canopy;
+//   float trans,refl,gamma;
+//   float cosThetas = cosThetaTangent(directions);
+  
+//   ////////////////////////////////////////////////////////
+//   //  Iteration in diffuse angle
+//   ////////////////////////////////////////////////////////
+//   for(int iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
+//   {
+//     directioni0 = DIFFUSE_DIRECTIONS[iangle];
+//     directioni = normalize(directioni0);
+//     float cosThetai = cosThetaTangent(directioni);
+
+//     // emitting lightxml along scattering direction in N angles.
+//     Ray ray = Ray(voxelPos0, directioni);
+
+//     // transmittance from voxel to solar.
+//     alpha_toSolar = 1.0;
+//     // transmittance from voxel to current voxel (ray intersecting voxel).
+//     alpha_toVoxel = 1.0;
+//     // transmittance of current voxel.
+//     alpha_voxel = 1.0;
+
+//     /////////////////////////////////////////////////////
+//     /// Iteration in travel step
+//     /////////////////////////////////////////////////////
+//     int kstep = 0;
+//     vec3 ffnormal;
+//     for(kstep = 0;kstep<=settingxml.maxStep;kstep++)
+//     {
+//       alpha_voxel = 1.0;
+//       ClosestHit(ray,0.001);
+//       if(prd.hitT == INFINITY)
+//       {
+//         // hit sky and return 
+//         //////////////////////////////
+//         /// sky case
+//         /// (sky -> i).
+//         /// sky only exists in the upper hemisphere sapce. so the direction number is N/2.
+//         /////////////////////////////
+//         for(int kband=0;kband<settingxml.maxBand;kband++)
+//         {
+//           float radiance = 0.0;
+
+//           // induced from upper hemisphere.
+//           if (directioni.y > 0)
+//           {
+//             // check if temperature is needed or only reflectance/emissivity
+//             if(settingxml.isTemperature == 1)
+//             {
+//               // planck for radiance 
+//               wavelength = waveSets[kband].wavelength;
+//               if(wavelength > 50) wavelength = wavelength/1000.0;
+//               if(wavelength > 2.5){ //add transmittance * sky thermal contribution
+//                 radiance += (alpha_toVoxel * planck(wavelength,lightSet.skyTemperature));
+//               }
+//               else{
+//                 radiance += alpha_toVoxel * lightSet.diffuse / (DIFFUSE_ANGLE_NUM / 2.0);
+//               }
+//             }else{ 
+//               radiance += alpha_toVoxel * lightSet.diffuse / (DIFFUSE_ANGLE_NUM / 2.0);
+//             }
+//           }
+//           voxelRads[bufferId0*DIFFUSE_ANGLE_NUM*settingxml.maxBand+kband*DIFFUSE_ANGLE_NUM+iangle].induced += radiance;
+//         }       
+//         // hit sky and return, this part is about sky direct contribution.
+//         break;
+//       }
+
+//       // get hit information
+//       ShadeState sstate = GetShadeState(prd);
+
+//       //////////////////////////////
+//       /// Trubid case
+//       /////////////////////////////
+//       if(sstate.typeId == TYPE_VEGETATION)
+//       {
+//         // get voxelId and alignVoxelId
+//         voxelId = getVoxelIdSemi(sstate.position,semiRange,settingxml.scale,directioni,alignVoxelId);
+//         // get bufferId and alignBufferId;
+//         // if bufferId/alignBufferId = -1, this voxel is blank;
+//         bufferId = nanovdbGet(nanoVDBLink,voxelId);
+//         alignBufferId = nanovdbGet(nanoVDBLink,alignVoxelId);
+//         if(kstep ==0) lastInstanceId = instanceId;
+//         if(bufferId >= 0)
+//         {
+//           // a valid voxel and get voxel information 
+//           // such as instanceId, typeId, spectralId, thermalId, canopyId
+//           instanceId = bufferVoxelLinks[bufferId].instanceId;
+//           instanceLink = instanceLinks[instanceId];
+//           canopyId = instanceLink.canopyId;
+//           typeId = instanceLink.typeId;
+//           spectralId = instanceLink.spectralId;
+//           thermalId = instanceLink.thermalId;
+//           uint spectralIdBase = spectralId*settingxml.maxBand;
+//           // the condition (instanceId == lastInstanceId) for path from penetrating part 
+//           // the condition (instanceId == alignInstanceId) due to a face corresponding to two facets belong to two align voxels, respectively
+//           // if((instanceId == lastInstanceId || instanceId == alignInstanceId))
+//           // {
+//             // get the pathLength  
+//             float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
+//             canopy = canopies[canopyId];
+//             alpha_voxel = exp(-canopy.density * canopy.G * pathLength);
+
+//             alpha_toVoxel = alpha_toVoxel * alpha_voxel;
+//             if(alpha_toVoxel < 0.01) break; 
+
+//             //////////////////////////////
+//             /// emitter case
+//             /// else-emitter(j -> i).
+//             /////////////////////////////
+//             alpha_toSolar = voxelDirs[bufferId].solar;
+
+//             for(int kband = 0;kband < settingxml.maxBand;kband++)
+//             {
+//               float radiance = 0;
+//               if(settingxml.isTemperature == 1)
+//               {
+//                 float wavelength = waveSets[kband].wavelength;
+//                 if(wavelength > 50) wavelength = wavelength /1000.0;
+//                 if(wavelength > 2.5)
+//                 {
+//                   // get sunlit and shaded fraction and mixed them for an average result
+//                   float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
+//                   float shadedTemperature = thermalMaterials[thermalId].shadedTemperature;
+//                   float sunlitRadiance = planck(wavelength,sunlitTemperature);
+//                   float shadedRadiance = planck(wavelength,shadedTemperature);
+//                   float thermalRadiance = sunlitRadiance*(alpha_toSolar)+shadedRadiance*(1-alpha_toSolar);
+//                   radiance += (thermalRadiance* alpha_toVoxel*(1-refl-trans)*(1-alpha_voxel));         
+//                 }else
+//                 {
+//                   // // do not consider hotspot in this phase
+//                   radiance += 0.0;
+//                 }
+//               }else
+//               {
+//                 radiance += 0.0;
+//               }
+
+//               // add solar and self primary scattering term to induced.
+//               atomicAdd(voxelRads[bufferId0*DIFFUSE_ANGLE_NUM*settingxml.maxBand+kband*DIFFUSE_ANGLE_NUM+iangle].induced,radiance,
+//                gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+//             } 
+//           // }
+//         }
+//       }else 
+//       {
+//         //////////////////////////////
+//         /// facet case
+//         /////////////////////////////
+//         vec3 woWorld = directioni;
+//         vec3 wiWorld = lightSet.direction;
+//         vec3 ffnormal = sstate.normal;
+//         vec3 wi = world2Tangent(sstate.normal,sstate.tangent,sstate.binormal,directions); 
+//         float cosThetaslocal = cosThetaTangent(wi);
+//         bool inSameSides = isSameSide(woWorld,wiWorld,ffnormal);
+//         uint spectralIdBase = sstate.spectralId*settingxml.maxBand;
+//         float radiance;
+
+//         //////////////////////////////
+//         /// emitter case
+//         /// else-emitter(j -> i).
+//         /// j = soil.
+//         /////////////////////////////
+//         for(int kband = 0;kband < settingxml.maxBand;kband++)
+//         {
+//           radiance = 0;
+//           trans = spectralMaterials[spectralIdBase+kband].transmittance;
+//           refl = spectralMaterials[spectralIdBase+kband].reflectance;
+//           if(settingxml.isTemperature == 1)
+//           {
+//             float wavelength = waveSets[kband].wavelength;
+//             if(wavelength > 50) wavelength = wavelength /1000.0;
+//             if(wavelength > 2.5)
+//             {
+//               // get sunlit and shaded fraction and mixed them for an average result
+//               float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
+//               float shadedTemperature = thermalMaterials[thermalId].shadedTemperature;
+//               float sunlitRadiance = planck(wavelength,sunlitTemperature);
+//               float shadedRadiance = planck(wavelength,shadedTemperature);
+//               float thermalRadiance = sunlitRadiance*(alpha_toSolar)+shadedRadiance*(1-alpha_toSolar);
+//               radiance += (thermalRadiance* alpha_toVoxel *(1-refl-trans));
+                        
+//             }else
+//             {
+//               radiance += 0.0;
+//             }
+//           }else
+//           {
+//             radiance += 0.0;
+//           }
+
+//           atomicAdd(voxelRads[bufferId0*DIFFUSE_ANGLE_NUM*settingxml.maxBand+kband*DIFFUSE_ANGLE_NUM+iangle].induced,radiance,
+//             gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+//           //Radiance[kband*DIFFUSE_ANGLE_NUM+iangle] += radiance;
+//         }
+//         break;
+//       }
+
+//       ray = Ray(sstate.position,directioni);
+//       ffnormal  = sstate.normal;
+//       ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
+
+//     }
+//   }
+//   return false;
+// }
+
+
+AllAabb LookUpAABB(int loc)
+{
+	AllAabb aabb = aabbs[loc];
+	return aabb;
+}
+
+float LookUpNanoValue(ivec3 pos)
+{
+	float value = -10000;
+	NanoVDBLink nanoVDBLink = nanovdbInit();
+	value = nanovdbGet(nanoVDBLink,pos);
+	return value;
+}
+
+void main()
+{
+    //------------------------------------------------------------
+    // Initialization for the position and SSBO index
+    //------------------------------------------------------------
+    // get bufferId, voxelId, instanceId and typeId
+    uint bufferId0 = uint(gl_GlobalInvocationID.x);
+    ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
+    uint instanceId0 = voxelLinks[bufferId0].instanceId;
+    uint typeId0 = instanceLinks[instanceId0].type;
+    // Get nanoVDBLink: from voxelId to bufferId
+    NanoVDBLink nanoVDBLink = nanovdbInit();
+
+    // get center position of a voxel
+    float scale = settingxml.scale;
+    vec3 semiRange = settingxml.scale * settingxml.voxelSize/2.0;
+    vec3 voxelPos0 = vec3((voxelId0.x)*scale-semiRange.x, (voxelId0.y)*scale,(voxelId0.z)*scale-semiRange.z ); 
+    if(typeId0 == TYPE_SOIL)
+    {
+        voxelPos0 = vec3((voxelId0.x+1)*scale - semiRange.x, (voxelId0.y)*scale,(voxelId0.z+1)*scale-semiRange.z ); 
+    }
+
+    // solar direction.
+    vec3 directions = normalize(lightSet.direction);
+    
+    // calculate the transmittance from voxel to solar.
+    traversalDirection(directions);
+
+    // initialize induced and cumulated, both are set 0.
+    for(int kband=0;kband<settingxml.maxBand;kband++)
+    {
+        for(int iangle = 0;iangle <DIFFUSE_ANGLE_NUM;iangle++)
+        {
+        voxelRads[bufferId0*DIFFUSE_ANGLE_NUM*settingxml.maxBand+kband*DIFFUSE_ANGLE_NUM+iangle].cumulated = 0.0;
+        voxelRads[bufferId0*DIFFUSE_ANGLE_NUM*settingxml.maxBand+kband*DIFFUSE_ANGLE_NUM+iangle].induced = 0.0;
+        }
+    }
+
+    // // calculate the primary scattering term and store in induced.
+    // voxel_raytracing_diffuse_single(voxelPos0,bufferId0,typeId0,nanoVDBLink);
+
+    // // set cumulate as induced.
+    // // here is voxel zero scattering, receive the sky contribution and other voxel emittering term.
+    // // induced = Lsky + Le(j), cumulated = induced.
+    // for(int kband=0;kband<settingxml.maxBand;kband++)
+    // {
+    //     for(int iangle = 0;iangle <DIFFUSE_ANGLE_NUM;iangle++)
+    //     {
+    //     atomicStore(voxelRads[bufferId0*DIFFUSE_ANGLE_NUM*settingxml.maxBand+kband*DIFFUSE_ANGLE_NUM+iangle].cumulated,
+    //         voxelRads[bufferId0*DIFFUSE_ANGLE_NUM*settingxml.maxBand+kband*DIFFUSE_ANGLE_NUM+iangle].induced,
+    //         gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+    //     }
+    // }
+
+
+// Ray ray;
+// ray.origin = vec3(-125,-1,-125);
+// ray.origin = vec3(125,-1,125);
+// ray.origin = vec3(125,-1,-125);
+// ray.origin = vec3(-125,-1,125);
+
+// ray.origin = vec3(-75,-1,-75);
+// // ray.origin = vec3(75,-1,75);
+// // ray.origin = vec3(-75,-1,75);
+// // ray.origin = vec3(75,-1,-75);
+
+// // ray.origin = vec3(50,-1,50);
+// // ray.origin = vec3(50,-1,-50);
+// // ray.origin = vec3(-50,-1,50);
+// // ray.origin = vec3(-50,-1,-50);
+
+// // ray.direction = vec3(0,1,0);
+// // ClosestHit(ray);
+// //     float abc = prd.hitT;
+
+// // // ivec3 voxelId = ivec3(25,-1,25);
+// // //     int loc = nanovdbGet(nanoVDBLink,voxelId);
+// // //     Aabb aabb = aabbs[loc];
+// // //     int instanceId = voxelLinks[loc].instanceId;
+// // //     abc = instanceId;
+// //     atomicStore(outImage[0],abc,gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+
+
+// // Ray ray;
+// // ray.origin = vec3(1,0,1);
+// // ray.direction = vec3(0,1,0);
+// // Aabb aabb;
+// // aabb.minimum = vec3(0.5,-0.5,0.5);
+// // aabb.maximum = vec3(1.5,0.5,1.5);
+// //     float abc = hitAabb(aabb, ray);
+// //     atomicStore(outImage[0],abc,gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+
+
+}

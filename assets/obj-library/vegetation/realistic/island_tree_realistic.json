@@ -1,0 +1,12 @@
+{
+  "source": "https://polyhaven.com/a/island_tree_02",
+  "sourceTriangles": 1072213,
+  "triangles": 90000,
+  "dimensions": [
+    4.2077,
+    3.4066,
+    4.0707
+  ],
+  "coordinateSystem": "Y-up",
+  "vertexColors": true
+}

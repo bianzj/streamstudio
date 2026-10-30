@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Stream Studio S logo concept</title>
+  <desc id="desc">A bold white S-shaped stream on a blue rounded square with a red simulation accent.</desc>
+  <defs>
+    <linearGradient id="background" x1="156" y1="96" x2="868" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1184DE"/>
+      <stop offset="0.58" stop-color="#0F72C7"/>
+      <stop offset="1" stop-color="#164F98"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="666" y1="682" x2="974" y2="978" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E34E48"/>
+      <stop offset="1" stop-color="#BE292E"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#052B50" flood-opacity="0.32"/>
+    </filter>
+    <clipPath id="tile">
+      <rect x="56" y="56" width="912" height="912" rx="214"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <rect x="56" y="56" width="912" height="912" fill="url(#background)"/>
+    <path d="M638 968H968V638L638 968Z" fill="url(#accent)"/>
+    <path d="M734 132 934 332M808 120 956 268M122 770 264 912"
+          fill="none" stroke="#FFFFFF" stroke-width="12" stroke-linecap="round" opacity="0.08"/>
+  </g>
+
+  <rect x="68" y="68" width="888" height="888" rx="202"
+        fill="none" stroke="#FFFFFF" stroke-width="10" opacity="0.14"/>
+
+  <path d="M724 284
+           C660 205 551 184 446 220
+           C337 257 288 344 343 421
+           C388 484 480 488 566 508
+           C668 532 721 593 696 682
+           C670 773 570 824 458 808
+           C353 793 278 748 231 678"
+        fill="none" stroke="#FFFFFF" stroke-width="142"
+        stroke-linecap="round" stroke-linejoin="round" filter="url(#shadow)"/>
+
+  <circle cx="231" cy="678" r="27" fill="#FFFFFF" opacity="0.96"/>
+</svg>

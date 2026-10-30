@@ -1,0 +1,81 @@
+# Stream Studio uses a new application identity. Uninstall HiStream Studio (or
+# StreamSim 1.x) before installing; user data is migrated on first launch.
+appId: cn.stream.studio
+productName: Stream Studio
+asar: true
+electronLanguages:
+  - zh-CN
+  - en-US
+directories:
+  output: release
+files:
+  - desktop/**/*
+  - server.mjs
+  - server/**/*.mjs
+  - tools/runtime-scene.mjs
+  - tools/surface-textures.mjs
+  - tools/png.mjs
+  - tools/tarp-cover.mjs
+  - tools/usd-export.mjs
+  - tools/usd-import.mjs
+  - src/renderer/src/project-schema.js
+  - src/renderer/src/project-unified.js
+  - src/renderer/src/material-specular.js
+  - package.json
+extraResources:
+  - from: gui
+    to: gui
+  - from: .packaging/assets
+    to: assets
+  - from: models/bin_x64/Release
+    to: engine
+    filter:
+      - "**/*"
+      - "!**/*.pdb"
+      - "!**/*.lib"
+      - "!.analysis{,/**/*}"
+      - "!log_nvprosample.txt"
+      - "!shader/cases/**/*.spv"
+      - "!shader/.idea{,/**/*}"
+      - "!shader/.vscode{,/**/*}"
+      - "!shader/*副本*"
+  # FIXED[中] 安全: 整个 docs 目录被打进安装包，其中有 docs/superpowers/plans/*（内部审计与修复计划）、model-remaining-issues-*.md、源 .docx 等内部开发文档；已修复：filter 白名单只打包用户手册与理论手册 PDF，排除 superpowers/、内部问题清单、release notes、figures 与 .docx 源文件
+  - from: docs
+    to: docs
+    filter:
+      - "Stream_Studio_User_Manual_CN.pdf"
+      - "Stream_Studio_Theory_Manual_CN.pdf"
+  - from: statistic
+    to: statistic
+    filter:
+      - "**/*.py"
+      - "**/*.mjs"
+      - "**/*.md"
+      - "**/*.txt"
+      - "!**/test_*.py"
+      - "!**/__pycache__{,/**/*}"
+  - from: src/renderer/src/project-schema.js
+    to: src/renderer/src/project-schema.js
+  - from: src/renderer/src/material-specular.js
+    to: src/renderer/src/material-specular.js
+  - from: design/branding/stream-studio-logo.ico
+    to: branding/stream-studio.ico
+win:
+  executableName: StreamStudio
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: Stream-Studio-Setup-${version}-x64-slim.${ext}
+  icon: design/branding/stream-studio-logo.ico
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Stream Studio
+  deleteAppDataOnUninstall: false
+  installerIcon: design/branding/stream-studio-logo.ico
+  uninstallerIcon: design/branding/stream-studio-logo.ico
+  installerHeaderIcon: design/branding/stream-studio-logo.ico

@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "wavelengthUnit": "nm",
+  "valueUnit": "fraction",
+  "usage": "quick-test-only",
+  "spectra": [
+    {"id": "crop_maize_green", "label": "玉米健康叶片", "file": "crop_maize_green.txt", "tirReflectance": 0.025, "tirTransmittance": 0.0},
+    {"id": "crop_wheat_green", "label": "小麦健康叶片", "file": "crop_wheat_green.txt", "tirReflectance": 0.03, "tirTransmittance": 0.0},
+    {"id": "crop_rice_green", "label": "水稻健康叶片", "file": "crop_rice_green.txt", "tirReflectance": 0.025, "tirTransmittance": 0.0},
+    {"id": "crop_senescent", "label": "衰老作物叶片", "file": "crop_senescent.txt", "tirReflectance": 0.045, "tirTransmittance": 0.0},
+    {"id": "tree_broadleaf_green", "label": "阔叶树健康叶片", "file": "tree_broadleaf_green.txt", "tirReflectance": 0.025, "tirTransmittance": 0.0},
+    {"id": "tree_conifer_needle", "label": "针叶树针叶", "file": "tree_conifer_needle.txt", "tirReflectance": 0.035, "tirTransmittance": 0.0},
+    {"id": "soil_dry_loam", "label": "干燥壤土", "file": "soil_dry_loam.txt", "tirReflectance": 0.07, "tirTransmittance": 0.0},
+    {"id": "soil_wet_loam", "label": "湿润壤土", "file": "soil_wet_loam.txt", "tirReflectance": 0.035, "tirTransmittance": 0.0},
+    {"id": "urban_asphalt", "label": "沥青路面", "file": "urban_asphalt.txt", "tirReflectance": 0.05, "tirTransmittance": 0.0},
+    {"id": "urban_concrete", "label": "混凝土", "file": "urban_concrete.txt", "tirReflectance": 0.08, "tirTransmittance": 0.0},
+    {"id": "water_clear", "label": "清洁水体", "file": "water_clear.txt", "tirReflectance": 0.02, "tirTransmittance": 0.0},
+    {"id": "tarp_olive_canvas", "label": "篷布·军绿帆布", "file": "tarp_olive_canvas.txt", "tirReflectance": 0.1, "tirTransmittance": 0.0},
+    {"id": "tarp_desert_tan", "label": "篷布·荒漠沙色", "file": "tarp_desert_tan.txt", "tirReflectance": 0.09, "tirTransmittance": 0.0},
+    {"id": "tarp_white_pe", "label": "篷布·白色 PE 编织布", "file": "tarp_white_pe.txt", "tirReflectance": 0.08, "tirTransmittance": 0.1},
+    {"id": "tarp_silver_reflective", "label": "篷布·镀铝反光膜", "file": "tarp_silver_reflective.txt", "tirReflectance": 0.72, "tirTransmittance": 0.0},
+    {"id": "tarp_ir_camouflage_green", "label": "篷布·仿植被红外伪装布", "file": "tarp_ir_camouflage_green.txt", "tirReflectance": 0.06, "tirTransmittance": 0.0},
+    {"id": "shade_net_black_fiber", "label": "遮阳网纤维·黑色 HDPE", "file": "shade_net_black_fiber.txt", "tirReflectance": 0.06, "tirTransmittance": 0.0},
+    {"id": "shade_net_green_fiber", "label": "遮阳网纤维·绿色 HDPE", "file": "shade_net_green_fiber.txt", "tirReflectance": 0.07, "tirTransmittance": 0.0},
+    {"id": "sand_desert_dune", "label": "沙漠沙丘沙（含铁石英砂）", "file": "sand_desert_dune.txt", "tirReflectance": 0.05, "tirTransmittance": 0.0},
+    {"id": "sand_desert_dark", "label": "沙漠丘间地（粗砂与砾石）", "file": "sand_desert_dark.txt", "tirReflectance": 0.06, "tirTransmittance": 0.0}
+  ]
+}

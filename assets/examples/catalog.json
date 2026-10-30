@@ -1,0 +1,65 @@
+{
+    "version":  1,
+    "examples":  [
+                     {
+                         "id":  "crop_gpp_npp",
+                         "label":  "垄行玉米-农业",
+                         "project":  "assets/examples/crop_gpp_npp/project.json",
+                         "recommendedMode":  "eVoxelEB",
+                         "focus":  [
+                                       "作物冠层温度",
+                                       "GPP",
+                                       "NPP",
+                                       "日变化"
+                                   ]
+                     },
+                     {
+                         "id":  "forest_gpp_npp",
+                         "label":  "混交森林-生态",
+                         "project":  "assets/examples/forest/project.json",
+                         "recommendedMode":  "eVoxelEB",
+                         "focus":  [
+                                       "冠层温度",
+                                       "GPP",
+                                       "NPP",
+                                       "日变化"
+                                   ]
+                     },
+                     {
+                         "id":  "photovoltaic",
+                         "label":  "光伏-新能源",
+                         "project":  "assets/examples/photovoltaic/project.json",
+                         "recommendedMode":  "eFacetEB",
+                         "focus":  [
+                                       "光伏热电耦合",
+                                       "温度",
+                                       "发电功率"
+                                   ]
+                     },
+                     {
+                         "id":  "urban_block",
+                         "label":  "城市-热环境",
+                         "project":  "assets/examples/urban_block/project.json",
+                         "recommendedMode":  "eVoxelRT",
+                         "focus":  [
+                                       "建筑阴影",
+                                       "街区反射率",
+                                       "热红外",
+                                       "行道树"
+                                   ]
+                     },
+                     {
+                         "id":  "landsat_beijing_eb",
+                         "label":  "北京市 Landsat 影像-ERA5 单日驱动",
+                         "project":  "assets/examples/landsat_beijing_eb/project.json",
+                         "recommendedMode":  "STREAM EB",
+                         "focus":  [
+                                       "遥感影像模拟",
+                                       "ERA5 2019-08-15",
+                                       "OLI 反射率",
+                                       "TIRS 亮温",
+                                       "能量平衡"
+                                   ]
+                     }
+                 ]
+}

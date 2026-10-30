@@ -1,0 +1,476 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXEL_LST_BIND_ININDEX
+#define VOXELLST 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../functions.glsl"
+#include "../nanovdb_info.glsl"
+#include "fluid_coupling.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+
+// The integrated stability correction to eddy diffusivity 
+// for momentum at height zr - d
+float psim(float z,float L)
+{   
+    if (L ==0) return 0;
+
+    float xz,pm,temp;
+    temp = 0.25;
+    xz = (1-16*z/L);
+    xz = pow(xz,temp);
+    pm = 0.0;
+    // unstability
+    if(L < 0 && L > -500)
+    {
+        pm = 2*log(0.5 + 0.5*xz) + log(0.5+0.5*xz*xz)- 2*atan(xz) + PID2;
+    }
+    // stability
+    if(L > 0 && L < 500)
+    {
+        pm = -5.0*z/L;
+    }
+    return pm;
+}
+
+// The integrated stability correction to eddy diffusivity 
+// for heat and water vapour at height z
+float psih(float z,float L)
+{
+    if (L==0) return 0;
+    float xz,ph,temp;
+    xz = (1-16*z/L);
+    temp = 0.25;
+    xz = pow(xz,temp);
+    ph = 0.0;
+    if(L < 0 && L > -500)
+    {
+        ph = 2*log(0.5+0.5*xz*xz);
+    }
+    if(L > 0 && L < 500)
+    {
+        ph = -5.0*z/L;
+    }
+    return ph;
+}
+
+
+float phstar(float z,float zr,float d,float L)
+{
+    if (L==0) return 0;
+    float xz,phs,temp;
+    xz= (1-16.0*z/L);
+    temp = 0.25;
+    xz = pow(xz,temp);
+    phs=0.0;
+    if(L < 0 && L > -500)
+    {
+        phs = (z-d)/(zr-d)*(xz*xz-1)/(xz*xz+1);
+    }
+    if(L > 0 && L < 500)
+    {
+        phs = -5*z/L;
+    }
+    return phs;
+}
+
+
+// from 2D to 1D 
+
+
+// !!!!!!!!!!   THIS IS ONLY FOR PLANE SURFACE         !!!!!!!!!!!!!!
+//--------------------------------------------------------------------
+// for vegetation, from top to surface:  rai + rar + rac + rwc + rbc
+//--------------------------------------------------------------------
+// inertial sublayer: rai
+// roughness sublayer: rar
+// canopy sublayer : rac
+// understory canopy sublayer: rwc
+// vegetation boundary sublayer:    rbc
+//--------------------------------------------------------------------
+// for soil, from top to surface: rai + rar + rac + rws + rbs
+//--------------------------------------------------------------------
+// bottom soil sublayer: rws
+// soil boundary sublayer: rbs
+
+// Leaf area index, canopy-top height above the cell and leaf width of the
+// vegetation standing in the grid column above a ground cell.
+float columnCanopy(NanoVDBLink nanoVDBLink, ivec3 voxelId0, out float top, out float leafwidth)
+{
+    float lai = 0.0;
+    top = 0.0;
+    leafwidth = 0.0;
+    ivec3 voxelRes = ivec3(setting.voxelSize);
+    for(int y = voxelId0.y + 1; y <= voxelId0.y + max(voxelRes.y, 1) + 1 && y - voxelId0.y < 2048; ++y)
+    {
+        ivec3 cell = ivec3(voxelId0.x, y, voxelId0.z);
+        int bufferId = nanovdbGet(nanoVDBLink, cell);
+        if(bufferId < 0 || bufferId >= setting.voxelCount) continue;
+        MeshLink link = meshLinks[instanceLinks[voxelLinks[bufferId].instanceId].meshId];
+        if(link.type != TYPE_VEGETATION) continue;
+        Canopy columnCanopy = canopies[link.canopyId];
+        if(isParticipatingMedium(columnCanopy)) continue;
+        lai += ResolveTurbidDensity(bufferId, link.canopyId, cell, voxelRes) * setting.scale;
+        top = float(y - voxelId0.y) * setting.scale;
+        leafwidth = max(leafwidth, columnCanopy.leafwidth);
+    }
+    return lai;
+}
+
+void main()
+{
+
+    //------------------------------------------------------------
+    // Initialization for the position and SSBO index
+    //------------------------------------------------------------
+    uint bufferId0 = gl_GlobalInvocationID.x;
+    if(bufferId0 >= uint(setting.voxelCount)) return;
+    if(voxelLinks[bufferId0].isValid==0) return;
+    //voxelRes: voxel number in 3 dimentions
+    ivec3 voxelRes = ivec3(setting.voxelSize);
+    ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
+    uint surf1DId = SurfFlatten(voxelId0,voxelRes);
+    // Get nanoVDBLink: from voxelId to bufferId
+    NanoVDBLink nanoVDBLink = nanovdbInit();
+
+    int faceId = voxelLinks[bufferId0].faceId;
+    //if(primId0 - faceid0*10 == 0) return; 
+
+    //-------------------------
+    // various parameters index
+    //-------------------------
+    uint spectralId,spectralId0;  // spectral property index of a voxel
+    uint canopyId,canopyId0;      // canopy structure of a voxel
+    uint instanceId0, instanceId,lastInstanceId=-1; // instance information of a voxel
+    uint aeroId,aeroId0;          // aerodynamic property index of a voxel
+    uint typeId,typeId0;          // voxel type: vegetation, soil...
+
+    //-------------------------
+    // various parameters
+    //-------------------------
+    float z, L, kappa, u, ra, rbs, rwc;
+    float z0m, d, zr, hcmax, hcmin, laimax, lai, n, leafwidth;
+    float rai, rar, rac, rbc, raa;
+    float pm_z, ph_z, ph_zr, pm_zr, phs_zr, phs_h, pms_zr, ph_h, pm_h, ustar;
+    int voxelMaxY,aerotype;
+    Canopy canopy0, canopy;
+    InstanceLink   instanceLink;
+    MeshLink       meshLink;
+
+
+    // It is a valid position and then continue
+    if(bufferId0 >=0 )
+    {
+        //-----------------------------------------------
+        // input from CPU parameter
+        //-----------------------------------------------
+
+        // various indexes
+        instanceId = voxelLinks[bufferId0].instanceId;
+        aeroId = voxelLinks[bufferId0].aeroId;
+        instanceLink = instanceLinks[instanceId];
+        meshLink = meshLinks[instanceLink.meshId];
+        canopyId = meshLink.canopyId; 
+        typeId = meshLink.type; 
+
+
+        aerotype = aeroConds[aeroId].type;
+        L = aeroConds[aeroId].L;
+        canopy = canopies[canopyId];
+        // A positive aerodynamic entry overrides the canopy; otherwise use the
+        // canopy's own height, LAI and leaf width (zero LAI would create an
+        // infinite boundary resistance).
+        hcmax = aeroConds[aeroId].hc_veg > 0.001
+            ? aeroConds[aeroId].hc_veg : max(canopy.height, 0.05);
+        laimax = aeroConds[aeroId].lai > 0.001
+            ? aeroConds[aeroId].lai : max(canopy.lai, 0.001);
+        leafwidth = aeroConds[aeroId].leafwidth > 0.0001
+            ? aeroConds[aeroId].leafwidth : max(canopy.leafwidth, 0.0001);
+        // Optional local-air closure. Never pass an in-canopy resolved speed
+        // through the above-canopy wind profile again. The same closure can
+        // use prescribed local air with fluid.enabled=false for paired runs.
+        if (fluidParameters.localExchange.x > 0.5 &&
+            (typeId == TYPE_VEGETATION || typeId == TYPE_SOIL)) {
+            float speed = max(localWindSpeed(bufferId0), 0.05);
+            if (typeId == TYPE_VEGETATION) {
+                // Empirical whole-leaf boundary resistance 70 sqrt(w/u).
+                // Per-face resistance is twice this (H/LE are per-face).
+                voxelRaas[bufferId0].raa = max(1.0, 140.0 * sqrt(leafwidth / speed));
+            } else {
+                // Neutral, unresolved ground-to-first-cell bulk approximation.
+                // Not a calibrated canopy logarithmic layer.
+                float height = max(0.5 * fluidParameters.spacingTime.y, 0.02);
+                float logHeight = log(height / 0.01);
+                voxelRaas[bufferId0].raa = max(1.0,
+                    logHeight * logHeight / (KAPPA * KAPPA * speed));
+            }
+            return;
+        }
+        rbs = 10; 
+        if(typeId == TYPE_SOIL || typeId == TYPE_WATER)
+        {
+            // Ground cells are sheltered by the vegetation actually above them,
+            // not by the canopy entry of their own material; open ground is bare.
+            float columnTop, columnLeafwidth;
+            float columnLai = columnCanopy(nanoVDBLink, voxelId0, columnTop, columnLeafwidth);
+            if(columnLai > 0.01)
+            {
+                hcmax = columnTop;
+                laimax = columnLai;
+                leafwidth = max(columnLeafwidth, 0.0001);
+            }
+            else if(aeroConds[aeroId].lai <= 0.001)
+            {
+                hcmax = 0.0;
+            }
+        }
+
+        //------------------------------------------
+        // variable parameters, these are from defined data
+        //------------------------------------------
+        // CD1 = aeros[aeroId].CD1;        // fitting parameter
+        // CSSOIL = aeros[aeroId].CSSOIL;  // drag coefficient for soil
+        // CD = aeros[aeroId].CD;          // drag coefficient for the vegetation 
+        // CR = aeros[aeroId].CR;          // drag coefficient for a isolated tree
+        // PSICOR = aeros[aeroId].PSICOR;  // Roughness layer correction
+        // rbs = aeros[aeroId].rbs;        // for boundary soil resistance
+        // rwc = aeros[aeroId].rwc;        // for Aerodynamic Resistance within canopy
+        // dynamic variable in iteration
+        //------------------------------------
+        // No updating for L
+        //------------------------------------
+        //  L = surfLs[surf1DId].L;
+
+
+        // dynamic variable in time
+        // The aerodynamic reference level must be above displacement height.
+        z = max(ubom.meteo.z, hcmax + max(2.0, 0.5 * hcmax));
+        u = max(localWindSpeed(bufferId0), 0.05); // obstacle- and canopy-resolved wind
+        kappa = KAPPA; 
+
+        if(aerotype == AEROTYPE_URBAN){
+            // Building canopy: reference height, displacement and roughness all
+            // follow the building height, so z - d > z0m holds by construction.
+            hcmax = max(aeroConds[aeroId].hc_build, 0.0);
+            z = max(ubom.meteo.z, hcmax + max(2.0, 0.5 * hcmax));
+            d = hcmax * 2.0 / 3.0;
+            z0m = max(hcmax / 10.0, 0.01);
+            zr = hcmax * 2.0;
+            pm_z = psim(z-d,L);
+            ph_z = psih(z-d,L);
+            ph_zr = psih(zr-d,L);
+            if(z < zr) ph_zr = ph_z; /// attention !!!
+            float logz = log((z - d) / z0m);
+            // friction wind speed
+            ustar = max(0.001, kappa*u / (logz - pm_z));
+            raa = (1.0 / (kappa*ustar)*(logz - ph_z + ph_zr));
+            // Invalid stability correction: use the neutral profile, never a constant.
+            if(isnan(raa) || isinf(raa) || raa < 1.0 || logz - pm_z <= 0.0)
+            {
+                ustar = max(0.001, kappa * u / logz);
+                raa = max(1.0, logz / (kappa * ustar));
+            }
+
+            aeroConds[aeroId].ustar = ustar;
+            voxelRaas[bufferId0].raa = raa;
+            return;
+        }
+
+
+        canopy = canopies[canopyId];
+        //--------------------------------------------------------
+        // Attention! The bottom layer cantain the toppest height.
+        // When constructing the 3D scene, it should be cautious!
+        // Obviously, each voxel contain this kind of information. 
+        //---------------------------------------------------------
+
+
+        z0m = 0.01;                     // Roughness lenght for momentum for the vegetation  
+        zr = hcmax * 2.5;               // top of roughness sublayer, bottom of intertial sublayer
+        n = CD*laimax / (2 * kappa*kappa);
+
+        if(hcmax <= 0.01)
+        {
+            //------------------------
+            // bare soil case
+            //------------------------
+            d = 0.01;                   // displacement height (zero plane)
+            z0m = 0.01;                 // roughtness length for momentum for the soil
+            zr = 0.01;                  // top of roughness sublayer
+            // stability correction functions, friction velocity and Kh=Km=Kv
+            pm_z = psim(z - d, L);
+            ph_z = psih(z - d, L);
+            ph_zr = phstar(zr, zr, d, L);
+            //--------------------------
+            // Point: Friction velocity   
+            //--------------------------
+            ustar = max(0.001, kappa * u /(log((z-d)/z0m) - pm_z));
+            //surfLs[surf1DId].ustar = ustar;
+            // aerodynamic resistance
+            aeroConds[aeroId].ustar = ustar;
+            raa = (1.0 / (kappa * ustar)*(log((z-d)/z0m)-ph_z + ph_zr));
+            if(isnan(raa) || isinf(raa) || raa < 1.0) raa = 50;
+            voxelRaas[bufferId0].raa = raa;
+            // voxelRaas[bufferId0].raa = surf1DId;
+            // return;
+        }
+        else
+        {
+            //voxelRaas[bufferId0].raa = surf1DId;
+            /////----------------------------------------------------------
+            ///// The toppest vegetation layer 
+            /////----------------------------------------------------------
+            float kh,kh0,sq,g1,uh,uz0,rac;
+            /// zom and h (m): roughness lenght for momentum and zero plane displacement
+            sq = sqrt(CD1 * laimax/2.0);
+            g1 = max(3.3, sqrt(CSSOIL + CD * laimax /2.0));
+            d = hcmax*(1 - (1 - exp(-sq))/sq);
+            z0m = (hcmax - d) * exp(-kappa * g1 + PSICOR);
+           // stability correction functions, friction velocity and Kh=Km=Kv
+            pm_z = psim(z-d,L);
+            ph_z = psih(z-d,L);
+            pm_h = psim(hcmax-d,L);
+            ph_zr = psih(zr-d,L); 
+            if(z < zr) ph_zr = ph_z; /// attention !!! 
+            phs_zr = phstar(zr,zr,d,L);
+            phs_h = phstar(hcmax,zr,d,L);
+            // friction wind speed
+            ustar = max(0.001, kappa*u / (log((z - d) / z0m) - pm_z)); 
+            // surfLs[surf1DId].ustar = ustar;
+            aeroConds[aeroId].ustar = ustar;
+            // initial and roughness layers
+            if (z > zr)
+            {
+                rai = (1.0 / (kappa*ustar)*(log((z - d) / (zr - d)) - ph_z + ph_zr));  //这里是空气1层；
+                rar = 1.0 / (kappa*ustar)*((zr - hcmax) / (zr - d)) - phs_zr + phs_h;  //这里是空气2层；
+            }
+            else
+            {
+                rai = 0;
+                rar = 1.0 / (kappa*ustar)*((z - hcmax) / (z - d)) - phs_zr + phs_h;
+            }
+            /////////////////////////////////////////////////////////////////////////////////////////////////////
+            kh0 = kappa*ustar*(zr - d);    //Diffusivity for heat
+            // unstable correction
+            if (L < 0 && L > -500) kh = kappa*ustar*(zr - d) * sqrt(1 - 16 * (hcmax - d) / L);
+            // stable correction 
+            if (L > 0 && L < 500) kh = kappa*ustar*(zr - d) / (1 + 5 * (hcmax - d) / L);
+            //  wind speed at height h and z0m
+            uh = max(ustar / kappa*(log((hcmax - d) / z0m) - pm_h), 0.01);  
+            uz0 = uh*exp(n*((z0m + d) / hcmax - 1));               
+            // aerodynamic resistance within the mixed canopy
+            rac = hcmax*sinh(n) / (n*kh0);
+            rac = rac *(log((exp(n) - 1) / (exp(n) + 1)) - 
+                log((exp(n*(z0m + d) / hcmax) - 1) / (exp(n*(z0m + d) / hcmax) + 1)));     
+            rbc = 70 / laimax *sqrt(leafwidth/uz0);
+            
+            //------------------------------------------
+            //-- really high is limited.
+            //------------------------------------------
+            // if((voxelId0.y+0.5)* setting.scale >= hcmax) 
+            // {
+            //     raa = rai + rar + rac + rbc;
+            //     if(isnan(raa)) raa = 50;
+            //     voxelRaas[bufferId0].raa = raa;
+            //     return;
+            // }
+            /////----------------------------------------------------------
+            ///// The toppest vegetation layer 
+            /////----------------------------------------------------------
+            float rwcs = 0, h1max, hctemp, laitemp, leafwidthtemp, sqtemp, g1temp, dtemp, z0mtemp;
+            float y1 = z0m + d;
+            float y2 = 0.01;
+            if(typeId == TYPE_NULL) return;
+            if((typeId == TYPE_SOIL) || (typeId == TYPE_WATER))
+            {
+                // for soil under overstory vegetation 
+                y2 = 0.01;
+                rwcs = hcmax*sinh(n) / (n*kh0) * 
+                        (log((exp(n*(y1) / hcmax) - 1) / (exp(n*(y1) / hcmax) + 1)) -
+                        log((exp(n*(y2) / hcmax) - 1) / (exp(n*(y2) / hcmax) + 1))); 
+                // SCOPE: the canopy-scale resistance is shared by LAI leaf
+                // units and one soil unit, ras = (LAI+1)*(raa + raws).
+                raa = (laimax + 1.0) * (rai + rar + rac + rwcs + rbs);
+
+                // raa =  n;
+                if(isnan(raa) || isinf(raa) || raa < 1.0) raa = 50;
+                voxelRaas[bufferId0].raa = raa;  
+
+                // voxelRaas[bufferId0].raa = sinh(n) / (n*kh0);
+                // voxelRaas[bufferId0].raa = kh0;
+
+            }else if (typeId == TYPE_BUILDING) {
+                // Exposed solids (including trunk and branch wood) must not use
+                // the under-canopy ground resistance at y=0.01 m.  Convert a
+                // standard forced-convection coefficient to aerodynamic
+                // resistance; the local canopy wind is retained but bounded by
+                // half of the reference wind for small exposed woody surfaces.
+                float localWind = max(uh, 0.5 * max(u, 0.1));
+                float heatTransfer = 8.3 + 4.1 * localWind;
+                if(soilSets[meshLink.bioId].thermalClass == 1)
+                {
+                    // Cylinder-like branch and trunk elements have a much
+                    // thinner thermal boundary layer than a wall or ground
+                    // plane. Use the reference wind and a material scale.
+                    heatTransfer = max(soilSets[meshLink.bioId].convectiveScale, 0.1)
+                        * (18.0 + 8.0 * max(u, 0.1));
+                }
+                raa = RHOA * CP / max(heatTransfer, 1.0);
+                if(isnan(raa) || isinf(raa) || raa < 1.0) raa = 50.0;
+                voxelRaas[bufferId0].raa = raa;
+            }else if (typeId == TYPE_VEGETATION) {
+                // for vegetation under overstory vegetation 
+                // information for other layer 
+                canopy = canopies[canopyId];
+                hctemp = canopy.height;
+
+                if(hctemp >= hcmax){
+                    // SCOPE rac = (LAI+1)*(raa + rawc) per unit leaf area;
+                    // H and LE are evaluated per face, hence the factor 2.
+                    raa = 2.0 * (laimax + 1.0) * (rai + rar + rac + rbc);
+                    if(isnan(raa) || isinf(raa) || raa < 1.0) raa = 50;
+                    voxelRaas[bufferId0].raa = raa;
+                    return;
+                }
+
+                leafwidthtemp = canopy.leafwidth;
+                laitemp = canopy.lai;
+                // d and tom 
+                sqtemp = sqrt(CD1*laitemp);
+                g1temp = max(3.3, sqrt(CSSOIL + CD*laitemp / 2.0));
+                dtemp= max(hctemp*(1 - (1 - exp(-sqtemp)) / sqtemp),0.01);   //
+                z0mtemp = max((hctemp - dtemp)*exp(-kappa*g1temp + PSICOR),0.01); //
+                y2 = dtemp + z0mtemp;
+                rwcs = hcmax*sinh(n) / (n*kh0) * 
+                    (log((exp(n*(y1) / hcmax) - 1) / (exp(n*(y1) / hcmax) + 1)) -
+                    log((exp(n*(y2) / hcmax) - 1) / (exp(n*(y2) / hcmax) + 1))); 
+                
+                rbc = 70 / laimax * sqrt(leafwidthtemp/uz0);
+                raa = 2.0 * (laimax + 1.0) * (rai + rar + rac + rwcs + rbc);
+                if(isnan(raa) || isinf(raa) || raa < 1.0) raa = 50;
+                voxelRaas[bufferId0].raa = raa;
+            }// if type
+        } // if type
+    }// if bufferId
+}

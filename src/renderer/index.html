@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>Stream Studio</title>
+  </head>
+  <body>
+    <svg class="svg-sprite" aria-hidden="true">
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+      <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 8V3m0 0h5M4 3l4 4a8 8 0 1 1-2 8"/></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7h7l2 2h9v10H3V7Z"/><path d="M3 7V5h7l2 2"/></symbol>
+      <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 3h12l3 3v15H4V3h1Z"/><path d="M8 3v6h8V3M8 21v-7h8v7"/></symbol>
+      <symbol id="i-cube" viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 7 9 5v10l-9-5V7Zm18 0-9 5v10l9-5V7Z"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M19 5l-1.5 1.5m-11 11L5 19"/></symbol>
+      <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 7h4l2-3h4l2 3h4v13H4V7Z"/><circle cx="12" cy="13" r="4"/></symbol>
+      <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></symbol>
+      <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M6 19h12a4 4 0 0 0 .5-8A7 7 0 0 0 5 9a5 5 0 0 0 1 10Z"/></symbol>
+      <symbol id="i-wind" viewBox="0 0 24 24"><path d="M3 8h11a3 3 0 1 0-3-3"/><path d="M3 12h16a2.5 2.5 0 1 1-2.5 2.5"/><path d="M3 16h8"/></symbol>
+      <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 5-6 7 6 7m8-14 6 7-6 7m-2-17-4 20"/></symbol>
+      <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H11v17H6.5A2.5 2.5 0 0 0 4 21.5v-17Z"/><path d="M20 4.5A2.5 2.5 0 0 0 17.5 2H13v17h4.5a2.5 2.5 0 0 1 2.5 2.5v-17Z"/></symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A8 8 0 0 0 15 6l-.3-2.6h-4L10.4 6a8 8 0 0 0-1.5.9l-2.4-1-2 3.4 2 1.6a7 7 0 0 0 0 2.1l-2 1.6 2 3.4 2.4-1a8 8 0 0 0 1.5.9l.3 2.6h4L15 18a8 8 0 0 0 1.5-.9l2.4 1 2-3.4-2-1.6a7 7 0 0 0 .1-1Z"/></symbol>
+      <symbol id="i-import" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 20h16"/></symbol>
+      <symbol id="i-fit" viewBox="0 0 24 24"><path d="M9 3H3v6m12-6h6v6M9 21H3v-6m12 6h6v-6"/></symbol>
+      <symbol id="i-expand" viewBox="0 0 24 24"><path d="M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6"/></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3m6 0h4"/></symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-draw" viewBox="0 0 24 24"><path d="M4 17.5V20h2.5L18.9 7.6l-2.5-2.5L4 17.5Z"/><path d="m15 6.5 2.5 2.5M4 14V4h10M10 20h10V10"/></symbol>
+    </svg>
+
+    <div id="app">
+      <nav class="menubar" id="menubar" aria-label="主菜单">
+        <div class="menu">
+          <button class="menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false">项目</button>
+          <div class="menu-panel" role="menu" hidden>
+            <button class="menu-item" role="menuitem" type="button" id="newProjectBtn" data-scene-command="new"><span>新建工程…</span><kbd>Ctrl+N</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" id="openXmlBtn" data-scene-command="open" title="打开 project.json，或直接打开 OpenUSD 场景（.usd/.usda/.usdc/.usdz）"><span>打开工程…</span><kbd>Ctrl+O</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" id="openExampleBtn"><span>打开示例…</span></button>
+            <div class="menu-separator" role="separator"></div>
+            <button class="menu-item" role="menuitem" type="button" id="saveXmlBtn" data-scene-command="save" title="保存 project.json，并同步写出 project.usd（可在 Blender 等软件中打开）"><span>保存</span><kbd>Ctrl+S</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" id="saveAsBtn" data-scene-command="save-as"><span>另存为…</span><kbd>Ctrl+Shift+S</kbd></button>
+          </div>
+        </div>
+        <div class="menu">
+          <button class="menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false">解决方案</button>
+          <div class="menu-panel" role="menu" hidden>
+            <div class="menu-label">三维解决方案</div>
+            <button class="menu-item" role="menuitem" type="button" data-solution-mode="eFacetRT"><span>面元辐射传输</span><kbd>Facet RT</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" data-solution-mode="eFacetEB"><span>面元能量平衡</span><kbd>Facet EB</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" data-solution-mode="eVoxelRT"><span>体元辐射传输</span><kbd>Voxel RT</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" data-solution-mode="eVoxelEB"><span>体元能量平衡</span><kbd>Voxel EB</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" data-solution-mode="eRaytracing"><span>简单光线追踪</span><kbd>Raytracing</kbd></button>
+            <div class="menu-separator" role="separator"></div>
+            <div class="menu-label">解析解决方案</div>
+            <button class="menu-item" role="menuitem" type="button" data-stream-command="mode-rt" title="STREAM 像元辐射传输：给定组分温度"><span>像元辐射传输</span><kbd>Pixel RT</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" data-stream-command="mode-eb" title="STREAM 像元能量平衡：ERA5 驱动"><span>像元能量平衡</span><kbd>Pixel EB</kbd></button>
+          </div>
+        </div>
+        <div class="menu">
+          <button class="menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false">结果</button>
+          <div class="menu-panel" role="menu" hidden>
+            <button class="menu-item" role="menuitem" type="button" id="openImageResultsTopBtn" title="需要图像输出（仿真模拟中启用“图像”）"><span>二维水平</span><kbd>2D</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" id="open3dResultsTopBtn" title="需要过程输出（面元/体元辐射过程或能量过程）"><span>三维立体</span><kbd>3D</kbd></button>
+          </div>
+        </div>
+        <div class="menu">
+          <button class="menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false">分析</button>
+          <div class="menu-panel" role="menu" hidden>
+            <button class="menu-item" role="menuitem" type="button" id="openTimeAnalysisBtn" title="需要图像输出与统计 CSV，且至少两个时间节点"><span>时间</span><kbd>Time</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" id="openAngleAnalysisBtn" title="需要图像输出与统计 CSV，且至少两个观测角度"><span>角度</span><kbd>Angle</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" id="openBandAnalysisBtn" title="需要图像输出与统计 CSV，且至少两个波段"><span>波段分析</span><kbd>Band</kbd></button>
+            <button class="menu-item" role="menuitem" type="button" id="openChangeAnalysisBtn" title="需要输出目录中至少两幅 TIFF 图像结果"><span>变化分析</span><kbd>Change</kbd></button>
+          </div>
+        </div>
+        <div class="menu">
+          <button class="menu-trigger" type="button" aria-haspopup="menu" aria-expanded="false">帮助</button>
+          <div class="menu-panel" role="menu" hidden>
+            <button class="menu-item" role="menuitem" type="button" data-help="reference"><span>理论与参考</span></button>
+            <button class="menu-item" role="menuitem" type="button" data-help="user"><span>使用手册（PDF）</span></button>
+            <button class="menu-item" role="menuitem" type="button" data-help="theory"><span>理论手册（PDF）</span></button>
+            <div class="menu-separator" role="separator"></div>
+            <button class="menu-item" role="menuitem" type="button" data-help="shortcuts"><span>快捷键</span></button>
+            <button class="menu-item" role="menuitem" type="button" data-help="about"><span>关于 Stream Studio</span></button>
+          </div>
+        </div>
+      </nav>
+      <header class="topbar">
+        <div class="brand">
+          <div class="brandLogo" aria-label="RTLab HiStream">
+            <span class="logoLab">RTLab</span>
+            <span class="logoSlash" aria-hidden="true"></span>
+            <span class="logoStream">HiStream</span>
+          </div>
+          <button class="brand-jump" type="button" data-stream-command="show" title="打开解析模型（STREAM，快捷键 F7）"><span>解析模型</span><svg><use href="#i-chevron"/></svg></button>
+        </div>
+        <div class="project-title">
+          <span class="status-dot"></span>
+          <span id="projectName">未打开工程</span>
+          <span class="unsaved" id="unsavedMark" hidden>已修改</span>
+        </div>
+        <div class="top-actions">
+          <button class="button ghost language-toggle" id="languageToggle" type="button" title="Switch to English" aria-label="Switch to English"><span data-language-label>EN</span></button>
+          <button class="button primary" id="runBtn"><svg><use href="#i-play"/></svg><span>运行模拟</span></button>
+          <button class="button danger" id="stopBtn" disabled><svg><use href="#i-stop"/></svg>停止</button>
+          <button class="button ghost" id="resetBtn"><svg><use href="#i-reset"/></svg>重置</button>
+        </div>
+      </header>
+
+      <main class="app-grid">
+        <aside class="sidebar">
+          <div class="sidebar-section project-block">
+            <div class="eyebrow">计算模型</div>
+            <div class="mode-grid" id="modeGrid">
+              <button class="mode-card" data-mode="eFacetRT"><svg><use href="#i-layers"/></svg><span>面元辐射传输</span><small>Facet RT</small></button>
+              <button class="mode-card" data-mode="eFacetEB"><svg><use href="#i-layers"/></svg><span>面元能量平衡</span><small>Facet EB</small></button>
+              <button class="mode-card" data-mode="eVoxelRT"><svg><use href="#i-cube"/></svg><span>体元辐射传输</span><small>Voxel RT</small></button>
+              <button class="mode-card active" data-mode="eVoxelEB"><svg><use href="#i-cube"/></svg><span>体元能量平衡</span><small>VoxelEB</small></button>
+              <button class="mode-card wide" data-mode="eRaytracing"><svg><use href="#i-sun"/></svg><span>简单光线追踪</span><small>Simple Ray Tracing</small></button>
+            </div>
+            <div class="device-picker">
+              <div class="device-picker-row">
+                <span class="device-picker-label">计算设备</span>
+                <select class="select" id="computeDevice" aria-label="计算设备"></select>
+                <button class="icon-button" id="refreshDevicesBtn" title="重新检测计算设备" aria-label="重新检测计算设备"><svg><use href="#i-reset"/></svg></button>
+              </div>
+              <div class="device-picker-row" id="cpuThreadsRow" hidden>
+                <span class="device-picker-label">CPU 线程</span>
+                <input class="input" id="cpuThreads" type="number" min="1" step="1" value="32" aria-label="CPU 线程数">
+              </div>
+              <div class="device-picker-hint" id="computeDeviceHint"></div>
+            </div>
+          </div>
+
+          <div class="sidebar-section scene-tree-section">
+            <div class="section-heading"><span>输入</span></div>
+            <nav class="scene-tree" id="sceneTree">
+              <div class="tree-group-label"><span>场景输入</span><small>仅三维工程</small></div>
+              <button class="tree-item" data-panel="shared-geo"><svg><use href="#i-cloud"/></svg><span>地理与时间</span><em id="geoBadge">40° / UTC+8</em></button>
+              <button class="tree-item" data-panel="light"><svg><use href="#i-sun"/></svg><span>太阳与天空</span><em id="lightBadge">30° / 135°</em></button>
+              <button class="tree-item" data-panel="shared-dem"><svg><use href="#i-layers"/></svg><span>DEM 地形</span><em id="demBadge">关闭</em></button>
+              <button class="tree-item" data-panel="atmosphere"><svg><use href="#i-cloud"/></svg><span>大气影响</span><em id="atmosphereBadge">关闭</em></button>
+              <div class="tree-group-label"><span>三维场景</span><small>HiStream 专用</small></div>
+              <button class="tree-item active" data-panel="scene"><svg><use href="#i-cube"/></svg><span>场景</span><em id="sceneSizeBadge">120 × 90 m</em></button>
+              <button class="tree-item" data-panel="sensor"><svg><use href="#i-camera"/></svg><span>传感器</span><em id="sensorBadge">16 × 16</em></button>
+              <button class="tree-item" data-panel="objects"><svg><use href="#i-layers"/></svg><span>场景对象</span><em id="objectBadge">24</em></button>
+              <button class="tree-item" data-panel="materials"><svg><use href="#i-settings"/></svg><span>材质属性</span><em id="materialBadge">预设</em></button>
+              <button class="tree-item" data-panel="meteorology"><svg><use href="#i-cloud"/></svg><span>气象驱动</span><em id="meteoBadge">内置</em></button>
+              <button class="tree-item" data-panel="fluid"><svg><use href="#i-wind"/></svg><span>流体力学</span><em id="fluidBadge">仅 VoxelEB</em></button>
+              <div class="tree-group-label"><span>运行与控制</span><small>仿真设置</small></div>
+              <button class="tree-item simulation-item" data-panel="simulation"><svg><use href="#i-play"/></svg><span>仿真模拟</span><em id="simulationBadge">统计</em></button>
+            </nav>
+          </div>
+
+          <div class="sidebar-footer">
+            <div class="engine-state"><span id="engineDot"></span><div><strong id="engineState">引擎待命</strong><small id="enginePath">正在检测 HiStream...</small></div></div>
+            <div class="sidebar-footer-actions">
+              <button class="text-button" id="engineBtn"><svg><use href="#i-settings"/></svg>配置引擎路径</button>
+              <button class="text-button" id="openHistreamProxyBtn" type="button" hidden><svg><use href="#i-cube"/></svg>histream-proxy 固定场景</button>
+              <button class="text-button" id="referenceBtn"><svg><use href="#i-book"/></svg>理论与参考</button>
+            </div>
+          </div>
+        </aside>
+
+        <section class="viewport-panel">
+          <div id="viewport"></div>
+          <div class="viewport-toolbar">
+            <div class="segmented" id="viewStyle">
+              <button class="active" data-style="solid">实体</button>
+              <button data-style="wireframe">线框</button>
+              <button data-style="thermal">温度</button>
+            </div>
+            <span class="toolbar-divider"></span>
+            <button class="icon-button viewport-button active" id="gridBtn" title="网格"><svg><use href="#i-layers"/></svg></button>
+            <button class="icon-button viewport-button" id="voxelBtn" title="体元预览"><svg><use href="#i-cube"/></svg></button>
+            <button class="icon-button viewport-button" id="fitBtn" title="适应窗口"><svg><use href="#i-fit"/></svg></button>
+            <span class="toolbar-divider"></span>
+            <div class="scene-object-tools">
+              <button class="viewport-draw-button scene-object-tools-trigger" id="sceneObjectToolsBtn" type="button" aria-expanded="false"><svg><use href="#i-settings"/></svg><span>编辑</span></button>
+              <div class="scene-object-tools-menu" id="sceneObjectToolsMenu" hidden>
+                <div class="scene-object-submenu-group">
+                  <button class="scene-object-submenu-trigger" id="sceneObjectModifyBtn" type="button" aria-expanded="false"><span>修改</span><i></i></button>
+                  <div class="scene-object-submenu" id="sceneObjectModifyMenu" hidden>
+                    <button class="viewport-draw-button" id="editObjectBtn" type="button" title="选择并编辑场景中的 OBJ"><svg><use href="#i-settings"/></svg><span>选择对象</span></button>
+                    <div class="transform-mode-buttons" id="transformModeButtons">
+                      <button class="active" type="button" data-transform-mode="translate">移动</button>
+                      <button type="button" data-transform-mode="rotate">旋转</button>
+                      <button type="button" data-transform-mode="scale">统一缩放</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="scene-object-submenu-group">
+                  <button class="scene-object-submenu-trigger" id="sceneObjectAddBtn" type="button" aria-expanded="false"><span>增加</span><i></i></button>
+                  <div class="scene-object-submenu" id="sceneObjectAddMenu" hidden>
+                    <button class="viewport-draw-button" id="drawRegionBtn" type="button" title="在场景中拖画矩形区域并生成 OBJ"><svg><use href="#i-draw"/></svg><span>区域</span></button>
+                    <button class="viewport-draw-button" id="drawBoxBtn" type="button" title="在场景中拖画底面和高度并生成 OBJ"><svg><use href="#i-cube"/></svg><span>立方体</span></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="viewport-draw-hint" id="viewportDrawHint" hidden></div>
+          <div class="scene-dimension-summary" id="sceneDimensionSummary">场景范围 60 × 60 × 20 m</div>
+          <div class="viewport-info">
+            <span><i class="mouse left"></i>旋转</span><span><i class="mouse wheel"></i>缩放</span><span><i class="mouse right"></i>平移</span>
+          </div>
+          <div class="axis-widget"><b class="axis-y">Y</b><b class="axis-x">X</b><b class="axis-z">Z</b><span></span></div>
+          <div class="render-stats"><span id="fps">60 FPS</span><span id="triangles">0 TRI</span></div>
+        </section>
+
+        <aside class="inspector">
+          <div class="inspector-header">
+            <div><span class="eyebrow">属性检查器</span><h2 id="inspectorTitle">场景</h2></div>
+            <button class="icon-button" id="xmlBtn" title="project.json 源码"><svg><use href="#i-code"/></svg></button>
+          </div>
+          <div class="inspector-scroll" id="inspectorContent"></div>
+        </aside>
+
+        <section class="console-panel">
+          <div class="console-header">
+            <div class="console-tabs">
+              <button class="active"><svg><use href="#i-terminal"/></svg>运行日志 <span id="logCount">0</span></button>
+            </div>
+            <div class="run-progress" id="runProgress">
+              <span id="runProgressText">待命</span>
+              <div class="run-progress-blocks" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+              <strong id="runProgressPercent">0%</strong>
+            </div>
+            <div class="console-meta"><span id="elapsed">耗时 00:00.0</span><button class="text-button small" id="clearLogBtn">清空</button><button class="text-button small" id="openOutputBtn">查看模拟结果</button></div>
+          </div>
+          <div class="console-output" id="consoleOutput"><div class="log-line muted"><time>--:--:--</time><span>STREAM STUDIO 已就绪，请打开场景工程的 project.json。</span></div></div>
+        </section>
+      </main>
+      <footer class="app-footer" aria-label="软件信息">
+        <span>出品: RTLab</span>
+        <span class="app-footer-separator" aria-hidden="true">·</span>
+        <span>邮箱: bianzj@aircas.ac.cn</span>
+      </footer>
+    </div>
+
+    <div class="drawer-backdrop" id="referenceDialog" hidden>
+      <section class="reference-dialog" role="dialog" aria-modal="true" aria-labelledby="referenceTitle">
+        <header>
+          <div><span class="eyebrow">STREAM / HiStream</span><h2 id="referenceTitle">理论、图例与主要参考文献</h2></div>
+          <button class="button ghost" id="closeReferenceBtn" type="button">关闭</button>
+        </header>
+        <div class="reference-scroll">
+          <section class="reference-section reference-overview">
+            <h3>模型框架</h3>
+            <p>Stream Studio 面向复杂三维地表场景，将面元或体元辐射传输、温度与能量平衡、多角度成像和外部统计分析连接为统一流程。下列图例来自当前软件的实际场景与结果界面。</p>
+            <div class="reference-flow" aria-label="Stream Studio 模型流程">
+              <span>三维场景与物化属性</span><i>→</i><span>Facet / Voxel 辐射传输</span><i>→</i><span>能量平衡与温度</span><i>→</i><span>多角度影像与统计</span>
+            </div>
+          </section>
+
+          <section class="reference-section">
+            <div class="reference-heading"><div><h3>主要图例</h3><p>单击图像可放大查看。</p></div><span>6 FIGURES</span></div>
+            <div class="reference-gallery">
+              <figure><button class="reference-shot" type="button" data-reference-title="森林场景构建与三维预览"><img src="/references/forest-workflow.png" alt="森林场景构建与三维预览" loading="lazy"></button><figcaption><strong>森林场景构建</strong><span>树木实例、太阳—传感器几何和场景边界的统一预览。</span></figcaption></figure>
+              <figure><button class="reference-shot" type="button" data-reference-title="城市建筑三维场景"><img src="/references/urban-scene.png" alt="城市建筑三维场景" loading="lazy"></button><figcaption><strong>城市建筑场景</strong><span>建筑群三维结构及面元/体元热辐射计算对象。</span></figcaption></figure>
+              <figure><button class="reference-shot" type="button" data-reference-title="作物场景表面温度分布"><img src="/references/crop-temperature.png" alt="作物场景表面温度分布" loading="lazy"></button><figcaption><strong>作物温度分布</strong><span>行播作物场景的空间温度差异及阴影效应。</span></figcaption></figure>
+              <figure><button class="reference-shot" type="button" data-reference-title="光伏阵列三维场景"><img src="/references/photovoltaic-scene.png" alt="光伏阵列三维场景" loading="lazy"></button><figcaption><strong>光伏阵列</strong><span>太阳能板几何、光谱物性与热电能量过程。</span></figcaption></figure>
+              <figure><button class="reference-shot" type="button" data-reference-title="船舶与海面场景"><img src="/references/ship-scene.png" alt="船舶与海面场景" loading="lazy"></button><figcaption><strong>船舶与海面</strong><span>复杂目标表面温度、多角度热红外和水体背景。</span></figcaption></figure>
+              <figure><button class="reference-shot" type="button" data-reference-title="热红外角度效应极坐标图"><img src="/references/angular-effect.png" alt="热红外角度效应极坐标图" loading="lazy"></button><figcaption><strong>热红外角度效应</strong><span>不同观测天顶角与方位角下的方向性温度分布。</span></figcaption></figure>
+            </div>
+          </section>
+
+          <section class="reference-section">
+            <div class="reference-heading"><div><h3>主要参考文献</h3><p>覆盖辐射度—能量平衡、GPU 光线追踪、温度方向性及 STREAM 系统。</p></div><span>CORE PAPERS</span></div>
+            <ol class="reference-list">
+              <li><span>R1 · 2017</span><div><strong>Bian, Z., et al. Modeling the Temporal Variability of Thermal Emissions From Row-Planted Scenes Using a Radiosity and Energy Budget Method.</strong><em>IEEE Transactions on Geoscience and Remote Sensing</em><a href="https://doi.org/10.1109/TGRS.2017.2719098" target="_blank" rel="noopener noreferrer">DOI 10.1109/TGRS.2017.2719098</a></div></li>
+              <li><span>R2 · 2018</span><div><strong>Bian, Z., et al. Modeling the Distributions of Brightness Temperatures of a Cropland Scene Using the Radiosity and Energy Budget Methods.</strong><em>Remote Sensing, 10(5), 736</em><a href="https://doi.org/10.3390/rs10050736" target="_blank" rel="noopener noreferrer">DOI 10.3390/rs10050736</a></div></li>
+              <li><span>R3 · 2020</span><div><strong>Bian, Z., et al. Modeling the Directional Anisotropy of Fine-Scale TIR Emissions Over Tree and Crop Canopies Based on UAV Measurements.</strong><em>Remote Sensing of Environment, 252, 112150</em><a href="https://doi.org/10.1016/j.rse.2020.112150" target="_blank" rel="noopener noreferrer">DOI 10.1016/j.rse.2020.112150</a></div></li>
+              <li><span>R4 · 2021</span><div><strong>卞尊健等，光学遥感三维计算机模拟模型的研究进展与应用。</strong><em>遥感学报</em><a href="https://doi.org/10.11834/jrs.20219274" target="_blank" rel="noopener noreferrer">DOI 10.11834/jrs.20219274</a></div></li>
+              <li><span>R5 · 2022</span><div><strong>Bian, Z., et al. A GPU-Based Solution for Ray Tracing 3-D Radiative Transfer Model of Complex Land Surface Scenes.</strong><em>IEEE Geoscience and Remote Sensing Letters</em><a href="https://doi.org/10.1109/LGRS.2022.3206312" target="_blank" rel="noopener noreferrer">DOI 10.1109/LGRS.2022.3206312</a></div></li>
+              <li><span>R6 · 2024</span><div><strong>Fan, M., et al. Modeling the Topographic Effect on Directional Anisotropies of Land Surface Temperature.</strong><em>Journal of Remote Sensing</em><a href="https://doi.org/10.34133/remotesensing.0226" target="_blank" rel="noopener noreferrer">DOI 10.34133/remotesensing.0226</a></div></li>
+              <li><span>R7 · 2025</span><div><strong>Fan, M., et al. STREAM: A System for Tracing Radiative Transfer and Energy Balance in Three-Dimensional Land Surface Scenes.</strong><em>International Journal of Applied Earth Observation and Geoinformation, 104763</em><a href="https://doi.org/10.1016/j.jag.2025.104763" target="_blank" rel="noopener noreferrer">DOI 10.1016/j.jag.2025.104763</a></div></li>
+              <li><span>R8 · 2025</span><div><strong>Bian, Z., et al. Evaluation of Three Modeling Frameworks of Thermal Infrared Radiative Transfer for Directional Anisotropies of Temperatures.</strong><em>IEEE Transactions on Geoscience and Remote Sensing, 63, 5001315</em><a href="https://doi.org/10.1109/TGRS.2025.3530503" target="_blank" rel="noopener noreferrer">DOI 10.1109/TGRS.2025.3530503</a></div></li>
+            </ol>
+          </section>
+        </div>
+        <footer><span>中国科学院空天信息创新研究院红外遥感组 · 卞尊健、曹彪、历华、杜永明、肖青、柳钦火</span><a href="mailto:bianzj@aircas.ac.cn">bianzj@aircas.ac.cn</a></footer>
+      </section>
+    </div>
+
+    <div class="drawer-backdrop reference-image-backdrop" id="referenceImageDialog" hidden>
+      <section class="reference-image-dialog" role="dialog" aria-modal="true" aria-labelledby="referenceImageTitle">
+        <header><h2 id="referenceImageTitle">图例预览</h2><button class="button ghost" id="closeReferenceImageBtn" type="button">关闭</button></header>
+        <div><img id="referenceImage" alt=""></div>
+      </section>
+    </div>
+
+    <div class="drawer-backdrop" id="xmlDrawer" hidden>
+      <section class="xml-drawer">
+        <header><div><span class="eyebrow">project.json</span><h2>配置源码</h2></div><button class="button ghost" id="closeXmlBtn">关闭</button></header>
+        <div class="empty-editor" id="emptyEditor"><svg><use href="#i-code"/></svg><h3>尚未打开工程</h3><p>在 Windows 文件选择框中选择已有工程的 project.json。</p><button class="button ghost" id="drawerOpenBtn">打开已有工程</button></div>
+        <textarea id="xmlEditor" spellcheck="false" hidden></textarea>
+        <footer><span id="xmlStatus">未加载文件</span><button class="button primary" id="applyXmlBtn" disabled>应用并保存</button></footer>
+      </section>
+    </div>
+    <div class="drawer-backdrop" id="exampleDialog" hidden>
+      <form class="project-dialog" id="exampleForm" role="dialog" aria-modal="true" aria-labelledby="exampleDialogTitle">
+        <header><div><span class="eyebrow">Examples</span><h2 id="exampleDialogTitle">打开示例</h2></div><button class="button ghost" id="cancelExampleBtn" type="button">取消</button></header>
+        <div class="project-form">
+          <label class="dialog-field dialog-field-wide"><span>示例</span><select class="select" id="exampleSelect" name="id" required></select></label>
+          <div class="notice dialog-field-wide" id="exampleSummary"></div>
+          <label class="dialog-field dialog-field-wide"><span>复制到目录</span><input class="input path-input" id="exampleDirectory" name="directory" type="text" required autocomplete="off" spellcheck="false"></label>
+          <div class="notice dialog-field-wide">示例会复制到该目录下再打开，运行结果写入副本，不修改内置示例。</div>
+        </div>
+        <footer><span>project.json</span><button class="button primary" id="submitExampleBtn" type="submit">复制并打开</button></footer>
+      </form>
+    </div>
+
+    <div class="drawer-backdrop" id="projectDialog" hidden>
+      <form class="project-dialog" id="projectForm">
+        <header><div><span class="eyebrow">Stream Studio Project</span><h2>新建工程</h2></div><button class="button ghost" id="closeProjectBtn" type="button">取消</button></header>
+        <div class="project-form">
+          <label class="dialog-field dialog-field-wide"><span>保存目录</span><input class="input" id="projectDirectory" name="directory" placeholder="D:\\StreamStudioProjects" required></label>
+          <label class="dialog-field"><span>工程名称</span><input class="input" id="newProjectName" name="name" value="scene01" required></label>
+          <label class="dialog-field"><span>计算模型</span><select class="select" id="newProjectMode" name="mode"><option value="eFacetRT">面元辐射传输（GPU Radiosity）</option><option value="eFacetEB">面元能量平衡</option><option value="eVoxelRT">体元辐射传输</option><option value="eVoxelEB" selected>体元辐射传输与能量平衡</option><option value="eRaytracing">简单光线追踪</option></select></label>
+          <label class="dialog-field"><span>X 尺寸·南北（m）</span><input class="input" name="sceneX" type="number" min="1" value="60" required></label>
+          <label class="dialog-field"><span>Z 尺寸·东西（m）</span><input class="input" name="sceneY" type="number" min="1" value="60" required></label>
+          <label class="dialog-field"><span>Y 最大高度（m）</span><input class="input" name="sceneHeight" type="number" min="0.1" step="0.1" value="15" required></label>
+          <label class="dialog-field"><span>体元大小（m）</span><input class="input" name="voxelSize" type="number" min="0.1" step="0.1" value="1" required></label>
+          <div class="project-layout dialog-field-wide"><strong>工程结构</strong><code>project.json · models/ · positions/ · spectral/ · meteorology/ · terrain/ · output/</code></div>
+        </div>
+        <footer><span>project.json 是唯一工程配置和运行入口。</span><button class="button primary" type="submit"><svg><use href="#i-plus"/></svg>创建工程</button></footer>
+      </form>
+    </div>
+    <div class="drawer-backdrop" id="saveAsDialog" hidden>
+      <form class="project-dialog" id="saveAsForm">
+        <header><div><span class="eyebrow">Stream Studio Project</span><h2>工程另存为</h2></div><button class="button ghost" id="closeSaveAsBtn" type="button">取消</button></header>
+        <div class="project-form">
+          <label class="dialog-field dialog-field-wide"><span>保存目录</span><input class="input" id="saveAsDirectory" name="directory" placeholder="D:\\StreamStudioProjects" required></label>
+          <label class="dialog-field dialog-field-wide"><span>工程名称</span><input class="input" id="saveAsName" name="name" required></label>
+          <div class="project-layout dialog-field-wide"><strong>当前工程</strong><code id="saveAsSourcePath"></code></div>
+        </div>
+        <footer><span>复制输入资源并创建空的 output 目录，不复制已有模拟结果。</span><button class="button primary" type="submit"><svg><use href="#i-save"/></svg>另存为</button></footer>
+      </form>
+    </div>
+    <div class="drawer-backdrop" id="geometryDialog" hidden>
+      <form class="object-dialog" id="geometryForm">
+        <header><div><span class="eyebrow">Procedural OBJ</span><h2>生成简单场景对象</h2></div><button class="button ghost" id="closeGeometryBtn" type="button">取消</button></header>
+        <div class="object-form">
+          <section class="material-section">
+            <h3>基本几何</h3>
+            <div class="material-grid three">
+              <label class="dialog-field"><span>对象名称</span><input class="input" name="geometryName" value="geometry_1" required></label>
+              <label class="dialog-field" id="geometryShapeField"><span id="geometryShapeLabel">包络形状</span><select class="select" name="geometryShape"><option value="ellipsoid">椭球</option><option value="cube">立方体</option></select></label>
+              <label class="dialog-field"><span>生成类型</span><select class="select" name="geometryMode"><option value="surface">几何体</option><option value="chaos">几何体混沌</option><option value="water">水体（水平面）</option><option value="fire">火焰</option><option value="fog">雾</option></select></label>
+              <label class="dialog-field"><span>X 尺寸（m）</span><input class="input" name="geometrySizeX" type="number" min="0.000001" step="any" value="2" required></label>
+              <label class="dialog-field" id="geometrySizeYField"><span id="geometrySizeYLabel">Y 高度（m）</span><input class="input" name="geometrySizeY" type="number" min="0.000001" step="any" value="2" required></label>
+              <label class="dialog-field"><span id="geometrySizeZLabel">Z 尺寸（m）</span><input class="input" name="geometrySizeZ" type="number" min="0.000001" step="any" value="2" required></label>
+            </div>
+          </section>
+          <section class="material-section" id="geometrySurfaceFields">
+            <h3>几何体表面</h3>
+            <div class="material-grid two">
+              <label class="dialog-field"><span>表面细分级别</span><input class="input" name="geometryDetail" type="number" min="1" max="32" step="1" value="2"></label>
+              <div class="notice" id="geometrySurfaceNotice">生成封闭外壳，适用于建筑等连续表面。立方体按六个面细分，椭球生成连续三角网格。</div>
+            </div>
+          </section>
+          <section class="material-section" id="geometryChaosFields" hidden>
+            <h3>几何体混沌</h3>
+            <div class="material-grid three">
+              <label class="dialog-field"><span>填充控制</span><select class="select" name="chaosBasis"><option value="lai">LAI</option><option value="lad">LAD</option><option value="count">面元数量</option></select></label>
+              <label class="dialog-field"><span id="geometryAmountLabel">LAI（m²/m²）</span><input class="input" name="chaosAmount" type="number" min="0.000001" step="any" value="3" required></label>
+              <label class="dialog-field"><span>单个面元面积（m²）</span><input class="input" name="chaosFacetArea" type="number" min="0.000001" step="any" value="0.01" required></label>
+              <label class="dialog-field"><span>面元方向</span><select class="select" name="chaosOrientation"><option value="spherical">球形随机分布</option><option value="horizontal">近水平分布</option><option value="vertical">近垂直分布</option></select></label>
+              <label class="dialog-field"><span>随机种子</span><input class="input" name="chaosSeed" type="number" step="1" value="2026"></label>
+              <div class="notice">仅在包络内部生成离散三角面元，不输出封闭外表面；适用于树冠等混沌介质。</div>
+            </div>
+          </section>
+          <section class="material-section" id="geometryWaterFields" hidden>
+            <h3>水体位置与偏移</h3>
+            <div class="material-grid three">
+              <label class="dialog-field"><span>中心 X·北向（m）</span><input class="input" name="waterPositionX" type="number" step="any" value="30"></label>
+              <label class="dialog-field"><span>中心 Z·东向（m）</span><input class="input" name="waterPositionY" type="number" step="any" value="30"></label>
+              <label class="dialog-field"><span>水面高程 Y（m）</span><input class="input" name="waterPositionZ" type="number" step="any" value="0.01"></label>
+              <label class="dialog-field"><span>X 偏移（m）</span><input class="input" name="waterOffsetX" type="number" step="any" value="0"></label>
+              <label class="dialog-field"><span>Z 偏移·东西（m）</span><input class="input" name="waterOffsetY" type="number" step="any" value="0"></label>
+              <label class="dialog-field"><span>Y 偏移·高度（m）</span><input class="input" name="waterOffsetZ" type="number" step="any" value="0"></label>
+              <div class="notice">最终位置为中心位置加整体偏移；生成后仍可在对象“分布”中修改。</div>
+            </div>
+          </section>
+          <section class="material-section" id="geometryMediumFields" hidden>
+            <h3>参与介质辐射参数</h3>
+            <div class="material-grid three">
+              <label class="dialog-field"><span>中心 X·北向（m）</span><input class="input" name="mediumPositionX" type="number" step="any" value="30"></label>
+              <label class="dialog-field"><span>中心 Z·东向（m）</span><input class="input" name="mediumPositionY" type="number" step="any" value="30"></label>
+              <label class="dialog-field"><span>底部高度 Y（m）</span><input class="input" name="mediumPositionZ" type="number" step="any" value="0"></label>
+              <label class="dialog-field"><span>消光系数（m⁻¹）</span><input class="input" name="mediumExtinction" type="number" min="0" step="0.01" value="1.2"></label>
+              <label class="dialog-field"><span>单次散射反照率</span><input class="input" name="mediumScatteringAlbedo" type="number" min="0" max="1" step="0.01" value="0.72"></label>
+              <label class="dialog-field"><span>散射非对称因子</span><input class="input" name="mediumAsymmetry" type="number" min="-0.99" max="0.99" step="0.01" value="0.55"></label>
+              <label class="dialog-field"><span>固定温度（K）</span><input class="input" name="mediumTemperature" type="number" min="0" step="1" value="1100"></label>
+              <label class="dialog-field"><span>发射倍率</span><input class="input" name="mediumEmissionScale" type="number" min="0" step="0.01" value="1"></label>
+              <div class="notice" id="geometryMediumNotice">坐标统一为 X 南北、Y 向上、Z 东西；参与介质会衰减、散射并按固定温度发射。</div>
+            </div>
+          </section>
+          <div class="notice" id="geometryEstimate">预计生成三角面元。</div>
+        </div>
+        <footer><span>生成后立即加入场景；默认属性可在 PRIM 原型卡片中继续修改。</span><button class="button primary" type="submit"><svg><use href="#i-plus"/></svg>生成并加入场景</button></footer>
+      </form>
+    </div>
+    <div class="drawer-backdrop" id="materialDialog" hidden>
+      <form class="material-dialog" id="materialForm">
+        <header><div><span class="eyebrow">OBJ Attribution</span><h2>定义 HiStream 对象属性</h2></div><button class="button ghost" id="closeMaterialBtn" type="button">取消</button></header>
+        <div class="material-form">
+          <section class="material-section">
+            <h3>对象</h3>
+            <div class="material-grid two">
+              <label class="dialog-field"><span>对象名称</span><input class="input" id="materialObjectName" name="objectName" required></label>
+              <label class="dialog-field"><span>对象类型</span><select class="select" id="materialObjectType" name="objectType"><option value="Vegetation">植被</option><option value="Building">建筑</option><option value="SolarPanel">太阳能板</option><option value="Human">人</option><option value="Vehicle">车辆</option><option value="Ship">船舶</option><option value="Soil">土壤</option><option value="Water">水体</option><option value="Other">其他</option></select></label>
+            </div>
+          </section>
+          <section class="material-section">
+            <h3>光谱定义</h3>
+            <div class="material-grid four">
+              <label class="dialog-field"><span>光谱名称</span><input class="input" id="spectralMaterialName" name="spectralName" value="object_spectral" required></label>
+              <label class="dialog-field"><span>导入属性</span><select class="select" id="spectralPreset" name="spectralPreset"></select></label>
+              <label class="dialog-field"><span>光谱来源</span><select class="select" id="spectralModel" name="spectralModel"><option value="custom">自定义（面板数据）</option><option value="Prospect">PROSPECT 模型</option><option value="BSM">BSM 模型</option><option value="file">导入波谱 TXT</option></select></label>
+              <div class="spectrum-value-fields" id="materialReflectanceFields"></div>
+              <div class="spectrum-value-fields" id="materialTransmittanceFields"></div>
+              <label class="dialog-field"><span>TIR 反射率</span><input class="input" name="refTir" type="number" min="0" max="1" step="0.01" value="0.05"></label>
+              <label class="dialog-field"><span>TIR 透射率</span><input class="input" name="tauTir" type="number" min="0" max="1" step="0.01" value="0"></label>
+              <div class="model-parameters" id="modelParameterFields"></div>
+              <div class="model-parameters" id="materialPhysicalTextureFields"></div>
+            </div>
+          </section>
+          <section class="material-section">
+            <h3>温度材质</h3>
+            <div class="material-grid four"><label class="dialog-field"><span>材质名称</span><input class="input" id="thermalMaterialName" name="thermalName" value="object_temperature" required></label><label class="dialog-field"><span>导入属性</span><select class="select" id="thermalPreset" name="thermalPreset"></select></label><label class="dialog-field"><span>阳面温度（K）</span><input class="input" name="sunlitTemperature" type="number" value="305"></label><label class="dialog-field"><span>阴面温度（K）</span><input class="input" name="shadedTemperature" type="number" value="295"></label></div>
+          </section>
+          <section class="material-section">
+            <h3>物化属性</h3>
+            <div class="material-grid two">
+              <label class="dialog-field"><span>属性名称</span><input class="input" id="physicalMaterialName" name="materialName" value="object_material" required></label>
+              <label class="dialog-field"><span>导入属性</span><select class="select" id="physicalMaterialPreset" name="materialPreset"></select></label>
+              <div class="physical-parameters" id="physicalParameterFields"></div>
+            </div>
+          </section>
+          <section class="material-section"><h3>Mesh 属性映射</h3><div class="mesh-table-wrap"><table class="mesh-material-table"><thead><tr><th>Mesh</th><th>光谱</th><th>温度</th><th>物化属性</th><th>结构属性</th><th>Mesh 镜面反射</th></tr></thead><tbody id="meshMaterialRows"></tbody></table></div><div class="notice">镜面反射逐 Mesh 独立设置，共用同一属性不会联动；仅简单光线追踪的短波计算生效。OBJ 定义三维形状，各 Mesh 的物化属性决定能量过程。光伏热电耦合使用 FacetEB，并需绑定不透明光谱。</div></section>
+        </div>
+        <footer><span>OBJ 方向统一为 +X 北、−X 南、+Y 上、+Z 东、−Z 西；Three.js 与计算引擎保持一致。MTL 不参与计算。</span><button class="button primary" type="submit"><svg><use href="#i-save"/></svg>保存并加入场景</button></footer>
+      </form>
+    </div>
+    <div class="drawer-backdrop" id="objectAttributeDialog" hidden>
+      <form class="object-dialog" id="objectAttributeForm">
+        <header><div><span class="eyebrow">OBJ Properties</span><h2>编辑 OBJ 计算属性</h2></div><button class="button ghost" id="closeObjectAttributeBtn" type="button">取消</button></header>
+        <div class="object-form">
+          <div class="material-grid three">
+            <label class="dialog-field"><span>对象名称</span><input class="input" name="objectName" readonly></label>
+              <label class="dialog-field"><span>对象类型</span><select class="select" id="objectAttributeType" name="objectType"><option value="Vegetation">植被</option><option value="Building">建筑</option><option value="SolarPanel">太阳能板</option><option value="Human">人</option><option value="Vehicle">车辆</option><option value="Ship">船舶</option><option value="Soil">土壤</option><option value="Water">水体</option><option value="Fire">火焰</option><option value="Fog">雾</option><option value="Other">其他</option></select></label>
+            <label class="dialog-field"><span>OBJ 路径</span><input class="input" name="objectPath" readonly></label>
+          </div>
+          <section class="material-section">
+            <h3>对象属性绑定</h3>
+            <div class="material-grid two">
+              <label class="dialog-field"><span>物化属性</span><select class="select" id="objectAttributeMaterial" name="materialName"></select></label>
+              <label class="dialog-field"><span>结构参数</span><select class="select" name="canopyName"></select></label>
+              <label class="dialog-field"><span>体元叶面积密度</span><select class="select" name="leafDensitySource"><option value="parameter">结构参数中的密度（默认）</option><option value="geometry">按 OBJ 面元面积计算</option></select></label>
+            </div>
+            <div class="notice">体元模式：OBJ 面元就是真实叶片时选“按 OBJ 面元面积计算”，每个体元的叶面积密度 = 体元内面元面积 / 体元体积，树冠边缘部分填充的体元不会被高估；OBJ 只是树冠外壳等代理几何时保持默认。面元模式和光线追踪模式直接使用面元，不受此项影响。</div>
+            <div class="notice" id="objectAttributeSummary"></div>
+          </section>
+          <section class="material-section"><h3>Mesh 完整属性映射</h3><div class="mesh-table-wrap"><table class="mesh-material-table"><thead><tr><th>Mesh</th><th>光谱属性</th><th>温度属性</th><th>物化属性</th><th>结构属性</th><th>Mesh 镜面反射</th></tr></thead><tbody id="objectAttributeMeshRows"></tbody></table></div><div class="notice">镜面反射逐 Mesh 独立设置，共用同一光谱或物化属性不会联动；仅简单光线追踪的短波计算生效。粗糙度越小，高光越集中。修改对象物化属性会同步到全部 Mesh，也可逐行独立设置。光伏热电耦合使用 FacetEB 和不透明光谱。</div></section>
+        </div>
+        <footer><span>选项来自“材质属性”预设库；保存后更新 project.json。</span><button class="button primary" type="submit"><svg><use href="#i-save"/></svg>保存 OBJ 属性</button></footer>
+      </form>
+    </div>
+    <div class="drawer-backdrop" id="objectDialog" hidden>
+      <form class="object-dialog" id="objectForm">
+        <header><div><span class="eyebrow">Scene Object</span><h2>设置对象实例分布</h2></div><button class="button ghost" id="closeObjectBtn" type="button">取消</button></header>
+        <div class="object-form">
+          <div class="material-grid three">
+            <label class="dialog-field"><span>对象名称</span><input class="input" name="objectName" required></label>
+            <label class="dialog-field"><span>对象类型</span><input class="input" name="objectType" readonly></label>
+            <label class="dialog-field"><span>OBJ 路径</span><input class="input" name="objectPath" readonly></label>
+          </div>
+          <section class="material-section distribution-section">
+            <h3>实例分布</h3>
+            <div class="material-grid four">
+              <label class="dialog-field"><span>分布方式</span><select class="select" name="distributionMode"><option value="random">随机分布</option><option value="grid">规则网格</option><option value="single">单实例</option><option value="manual">自定义坐标</option></select></label>
+              <label class="dialog-field"><span>控制方式</span><select class="select" name="distributionBasis"><option value="count">按数量</option><option value="density">按密度</option></select></label>
+              <label class="dialog-field"><span>实例数量（个）</span><input class="input" name="distributionCount" type="number" min="1" max="100000"></label>
+              <label class="dialog-field"><span>分布密度（个/公顷）</span><input class="input" name="distributionDensity" type="number" min="0.01" step="0.01" inputmode="decimal" required><small>1 公顷 = 10,000 m²</small></label>
+              <input name="distributionDensityUnit" type="hidden" value="hectare">
+              <label class="dialog-field"><span>X 最小值（南）</span><input class="input" name="distributionMinX" type="number"></label>
+              <label class="dialog-field"><span>X 最大值（北）</span><input class="input" name="distributionMaxX" type="number"></label>
+              <label class="dialog-field"><span>Z 最小值（西）</span><input class="input" name="distributionMinY" type="number"></label>
+              <label class="dialog-field"><span>Z 最大值（东）</span><input class="input" name="distributionMaxY" type="number"></label>
+              <label class="dialog-field"><span>随机种子</span><input class="input" name="distributionSeed" type="number"></label>
+              <label class="dialog-field"><span>最小缩放</span><input class="input" name="distributionScaleMin" type="number" min="0.01" step="0.01"></label>
+              <label class="dialog-field"><span>最大缩放</span><input class="input" name="distributionScaleMax" type="number" min="0.01" step="0.01"></label>
+              <label class="dialog-field"><span>高度 Y</span><input class="input" name="distributionZ" type="number"></label>
+              <label class="dialog-field"><span>整体偏移 X</span><input class="input" name="distributionOffsetX" type="number" step="any"></label>
+              <label class="dialog-field"><span>整体偏移 Z（东西）</span><input class="input" name="distributionOffsetY" type="number" step="any"></label>
+              <label class="dialog-field"><span>整体偏移 Y（高度）</span><input class="input" name="distributionOffsetZ" type="number" step="any"></label>
+            </div>
+            <div class="dialog-field distribution-points">
+              <span>自定义位置（每行：X北向 Z东向 Y高度 缩放 旋转角）</span>
+              <textarea class="input" name="distributionPoints" rows="7"></textarea>
+              <div class="distribution-import">
+                <label class="button ghost" for="distributionTxtFile"><svg><use href="#i-import"/></svg>导入 TXT<input id="distributionTxtFile" type="file" accept=".txt,text/plain" hidden></label>
+                <small>OBJ 与 PRIM 格式一致；至少填写 X北向、Z东向，缺省值为 Y=当前高度、缩放=1、旋转角=0。</small>
+              </div>
+            </div>
+          </section>
+          <section class="material-section" id="objectMovementFields" hidden>
+            <h3>随机移动</h3>
+            <div class="switch-row"><span>启用随机移动</span><label><input name="movementEnabled" type="checkbox"> 开启</label></div>
+            <div class="material-grid five">
+              <label class="dialog-field"><span>平均速度（m/s）</span><input class="input" name="movementSpeed" type="number" min="0" max="100" step="0.1"></label>
+              <label class="dialog-field"><span>速度扰动（±m/s）</span><input class="input" name="movementSpeedVariation" type="number" min="0" max="100" step="0.1"></label>
+              <label class="dialog-field"><span>活动半径（m）</span><input class="input" name="movementRange" type="number" min="0.1" step="0.1"></label>
+              <label class="dialog-field"><span>转向间隔（s）</span><input class="input" name="movementTurnInterval" type="number" min="0.1" step="0.1"></label>
+              <label class="dialog-field"><span>随机种子</span><input class="input" name="movementSeed" type="number" step="1"></label>
+            </div>
+            <div class="notice">仅用于人、车辆和船舶；保存到 project.json，并在三维场景中实时预览随机游走。</div>
+          </section>
+        </div>
+        <footer><span id="objectDistributionStatus">修改后同步更新 positions 文件和 project.json。</span><button class="button primary" type="submit"><svg><use href="#i-save"/></svg>保存修改</button></footer>
+      </form>
+    </div>
+    <div class="drawer-backdrop" id="presetDialog" hidden>
+      <form class="preset-dialog" id="presetForm">
+        <header><div><span class="eyebrow">Material Library</span><h2 id="presetDialogTitle">新增材质属性</h2></div><button class="button ghost" id="closePresetBtn" type="button">取消</button></header>
+        <div class="preset-form">
+          <div class="material-grid three">
+            <label class="dialog-field"><span>属性类别</span><select class="select" id="presetKind" name="presetKind"><option value="spectrum">光谱特征</option><option value="thermal">温度特征</option><option value="canopy">结构参数</option><option value="physical">物化属性</option></select></label>
+            <label class="dialog-field"><span>内部名称</span><input class="input" id="presetName" name="presetName" placeholder="例如：crop_leaf" required></label>
+            <label class="dialog-field"><span>显示名称</span><input class="input" id="presetLabel" name="presetLabel" placeholder="例如：作物绿叶"></label>
+          </div>
+          <section class="material-section"><div class="material-grid four" id="presetParameterFields"></div></section>
+        </div>
+        <footer><span>修改会同步写入当前工程的 project.json。</span><button class="button primary" id="presetSubmitBtn" type="submit"><svg><use href="#i-plus"/></svg>加入预设库</button></footer>
+      </form>
+    </div>
+    <div class="drawer-backdrop" id="resultDialog" hidden>
+      <section class="result-dialog">
+        <header>
+          <div><span class="eyebrow">Stream Studio Output</span><h2 id="resultDialogTitle">图像结果</h2></div>
+          <div class="result-actions"><div class="result-tabs"><button class="button ghost active" id="resultImageTab" type="button">图像结果</button><button class="button ghost" id="resultAnalysisTab" type="button">分析</button></div><button class="button danger" id="resultDeleteAllBtn" type="button">删除所有结果</button><button class="button ghost" id="resultRefreshBtn" type="button">刷新</button><button class="button ghost" id="closeResultBtn" type="button">关闭</button></div>
+        </header>
+        <div class="result-analysis-tabs" id="resultAnalysisTabs" hidden>
+          <button class="button ghost active" id="angleAnalysisTab" type="button">角度分析</button>
+          <button class="button ghost" id="bandAnalysisTab" type="button">波段分析</button>
+          <button class="button ghost" id="timeAnalysisTab" type="button">时间分析</button>
+          <button class="button ghost" id="changeAnalysisTab" type="button">变化分析</button>
+          <button class="button ghost" id="threeAnalysisTab" type="button">三维分析</button>
+        </div>
+        <div class="result-layout">
+          <aside class="result-sidebar">
+            <div class="result-directory" id="resultDirectory">尚未加载输出目录</div>
+            <div class="result-files" id="resultFiles"></div>
+          </aside>
+          <main class="result-preview" id="resultPreview">
+            <div class="empty-editor"><svg><use href="#i-layers"/></svg><h3>尚无图像结果</h3><p>图像结果与面元三维结果分别浏览，互不混合。</p></div>
+          </main>
+        </div>
+        <footer>
+          <span id="resultStatus">支持 .tif/.tiff、.hdr + .img、.txt、.csv、.dat</span>
+          <button class="button ghost" id="resultFolderBtn" type="button"><svg><use href="#i-folder"/></svg>在资源管理器中打开</button>
+        </footer>
+      </section>
+    </div>
+    <div class="drawer-backdrop" id="histreamProxyDialog" hidden>
+      <section class="histream-proxy-dialog" role="dialog" aria-modal="true" aria-labelledby="histreamProxyTitle">
+        <header>
+          <div><span class="eyebrow">Independent radiometric proxy</span><h2 id="histreamProxyTitle">histream-proxy · 固定场景数值预测</h2></div>
+          <button class="button ghost" id="closeHistreamProxyBtn" type="button">关闭</button>
+        </header>
+        <div class="histream-proxy-body">
+          <div class="histream-proxy-scope" id="histreamProxyScope">正在读取训练部署…</div>
+          <div class="histream-proxy-controls">
+            <label class="dialog-field"><span>训练捕获帧（固定数据集）</span><select class="select" id="histreamProxyFrameSelect" disabled></select></label>
+            <label class="dialog-field"><span>显示波段</span><select class="select" id="histreamProxyBandSelect">
+              <option value="reflectance_475nm">475 nm 反射率 · unitless</option>
+              <option value="reflectance_560nm">560 nm 反射率 · unitless</option>
+              <option value="reflectance_668nm">668 nm 反射率 · unitless</option>
+              <option value="brightness_temperature_10500nm_K">10.5 μm 亮温 · K</option>
+            </select></label>
+            <button class="button primary" id="runHistreamProxyBtn" type="button" disabled>生成所选数值影像</button>
+          </div>
+          <div class="histream-proxy-status" id="histreamProxyStatus" role="status">尚未运行</div>
+          <div class="histream-proxy-preview-wrap">
+            <div class="histream-proxy-preview-title" id="histreamProxyPreviewTitle">数值影像预览</div>
+            <img id="histreamProxyPreview" alt="histream-proxy 单波段数值预览" hidden>
+          </div>
+          <div class="histream-proxy-runtime" id="histreamProxyRuntime"></div>
+        </div>
+        <footer>
+          <span>该入口仅处理训练清单中的 Aoyun capture 帧，不读取当前 project.json，也不调用 histream.exe。</span>
+          <a class="button ghost" id="downloadHistreamProxyBtn" hidden>下载4波段数值 NPZ</a>
+        </footer>
+      </section>
+    </div>
+    <section class="scene-workspace" id="streamWorkspace" aria-label="遥感影像模拟" hidden></section>
+    <div class="toast-stack" id="toastStack"></div>
+    <div class="drawer-backdrop" id="helpDialog" hidden>
+      <section class="project-dialog help-dialog" role="dialog" aria-modal="true" aria-labelledby="helpDialogTitle">
+        <header><div><h2 id="helpDialogTitle"></h2></div><button class="button ghost" id="closeHelpBtn" type="button">关闭</button></header>
+        <div class="help-body" id="helpBody"></div>
+        <footer><span>中国科学院空天信息创新研究院红外遥感组</span><a href="mailto:bianzj@aircas.ac.cn">bianzj@aircas.ac.cn</a></footer>
+      </section>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

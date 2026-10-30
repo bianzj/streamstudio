@@ -1,0 +1,137 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+
+#define MAX_FRAGMENTS 64u
+#define EMPTY_KEY 0xfffffffffffffffful
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct FragmentRecord {
+    uint depthBits;
+    uint cameraSide;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer FragmentBuffer {
+    FragmentRecord records[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer PixelCounts {
+    uint pixelCounts[];
+};
+layout(std430, set = 0, binding = 2) buffer EdgeKeys {
+    uint64_t edgeKeys[];
+};
+layout(std430, set = 0, binding = 3) buffer EdgeCounts {
+    uint edgeCounts[];
+};
+layout(std430, set = 0, binding = 4) buffer Denominators {
+    uint denominators[];
+};
+layout(std430, set = 0, binding = 5) buffer SkyCounts {
+    uint skyCounts[];
+};
+layout(std430, set = 0, binding = 6) buffer Statistics {
+    uint statistics[];
+};
+
+layout(push_constant) uniform VisibilityPush {
+    mat4 viewProjection;
+    vec4 viewDirection;
+    uvec4 raster;
+    vec4 periodic;
+} pc;
+
+uint hashKey(uint64_t key)
+{
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdul;
+    key ^= key >> 33;
+    return uint(key) ^ uint(key >> 32);
+}
+
+void addEdge(uint sideA, uint sideB, uint weight)
+{
+    // A facet seeing its own periodic replica links its two sides (2f, 2f+1),
+    // which is a valid edge; only an identical side pair is skipped.
+    if (weight == 0u || sideA == sideB) {
+        return;
+    }
+
+    const uint lo = min(sideA, sideB);
+    const uint hi = max(sideA, sideB);
+    const uint64_t key = (uint64_t(lo) << 32) | uint64_t(hi);
+    const uint mask = pc.raster.w - 1u;
+    uint slot = hashKey(key) & mask;
+
+    // Bounded linear probing: a nearly full table must report hashOverflow
+    // rather than scan the whole table per insert and trip the GPU watchdog.
+    const uint probes = min(pc.raster.w, 4096u);
+    for (uint probe = 0u; probe < probes; ++probe) {
+        const uint64_t previous = atomicCompSwap(edgeKeys[slot], EMPTY_KEY, key);
+        if (previous == EMPTY_KEY || previous == key) {
+            atomicAdd(edgeCounts[slot], weight);
+            return;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    atomicAdd(statistics[1], 1u);
+}
+
+const uint REPLICA_BIT = 0x80000000u;
+
+uint sideOf(FragmentRecord record) { return record.cameraSide & ~REPLICA_BIT; }
+uint centralWeight(FragmentRecord record) { return (record.cameraSide & REPLICA_BIT) == 0u ? 1u : 0u; }
+
+void main()
+{
+    const uint pixel = gl_GlobalInvocationID.x;
+    const uint pixelTotal = pc.raster.x * pc.raster.y;
+    if (pixel >= pixelTotal) {
+        return;
+    }
+
+    const uint count = min(min(pixelCounts[pixel], pc.raster.z), MAX_FRAGMENTS);
+    if (count == 0u) {
+        return;
+    }
+
+    FragmentRecord localRecords[MAX_FRAGMENTS];
+    for (uint i = 0u; i < count; ++i) {
+        localRecords[i] = records[pixel * pc.raster.z + i];
+    }
+
+    // Private-memory insertion sort; depth is in [0,1], so float bit order is valid.
+    for (uint i = 1u; i < count; ++i) {
+        const FragmentRecord value = localRecords[i];
+        uint j = i;
+        while (j > 0u && localRecords[j - 1u].depthBits > value.depthBits) {
+            localRecords[j] = localRecords[j - 1u];
+            --j;
+        }
+        localRecords[j] = value;
+    }
+
+    // Only central-tile fragments receive. Counts are doubled so that a pair
+    // of fragments weighs (number of central members): periodic replicas are
+    // identical, so this keeps the undirected edge table reciprocal while the
+    // truncated outer tiles never act as receivers.
+    for (uint i = 0u; i < count; ++i) {
+        const uint weight = 2u * centralWeight(localRecords[i]);
+        if (weight == 0u) continue;
+        const uint cameraSide = sideOf(localRecords[i]);
+        atomicAdd(denominators[cameraSide], weight);
+        atomicAdd(denominators[cameraSide ^ 1u], weight);
+    }
+
+    if (centralWeight(localRecords[0]) != 0u)
+        atomicAdd(skyCounts[sideOf(localRecords[0])], 2u);
+    if (centralWeight(localRecords[count - 1u]) != 0u)
+        atomicAdd(skyCounts[sideOf(localRecords[count - 1u]) ^ 1u], 2u);
+
+    for (uint i = 0u; i + 1u < count; ++i) {
+        const uint nearBackSide = sideOf(localRecords[i]) ^ 1u;
+        const uint farCameraSide = sideOf(localRecords[i + 1u]);
+        addEdge(nearBackSide, farCameraSide,
+                centralWeight(localRecords[i]) + centralWeight(localRecords[i + 1u]));
+    }
+}

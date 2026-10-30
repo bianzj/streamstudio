@@ -1,0 +1,13 @@
+{
+  "source": "https://quaternius.com/packs/cars.html",
+  "triangles": 2954,
+  "dimensions": [
+    1.82,
+    1.46,
+    4.58
+  ],
+  "coordinateSystem": "Y-up",
+  "unit": "metre",
+  "vertexColors": true,
+  "derivedFrom": "NormalCar1.obj"
+}

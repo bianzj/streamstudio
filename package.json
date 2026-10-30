@@ -1,0 +1,28 @@
+{
+  "name": "stream-studio",
+  "version": "2.0.0",
+  "private": true,
+  "license": "SEE LICENSE IN LICENSE",
+  "description": "Stream Studio desktop and web interface for the HiStream and STREAM engines",
+  "type": "module",
+  "main": "desktop/main.mjs",
+  "scripts": {
+    "dev": "node dev.mjs",
+    "build": "vite build",
+    "build:gui": "vite build",
+    "build:engine": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-engine.ps1",
+    "build:all": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-all.ps1",
+    "start": "node server.mjs",
+    "validate:assets": "node tools/validate-obj-library.mjs",
+    "lut:modtran": "node tools/modtran-lut.mjs",
+    "desktop": "electron .",
+    "stage:package": "node tools/stage-package-assets.mjs",
+    "pack:win": "npm run build:all && npm run stage:package && electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^38.0.0",
+    "electron-builder": "^26.0.12",
+    "three": "0.185.1",
+    "vite": "7.3.6"
+  }
+}

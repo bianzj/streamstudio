@@ -1,0 +1,110 @@
+{
+  "kind": "stream-image-project",
+  "schemaVersion": 2,
+  "name": "Landsat 8/9 北京市 300 m · ERA5 单日驱动 EB（2019-08-15）",
+  "description": "2019-08-15 02:55 UTC（北京时间 10:55）天底观测；组分温度由 ERA5 2019-08-15 单日逐小时数据驱动能量平衡求解；LAI 为 2019-08-13 至 08-20 的 Landsat 8 天合成。 内置示例为 300 m 版本（30 m 输入按 10×10 聚合）；重新运行约需数秒。",
+  "scene": {
+    "name": "landsat_beijing_eb",
+    "outputRoot": "runs",
+    "locationSource": "georef",
+    "overpass": "2019-08-15T02:55:00Z",
+    "displayTimezone": 8,
+    "threads": 0,
+    "region": {
+      "enabled": false,
+      "startRow": 0,
+      "endRow": 1,
+      "startColumn": 0,
+      "endColumn": 1
+    },
+    "surface": {
+      "type": {
+        "file": "inputs/type.tif"
+      },
+      "lai": {
+        "file": "inputs/lai.tif"
+      },
+      "dem": {
+        "file": "inputs/dem.tif"
+      }
+    },
+    "view": {
+      "vza": {
+        "value": 0
+      },
+      "vaa": {
+        "value": 0
+      }
+    },
+    "optical": {
+      "enabled": true,
+      "preset": "landsat",
+      "bands": [
+        {
+          "name": "B1",
+          "center": 443,
+          "fwhm": 16
+        },
+        {
+          "name": "B2",
+          "center": 482,
+          "fwhm": 60
+        },
+        {
+          "name": "B3",
+          "center": 561,
+          "fwhm": 57
+        },
+        {
+          "name": "B4",
+          "center": 655,
+          "fwhm": 37
+        },
+        {
+          "name": "B5",
+          "center": 865,
+          "fwhm": 28
+        },
+        {
+          "name": "B6",
+          "center": 1609,
+          "fwhm": 85
+        },
+        {
+          "name": "B7",
+          "center": 2201,
+          "fwhm": 187
+        }
+      ]
+    },
+    "thermal": {
+      "enabled": true,
+      "preset": "landsat",
+      "bands": [
+        {
+          "name": "B10",
+          "center": 10.9,
+          "fwhm": 0.6
+        },
+        {
+          "name": "B11",
+          "center": 12,
+          "fwhm": 1
+        }
+      ]
+    },
+    "temperature": {
+      "mode": "eb",
+      "era5": {
+        "pack": "era5/era5-pack.json"
+      },
+      "soilMoisture": {
+        "source": "era5"
+      },
+      "elevationCorrection": true,
+      "components": {
+        "source": "fields"
+      }
+    }
+  }
+}

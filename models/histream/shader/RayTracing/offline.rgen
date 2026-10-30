@@ -1,0 +1,537 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable         // To be able to use #include
+#extension GL_EXT_ray_tracing : require                 // This is about ray tracing
+#extension GL_KHR_shader_subgroup_basic : require       // Special extensions to debug groups, warps, SM, ...
+#extension GL_EXT_scalar_block_layout : enable          // Align structure layout to scalar
+#extension GL_EXT_nonuniform_qualifier : enable         // To access unsized descriptor arrays
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+#extension GL_EXT_scalar_block_layout : enable          // Usage of 'scalar' block layout
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:enable
+#extension GL_EXT_shader_atomic_float: enable
+
+#define RAYTRACING 1
+
+#include "../global.glsl"
+#include "../parameters.h"
+#include "../settings.h"
+#include "../bsdf.glsl"
+#include "../background_hapke.glsl"
+#include "../specular_brdf.glsl"
+#include "../shade_state.glsl"
+#include "../bindinglayout.h"
+
+layout(location = 0) rayPayloadEXT PtPayload prd;
+layout(location = 1) rayPayloadEXT ShadowHitPayload shadow_payload;
+
+float Radiance[800];
+float RadianceSum[800];
+float Throughput[800];
+
+// Physical-texture factor of the current hit triangle (1 = untextured).
+float surfaceTextureFactor = 1.0;
+bool specularPathEncountered = false;
+
+const uint NO_TEXTURE_OFFSET = 0xFFFFFFFFu;
+
+float HitTextureFactor()
+{
+  uint offset = instanceTextureOffsets[prd.instanceCustomIndex];
+  return offset == NO_TEXTURE_OFFSET ? 1.0 : textureFactors[offset + uint(prd.primitiveID)];
+}
+
+// Reflectance after the physical texture, kept within 1 - T. Thermal bands
+// (> 2.5 um) are never modulated.
+float ShortwaveReflectance(uint index, int kBand)
+{
+  float reflectance = spectralMaterials[index].reflectance;
+  float wavelength = waveSets[kBand];
+  if(wavelength > 50.0) wavelength /= 1000.0;
+  if(surfaceTextureFactor == 1.0 || wavelength > 2.5) return reflectance;
+  return min(reflectance * surfaceTextureFactor,
+             max(0.0, 1.0 - spectralMaterials[index].transmittance));
+}
+
+float MaterialReflectance(uint index, int band, vec3 wi, vec3 wo, vec3 normal, float angularStrength)
+{
+  float r = ShortwaveReflectance(index, band);
+  SpectralMaterial material = spectralMaterials[index];
+  if(material.specularFraction > 0.0)
+  {
+    specularPathEncountered = true;
+    return specularReflectanceWeight(r, material.specularFraction,
+      material.specularRoughness, wi, wo, normal);
+  }
+  return backgroundReflectanceWeight(r, wi, wo, normal, angularStrength);
+}
+
+// Return the next X/Z domain-boundary distance for a ray whose origin is in
+// the central domain. The boundary itself is handled by PathTrace as one path
+// depth; this function never launches an additional query.
+float NextPeriodicBoundary(Ray r, out bvec2 crossedAxis)
+{
+  const float huge = 1.0e30;
+  const float directionEpsilon = 1.0e-8;
+  vec2 halfSize = max(setting.sceneSize, vec2(0.01)) * 0.5;
+  float tx = huge;
+  float tz = huge;
+  if(r.direction.x > directionEpsilon)
+    tx = (halfSize.x - r.origin.x) / r.direction.x;
+  else if(r.direction.x < -directionEpsilon)
+    tx = (-halfSize.x - r.origin.x) / r.direction.x;
+  if(r.direction.z > directionEpsilon)
+    tz = (halfSize.y - r.origin.z) / r.direction.z;
+  else if(r.direction.z < -directionEpsilon)
+    tz = (-halfSize.y - r.origin.z) / r.direction.z;
+
+  tx = tx > 0.0 ? tx : huge;
+  tz = tz > 0.0 ? tz : huge;
+  float distance = min(tx, tz);
+  float tolerance = 1.0e-5 * max(1.0, distance);
+  crossedAxis = bvec2(abs(tx - distance) <= tolerance,
+                      abs(tz - distance) <= tolerance);
+  return distance;
+}
+
+void WrapPeriodicRay(inout Ray r, float boundaryDistance, bvec2 crossedAxis)
+{
+  vec2 size = max(setting.sceneSize, vec2(0.01));
+  vec2 halfSize = size * 0.5;
+  float inset = max(max(size.x, size.y) * 1.0e-6, 1.0e-5);
+  r.origin += r.direction * boundaryDistance;
+  if(crossedAxis.x)
+    r.origin.x = r.direction.x > 0.0 ? -halfSize.x + inset
+                                     :  halfSize.x - inset;
+  if(crossedAxis.y)
+    r.origin.z = r.direction.z > 0.0 ? -halfSize.y + inset
+                                     :  halfSize.y - inset;
+}
+
+// One invocation performs exactly one TLAS query. Periodic continuation is
+// controlled by PathTrace and therefore cannot multiply queries inside a
+// single path depth.
+void ClosestHit(Ray r, float Lmin, float Lmax)
+{
+	uint rayFlags = gl_RayFlagsOpaqueEXT;
+	prd.hitT = INFINITY;
+	traceRayEXT(topLevelAS, rayFlags, 0xFF, 0, 0, 0,
+		r.origin, Lmin, r.direction, Lmax, 0);
+}
+
+//  used in ray tracing pipeline, similar to cloestHit().
+bool AnyHit(Ray r, float maxDist)
+{
+    uint rayFlags = gl_RayFlagsSkipClosestHitShaderEXT ;
+    shadow_payload.isHit = true;
+    shadow_payload.seed = 0;
+    traceRayEXT(topLevelAS, rayFlags, 0xFF, 0, 0, 1,
+                r.origin, 0.011, r.direction, maxDist, 1);
+    return shadow_payload.isHit;
+}
+
+// wi: in direction; wo: out direction; *World: direction in world coordinates.
+bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
+{
+  uint matIndex0 = sstate.spectralId * setting.n_wave;  // spectral index of band0 for spectralId
+  float angularStrength = meshLinks[
+    instanceLinks[sstate.instanceId].meshId].angularEffectStrength;
+  
+  vec3 emitterWiWorld = normalize(lightSet.direction);  // sun direction in world coordinates.
+  vec3 emitterWi = World2Tangent(sstate.normal, sstate.tangent, sstate.binormal, emitterWiWorld); // sun direction in local coordinates.
+
+  // Judge whether it is exposed to the sun (to avoid self collision, perform small translation of the origin position)
+  vec3 ffnormal = dot(sstate.normal, emitterWiWorld) <= 0.0 ? -sstate.normal : sstate.normal;
+  vec3 origin = OffsetRay(position, ffnormal);
+  Ray shadowRay = Ray(origin, emitterWiWorld);
+  bool inLightShadow = AnyHit(shadowRay, OUTER);
+  
+  // sun distribution
+  // Next-event estimation is evaluated at every path vertex.  Throughput
+  // already contains the BRDF/PDF weights of all preceding bounces, so these
+  // terms correctly include multiple scattering without double counting.
+  if(!inLightShadow)
+  {
+    vec3 wi = emitterWi;
+    bool inSameSide = IsSameSide(woWorld, emitterWiWorld, ffnormal);
+    float cosTheta = CosThetaTangent(wi);
+    float bsdf;
+    float bsdf0 = CoefficientOfBSDF(prd.seed); // 1/Pi or -1/Pi
+
+    for(int kBand = 0; kBand < setting.n_wave; kBand++)
+    {
+      //int waveInd = sensorWaveInds[kBand].value;
+      float wavelength = waveSets[kBand];
+      if(wavelength > 50) wavelength = wavelength / 1000.0;
+      if(wavelength <= 2.5)
+      {
+        if(!inSameSide)
+        {
+          bsdf = abs(bsdf0) * spectralMaterials[matIndex0 + kBand].transmittance;
+        }
+        else
+        {
+          float reflectance = MaterialReflectance(
+            matIndex0 + kBand, kBand,
+            emitterWiWorld, woWorld, sstate.normal, angularStrength);
+          bsdf = abs(bsdf0) * reflectance;
+        }
+        Radiance[kBand] += Throughput[kBand] * lightSet.direct * bsdf * cosTheta;
+        // Radiance[kBand] += cosTheta;
+      }
+    }
+
+  }
+
+  // emission distribution
+  // Always solve thermal radiance; the output switch only selects radiance
+  // versus inverse-Planck brightness temperature.
+  {
+    bool inSameSide = IsSameSide(woWorld, emitterWiWorld, ffnormal);
+    for(int kBand = 0; kBand < setting.n_wave; kBand++)
+    {
+      //int waveInd = sensorWaveInds[kBand].value;
+      float wavelength = waveSets[kBand];
+      if(wavelength > 50) wavelength = wavelength/1000.0;
+      if(wavelength > 2.5)
+      {
+        if(!inLightShadow)//sunlit
+        {
+          float emissivity = surfaceThermalEmissivity(
+            spectralMaterials[matIndex0 + kBand].reflectance,
+            spectralMaterials[matIndex0 + kBand].transmittance,
+            woWorld, sstate.normal, angularStrength);
+          Radiance[kBand] += Throughput[kBand] * Emission_diff(wavelength, thermalMaterials[sstate.thermalId].sunlitTemperature)
+            * emissivity;
+        }
+        else
+        {
+          float emissivity = surfaceThermalEmissivity(
+            spectralMaterials[matIndex0 + kBand].reflectance,
+            spectralMaterials[matIndex0 + kBand].transmittance,
+            woWorld, sstate.normal, angularStrength);
+          Radiance[kBand] += Throughput[kBand] * Emission_diff(wavelength, thermalMaterials[sstate.thermalId].shadedTemperature)
+            * emissivity;
+        }
+      }
+    }
+  }
+
+  // Isotropic diffuse sky at every path vertex.  One cosine-weighted sample
+  // estimates the sky-view factor.  The 0.5 term is the upper-hemisphere
+  // integral used by the input direct/diffuse ratio.
+  if(lightSet.diffuse > EPSION)
+  {
+    vec3 emitterWi;
+    float emitterBsdf0, emitterPr;
+    vec3 upWorld = {0, 1, 0};
+    SampleBSDF(prd.seed, emitterWi, emitterBsdf0, emitterPr);
+
+    vec3 emitterWiWorld = Tangent2World(sstate.normal, sstate.tangent, sstate.binormal, emitterWi);
+    emitterWiWorld = dot(upWorld, emitterWiWorld) <= 0.0 ? -emitterWiWorld : emitterWiWorld;
+
+    bool inSameSide = IsSameSide(woWorld, emitterWiWorld, ffnormal);
+    origin = OffsetRay(position, dot(emitterWiWorld, ffnormal) > 0 ? ffnormal : -ffnormal);
+    Ray skyRay = Ray(origin, emitterWiWorld);
+    bool inSkyShadow = AnyHit(skyRay, OUTER);
+
+    if(!inSkyShadow)
+    {
+      for(int kBand = 0; kBand <  setting.n_wave; kBand++)
+      {
+        float wavelength = waveSets[kBand];
+        if(wavelength > 50) wavelength = wavelength/1000.0;
+        if(wavelength <= 2.5)
+        {
+          float opticalCoefficient = inSameSide
+            ? MaterialReflectance(
+                matIndex0 + kBand, kBand,
+                emitterWiWorld, woWorld, sstate.normal, angularStrength)
+            : spectralMaterials[matIndex0 + kBand].transmittance;
+          Radiance[kBand] += Throughput[kBand] * lightSet.diffuse * 0.5
+            * opticalCoefficient * M_1_OVER_PI;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+bool InDirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth, out vec3 wiWorld)
+{
+  float bsdf0, pr;
+  vec3 wi;
+  vec3 upWorld = {0, 1, 0};
+  SampleBSDF(prd.seed, wi, bsdf0, pr);
+
+  float cosTheta = CosThetaTangent(wi);
+  uint matIndex0 = sstate.spectralId * setting.n_wave;
+  float angularStrength = meshLinks[
+    instanceLinks[sstate.instanceId].meshId].angularEffectStrength;
+  wiWorld = Tangent2World(sstate.normal, sstate.tangent, sstate.binormal, wi);
+
+  // The reflect/transmit choice is one path decision for all bands: if any
+  // band transmits, every band uses the 50/50 estimator (x2), and bands with
+  // T = 0 contribute nothing on the transmission branch.
+  bool materialTransmits = false;
+  for(int kBand = 0; kBand < setting.n_wave; kBand++)
+    if(spectralMaterials[matIndex0 + kBand].transmittance >= EPSION) materialTransmits = true;
+  int ifrefl = (materialTransmits && bsdf0 < 0) ? 0 : 1;
+
+  for(int kBand = 0; kBand < setting.n_wave; kBand++)
+  {
+    float bsdf, pathThroughput;
+    if(ifrefl == 0)
+    {
+      bsdf = abs(bsdf0) * spectralMaterials[matIndex0 + kBand].transmittance;
+    }
+    else
+    {
+      // Evaluate in the actual reflected hemisphere, before tracing the bounce.
+      vec3 reflectedWi = IsSameSide(woWorld, wiWorld, sstate.normal) ? wiWorld : -wiWorld;
+      float reflectance = MaterialReflectance(
+        matIndex0 + kBand, kBand,
+        reflectedWi, woWorld, sstate.normal, angularStrength);
+      bsdf = abs(bsdf0) * reflectance;
+    }
+    pathThroughput = (materialTransmits ? 2.0 : 1.0) * bsdf * cosTheta;
+
+    if(pr > EPSION) Throughput[kBand] *= (pathThroughput/pr);
+    else Throughput[kBand] *= (pathThroughput);
+  }
+
+  bool inSameSide = IsSameSide(woWorld, wiWorld, sstate.normal);
+  if((inSameSide == false) && (ifrefl == 1)) wiWorld = -wiWorld;
+  if((inSameSide == true) && (ifrefl == 0)) wiWorld = -wiWorld;
+
+  return true;
+}
+
+// Cyclic iteration of ray collisions.
+bool PathTrace(Ray r)
+{
+  int periodicTraversals = 0;
+  int periodicLimit = clamp(setting.periodicNeighborCount, 0, 20);
+  bool cameraPath = true;
+  for(int kDepth = 0; kDepth < setting.maxDepth; kDepth++)
+  {
+    // Russian roulette termination.
+    if(kDepth >= 10)
+    {
+      float maxPathThroughput = 0;
+      for(int kBand = 0; kBand < setting.n_wave; kBand++)
+      {
+        if(Throughput[kBand] > maxPathThroughput)
+        {
+          maxPathThroughput = Throughput[kBand];
+        }
+      }
+      float pCont = 1 - maxPathThroughput;
+      pCont = max(pCont, 0.05);
+      if(rand(prd.seed) < pCont) break; // no change
+      // set all throughput /= (1 - P)
+      for(int kBand = 0; kBand < setting.n_wave; kBand++)
+      {
+        Throughput[kBand] /= (1 - pCont);
+      }
+    }
+
+    // A periodic boundary is a path event. Query only the current domain
+    // segment. If the boundary is reached first, wrapping consumes this depth
+    // and the next loop iteration performs the next (single) TLAS query.
+    bvec2 crossedAxis = bvec2(false);
+    float boundaryDistance = INFINITY;
+    if(cameraPath && periodicLimit > 0)
+      boundaryDistance = NextPeriodicBoundary(r, crossedAxis);
+    ClosestHit(r, 0.0001, boundaryDistance);
+
+    // if hit outside the scene(PS: the started data segment is 0.)
+    if(prd.hitT == INFINITY)
+    {
+      bool reachedBoundary = cameraPath && periodicLimit > 0
+        && boundaryDistance < INFINITY;
+      if(reachedBoundary && periodicTraversals < periodicLimit) {
+        WrapPeriodicRay(r, boundaryDistance, crossedAxis);
+        ++periodicTraversals;
+        continue;
+      }
+      if(cameraPath) {
+        if(setting.skyboxEnabled == 0) return false;
+        float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
+        float referenceIrradiance = lightSet.direct * cosSolarZenith
+          + lightSet.diffuse * 0.5;
+        for(int kBand = 0; kBand < setting.n_wave; ++kBand) {
+          float wavelength = waveSets[kBand];
+          if(wavelength > 50.0) wavelength /= 1000.0;
+          if(wavelength <= 2.5) {
+            Radiance[kBand] += proceduralSkyReflectance(
+              wavelength, r.direction) * referenceIrradiance / M_PI;
+          } else if(setting.isTemperature == 1) {
+            Radiance[kBand] += Emission_diff(wavelength,
+              proceduralSkyTemperature(r.direction, lightSet.skyTemperature));
+          }
+        }
+        return true;
+      }
+      for(int kBand = 0; kBand < setting.n_wave; kBand++)
+      {
+       // int waveInd = sensorWaveInds[kBand].value;
+        float wavelength = waveSets[kBand];  // units set to nanometers.
+        if(wavelength > 50) wavelength = wavelength/1000.0;
+        if(wavelength > 2.5)  // for wavelength > 2500nm, added sky temperature.
+        {
+          Radiance[kBand] += Throughput[kBand] * Emission_diff(wavelength, lightSet.skyTemperature);
+          //Radiance[kBand] = 1.0;
+        }
+      }
+
+
+      return true;
+    }
+
+      // for(int kBand = 0; kBand < setting.n_wave; kBand++)
+      // {
+      //    Radiance[kBand] = 2.0;
+      // }
+      // return true;
+
+    ShadeState sstate = GetShadeState(prd);
+    surfaceTextureFactor = HitTextureFactor();
+    vec3 position = sstate.position;
+    vec3 normal = sstate.normal;
+    vec3 woWorld = sstate.position - sstate.lastPosition;
+    vec3 wiWorld = vec3(0, 1, 0);
+
+    DirectLighting(position, woWorld, sstate, kDepth);
+    InDirectLighting(position, woWorld, sstate, kDepth, wiWorld);
+    cameraPath = false;
+
+    vec3 ffnormal = sstate.normal;
+    r.direction = wiWorld;
+    r.origin = OffsetRay(sstate.position, dot(wiWorld, ffnormal) > 0 ? ffnormal : -ffnormal);
+  }
+  return true;
+}
+
+void SamplePixel(int kSample, ivec2 imageCoords, ivec2 imageResolution)
+{
+
+  // For each sampling of a pixel, its inital postion and direction are randomly generated.
+  // subPixel_jitter is the random disturbance variation.
+  vec2 subPixel_jitter = kSample == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
+  const vec2 pixelCenter = vec2(imageCoords) + subPixel_jitter;
+  const vec2 inUV = pixelCenter/vec2(imageResolution.xy);
+  vec2 d = inUV * 2.0 - 1.0;  // this scope is limited to [-1,1]
+  vec4 origin = sensorMatrix.viewInverse * vec4(0, 0, 0, 1);    // ray origin.
+  vec4 target = sensorMatrix.projInverse * vec4(d.x, d.y, 1, 1);
+  vec4 direction = sensorMatrix.viewInverse * vec4(normalize(target.xyz), 0); // ray direction
+  // Explicit parallel camera from the host: move the ray origin across the
+  // sensor plane; every wavelength uses this same primary ray.
+  if(sensorMatrix.focalDist < 0.0) {
+    origin = sensorMatrix.viewInverse * vec4(target.xy, 0, 1);
+    direction = sensorMatrix.viewInverse * vec4(0, 0, -1, 0);
+  }
+
+  // Parallel projection and central projection. ?if use?, can removed????
+  vec3 focalPoint = sensorMatrix.focalDist * direction.xyz;
+  float cam_r1 = rand(prd.seed) * M_TWO_PI;
+  float cam_r2 = rand(prd.seed) * sensorMatrix.aperture;
+  vec4 cam_right = sensorMatrix.viewInverse * vec4(1, 0, 0, 0);
+  vec4 cam_up = sensorMatrix.viewInverse * vec4(0, 1, 0, 0);
+  vec3 randomAperturePos = (cos(cam_r1) * cam_right.xyz + sin(cam_r1) * cam_up.xyz) * sqrt(cam_r2);
+  vec3  finalRayDir       = normalize(focalPoint - randomAperturePos);
+
+  // Every band radiance value is initialized to 0.
+  for(int kBand = 0; kBand <  setting.n_wave; kBand++)
+  {
+    Radiance[kBand] = 0;
+    Throughput[kBand] = 1.0;
+  }
+
+
+
+  Ray ray = Ray(origin.xyz, direction.xyz);
+  PathTrace(ray);
+
+}
+
+void main()
+{
+	uint64_t start = clockRealtimeEXT();  // Debug - Heatmap
+	ivec2 imageRes    = setting.imageSize;
+	ivec2 imageCoords = ivec2(gl_LaunchIDEXT.xy)
+		+ ivec2(0, setting.imageOffsetY);
+	if(any(greaterThanEqual(imageCoords, imageRes))) return;
+	
+  prd.seed = initRandom(uvec2(imageRes), uvec2(imageCoords), setting.frame);
+  uint n_pixel = imageRes.x * imageRes.y;
+
+
+
+	// Average value after multiple sampling.
+  // set RandianceSum = 0; accumulation over sampling; average the accumulation.
+	for(int kBand = 0; kBand <  setting.n_wave; kBand++)
+  {
+    Radiance[kBand] = 0.0;
+    RadianceSum[kBand] = 0.0;
+  }
+  for(int kSample = 0; kSample <  setting.n_sample; kSample++)
+  {
+    SamplePixel(kSample, imageCoords, imageRes);
+
+    for(int kBand = 0; kBand <  setting.n_wave; kBand++)
+    {
+      // Zero-contribution paths are valid samples, especially in shadows.
+      RadianceSum[kBand] += Radiance[kBand];
+    }
+  }
+
+	for(int kBand = 0; kBand <  setting.n_wave; kBand++)
+	{
+		Radiance[kBand] = setting.n_sample > 0
+      ? RadianceSum[kBand] / float(setting.n_sample) : 0.0;
+
+    float wavelength = waveSets[kBand];
+    if(wavelength > 50) wavelength = wavelength / 1000.0;
+    if(wavelength <= 2.5)
+    {
+      float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
+      float referenceIrradiance = lightSet.direct * cosSolarZenith
+        + lightSet.diffuse * 0.5;
+      Radiance[kBand] = referenceIrradiance > EPSION
+        ? (specularPathEncountered
+            ? max(M_PI * Radiance[kBand] / referenceIrradiance, 0.0)
+            : clamp(M_PI * Radiance[kBand] / referenceIrradiance, 0.0, 1.0)) : 0.0;
+    }
+    else if(setting.isTemperature == 1)
+    {
+      Radiance[kBand] = Radiance[kBand] > EPSION
+        ? InvPlanck(wavelength, Radiance[kBand]) : 0.0;
+    }
+	}
+
+
+  // float value = imageRes.x;
+	// atomicStore(outImage[0], value, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+
+	// Write result into _bufferstorage(layout buffer)
+	for(int kBand = 0; kBand <  setting.n_wave; kBand++)
+	{
+		float value = Radiance[kBand];
+
+    // value = lightSet.direct / PI;
+    uint bufferId =  (n_pixel * kBand) + (imageCoords.y * imageRes.x + imageCoords.x );
+		atomicStore(outImage[bufferId], value, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+	}
+
+// float a = imageCoords.x;
+// atomicStore(outImage[0], a, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+}

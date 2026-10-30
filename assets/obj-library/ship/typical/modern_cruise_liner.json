@@ -1,0 +1,13 @@
+{
+  "source": "https://quaternius.com/packs/ships.html",
+  "triangles": 858,
+  "dimensions": [
+    42,
+    65,
+    290
+  ],
+  "coordinateSystem": "Y-up",
+  "unit": "metre",
+  "vertexColors": true,
+  "derivedFrom": "CruiseShip.obj"
+}

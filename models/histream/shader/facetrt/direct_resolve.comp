@@ -1,0 +1,60 @@
+#version 460
+
+#define MAX_FRAGMENTS 64u
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct FragmentRecord {
+    uint depthBits;
+    uint cameraSide;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer FragmentBuffer {
+    FragmentRecord records[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer PixelCounts {
+    uint pixelCounts[];
+};
+layout(std430, set = 0, binding = 4) buffer TotalCounts {
+    uint totalCounts[];
+};
+layout(std430, set = 0, binding = 5) buffer VisibleCounts {
+    uint visibleCounts[];
+};
+
+layout(push_constant) uniform VisibilityPush {
+    mat4 viewProjection;
+    vec4 viewDirection;
+    uvec4 raster;
+    vec4 periodic;
+} pc;
+
+void main()
+{
+    const uint pixel = gl_GlobalInvocationID.x;
+    const uint pixelTotal = pc.raster.x * pc.raster.y;
+    if (pixel >= pixelTotal) {
+        return;
+    }
+
+    const uint count = min(min(pixelCounts[pixel], pc.raster.z), MAX_FRAGMENTS);
+    if (count == 0u) {
+        return;
+    }
+
+    // Periodic replicas (high bit) occlude but are not receivers.
+    const uint REPLICA_BIT = 0x80000000u;
+    uint nearestDepth = 0xffffffffu;
+    uint nearestSide = REPLICA_BIT;
+    for (uint i = 0u; i < count; ++i) {
+        const FragmentRecord fragment = records[pixel * pc.raster.z + i];
+        if ((fragment.cameraSide & REPLICA_BIT) == 0u)
+            atomicAdd(totalCounts[fragment.cameraSide], 1u);
+        if (fragment.depthBits < nearestDepth) {
+            nearestDepth = fragment.depthBits;
+            nearestSide = fragment.cameraSide;
+        }
+    }
+    if ((nearestSide & REPLICA_BIT) == 0u)
+        atomicAdd(visibleCounts[nearestSide], 1u);
+}

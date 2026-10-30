@@ -1,0 +1,354 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXEL_LST_BIND_ININDEX
+#define VOXELLST 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../functions.glsl"
+#include "../nanovdb_info.glsl"
+#include "fluid_coupling.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+
+#define NUM_VNIR 2001
+// Sunlit foliage is resolved into orientation classes inside the physiology:
+// a single mean sunlit leaf closes its stomata all at once under heat stress,
+// whereas leaves at grazing sun angles stay cool and keep transpiring.
+#define SUNLIT_CLASSES 8
+#define LEAF_TEMPERATURE_STEPS 6
+
+struct LeafParameters
+{
+    float type, vcmax25, slope, rdPerVcmax25, intercept, stress;
+    float slti, shti, thl, thh, trdm;
+    int tcor;
+    float oxygen, pressure;
+};
+
+struct LeafState
+{
+    float gross, net, ciPpm, rcw;
+    bool valid;
+};
+
+// Ball-Berry/Collatz leaf photosynthesis and stomatal resistance (SCOPE biochemical.m).
+// Tc in K, Q absorbed PAR (umol m-2 leaf s-1), CO2 at the surface in ppm, eb in hPa.
+LeafState ballBerryLeaf(LeafParameters P, float Tc, float Q, float surfaceCO2, float eb)
+{
+    LeafState leaf;
+    float ppm2bar = 1E-6 * (P.pressure * 1E-3);
+    float Cs = surfaceCO2 * ppm2bar;
+    float O = (P.oxygen * 1E-3) * (P.pressure * 1E-3);
+    if(P.type > 3.5) O = 0.0;
+    float effcon = P.type <= 3.5 ? 1.0/5.0 : 1.0/6.0;
+    float Tref = 25.0 + 273.15;
+    float Kc25 = 350.0 * 1e-6;
+    float Ko25 = 450.0 * 1e-3;
+    float spfy25 = 2600.0;
+    float Kpep25 = (P.vcmax25/56.0)*1e6;
+    float atheta = 0.8;
+    float Kf = 0.05;
+    float Kd = max(0.8738, 0.0301*(Tc-273.15)+0.0773);
+    float Kp = 4.0;
+    float rhoa = 1.2047;
+    float Mair = 28.96;
+
+    float qt = 0.1*(Tc-Tref)*float(P.tcor);
+    float TH = 1.0 + float(P.tcor) * exp(P.shti*(Tc-P.thh));
+    float TL = 1.0 + float(P.tcor) * exp(P.slti*(P.thl-Tc));
+    float Kc = Kc25 * exp(log(2.1)*qt);
+    float Ko = Ko25 * exp(log(1.2)*qt);
+    float Kpepcase = Kpep25 * exp(log(1.8)*qt);
+    float Vcmax = P.type < 3.5
+        ? P.vcmax25 * exp(log(2.1)*qt)/TH*P.stress
+        : P.vcmax25 * exp(log(2.1)*qt)/(TH*TL)*P.stress;
+    float spfy = spfy25 * exp(log(0.75)*qt);
+    float Rd = P.rdPerVcmax25 * P.vcmax25 * exp(log(1.8)*qt) / (1.0 + exp(1.3*(Tc-P.trdm)));
+    float po0 = Kp / (Kf+Kd+Kp);
+    float Je = 0.5 * po0 * Q;
+    float Gamma_star = 0.5 * O / spfy;
+    float MM_const = P.type < 3.5 ? Kc*(1.0+O/Ko) : 0.0;
+    float Vs_C3 = P.type < 3.5 ? (P.vcmax25/2.0) * exp(log(1.8)*qt) : 0.0;
+    float minCi = P.type < 3.5 ? 0.3 : 0.1;
+
+    float RH = clamp(eb/es_fun(Tc-273.15), 0.0, 1.0);
+    // Ball-Berry with b = 0 at equilibrium: Ci = Cs(1 - 1.6/(m RH)).
+    float Ci = biochemicalIntercellularCO2(Cs, minCi * Cs, P.slope, RH, 1.0);
+    float Vc, Ve, Vs;
+    if(P.type < 3.5) {
+        Vs = Vs_C3;
+        Vc = MM_const + Ci > 0.0 ? Vcmax*(Ci-Gamma_star)/(MM_const + Ci) : 0.0;
+        float co2PerElectron = Ci+2.0*Gamma_star > 0.0
+            ? (Ci-Gamma_star)/(Ci+2.0*Gamma_star) * effcon : 0.0;
+        Ve = Je * co2PerElectron;
+    } else {
+        Vc = Vcmax;
+        Vs = Kpepcase * Ci;
+        Ve = Je * effcon;
+    }
+    float V = biochemicalQuadraticRoot(atheta, -(Vc+Ve), Vc*Ve, sign(-Vc));
+    float Ag = biochemicalQuadraticRoot(0.98, -(V+Vs), V*Vs, -1.0);
+    if(Q == 0.0 || Cs == 0.0 || P.slope == 0.0 || RH == 0.0 || P.stress == 0.0)
+        Ag = 0.0;
+    float A = Ag - Rd;
+    float rcw = biochemicalResistance(Cs, Ci, A, rhoa, Mair, P.pressure * 100.0);
+    // Ball-Berry intercept g0 [mol m-2 s-1] in parallel (m s-1), which also
+    // keeps the resistance continuous where A crosses zero.
+    float residualConductance = P.intercept * 8.314 * Tc / (P.pressure * 100.0);
+    float openConductance = A > 0.0 && rcw < 625000.0 ? 1.0 / max(rcw, 1.0) : 0.0;
+    if(openConductance + residualConductance > 0.0)
+        rcw = min(1.0 / (openConductance + residualConductance), 625000.0);
+    float ciPpm = Ci / ppm2bar;
+    bool ratesValid = biochemicalFinite(Vcmax) && Vcmax >= 0.0 &&
+        biochemicalFinite(ppm2bar) && ppm2bar > 0.0 &&
+        biochemicalFinite(TH) && TH > 0.0 && biochemicalFinite(TL) && TL > 0.0 &&
+        biochemicalFinite(Kc) && Kc > 0.0 && biochemicalFinite(Ko) && Ko > 0.0 &&
+        biochemicalFinite(Kpepcase) && Kpepcase >= 0.0 &&
+        biochemicalFinite(spfy) && spfy > 0.0 && biochemicalFinite(po0) &&
+        biochemicalFinite(Je) && Je >= 0.0 && biochemicalFinite(V) &&
+        biochemicalFinite(Vc) && biochemicalFinite(Ve) && biochemicalFinite(Vs);
+    leaf.valid = ratesValid && biochemicalFinite(Ag) && biochemicalFinite(A) &&
+        biochemicalFinite(Rd) && biochemicalFinite(RH) && biochemicalFinite(Ci) &&
+        biochemicalFinite(ciPpm) && ciPpm >= 0.0 &&
+        biochemicalFinite(rcw) && rcw >= 0.0;
+    leaf.gross = Ag;
+    leaf.net = A;
+    leaf.ciPpm = ciPpm;
+    leaf.rcw = rcw;
+    return leaf;
+}
+
+// Leaf-surface relaxation of a new resistance toward the previous energy
+// iteration damps the humidity/stomata oscillation; each node starts afresh.
+float dampedResistance(float rcw, float previousRcw)
+{
+    if(setting.energyIteration > 0
+       && biochemicalFinite(previousRcw) && previousRcw > 0.0 && previousRcw <= 625000.0
+       && biochemicalFinite(rcw) && rcw > 0.0)
+        return sqrt(previousRcw * rcw);
+    return rcw;
+}
+
+void main()
+{
+    uint bufferId0 = uint(gl_GlobalInvocationID.x);
+    if(bufferId0 >= uint(setting.voxelCount)) return;
+    if(voxelLinks[bufferId0].isValid==0) return;
+    ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
+    MeshLink meshLink0 = meshLinks[instanceLinks[voxelLinks[bufferId0].instanceId].meshId];
+
+    // Carbon-process output shares the existing per-voxel flux buffer.  Set
+    // non-vegetation voxels to zero before the vegetation branch below.
+    voxelHeatFlux[bufferId0].GPPsunlit = 0.0;
+    voxelHeatFlux[bufferId0].GPPshaded = 0.0;
+    voxelHeatFlux[bufferId0].NPPsunlit = 0.0;
+    voxelHeatFlux[bufferId0].NPPshaded = 0.0;
+
+    float scale = setting.scale;
+    ivec3 semiRange = ivec3(floor(setting.voxelSize.x/2.0 + 0.5),
+                            floor(setting.voxelSize.y/2.0 + 0.5),
+                            floor(setting.voxelSize.z/2.0 + 0.5));
+    uint spectralId = meshLink0.spectralId;
+    uint canopyId = meshLink0.canopyId;
+    uint bioId = meshLink0.bioId;
+    uint typeId = meshLink0.type;
+    float rss;
+
+    if(typeId == TYPE_SOIL || typeId == TYPE_BUILDING)
+    {
+        rss = localSoilResistance(bufferId0, bioId);
+        atomicStore(voxelRsss[bufferId0].sunlit, rss, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+        atomicStore(voxelRsss[bufferId0].shaded, rss, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+    }
+    else if(typeId == TYPE_WATER)
+    {
+        rss = max(waterSets[bioId].rss, 0.0);
+        atomicStore(voxelRsss[bufferId0].sunlit, rss, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+        atomicStore(voxelRsss[bufferId0].shaded, rss, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+    }
+    else if(typeId == TYPE_VEGETATION)
+    {
+        Canopy canopy = canopies[canopyId];
+        if(isParticipatingMedium(canopy)) return;
+        vec3 voxelPos = vec3(voxelId0.x +0.5 -semiRange.x,
+                             voxelId0.y +0.5,
+                             voxelId0.z +0.5 -semiRange.z);
+        float hcmax = canopy.height;
+        // xl: relative depth below the canopy top, [0,-1]
+        float xl = clamp(hcmax > 0.0 ? -(hcmax - voxelPos.y*scale)/hcmax : 0.0, -1.0, 0.0);
+
+        LeafParameters P;
+        P.type = leafBios[bioId].Type;
+        float kV = leafBios[bioId].kV;
+        // Vertical decline of the carboxylation capacity.
+        P.vcmax25 = leafBios[bioId].Vcmax * exp(kV * xl);
+        P.slope = leafBios[bioId].leafM;
+        P.rdPerVcmax25 = leafBios[bioId].Rdparam;
+        P.intercept = max(leafBios[bioId].BallBerry, 0.0);
+        P.stress = leafBios[bioId].stressfactor;
+        P.slti = leafBios[bioId].Tparam[0];
+        P.shti = leafBios[bioId].Tparam[1];
+        P.thl = leafBios[bioId].Tparam[2];
+        P.thh = leafBios[bioId].Tparam[3];
+        P.trdm = leafBios[bioId].Tparam[4];
+        P.tcor = leafBios[bioId].Tcor;
+        P.oxygen = ubom.meteo.Oa;
+        P.pressure = ubom.meteo.p;
+
+        float directPar = voxelPnets[bufferId0].directPnet;
+        float diffusePar = voxelPnets[bufferId0].diffusePnet;
+        bool parametersValid =
+            biochemicalFinite(P.oxygen) && P.oxygen >= 0.0 &&
+            biochemicalFinite(P.pressure) && P.pressure > 0.0 &&
+            biochemicalFinite(P.pressure * 100.0) &&
+            biochemicalFinite(directPar) && directPar >= 0.0 &&
+            biochemicalFinite(diffusePar) && diffusePar >= 0.0 &&
+            (P.type == 3.0 || P.type == 4.0) &&
+            biochemicalFinite(P.vcmax25) && P.vcmax25 >= 0.0 &&
+            biochemicalFinite(P.slope) && P.slope >= 0.0 &&
+            biochemicalFinite(P.rdPerVcmax25) && P.rdPerVcmax25 >= 0.0 &&
+            biochemicalFinite(kV) && kV >= 0.0 &&
+            biochemicalFinite(P.stress) && P.stress >= 0.0 && P.stress <= 1.0 &&
+            biochemicalFinite(hcmax) && hcmax > 0.0 && (P.tcor == 0 || P.tcor == 1) &&
+            biochemicalFinite(P.slti) && P.slti >= 0.0 && biochemicalFinite(P.shti) && P.shti >= 0.0 &&
+            biochemicalFinite(P.thl) && P.thl > 0.0 && biochemicalFinite(P.thh) && P.thh > P.thl &&
+            biochemicalFinite(P.trdm) && P.trdm > 0.0;
+        float missing = biochemicalMissing();
+
+        //---------------------------------------------
+        // Shaded leaves: one state with diffuse light only.
+        //---------------------------------------------
+        {
+            float Tc = voxelTempes[bufferId0].shaded;
+            if(Tc < 100.0) Tc += 273.15;
+            // Each node's first pass starts from this node's ambient air, not
+            // the leaf-surface values left by the previous node.
+            bool firstPass = setting.energyIteration == 0;
+            float Cs = firstPass ? localAmbientCo2Ppm(bufferId0) : voxelAirs[bufferId0].cs[0];
+            float Es = firstPass ? localVaporPressureHpa(bufferId0) : voxelAirs[bufferId0].es[0];
+            // Ball-Berry humidity at the leaf surface (SCOPE ec, updated by
+            // evapo.comp); ambient vapour pressure seeds the first pass.
+            float eb = biochemicalFinite(Es) && Es > 0.0 ? Es : localVaporPressureHpa(bufferId0);
+            LeafState leaf;
+            leaf.valid = false;
+            if(parametersValid && biochemicalFinite(Tc) && Tc > 0.0 &&
+               biochemicalFinite(Cs) && Cs >= 0.0 && biochemicalFinite(eb) && eb >= 0.0)
+                leaf = ballBerryLeaf(P, Tc, diffusePar, Cs, eb);
+            if(leaf.valid) {
+                voxelHeatFlux[bufferId0].GPPshaded = max(0.0, leaf.gross);
+                voxelHeatFlux[bufferId0].NPPshaded = leaf.net;
+                voxelRsss[bufferId0].shaded = dampedResistance(leaf.rcw, voxelRsss[bufferId0].shaded);
+                voxelAirs[bufferId0].ci[0] = leaf.ciPpm;
+            } else {
+                voxelHeatFlux[bufferId0].GPPshaded = missing;
+                voxelHeatFlux[bufferId0].NPPshaded = missing;
+                voxelRsss[bufferId0].shaded = missing;
+                voxelAirs[bufferId0].ci[0] = missing;
+            }
+        }
+
+        //---------------------------------------------
+        // Sunlit leaves: orientation classes, each with its own leaf energy
+        // balance at the class's absorbed beam. |cos(leaf normal, sun)| is
+        // uniform on [0,1] for spherical foliage, so class k receives
+        // 2*(k+0.5)/N times the mean sunlit beam.
+        //---------------------------------------------
+        {
+            float Tclass = voxelTempes[bufferId0].sunlit;
+            if(Tclass < 100.0) Tclass += 273.15;
+            float Cs = setting.energyIteration == 0 ? localAmbientCo2Ppm(bufferId0) : voxelAirs[bufferId0].cs[1];
+            bool valid = parametersValid && biochemicalFinite(Tclass) && Tclass > 0.0 &&
+                biochemicalFinite(Cs) && Cs >= 0.0;
+            float raa = max(voxelRaas[bufferId0].raa, 1.0);
+            float Ta = localAirTemperatureC(bufferId0);
+            float ea = localVaporPressureHpa(bufferId0);
+            float eToQ = MH20 / MAIR / ubom.meteo.p;
+            SpectralMaterial thermal = spectralMaterials[spectralId*NBAND + NUM_VNIR];
+            float emis = clamp(1.0 - thermal.reflectance - thermal.transmittance, 0.0, 1.0);
+            // Absorbed by both faces per one-sided leaf area, as in budget.comp.
+            float diffuseAbsorbed = voxelNetRads[bufferId0].diffuseVrad + voxelNetRads[bufferId0].diffuseTrad;
+            float directAbsorbed = voxelNetRads[bufferId0].directVrad + voxelNetRads[bufferId0].directTrad;
+            float previousRcw = voxelRsss[bufferId0].sunlit;
+            float startRcw = biochemicalFinite(previousRcw) && previousRcw > 0.0 && previousRcw <= 625000.0
+                ? previousRcw : 300.0;
+            float gross = 0.0, net = 0.0, ci = 0.0, conductance = 0.0, vapourFlux = 0.0;
+            for(int k = 0; k < SUNLIT_CLASSES && valid; ++k)
+            {
+                float exposure = 2.0 * (float(k) + 0.5) / float(SUNLIT_CLASSES);
+                float Q = diffusePar + directPar * exposure;
+                float absorbed = diffuseAbsorbed + directAbsorbed * exposure;
+                float T = Tclass;
+                float rcw = startRcw;
+                LeafState leaf;
+                leaf.valid = false;
+                for(int step = 0; step < LEAF_TEMPERATURE_STEPS; ++step)
+                {
+                    float TC = T - 273.15;
+                    float ei = es_fun(TC);
+                    float eb = ea + (ei - ea) * raa / (raa + 2.0 * rcw);
+                    leaf = ballBerryLeaf(P, T, Q, Cs, max(eb, 0.0));
+                    if(!leaf.valid) break;
+                    rcw = leaf.rcw;
+                    // Both faces emit and exchange: H and LE per face with the
+                    // aerodynamic raa and stomatal 2*rcw (evapo.comp convention).
+                    float g = 1.0 / (raa + 2.0 * rcw);
+                    float lambda = (2.501 - 0.002361 * TC) * 1E6;
+                    float residual = absorbed - 2.0 * Stefen_Boltzmann(T, emis)
+                        - 2.0 * RHOA * CP * (TC - Ta) / raa
+                        - 2.0 * RHOA * lambda * eToQ * (ei - ea) * g;
+                    float derivative = 8.0 * emis * SIGMASB * T * T * T + 2.0 * RHOA * CP / raa
+                        + 2.0 * RHOA * lambda * eToQ * max(s_fun(ei, TC), 0.0) * g;
+                    T = clamp(T + clamp(residual / derivative, -5.0, 5.0),
+                              float(TMIN_THRESHOLD), float(TMAX_THRESHOLD));
+                }
+                valid = valid && leaf.valid;
+                gross += max(0.0, leaf.gross);
+                net += leaf.net;
+                ci += leaf.ciPpm;
+                float g = 1.0 / (raa + 2.0 * leaf.rcw);
+                conductance += g;
+                vapourFlux += g * (es_fun(T - 273.15) - ea);
+            }
+            if(valid)
+            {
+                float n = float(SUNLIT_CLASSES);
+                // Effective class resistance reproducing the mean class
+                // transpiration at the class temperature; the conductance mean
+                // where there is no vapour deficit.
+                float deficit = es_fun(Tclass - 273.15) - ea;
+                float total = deficit > 0.01 && vapourFlux > 1.0e-9
+                    ? deficit / (vapourFlux / n) : n / conductance;
+                float classRcw = clamp(0.5 * (total - raa), 1.0, 625000.0);
+                voxelHeatFlux[bufferId0].GPPsunlit = gross / n;
+                voxelHeatFlux[bufferId0].NPPsunlit = net / n;
+                voxelRsss[bufferId0].sunlit = dampedResistance(classRcw, previousRcw);
+                voxelAirs[bufferId0].ci[1] = ci / n;
+            } else {
+                voxelHeatFlux[bufferId0].GPPsunlit = missing;
+                voxelHeatFlux[bufferId0].NPPsunlit = missing;
+                voxelRsss[bufferId0].sunlit = missing;
+                voxelAirs[bufferId0].ci[1] = missing;
+            }
+        }
+    }
+}

@@ -1,0 +1,12 @@
+{
+  "source": "Stream Studio procedural reference geometry",
+  "triangles": 660,
+  "dimensions": [
+    2.84,
+    3.14,
+    11.94
+  ],
+  "coordinateSystem": "Y-up",
+  "unit": "metre",
+  "vertexColors": true
+}

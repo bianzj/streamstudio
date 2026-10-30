@@ -1,0 +1,93 @@
+{
+  "id": "RAMI5_HET07_JPS_SUM",
+  "label": "RAMI-V Järvselja Pine Stand (Summer)",
+  "coordinateSystem": "Y-up OBJ; position files use X/Y horizontal and Z vertical",
+  "sceneDimensionsMetres": [
+    105.932,
+    106.118,
+    18.56
+  ],
+  "totalInstances": 1120,
+  "source": "https://rami-benchmark.jrc.ec.europa.eu/",
+  "dartObjSource": "https://dart.omp.eu/index.php#/doc",
+  "license": "RAMI-V reference data; source acknowledgement required",
+  "objects": [
+    {
+      "id": 0,
+      "code": "BEPE",
+      "file": "prototypes/BEPE.obj",
+      "positionFile": "positions/BEPE_position.txt",
+      "instances": 6
+    },
+    {
+      "id": 1,
+      "code": "PISY1",
+      "file": "prototypes/PISY1.obj",
+      "positionFile": "positions/PISY1_position.txt",
+      "instances": 8
+    },
+    {
+      "id": 2,
+      "code": "PISY10",
+      "file": "prototypes/PISY10.obj",
+      "positionFile": "positions/PISY10_position.txt",
+      "instances": 9
+    },
+    {
+      "id": 3,
+      "code": "PISY2",
+      "file": "prototypes/PISY2.obj",
+      "positionFile": "positions/PISY2_position.txt",
+      "instances": 29
+    },
+    {
+      "id": 4,
+      "code": "PISY3",
+      "file": "prototypes/PISY3.obj",
+      "positionFile": "positions/PISY3_position.txt",
+      "instances": 100
+    },
+    {
+      "id": 5,
+      "code": "PISY4",
+      "file": "prototypes/PISY4.obj",
+      "positionFile": "positions/PISY4_position.txt",
+      "instances": 149
+    },
+    {
+      "id": 6,
+      "code": "PISY5",
+      "file": "prototypes/PISY5.obj",
+      "positionFile": "positions/PISY5_position.txt",
+      "instances": 220
+    },
+    {
+      "id": 7,
+      "code": "PISY6",
+      "file": "prototypes/PISY6.obj",
+      "positionFile": "positions/PISY6_position.txt",
+      "instances": 219
+    },
+    {
+      "id": 8,
+      "code": "PISY7",
+      "file": "prototypes/PISY7.obj",
+      "positionFile": "positions/PISY7_position.txt",
+      "instances": 193
+    },
+    {
+      "id": 9,
+      "code": "PISY8",
+      "file": "prototypes/PISY8.obj",
+      "positionFile": "positions/PISY8_position.txt",
+      "instances": 147
+    },
+    {
+      "id": 10,
+      "code": "PISY9",
+      "file": "prototypes/PISY9.obj",
+      "positionFile": "positions/PISY9_position.txt",
+      "instances": 40
+    }
+  ]
+}

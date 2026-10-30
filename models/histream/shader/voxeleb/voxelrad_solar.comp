@@ -1,0 +1,181 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXEL_LST_BIND_ININDEX
+#define VOXELLST 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../nanovdb_info.glsl"
+#include "../bsdf.glsl"
+#include "../functions.glsl"
+#include "../shade_state_voxel.glsl"
+#include "../random.glsl"
+
+PtPayload        prd;
+ShadowHitPayload shadow_payload;
+
+#include "../traceray_comp.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+
+#define MAXBAND    25
+#define NUM_VNIR 2001 
+#define NUM_BAND 2002
+float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
+float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
+
+float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
+                                NanoVDBLink nanoVDBLink, vec3 semiRange)
+{
+    ResetHexRay();
+    float scale = setting.scale;
+    float density = 1.0;
+    float G = 0.5;
+    float alphaToSolar = 1.0;
+    ivec3 voxelRes = ivec3(setting.voxelSize);
+    Ray ray = Ray(origin, lightDirection);
+
+    for(int step = 0; step < setting.maxStep; ++step)
+    {
+        float alphaVoxel = 1.0;
+        ClosestHit(ray, 0.01);
+        if(prd.hitT == INFINITY)
+            return alphaToSolar * TurbidEscapeTransmittance(ray.origin, ray.direction);
+
+        ShadeState sstate = GetShadeState(prd);
+        ivec3 alignVoxelId;
+        ivec3 voxelId = getVoxelIdSemi(
+            sstate.position, semiRange, setting.scale,
+            normalize(lightDirection), alignVoxelId);
+        int bufferId = nanovdbGet(nanoVDBLink, voxelId);
+        if(bufferId >= 0)
+        {
+            uint instanceId = voxelLinks[bufferId].instanceId;
+            uint meshId = instanceLinks[instanceId].meshId;
+            uint typeId = meshLinks[meshId].type;
+            uint canopyId = meshLinks[meshId].canopyId;
+            if(typeId == TYPE_VEGETATION)
+            {
+                G = canopies[canopyId].G;
+                density = ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
+                float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
+                alphaVoxel = isParticipatingMedium(canopies[canopyId])
+                    ? canopyVoxelTransmittance(canopies[canopyId], density, G,
+                        pathLength, scale)
+                    : ResolveSpatialInteraction(bufferId, density, G,
+                        sstate.lastPosition, sstate.position, scale).x;
+            }
+        }
+
+        int alignBufferId = nanovdbGet(nanoVDBLink, alignVoxelId);
+        if(alignBufferId >= 0)
+        {
+            uint instanceId = voxelLinks[alignBufferId].instanceId;
+            uint meshId = instanceLinks[instanceId].meshId;
+            uint typeId = meshLinks[meshId].type;
+            if(typeId == TYPE_SOIL || typeId == TYPE_BUILDING || typeId == TYPE_WATER)
+                return 0.0;
+        }
+
+        alphaToSolar *= alphaVoxel;
+        if(alphaToSolar <= 0.001) return alphaToSolar;
+        vec3 ffnormal = sstate.normal;
+        ray.origin = OffsetRay(
+            sstate.position,
+            dot(ray.direction, ffnormal) > 0.0 ? ffnormal : -ffnormal);
+    }
+    return alphaToSolar;
+}
+
+// Building OBJ voxels carry one physical/energy state.  Their illumination is
+// the best visibility obtained from the top and from the horizontal side that
+// faces the sun, rather than five independently stored facade states.
+bool TraversalDirection(vec3 lightDirection)
+{
+    uint bufferId0 = uint(gl_GlobalInvocationID.x);
+    ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
+    uint instanceId0 = voxelLinks[bufferId0].instanceId;
+    uint meshId0 = instanceLinks[instanceId0].meshId;
+    uint typeId0 = meshLinks[meshId0].type;
+    int faceId = voxelLinks[bufferId0].faceId;
+    NanoVDBLink nanoVDBLink = nanovdbInit();
+    ConfigureTurbidGrid(nanoVDBLink);
+    vec3 semiRange = vec3(
+        floor(setting.voxelSize.x / 2.0 + 0.5), 0.0,
+        floor(setting.voxelSize.z / 2.0 + 0.5));
+    vec3 voxelMinimum = vec3(
+        voxelId0.x - semiRange.x, voxelId0.y,
+        voxelId0.z - semiRange.z);
+
+    float visibility;
+    vec3 storedNormal = vec3(voxelLinks[bufferId0].normalX, voxelLinks[bufferId0].normalY,
+                             voxelLinks[bufferId0].normalZ);
+    if(typeId0 == TYPE_BUILDING && faceId == 0 && length(storedNormal) > 0.5)
+    {
+        // Start on the cube face that the facet normal points through.
+        vec3 n = normalize(storedNormal);
+        vec3 origin = voxelMinimum + vec3(0.5)
+            + n * (0.5 / max(max(abs(n.x), abs(n.y)), abs(n.z)));
+        visibility = SolarVisibilityFromOrigin(
+            origin, normalize(lightDirection), nanoVDBLink, semiRange);
+    }
+    else if(typeId0 == TYPE_BUILDING && faceId == 0)
+    {
+        vec3 direction = normalize(lightDirection);
+        vec3 topOrigin = voxelMinimum + vec3(0.5, 1.0, 0.5);
+        float topVisibility = SolarVisibilityFromOrigin(
+            topOrigin, direction, nanoVDBLink, semiRange);
+        float sideVisibility = 0.0;
+        if(dot(direction.xz, direction.xz) > 1.0e-8)
+        {
+            vec3 sideOrigin = voxelMinimum + vec3(0.5);
+            if(abs(direction.x) >= abs(direction.z))
+                sideOrigin.x = voxelMinimum.x + (direction.x >= 0.0 ? 1.0 : 0.0);
+            else
+                sideOrigin.z = voxelMinimum.z + (direction.z >= 0.0 ? 1.0 : 0.0);
+            sideVisibility = SolarVisibilityFromOrigin(
+                sideOrigin, direction, nanoVDBLink, semiRange);
+        }
+        visibility = max(topVisibility, sideVisibility);
+    }
+    else
+    {
+        vec3 origin = voxelMinimum;
+        getFacetIdPos(faceId, origin);
+        visibility = SolarVisibilityFromOrigin(
+            origin, normalize(lightDirection), nanoVDBLink, semiRange);
+    }
+
+    voxelDirs[bufferId0].solar = visibility;
+    return visibility <= 0.001;
+}
+
+void main()
+{
+    vec3 directions = normalize(lightSet.direction);
+    uint bufferId0 = uint(gl_GlobalInvocationID.x);
+    if(bufferId0 >= uint(setting.voxelCount)) return;
+    if(voxelLinks[bufferId0].isValid==0) return;
+
+    voxelDirs[bufferId0].solar = 0.0;
+    if(directions.y >= 0.01) TraversalDirection(directions);
+}

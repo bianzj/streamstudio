@@ -1,0 +1,121 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXEL_LST_BIND_ININDEX
+#define VOXELLST 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../functions.glsl"
+#include "../nanovdb_info.glsl"
+#include "../shade_state_voxel.glsl"
+
+PtPayload        prd;
+ShadowHitPayload shadow_payload;
+
+#include "../traceray_comp.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+
+#define MAXBAND    25
+#define NUM_VNIR 2001 
+#define NUM_BAND 2002
+
+float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
+float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
+
+
+
+void main()
+{
+    //------------------------------------------------------------
+    // Initialization for the position and SSBO index
+    //------------------------------------------------------------
+    // get bufferId, voxelId, instanceId and typeId
+    uint bufferId0 = uint(gl_GlobalInvocationID.x);
+    if(bufferId0 >= uint(setting.voxelCount)) return;
+    ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
+    if(voxelLinks[bufferId0].isValid==0) return;
+    // Get nanoVDBLink: from voxelId to bufferId
+    NanoVDBLink nanoVDBLink = nanovdbInit();
+    // uint bufferId = nanovdbGet(nanoVDBLink, voxelId0);
+    uint instanceId = voxelLinks[bufferId0].instanceId;
+    uint meshId = instanceLinks[instanceId].meshId;
+    uint typeId = meshLinks[meshId].type;
+    uint spectralId = meshLinks[meshId].spectralId;
+    uint spectralIdBase = spectralId * NUM_BAND;
+
+    int faceId = voxelLinks[bufferId0].faceId;
+    // if(primId0 - faceid0*10 == 0) return; 
+    uint canopyId = meshLinks[meshId].canopyId;
+    voxelNetRads[bufferId0].directTrad = 0;
+
+    // Rli is hemispherical downwelling longwave and is handled by diffuseTIR.
+    // Keeping a directional component here would count the same sky flux twice.
+    return;
+
+
+    float Rin = ubom.meteo.Rin;               // measurement height 
+    float Rli = ubom.meteo.Rli;               // wind speed
+    float cosSolar = abs(normalize(lightSet.direction).y);
+    //---------------------------------------------------
+    // Iteration in TIR band
+    //---------------------------------------------------
+    float alpha_toSolar = voxelDirs[bufferId0].solar; 
+    for(int kband = NUM_VNIR; kband < NUM_BAND; kband++)
+    {
+        // solar direct radiance: lightSet.Rin*atomCondss[kband].direct*0.001
+        // transmittance to solar: alpha_toSolar
+        // absorb = 1- refl - trans
+        float absorb = 1- spectralMaterials[spectralIdBase + kband].transmittance - 
+                spectralMaterials[spectralIdBase + kband].reflectance;
+        float band0 = atomConds[kband-1].wavelength;
+        float bandwidth = atomConds[kband].wavelength - band0;
+        float rad = Rli * atomConds[kband].direct * 0.001 * bandwidth;//  * absorb;
+
+        if (typeId == TYPE_VEGETATION){
+            if (cosSolar > 0.05){ //
+                rad = rad / cosSolar;
+            }
+            else{
+                rad = rad / 0.05;
+            }
+            
+
+            float lai = canopies[canopyId].lai;
+            float p = calReCor(lai);
+            float refl = spectralMaterials[spectralIdBase + kband].reflectance;
+            float trans = spectralMaterials[spectralIdBase + kband].transmittance;
+            float w = refl + trans;
+            float s = (w - p* w) / (1 - p* w);
+            float a = (1-w) / (1 - p *w); 
+            // absorb = a;
+            rad = rad * 0.5;
+        }
+        // else{
+        //     rad = Rli * curDirect / effectWave * absorb;
+        // }
+
+        rad = rad * absorb;
+
+        atomicAdd(voxelNetRads[bufferId0].directTrad,rad,
+            gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+    }
+
+}

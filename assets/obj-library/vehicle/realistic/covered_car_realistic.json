@@ -1,0 +1,12 @@
+{
+  "source": "https://polyhaven.com/a/covered_car",
+  "sourceTriangles": 12592,
+  "triangles": 12592,
+  "dimensions": [
+    1.789,
+    1.4111,
+    4.3803
+  ],
+  "coordinateSystem": "Y-up",
+  "vertexColors": true
+}

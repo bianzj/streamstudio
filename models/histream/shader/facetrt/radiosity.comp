@@ -1,0 +1,106 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct CsrEdge {
+    uint neighbor;
+    uint count;
+};
+
+struct SurfaceOptics {
+    float reflectance;
+    float transmittance;
+    float emission;
+    float directIrradiance;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer RowOffsets {
+    uint rowOffsets[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer Edges {
+    CsrEdge edges[];
+};
+layout(std430, set = 0, binding = 2) readonly buffer Denominators {
+    uint denominators[];
+};
+layout(std430, set = 0, binding = 3) readonly buffer SkyCounts {
+    uint skyCounts[];
+};
+layout(std430, set = 0, binding = 4) readonly buffer Optics {
+    SurfaceOptics optics[];
+};
+layout(std430, set = 0, binding = 5) buffer RadiosityA {
+    float radiosityA[];
+};
+layout(std430, set = 0, binding = 6) buffer RadiosityB {
+    float radiosityB[];
+};
+layout(std430, set = 0, binding = 7) buffer Residual {
+    uint maxDeltaBits;
+};
+
+layout(push_constant) uniform SolvePush {
+    uint facetCount;
+    uint ping;
+    float skyRadiosity;
+    float relaxation;
+} pc;
+
+float readRadiosity(uint side)
+{
+    return pc.ping == 0u ? radiosityA[side] : radiosityB[side];
+}
+
+void writeRadiosity(uint side, float value)
+{
+    if (pc.ping == 0u) {
+        radiosityB[side] = value;
+    } else {
+        radiosityA[side] = value;
+    }
+}
+
+float incoming(uint side)
+{
+    const uint denominator = denominators[side];
+    if (denominator == 0u) {
+        return pc.skyRadiosity;
+    }
+
+    float value = float(skyCounts[side]) * pc.skyRadiosity;
+    for (uint edgeIndex = rowOffsets[side]; edgeIndex < rowOffsets[side + 1u]; ++edgeIndex) {
+        const CsrEdge edge = edges[edgeIndex];
+        value += float(edge.count) * readRadiosity(edge.neighbor);
+    }
+    return value / float(denominator);
+}
+
+void main()
+{
+    const uint facet = gl_GlobalInvocationID.x;
+    if (facet >= pc.facetCount) {
+        return;
+    }
+
+    const uint side0 = facet * 2u;
+    const uint side1 = side0 + 1u;
+    const float h0 = incoming(side0) + optics[side0].directIrradiance;
+    const float h1 = incoming(side1) + optics[side1].directIrradiance;
+
+    const float target0 = optics[side0].emission
+                        + optics[side0].reflectance * h0
+                        + optics[side0].transmittance * h1;
+    const float target1 = optics[side1].emission
+                        + optics[side1].reflectance * h1
+                        + optics[side1].transmittance * h0;
+
+    const float old0 = readRadiosity(side0);
+    const float old1 = readRadiosity(side1);
+    const float next0 = mix(old0, target0, pc.relaxation);
+    const float next1 = mix(old1, target1, pc.relaxation);
+    writeRadiosity(side0, next0);
+    writeRadiosity(side1, next1);
+
+    const float delta = max(abs(next0 - old0), abs(next1 - old1));
+    atomicMax(maxDeltaBits, floatBitsToUint(delta));
+}

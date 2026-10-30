@@ -1,0 +1,99 @@
+#version 460
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer Parameters { float P[]; };
+layout(std430,binding=1) readonly buffer Inputs { float I[]; };
+layout(std430,binding=2) buffer Temperatures { float T[]; };
+layout(std430,binding=3) buffer Fluxes { float F[]; };
+struct Optics { float reflectance,transmittance,emission,directIrradiance; };
+layout(std430,binding=4) buffer Optical { Optics optics[]; };
+layout(std430,binding=5) readonly buffer Incident { float H[]; };
+layout(std430,binding=6) buffer Statistics { uint stats[]; };
+layout(push_constant) uniform EnergyPush {
+    uint facets,objects,method,phase;
+    float air,rho,pressure,vapor,dt,co2,relax,reserved;
+} pc;
+const float SIGMA=5.670374419e-8;
+#include "energy_math.glsl"
+void maximum(uint k,float v) { if(isnan(v)||isinf(v)) atomicOr(stats[5],1u); else atomicMax(stats[k],floatBitsToUint(max(0.0,v))); }
+void main() {
+    uint f=gl_GlobalInvocationID.x;
+    if(f>=pc.facets) return;
+    uint s0=2u*f,p=f*32u,surfaces=2u*pc.facets;
+    bool object=f<pc.objects,leaf=object&&P[p]>0.5;
+    if(pc.phase==2u) {
+        for(uint s=s0;s<s0+2u;++s) {
+            uint b=s*12u; float e=clamp(1.0-I[b+9u]-I[b+10u],0.0,1.0),w=I[b+11u];
+            optics[s]=Optics(I[b+9u],I[b+10u],e*SIGMA*(w*pow(clamp(T[s],1.0,1000.0),4.0)+(1.0-w)*pow(clamp(T[s+surfaces],1.0,1000.0),4.0)),0.0);
+        }
+        return;
+    }
+    for(uint state=0u;state<2u;++state) {
+        uint index=state*surfaces+s0,b=index*12u,z=index*12u;
+        if(pc.phase==1u) {
+            for(uint side=0u;side<(object?1u:2u);++side) {
+                uint k=index+side,j=k*12u; float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
+                float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0);
+                float response=(object?8.0:4.0)*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
+                float candidate=clamp(temp+clamp(residual/max(1.0,response),-5.0,5.0),220.0,360.0);
+                float next=temp+(leaf?F[j+9u]:pc.relax*(candidate-temp));
+                maximum(4u,abs(next-temp)); T[k]=next; if(object) T[k+1u]=next;
+            }
+            continue;
+        }
+        float net[2];
+        for(uint side=0u;side<2u;++side) {
+            uint j=(index+side)*12u,s=s0+side;float temp=T[index+side];
+            float e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
+            net[side]=I[j+1u]+e*H[s]-e*SIGMA*pow(clamp(temp,1.0,1000.0),4.0);
+            for(uint k=0u;k<12u;++k) F[j+k]=0.0;
+        }
+        float temp=T[index];
+        if(object) {
+            float rn=net[0]+net[1],rb=I[b+4u],depth=I[b+6u],previous=I[b];
+            float conductance=leaf?pc.rho*1005.0*P[p+3u]/rb:2.0*(5.8+4.1*sqrt(max(.1,pc.reserved)))*P[p+3u];
+            float h=conductance*(temp-pc.air),ss=max(0.0,P[p+2u])/pc.dt,storage=ss*(temp-previous);
+            float inc=I[b+3u]+P[p+6u]*I[b+15u],available=I[b+1u]+I[b+13u];
+            float raw=P[p+4u]*(1.0+P[p+5u]*(temp-298.15))*inc;
+            float power=P[p+1u]>.5?clamp(raw,0.0,max(0.0,available)):0.0;
+            float ps=P[p+1u]>.5&&raw>0.0&&raw<available?P[p+4u]*P[p+5u]*inc:0.0;
+            float le=0.0,ls=0.0,step=0.0,mismatch=0.0;
+            if(leaf) {
+                float par=max(0.0,I[b+2u]+I[b+14u]);
+                double eps=double(clamp(1.0-I[b+9u]-I[b+10u],0.0,1.0)+clamp(1.0-I[b+21u]-I[b+22u],0.0,1.0));
+                double lo=0.0lf,hi=dlog(625000.0lf);
+                for(int k=0;k<24;++k) {
+                    double mid=.5lf*(lo+hi),rs=dexp(mid),trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
+                    double target=double(physiology(f,trial,rs,par,rb,depth));
+                    if(isnan(target)||isinf(target)||target<=0.0lf) atomicOr(stats[5],2u);
+                    if(mid>dlog(target)) hi=mid; else lo=mid;
+                }
+                double rs=dexp(.5lf*(lo+hi)),trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
+                step=pc.relax*float(clamp(trial-double(temp),-5.0lf,5.0lf));
+                le=latent(temp,rb,float(rs)); ls=latentSlope(temp,rb,float(rs));
+                mismatch=float(abs(dlog(rs/double(physiology(f,double(temp),rs,par,rb,depth)))));
+            }
+            for(uint side=0u;side<2u;++side) {
+                uint j=(index+side)*12u;
+                F[j]=rn;F[j+1u]=h;F[j+2u]=conductance;F[j+3u]=le;F[j+4u]=ls;
+                F[j+5u]=storage;F[j+6u]=ss;F[j+7u]=power;F[j+8u]=ps;F[j+9u]=step;F[j+10u]=mismatch;
+            }
+        } else {
+            for(uint side=0u;side<2u;++side) {
+                uint k=index+side,j=k*12u;float temp=T[k],rb=I[j+5u],conductance=pc.rho*1005.0/rb;
+                F[j]=net[side]; F[j+1u]=conductance*(temp-pc.air); F[j+2u]=conductance;
+                F[j+3u]=P[p+8u]>.5?0.0:latent(temp,rb,P[p+7u]);
+                F[j+4u]=P[p+8u]>.5?0.0:latentSlope(temp,rb,P[p+7u]);
+                F[j+6u]=I[j+7u]; F[j+5u]=P[p+9u]<.5?.35*net[side]:I[j+7u]*temp+I[j+8u];
+            }
+        }
+        for(uint side=0u;side<(object?1u:2u);++side) {
+            uint k=index+side,j=k*12u;float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
+            float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0);
+            float response=(object?8.0:4.0)*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
+            maximum(0u,abs(residual));maximum(1u,abs(residual)/max(1.0,response));
+            if(leaf) {maximum(2u,F[j+10u]);maximum(3u,abs(residual));}
+        }
+    }
+}

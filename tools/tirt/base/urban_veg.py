@@ -1,0 +1,1098 @@
+import numpy as np
+from .crown import *
+from .emissivity import canopy_scatter
+from .vegetation import CanopyGeometry
+
+_COVERAGE_CACHE = {}
+
+
+def _fold(angle):
+    """Absolute angular difference folded to [0, 180] degrees."""
+    return np.abs((np.asarray(angle, dtype=float) + 180.0) % 360.0 - 180.0)
+
+
+def _overlap(tantv, tants, up):
+    """Sun/view shadow overlap ratio; 0 when both directions are vertical (0/0)."""
+    num = np.sqrt(np.maximum(tantv * tantv + tants * tants - 2 * tantv * tants * up, 0.0))
+    den = tantv + tants
+    return num / den if abs(den) > 1.0e-12 else 0.0
+
+### version 0.1 有错误，但是能跑
+### version 0.5 有错误，修正了一部分，也能跑，这个版本投了iGARSS
+### version 1.0 修正了一大部分，但是不能改变建筑的方位角，或者是说所有的建筑的方位角是固定的，同时来说，这么跑会快一点
+### version 1.1 能改变建筑的方位角，同时来说，这么跑慢很多
+
+
+class Urban_Veg(CanopyGeometry):
+    """Building occlusion plus canopy geometry and approximate interreflection.
+
+    The scattering kernel uses a hemisphere-averaged canopy/street mixture;
+    this approximation does not resolve each tree/row/building interaction.
+    """
+
+    thermal_crown_geometry = 'legacy'
+    thermal_hotspot_inner = None
+    thermal_hotspot_outer = None
+    # Optional crown closures, as in TerrainForest.
+    canopy_fraction_model = None
+    canopy_scatter_model = None
+    # (zenith, azimuth) midpoint nodes of the wall-exchange hemisphere; 9 x 12 changes the urban forest
+    # scene by at most 0.016 K versus the original 90 x 60 grid
+    hemisphere_grid = (9, 12)
+    # (zenith, azimuth) nodes of the flux-weighted canopy coverage seen from the street
+    coverage_grid = (9, 12)
+    def set_hotspot_geometry(self, mode='legacy', inner=None, outer=None):
+        if mode not in ('legacy', 'clumping_dual', 'parametric'):
+            raise ValueError('Urban forest geometry supports legacy, clumping_dual or parametric.')
+        for width in (inner, outer):
+            if width not in (None, '') and (not np.isfinite(float(width)) or float(width) < 0):
+                raise ValueError('Urban forest hotspot widths must be finite and nonnegative.')
+        self.thermal_crown_geometry = mode
+        self.thermal_hotspot_inner = inner
+        self.thermal_hotspot_outer = outer
+
+    def canopy_proportions(self, vza, vaa, sza, saa, density=None,
+                           crown_height=None, row_azimuth=None, row_geometry=None):
+        if self.canopy_fraction_model is not None and self.vegetation_model in ('hom', 'row', 'crown'):
+            lai, std, radius, height, hspot = self.forestshape[:5]
+            view, view_azimuth, solar, solar_azimuth = (a.ravel() for a in np.broadcast_arrays(
+                np.atleast_1d(vza).astype(float), np.atleast_1d(vaa).astype(float),
+                np.atleast_1d(sza).astype(float), np.atleast_1d(saa).astype(float)))
+            if self.vegetation_model == 'crown':
+                vertical = height if crown_height is None else crown_height
+                shape, azimuth = (std if density is None else density, vertical, radius), 0.0
+                base = getattr(self, 'crown_base', None)
+                base = vertical if base is None else base
+            else:
+                shape, azimuth, base = self.row_shape[:3], self.row_shape[3] if row_azimuth is None else row_azimuth, None
+            return np.asarray([self.canopy_fraction_model(self.vegetation_model, float(lai), float(hspot), shape,
+                                                          v, a, s, sa, float(azimuth), base)
+                               for v, a, s, sa in zip(view, view_azimuth, solar, solar_azimuth)]).T
+        if self.vegetation_model != 'crown' or self.thermal_crown_geometry == 'legacy':
+            return super().canopy_proportions(vza, vaa, sza, saa, density,
+                                               crown_height, row_azimuth, row_geometry)
+        # Reuse whole-crown two-scale geometry only. Thermal source terms and
+        # building sun/view overlap remain in the urban emission calculation.
+        from .thermal_crown import component_fractions
+        lai, std, radius, height, hspot = self.forestshape
+        settings = dict(lai=lai, stand_density=std if density is None else density,
+                        height=height if crown_height is None else crown_height,
+                        width=radius, hspot=hspot, thermal_crown_geometry=self.thermal_crown_geometry,
+                        thermal_hotspot_inner=self.thermal_hotspot_inner,
+                        thermal_hotspot_outer=self.thermal_hotspot_outer,
+                        crown_base=getattr(self, 'crown_base', None))
+        view, view_azimuth, solar, solar_azimuth = np.broadcast_arrays(
+            np.asarray(vza, float), np.asarray(vaa, float),
+            np.asarray(sza, float), np.asarray(saa, float))
+        relative = np.abs((view_azimuth - solar_azimuth + 180.) % 360. - 180.)
+        return component_fractions(settings, solar, view, relative)
+
+
+    shapes = np.asarray([[10,10,10,0.001,0,90],
+                         [10,10,30,0.0005,0,90]])
+    n_shape,n_dim = np.shape(shapes)
+
+    forestshape = np.asarray([5.0,0.01,3,3,0.2])
+    crown = Crown()
+
+    ci = 1.0
+    ### liqing 0.90-0.85
+    ### shimian 0.90-0.95
+    ### zhuan 0.930
+    ### boli 0.94
+    ### suliao 0.7-0.9
+    ### shuini 0.95
+    ### wuding 0.91
+    ### hunningtu 0.94
+
+
+    Eroof = 0.92
+    Ewall = 0.90
+    Estreat = 0.90
+    Estreat_ee = 0.950  ### 这个是有效发射率
+    Eveg = 0.975
+
+
+    Troof_sunlit = 310
+    Troof_shaded = 300
+    Twall_sunlit = 310
+    Twall_shaded = 300
+    Tstreat_sunlit = 310
+    Tstreat_shaded = 300
+    vza_ = np.asarray([40,40])
+    vaa_ = np.asarray([90,90])
+    sza = 20
+    saa = 25
+    n_part = 3
+    n_angle = 2
+    canopy_effective_emissivity = []
+    component_effective_emissivity = []
+    canopy_brightness_temperature = []
+    pStreatV = 0
+    pRoofV = 0
+    pWallV = 0
+
+
+
+    ###############################################
+    #### geometrical optical theory
+    ###########################################
+
+    def calculate_direct_emissivity(self,kangle,ifP = 0):
+        shapes = self.shapes
+        Eroof = self.Eroof
+        Ewall = self.Ewall
+        Estreat = self.Estreat
+        Eveg = self.Eveg
+        n_shape = self.n_shape
+        n_dem = self.n_dim
+        n_part = self.n_part
+        vza = self.vza_[kangle]
+        vaa = self.vaa_[kangle]
+        sza = self.sza
+        saa = self.saa
+        raa = np.asarray(_fold(vaa - saa))
+
+        ind = raa>180
+        if np.sum(ind)>0:
+            raa[ind] = 360-raa[ind]
+
+
+        rd = np.pi / 180.0
+        ui = np.cos(sza * rd)
+        uv = np.cos(vza * rd)
+        si = np.sin(sza * rd)
+        sv = np.sin(vza * rd)
+        up = np.cos(raa * rd)
+        tantv = np.tan(vza * rd)
+        tants = np.tan(sza * rd)
+
+        height1r = 0
+        projv = 0
+        projs = 0
+        projvs = 0
+        # laa = 0
+        # waa = laa + 90
+        proof = 0
+        for kshape2 in range(n_shape):
+            shape2 = shapes[kshape2]
+            length2 = shape2[0]
+            width2 = shape2[1]
+            height2 = shape2[2]
+            alpha2 = shape2[3]
+            laa2 = shape2[4]
+            waa2 = shape2[5]
+            height2m1 = height2 - height1r
+            if height2m1 <= 0: continue
+            proj_roof = alpha2 * length2 * width2
+            projv_wall = alpha2 * (height2m1 * length2 * tantv * np.abs(np.cos((vaa - laa2) * rd)) +
+                                   height2m1 * width2 * tantv * np.abs(np.cos((vaa - waa2) * rd)))
+            projv_temp = projv_wall
+            projv = projv + projv_temp
+            projs_wall = alpha2 * (height2m1 * length2 * tants * np.abs( np.cos((saa - laa2) * rd)) +
+                                   height2m1 * width2 * tants * np.abs(np.cos((saa - waa2) * rd)))
+            projs_temp = projs_wall
+            projs = projs + projs_temp
+            proof = proof+ proj_roof
+        Overlapping = _overlap(tantv, tants, up)
+        partmax = np.max([projv,projs])
+        partmin = np.min([projv,projs])
+        # if (raa == 0) | (raa == 180):
+        #     Overlapping = 0
+        projvs = partmax+partmin * Overlapping
+        # projvs = projv + projs * Overlapping
+
+        pStreatV = np.exp(-projv)*(1-proof)
+        pStreatS = np.exp(-projs)*(1-proof)
+        pStreatV_sunlit = np.exp(-projvs)*(1-proof)
+        pStreatV_shaded = pStreatV - pStreatV_sunlit
+        pStreatV_sunlit_fraction = pStreatV_sunlit / pStreatV if pStreatV > 0.0 else 0.0
+
+
+        ###-------------------------------------------------
+        forestshape = self.forestshape
+        lai = forestshape[0]
+        std = forestshape[1]
+        hspot = forestshape[4]
+        hcr = forestshape[3]
+        rcr = forestshape[2]
+        Pcomtemp = self.canopy_proportions(vza, vaa, sza, saa)
+
+        pStreatV_veg = pStreatV_sunlit*( Pcomtemp[2][0]+Pcomtemp[3][0]) +pStreatV_shaded*( Pcomtemp[2][0]+Pcomtemp[3][0])
+        pStreatV_veg_sunlit = pStreatV_sunlit*Pcomtemp[0][0]
+        pStreatV_veg_shaded = pStreatV_sunlit*Pcomtemp[1][0] + pStreatV_shaded*(Pcomtemp[0][0] + Pcomtemp[1][0])
+        pStreatV_leaf_sunlit = pStreatV_sunlit * Pcomtemp[2][0]
+        pStreatV_leaf_shaded = pStreatV * (Pcomtemp[2][0] + Pcomtemp[3][0]) - pStreatV_leaf_sunlit
+        self._street_view = (float(pStreatV_sunlit), float(pStreatV_shaded))
+
+        ###-------------------------------------------------
+
+
+
+        ## 计算屋顶的可视比例
+        pRoofV = 0
+        pRoofS = 0
+        pRoof_sunlit = 0
+        for kshape1 in range(n_shape):
+            shape1 = shapes[kshape1]
+            length1 = shape1[0]
+            width1 = shape1[1]
+            height1 = shape1[2]
+            alpha1 = shape1[3]
+            height1r = height1
+            projv = 0
+            projs = 0
+            for kshape2 in range(n_shape):
+                shape2 = shapes[kshape2]
+                length2 = shape2[0]
+                width2 = shape2[1]
+                height2 = shape2[2]
+                alpha2 = shape2[3]
+                laa2 = shape2[4]
+                waa2 = shape2[5]
+                height2m1 = height2 - height1r
+                if height2m1 <= 0: continue
+                proj_roof = alpha2 * length2 * width2
+                projv_wall = alpha2 * (height2m1 * length2 * tantv * np.abs(np.cos((vaa - laa2) * rd)) +
+                                       height2m1 * width2 * tantv * np.abs(np.cos((vaa - waa2) * rd)))
+                projv_temp = projv_wall
+                projv = projv + projv_temp
+
+                projs_wall = alpha2 * (height2m1 * length2 * tants * np.abs(np.cos((saa - laa2) * rd)) +
+                                       height2m1 * width2 * tants * np.abs(np.cos((saa - waa2) * rd)))
+                projs_temp = projs_wall
+                projs = projs + projs_temp
+            Overlapping = _overlap(tantv, tants, up)
+            partmax = np.max([projv, projs])
+            partmin = np.min([projv, projs])
+            # if (raa == 0) | (raa==180):
+            #     Overlapping = 0
+            projvs = partmax+partmin * Overlapping
+            # projvs = projv + projs * Overlapping
+            gapv_roof = np.exp(-projv)
+            gaps_roof = np.exp(-projs)
+            gapvs_roof = np.exp(-projvs)
+            pRoofV_temp = alpha1 * gapv_roof * (length1) * (width1)
+            pRoofV = pRoofV + pRoofV_temp
+            pRoofS_temp = alpha1 * gaps_roof * (length1) * (width1)
+            pRoofS = pRoofS + pRoofS_temp
+            pRoof_sunlit_temp = alpha1 * gapvs_roof * (length1) * (width1)
+            pRoof_sunlit = pRoof_sunlit + pRoof_sunlit_temp
+        pRoof_shaded = pRoofV - pRoof_sunlit
+
+        pWall_sunlit_fraction = 0
+        pWall_sunlit_fraction_Weight = 0
+        wsunlit = 0
+        lsunlit = 0
+        for kshape1 in range(n_shape):
+            shape1 = shapes[kshape1]
+            length1 = shape1[0]
+            width1 = shape1[1]
+            height1 = shape1[2]
+            alpha1 = shape1[3]
+            height1r = height1
+            laa1 = shape1[4]
+            waa1 = shape1[5]
+            dheight = height1 / n_part
+            projv = 0
+            projs = 0
+            for kh in range(n_part):
+                height_temp = dheight * (kh + 0.5)
+                #### 计算在观测方向投影，分别有墙壁和屋顶的投影
+                proj = (shapes[:, 2] - height_temp) * shapes[:, 3] * tantv
+                ind = proj < 0
+                proj[ind] = 0
+                area_roof = shapes[:, 3] * shapes[:, 1] * shapes[:, 0]
+                area_roof[ind] = 0
+                proj_roof = np.sum(area_roof)
+                projv_wall = np.sum(proj * shapes[:, 0] * np.abs(np.cos((vaa - shapes[:,4]) * rd))) +\
+                             np.sum(proj * shapes[:, 1] * np.abs(np.cos((vaa - shapes[:,5]) * rd)))
+                projv_temp = projv_wall + proj_roof
+                projv = projv + projv_temp
+
+                ### 计算在太阳角度投影
+                proj = (shapes[:, 2] - height_temp) * shapes[:, 3] * tants
+                ind = proj < 0
+                proj[ind] = 0
+                projs_wall = np.sum(proj * shapes[:, 0] * np.abs(np.cos((saa - shapes[:,4]) * rd))) + \
+                             np.sum(proj * shapes[:, 1] * np.abs(np.cos((saa - shapes[:,5]) * rd)))
+                area_roof = shapes[:, 3] * shapes[:, 1] * shapes[:, 0]
+                area_roof[ind] = 0
+                proj_roof = np.sum(area_roof)
+                projs_temp = projs_wall + proj_roof
+                projs = projs + projs_temp
+            projv = projv / n_part
+            projs = projs / n_part
+            Overlapping = _overlap(tantv, tants, up)
+            if Overlapping==0:
+                a = 1
+            partmax = np.max([projv, projs])
+            partmin = np.min([projv, projs])
+            # if (raa == 0) | (raa==180):
+            #     Overlapping = 0
+            projvs = partmax+partmin * Overlapping
+            # projvs = projv + projs * Overlapping
+            gapv_wall = np.exp(-projv)
+            gapvs_wall = np.exp(-projvs)
+
+
+            lsunlit = 0
+            part1 = np.abs(laa1 - saa)
+            part1 = _fold(part1)
+            part2 = np.abs(laa1 - vaa)
+            part2 = _fold(part2)
+            if ((part1 < 90) * (part2 < 90)) > 0: lsunlit = 1
+            part1 = np.abs(laa1+180 - saa)
+            part1 = _fold(part1)
+            part2 = np.abs(laa1+180 - vaa)
+            part2 = _fold(part2)
+            if ((part1 < 90) * (part2 < 90)) > 0: lsunlit = 1
+            wsunlit = 0
+            part1 = np.abs(waa1 - saa)
+            part1 = _fold(part1)
+            part2 = np.abs(waa1 - vaa)
+            part2 = _fold(part2)
+            if ((part1 < 90) * (part2 < 90)) > 0: wsunlit = 1
+            part1 = np.abs(waa1+180 - saa)
+            part1 = _fold(part1)
+            part2 = np.abs(waa1+180 - vaa)
+            part2 = _fold(part2)
+            if ((part1 < 90) * (part2 < 90)) > 0: wsunlit = 1
+
+            # lsunlit_ratio = np.cos(np.abs(laa1 - saa))
+            # wsunlit_ratio = np.cos(np.abs(waa1 - saa))
+            lsunlit_ratio = 1.0
+            wsunlit_ratio = 1.0
+
+            pWall_sunlit_fraction = pWall_sunlit_fraction + alpha1 * gapvs_wall * (
+                        (height1 * length1 * tantv * np.abs(np.cos((vaa - laa1) * rd))) * lsunlit * lsunlit_ratio +
+                        (height1 * width1 * tantv * np.abs(np.cos((vaa - waa1) * rd)) * wsunlit*wsunlit_ratio))
+            pWall_sunlit_fraction_Weight = pWall_sunlit_fraction_Weight + alpha1 * gapv_wall * (
+                        (height1 * length1 * tantv * np.abs(np.cos((vaa - laa1) * rd))) +
+                        (height1 * width1 * tantv * np.abs(np.cos((vaa - waa1) * rd))))
+        if pWall_sunlit_fraction_Weight !=0:
+            pWall_sunlit_fraction = pWall_sunlit_fraction / pWall_sunlit_fraction_Weight
+        else:
+            pWall_sunlit_fraction = 0
+
+        # print(pWall_sunlit_fraction_Weight,pWall_sunlit_fraction)
+        pWallV = 1 - pStreatV - pRoofV
+        # pWallV = pWall_sunlit_fraction_Weight
+        pWallV_sunlit = pWallV * pWall_sunlit_fraction
+        pWallV_shaded = pWallV - pWallV_sunlit
+
+        #
+        # pStreatV = 1-pWallV-pRoofV
+        # pStreatV_sunlit = pStreatV * pStreatV_sunlit_fraction
+        # pStreatV_shaded = pStreatV - pStreatV_sunlit
+
+        wsunlit = wsunlit
+        if ifP ==1:
+            return pWallV*Ewall, pStreatV*Estreat, pRoofV*Eroof
+            # return 0, 0, pRoofV
+        elif ifP ==2:
+            return pWallV_sunlit * Ewall, pWallV_shaded * Ewall,\
+                   pStreatV_veg_sunlit * Estreat, pStreatV_veg_shaded * Estreat,\
+                   pRoof_sunlit*Eroof,pRoof_shaded*Eroof,\
+                   pStreatV_leaf_sunlit*Eveg,pStreatV_leaf_shaded*Eveg
+            # return wsunlit, wsunlit,\
+            #        wsunlit, wsunlit, \
+            #        wsunlit, wsunlit
+        elif ifP ==3:
+            return pWallV_sunlit, pWallV_shaded , \
+                   pStreatV_sunlit , pStreatV_shaded , \
+                   pRoof_sunlit , pRoof_shaded
+        else:
+            return pWallV*Ewall + pStreatV *Estreat + pRoofV*Eroof
+
+    def calculate_proportions(self,kangle,ifP = 0):
+        shapes = self.shapes
+        Eroof = self.Eroof
+        Ewall = self.Ewall
+        Estreat = self.Estreat
+        n_shape = self.n_shape
+        n_dem = self.n_dim
+        n_part = self.n_part
+        vza = self.vza_[kangle]
+        vaa = self.vaa_[kangle]
+        sza = self.sza
+        saa = self.saa
+        raa = np.asarray(_fold(vaa - saa))
+
+        ind = raa>180
+        if np.sum(ind)>0:
+            raa[ind] = 360-raa[ind]
+
+
+        rd = np.pi / 180.0
+        ui = np.cos(sza * rd)
+        uv = np.cos(vza * rd)
+        si = np.sin(sza * rd)
+        sv = np.sin(vza * rd)
+        up = np.cos(raa * rd)
+        tantv = np.tan(vza * rd)
+        tants = np.tan(sza * rd)
+
+        height1r = 0
+        projv = 0
+        projs = 0
+        projvs = 0
+        # laa = 0
+        # waa = laa + 90
+        proof = 0
+        for kshape2 in range(n_shape):
+            shape2 = shapes[kshape2]
+            length2 = shape2[0]
+            width2 = shape2[1]
+            height2 = shape2[2]
+            alpha2 = shape2[3]
+            laa2 = shape2[4]
+            waa2 = shape2[5]
+            height2m1 = height2 - height1r
+            if height2m1 <= 0: continue
+            proj_roof = alpha2 * length2 * width2
+            projv_wall = alpha2 * (height2m1 * length2 * tantv * np.abs(np.cos((vaa - laa2) * rd)) +
+                                   height2m1 * width2 * tantv * np.abs(np.cos((vaa - waa2) * rd)))
+            projv_temp = projv_wall
+            projv = projv + projv_temp
+            projs_wall = alpha2 * (height2m1 * length2 * tants * np.abs( np.cos((saa - laa2) * rd)) +
+                                   height2m1 * width2 * tants * np.abs(np.cos((saa - waa2) * rd)))
+            projs_temp = projs_wall
+            projs = projs + projs_temp
+            proof = proof+ proj_roof
+        Overlapping = _overlap(tantv, tants, up)
+        partmax = np.max([projv,projs])
+        partmin = np.min([projv,projs])
+        # if (raa == 0) | (raa == 180):
+        #     Overlapping = 0
+        projvs = partmax+partmin * Overlapping
+        # projvs = projv + projs * Overlapping
+
+        pStreatV = np.exp(-projv)*(1-proof)
+        pStreatS = np.exp(-projs)*(1-proof)
+        pStreatV_sunlit = np.exp(-projvs)*(1-proof)
+        pStreatV_shaded = pStreatV - pStreatV_sunlit
+        pStreatV_sunlit_fraction = pStreatV_sunlit/pStreatV
+
+        ## 计算屋顶的可视比例
+        pRoofV = 0
+        pRoofS = 0
+        pRoof_sunlit = 0
+        for kshape1 in range(n_shape):
+            shape1 = shapes[kshape1]
+            length1 = shape1[0]
+            width1 = shape1[1]
+            height1 = shape1[2]
+            alpha1 = shape1[3]
+            height1r = height1
+            projv = 0
+            projs = 0
+            for kshape2 in range(n_shape):
+                shape2 = shapes[kshape2]
+                length2 = shape2[0]
+                width2 = shape2[1]
+                height2 = shape2[2]
+                alpha2 = shape2[3]
+                laa2 = shape2[4]
+                waa2 = shape2[5]
+                height2m1 = height2 - height1r
+                if height2m1 <= 0: continue
+                proj_roof = alpha2 * length2 * width2
+                projv_wall = alpha2 * (height2m1 * length2 * tantv * np.abs(np.cos((vaa - laa2) * rd)) +
+                                       height2m1 * width2 * tantv * np.abs(np.cos((vaa - waa2) * rd)))
+                projv_temp = projv_wall
+                projv = projv + projv_temp
+
+                projs_wall = alpha2 * (height2m1 * length2 * tants * np.abs(np.cos((saa - laa2) * rd)) +
+                                       height2m1 * width2 * tants * np.abs(np.cos((saa - waa2) * rd)))
+                projs_temp = projs_wall
+                projs = projs + projs_temp
+            Overlapping = _overlap(tantv, tants, up)
+            partmax = np.max([projv, projs])
+            partmin = np.min([projv, projs])
+            # if (raa == 0) | (raa==180):
+            #     Overlapping = 0
+            projvs = partmax+partmin * Overlapping
+            # projvs = projv + projs * Overlapping
+            gapv_roof = np.exp(-projv)
+            gaps_roof = np.exp(-projs)
+            gapvs_roof = np.exp(-projvs)
+            pRoofV_temp = alpha1 * gapv_roof * (length1) * (width1)
+            pRoofV = pRoofV + pRoofV_temp
+            pRoofS_temp = alpha1 * gaps_roof * (length1) * (width1)
+            pRoofS = pRoofS + pRoofS_temp
+            pRoof_sunlit_temp = alpha1 * gapvs_roof * (length1) * (width1)
+            pRoof_sunlit = pRoof_sunlit + pRoof_sunlit_temp
+        pRoof_shaded = pRoofV - pRoof_sunlit
+
+        pWall_sunlit_fraction = 0
+        pWall_sunlit_fraction_Weight = 0
+        wsunlit = 0
+        lsunlit = 0
+        for kshape1 in range(n_shape):
+            shape1 = shapes[kshape1]
+            length1 = shape1[0]
+            width1 = shape1[1]
+            height1 = shape1[2]
+            alpha1 = shape1[3]
+            height1r = height1
+            laa1 = shape1[4]
+            waa1 = shape1[5]
+            dheight = height1 / n_part
+            projv = 0
+            projs = 0
+            for kh in range(n_part):
+                height_temp = dheight * (kh + 0.5)
+                #### 计算在观测方向投影，分别有墙壁和屋顶的投影
+                proj = (shapes[:, 2] - height_temp) * shapes[:, 3] * tantv
+                ind = proj < 0
+                proj[ind] = 0
+                area_roof = shapes[:, 3] * shapes[:, 1] * shapes[:, 0]
+                area_roof[ind] = 0
+                proj_roof = np.sum(area_roof)
+                projv_wall = np.sum(proj * shapes[:, 0] * np.abs(np.cos((vaa - shapes[:,4]) * rd))) +\
+                             np.sum(proj * shapes[:, 1] * np.abs(np.cos((vaa - shapes[:,5]) * rd)))
+                projv_temp = projv_wall + proj_roof
+                projv = projv + projv_temp
+
+                ### 计算在太阳角度投影
+                proj = (shapes[:, 2] - height_temp) * shapes[:, 3] * tants
+                ind = proj < 0
+                proj[ind] = 0
+                projs_wall = np.sum(proj * shapes[:, 0] * np.abs(np.cos((saa - shapes[:,4]) * rd))) + \
+                             np.sum(proj * shapes[:, 1] * np.abs(np.cos((saa - shapes[:,5]) * rd)))
+                area_roof = shapes[:, 3] * shapes[:, 1] * shapes[:, 0]
+                area_roof[ind] = 0
+                proj_roof = np.sum(area_roof)
+                projs_temp = projs_wall + proj_roof
+                projs = projs + projs_temp
+            projv = projv / n_part
+            projs = projs / n_part
+            Overlapping = _overlap(tantv, tants, up)
+            if Overlapping==0:
+                a = 1
+            partmax = np.max([projv, projs])
+            partmin = np.min([projv, projs])
+            # if (raa == 0) | (raa==180):
+            #     Overlapping = 0
+            projvs = partmax+partmin * Overlapping
+            # projvs = projv + projs * Overlapping
+            gapv_wall = np.exp(-projv)
+            gapvs_wall = np.exp(-projvs)
+
+
+            lsunlit = 0
+            part1 = np.abs(laa1 - saa)
+            part1 = _fold(part1)
+            part2 = np.abs(laa1 - vaa)
+            part2 = _fold(part2)
+            if ((part1 < 90) * (part2 < 90)) > 0: lsunlit = 1
+            part1 = np.abs(laa1+180 - saa)
+            part1 = _fold(part1)
+            part2 = np.abs(laa1+180 - vaa)
+            part2 = _fold(part2)
+            if ((part1 < 90) * (part2 < 90)) > 0: lsunlit = 1
+            wsunlit = 0
+            part1 = np.abs(waa1 - saa)
+            part1 = _fold(part1)
+            part2 = np.abs(waa1 - vaa)
+            part2 = _fold(part2)
+            if ((part1 < 90) * (part2 < 90)) > 0: wsunlit = 1
+            part1 = np.abs(waa1+180 - saa)
+            part1 = _fold(part1)
+            part2 = np.abs(waa1+180 - vaa)
+            part2 = _fold(part2)
+            if ((part1 < 90) * (part2 < 90)) > 0: wsunlit = 1
+
+            # lsunlit_ratio = np.cos(np.abs(laa1 - saa))
+            # wsunlit_ratio = np.cos(np.abs(waa1 - saa))
+            lsunlit_ratio = 1.0
+            wsunlit_ratio = 1.0
+
+            pWall_sunlit_fraction = pWall_sunlit_fraction + alpha1 * gapvs_wall * (
+                        (height1 * length1 * tantv * np.abs(np.cos((vaa - laa1) * rd))) * lsunlit * lsunlit_ratio +
+                        (height1 * width1 * tantv * np.abs(np.cos((vaa - waa1) * rd)) * wsunlit*wsunlit_ratio))
+            pWall_sunlit_fraction_Weight = pWall_sunlit_fraction_Weight + alpha1 * gapv_wall * (
+                        (height1 * length1 * tantv * np.abs(np.cos((vaa - laa1) * rd))) +
+                        (height1 * width1 * tantv * np.abs(np.cos((vaa - waa1) * rd))))
+        if pWall_sunlit_fraction_Weight !=0:
+            pWall_sunlit_fraction = pWall_sunlit_fraction / pWall_sunlit_fraction_Weight
+        else:
+            pWall_sunlit_fraction = 0
+
+        # print(pWall_sunlit_fraction_Weight,pWall_sunlit_fraction)
+        pWallV = 1 - pStreatV - pRoofV
+        # pWallV = pWall_sunlit_fraction_Weight
+        pWallV_sunlit = pWallV * pWall_sunlit_fraction
+        pWallV_shaded = pWallV - pWallV_sunlit
+
+        #
+        # pStreatV = 1-pWallV-pRoofV
+        # pStreatV_sunlit = pStreatV * pStreatV_sunlit_fraction
+        # pStreatV_shaded = pStreatV - pStreatV_sunlit
+
+        wsunlit = wsunlit
+        if ifP ==0:
+            return pWallV, pStreatV, pRoofV
+
+
+    ###############################################
+    #### spectral invariant theory
+    ###########################################
+    def calculate_scattering_emissivity(self, hza0,ifP = 0):
+
+        shapes = self.shapes
+        Eroof = self.Eroof
+        Ewall = self.Ewall
+        Estreat = self.Estreat
+        Eveg = self.Eveg
+
+        forestshape = self.forestshape
+        lai = forestshape[0]
+        std = forestshape[1]
+        hspot = forestshape[4]
+        hcr = forestshape[3]
+        rcr = forestshape[2]
+
+        # Flux-weighted hemisphere canopy coverage drives the existing
+        # street/wall interreflection approximation for every canopy kind.
+        # It does not depend on the view direction: computed once per sun position and canopy.
+        key = (self.vegetation_model, self.thermal_crown_geometry, str(self.thermal_hotspot_inner),
+               str(self.thermal_hotspot_outer), str(getattr(self, 'crown_base', None)), tuple(self.row_shape),
+               self.canopy_fraction_model, tuple(np.asarray(forestshape, float)), float(self.sza), float(self.saa),
+               tuple(self.coverage_grid))
+        if key not in _COVERAGE_CACHE:
+            hz, ha = np.meshgrid((np.arange(self.coverage_grid[0]) + 0.5) * 90.0 / self.coverage_grid[0],
+                                 np.arange(self.coverage_grid[1]) * 360.0 / self.coverage_grid[1])
+            cov_weights = np.cos(np.deg2rad(hz)).ravel() * np.sin(np.deg2rad(hz)).ravel()
+            # Only the leaf/soil view marginals are used; the row corridor
+            # correction preserves them, so the cheaper legacy row geometry is exact here.
+            cov = self.canopy_proportions(hz.ravel(), ha.ravel(), self.sza, self.saa, row_geometry="legacy")
+            if len(_COVERAGE_CACHE) > 4096:
+                _COVERAGE_CACHE.clear()
+            _COVERAGE_CACHE[key] = (cov, cov_weights)
+        coverage, weights = _COVERAGE_CACHE[key]
+        Pveg_in_streat = float(np.average(coverage[2] + coverage[3], weights=weights))
+        Estreat_ee = Estreat*(1-Pveg_in_streat)+Eveg*Pveg_in_streat
+
+        n_shape = self.n_shape
+        n_dem = self.n_dim
+        n_part = self.n_part
+        vza = self.vza_[hza0]
+        vaa = self.vaa_[hza0]
+        sza = self.sza
+        saa = self.saa
+        raa = np.asarray(_fold(vaa - saa))
+
+        ind = raa>180
+        if np.sum(ind)>0:
+            raa[ind] = 360-raa[ind]
+
+
+        rd = np.pi / 180.0
+        ui = np.cos(sza * rd)
+        uv = np.cos(vza * rd)
+        si = np.sin(sza * rd)
+        sv = np.sin(vza * rd)
+        up = np.cos(raa * rd)
+        tantv = np.tan(vza * rd)
+        tants = np.tan(sza * rd)
+        # laa = 0   ### the relatvie anzimuth angle of length
+        # waa = laa + 90  #### the relative azimuth angle of width
+
+        ###-------------------------------
+        ### 街道的计算
+        ###-------------------------------
+        height1r = 0
+        projv = 0
+        projs = 0
+        projvs = 0
+        for kshape2 in range(n_shape):
+            #### information of building will be projected
+            shape2 = shapes[kshape2]
+            length2 = shape2[0]
+            width2 = shape2[1]
+            height2 = shape2[2]
+            alpha2 = shape2[3]
+            laa2 = shape2[4]
+            waa2 = shape2[5]
+            ### pass the lower building against a reference height
+            height2m1 = height2 - height1r
+            if height2m1 < 0: continue
+            ### projection of roof, this is direct to its area with density
+            proj_roof = alpha2 * length2 * width2
+            ### projection of wall from length and width for view;    h * l * tanL * cosl + h* w*tanW*cosW
+            projv_wall = alpha2 * (height2m1 * length2 * tantv * np.abs(np.cos((vaa - laa2) * rd)) +
+                                   height2m1 * width2 * tantv * np.abs(np.cos((vaa - waa2) * rd)))
+            ### for kshape2 the projection
+            projv_temp = projv_wall + proj_roof
+            ### all projection accumulate
+            projv = projv + projv_temp
+            ### projection of wall from length and width for solar;    h * l * tanL * cosl + h* w*tanW*cosW
+            projs_wall = alpha2 * (height2m1 * length2 * tants * np.abs(np.cos((saa - laa2) * rd)) +
+                                   height2m1 * width2 * tants * np.abs(np.cos((saa - waa2) * rd)))
+            #### for solar
+            projs_temp = projs_wall + proj_roof
+            ### accumate
+            projs = projs + projs_temp
+
+        ### calculate the sunlitfraction, this is the overlappling increatsing part, hotspot O = 0
+        Overlapping = _overlap(tantv, tants, up)
+        partmax = np.max([projv, projs])
+        partmin = np.min([projv, projs])
+        # if (raa == 0) | (raa==180):
+        #     Overlapping = 0
+        projvs = partmax + partmin * Overlapping
+        # projvs = projv + projs * Overlapping
+
+        ### gap frequency of streat in solar and viewing directions
+        pStreatV = np.exp(-projv)
+        pStreatS = np.exp(-projs)
+        ### sunit and shaded part
+        pStreatV_sunlit = np.exp(-projvs)
+        pStreatV_shaded = pStreatV - pStreatV_sunlit
+
+        ###-------------------------------
+        ### 墙壁的计算
+        ###-------------------------------
+        ### 半球投影的归一化
+        if2 = 1.0
+        ### 上半球的方向
+        if self.hemisphere_grid is None:
+            n_hza0, n_haa0 = 90, 60
+            hza0 = np.linspace(0, 89, n_hza0) # hemisphere space
+            haa0 = np.linspace(0, 360, n_haa0)
+        else:
+            n_hza0, n_haa0 = self.hemisphere_grid
+            hza0 = (np.arange(n_hza0) + 0.5) * 90.0 / n_hza0
+            haa0 = (np.arange(n_haa0) + 0.5) * 360.0 / n_haa0
+        hza,haa = np.meshgrid(hza0,haa0)
+        hza = np.reshape(hza,-1)  ### to linear
+        haa = np.reshape(haa,-1)  ### to linear
+
+        ### step of hza in rad unit rather zhan degree unit
+        dangle = np.pi/2.0/n_hza0 # 角度的步长
+        tantemp = np.tan(hza * rd)   ### 半球的正切
+        # fweiplus = np.sin(hza*rd)*dangle *np.cos(hza*rd) # 角度的归一化方式, 一般是0.5
+        fweiplus = np.sin(hza * rd) * dangle  ##### 一般是1.0
+        fweiplusSum = np.sum(if2*fweiplus)  ### 权重累计，如果没有meshgrid，应该是0.5，现在总和是0.5*n_haa0
+
+        ### 墙壁在观测方向的投影面积
+        tempSv = (np.sum(shapes[:, 3] * shapes[:, 2]  * shapes[:, 0] * tantv * np.abs(np.cos((vaa - shapes[:, 4]) * rd))) +
+                  np.sum(shapes[:, 3] * shapes[:, 2]  * shapes[:, 1] * tantv * np.abs(np.cos((vaa - shapes[:, 5]) * rd))))
+        ### 屋顶的投影面积
+        proj_rooff =  np.sum(shapes[:,1]*shapes[:,0]*shapes[:,3])
+        ### 透过屋顶又通过墙壁的到达街道的概率
+        f = np.exp(-(tempSv+proj_rooff))
+        ff =  np.exp(-(proj_rooff))
+        f0 = np.exp(-tempSv)
+        fw = ff- f
+        i0v = 1-f0
+        i0v = ff-f
+        fs = f
+        fr = 1-ff
+        # print(fr+fs+fw)
+        eu = 0.0
+        ed = 0.0
+        au = 0.5
+        ad = 0.5
+
+
+
+        for kshape1 in range(n_shape):
+            shape1 = shapes[kshape1]
+            length1 = shape1[0]
+            width1 = shape1[1]
+            height1 = shape1[2]
+            alpha1 = shape1[3]
+            dheight = height1 / n_part
+            height1p = height1
+            laa1 = shape1[4]
+            waa1 = shape1[5]
+            for kh in range(n_part):
+                heighttemp = dheight * (kh+0.5)
+                tempdS = (length1 * dheight * alpha1)* tantv * np.abs(np.cos((vaa - laa1) * rd)) +\
+                         (width1 * dheight * alpha1)* tantv * np.abs(np.cos((vaa - waa1) * rd))
+
+                ftempv = 1.0
+
+                projStemp = 0
+                proj_roof = 0
+                tempSv = 0
+                for kshape2 in range(n_shape):
+                    shape2 = shapes[kshape2]
+                    length2 = shape2[0]
+                    width2 = shape2[1]
+                    height2 = shape2[2]
+                    alpha2 = shape2[3]
+                    laa2 = shape2[4]
+                    waa2 = shape2[5]
+
+                    if(height2 - heighttemp>0):
+                        proj_roof = proj_roof + width2 * length2 * alpha2
+                        projStemp = projStemp + (alpha2 * (height2-heighttemp) *length2)* \
+                                     tantemp * np.abs(np.cos((haa - laa2) * rd)) + \
+                                     (alpha2 * (height2-heighttemp) *width2) * \
+                                     tantemp * np.abs(np.cos((haa - waa2) * rd))
+
+                        tempSv = tempSv + (alpha2 * (height2-heighttemp) *length2)* tantv * np.abs(np.cos((vaa - laa2) * rd)) + \
+                                (alpha2 * (height2-heighttemp) *width2)* tantv * np.abs(np.cos((vaa - waa2) * rd))
+                ftempv = np.exp(-(tempSv))
+                ftemp = np.exp(-(projStemp))
+                eu = eu + np.sum(if2 *ftemp*fweiplus/ fweiplusSum) *tempdS*ftempv
+
+                projStemp = 0
+                proj_roof = 0
+                for kshape2 in range(n_shape):
+                    shape2 = shapes[kshape2]
+                    length2 = shape2[0]
+                    width2 = shape2[1]
+                    height2 = shape2[2]
+                    alpha2 = shape2[3]
+                    laa2 = shape2[4]
+                    waa2 = shape2[5]
+
+                    if (height2 - heighttemp < 0):
+                        proj_roof = proj_roof + width2 * length2 * alpha2
+                        projStemp = projStemp  + (alpha2 * (height2) *length2)* \
+                                     tantemp * np.abs(np.cos((haa - laa2) * rd)) + \
+                                     (alpha2 * (height2) *width2) * \
+                                     tantemp * np.abs(np.cos((haa - waa2) * rd))
+                    if (height2 - heighttemp > 0):
+                        proj_roof = proj_roof + width2 * length2 * alpha2
+                        projStemp = projStemp + (alpha2 * (heighttemp) * length2) * \
+                                    tantemp * np.abs(np.cos((haa - laa2) * rd)) + \
+                                    (alpha2 * (heighttemp) * width2) * \
+                                    tantemp * np.abs(np.cos((haa - waa2) * rd))
+                ftemp = np.exp(-(projStemp))
+                ed = ed + np.sum(if2 * ftemp * fweiplus/ fweiplusSum) * tempdS * ftempv
+
+        if i0v == 0:
+            p = 0
+            eu = 0
+            ed = 0
+        else:
+            eu = eu / i0v * 0.5
+            ed = ed / i0v * 0.5
+            p = 1 - eu - ed
+
+
+
+
+        ### 到达街道，然后街道的比例，然后街道离开地面到达天空的概率
+        heighttemp = 0
+        ws = 0
+        C = 1.05
+        projStemp = 0
+        proj_roof = 0
+        tempSv = 0
+        for kshape2 in range(n_shape):
+            shape2 = shapes[kshape2]
+            length2 = shape2[0]
+            width2 = shape2[1]
+            height2 = shape2[2]
+            alpha2 = shape2[3]
+            laa2 = shape2[4]
+            waa2 = shape2[5]
+
+            if (height2 - heighttemp> 0):
+                proj_roof = proj_roof + width2 * length2 * alpha2
+                projStemp = projStemp + (alpha2 * (height2 - heighttemp) * length2) * \
+                            tantemp * np.abs(np.cos((haa - laa2) * rd)) + \
+                            (alpha2 * (height2 - heighttemp) * width2) * \
+                            tantemp * np.abs(np.cos((haa - waa2) * rd))
+                tempSv = tempSv + (alpha2 * (height2 - heighttemp) * length2) * tantv * np.abs(
+                        np.cos((vaa - laa2) * rd)) + \
+                         (alpha2 * (height2 - heighttemp) * width2) * tantv * np.abs(np.cos((vaa - waa2) * rd))
+
+        ftemp = np.exp(-(projStemp))
+        ftempv = np.exp(-(tempSv)) ### 到达该体元的概率
+        tempds = 1-proj_roof
+        ws = (1-np.sum(if2*(ftemp) * fweiplus/ fweiplusSum)) * ftempv * tempds
+
+
+        ### 从墙壁到达2屋顶，然后从屋顶反射到达天空的概率
+        wr = 0.0
+        for kshape1 in range(n_shape):
+            shape1 = shapes[kshape1]
+            length1 = shape1[0]
+            width1 = shape1[1]
+            height1 = shape1[2]
+            alpha1 = shape1[3]
+            heighttemp = height1
+            projStemp = 0
+            proj_roof = 0
+            tempSv = 0
+            for kshape2 in range(n_shape):
+                shape2 = shapes[kshape2]
+                length2 = shape2[0]
+                width2 = shape2[1]
+                height2 = shape2[2]
+                alpha2 = shape2[3]
+                laa2 = shape2[4]
+                waa2 = shape2[5]
+                if (height2 - heighttemp >= 0):
+                    ### 屋顶的总面积，高于所针对的屋顶
+                    proj_roof = proj_roof + width2 * length2 * alpha2
+                    ### 墙壁的投影面积，高于所针对的屋顶
+                    projStemp = projStemp + (alpha2 * (height2 - heighttemp) * length2) * \
+                                tantemp * np.abs(np.cos((haa - laa2) * rd)) + \
+                                (alpha2 * (height2 - heighttemp) * width2) * \
+                                tantemp * np.abs(np.cos((haa - waa2) * rd))
+                    ### 屋顶的位置被看到的概率
+                    tempSv = tempSv + (alpha2 * (height2 - heighttemp) * length2) * tantv * np.abs(
+                             np.cos((vaa - laa2) * rd)) + \
+                             (alpha2 * (height2 - heighttemp) * width2) * tantv * \
+                             np.abs(np.cos((vaa - waa2) * rd))
+            ftemp = np.exp(-(projStemp))
+            tempdS = length1 * width1 * alpha1*1.0/(1-proj_roof)
+            ftempv = np.exp(-(tempSv))*(1-proj_roof)
+            wr = wr + (1-np.sum(if2 * (ftemp) * fweiplus/fweiplusSum)) * tempdS * ftempv
+
+
+
+
+
+        eww = Ewall * (1 - Ewall) * p * i0v
+        ews = Ewall * (1-Estreat_ee) * ws
+        esw = Estreat_ee *(1-Ewall) * ed * i0v
+        ewr = Ewall *(1-Eroof) * wr
+        # ewr = 0
+
+        ew = fw * Ewall
+        es = f * Estreat_ee
+        er = (1-ff)*Eroof
+
+        vsraa = (180.0 - np.abs(raa)) / 180.0  # sunlit part becasue of raa
+        vhraa = 1 - vsraa
+
+
+        ## 场景中有多少光照组分
+
+        area = 0
+        fts = 1.0
+        for kshape1 in range(n_shape):
+            shape1 = shapes[kshape1]
+            length1 = shape1[0]
+            width1 = shape1[1]
+            height1 = shape1[2]
+            alpha1 = shape1[3]
+            laa1 = shape1[4]
+            waa1 = shape1[5]
+
+            area = area + (alpha1 * (height1) * length1) * tants * np.abs(np.cos((saa - laa1) * rd)) + \
+            (alpha1 * (height1) * width1) * tants * np.abs(np.cos((saa - waa1) * rd))
+        if area > 0:
+            fts = (1 - np.exp(-area)) / (area)
+
+        # eww = 0
+        # ews = 0
+        emw = ews + eww+ewr
+        emws = emw * fts*vhraa
+        emwh = emw - emws
+        ems = esw
+        emss = ems * pStreatS
+        emsh = ems - emss
+
+        street_to_wall = (1 - Ewall) * ed * i0v
+        emss = street_to_wall * Estreat * (1 - Pveg_in_streat) * pStreatS
+        emsh = street_to_wall * Estreat * (1 - Pveg_in_streat) * (1 - pStreatS)
+        emv = street_to_wall * Eveg * Pveg_in_streat
+        leaf_coverage = float(np.average(coverage[2] + coverage[3], weights=weights))
+        leaf_sun_fraction = (float(np.average(coverage[2], weights=weights)) /
+                             leaf_coverage if leaf_coverage > 0.0 else 0.0)
+        emvs = emv * pStreatS * leaf_sun_fraction
+        emvh = emv - emvs
+
+        # print(vza,vaa,wr)
+        if ifP == 1:
+            return emw,ems,0
+        elif ifP == 2:
+            return emws, emwh, emss, emsh, 0, 0, emvs, emvh
+        elif ifP == 3:
+            return 0, 0, 0, 0, 0, 0
+        else:
+            return esw + ews + eww + ewr
+
+
+    def set_strcutural_input(self,shapes):
+        from .urban import validate_urban_shapes
+        self.shapes = validate_urban_shapes(shapes)
+        self.n_shape, self.n_dim = np.shape(self.shapes)
+
+    def set_structural_input(self, shapes):
+        return self.set_strcutural_input(shapes)
+    def set_thermal_input(self,Trs,Trh,Tws,Twh,Tss,Tsh):
+        self.Troof_sunlit = Trs
+        self.Troof_shaded = Trh
+        self.Twall_sunlit = Tws
+        self.Twall_shaded = Twh
+        self.Tstreat_sunlit = Tss
+        self.Tstreat_shaded = Tsh
+
+    def set_angular_input(self,vza_,vaa_,sza,saa):
+        self.vaa_ = vaa_
+        self.vza_ = vza_
+        self.sza = sza
+        self.saa = saa
+        self.n_angle = np.size(vza_)
+
+    def set_spectral_input(self,estreat,ewall,eroof,eveg):
+        self.Estreat = estreat
+        self.Ewall = ewall
+        self.Eroof = eroof
+        self.Eveg = eveg
+
+    def calculate_effective_emissivity(self):
+        emissivity_ = []
+        for kangle in range(self.n_angle):
+            direct = self.calculate_direct_emissivity(kangle,0)
+            scatter = self.calculate_scattering_emissivity(kangle,0)
+            direct = np.asarray(direct)
+            scatter = np.asarray(scatter)
+            emissivity_.append(direct + scatter)
+
+        self.canopy_effective_emissivity = np.asarray(emissivity_ )
+        return np.asarray(emissivity_ )
+
+    def _canopy_scatter(self, kangle):
+        """Canopy scattering over the visible street, split by building shadow.
+
+        Returns street sunlit/shaded (soil-source terms; zero for the leaf-source closure) and leaf sunlit/shaded.
+        """
+        sunlit_view, shaded_view = self._street_view
+        lai, std, rcr, hcr = self.forestshape[:4]
+        angles = (np.asarray([self.vza_[kangle]]), np.asarray([self.sza]))
+        if self.canopy_scatter_model is None:
+            scat = canopy_scatter(self.vegetation_model, lai, self.Eveg, self.Estreat, *angles, std, hcr, rcr)[:, 0]
+        else:
+            scat = self.canopy_scatter_model(self.vegetation_model, lai, self.Eveg, self.Estreat, *angles, std, hcr, rcr,
+                                             self.vaa_[kangle], self.saa, tuple(self.row_shape))[:, 0]
+        street_sunlit = sunlit_view * scat[0]
+        street_shaded = sunlit_view * scat[1] + shaded_view * (scat[0] + scat[1])
+        leaf_sunlit = sunlit_view * scat[2]
+        leaf_shaded = sunlit_view * scat[3] + shaded_view * (scat[2] + scat[3])
+        return street_sunlit, street_shaded, leaf_sunlit, leaf_shaded
+
+    def calculate_effective_component_emissivity(self,ifP = 0):
+        emissivity_ = []
+        for kangle in range(self.n_angle):
+            direct = np.asarray(self.calculate_direct_emissivity(kangle,2), dtype=float)
+            scatter = np.asarray(self.calculate_scattering_emissivity(kangle,2), dtype=float)
+            canopy = np.zeros_like(direct)
+            canopy[2], canopy[3], canopy[6], canopy[7] = self._canopy_scatter(kangle)
+            budget = max(0.0, 1.0 - float(np.sum(direct + scatter)))
+            if canopy.sum() > budget:
+                canopy *= budget / canopy.sum()
+            components = direct + scatter + canopy
+            if ifP == 2:
+                emissivity_.append(components)
+            elif ifP == 1:
+                emissivity_.append([components[0:2].sum(), components[2:4].sum() + components[6:8].sum(), components[4:6].sum()])
+            elif ifP == 3:
+                emissivity_.append(np.asarray(self.calculate_direct_emissivity(kangle,3)) * 0)
+            else:
+                emissivity_.append(components.sum())
+
+        self.canopy_effective_emissivity = np.asarray(emissivity_ )
+        return np.asarray(emissivity_ )

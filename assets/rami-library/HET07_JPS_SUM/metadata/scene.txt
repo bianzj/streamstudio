@@ -1,0 +1,3 @@
+Dimension (X x Y x Z)	105.932 m x 106.118 m x 18.56 m
+(Xmin, Ymin, Zmin)	-2.773 m, -3.623 m, 0.0 m
+(Xmax, Ymax, Zmax)	+103.159 m, +102.495 m, 18.56 m

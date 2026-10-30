@@ -1,0 +1,174 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Shortwave reflectance variance templates. Pixel means are removed at runtime; these files never replace a material's mean spectrum.",
+  "defaultEnabled": false,
+  "license": "CC0-1.0",
+  "textures": [
+    {
+      "id": "concrete",
+      "label": "混凝土",
+      "fileName": "assets/texture-library/concrete_variance.jpg",
+      "sourceAsset": "Concrete034",
+      "sourceUrl": "https://ambientcg.com/view?id=Concrete034",
+      "suggestedRepeatSize": 2.0,
+      "sha256": "8CEB9186D990B31FCE785E06FDC6974C160F1D27C43F6160266F164DEBA713AA"
+    },
+    {
+      "id": "brick",
+      "label": "砖墙",
+      "fileName": "assets/texture-library/brick_variance.jpg",
+      "sourceAsset": "Bricks075A",
+      "sourceUrl": "https://ambientcg.com/view?id=Bricks075A",
+      "suggestedRepeatSize": 2.0,
+      "sha256": "9E5E42EA1EC80A8657B52CD074738BA32752D610B2C16F9A5024FF2AC2EC3CB2"
+    },
+    {
+      "id": "asphalt",
+      "label": "沥青",
+      "fileName": "assets/texture-library/asphalt_variance.jpg",
+      "sourceAsset": "Asphalt031",
+      "sourceUrl": "https://ambientcg.com/view?id=Asphalt031",
+      "suggestedRepeatSize": 3.0,
+      "sha256": "D8301EE35F486BA073BDD5FDA3EA9ED7E40F768AA1DEF75C420BCC5C055E3534"
+    },
+    {
+      "id": "metal",
+      "label": "金属",
+      "fileName": "assets/texture-library/metal_variance.jpg",
+      "sourceAsset": "Metal046B",
+      "sourceUrl": "https://ambientcg.com/view?id=Metal046B",
+      "suggestedRepeatSize": 1.5,
+      "sha256": "7CAF8DDBD06AA730E41DB993FF344EB60D872FF698E5DA117B3527F09BA1877E"
+    },
+    {
+      "id": "camouflage_woodland",
+      "kind": "variance",
+      "label": "林地迷彩",
+      "fileName": "assets/texture-library/camouflage_woodland_variance.jpg",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 1.5,
+      "sha256": "6A0669A1C47F8AAC13154A3A1EE800800C6D03E32821C58044AF6DA643FA1869"
+    },
+    {
+      "id": "camouflage_desert",
+      "kind": "variance",
+      "label": "荒漠迷彩",
+      "fileName": "assets/texture-library/camouflage_desert_variance.jpg",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 1.5,
+      "sha256": "BAA5E10E682A7145A0425A2CFAFAC6BEAF4BE96CBED42C6C153D06BE0C4E79E0"
+    },
+    {
+      "id": "canvas_weave",
+      "kind": "variance",
+      "label": "帆布织纹",
+      "fileName": "assets/texture-library/canvas_weave_variance.jpg",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 0.5,
+      "sha256": "B5C013C27E32B52AD8FA92C723CAEBD8C755660F9A2774E139308E71E94467F4"
+    },
+    {
+      "id": "camouflage_digital",
+      "kind": "variance",
+      "label": "数码迷彩",
+      "fileName": "assets/texture-library/camouflage_digital_variance.jpg",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 1.6,
+      "sha256": "B812DCCFC6F06BC991EA8E60A51514DB53676BDDF08F0A5FBD83D7C021BDC0FD"
+    },
+    {
+      "id": "stripes",
+      "kind": "variance",
+      "label": "遮阳条纹",
+      "fileName": "assets/texture-library/stripes_variance.jpg",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 1.2,
+      "sha256": "C02629D1FE777529C9F14FD1348F6BC10E77AB67096B40923F58CC52EC3BC1A3"
+    },
+    {
+      "id": "crumpled_film",
+      "kind": "variance",
+      "label": "褶皱反光膜",
+      "fileName": "assets/texture-library/crumpled_film_variance.jpg",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 2.0,
+      "sha256": "1255806A2958794D5D8F6EE942D8EE6CC06A9BA00880348E1F765962228984B3"
+    },
+    {
+      "id": "sand_mottling",
+      "kind": "variance",
+      "label": "沙面风纹",
+      "fileName": "assets/texture-library/sand_mottling_variance.jpg",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 20.0,
+      "sha256": "71C0B2C589708C810C0ADEA4719910775B372DFC04D2D244A0692944E5241461"
+    },
+    {
+      "id": "soil_mottling",
+      "kind": "variance",
+      "label": "裸土斑块",
+      "fileName": "assets/texture-library/soil_mottling_variance.jpg",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 10.0,
+      "sha256": "BDC6D4C9D073CE04F68696D281E65AE68EDCB0CDDB88F5C1FABB68E71DDE83E9"
+    },
+    {
+      "id": "class_woodland_4",
+      "kind": "class",
+      "label": "林地迷彩 4 类（分类纹理）",
+      "fileName": "assets/texture-library/class_woodland_4.png",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 1.5,
+      "sha256": "BB90F226025E3CF150CDAF1AF8073C10224EDDE86F3AA90C890A3F11C48E323B"
+    },
+    {
+      "id": "class_digital_4",
+      "kind": "class",
+      "label": "数码迷彩 4 类（分类纹理）",
+      "fileName": "assets/texture-library/class_digital_4.png",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 1.6,
+      "sha256": "D4FB51B68649379D7FB1EF5B705FF6837EB294ECB7E926B89F6C0DB92F605A31"
+    },
+    {
+      "id": "class_desert_3",
+      "kind": "class",
+      "label": "荒漠迷彩 3 类（分类纹理）",
+      "fileName": "assets/texture-library/class_desert_3.png",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 1.5,
+      "sha256": "1E43899A552D296EAF8E556BFE53F2DB5A4FECF2F2891B1B232425C8EA357BB3"
+    },
+    {
+      "id": "openness_damaged_net",
+      "kind": "openness",
+      "label": "遮阳网破损（开孔率纹理）",
+      "fileName": "assets/texture-library/openness_damaged_net.png",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 1.0,
+      "sha256": "2B915F31214EC29B13767C652979603D7CF22D883097B37350B8A20C66188B93"
+    },
+    {
+      "id": "openness_weave_density",
+      "kind": "openness",
+      "label": "织物疏密不均（开孔率纹理）",
+      "fileName": "assets/texture-library/openness_weave_density.png",
+      "sourceAsset": "tools/generate-tarp-assets.py",
+      "sourceUrl": "",
+      "suggestedRepeatSize": 1.0,
+      "sha256": "9767C6FCA9AE038F7CA8439582C9AB529FE476523F5E6D33EEDA0CE231B8374F"
+    }
+  ]
+}

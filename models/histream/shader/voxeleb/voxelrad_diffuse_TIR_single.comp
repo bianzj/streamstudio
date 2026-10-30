@@ -1,0 +1,527 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXEL_LST_BIND_ININDEX
+#define VOXELLST 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../settings.h"
+#include "../nanovdb_info.glsl"
+#include "../functions.glsl"
+#include "../surface_brdf.glsl"
+#include "../shade_state_voxel.glsl"
+#include "fluid_coupling.glsl"
+
+PtPayload        prd;
+ShadowHitPayload shadow_payload;
+
+#include "../traceray_comp.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+// #define DIFFUSE_ANGLE_NUM 32
+#define MAXBAND    25
+#define NUM_VNIR 2001 
+#define NUM_BAND 2002
+
+// Opaque cells end a diffuse ray; turbid vegetation planes and participating
+// media do not (a plane's front cell is its own vegetation voxel).
+bool isSolidVoxel(int bufferId)
+{
+    if (bufferId < 0) return false;
+    uint type = meshLinks[instanceLinks[voxelLinks[bufferId].instanceId].meshId].type;
+    return type == TYPE_BUILDING || type == TYPE_SOIL || type == TYPE_WATER;
+}
+
+bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
+ int kiter,int kband,float Esun,float Esky)
+{
+  // vec3 semiRange = setting.scale * setting.voxelSize/2.0;
+  float scale = setting.scale;
+  ivec3 semiRange = ivec3(floor(setting.voxelSize.x/2.0 + 0.5),
+                            0,
+                            floor(setting.voxelSize.z/2.0 + 0.5));       // voxel scene semiRange.
+  // semiRange = vec3(0,0,0);
+  // i:induced direction for the selected voxel; 0 original
+  // j:induced direction for the traveled voxel;
+  // s:solar direction
+  vec3 directioni,directioni0,directionj,directionj0;
+  vec3 directions = normalize(lightSet.direction);
+  int bufferId,alignBufferId, meshId;
+  uint spectralId,thermalId,canopyId;
+  vec2 gammart;
+  float alpha_voxel,alpha_toSolar,alpha_toVoxel;
+  uint bioId,typeId;
+  uint instanceId,lastInstanceId,alignInstanceId;
+  uint bufferIdPlus0;
+  ivec3 voxelId,alignVoxelId;
+  float pl_toSolar,pl_toVoxel,refl,trans,emis,gamma,wavelength;
+  float sunlitTemperature,sunlitRadiance,shadedTemperature,shadedRadiance,thermalRadiance;
+  InstanceLink instanceLink;
+  MeshLink meshLink;
+  Canopy canopy;
+  //ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
+  uint instanceId0 = voxelLinks[bufferId0].instanceId;
+  uint meshId0 = instanceLinks[instanceId0].meshId;
+  uint typeId0 = meshLinks[meshId0].type;
+  float density,G;
+  bool isvegfirst = true;
+  bool surfaceReceiver = typeId0 == TYPE_BUILDING || typeId0 == TYPE_SOIL || typeId0 == TYPE_WATER;
+  vec3 receiverNormal = surfaceReceiver ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
+
+  ivec3 voxelRes = ivec3(setting.voxelSize);
+  float cosSolar = abs(normalize(lightSet.direction).y);
+  float receiverLeafEmission = 0.0;
+  if(typeId0 == TYPE_VEGETATION && !isParticipatingMedium(canopies[meshLinks[meshId0].canopyId]))
+  {
+    // Gray isothermal leaf (emission plus scattering), as for crossed leaves.
+    float receiverSolar = clamp(voxelDirs[bufferId0].solar, 0.0, 1.0);
+    receiverLeafEmission = mix(Stefen_Boltzmann(voxelTempes[bufferId0].shaded, 1),
+                               Stefen_Boltzmann(voxelTempes[bufferId0].sunlit, 1), receiverSolar);
+  }
+  ////////////////////////////////////////////////////////
+  //  Iteration in difuse angle
+  ////////////////////////////////////////////////////////
+  for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
+  {
+    directioni0 = DIFFUSE_DIRECTIONS[iangle];
+    directioni = normalize(directioni0);
+    ConfigureCone(voxelPos0, directioni, 0.0, 0.0);
+
+
+    Ray ray = Ray(voxelPos0, directioni);
+    // vec3 ffnormal0  = vec3(0,1,0);
+    // ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal0) > 0 ? ffnormal0 : -ffnormal0);
+
+
+
+    alpha_toSolar = 1.0;
+    alpha_toVoxel = 1.0;
+    // A ray leaving the receiver's own leaf cell crosses the receiver's leaves.
+    float lastLeafEmission = receiverLeafEmission;
+		voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].induced = 0.0;
+    // A solid surface only receives radiance through its outer hemisphere.
+    // Rays into the object interior would hit its own inner facets and add the
+    // object's emission/reflection to its own incident environment.
+    if(surfaceReceiver && dot(directioni0, receiverNormal) <= 0.0) continue;
+    // if((typeId0 == TYPE_SOIL) && (directioni0.y < 0))
+    // {
+    //   continue;
+    // }
+
+
+    //----------------------------------
+    //  uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
+    // atomicAdd(voxelRads[index].induced,
+    //     Esky,
+    //     gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+    //     continue;
+    //---------------------------------------
+
+
+    /////////////////////////////////////////////////////
+    /// Iteration in travel step
+    /////////////////////////////////////////////////////
+    int kstep = 0;
+    vec3 ffnormal;
+
+
+    for(kstep = 0;kstep<=setting.maxStep;kstep++)
+    { 
+      alpha_voxel = 1.0;
+      ClosestHit(ray,0.01);
+      if(prd.hitT == INFINITY)
+      {
+        //////////////////////////////
+        /// Atmospheric case
+        /////////////////////////////
+
+        // add save the sky contribution
+        // sky contribution: lightSet.Rli*waveSets[kband].diffuse*0.001
+        // The canopy crossed after the last hit absorbs sky radiation and
+        // emits at the temperature of the last leaf voxel on the ray.
+        float escape = TurbidEscapeTransmittance(ray.origin, ray.direction);
+        uint escapeIndex = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
+        atomicAdd(voxelRads[escapeIndex].induced,
+            alpha_toVoxel * (1.0 - escape) * lastLeafEmission,
+            gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+        alpha_toVoxel *= escape;
+        if(directioni0.y > 0.0)
+        {
+           float skyrad = alpha_toVoxel*Esky;
+          uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
+          atomicAdd(voxelRads[index].induced,
+              skyrad,
+              gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+        }
+        alpha_toVoxel = 0.001;
+        break;
+      }
+
+
+      // float skyrad = 1;
+      // uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
+      // atomicAdd(voxelRads[index].induced,
+      //     skyrad,
+      //     gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+      //     break;
+
+      // get hit information
+      ShadeState sstate = GetShadeState(prd);
+      voxelId = getVoxelIdSemi(sstate.position, semiRange, scale, directioni, alignVoxelId);
+      bufferId = nanovdbGet(nanoVDBLink,voxelId);
+      alignBufferId = nanovdbGet(nanoVDBLink, alignVoxelId);
+
+      //////////////////////////////
+      /// Trubid case
+      /////////////////////////////
+      if(bufferId >= 0)
+      {
+        // a valid voxel and get voxel information 
+        // such as instanceId, typeId, spectralId, thermalId, canopyId
+          instanceId = voxelLinks[bufferId].instanceId;
+          InstanceLink instanceLink = instanceLinks[instanceId];
+          meshId = instanceLink.meshId;
+          MeshLink meshLink = meshLinks[meshId];
+          spectralId = meshLink.spectralId;
+          canopyId = meshLink.canopyId;
+          bioId = meshLink.bioId;
+          typeId = meshLink.type;
+
+
+
+          if(typeId == TYPE_VEGETATION)
+          {
+              G = canopies[canopyId].G;
+            density = ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
+            float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
+            alpha_voxel = isParticipatingMedium(canopies[canopyId])
+                ? canopyVoxelTransmittance(canopies[canopyId], density, G, pathLength, scale)
+                : ResolveSpatialInteraction(bufferId, density, G,
+                    sstate.lastPosition, sstate.position, scale).x;
+            alpha_toSolar = voxelDirs[bufferId].solar;
+
+          // get the phase function for solar direction to induced direction;
+          // scattered light propagates back along -directioni to the receiver.
+          gammart = scattering_phase_function_direct_XZY_paper(directions, directioni);
+          sunlitTemperature = voxelTempes[bufferId].sunlit;
+          shadedTemperature = voxelTempes[bufferId].shaded;
+          /////////////////////////////////////////////////////
+          /// Iteration in BAND
+          /////////////////////////////////////////////////////
+
+            // THERMAL
+            sunlitRadiance = Stefen_Boltzmann(sunlitTemperature,1);
+            shadedRadiance = Stefen_Boltzmann(shadedTemperature,1);
+            thermalRadiance = (1-alpha_toSolar)*shadedRadiance + alpha_toSolar*sunlitRadiance;
+            // SPECTRAL
+            trans = spectralMaterials[spectralId*NBAND+kband].transmittance;
+            refl = spectralMaterials[spectralId*NBAND+kband].reflectance;
+            emis = 1 - trans - refl;
+            float gamma = clamp(abs(gammart.x)*(refl + trans) + gammart.y*trans, 0.0, 1.0);
+            float radiance = 0;
+            //////////////////////////////
+            // emitter
+            /////////////////////////////
+            // thermalRadiance = 100;
+            if(isParticipatingMedium(canopies[canopyId])) {
+              float removedFraction = 1.0 - alpha_voxel;
+              float scatteringFraction = removedFraction
+                  * clamp(canopies[canopyId].scatteringAlbedo, 0.0, 1.0);
+              float absorptionFraction = removedFraction - scatteringFraction;
+              float mediumTemperature = canopies[canopyId].fixedTemperature > 0.0
+                  ? canopies[canopyId].fixedTemperature
+                  : 0.5 * (sunlitTemperature + shadedTemperature);
+              radiance += Stefen_Boltzmann(mediumTemperature, 1)
+                  * canopies[canopyId].emissionScale * absorptionFraction * alpha_toVoxel;
+              // Longwave scattered by droplets/particles redistributes the
+              // surrounding field; in the gray isothermal approximation used
+              // for leaves it radiates at the ambient air temperature.
+              radiance += Stefen_Boltzmann(localAirTemperatureC(uint(bufferId)) + 273.15, 1)
+                  * scatteringFraction * alpha_toVoxel;
+            } else {
+              // Intercepted rays leave the leaves as emission (emis) plus the
+              // leaf-scattered longwave (refl + trans), the latter in the gray
+              // isothermal approximation, so the leaf radiates as a blackbody.
+              radiance+= (thermalRadiance*(1-alpha_voxel)*(emis + refl + trans)* alpha_toVoxel);
+              lastLeafEmission = thermalRadiance * (emis + refl + trans);
+            }
+            // radiance = shadedTemperature;
+            //////////////////////////////
+            /// Solar 
+            /////////////////////////////
+            if(!isParticipatingMedium(canopies[canopyId])) {
+              // Single scattering of the beam, as in the image pass (Esun is horizontal).
+              radiance += alpha_toSolar * gamma / max(G, 0.000001)
+                  * Esun / max(cosSolar, 0.001) * alpha_toVoxel * (1 - alpha_voxel);
+            }
+            //////////////////////////////
+            /// Save back
+            /////////////////////////////
+            atomicAdd(voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].induced,radiance,
+                gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+          alpha_toVoxel = alpha_toVoxel * alpha_voxel;
+          if(alpha_toVoxel < 0.01) break; 
+        } // veg
+      } // bufferId
+      if (isSolidVoxel(alignBufferId))
+      {
+          //////////////////////////////
+          /// facet case
+          /////////////////////////////
+        
+
+          alignBufferId = ResolveVoxelSurfaceState(alignBufferId, sstate.normal);
+
+
+          instanceId = voxelLinks[alignBufferId].instanceId;
+          meshId = instanceLinks[instanceId].meshId;
+          typeId = meshLinks[meshId].type;
+          canopyId = meshLinks[meshId].canopyId;
+          spectralId = meshLinks[meshId].spectralId;
+          thermalId = meshLinks[meshId].thermalId;
+          uint bioId = meshLinks[meshId].bioId;
+          uint spectralIdBase = spectralId*NBAND;
+          alpha_toSolar = voxelDirs[alignBufferId].solar;
+          if (dot(sstate.normal, lightSet.direction) <= 0.0) alpha_toSolar = 0.0;
+
+          vec3 wo = directioni;  // FROM SELECTED VOXEL OUT TO HIT FACET  
+          vec3 wi = lightSet.direction; // FROM SELECTED VOXEL OUT TO SOLAR
+          vec3 ffnormal = sstate.normal;
+          bool inSameSides = IsSameSide(wo,wi,ffnormal);
+
+          // THERMAL
+          sunlitTemperature = voxelTempes[alignBufferId].sunlit;
+          shadedTemperature = voxelTempes[alignBufferId].shaded;
+          float radiance=0;
+
+          sunlitRadiance = Stefen_Boltzmann(sunlitTemperature,1);
+          shadedRadiance = Stefen_Boltzmann(shadedTemperature,1);
+          thermalRadiance = (1-alpha_toSolar)*shadedRadiance + alpha_toSolar*sunlitRadiance;
+          // SPECTRAL
+          trans = spectralMaterials[spectralId*NBAND+kband].transmittance;
+          refl = spectralMaterials[spectralId*NBAND+kband].reflectance;
+          emis = surfaceThermalEmissivity(
+              refl, trans, -directioni, ffnormal,
+              meshLinks[meshId].angularEffectStrength);
+          refl = surfaceThermalReflectance(
+              refl, trans, -directioni, ffnormal,
+              meshLinks[meshId].angularEffectStrength);
+          // //////////////////////////////
+          // /// Multiple case
+          // /////////////////////////////
+          // if(kiter > 0)
+          // {
+          //   for(int jangle=0;jangle<DIFFUSE_ANGLE_NUM;jangle++)
+          //   {
+          //       directionj0 = (DIFFUSE_DIRECTIONS[jangle]);
+          //       bool inSameSide = isSameSide(directioni,directionj0,ffnormal);
+          //       if(!inSameSide) continue;
+          //       float radiancej = voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].cumulated;
+          //       radiance= radiance + radiancej * refl* alpha_toVoxel;  
+          //   }
+          //   radiance = radiance/DIFFUSE_ANGLE_NUM;
+          // }
+          
+          ////////////////////////////////
+          // SOLAR CASE
+          ///////////////////////////////
+          if(inSameSides)
+          {
+            float surfaceWeight = surfaceReflectanceWeight(
+                typeId, bioId, refl, wi, wo, ffnormal,
+                meshLinks[meshId].angularEffectStrength);
+            // Beam irradiance on the facet, as in the image pass (Esun is horizontal).
+            float cosIncidence = abs(dot(normalize(ffnormal), normalize(wi)));
+            radiance += (surfaceWeight * cosIncidence * Esun / max(cosSolar, 0.001)
+                * alpha_toSolar * alpha_toVoxel);
+          }
+          // ////////////////////////////////
+          // //emitter
+          // ////////////////////////////////
+          // Reflected longwave of the facet in the gray isothermal
+          // approximation (exact in an enclosure); the facet's own incident
+          // field is being rewritten in this pass and cannot be read.
+          radiance+= (thermalRadiance * (emis + refl) * alpha_toVoxel);
+          //////////////////////////////
+          /// Save back
+          /////////////////////////////
+          atomicAdd(voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].induced,radiance,
+              gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+
+          alpha_toVoxel = 0;
+          break;
+      }// alignbufferId
+
+      ray = Ray(sstate.position,directioni);
+      ffnormal  = sstate.normal;
+      ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
+    } // step
+
+    // A step limit is an unresolved path, not a connection to the sky.
+    // Keep the accumulated source terms; only an actual upward miss above
+    // may supply sky illumination. Opacity and geometric offsets are unchanged.
+  } // angle
+  return false;
+}
+
+
+void main()
+{
+    //------------------------------------------------------------
+    // Initialization for the position and SSBO index
+    //------------------------------------------------------------
+    // get bufferId, voxelId, instanceId and typeId
+    uint bufferId0 = (gl_GlobalInvocationID.x);
+    if(bufferId0 >= uint(setting.voxelCount)) return;
+    ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
+      if(voxelLinks[bufferId0].isValid==0) return;
+      
+    uint instanceId0 = voxelLinks[bufferId0].instanceId;
+    uint meshId0 = instanceLinks[instanceId0].meshId;
+
+    InstanceLink instanceLink0 = instanceLinks[instanceId0];
+    MeshLink meshLink0 = meshLinks[meshId0];
+    uint typeId0 = meshLink0.type;
+    uint spectralId0 = meshLink0.spectralId;
+    uint spectralBase0 = spectralId0 * NBAND;
+    vec3 ffnormal0 = typeId0 == TYPE_VEGETATION
+        ? vec3(0.0, 1.0, 0.0) : solidSurfaceNormal(int(bufferId0));
+
+
+
+    int faceId = voxelLinks[bufferId0].faceId;
+
+    // if(primId0 - faceid0*10 == 0) return; 
+
+
+    // if(primId0 == 0) {ffnormal0 = vec3(0,0,0); }
+    // atomicAdd(voxelNetRads[bufferId0].diffuseTrad, primId0, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+    // return;
+    // Get nanoVDBLink: from voxelId to bufferId
+    NanoVDBLink nanoVDBLink = nanovdbInit();
+    ConfigureTurbidGrid(nanoVDBLink);
+    // get center position of a voxel
+    vec3 semiRange = vec3(floor(setting.voxelSize.x/2.0+0.5),0,floor(setting.voxelSize.z/2.0+0.5));
+    vec3 voxelPos0 = vec3(voxelId0.x-semiRange.x,
+                          voxelId0.y,
+                          voxelId0.z -semiRange.z); 
+    getFacetIdPos(faceId,  voxelPos0);
+
+    float Rin = ubom.meteo.Rin;               // measurement height 
+    float Rli = ubom.meteo.Rli;               // wind speed
+
+    // reset the voxelRads in VNIR band
+    // for(uint kband=NUM_VNIR;kband < NUM_BAND;kband++)
+    //   for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
+    //   {
+    //     uint index = bufferId0*32*2162+kband*32+iangle;
+    //     voxelRads[index].cumulated=0.0;
+    //   }
+
+    //------------------------------------------------------------
+    // An iteration process for diffuse scattering function
+    //------------------------------------------------------------
+    voxelNetRads[bufferId0].diffuseTrad = 0 ;
+
+    int kband_start = 0, kband_end = 0;
+    // int kstep = setting.bandTstep;
+    int kbandj = NUM_VNIR;
+    int kband_center = NUM_VNIR;
+
+
+    float wavelength = atomConds[kbandj].wavelength;
+    float Esun = 0;
+    float Esky = Rli;
+
+        // Leaf and surface scattering use the gray isothermal closure, so one
+        // pass gives the incident field; no iterate is read back.
+        {
+            int kiter = 0;
+            voxel_raytracing_diffuse(voxelPos0, bufferId0, nanoVDBLink, kiter,kband_center,Esun,Esky);
+            // Order this invocation's SSBO accesses without waiting for tail
+            // or invalid lanes that have already returned.
+            memoryBarrierBuffer();
+
+            for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
+            {
+                uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
+                voxelRads[index].cumulated = voxelRads[index].induced;
+            }
+        }
+
+    //------------------------------------------------------------
+    // accumulated incident radiation to four components: direct/diffuse VNIN/TIR radiation
+    //------------------------------------------------------------
+
+        float rads=0,radtemp = 0,absorb;
+        float radsCorrection = 0.0;
+        float cosineWeight = 0.0;
+        float cosineWeightCorrection = 0.0;
+        if(typeId0 == TYPE_VEGETATION)
+        {
+            // A randomly oriented leaf absorbs (1/2) * integral of L over the
+            // full sphere with its two faces; in the stored pi*L field this is
+            // the sum over all directions times 2/N, as for diffuseVrad.
+            for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
+                compensatedAdd(rads, radsCorrection, finiteNonnegative(
+                    voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].cumulated));
+            rads *= DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+        }
+        else
+        {
+        // Cosine-weighted hemisphere quadrature for incident longwave.
+        for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
+        {
+
+           vec3 directioni0 = DIFFUSE_DIRECTIONS[iangle];
+           vec3  directioni = normalize(directioni0);
+           float abc = max(cross0(directioni, ffnormal0), 0.0);
+           if(abc <= 0.0) {continue;}
+            uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
+            radtemp = voxelRads[index].cumulated;
+            compensatedAdd(rads, radsCorrection, finiteNonnegative(radtemp) * abc);
+            compensatedAdd(cosineWeight, cosineWeightCorrection, abc);
+
+
+        }// for iteration
+
+        rads = cosineWeight > EPSION ? rads / cosineWeight : 0.0;
+        }
+        
+        
+        // Kirchhoff consistency: diffuseTrad stores absorbed incident
+        // longwave, matching the emissivity-weighted outgoing term used by
+        // budget.comp.  Previously all incident longwave was absorbed even
+        // when the material had non-zero TIR reflectance/transmittance.
+        absorb = clamp(
+            1.0 - spectralMaterials[spectralBase0 + kband_center].transmittance
+                - spectralMaterials[spectralBase0 + kband_center].reflectance,
+            0.0, 1.0);
+        rads *= absorb;
+
+
+        atomicAdd(voxelNetRads[bufferId0].diffuseTrad, rads, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+    //}// for band
+
+    // float rads = typeId0;
+    // atomicAdd(voxelNetRads[bufferId0].diffuseTrad, rads, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+}

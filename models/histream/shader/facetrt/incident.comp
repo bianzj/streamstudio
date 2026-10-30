@@ -1,0 +1,24 @@
+#version 460
+#extension GL_ARB_gpu_shader_fp64 : require
+layout(local_size_x=64) in;
+struct CsrEdge { uint neighbor,count; };
+struct SurfaceOptics { float reflectance,transmittance,emission,directIrradiance; };
+layout(std430,binding=0) readonly buffer Rows { uint rows[]; };
+layout(std430,binding=1) readonly buffer Edges { CsrEdge edges[]; };
+layout(std430,binding=2) readonly buffer Denominators { uint denom[]; };
+layout(std430,binding=3) readonly buffer Sky { uint sky[]; };
+layout(std430,binding=4) readonly buffer Optical { SurfaceOptics optics[]; };
+layout(std430,binding=5) readonly buffer RadiosityA { float A[]; };
+layout(std430,binding=6) readonly buffer RadiosityB { float B[]; };
+layout(std430,binding=8) writeonly buffer Incident { float H[]; };
+layout(push_constant) uniform Push { uint facets,ping;float skyRadiosity,relaxation; } pc;
+void main() {
+    uint s=gl_GlobalInvocationID.x; if(s>=2u*pc.facets) return;
+    double v=double(pc.skyRadiosity);
+    if(denom[s]!=0u) {
+        v=double(sky[s])*double(pc.skyRadiosity);
+        for(uint k=rows[s];k<rows[s+1u];++k) v+=double(edges[k].count)*double(pc.ping==0u?A[edges[k].neighbor]:B[edges[k].neighbor]);
+        v/=double(denom[s]);
+    }
+    H[s]=max(0.0,float(v)+optics[s].directIrradiance);
+}

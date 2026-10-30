@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "coordinateSystem": "Y-up",
+  "unit": "metre",
+  "scenes": [
+    {
+      "id": "RAMI5_HET07_JPS_SUM",
+      "label": "RAMI-V Järvselja 夏季松林",
+      "type": "真实森林",
+      "manifest": "HET07_JPS_SUM/manifest.json",
+      "dimensions": [105.932, 106.118, 18.56],
+      "instances": 1120,
+      "source": "RAMI-V / DART Team"
+    }
+  ]
+}

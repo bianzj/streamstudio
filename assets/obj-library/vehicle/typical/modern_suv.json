@@ -1,0 +1,13 @@
+{
+  "source": "https://quaternius.com/packs/cars.html",
+  "triangles": 3294,
+  "dimensions": [
+    1.98,
+    1.76,
+    4.72
+  ],
+  "coordinateSystem": "Y-up",
+  "unit": "metre",
+  "vertexColors": true,
+  "derivedFrom": "SUV.obj"
+}

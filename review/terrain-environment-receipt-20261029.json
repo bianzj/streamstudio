@@ -1,0 +1,27 @@
+{
+  "nativeBuildExitCode": 0,
+  "guiBuildExitCode": 0,
+  "staticReview": "1 finding fixed: exclude solid cells from terrain scalar interpolation",
+  "testsRun": false,
+  "simulationsRun": false,
+  "runtimeShaderFilesMatched": [
+    "parameters.h",
+    "voxeleb/fluid_coupling.glsl",
+    "voxeleb/fluid_common.glsl",
+    "voxeleb/fluid_lbm.comp",
+    "voxeleb/biochemical.comp",
+    "voxeleb/biochemical_m12.comp",
+    "voxeleb/evapo.comp",
+    "voxeleb/budget.comp",
+    "voxeleb/updateTp.comp"
+  ],
+  "executable": "C:\\work\\streamstudio\\models\\bin_x64\\Release\\histream.exe",
+  "executableSha256": "c834d6792e9a324a3f9f749d70914c465cb5ba06d0431c7bfc2b5660b995db76",
+  "scope": "VoxelEB",
+  "limits": [
+    "uncalibrated defaults",
+    "prescribed common drainage elevation, not routed HAND",
+    "static soil moisture without water balance",
+    "evaporation is not a vapor source"
+  ]
+}

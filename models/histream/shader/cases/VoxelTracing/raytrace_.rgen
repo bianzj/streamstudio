@@ -1,0 +1,114 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXELTRACING 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../bsdf.glsl"
+// #include "../functions.glsl"
+#include "../nanovdb_info.glsl"
+#include "../shade_state_voxel.glsl"
+#include "../random.glsl"
+
+layout(location = 0) rayPayloadEXT hitValue hitID;
+
+void main()
+{
+    vec2 imageRes    = settingxml.imageSize;
+    // image coordinate from 1-imageSize
+    ivec2 imageCoords = ivec2(gl_LaunchIDEXT.xy);
+    uint bufferId = uint(sensorMatrix.waveNum * (imageCoords.y * imageRes.x + imageCoords.x));
+
+    vec2 subpixel_jitter = vec2(0.5f, 0.5f) ;
+	// 计算样本的波动，范围 [-1 .. 1]
+	const vec2 pixelCenter = vec2(ivec2(gl_LaunchIDEXT.xy)) + subpixel_jitter;
+	const vec2 inUV        = pixelCenter / vec2(ivec2(gl_LaunchSizeEXT.xy));
+	vec2       d           = inUV * 2.0 - 1.0;
+
+    vec4 origin    = sensorMatrix.viewInverse * vec4(0, 0, 0, 1);
+	vec4 target    = sensorMatrix.projInverse * vec4(d.x, d.y, 1, 1);
+	vec4 direction = sensorMatrix.viewInverse * vec4(normalize(target.xyz), 0);
+
+    uint  rayFlags = gl_RayFlagsTerminateOnFirstHitEXT;//gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT;
+    float tMin     = 0.001;
+    float tMax     = INFINITY;
+
+    traceRayEXT(topLevelAS,     // acceleration structure
+                rayFlags,       // rayFlags
+                0xFF,           // cullMask
+                0,              // sbtRecordOffset
+                0,              // sbtRecordStride
+                0,              // missIndex
+                origin.xyz,     // ray origin
+                tMin,           // ray min range
+                direction.xyz,  // ray direction
+                tMax,           // ray max range
+                0              // payload (location = 0)
+    );
+
+    for(int kband = 0; kband < sensorMatrix.waveNum;kband++)
+    {
+        //Radiance[kband] = prd.primitiveID;
+        float abc = hitID.id;
+        if(abc > 9999999)
+        {
+            abc = -99;
+        }
+        atomicStore(outImage[bufferId+kband],abc,gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+    }
+
+
+
+    // rayFlags = gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT;
+    // vec3 ori = vec3(5,10,5);
+    // vec3 direct = vec3(0,-1,0);
+    // traceRayEXT(topLevelAS,     // acceleration structure
+    //             rayFlags,       // rayFlags
+    //             0xFF,           // cullMask
+    //             0,              // sbtRecordOffset
+    //             0,              // sbtRecordStride
+    //             0,              // missIndex
+    //             ori,            // ray origin
+    //             tMin,           // ray min range
+    //             direct,         // ray direction
+    //             tMax,           // ray max range
+    //             0              // payload (location = 0)
+    // );
+    // atomicStore(outImage[0],hitID.id,gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+
+    // ori = vec3(4,10,4);
+    // direct = vec3(0,-1,0);
+    // traceRayEXT(topLevelAS,     // acceleration structure
+    //             rayFlags,       // rayFlags
+    //             0xFF,           // cullMask
+    //             0,              // sbtRecordOffset
+    //             0,              // sbtRecordStride
+    //             0,              // missIndex
+    //             ori,            // ray origin
+    //             tMin,           // ray min range
+    //             direct,         // ray direction
+    //             tMax,           // ray max range
+    //             0              // payload (location = 0)
+    // );
+    // atomicStore(outImage[1],hitID.id,gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+
+}

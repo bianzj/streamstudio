@@ -1,0 +1,259 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXEL_LST_BIND_ININDEX
+#define VOXELLST 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../functions.glsl"
+#include "../nanovdb_info.glsl"
+#include "fluid_coupling.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+
+
+
+
+
+void main()
+{
+    //------------------------------------------------------------
+    // Initialization for the position and SSBO index
+    //------------------------------------------------------------
+    // get bufferId, voxelId, instanceId and typeId
+    uint bufferId = uint(gl_GlobalInvocationID.x);
+    if(bufferId >= uint(setting.voxelCount)) return;
+    if(voxelLinks[bufferId].isValid==0) return;
+    //voxelRes: voxel number in 3 dimentions
+    ivec3 voxelRes = ivec3(setting.voxelSize);
+    
+
+    int faceId = voxelLinks[bufferId].faceId;
+
+
+    //-------------------------
+    // various parameters index
+    //-------------------------
+    uint instanceId = voxelLinks[bufferId].instanceId;
+    // VoxelInstanceLink instanceLink = instanceLinks[instanceId];
+    InstanceLink instanceLink = instanceLinks[instanceId];
+    MeshLink meshLink = meshLinks[instanceLink.meshId];
+    uint spectralId,canopyId,bioId,typeId;
+
+    spectralId = meshLink.spectralId;
+    canopyId = meshLink.canopyId;
+    bioId = meshLink.bioId;
+    typeId = meshLink.type;
+    if(typeId == TYPE_VEGETATION && isParticipatingMedium(canopies[canopyId])) {
+        voxelHeatFlux[bufferId].Hsunlit = 0.0;
+        voxelHeatFlux[bufferId].Hshaded = 0.0;
+        voxelHeatFlux[bufferId].LEsunlit = 0.0;
+        voxelHeatFlux[bufferId].LEshaded = 0.0;
+        voxelHeatFlux[bufferId].Gsunlit = 0.0;
+        voxelHeatFlux[bufferId].Gshaded = 0.0;
+        return;
+    }
+    //-------------------------
+    // various parameters
+    //-------------------------
+    // lambda: Evapor. heat
+    // ei: saturated water pressure function for intercellular leaf
+    // ea: H20 concentration for ambient air
+    // qi: water humidity for intercellular leaf 
+    // qa: water humidity for ambient air 
+    // tc: canopy/surface temperature 
+    // ci: CO2 concentration for intercellular leaf
+    // ca: CO2 concentration for ambient air 
+    // PSI: leaf water potential 
+    // Gsoil: soil heat storage
+	float lambda, ei, qi, qa, Tc, PSI;
+    // this is used only for under soil 
+	float Tprof[TLASTNUM],Tproflast[TLASTNUM]; // temperature profile
+	float WTprof[3],WTproflast[3]; // water profile
+    // conv. from vapour pressure to abs hum
+	float e_to_q = MH20 / MAIR / ubom.meteo.p; 
+    // dtime: time period step 
+	float dtime_[TLASTNUM], raa,rss;
+    float dtime = ubom.meteo.dtime;
+    float ea = localVaporPressureHpa(bufferId);
+    float Ta = localAirTemperatureC(bufferId);
+    float ca = localAmbientCo2Ppm(bufferId);
+    float ci;
+    float H; // latent heat flux
+    float LE;  // sensible heat flux
+    // new,new-1,new-2....old
+    for(int i=0;i<TLASTNUM;i++) dtime_[i] = dtime*(i+1);
+    //
+    uint TlastId = bufferId*TLASTNUM;
+
+    for(int issunlit = 0;issunlit < 2;issunlit++)
+    {
+        // get surface temperature 
+        if(issunlit == 0)
+        {
+            Tc = voxelTempes[bufferId].shaded; 
+            rss = voxelRsss[bufferId].shaded;
+        }else
+        {
+            Tc = voxelTempes[bufferId].sunlit; 
+            rss = voxelRsss[bufferId].sunlit;
+        }
+        // H and LE are per leaf face: rcw is the whole-leaf stomatal
+        // resistance, so each face carries twice it (as raa, see aeresist).
+        if(typeId == TYPE_VEGETATION) rss *= 2.0;
+
+        //PSI = 0;
+        //ei = es_fun(Tc-273.15)*exp(1E-3*PSI*MH20 / R / (Tc-273.15));
+        ei = es_fun(Tc - 273.15);
+        qi = ei * e_to_q;
+        qa = ea * e_to_q;
+
+        //-------------------------
+        // heat fluxes: H, LE
+        //-------------------------
+        raa = voxelRaas[bufferId].raa;
+        lambda = (2.501 - 0.002361*(Tc-273.15))*1E6;
+        
+        if(raa < 1) raa = 1;
+        // H = raa;
+        H = (RHOA * CP) / raa * (Tc-273.15 - Ta);
+        LE = RHOA / (raa + rss) * lambda * (qi - qa);
+
+        if (typeId == TYPE_WATER)
+        {
+            LE *= clamp(waterSets[bioId].evaporationCoefficient, 0.0, 1.0);
+        }
+        else if (typeId == TYPE_BUILDING)
+        {
+            LE = 0;
+        }
+        else if (typeId == TYPE_SOIL && (localSoilMoisture(bufferId, bioId) < 0.03))
+        {
+            LE = 0;
+        }
+
+
+        //-------------------------
+        // update es and cs of this conditional component
+        //-------------------------
+        ci = voxelAirs[bufferId].ci[issunlit];
+        // A missing surface resistance restarts es from ambient vapour, as cs
+        // does below, so one invalid physiology pass cannot lock the m12 path.
+        voxelAirs[bufferId].es[issunlit] = isnan(rss) || isinf(rss)
+            ? ea : ea + (ei-ea)*raa/(raa+rss);
+        // An invalid physiology pass leaves ci missing; restart from ambient
+        // CO2 instead of carrying the missing value into every later pass.
+        voxelAirs[bufferId].cs[issunlit] = isnan(ci) || isinf(ci)
+            ? ca : ca - (ca - ci) * raa/(raa+rss);
+
+        
+        float Gst = 0;
+        float ssum = 0;
+        float GAM = 0;
+        if(typeId == TYPE_WATER)
+        {
+            // Qw = volumetric heat capacity * mixed-layer depth * dT / dt.
+            float previousTemperature = issunlit == 1
+                ? voxelTlasts[TlastId].sunlit
+                : voxelTlasts[TlastId].shaded;
+            float capacity = waterSets[bioId].heatCapacity
+                             * max(waterSets[bioId].mixingDepth, 0.01);
+            Gst = capacity * ((Tc - 273.15) - previousTemperature)
+                  / max(dtime, 1.0);
+        }
+        else if(typeId == TYPE_SOIL || typeId == TYPE_BUILDING)
+        {
+            if(soilSets[bioId].method == 0)
+            {
+                // GST is dimensionless. budget.comp computes/writes GST*Rn
+                // after the independent net radiation is available.
+                Gst = 0.0;
+            }
+            else if(soilSets[bioId].method == 1){
+                // soil thermal inertial
+                float cs = soilSets[bioId].cs;
+                float rhos = soilSets[bioId].rhos;
+                float lamb = soilSets[bioId].lambdas ;
+                GAM = thermal_inertial(cs,rhos,lamb);
+                // soil case
+                for(int ktime = 0;ktime <TLASTNUM;ktime++)
+                {
+                    if(issunlit==1)
+                    {
+                        if(ktime==0) {
+                            ssum = ssum + (Tc-273.15-voxelTlasts[TlastId+ktime].sunlit)/dtime *
+                            (sqrt(dtime_[ktime]) - sqrt(dtime_[ktime]-dtime));
+                        }
+                        else {
+                            ssum = ssum + (voxelTlasts[TlastId+ktime-1].sunlit - voxelTlasts[TlastId+ktime].sunlit)/dtime *
+                            (sqrt(dtime_[ktime])-sqrt(dtime_[ktime]-dtime));
+                        }
+                    }
+                    else
+                    {
+                        if(ktime==0) {
+                            ssum = ssum + (Tc-273.15-voxelTlasts[TlastId+ktime].shaded)/dtime *
+                            (sqrt(dtime_[ktime]) - sqrt(dtime_[ktime]-dtime));
+                        }
+                        else {
+                            ssum = ssum + (voxelTlasts[TlastId+ktime-1].shaded - voxelTlasts[TlastId+ktime].shaded)/dtime *
+                            (sqrt(dtime_[ktime])-sqrt(dtime_[ktime]-dtime));
+                        }
+                    }
+                }
+                Gst = GAM /sqrt(PI)* 2 * ssum;
+            }else{
+                float ToldProfile[TLASTNUM],Mprofile[TLASTNUM],TnewProfile[TLASTNUM];
+                for(int kdepth = 0;kdepth <TLASTNUM;kdepth++){
+                    if(issunlit == 0) ToldProfile[kdepth] = voxelTlasts[TlastId+kdepth].shaded;
+                    else ToldProfile[kdepth] = voxelTlasts[TlastId+kdepth].sunlit;
+                    TnewProfile[kdepth] = 0;
+                    Mprofile[kdepth] = soilMoistureFraction(
+                        localSoilMoisture(bufferId, bioId), soilSets[bioId].SatWater);
+                }
+                Soilheatflux(ToldProfile, Mprofile, Tc - 273.15,
+                             soilSets[bioId].Tsoil, Gst, TnewProfile, dtime,
+                             soilSets[bioId].cs, soilSets[bioId].rhos,
+                             soilSets[bioId].lambdas, soilSets[bioId].SatWater);
+            }
+        }// if soil
+
+        //--------------------------
+        // Save H,LE and G
+        //--------------------------
+        if (issunlit > 0)
+        {
+            atomicStore(voxelHeatFlux[bufferId].Hsunlit,H , gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+            atomicStore(voxelHeatFlux[bufferId].LEsunlit,LE, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+            atomicStore(voxelHeatFlux[bufferId].Gsunlit,Gst, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+
+        }else
+        {
+            atomicStore(voxelHeatFlux[bufferId].Hshaded,H, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+            atomicStore(voxelHeatFlux[bufferId].LEshaded,LE, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+            atomicStore(voxelHeatFlux[bufferId].Gshaded,Gst, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+
+        }
+
+    }// for sunlit and shaded 
+
+}

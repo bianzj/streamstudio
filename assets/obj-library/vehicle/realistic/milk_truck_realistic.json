@@ -1,0 +1,12 @@
+{
+  "source": "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/CesiumMilkTruck",
+  "sourceTriangles": 3624,
+  "triangles": 3624,
+  "dimensions": [
+    2.792,
+    2.5829,
+    4.8689
+  ],
+  "coordinateSystem": "Y-up",
+  "vertexColors": true
+}

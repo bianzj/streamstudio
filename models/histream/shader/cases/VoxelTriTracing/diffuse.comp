@@ -1,0 +1,428 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXELTRITRACING 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../bsdf.glsl"
+#include "../functions.glsl"
+#include "../nanovdb_info.glsl"
+#include "../shade_state_voxel.glsl"
+#include "../random.glsl"
+
+PtPayload        prd;
+ShadowHitPayload shadow_payload;
+
+#include "../traceray_comp.glsl"
+
+layout(local_size_x = GROUP_SIZEX) in;
+#define MAXSTEP   100
+#define DIFFUSE_ANGLE_NUM 32
+#define MAXBAND    25
+#define NUM_VNIR 2001 
+#define NUM_BAND 2162
+#define NUM_TIR 162
+// from traveled direction to selected direction
+float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];    // gamma relflectance
+float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];    // gamma transmittance
+// from solar direction to selected direction;
+float GammaSR[DIFFUSE_ANGLE_NUM];           // gamma sun relflectance
+float GammaST[DIFFUSE_ANGLE_NUM];           // gamma sun transmittance
+
+// calculate the scattering phase function from solar angle to N angles.
+void Scattering_phase_function_solar_diffuse()
+{
+    vec3 directioni = normalize(lightSet.direction);
+    for(int jangle = 0; jangle < DIFFUSE_ANGLE_NUM; jangle++)
+    {
+        vec3 directionj = normalize(DIFFUSE_DIRECTIONS[jangle]);
+        vec2 gamma = scattering_phase_function_direct_XZY(directioni, directionj);
+        GammaSR[jangle] = gamma.x;
+        GammaST[jangle] = gamma.y;
+    }
+}
+
+// calculate the scattering phase function from N angles to N angles.
+void Scattering_phase_function_diffuse()
+{
+    for(int iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
+    {
+        vec3 directioni = normalize(DIFFUSE_DIRECTIONS[iangle]);
+        for(int jangle = 0; jangle < DIFFUSE_ANGLE_NUM; jangle++)
+        {
+            vec3 directionj = normalize(DIFFUSE_DIRECTIONS[jangle]);
+            vec2 gamma = scattering_phase_function_direct_XZY(directioni, directionj);
+            GammaR[iangle * DIFFUSE_ANGLE_NUM + jangle] = gamma.x;
+            GammaR[iangle * DIFFUSE_ANGLE_NUM + jangle] = gamma.y;
+        }
+    }
+}
+
+// calculate the diffuse term.
+bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBLink)
+{
+    vec3 directioni0, directioni, directionj0, directionj;
+    Ray ray;
+    float alpha_toSolar, alpha_toVoxel, alpha_voxel;
+    ivec3 voxelId;
+    uint bufferId;
+    float scale = settingxml.scale;
+    uint instanceId, typeId;                // passed voxel Id through voxelLink and instanceLink.
+    uint canopyId, thermalId, spectralId;
+    Canopy canopy;
+    vec2 gammart;
+    // float cosThetaSun = abs(normalize(lightSet.direction).y); // XZY
+    float cosThetaSun = CosThetaTangent(normalize(lightSet.direction));
+    float pl_toSolar, pl_toVoxel;
+
+    ////////////////////////////////////
+    // Iteration in diffuse angle
+    ////////////////////////////////////
+    for(int iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
+    {
+        directioni0 = DIFFUSE_DIRECTIONS[iangle];
+        directioni = normalize(directioni0);
+        float cosThetai = CosThetaTangent(directioni); // attention
+
+        ray = Ray(voxelPos0, directioni);
+        alpha_toSolar = 1.0;
+        alpha_toVoxel = 1.0;
+
+        // initial induced = 0.
+        for(int kband = 0; kband < sensorMatrix.waveNum; kband++)
+        {
+            uint loc = bufferId0 * DIFFUSE_ANGLE_NUM * sensorMatrix.waveNum + kband * DIFFUSE_ANGLE_NUM + iangle;
+            voxelRads[loc].induced = 0.0;
+        }
+
+        // iteration in travel step.
+        vec3 ffnormal;
+        for(int kstep = 0; kstep <= settingxml.maxStep; kstep++)
+        {
+            alpha_voxel = 1.0;
+            ClosestHit(ray);
+
+            //////////////////////////////
+            /// sky case
+            /// (sky -> i).
+            /// hit sky and return, this direction is done.
+            /////////////////////////////
+            if(prd.hitT == INFINITY)
+            {
+                // if(directioni.y > 0)
+                // {
+                //     for(int kband = 0; kband < sensorMatrix.waveNum; kband++)
+                //     {
+                //         uint loc = bufferId0 * DIFFUSE_ANGLE_NUM * sensorMatrix.waveNum + kband * DIFFUSE_ANGLE_NUM + iangle;
+                //         if(settingxml.isTemperature == 1)
+                //         {
+                //             int waveInd = sensorWaveInds[kband].value;
+                //             float wavelength = waveSets[waveInd].wavelength;
+                //             if(wavelength > 50) wavelength = wavelength/1000.0;
+                //             if(wavelength > 2.5)
+                //             {
+                //                 voxelRads[loc].induced += alpha_toVoxel * Planck(wavelength, lightSet.skyTemperature);
+                //             }
+                //             else
+                //             {
+                //                 voxelRads[loc].induced += alpha_toVoxel * lightSet.diffuse / (DIFFUSE_ANGLE_NUM / 2.0);
+                //             }
+                //         }
+                //         else
+                //         {
+                //             voxelRads[loc].induced += alpha_toVoxel * lightSet.diffuse / (DIFFUSE_ANGLE_NUM / 2.0);
+                //         }
+                //     }
+                // }
+                break;
+            }
+
+            //////////////////////////////
+            /// Turbid or facet ground case (j -> i).
+            /////////////////////////////
+            /// get hit information.
+            ShadeState sstate = GetShadeState(prd);
+            voxelId = getPassedVoxelId(sstate.position, scale, normalize(ray.direction));
+            bufferId = nanovdbGet(nanoVDBLink, voxelId);
+
+            // a valid voxel and get this voxel information.
+            if(bufferId >=0)
+            {
+                instanceId = voxelLinks[bufferId].instanceId;
+                typeId = instanceLinks[instanceId].type;
+                canopyId = instanceLinks[instanceId].canopyId;
+                spectralId = instanceLinks[instanceId].spectralId;
+                thermalId = instanceLinks[instanceId].thermalId;
+                canopy = canopies[canopyId];
+
+                if(typeId == TYPE_VEGETATION)
+                {
+                    float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
+                    alpha_voxel = exp(-canopies[canopyId].density * canopies[canopyId].G * pathLength);
+                    alpha_toVoxel = alpha_toVoxel * alpha_voxel;
+                    alpha_toSolar = voxelDirs[bufferId].solar;
+                    if(alpha_toVoxel < 0.001) break;
+
+                    // get the phase function for solar direction to induced direction.
+                    gammart.x = GammaSR[iangle];
+                    gammart.y = GammaST[iangle];
+
+                    // this is used for the hotspot effect
+                    if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
+                    else pl_toSolar = -log(alpha_toSolar) / canopy.G / 1.0;
+                    if(alpha_toVoxel < 0.0001) pl_toVoxel = 10000.0;
+                    else pl_toVoxel = -log(alpha_toVoxel) / canopy.G / 1.0;
+                    float hotspot = Hotspot_Kuusk(normalize(lightSet.direction), -normalize(ray.direction), pl_toSolar, pl_toVoxel, 1.0, HSPOT);
+
+                    for(int kband = 0; kband < sensorMatrix.waveNum; kband++)
+                    {
+                        float refl = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].reflectance;
+                        float trans = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].transmittance;
+
+                        //////////////////////////////
+                        /// Solar case and other voxel emitter
+                        // (sun -> j -> i) + else-emitter(j -> i).
+                        /////////////////////////////
+                        float radianceDirect = 0.0;
+                        float gamma = abs(gammart.x) * (refl + trans) + abs(gammart.y) * trans;
+                        gamma = clamp(gamma, 0, 1);
+                        if(settingxml.isTemperature == 1)
+                        {
+                            int waveInd = sensorWaveInds[kband].value;
+                            float wavelength = waveSets[waveInd].wavelength;
+                            if(wavelength > 50) wavelength = wavelength/1000.0;
+                            if(wavelength > 2.5)
+                            {
+                                // get sunlit and shaded fraction and mixed them for an average result.
+                                float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
+                                float shadedTemperature = thermalMaterials[thermalId].shadedTemperature;
+
+                                // hot spot
+                                float thermalRadiance = Planck(wavelength, sunlitTemperature) * hotspot
+                                                        + Planck(wavelength, shadedTemperature) * (alpha_toVoxel - hotspot);
+                                radianceDirect += thermalRadiance * (1 - refl - trans) * (1 - alpha_voxel);
+                                // // get sunlit and shaded fraction and mixed them for an average result.
+                                // float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
+                                // float shadedTemperature = thermalMaterials[thermalId].shadedTemperature;
+                                // float thermalRadiance = Planck(wavelength, sunlitTemperature) * alpha_toSolar 
+                                //                         + Planck(wavelength, shadedTemperature) * (1 - alpha_toSolar);
+                                // radianceDirect += thermalRadiance * alpha_toVoxel * (1- refl - trans) * (1 - alpha_voxel);
+                            }
+                            else
+                            {
+                                radianceDirect += lightSet.direct * alpha_toSolar * abs(cosThetaSun) *(1 - alpha_voxel) * gamma * alpha_toVoxel;
+                            }
+                        }
+                        else
+                        {
+                            radianceDirect += lightSet.direct * alpha_toSolar * abs(cosThetaSun) *(1 - alpha_voxel) * gamma * alpha_toVoxel;
+                        }
+
+                        //////////////////////////////
+                        /// Multiple case
+                        /// (sky -> j -> i) + else-emitter(jj -> j -> i) for the first time.
+                        /////////////////////////////
+                        float radianceDiffuse = 0.0;
+                        float radianceDiffuse0 = 0.0;
+                        float weight = 0.0;
+                        uint loc = bufferId0 * DIFFUSE_ANGLE_NUM * sensorMatrix.waveNum + kband * DIFFUSE_ANGLE_NUM + iangle; 
+                        for(int jangle = 0; jangle < DIFFUSE_ANGLE_NUM; jangle++)
+                        {
+                            float radiancej = voxelRads[loc].cumulated;
+                            directionj0 = DIFFUSE_DIRECTIONS[jangle];
+                            directionj = normalize(directionj0);
+                            float cosThetaj = CosThetaTangent(directionj);
+
+                            gammart.x = GammaR[iangle * DIFFUSE_ANGLE_NUM + jangle];
+                            gammart.y = GammaT[iangle * DIFFUSE_ANGLE_NUM + jangle];
+                            gamma = abs(gammart.x) * (refl + trans) + abs(gammart.y) * trans;
+                            gamma = clamp(gamma, 0, 1);
+
+                            radianceDiffuse0 += radiancej * alpha_toVoxel * canopy.density * gamma / DIFFUSE_ANGLE_NUM / 2 / PI;
+
+                            weight += abs(cosThetaj)/DIFFUSE_ANGLE_NUM;
+                        }
+                        if(weight > EPSION)
+                        {
+                            radianceDiffuse += radianceDiffuse0;///weight;
+                        }
+                        voxelRads[loc].induced += radianceDirect + radianceDiffuse;
+                    }
+                }
+
+                if(typeId == TYPE_SOIL)
+                {
+                    ffnormal = sstate.normal;
+                    bool inSameSide = IsSameSide(directioni, lightSet.direction, ffnormal);
+
+                    // this is used for the hotspot effect
+                    if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
+                    else pl_toSolar = -log(alpha_toSolar) / canopy.G / 1.0;
+                    if(alpha_toVoxel < 0.0001) pl_toVoxel = 10000.0;
+                    else pl_toVoxel = -log(alpha_toVoxel) / canopy.G / 1.0;
+                    float hotspot = Hotspot_Kuusk(normalize(lightSet.direction), -normalize(ray.direction), pl_toSolar, pl_toVoxel, 1.0, HSPOT);
+
+                    for(int kband = 0; kband < sensorMatrix.waveNum; kband++)
+				    {
+                        float refl = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].reflectance;
+                        float trans = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].transmittance;
+                        alpha_toSolar = voxelDirs[bufferId].solar;
+
+                        //////////////////////////////
+                        /// Solar case and emitter case
+                        /// (sun -> j -> i) + else-emitter(j -> i).
+                        /// i = soil.
+                        /////////////////////////////
+                        float radianceDirect = 0.0;
+                        if(settingxml.isTemperature == 1)
+                        {
+                            int waveInd = sensorWaveInds[kband].value;
+                            float wavelength = waveSets[waveInd].wavelength;
+                            if(wavelength > 50) wavelength = wavelength/1000.0;
+                            if(wavelength > 2.5)
+                            {
+                                // get sunlit and shaded fraction and mixed them for an average result.
+                                float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
+                                float shadedTemperature = thermalMaterials[thermalId].shadedTemperature;
+
+                                // hotspot
+                                float thermalRadiance = Planck(wavelength, sunlitTemperature) * hotspot 
+                                                        + Planck(wavelength, shadedTemperature) * (alpha_toVoxel - hotspot);
+                                radianceDirect += thermalRadiance * (1 - refl - trans) * alpha_toVoxel;
+                                // // get sunlit and shaded fraction and mixed them for an average result.
+                                // float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
+                                // float shadedTemperature = thermalMaterials[thermalId].shadedTemperature;
+                                // float thermalRadiance = Planck(wavelength, sunlitTemperature) * alpha_toSolar 
+                                //                         + Planck(wavelength, shadedTemperature) * (1 - alpha_toSolar);
+                                // radianceDirect += thermalRadiance * alpha_toVoxel * (1 - refl - trans);
+                            }
+                            else
+                            {
+                                if(inSameSide)
+                                {
+                                    radianceDirect += lightSet.direct * alpha_toSolar * abs(cosThetaSun) * refl/M_PI * alpha_toVoxel;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if(inSameSide)
+                            {
+                                radianceDirect += lightSet.direct * alpha_toSolar * abs(cosThetaSun) * refl/M_PI * alpha_toVoxel;
+                            }
+                        }
+
+                        //////////////////////////////
+                        /// Multiple case
+                        /// (sky -> j -> i) + else-emitter(jj -> j -> i) for the first time.
+                        /// i = soil.
+                        /////////////////////////////
+                        float radianceDiffuse = 0.0;
+                        float radianceDiffuse0 = 0.0;
+                        float weight = 0.0;
+                        uint loc = bufferId0 * DIFFUSE_ANGLE_NUM * sensorMatrix.waveNum + kband * DIFFUSE_ANGLE_NUM + iangle; 
+                        for(int jangle = 0; jangle < DIFFUSE_ANGLE_NUM; jangle++)
+                        {
+                            directionj0 = DIFFUSE_DIRECTIONS[jangle];
+                            directionj = normalize(directionj0);
+                            float cosThetaj = CosThetaTangent(directionj);
+
+                            inSameSide = IsSameSide(directioni, directionj, ffnormal);
+                            if(!inSameSide) continue;
+                            
+                            float radiancej = voxelRads[loc].cumulated;
+                            radianceDiffuse0 += radiancej * abs(cosThetaj) * refl/M_PI * alpha_toVoxel;
+                            weight += abs(cosThetaj) / (DIFFUSE_ANGLE_NUM / 2.0);
+                        }
+                        if(weight > EPSION)
+                        {
+                            radianceDiffuse += radianceDiffuse0;// / weight;
+                        }
+
+                        voxelRads[loc].induced += radianceDirect + radianceDiffuse;
+                    }
+                    break;
+                }
+            }
+
+            //// change ray origin position to hit position; and avoid self collide.
+            ray = Ray(sstate.position, directioni);
+            ffnormal = sstate.normal;
+            ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
+        }
+    }
+
+    return false;
+}
+
+void main()
+{
+    //------------------------------------------------------------
+    // Initialization for the position and SSBO index
+    //------------------------------------------------------------
+    // get bufferId, voxelId, instanceId and typeId
+    uint bufferId0 = uint(gl_GlobalInvocationID);
+    ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
+    // Get nanoVDBLink: from voxelId to bufferId
+    NanoVDBLink nanoVDBLink = nanovdbInit();
+
+    // get center postion of a voxel
+    float scale = settingxml.scale;
+    vec3 semiRange = settingxml.scale * settingxml.voxelSize/2.0;
+    vec3 voxelPos0 = vec3(voxelId0.x + scale/2.0, voxelId0.y + scale/2.0, voxelId0.z + scale/2.0);
+
+    // maxIteration is scattering times.
+    // induced in primary time is calculated at solar file.
+    if(settingxml.maxIteration > 1)
+    {
+        // calculate the scattering phase function from solar angle to N angles.
+        Scattering_phase_function_solar_diffuse();
+
+        // calculate the scattering phase function from N angles to N angles.
+        Scattering_phase_function_diffuse();
+
+        float iterationNum = settingxml.maxIteration - 1;
+        for(int kiter = 0; kiter < iterationNum; kiter++)
+        {
+            // calculate the diffuse term.
+            Voxel_raytracing_diffuse(voxelPos0, bufferId0, nanoVDBLink);
+
+            // groupMemoryBarrier waits on the completion of all memory accesses 
+            // performed by an invocation of a compute shader
+            // relative to the same access performed by other invocations 
+            // in the same work group and then returns with no other effect. 
+            groupMemoryBarrier();
+            barrier();
+
+            for(int kband = 0; kband < sensorMatrix.waveNum; kband++)
+            {
+                for(int iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
+                {
+                    uint loc = bufferId0 * DIFFUSE_ANGLE_NUM * sensorMatrix.waveNum + kband * DIFFUSE_ANGLE_NUM + iangle;
+                    atomicStore(voxelRads[loc].cumulated, voxelRads[loc].induced, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+                }
+            }
+
+        }
+    }
+
+}

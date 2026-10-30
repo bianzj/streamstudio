@@ -1,0 +1,109 @@
+#version 460
+layout(local_size_x=64) in;
+struct SurfaceOptics { float reflectance,transmittance,emission,directIrradiance; };
+layout(std430,binding=0) readonly buffer Facets { float F[]; };
+layout(std430,binding=1) readonly buffer Materials { vec4 M[]; };
+layout(std430,binding=2) buffer Optical { SurfaceOptics optics[]; };
+layout(std430,binding=3) buffer Emission { vec2 emission[]; };
+layout(std430,binding=4) readonly buffer RadiosityA { float A[]; };
+layout(std430,binding=5) readonly buffer RadiosityB { float B[]; };
+layout(std430,binding=6) buffer Previous { float previous[]; };
+layout(std430,binding=7) buffer Output { float outputData[]; };
+layout(std430,binding=8) buffer Dispatch { uint dispatchData[]; };
+layout(std430,binding=9) readonly buffer Residual { uint residual[]; };
+layout(push_constant) uniform Push {
+    uint phase,band,facets,materials;
+    float sunX,sunY,sunZ,strength,beam,scale;
+    uint thermal,ping,bands,reserved;
+} pc;
+
+float hapkeH(float mu,float w) {
+    float gamma=sqrt(max(1.0-w,1e-6));
+    return (1.0+2.0*mu)/(1.0+2.0*mu*gamma);
+}
+float backgroundReflectance(float value,uint f) {
+    const float pi=3.14159265358979323846;
+    float base=clamp(value,0.0,0.999);
+    float w=clamp(4.0*base/((1.0+base)*(1.0+base)),1e-5,0.999);
+    float mu0=F[f+8],mu=F[f+11],opposition=F[f+9];
+    precise float multiple=hapkeH(mu0,w)*hapkeH(mu,w)-1.0;
+    precise float directional=w/(4.0*pi)*mu0/max(mu0+mu,1e-5)*(1.0+opposition+multiple);
+    float h=hapkeH(1.0,w);
+    precise float reference=w/(8.0*pi)*h*h;
+    float hapke=clamp(base*directional/mu0/max(reference,1e-6),0.0,1.0);
+    precise float result=base+(hapke-base)*clamp(pc.strength,0.0,1.0);
+    return result;
+}
+float directionalEmission(float base,float mu) {
+    float root=sqrt(1.0-clamp(1.0-base*base,1e-5,0.999));
+    precise float value=root*(1.0+2.0*mu/1.5)/(1.0+2.0*mu/1.5*root);
+    return value;
+}
+float backgroundEmissivity(float value,uint f) {
+    float base=clamp(value,0.0,1.0);
+    float hapke=clamp(base*directionalEmission(base,clamp(F[f+10],1e-4,1.0))/max(directionalEmission(base,1.0),1e-6),0.0,1.0);
+    precise float result=base+(hapke-base)*clamp(pc.strength,0.0,1.0);
+    return result;
+}
+float finish(float value) {
+    float v=max(0.0,value*pc.scale);
+    return pc.thermal==0u?min(v,1.0):v;
+}
+void main() {
+    uint s=gl_GlobalInvocationID.x,n=2u*pc.facets;
+    if(pc.phase==5u || pc.phase==6u) {
+        if(s!=0u)return;
+        if(pc.phase==5u) {
+            dispatchData[0]=(pc.facets+63u)/64u;
+            dispatchData[1]=1u;dispatchData[2]=1u;
+            dispatchData[3]=0u;dispatchData[4]=0u;
+        } else if(dispatchData[0]!=0u) {
+            dispatchData[3]+=8u;dispatchData[4]=residual[0];
+            if(uintBitsToFloat(residual[0])<=1e-4)dispatchData[0]=0u;
+        }
+        return;
+    }
+    if(s>=n)return;
+    uint f=(s/2u)*12u,other=s^1u;
+    vec3 normal=vec3(F[f],F[f+1],F[f+2]);
+    // Spell out the CPU dot-product order and disable multiply-add contraction.
+    precise float cosine=normal.x*pc.sunX+normal.y*pc.sunY+normal.z*pc.sunZ;
+    if(pc.phase==0u) {
+        vec4 material=M[pc.band*pc.materials+uint(F[f+4])];
+        bool thermal=pc.thermal!=0u,object=F[f+5]!=0.0;
+        float r=clamp(material.x*(thermal?1.0:F[f+3]),0.0,1.0);
+        float t=clamp(material.y,0.0,1.0-r);
+        float e=max(0.0,1.0-r-t);
+        if(!object) {
+            if(thermal){e=backgroundEmissivity(e,f);r=clamp(1.0-t-e,0.0,1.0);}
+            else r=backgroundReflectance(r,f);
+        }
+        SurfaceOptics o;
+        o.reflectance=r;o.transmittance=min(t,1.0-r);
+        emission[s]=thermal?vec2(e*material.z,e*material.w):vec2(0.0);
+        float lit=clamp(F[f+6]+F[f+7],0.0,1.0);
+        precise float mixed=lit*emission[s].x+(1.0-lit)*emission[s].y;
+        o.emission=thermal?mixed:0.0;
+        precise float direct=F[f+6u+(s&1u)]*max(0.0,(s&1u)==0u?cosine:-cosine)*pc.beam;
+        o.directIrradiance=thermal?0.0:direct;
+        optics[s]=o;
+    } else if(pc.phase==4u) {
+        optics[s].directIrradiance=0.0;
+    } else {
+        float raw=pc.ping==0u?A[s]:B[s];
+        if(pc.phase==2u) {
+            previous[s]=raw; // Physical radiosity, before output normalization.
+            outputData[pc.band*n+s]=finish(raw);
+            SurfaceOptics o=optics[s];
+            precise float diffuseShared=raw-o.reflectance*o.directIrradiance-o.transmittance*optics[other].directIrradiance-o.emission;
+            float own=max(0.0,(s&1u)==0u?cosine:-cosine)*pc.beam;
+            float opposite=max(0.0,(s&1u)==0u?-cosine:cosine)*pc.beam;
+            precise float lit=diffuseShared+o.reflectance*own+o.transmittance*opposite+emission[s].x;
+            precise float shade=diffuseShared+emission[s].y;
+            uint k=pc.bands*n+2u*(pc.band*n+s);
+            outputData[k]=finish(lit);outputData[k+1u]=finish(shade);
+        } else if(pc.phase==3u) {
+            outputData[3u*pc.bands*n+s]=max(0.0,outputData[s]-finish(raw));
+        }
+    }
+}

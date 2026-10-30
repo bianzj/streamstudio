@@ -1,0 +1,701 @@
+{
+  "kind": "stream-classes",
+  "schemaVersion": 1,
+  "description": "STREAM 遥感影像模拟的 IGBP 地类参数。冠层、叶片光学与光合参数沿用 StreamEarth defined.cpp，土壤与空气动力学参数对齐 TiRT/TIRTEB 默认值（2026-10 版本）；城市（13）、冰雪（15）地面与光合途径的调整见 models/stream/PORTING.md。 2026-10-28：新增 ground.heatRoughnessKb（kB⁻¹=ln(z0/z0h)），裸土/城市 5、稀疏灌丛 3、短植被 2、森林 1.5、冰雪 2；决定地表与大气耦合强度，直接影响日较差。",
+  "soil": {
+    "optics": {
+      "brightness": 0.25,
+      "latitude": 25,
+      "longitude": 45
+    },
+    "defaultMoisture": 0.25,
+    "saturatedMoisture": 0.45,
+    "emissivity": 0.955,
+    "conductivity": 1.55,
+    "thermalInertia": 1418.4,
+    "surfaceResistance": 200,
+    "resistance": "constant"
+  },
+  "atmosphere": {
+    "co2": 380,
+    "o2": 209,
+    "referenceHeight": 15
+  },
+  "aerodynamics": {
+    "cd": 0.2,
+    "cd1": 20.6,
+    "cr": 0.35,
+    "psicor": 0.2,
+    "cssoil": 0.01,
+    "soilBoundaryResistance": 10
+  },
+  "classes": [
+    {
+      "code": 0,
+      "name": "未分类",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 3.0,
+        "leafWidth": 0.2,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 58.0,
+        "cw": 0.015,
+        "cdm": 0.0036,
+        "cs": 0.0,
+        "n": 1.86,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 80,
+        "ballBerrySlope": 9,
+        "respiration": 0.015,
+        "temperature": [
+          0.2,
+          0.3,
+          281,
+          308,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 2.0
+      }
+    },
+    {
+      "code": 1,
+      "name": "常绿针叶林",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 18,
+        "leafWidth": 0.01,
+        "leafProjection": 0.5,
+        "hotspot": 0.5
+      },
+      "leaf": {
+        "cab": 45.0,
+        "cw": 0.02,
+        "cdm": 0.05,
+        "cs": 0.0,
+        "n": 2.0,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 70,
+        "ballBerrySlope": 9,
+        "respiration": 0.015,
+        "temperature": [
+          0.2,
+          0.3,
+          278,
+          308,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 1.5
+      }
+    },
+    {
+      "code": 2,
+      "name": "常绿阔叶林",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 20,
+        "leafWidth": 0.1,
+        "leafProjection": 0.5,
+        "hotspot": 0.5
+      },
+      "leaf": {
+        "cab": 50.0,
+        "cw": 0.025,
+        "cdm": 0.05,
+        "cs": 0.0,
+        "n": 2.5,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 90,
+        "ballBerrySlope": 12,
+        "respiration": 0.02,
+        "temperature": [
+          0.2,
+          0.3,
+          288,
+          313,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 1.5
+      }
+    },
+    {
+      "code": 3,
+      "name": "落叶针叶林",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 16,
+        "leafWidth": 0.01,
+        "leafProjection": 0.5,
+        "hotspot": 0.5
+      },
+      "leaf": {
+        "cab": 35.0,
+        "cw": 0.015,
+        "cdm": 0.005,
+        "cs": 0.0,
+        "n": 1.8,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 70,
+        "ballBerrySlope": 9,
+        "respiration": 0.013,
+        "temperature": [
+          0.2,
+          0.3,
+          278,
+          303,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 1.5
+      }
+    },
+    {
+      "code": 4,
+      "name": "落叶阔叶林",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 15,
+        "leafWidth": 0.1,
+        "leafProjection": 0.5,
+        "hotspot": 0.5
+      },
+      "leaf": {
+        "cab": 50.0,
+        "cw": 0.02,
+        "cdm": 0.005,
+        "cs": 0.0,
+        "n": 2.2,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 90,
+        "ballBerrySlope": 12,
+        "respiration": 0.017,
+        "temperature": [
+          0.2,
+          0.3,
+          283,
+          311,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 1.5
+      }
+    },
+    {
+      "code": 5,
+      "name": "混交林",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 17,
+        "leafWidth": 0.05,
+        "leafProjection": 0.5,
+        "hotspot": 0.5
+      },
+      "leaf": {
+        "cab": 50.0,
+        "cw": 0.02,
+        "cdm": 0.025,
+        "cs": 0.0,
+        "n": 2.0,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 80,
+        "ballBerrySlope": 12,
+        "respiration": 0.016,
+        "temperature": [
+          0.2,
+          0.3,
+          281,
+          307,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 1.5
+      }
+    },
+    {
+      "code": 6,
+      "name": "郁闭灌丛",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 2.0,
+        "leafWidth": 0.03,
+        "leafProjection": 0.5,
+        "hotspot": 0.5
+      },
+      "leaf": {
+        "cab": 35.0,
+        "cw": 0.018,
+        "cdm": 0.005,
+        "cs": 0.0,
+        "n": 2.0,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 60,
+        "ballBerrySlope": 9,
+        "respiration": 0.012,
+        "temperature": [
+          0.2,
+          0.3,
+          278,
+          313,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 2.0
+      }
+    },
+    {
+      "code": 7,
+      "name": "稀疏灌丛",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 1.5,
+        "leafWidth": 0.03,
+        "leafProjection": 0.5,
+        "hotspot": 0.5
+      },
+      "leaf": {
+        "cab": 35.0,
+        "cw": 0.015,
+        "cdm": 0.005,
+        "cs": 0.0,
+        "n": 1.7,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 45,
+        "ballBerrySlope": 9,
+        "respiration": 0.011,
+        "temperature": [
+          0.2,
+          0.3,
+          278,
+          313,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 3.0
+      }
+    },
+    {
+      "code": 8,
+      "name": "木本稀树草原",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 2.0,
+        "leafWidth": 0.02,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 35.0,
+        "cw": 0.012,
+        "cdm": 0.005,
+        "cs": 0.0,
+        "n": 1.6,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 65,
+        "ballBerrySlope": 9,
+        "respiration": 0.014,
+        "temperature": [
+          0.2,
+          0.3,
+          288,
+          303,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 3.0
+      }
+    },
+    {
+      "code": 9,
+      "name": "稀树草原",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 1.5,
+        "leafWidth": 0.02,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 30.0,
+        "cw": 0.01,
+        "cdm": 0.005,
+        "cs": 0.0,
+        "n": 1.5,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 55,
+        "ballBerrySlope": 9,
+        "respiration": 0.013,
+        "temperature": [
+          0.2,
+          0.3,
+          288,
+          303,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 3.0
+      }
+    },
+    {
+      "code": 10,
+      "name": "草地",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 0.6,
+        "leafWidth": 0.02,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 20.0,
+        "cw": 0.01,
+        "cdm": 0.005,
+        "cs": 0.0,
+        "n": 1.2,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 100,
+        "ballBerrySlope": 4,
+        "respiration": 0.012,
+        "temperature": [
+          0.2,
+          0.3,
+          288,
+          313,
+          328
+        ],
+        "temperatureCorrection": true
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 2.0
+      }
+    },
+    {
+      "code": 11,
+      "name": "永久湿地",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 0.5,
+        "leafWidth": 0.02,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 30.0,
+        "cw": 0.015,
+        "cdm": 0.005,
+        "cs": 0.0,
+        "n": 1.5,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 30,
+        "ballBerrySlope": 8,
+        "respiration": 0.014,
+        "temperature": [
+          0.2,
+          0.3,
+          288,
+          303,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 2.0
+      }
+    },
+    {
+      "code": 12,
+      "name": "农田",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 1.0,
+        "leafWidth": 0.1,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 35.0,
+        "cw": 0.015,
+        "cdm": 0.005,
+        "cs": 0.0,
+        "n": 1.5,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C4",
+        "vcmax": 45,
+        "ballBerrySlope": 9,
+        "respiration": 0.016,
+        "temperature": [
+          0.2,
+          0.3,
+          281,
+          308,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 2.0
+      }
+    },
+    {
+      "code": 13,
+      "name": "城市与建成区",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 1.0,
+        "leafWidth": 0.2,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 58.0,
+        "cw": 0.015,
+        "cdm": 0.0036,
+        "cs": 0.0,
+        "n": 1.86,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 60,
+        "ballBerrySlope": 9,
+        "respiration": 0.015,
+        "temperature": [
+          0.2,
+          0.3,
+          283,
+          311,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "impervious",
+        "reflectance": 0.15,
+        "emissivity": 0.95,
+        "surfaceResistance": 3662.86,
+        "conductivity": 1.5,
+        "thermalInertia": 2000,
+        "heatRoughnessKb": 5.0
+      }
+    },
+    {
+      "code": 14,
+      "name": "农田与自然植被镶嵌",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 3.0,
+        "leafWidth": 0.1,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 40.0,
+        "cw": 0.015,
+        "cdm": 0.015,
+        "cs": 0.0,
+        "n": 1.5,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C4",
+        "vcmax": 50,
+        "ballBerrySlope": 9,
+        "respiration": 0.015,
+        "temperature": [
+          0.2,
+          0.3,
+          281,
+          308,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 2.5
+      }
+    },
+    {
+      "code": 15,
+      "name": "冰雪",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 0.5,
+        "leafWidth": 0.2,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 58.0,
+        "cw": 0.015,
+        "cdm": 0.0036,
+        "cs": 0.0,
+        "n": 1.86,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "none"
+      },
+      "ground": {
+        "surface": "snow",
+        "reflectance": 0.75,
+        "emissivity": 0.985,
+        "surfaceResistance": 100,
+        "conductivity": 0.5,
+        "thermalInertia": 600,
+        "heatRoughnessKb": 2.0
+      }
+    },
+    {
+      "code": 16,
+      "name": "裸地",
+      "surface": "vegetation",
+      "canopy": {
+        "height": 0.05,
+        "leafWidth": 0.2,
+        "leafProjection": 0.5,
+        "hotspot": 0.2
+      },
+      "leaf": {
+        "cab": 35.0,
+        "cw": 0.002,
+        "cdm": 0.001,
+        "cs": 0.0,
+        "n": 0.5,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "C3",
+        "vcmax": 20,
+        "ballBerrySlope": 9,
+        "respiration": 0.012,
+        "temperature": [
+          0.2,
+          0.3,
+          281,
+          308,
+          328
+        ]
+      },
+      "ground": {
+        "surface": "soil",
+        "heatRoughnessKb": 5.0
+      }
+    },
+    {
+      "code": 17,
+      "name": "水体",
+      "surface": "water",
+      "canopy": {
+        "height": 0,
+        "leafWidth": 0,
+        "leafProjection": 0.5,
+        "hotspot": 0
+      },
+      "leaf": {
+        "cab": 58.0,
+        "cw": 0.015,
+        "cdm": 0.0036,
+        "cs": 0.0,
+        "n": 1.86,
+        "reflTir": 0.025,
+        "transTir": 0
+      },
+      "photosynthesis": {
+        "pathway": "none"
+      },
+      "ground": {
+        "emissivity": 0.99,
+        "heatRoughnessKb": 2.0
+      }
+    },
+    {
+      "code": 18,
+      "name": "填充值",
+      "surface": "fill"
+    },
+    {
+      "code": 255,
+      "name": "填充值",
+      "surface": "fill"
+    }
+  ]
+}

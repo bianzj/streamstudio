@@ -1,0 +1,624 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXEL_LST_BIND_ININDEX
+#define VOXELLST 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../nanovdb_info.glsl"
+#include "../bsdf.glsl"
+#include "../functions.glsl"
+#include "../surface_brdf.glsl"
+#include "../shade_state_voxel.glsl"
+#include "../random.glsl"
+
+PtPayload        prd;
+ShadowHitPayload shadow_payload;
+
+#include "../traceray_comp.glsl"
+
+layout(local_size_x = GROUP_SIZEXY, local_size_y = GROUP_SIZEXY) in;
+
+#define MAXBAND    800
+#define NUM_VNIR 2001
+#define NUM_BAND 2002
+
+float Radiance[MAXBAND];
+float RadianceSum[MAXBAND];
+
+bool isOpticalBand(float wavelength)
+{
+    float wavelengthNm = wavelength <= 2.5 ? wavelength * 1000.0 : wavelength;
+    return wavelengthNm <= 2500.0;
+}
+
+int atmosphereBand(float wavelength)
+{
+    float wavelengthNm = wavelength <= 2.5 ? wavelength * 1000.0 : wavelength;
+    if(wavelengthNm > 2500.0) return NUM_VNIR;
+    return clamp(int(round(wavelengthNm - 400.0)), 0, NUM_VNIR - 1);
+}
+
+float directSpectralIrradiance(float wavelength)
+{
+    int band = atmosphereBand(wavelength);
+    return max(ubom.meteo.Rin, 0.0) * max(atomConds[band].direct, 0.0) * 0.001;
+}
+
+float diffuseSpectralIrradiance(float wavelength)
+{
+    int band = atmosphereBand(wavelength);
+    return max(ubom.meteo.Rin, 0.0) * max(atomConds[band].diffuse, 0.0) * 0.001;
+}
+
+// Rin*direct is horizontal irradiance (as in the energy balance); scattering
+// and facet illumination need the irradiance normal to the beam.
+float beamNormalScale()
+{
+    return 1.0 / max(normalize(lightSet.direction).y, 0.05);
+}
+
+// Optical output is the hemispherical-directional reflectance factor:
+// pi*L divided by the global horizontal irradiance.
+float referenceIrradiance(float wavelength)
+{
+    return normalize(lightSet.direction).y > 0.0
+        ? directSpectralIrradiance(wavelength) + diffuseSpectralIrradiance(wavelength)
+        : diffuseSpectralIrradiance(wavelength);
+}
+
+bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
+{
+    ResetHexRay();
+    // initialized the transmittance and accumulated radiance 
+    float alpha_toSensor = 1.0;
+    float alpha_toSolar, alpha_voxel;
+    float density,G;
+    for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
+        Radiance[kwave] = 0.0;
+    }
+    vec3 ffnormal;
+    ivec3 voxelId;
+    int bufferId,alignBufferId;
+    float scale = setting.scale;			// scale
+    uint instanceId, typeId,meshId;                // passed voxel Id through voxelLink and instanceLink.
+    uint canopyId, thermalId, spectralId;   // passed voxel spectral, thermal, canopy ID.
+	float pl_toSolar, pl_toSensor;			// hotspot parameters.
+    Canopy canopy;							// store canopy information
+    vec3 semiRange = vec3(floor(setting.voxelSize.x/2.0+0.5),0,floor(setting.voxelSize.z/2.0+0.5));
+
+    // ray.direction points from the sensor into the scene.  Hotspot_Kuusk
+    // uses the scene-to-sensor direction, while the leaf phase function
+    // uses the corresponding radiance propagation direction.
+    vec3 solarDirection = normalize(lightSet.direction);
+    vec3 viewDirection = normalize(-ray.direction);
+    vec2 gamma = scattering_phase_function_direct_XZY_paper(
+        solarDirection, -viewDirection);
+    ivec3 voxelRes = ivec3(setting.voxelSize);
+    // Canopy parameters of the last turbid voxel on this ray, reused for the
+    // Kuusk joint gap probability of surfaces seen through the canopy.
+    float hotspotDensity = DENSITY;
+    float hotspotG = LEAFG;
+    float hotspotLeafSize = HSPOT;
+
+    float canopyTSum = 0.0;
+    float canopyTNum = 0;
+    
+
+    float vegTemperatureSum = 0;
+    float vegNum = 0;
+    for(int kstep = 0;kstep<=setting.maxStep;kstep++)
+    {
+        alpha_voxel = 1.0;
+        ClosestHitPeriodic(ray, 0.001);
+
+        ///////////////////////////////////////////////////
+		/// sky case (sky -> sensor).
+		/// hit sky or out of scene, then return true. 
+		/// the sky contribution is added in solar file.
+		///////////////////////////////////////////////////
+        if(prd.hitT == INFINITY)
+        {
+            if(setting.skyboxEnabled == 0) {
+                // Preserve the existing COS/default sky response when the
+                // visual skybox is disabled.
+                return false;
+            }
+            for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
+                float wavelength = wave[kwave];
+                if(isOpticalBand(wavelength)) {
+                    Radiance[kwave] += alpha_toSensor
+                        * proceduralSkyReflectance(wavelength, ray.direction)
+                        * referenceIrradiance(wavelength);
+                } else {
+                    float wavelengthUm = wavelength > 50.0
+                        ? wavelength / 1000.0 : wavelength;
+                    Radiance[kwave] += alpha_toSensor * Planck(wavelengthUm,
+                        proceduralSkyTemperature(ray.direction,
+                            lightSet.skyTemperature));
+                }
+            }
+            return true;
+        }
+
+        ///////////////////////////////////////////////////
+		/// Turbid or facet ground case (j -> sensor).
+		///////////////////////////////////////////////////
+		/// get hit information.
+		ShadeState sstate = GetShadeState(prd);
+		//voxelId = getPassedVoxelId(sstate.position, scale, normalize(ray.direction));
+        ivec3 alignVoxelId;
+        voxelId = getVoxelIdSemi(sstate.position,semiRange,setting.scale,normalize(ray.direction),alignVoxelId);
+		bufferId = nanovdbGet(nanoVDBLink, voxelId);
+        alignBufferId = nanovdbGet(nanoVDBLink, alignVoxelId);
+
+
+        // LST = sstate.position.y;
+        // LST = bufferId;
+        // LST = alignBufferId;
+        // LST = alignVoxelId.y;
+        // LST = 20;
+        // return false;
+        
+   
+        if(bufferId >= 0)
+		{
+            
+			instanceId = voxelLinks[bufferId].instanceId;
+            meshId = instanceLinks[instanceId].meshId;
+
+			typeId = meshLinks[meshId].type;
+			canopyId = meshLinks[meshId].canopyId;
+			spectralId = meshLinks[meshId].spectralId;
+			thermalId = meshLinks[meshId].thermalId;
+
+			canopy = canopies[canopyId];
+            uint spectralBase = spectralId * setting.n_wave;
+            // Vegetation stores the two-face total; one face sees half of it.
+            float envTemp = Inv_Stefen_Boltzmann(voxelNetRads[bufferId].diffuseTrad
+                * (typeId == TYPE_VEGETATION ? 0.5 : 1.0), 1);
+
+            // LST = voxelNetRads[bufferId].diffuseVrad;
+            // LST = voxelHeatFlux[bufferId].Gshaded;
+            // LST = voxelDirs[bufferId].solar;
+            // LST = voxelTempes[bufferId].sunlit;
+            // LST = voxelDirs[bufferId].solar;
+            // return true;
+            // LST = voxelDirs[bufferId].solar;
+            // LST = voxelHeatFlux[bufferId].Gsunlit;
+            // LST =  voxelRsss[bufferId].sunlit;
+            // LST = alpha_toSensor;
+            // return true;
+
+
+			if(typeId == TYPE_VEGETATION)
+			{
+                // LST = voxelDirs[bufferId].solar;
+                // return true;
+
+                G = canopies[canopyId].G;
+                density = isParticipatingMedium(canopy) ? canopy.density
+                    : ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
+				float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);// * 0.2; //!!!!需要改回去！！！
+                alpha_voxel = isParticipatingMedium(canopy)
+                    ? canopyVoxelTransmittance(canopy, density, G, pathLength, scale)
+                    : ResolveSpatialInteraction(bufferId, density, G,
+                        sstate.lastPosition, sstate.position, scale).x;
+				alpha_toSolar = voxelDirs[bufferId].solar;
+
+                // LST = pathLength;
+                // return true;
+                // float sunlitTemperature1 = voxelTempes[bufferId].sunlit;
+                // LST =  Planck(wavelength, sunlitTemperature1);
+                // // // LST = voxelNetRads[bufferId].diffuseVrad;// + voxelNetRads[bufferId].diffuseTrad;
+                // LST =  voxelNetRads[bufferId].directVrad;
+                // // // // // LST = voxelRsss[bufferId].sunlit;
+                // // // // // LST = voxelRaas[bufferId].raa;
+                // // // // // // // // // LST = sunlitTemperature1;
+                // // // // LST = voxelNetRads[bufferId].diffuseTrad;
+                // return true;
+                
+				if(alpha_toSensor < 0.001) {
+                    return true;
+                }
+
+				if(isParticipatingMedium(canopy))
+				{
+					float removedFraction = 1.0 - alpha_voxel;
+					float scatteringFraction = removedFraction
+						* clamp(canopy.scatteringAlbedo, 0.0, 1.0);
+					float absorptionFraction = removedFraction - scatteringFraction;
+					float mediumTemperature = canopy.fixedTemperature > 0.0
+						? canopy.fixedTemperature : max(ubom.meteo.Ta + 273.15, 150.0);
+					// HG phase of the scattering angle between the beam's
+					// propagation (-sun) and the sensor direction.
+					float scatteringPhase = mediumPhaseHG(
+						canopy, dot(-solarDirection, viewDirection));
+					for(int kwave = 0; kwave < setting.n_wave; ++kwave)
+					{
+						float wavelength = wave[kwave];
+						if(isOpticalBand(wavelength))
+						{
+							float directSource = directSpectralIrradiance(wavelength)
+								* beamNormalScale() * alpha_toSolar * scatteringPhase;
+							float diffuseSource = diffuseSpectralIrradiance(wavelength)
+								* voxelDirs[bufferId].skyDiffuse * 0.0795774715;
+							Radiance[kwave] += alpha_toSensor * scatteringFraction
+								* (directSource + diffuseSource);
+						}
+						else
+						{
+							Radiance[kwave] += alpha_toSensor * absorptionFraction
+								* canopy.emissionScale * Planck(wavelength, mediumTemperature);
+							Radiance[kwave] += alpha_toSensor * scatteringFraction
+								* Planck(wavelength, envTemp);
+						}
+					}
+				}
+				else
+				{
+				// this is used for the hotspot effect
+                float solarDensity = max(HexHotspotDensity(bufferId, solarDirection, density, G), 0.000001);
+                float viewDensity = max(HexHotspotDensity(bufferId, viewDirection, density, G), 0.000001);
+                float safeG = max(G, 0.000001);
+				if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
+				else pl_toSolar = -log(clamp(alpha_toSolar, 0.000001, 1.0)) / safeG / solarDensity;
+				if(alpha_toSensor < 0.0001) pl_toSensor = 10000.0;
+				else pl_toSensor = -log(clamp(alpha_toSensor, 0.000001, 1.0)) / safeG / viewDensity;
+                // SAIL hspot is leaf size / canopy height; Kuusk needs metres.
+                float hspot = max(canopy.hspot * canopy.height, 0.0001);
+                hotspotDensity = sqrt(solarDensity * viewDensity);
+                hotspotG = safeG;
+                hotspotLeafSize = hspot;
+				float hotspot = Hotspot_Kuusk(solarDirection, viewDirection, pl_toSolar, pl_toSensor, sqrt(solarDensity * viewDensity), hspot);
+                if (!isnan(hotspot) && !isinf(hotspot)) {
+                    hotspot = clamp(hotspot, 0.0, 1.0);
+                }
+                if (checkSameDirection(solarDirection, viewDirection) && abs(alpha_toSolar - alpha_toSensor) < EPSION_2)
+                {
+                    alpha_toSolar = alpha_toSensor;
+                    hotspot = alpha_toSensor;
+                }
+                if ((pl_toSensor > 999) || (pl_toSolar>999))
+                {
+                    hotspot = 0.0;
+                }
+
+                // Sunlit fraction of the visible leaf area. A thin leaf has one
+                // temperature on both faces, so the optical phase factor does not apply.
+                float sunlitFraction = 0.0;
+                if (!isnan(hotspot) && !isinf(hotspot)) {
+                    sunlitFraction = clamp(
+                        hotspot / max(alpha_toSensor, 0.000001), 0.0, 1.0);
+                } else {
+                    hotspot = 0.0;
+                }
+
+                // get sunlit and shaded fraction and mixed them for an average result.
+                float sunlitTemperature = voxelTempes[bufferId].sunlit;
+                float shadedTemperature = voxelTempes[bufferId].shaded;
+                float fallbackTemperature = max(
+                    ubom.meteo.Ta + 273.15, 150.0);
+                if (isParticipatingMedium(canopy) && canopy.fixedTemperature > 0.0) {
+                    sunlitTemperature = canopy.fixedTemperature;
+                    shadedTemperature = canopy.fixedTemperature;
+                } else {
+                    if (isnan(shadedTemperature) || isinf(shadedTemperature)
+                        || shadedTemperature < TMIN_THRESHOLD
+                        || shadedTemperature > TMAX_THRESHOLD) {
+                        shadedTemperature = fallbackTemperature;
+                    }
+                    if (isnan(sunlitTemperature) || isinf(sunlitTemperature)
+                        || sunlitTemperature < TMIN_THRESHOLD
+                        || sunlitTemperature > TMAX_THRESHOLD) {
+                        sunlitTemperature = shadedTemperature;
+                    }
+                }
+
+                for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
+                    float wavelength = wave[kwave];
+                    float refl = clamp(specMaterials[spectralBase + kwave].reflectance, 0.0, 1.0);
+                    float trans = clamp(specMaterials[spectralBase + kwave].transmittance, 0.0, 1.0);
+                    // Leaf single-scattering albedo. Attenuation through the voxel already
+                    // removes photons that would recollide inside it, and collisions
+                    // between voxels are traced by the diffuse passes, so no in-voxel
+                    // recollision factor is applied here.
+                    float w = clamp(refl + trans, 0.0, 1.0);
+                    float s = w;
+                    float a = 1.0 - w;
+                    if(isOpticalBand(wavelength)) {
+                        float directIrradiance = directSpectralIrradiance(wavelength) * beamNormalScale();
+                        float diffuseIrradiance = diffuseSpectralIrradiance(wavelength)
+                            * voxelDirs[bufferId].skyDiffuse;
+                        // A leaf face sees on average half of the two-face total.
+                        Radiance[kwave] += alpha_toSensor * (1.0 - alpha_voxel) * s
+                            * diffuseIrradiance * 0.5;
+                        // Single scattering of the direct beam (Ross/Kuusk): leaf phase
+                        // function with this leaf's rho/tau, view interception
+                        // (1 - alpha_voxel)/G, and the joint sun/view gap probability
+                        // (Kuusk hot spot) instead of independent transmittances.
+                        float leafGamma = max(gamma.x * (refl + trans) + gamma.y * trans, 0.0);
+                        Radiance[kwave] += directIrradiance * leafGamma / safeG
+                            * (1.0 - alpha_voxel) * hotspot;
+                    } else {
+                        float thermalRadiance = alpha_toSensor * mix(
+                            Planck(wavelength, shadedTemperature),
+                            Planck(wavelength, sunlitTemperature), sunlitFraction);
+                        Radiance[kwave] += thermalRadiance * a * (1.0 - alpha_voxel);
+                        Radiance[kwave] += Planck(wavelength, envTemp)
+                            * (1.0 - alpha_voxel) * s * alpha_toSensor;
+                    }
+                }
+                vegTemperatureSum += shadedTemperature;
+                vegNum ++;
+				}
+
+
+				alpha_toSensor = alpha_toSensor * alpha_voxel;
+			}
+
+		}
+
+        if(alignBufferId >= 0)
+		{
+            alignBufferId = ResolveVoxelSurfaceState(alignBufferId, sstate.normal);
+            instanceId = voxelLinks[alignBufferId].instanceId;
+            meshId = instanceLinks[instanceId].meshId;
+            typeId = meshLinks[meshId].type;
+            canopyId = meshLinks[meshId].canopyId;
+            spectralId = meshLinks[meshId].spectralId;
+            thermalId = meshLinks[meshId].thermalId;
+            uint bioId = meshLinks[meshId].bioId;
+            uint spectralBase = spectralId * setting.n_wave;
+            float envTemp = Inv_Stefen_Boltzmann(voxelNetRads[alignBufferId].diffuseTrad, 1);
+
+            // LST = voxelNetRads[alignBufferId].diffuseTrad + voxelNetRads[alignBufferId].directTrad + voxelNetRads[alignBufferId].directVrad + voxelNetRads[alignBufferId].diffuseVrad;
+            // float sunlitTemperature1 = voxelTempes[alignBufferId].sunlit;
+            // LST =  Planck(wavelength, sunlitTemperature1);
+            // // LST = voxelHeatFlux[alignBufferId].Hshaded;
+            // // LST = voxelHeatFlux[alignBufferId].LEshaded;
+            // // LST = voxelDirs[alignBufferId].solar;
+            // // LST = voxelRaas[alignBufferId].raa;
+            // // LST = voxelRsss[alignBufferId].shaded;
+            // return true;
+
+            if((typeId == TYPE_BUILDING) || (typeId == TYPE_SOIL) || (typeId == TYPE_WATER)){
+
+// if (vegNum==0) vegNum=1;
+// LST = vegTemperatureSum/vegNum;//voxelNetRads[bufferId].diffuseTrad;;
+// return true;
+            
+                // LST = voxelHeatFlux[bufferId].Gshaded;
+                // return true;
+                // LST = 0;
+                // return true;
+
+                // LST = voxelNetRads[alignBufferId].directVrad;
+                // LST = voxelNetRads[bufferId].diffuseVrad;
+                // // LST = voxelNetRads[bufferId].directTrad;
+                // // LST = voxelNetRads[bufferId].diffuseTrad;
+                // // LST = voxelHeatFlux[bufferId].Gshaded;
+                // // LST = voxelDirs[bufferId].solar;
+                // // LST = voxelTempes[bufferId].shaded;
+                // // LST = voxelRaas[bufferId].raa;
+                // // LST = voxelHeatFlux[bufferId].Gsunlit;
+                // // break;
+                // float sunlitTemperature1 = voxelTempes[alignBufferId].shaded;
+                // LST =  Planck(wavelength, sunlitTemperature1);
+                // // LST = sunlitTemperature1;
+                // return true;
+                
+
+
+				alpha_toSolar = voxelDirs[alignBufferId].solar;
+				// Solar visibility is stored per voxel; a facet turned away from the sun is shaded.
+				if (dot(sstate.normal, solarDirection) <= 0.0) alpha_toSolar = 0.0;
+
+				// this is used for the hotspot effect
+				if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
+				else pl_toSolar = -log(alpha_toSolar) / hotspotG / hotspotDensity;
+				if(alpha_toSensor < 0.0001) pl_toSensor = 10000.0;
+				else pl_toSensor = -log(alpha_toSensor) / hotspotG / hotspotDensity;
+
+				float hotspot =  Hotspot_Kuusk(solarDirection, viewDirection, pl_toSolar, pl_toSensor, hotspotDensity, hotspotLeafSize);
+                hotspot = min(hotspot, min(alpha_toSolar, alpha_toSensor));
+                if (checkSameDirection(solarDirection, viewDirection) && abs(alpha_toSolar - alpha_toSensor) < EPSION_2)
+                {
+                    alpha_toSolar = alpha_toSensor;
+                    hotspot = alpha_toSensor;
+                }
+                if ((pl_toSensor > 999) || (pl_toSolar>999) || isnan(hotspot) || isinf(hotspot))
+                {
+                    hotspot = 0.0;
+                }
+                // float alpha_ = min(alpha_toSolar, alpha_toSensor);
+                // float fhotspot = hotspot / alpha_ ;
+
+                // LST = voxelNetRads[alignBufferId].diffuseTrad + voxelNetRads[alignBufferId].directTrad 
+                //                         + voxelNetRads[alignBufferId].directVrad + voxelNetRads[alignBufferId].diffuseVrad - Stefen_Boltzmann(voxelTempes[alignBufferId].sunlit,(1 - refl - trans));
+                // // LST = voxelNetRads[alignBufferId].directVrad;
+                // return true;
+
+                // get sunlit and shaded fraction and mixed them for an average result.
+                float sunlitTemperature = voxelTempes[alignBufferId].sunlit;
+                float shadedTemperature = voxelTempes[alignBufferId].shaded;
+                float fallbackTemperature = max(
+                    ubom.meteo.Ta + 273.15, 150.0);
+                if (isnan(shadedTemperature) || isinf(shadedTemperature)
+                    || shadedTemperature <= 0.0) {
+                    shadedTemperature = fallbackTemperature;
+                }
+                if (isnan(sunlitTemperature) || isinf(sunlitTemperature)
+                    || sunlitTemperature <= 0.0) {
+                    sunlitTemperature = shadedTemperature;
+                }
+
+                // Sunlit fraction of the visible surface: the Kuusk joint sun/view
+                // gap probability of the canopy above, conditioned on the view gap.
+                // It is bounded by the solar-path transmittance, so shadows of
+                // resolved objects still follow the sun.
+                float sunlitFraction = clamp(
+                    hotspot / max(alpha_toSensor, 0.000001), 0.0, 1.0);
+                float cosIncidence = max(dot(normalize(sstate.normal), solarDirection), 0.0);
+                for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
+                    float wavelength = wave[kwave];
+                    float refl = clamp(specMaterials[spectralBase + kwave].reflectance, 0.0, 1.0);
+                    float trans = clamp(specMaterials[spectralBase + kwave].transmittance, 0.0, 1.0);
+                    float angularStrength = meshLinks[meshId].angularEffectStrength;
+                    if(isOpticalBand(wavelength)) {
+                        float directIrradiance = directSpectralIrradiance(wavelength) * beamNormalScale();
+                        float diffuseIrradiance = diffuseSpectralIrradiance(wavelength)
+                            * voxelDirs[alignBufferId].skyDiffuse;
+                        float directWeight = surfaceReflectanceWeight(
+                            typeId, meshLinks[meshId].bioId, refl,
+                            solarDirection, viewDirection, sstate.normal,
+                            angularStrength);
+                        float diffuseWeight = surfaceReflectanceWeight(
+                            typeId, meshLinks[meshId].bioId, refl,
+                            sstate.normal, viewDirection, sstate.normal,
+                            angularStrength);
+                        Radiance[kwave] += alpha_toSensor
+                            * diffuseWeight * diffuseIrradiance;
+                        // Sunlit and visible: Kuusk joint gap probability (hot spot).
+                        Radiance[kwave] += directWeight * directIrradiance
+                            * cosIncidence * hotspot;
+                    } else {
+                        float thermalRadiance = alpha_toSensor * mix(
+                            Planck(wavelength, shadedTemperature),
+                            Planck(wavelength, sunlitTemperature), sunlitFraction);
+                        float emissivity = surfaceThermalEmissivity(
+                            refl, trans, viewDirection, sstate.normal,
+                            angularStrength);
+                        float thermalReflectance = surfaceThermalReflectance(
+                            refl, trans, viewDirection, sstate.normal,
+                            angularStrength);
+                        Radiance[kwave] += thermalRadiance * emissivity;
+                        Radiance[kwave] += Planck(wavelength, envTemp)
+                            * thermalReflectance * alpha_toSensor;
+                    }
+                }
+                return true;
+            }
+			
+		}
+
+        // LST = 55;
+        // break;
+		//// change ray origin position to hit position; and avoid self collide.
+		ray = Ray(sstate.position, ray.direction);
+		ffnormal = sstate.normal;
+		ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
+    }
+    return alpha_toSensor < 0.001;
+}
+
+bool SamplePixel(vec2 imageCoords,vec2 sizeImage,int smpl)
+{
+    // 每次光线的随机/波动进行光滑
+    vec2 subpixel_jitter = smpl == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
+    // vec2 subpixel_jitter = vec2(0.5f, 0.5f) ;
+	// 计算样本的波动，范围 [-1 .. 1]
+	const vec2 pixelCenter = vec2(imageCoords) + subpixel_jitter;
+	const vec2 inUV        = pixelCenter / vec2(sizeImage.xy);
+	vec2       d           = inUV * 2.0 - 1.0;
+
+	// 计算光线的初始化和方向
+	vec4 origin    = sensorMatrix.viewInverse * vec4(0, 0, 0, 1);
+	vec4 target    = sensorMatrix.projInverse * vec4(d.x, d.y, 1, 1);
+	vec4 direction = sensorMatrix.viewInverse * vec4(normalize(target.xyz), 0);
+
+	// // 景深-平行投影还是中心投影
+	// vec3  focalPoint        = sensorMatrix.focalDist * direction.xyz;
+	// float cam_r1            = rand(prd.seed) * M_TWO_PI;
+	// float cam_r2            = rand(prd.seed) * sensorMatrix.aperture;
+	// vec4  cam_right         = sensorMatrix.viewInverse * vec4(1, 0, 0, 0);
+	// vec4  cam_up            = sensorMatrix.viewInverse * vec4(0, 1, 0, 0);
+	// vec3  randomAperturePos = (cos(cam_r1) * cam_right.xyz + sin(cam_r1) * cam_up.xyz) * sqrt(cam_r2);
+	// vec3  finalRayDir       = normalize(focalPoint - randomAperturePos);
+    NanoVDBLink nanoVDBLink = nanovdbInit();
+    ConfigureTurbidGrid(nanoVDBLink);
+
+    // 光线位置和方向
+	//Ray ray = Ray(origin.xyz + randomAperturePos, finalRayDir);
+    vec3 directionv = normalize(direction.xyz);
+	Ray ray = Ray(origin.xyz, directionv);
+    float pixelDiameter = max(
+        abs(sensorMatrix.projInverse[0][0]) * 2.0 / sizeImage.x,
+        abs(sensorMatrix.projInverse[1][1]) * 2.0 / sizeImage.y);
+    float halfAngle = atan(0.5 * pixelDiameter /
+                           max(sensorMatrix.focalDist, 1.0e-6));
+    ConfigureCone(ray.origin, ray.direction, pixelDiameter, halfAngle);
+    return Voxel_raytracing(ray, nanoVDBLink);
+   // LST = 1.0;
+}
+
+
+void main()
+{
+    // image imageSize
+	ivec2 imageRes    = ivec2(setting.imageSize);
+    // image coordinate from 1-imageSize
+    ivec2 imageCoords = ivec2(gl_GlobalInvocationID.xy);  //SampleSizzled();
+    if(any(greaterThanEqual(imageCoords, setting.imageSize))) return;
+    
+    uint n_pixel = uint(imageRes.x * imageRes.y);
+    uint temp = uint(setting.imageSize.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x);
+    prd.seed = tea(temp, setting.frame * setting.n_sample);
+    for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
+        RadianceSum[kwave] = 0.0;
+    }
+    int validSampleCount = 0;
+
+    // int bufferId = int((imageCoords.y * imageRes.x + imageCoords.x ));
+    // LST = imageCoords.x;
+    // atomicStore(outImage[bufferId], LST, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+
+
+    for(int smpl = 0; smpl< setting.n_sample; smpl++)
+    {
+        if(SamplePixel(imageCoords, imageRes, smpl))
+        {
+            validSampleCount++;
+            for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
+                RadianceSum[kwave] += Radiance[kwave];
+            }
+        }
+    }
+
+    for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
+        float value = validSampleCount > 0
+            ? RadianceSum[kwave] / float(validSampleCount)
+            : 0.0;
+        float wavelength = wave[kwave];
+        if(isOpticalBand(wavelength)) {
+            float reference = referenceIrradiance(wavelength);
+            value = reference > EPSION
+                ? clamp(value / reference, 0.0, 1.0)
+                : 0.0;
+        }
+        int bufferId = int(n_pixel * uint(kwave)
+            + uint(imageCoords.y * imageRes.x + imageCoords.x));
+        atomicStore(outImage[bufferId], value,
+            gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+    }
+
+}

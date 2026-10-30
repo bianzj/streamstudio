@@ -1,0 +1,377 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_ARB_shader_clock : enable                 // Using clockARB
+#extension GL_EXT_shader_image_load_formatted : enable  // The folowing extension allow to pass images as function parameters
+
+#extension GL_NV_shader_sm_builtins : require     // Debug - gl_WarpIDNV, gl_SMIDNV
+#extension GL_ARB_gpu_shader_int64 : enable       // Debug - heatmap value
+#extension GL_EXT_shader_realtime_clock : enable  // Debug - heatmap timing
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_KHR_memory_scope_semantics:require
+#extension GL_EXT_shader_atomic_float: require 
+
+#define VOXELTRITRACING 1
+
+#include "../bindinglayout.h"
+#include "../parameters.h"
+#include "../global.glsl"
+#include "../bsdf.glsl"
+#include "../functions.glsl"
+#include "../nanovdb_info.glsl"
+#include "../shade_state_voxel.glsl"
+#include "../random.glsl"
+
+PtPayload        prd;
+ShadowHitPayload shadow_payload;
+
+#include "../traceray_comp.glsl"
+
+layout(local_size_x = GROUP_SIZEXY, local_size_y = GROUP_SIZEXY) in;
+#define MAXSTEP   100
+#define DIFFUSE_ANGLE_NUM 32
+#define MAXBAND    25
+float Radiance[MAXBAND];
+float RadianceSum[MAXBAND];
+
+bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
+{
+	// initial the transmittance and accumulated radiance.
+	float alpha_toSensor = 1.0;
+	/// transmittance from voxel to solar; from voxel to current voxel; current voxel
+    float alpha_toSolar, alpha_voxel;
+	ivec3 voxelId;                          // current passed voxel
+    int bufferId;                           // passed voxel Id
+	float scale = settingxml.scale;			// scale
+	vec3 ffnormal;                          // Collision Point Normals
+	uint instanceId, typeId;                // passed voxel Id through voxelLink and instanceLink.
+    uint canopyId, thermalId, spectralId;   // passed voxel spectral, thermal, canopy ID.
+	float pl_toSolar, pl_toSensor;			// hotspot parameters.
+	//float cosThetaSun = abs(normalize(lightSet.direction).y); // XZY
+	float cosThetaSun = CosThetaTangent(normalize(lightSet.direction));
+	vec2 gammart;							// scattering phase function, x and y.
+	float gamma;							// scattering value.
+	Canopy canopy;							// store canopy information
+
+	// set origin radiance value 0.0.
+	for(int kband=0; kband < sensorMatrix.waveNum; kband++)
+	{
+		Radiance[kband] = 0.0;
+	}
+
+	for(int kstep = 0; kstep < MAXSTEP; kstep++)
+	{
+		alpha_voxel = 1.0;
+		ClosestHit(ray);
+
+		///////////////////////////////////////////////////
+		/// sky case (sky -> sensorxml).
+		/// hit sky or out of scene, then return true. 
+		/// the sky contribution is added in solar file.
+		///////////////////////////////////////////////////
+		if(prd.hitT == INFINITY)
+		{
+			for(int kband=0; kband < sensorMatrix.waveNum; kband++)
+			{
+				Radiance[kband] += 0.0;
+			}
+			return true;
+		}
+
+		///////////////////////////////////////////////////
+		/// Turbid or facet ground case (j -> sensorxml).
+		///////////////////////////////////////////////////
+		/// get hit information.
+		ShadeState sstate = GetShadeState(prd);
+		voxelId = getPassedVoxelId(sstate.position, scale, normalize(ray.direction));
+		bufferId = nanovdbGet(nanoVDBLink, voxelId);
+		// a valid voxel and get this voxel information.
+		if(bufferId >= 0)
+		{
+			instanceId = voxelLinks[bufferId].instanceId;
+			typeId = instanceLinks[instanceId].type;
+			canopyId = instanceLinks[instanceId].canopyId;
+			spectralId = instanceLinks[instanceId].spectralId;
+			thermalId = instanceLinks[instanceId].thermalId;
+			canopy = canopies[canopyId];
+
+			if(typeId == TYPE_VEGETATION)
+			{
+				float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
+				alpha_voxel = exp(-canopies[canopyId].density * canopies[canopyId].G * pathLength);
+
+				alpha_toSolar = voxelDirs[bufferId].solar;
+
+				if(alpha_toSensor < 0.001) break;
+
+				// this is used for the hotspot effect
+				if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
+				else pl_toSolar = -log(alpha_toSolar) / canopy.G / 1.0;
+				if(alpha_toSensor < 0.0001) pl_toSensor = 10000.0;
+				else pl_toSensor = -log(alpha_toSensor) / canopy.G / 1.0;
+				float hotspot = Hotspot_Kuusk(normalize(lightSet.direction), -normalize(ray.direction), pl_toSolar, pl_toSensor, 1.0, HSPOT);
+
+				for(int kband = 0; kband<sensorMatrix.waveNum; kband++)
+				{
+					float refl = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].reflectance;
+                    float trans = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].transmittance;
+
+					//// solar and emitter direct case, primary scattering term of solar and self emitter term.
+					//// (sun -> i -> o) + emitter(i -> o)
+					float radianceDirect = 0.0;
+					gammart = scattering_phase_function_direct_XZY(normalize(lightSet.direction), -normalize(ray.direction));
+					gamma = abs(gammart.x) * (refl + trans) + abs(gammart.y) * trans;
+					gamma = clamp(gamma, 0, 1);
+					if(settingxml.isTemperature == 1)
+					{
+						int waveInd = sensorWaveInds[kband].value;
+						float wavelength = waveSets[waveInd].wavelength;
+						if(wavelength > 50) wavelength = wavelength/1000.0;
+						if(wavelength > 2.5)
+						{
+							// get sunlit and shaded fraction and mixed them for an average result.
+							float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
+							float shadedTemperature = thermalMaterials[thermalId].shadedTemperature;
+
+							// hot spot
+							float thermalRadiance = Planck(wavelength, sunlitTemperature) * hotspot
+													+ Planck(wavelength, shadedTemperature) * (alpha_toSensor - hotspot);
+							radianceDirect += thermalRadiance * (1 - refl - trans) * (1 - alpha_voxel);
+						}
+						else
+						{
+							// add hotspot revision
+							radianceDirect += lightSet.direct * abs(cosThetaSun) * (1 - alpha_voxel) * gamma * hotspot;
+						}
+					}
+					else
+					{
+						// add hotspot revision
+						radianceDirect += lightSet.direct * abs(cosThetaSun) * (1 - alpha_voxel) * gamma * hotspot;
+					}
+
+
+					float radianceDiffuse = 0.0;
+					float radianceDiffuse0 = 0.0;
+					if(settingxml.maxIteration != 0)
+					{
+						//// diffuse direction contribution
+						//// (sky ->i -> o) + emitter(j -> i -> o) + .et al.
+						float weight = 0.0;
+						for(int kangle = 0; kangle < DIFFUSE_ANGLE_NUM; kangle++)
+						{
+							vec3 directionj0 = DIFFUSE_DIRECTIONS[kangle];
+							vec3 directionj = normalize(directionj0);
+							float cosThetaj = CosThetaTangent(directionj);
+
+							gammart = scattering_phase_function_direct_XZY(directionj, -normalize(ray.direction));
+							gamma = abs(gammart.x) * (refl + trans) + abs(gammart.y) * trans;
+							gamma = clamp(gamma, 0, 1);
+							float radiancej = voxelRads[bufferId * DIFFUSE_ANGLE_NUM * sensorMatrix.waveNum + kband * DIFFUSE_ANGLE_NUM + kangle].cumulated;
+							////attention
+							radianceDiffuse0 += radiancej * canopy.density * (gamma / DIFFUSE_ANGLE_NUM / 2 / PI) * alpha_toSensor;
+							// radianceDiffuse0 += radiancej * (refl + trans) * 0.5;
+							weight += abs(cosThetaj)/DIFFUSE_ANGLE_NUM;
+						}
+						if(weight > EPSION)
+						{
+							radianceDiffuse = radianceDiffuse0;// / weight;
+						}
+					}
+
+					
+					Radiance[kband] += radianceDirect + radianceDiffuse; // debug
+					// Radiance[kband] += radianceDiffuse; // debug
+				}
+
+				
+				alpha_toSensor = alpha_toSensor * alpha_voxel;
+				// break;				// debug
+			}
+			if(typeId == TYPE_SOIL)
+			{
+				alpha_toSolar = voxelDirs[bufferId].solar;
+
+				// this is used for the hotspot effect
+				if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
+				else pl_toSolar = -log(alpha_toSolar) / canopy.G / 1.0;
+				if(alpha_toSensor < 0.0001) pl_toSensor = 10000.0;
+				else pl_toSensor = -log(alpha_toSensor) / canopy.G / 1.0;
+				float hotspot = Hotspot_Kuusk(normalize(lightSet.direction), -normalize(ray.direction), pl_toSolar, pl_toSensor, 1.0, HSPOT);
+
+				for(int kband = 0; kband < sensorMatrix.waveNum; kband++)
+				{
+					float refl = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].reflectance;
+                    float trans = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].transmittance;
+
+					//// solar and emitted case
+					//// (solar -> i -> o) + self-emitter(i -> o); i is soil.
+					float radianceDirect = 0.0;
+					if(settingxml.isTemperature == 1)
+					{
+						int waveInd = sensorWaveInds[kband].value;
+						float wavelength = waveSets[waveInd].wavelength;
+						if(wavelength > 50) wavelength = wavelength/1000.0;
+						if(wavelength > 2.5)
+						{
+							// get sunlit and shaded fraction and mixed them for an average result.
+							float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
+							float shadedTemperature = thermalMaterials[thermalId].shadedTemperature;
+
+							// hotspot
+							float thermalRadiance = Planck(wavelength, sunlitTemperature) * hotspot 
+													+ Planck(wavelength, shadedTemperature) * (alpha_toSensor - hotspot);
+							radianceDirect += thermalRadiance * (1 - refl - trans);
+						}
+						else
+						{
+							radianceDirect += lightSet.direct * abs(cosThetaSun) * alpha_toSolar * refl/M_PI * alpha_toSensor;
+						}
+					}
+					else
+					{
+						radianceDirect += lightSet.direct * abs(cosThetaSun) * alpha_toSolar * refl/M_PI * alpha_toSensor;
+					}
+
+					//// Diffuse direction contribution.
+					//// (sky -> i -> o) + else-emitter(j -> i -> o); i is soil.
+					float radianceDiffuse = 0.0;
+					float radianceDiffuse0 = 0.0;
+					if(settingxml.maxIteration != 0)
+					{
+						float weight = 0.0;
+						for(int jangle = 0; jangle < DIFFUSE_ANGLE_NUM; jangle++)
+						{
+							vec3 directionj0 = DIFFUSE_DIRECTIONS[jangle];
+							vec3 directionj = normalize(directionj0);
+							float cosThetaj = CosThetaTangent(directionj);
+							//	float cosThetaj = abs(directionj.y);
+
+							float radiancej = voxelRads[bufferId * DIFFUSE_ANGLE_NUM * sensorMatrix.waveNum + kband * DIFFUSE_ANGLE_NUM + jangle].cumulated;
+							radianceDiffuse0 += radiancej * refl / DIFFUSE_ANGLE_NUM / M_PI * alpha_toSensor;
+							weight += abs(cosThetaj) / (DIFFUSE_ANGLE_NUM / 2);
+						}
+						if(weight > EPSION)
+						{
+							// weight is normalized parameter.
+							radianceDiffuse = radianceDiffuse0;// / weight;
+						}
+
+					}
+					
+					Radiance[kband] += radianceDirect + radianceDiffuse;
+					// Radiance[kband] += 0;// debug
+				}
+				break;
+			}
+		}
+
+		//// change ray origin position to hit position; and avoid self collide.
+		ray = Ray(sstate.position, ray.direction);
+		ffnormal = sstate.normal;
+		ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
+	}
+
+	return false;
+}
+
+void SamplePixel(vec2 imageCoords,vec2 sizeImage,int smpl)
+{
+    // 每次光线的随机/波动进行光滑
+    vec2 subpixel_jitter = smpl == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
+    // vec2 subpixel_jitter = vec2(0.5f, 0.5f) ;
+	// 计算样本的波动，范围 [-1 .. 1]
+	const vec2 pixelCenter = vec2(imageCoords) + subpixel_jitter;
+	const vec2 inUV        = pixelCenter / vec2(sizeImage.xy);
+	vec2       d           = inUV * 2.0 - 1.0;
+
+	// 计算光线的初始化和方向
+	vec4 origin    = sensorMatrix.viewInverse * vec4(0, 0, 0, 1);
+	vec4 target    = sensorMatrix.projInverse * vec4(d.x, d.y, 1, 1);
+	vec4 direction = sensorMatrix.viewInverse * vec4(normalize(target.xyz), 0);
+
+	// // 景深-平行投影还是中心投影
+	// vec3  focalPoint        = sensorMatrix.focalDist * direction.xyz;
+	// float cam_r1            = rand(prd.seed) * M_TWO_PI;
+	// float cam_r2            = rand(prd.seed) * sensorMatrix.aperture;
+	// vec4  cam_right         = sensorMatrix.viewInverse * vec4(1, 0, 0, 0);
+	// vec4  cam_up            = sensorMatrix.viewInverse * vec4(0, 1, 0, 0);
+	// vec3  randomAperturePos = (cos(cam_r1) * cam_right.xyz + sin(cam_r1) * cam_up.xyz) * sqrt(cam_r2);
+	// vec3  finalRayDir       = normalize(focalPoint - randomAperturePos);
+
+	// vec4 origin = vec4(inUV.x * 1000, 3000, inUV.y * 1000, 1);
+	// vec4 direction = vec4(0,-1,0,0);
+
+    NanoVDBLink nanoVDBLink = nanovdbInit();
+
+	for(int kband = 0;kband < sensorMatrix.waveNum; kband++)
+	{
+		Radiance[kband] = 0.0;
+	}
+	// 光线位置和方向
+	//Ray ray = Ray(origin.xyz + randomAperturePos, finalRayDir);
+    vec3 directionv = normalize(direction.xyz);
+	Ray ray = Ray(origin.xyz, directionv);
+
+    Voxel_raytracing(ray, nanoVDBLink);
+}
+
+
+
+void main()
+{
+    // image imageSize.
+	vec2 imageRes    = settingxml.imageSize;
+    // image coordinate from 1-imageSize.
+    ivec2 imageCoords = ivec2(gl_GlobalInvocationID.xy);  //SampleSizzled();
+	int bufferId = int(sensorMatrix.waveNum * (imageCoords.y*imageRes.x + imageCoords.x));
+    uint temp = uint(settingxml.imageSize.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x);
+    // random.
+    prd.seed = tea(temp,settingxml.frame * settingxml.maxSample);
+
+	// Average value after multiple sampling.
+	// set RandianceSum = 0; accumulation over sampling; average the accumulation.
+	for(int kBand = 0; kBand < sensorMatrix.waveNum; kBand++)
+	{
+		Radiance[kBand] = 0.0;
+		RadianceSum[kBand] = 0.0;
+	}
+
+	int validNum = 0;
+	for(int kSample = 0; kSample < settingxml.maxSample; kSample++)
+	{
+		SamplePixel(imageCoords, imageRes, kSample);
+
+		bool isValid = false;
+		for(int kBand = 0; kBand < sensorMatrix.waveNum; kBand++)
+		{
+			if(Radiance[kBand] > EPSION)
+			{
+				RadianceSum[kBand] += Radiance[kBand];
+				isValid = true;
+			}
+		}
+
+		if(isValid) validNum += 1;
+	}
+	// Do accumulation over sample
+	for(int kBand = 0; kBand < sensorMatrix.waveNum; kBand++)
+	{
+		if(validNum == 0) Radiance[kBand] = 0;
+		if(validNum > 0) Radiance[kBand] = RadianceSum[kBand]/validNum;
+	}
+
+	// Write result into _bufferstorage(layout buffer)
+	for(int kBand = 0; kBand < sensorMatrix.waveNum; kBand++)
+	{
+		float value = Radiance[kBand];
+		atomicStore(outImage[bufferId + kBand], value, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+	}
+}
