@@ -113,9 +113,9 @@ async function rewriteRamiCatalog() {
   await writeFile(targetCatalog, `${JSON.stringify(catalog, null, 2)}\n`, 'utf8')
 }
 
-await rm(targetRoot, { recursive: true, force: true })
 await scan(sourceRoot)
 await findIncompleteRamiScenes()
+await rm(targetRoot, { recursive: true, force: true })
 await copyTree(sourceRoot, targetRoot)
 await rewriteObjCatalog()
 await rewriteRamiCatalog()

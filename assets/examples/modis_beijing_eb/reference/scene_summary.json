@@ -1,0 +1,238 @@
+{
+  "kind": "stream-image-result",
+  "schemaVersion": 2,
+  "model": "STREAM image simulation: PROSPECT + BSM; TiRT standard four-component closure (hom3 node radiosity, hotspot); TIRTEB energy balance; NREL SPA",
+  "closure": "tirt-standard",
+  "atmosphere": "none (top-of-canopy)",
+  "overpass": "2019-08-15T02:30:00Z",
+  "grid": {
+    "width": 215,
+    "height": 170,
+    "startRow": 0,
+    "endRow": 170,
+    "startColumn": 0,
+    "endColumn": 215
+  },
+  "counts": {
+    "opticalPixels": 17241,
+    "thermalPixels": 17352,
+    "invalidInputPixels": 0,
+    "unknownTypePixels": 19198,
+    "waterOrFillPixels": 111,
+    "nightPixels": 0,
+    "solarFailedPixels": 0,
+    "thermalFailedPixels": 0
+  },
+  "solarGeometry": [
+    {
+      "name": "solar zenith angle (deg)",
+      "validPixels": 17352,
+      "minimum": 34.65764236450195,
+      "mean": 35.265837653983624,
+      "maximum": 35.872093200683594
+    },
+    {
+      "name": "solar azimuth angle (deg)",
+      "validPixels": 17352,
+      "minimum": 127.9469985961914,
+      "mean": 129.75217760955755,
+      "maximum": 131.72494506835938
+    }
+  ],
+  "runMode": "simulation",
+  "optical": [
+    {
+      "name": "B1 reflectance @ 645 nm",
+      "validPixels": 17241,
+      "minimum": 0.016942676156759262,
+      "mean": 0.03778149962916147,
+      "maximum": 0.15000000596046448
+    },
+    {
+      "name": "B2 reflectance @ 858 nm",
+      "validPixels": 17241,
+      "minimum": 0.10106828808784485,
+      "mean": 0.38142011190086844,
+      "maximum": 0.5800898671150208
+    },
+    {
+      "name": "B3 reflectance @ 469 nm",
+      "validPixels": 17241,
+      "minimum": 0.016656633466482162,
+      "mean": 0.03377597212798357,
+      "maximum": 0.15000000596046448
+    },
+    {
+      "name": "B4 reflectance @ 555 nm",
+      "validPixels": 17241,
+      "minimum": 0.051461365073919296,
+      "mean": 0.08614264362195163,
+      "maximum": 0.15000000596046448
+    },
+    {
+      "name": "B5 reflectance @ 1240 nm",
+      "validPixels": 17241,
+      "minimum": 0.11499256640672684,
+      "mean": 0.3268956763773671,
+      "maximum": 0.43462321162223816
+    },
+    {
+      "name": "B6 reflectance @ 1640 nm",
+      "validPixels": 17241,
+      "minimum": 0.11605876684188843,
+      "mean": 0.20143666627448076,
+      "maximum": 0.23248106241226196
+    },
+    {
+      "name": "B7 reflectance @ 2130 nm",
+      "validPixels": 17241,
+      "minimum": 0.03546563535928726,
+      "mean": 0.08181519083020568,
+      "maximum": 0.15000000596046448
+    }
+  ],
+  "thermal": [
+    {
+      "name": "B31 brightness temperature (K) @ 11030 nm",
+      "validPixels": 17352,
+      "minimum": 298.25091552734375,
+      "mean": 303.5923170421243,
+      "maximum": 312.2027282714844
+    },
+    {
+      "name": "B31 surface temperature (K) @ 11030 nm",
+      "validPixels": 17352,
+      "minimum": 298.52777099609375,
+      "mean": 304.22634825436074,
+      "maximum": 316.0212707519531
+    },
+    {
+      "name": "B32 brightness temperature (K) @ 12020 nm",
+      "validPixels": 17352,
+      "minimum": 298.22723388671875,
+      "mean": 303.54133616685317,
+      "maximum": 311.8910217285156
+    },
+    {
+      "name": "B32 surface temperature (K) @ 12020 nm",
+      "validPixels": 17352,
+      "minimum": 298.5272216796875,
+      "mean": 304.2280187347398,
+      "maximum": 316.0212707519531
+    }
+  ],
+  "components": [
+    {
+      "name": "Tss sunlit soil temperature (K)",
+      "validPixels": 17352,
+      "minimum": 302.7827453613281,
+      "mean": 311.7490221571406,
+      "maximum": 317.7081298828125
+    },
+    {
+      "name": "Tsh shaded soil temperature (K)",
+      "validPixels": 17352,
+      "minimum": 295.6498107910156,
+      "mean": 300.3699807870108,
+      "maximum": 305.1520690917969
+    },
+    {
+      "name": "Tcs sunlit leaf temperature (K)",
+      "validPixels": 17320,
+      "minimum": 299.0678405761719,
+      "mean": 304.76370476420976,
+      "maximum": 313.299072265625
+    },
+    {
+      "name": "Tch shaded leaf temperature (K)",
+      "validPixels": 17320,
+      "minimum": 297.7330322265625,
+      "mean": 301.47956679698774,
+      "maximum": 306.2726745605469
+    }
+  ],
+  "fluxes": [
+    {
+      "name": "net radiation (W m-2)",
+      "validPixels": 17241,
+      "minimum": 425.1492004394531,
+      "mean": 487.01708655498135,
+      "maximum": 579.0294189453125
+    },
+    {
+      "name": "sensible heat (W m-2)",
+      "validPixels": 17241,
+      "minimum": -50.199520111083984,
+      "mean": 90.53530456809814,
+      "maximum": 249.93641662597656
+    },
+    {
+      "name": "latent heat (W m-2)",
+      "validPixels": 17241,
+      "minimum": 26.794471740722656,
+      "mean": 309.6085807899195,
+      "maximum": 696.4427490234375
+    },
+    {
+      "name": "ground heat (W m-2)",
+      "validPixels": 17241,
+      "minimum": 17.351425170898438,
+      "mean": 86.88944790757564,
+      "maximum": 319.1000671386719
+    },
+    {
+      "name": "friction velocity (m s-1)",
+      "validPixels": 17241,
+      "minimum": 0.025483977049589157,
+      "mean": 0.20261003777739547,
+      "maximum": 0.6406365036964417
+    },
+    {
+      "name": "energy balance residual (W m-2)",
+      "validPixels": 17241,
+      "minimum": 0.00982136745005846,
+      "mean": 1.3431681772561863,
+      "maximum": 741.5607299804688
+    }
+  ],
+  "temperature": {
+    "mode": "eb",
+    "era5": {
+      "product": "era5",
+      "year": 2019,
+      "fullYear": false,
+      "hours": "2019-08-15T00:00:00Z/2019-08-15T23:00:00Z",
+      "pack": "../era5/era5-pack.json",
+      "elevationCorrection": false,
+      "soilMoisture": "era5"
+    },
+    "nodes": [
+      "2019-08-15T00:00:00Z",
+      "2019-08-15T01:00:00Z",
+      "2019-08-15T02:00:00Z",
+      "2019-08-15T02:30:00Z"
+    ],
+    "solvedPixels": 17241,
+    "convergedPixels": 17037,
+    "stabilityConvergedPixels": 17080,
+    "stability": "Monin-Obukhov coupled solve: 1/L secant with sign bracket, H-only buoyancy, tolerance 1e-7 + 1e-6|target|",
+    "energyScheme": "tirt",
+    "soilHeatMethod": "surface",
+    "temperatureMethod": "robust",
+    "waterPixels": 111,
+    "failedPixels": 0,
+    "noForcingPixels": 0,
+    "moistureFallbackPixels": 0,
+    "notes": []
+  },
+  "products": [
+    "solar_geometry.tif",
+    "optical_reflectance.tif",
+    "tir_brightness_temperature.tif",
+    "tir_surface_temperature.tif",
+    "components.tif",
+    "eb_forcing.tif",
+    "eb_fluxes.tif"
+  ],
+  "elapsedSeconds": 1.0964464
+}

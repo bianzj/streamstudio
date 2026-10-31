@@ -2,6 +2,8 @@
 #include "heat_conduction.h"
 #include "shortwave.h"
 
+#include <array>
+
 namespace stream {
 
 // Farquhar photosynthesis with Ball-Berry stomatal closure (TiRT base/biochemical.py).
@@ -90,6 +92,30 @@ struct EnergyDiagnostics {
 EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& forcing,
                                   const ShortwaveAbsorption& shortwave, double szaDeg, bool sunlit,
                                   double dtSeconds, EnergyState& state);
+
+// Inputs of the four component balances at one node on any scalar type (double or Ad). The forward solve uses
+// double; the assimilation evaluates the same balance with Ad to get dR/dT and dR/dx at the converged state
+// (implicit differentiation: dT/dx = -(dR/dT)^-1 dR/dx).
+template <class T>
+struct EnergyInputsT {
+    T soilSunlit{}, soilShaded{}, leafSunlit{}, leafShaded{};  // component temperatures, K
+    T lai{}, soilMoisture{}, vcmax{}, soilEmissivity{}, soilInertia{};
+    // absorbed shortwave per unit component area and PAR (ShortwaveAbsorption)
+    T soilDirect{}, soilDiffuseSun{}, soilDiffuseShade{}, leafDirect{}, leafDiffuseSun{}, leafDiffuseShade{};
+    T parSun{}, parShade{}, soilSunlitFraction{}, laiSunlit{};
+};
+EnergyInputsT<double> energyInputs(const EnergySurface& surface, const ShortwaveAbsorption& shortwave,
+                                   const EnergyState& state);
+
+// Component residuals Rn - H - LE (- G for soil) at a frozen stability / gust state and soil heat history.
+template <class T>
+std::array<T, 4> energyResiduals(const EnergySurface& surface, const EnergyInputsT<T>& inputs, const Forcing& forcing,
+                                 double szaDeg, bool sunlit, double dtSeconds, const EnergyState& history,
+                                 double inverseObukhov, double sceneSensible);
+
+// Johansen soil conductivity / volumetric heat capacity from the water content (coarse soil).
+template <class T>
+void johansenSoilThermal(double saturatedMoisture, const T& moisture, T& conductivity, T& volumetricCapacity);
 
 // Tetens saturation vapour pressure [hPa] at a temperature in Celsius.
 double saturationVapourPressure(double celsius);

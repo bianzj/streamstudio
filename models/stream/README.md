@@ -82,9 +82,30 @@ stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...
 
 纬度、经度省略时由地表类型栅格的地理参考换算为 WGS84。
 
-## 温度反演（LST / LSCT）
+## 同化（直接模拟 / 同化）
 
-配置块 `inversion`（`stream-image-config` v2，可选）让引擎在同一次运行里从热红外观测反演 LST 或四组分温度 LSCT，观测算子与正向成像共用 `app/thermal_view.cpp` 的四组分权重（TiRT 比例 × 发射率 + `hom3` 多次散射、Hapke/含水量土壤发射率）：
+配置块 `assimilation`（`stream-image-config` v2，可选）。只需给出观测是什么和数据文件，其余（观测/背景误差、迭代、控制变量）是 `app/assimilation.cpp` 的内置默认值：
+
+```json
+"assimilation": {
+  "observation": "brightness",
+  "data": "D:\\obs\\bt.tif",
+  "optical": "D:\\obs\\reflectance.tif",
+  "views": [{ "data": "D:\\obs\\bt_oblique.tif", "vza": { "value": 55 }, "vaa": { "value": 90 } }]
+}
+```
+
+- `observation`：`brightness`（波段数 = 热红外波段数，需启用热红外）、`lst`（1 波段，固定发射率约定，10.5 μm）、`components`（4 波段 Tss/Tsh/Tcs/Tch）；NaN 为缺测；
+- `optical`（可选）：波段数 = 光学波段数，给出时 LAI 也作为控制变量；`views` 只用于亮温；
+- 控制变量：RT 背景为四组分温度；EB 背景为土壤水分 + Vcmax（组分温度由过境时刻能量平衡的隐式微分 dT/dx = −(∂R/∂T)⁻¹∂R/∂x 给出）；不含发射率；
+- 雅可比来自模型内置的可微算子：物理核为标量类型模板，同化以 `Dual<8>`（`physics/dual.h`）前向自动微分运行与成像相同的代码；
+- 输出 `analysis_components.tif`、`background_components.tif`、`analysis_uncertainty.tif`、`analysis_qa.tif`（质量位、O−B、O−A、O−A RMS、DFS、观测数、迭代），EB 或有光学时加 `analysis_controls.tif`、`background_controls.tif`，EB 加 `analysis_fluxes.tif`；本次 `optical_*`/`tir_*` 为分析场的正向图像。
+
+默认值：σ_o 亮温 0.5 K、LST 1.0 K、组分 2.0 K、反射率 0.02；σ_b 组分温度 5 K（相关 0.5）、土壤水分 0.10、Vcmax 30%、LAI 30%；RT 20 次、EB 10 次迭代。
+
+## 温度反演（LST / LSCT，脚本接口）
+
+配置块 `inversion`（可选，不能与 `assimilation` 同时使用）让引擎在同一次运行里从热红外观测反演 LST 或四组分温度 LSCT，观测算子与正向成像共用 `app/thermal_view.cpp` 的四组分权重（TiRT 比例 × 发射率 + `hom3` 多次散射、Hapke/含水量土壤发射率）；工作台不再单独列出：
 
 - `target: "lst"`：每像元一个辐射温度，1/σ² 加权 Gauss–Newton，发射率误差并入不确定度；输出 `lst.tif`、`lst_uncertainty.tif`、`lst_qa.tif`；
 - `target: "lsct"`：以 RT 输入或 EB 解为背景的 MAP Gauss–Newton，可选同地类 s×s 窗口；输出 `lsct.tif`、`lsct_uncertainty.tif`（后验 1σ）、`lsct_qa.tif`（质量位、残差、DFS、观测数、迭代）、`lsct_fractions.tif`，后验组分温度同时用于本次热红外成像。

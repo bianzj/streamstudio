@@ -1,65 +1,116 @@
 {
-    "version":  1,
-    "examples":  [
-                     {
-                         "id":  "crop_gpp_npp",
-                         "label":  "垄行玉米-农业",
-                         "project":  "assets/examples/crop_gpp_npp/project.json",
-                         "recommendedMode":  "eVoxelEB",
-                         "focus":  [
-                                       "作物冠层温度",
-                                       "GPP",
-                                       "NPP",
-                                       "日变化"
-                                   ]
-                     },
-                     {
-                         "id":  "forest_gpp_npp",
-                         "label":  "混交森林-生态",
-                         "project":  "assets/examples/forest/project.json",
-                         "recommendedMode":  "eVoxelEB",
-                         "focus":  [
-                                       "冠层温度",
-                                       "GPP",
-                                       "NPP",
-                                       "日变化"
-                                   ]
-                     },
-                     {
-                         "id":  "photovoltaic",
-                         "label":  "光伏-新能源",
-                         "project":  "assets/examples/photovoltaic/project.json",
-                         "recommendedMode":  "eFacetEB",
-                         "focus":  [
-                                       "光伏热电耦合",
-                                       "温度",
-                                       "发电功率"
-                                   ]
-                     },
-                     {
-                         "id":  "urban_block",
-                         "label":  "城市-热环境",
-                         "project":  "assets/examples/urban_block/project.json",
-                         "recommendedMode":  "eVoxelRT",
-                         "focus":  [
-                                       "建筑阴影",
-                                       "街区反射率",
-                                       "热红外",
-                                       "行道树"
-                                   ]
-                     },
-                     {
-                         "id":  "landsat_beijing_eb",
-                         "label":  "北京市 Landsat 影像-ERA5 单日驱动",
-                         "project":  "assets/examples/landsat_beijing_eb/project.json",
-                         "recommendedMode":  "STREAM EB",
-                         "focus":  [
-                                       "遥感影像模拟",
-                                       "ERA5 2019-08-15",
-                                       "OLI 反射率",
-                                       "TIRS 亮温",
-                                       "能量平衡"
-                                   ]
-                     }
-                 ]
+  "version": 1,
+  "examples": [
+    {
+      "id": "crop_gpp_npp",
+      "label": "垄行玉米-农业",
+      "project": "assets/examples/crop_gpp_npp/project.json",
+      "recommendedMode": "eVoxelEB",
+      "focus": [
+        "作物冠层温度",
+        "GPP",
+        "NPP",
+        "日变化"
+      ],
+      "category": "vegetation",
+      "tier": "featured",
+      "note": "参考碳通量结果较旧，发布验收状态见案例说明",
+      "categoryLabel": "农业与生态"
+    },
+    {
+      "id": "forest_gpp_npp",
+      "label": "混交森林-生态",
+      "project": "assets/examples/forest/project.json",
+      "recommendedMode": "eVoxelEB",
+      "focus": [
+        "冠层温度",
+        "GPP",
+        "NPP",
+        "日变化"
+      ],
+      "category": "vegetation",
+      "tier": "featured",
+      "note": "森林EB示例，科学边界见案例说明",
+      "categoryLabel": "农业与生态"
+    },
+    {
+      "id": "urban_block",
+      "label": "城市-热环境",
+      "project": "assets/examples/urban_block/project.json",
+      "recommendedMode": "eVoxelRT",
+      "focus": [
+        "建筑阴影",
+        "街区反射率",
+        "热红外",
+        "行道树"
+      ],
+      "category": "urban",
+      "tier": "featured",
+      "note": "当前为辐射传输示例，不代表能量平衡温度预测",
+      "categoryLabel": "城市与建筑"
+    },
+    {
+      "id": "landsat_beijing_eb",
+      "label": "北京市 Landsat 300 m · ERA5能量平衡",
+      "project": "assets/examples/landsat_beijing_eb/project.json",
+      "recommendedMode": "STREAM EB",
+      "focus": [
+        "ERA5驱动",
+        "光学反射率",
+        "热红外亮温",
+        "组分温度"
+      ],
+      "category": "remote-sensing",
+      "tier": "featured",
+      "note": "参考综合收敛率99.95%；异常像元已标记",
+      "categoryLabel": "区域遥感影像"
+    },
+    {
+      "id": "modis_beijing_eb",
+      "label": "北京市 MODIS 1 km · ERA5能量平衡",
+      "project": "assets/examples/modis_beijing_eb/project.json",
+      "recommendedMode": "STREAM EB",
+      "category": "remote-sensing",
+      "tier": "featured",
+      "focus": [
+        "ERA5驱动",
+        "光学反射率",
+        "热红外亮温",
+        "组分温度"
+      ],
+      "note": "参考综合收敛率98.82%；异常像元已标记",
+      "categoryLabel": "区域遥感影像"
+    }
+  ],
+  "categories": [
+    {
+      "id": "vegetation",
+      "label": "农业与生态"
+    },
+    {
+      "id": "urban",
+      "label": "城市与建筑"
+    },
+    {
+      "id": "energy",
+      "label": "光伏与新能源"
+    },
+    {
+      "id": "terrain",
+      "label": "山地与复杂地形"
+    },
+    {
+      "id": "remote-sensing",
+      "label": "区域遥感影像"
+    },
+    {
+      "id": "targets",
+      "label": "海面与目标"
+    },
+    {
+      "id": "reference",
+      "label": "对比与历史资料"
+    }
+  ],
+  "library": "builtin"
 }

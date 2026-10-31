@@ -1,0 +1,122 @@
+{
+  "kind": "stream-image-project",
+  "schemaVersion": 2,
+  "name": "北京市 MODIS 1 km · ERA5能量平衡",
+  "description": "内置精选：MODIS 1 km区域光学与热红外影像模拟。参考运行综合收敛17037/17241（98.82%），204个异常像元保留质量标记。数值收敛不代表独立观测精度。",
+  "scene": {
+    "name": "stream_beijing_1km_modis",
+    "locationSource": "georef",
+    "overpass": "2019-08-15T02:30:00Z",
+    "displayTimezone": 8,
+    "threads": 0,
+    "region": {
+      "enabled": false,
+      "startRow": 0,
+      "endRow": 1,
+      "startColumn": 0,
+      "endColumn": 1
+    },
+    "surface": {
+      "type": {
+        "file": "inputs/type.tif"
+      },
+      "lai": {
+        "file": "inputs/lai.tif"
+      },
+      "dem": {
+        "file": "inputs/dem.tif"
+      }
+    },
+    "view": {
+      "vza": {
+        "value": 0
+      },
+      "vaa": {
+        "value": 0
+      }
+    },
+    "optical": {
+      "enabled": true,
+      "preset": "modis",
+      "bands": [
+        {
+          "name": "B1",
+          "center": 645,
+          "fwhm": 50
+        },
+        {
+          "name": "B2",
+          "center": 858.5,
+          "fwhm": 35
+        },
+        {
+          "name": "B3",
+          "center": 469,
+          "fwhm": 20
+        },
+        {
+          "name": "B4",
+          "center": 555,
+          "fwhm": 20
+        },
+        {
+          "name": "B5",
+          "center": 1240,
+          "fwhm": 20
+        },
+        {
+          "name": "B6",
+          "center": 1640,
+          "fwhm": 24
+        },
+        {
+          "name": "B7",
+          "center": 2130,
+          "fwhm": 50
+        }
+      ]
+    },
+    "thermal": {
+      "enabled": true,
+      "preset": "modis",
+      "bands": [
+        {
+          "name": "B31",
+          "center": 11.03,
+          "fwhm": 0.5
+        },
+        {
+          "name": "B32",
+          "center": 12.02,
+          "fwhm": 0.5
+        }
+      ]
+    },
+    "temperature": {
+      "mode": "eb",
+      "era5": {
+        "pack": "era5/era5-pack.json"
+      },
+      "soilMoisture": {
+        "source": "era5"
+      },
+      "elevationCorrection": true,
+      "components": {
+        "source": "fields"
+      },
+      "energy": {
+        "scheme": "tirt",
+        "soilHeatMethod": "surface",
+        "temperatureMethod": "robust",
+        "diffuseFraction": 0.2,
+        "enforceSolarLimit": true,
+        "spectralBinNm": 50,
+        "soilResistance": {
+          "method": "constant",
+          "value": 200
+        }
+      }
+    },
+    "outputRoot": "output"
+  }
+}

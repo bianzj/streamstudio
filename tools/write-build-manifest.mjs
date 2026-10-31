@@ -18,6 +18,7 @@ function inventory(directory, predicate) {
   return files.sort()
 }
 const sourceFiles = [
+  path.join(root, 'models/cmake/copy-runtime-dependencies.cmake'),
   path.join(root, 'models/histream/CMakeLists.txt'),
   ...inventory(path.join(root, 'models/histream/src'), p => /\.(cpp|h|inl)$/.test(p)),
   ...inventory(path.join(root, 'models/histream/shader'), p => /\.(glsl|h|comp|rgen|rchit|rmiss|vert|frag)$/.test(p)),

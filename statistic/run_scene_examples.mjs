@@ -25,7 +25,7 @@ for (const name of ['building', 'forest']) {
   Object.assign(c.control, { samples: 64, depth: 3, periodicTraversalCount: 0 })
   Object.assign(c.sensor, { image: false, process: true, radiationProcess: true, energyProcess: true, bands: '560,10500' })
   const meteo = path.join(folder, 'inputs/meteo.txt')
-  fs.copyFileSync(path.join(root, 'assets/examples/photovoltaic/meteo.txt'), meteo)
+  fs.copyFileSync(path.join(root, 'statistic/inputs/scene-example-meteo.txt'), meteo)
   Object.assign(c.meteo, { path: meteo, start: 24, end: 25 })
   c.fluid.enabled = false
   const definitions = name === 'building'

@@ -120,143 +120,171 @@ ShortwaveAbsorption absorbShortwave(const SolarBins& sun, const OpticalSpectra& 
     if (!spectra.leafReflectance || !spectra.leafTransmittance || !spectra.soilReflectance) return result;
     if (!(sun.directTotal > 0.0) || !(sun.diffuseTotal > 0.0)) return result;
 
+    const ShortwaveComponentsT<double> parts = shortwaveComponents<double>(
+        sun, *spectra.leafReflectance, *spectra.leafTransmittance, *spectra.soilReflectance, lai, globalShortwave,
+        result.diffuseFraction, szaDeg, sunlit);
+    result.soilDirect = parts.soilDirect;
+    result.leafDirect = parts.leafDirect;
+    result.soilDiffuseSun = parts.soilDiffuseSun;
+    result.soilDiffuseShade = parts.soilDiffuseShade;
+    result.leafDiffuseSun = parts.leafDiffuseSun;
+    result.leafDiffuseShade = parts.leafDiffuseShade;
+    result.soilMean = parts.soilMean;
+    result.leafMean = parts.leafMean;
+    result.parLeafDirect = parts.parLeafDirect;
+    result.parLeafDiffuse = parts.parLeafDiffuse;
+    result.parLeafDiffuseSun = parts.parLeafDiffuseSun;
+    result.parLeafDiffuseShade = parts.parLeafDiffuseShade;
+    result.soilSunlitFraction = parts.soilSunlitFraction;
+    result.laiSunlit = parts.laiSunlit;
+    result.albedo = parts.incident > 0.0 ? 1.0 - parts.absorbed / parts.incident : 0.0;
+    return result;
+}
+
+namespace {
+template <class S> double soilValue(const S& value) { return static_cast<double>(value); }
+template <int N> Dual<N> soilValue(const Dual<N>& value) { return value; }
+}  // namespace
+
+template <class T, class SoilSpectrum>
+ShortwaveComponentsT<T> shortwaveComponents(const SolarBins& sun, const std::vector<float>& leafReflectance,
+                                            const std::vector<float>& leafTransmittance, const SoilSpectrum& soilSpectrum,
+                                            const T& lai, double globalShortwave, double diffuseFraction,
+                                            double szaDeg, bool sunlit)
+{
+    ShortwaveComponentsT<T> out;
+    if (!(globalShortwave > 0.0) || sun.size() == 0 || !(sun.directTotal > 0.0) || !(sun.diffuseTotal > 0.0)) return out;
     const bool lit = sunlit && szaDeg < 90.0;
     const double extinction = kG / std::max(std::cos(std::min(szaDeg, 85.0) * kPi / 180.0), 1e-6);
-    const double directScale = globalShortwave * (1.0 - result.diffuseFraction) / sun.directTotal;
-    const double diffuseScale = globalShortwave * result.diffuseFraction / sun.diffuseTotal;
+    const double directScale = globalShortwave * (1.0 - diffuseFraction) / sun.directTotal;
+    const double diffuseScale = globalShortwave * diffuseFraction / sun.diffuseTotal;
 
-    HomCanopy nodes(std::max(lai, 0.0));
-    double beam[kHomNodes]{}, sky[kHomNodes]{};
-    if (lit && lai > 0.0) nodes.split(szaDeg, beam);
-    double skySum = 0.0;
+    if (!(lai > 0.0)) {
+        T directSoil(0.0), diffuseSoil(0.0), absorbed(0.0);
+        double incident = 0.0;
+        for (size_t bin = 0; bin < sun.size(); ++bin) {
+            const double esun = lit ? directScale * sun.direct[bin] : 0.0;
+            const double esky = diffuseScale * sun.diffuse[bin];
+            const T soil = ad::clamp(T(soilValue(soilSpectrum[bin])), 0.0, 1.0);
+            const T direct = esun * (T(1.0) - soil);
+            const T diffuse = esky * (T(1.0) - soil);
+            directSoil += direct;
+            diffuseSoil += diffuse;
+            absorbed += direct + diffuse;
+            incident += esun + esky;
+        }
+        out.soilDirect = directSoil;
+        out.soilDiffuseSun = out.soilDiffuseShade = out.soilMean = diffuseSoil;
+        out.soilSunlitFraction = T(lit ? 1.0 : 0.0);
+        out.absorbed = absorbed;
+        out.incident = T(incident);
+        return out;
+    }
+
+    const HomCanopyT<T> nodes(ad::max(lai, 0.0));
+    T beam[kHomNodes]{}, sky[kHomNodes]{};
+    if (lit) nodes.split(szaDeg, beam);
+    T skySum(0.0);
     for (int node = 0; node < kHomNodes; ++node) {
         sky[node] = nodes.escape[node] * nodes.capacity[node];
         skySum += sky[node];
     }
-    double beamArrivals[2 * kHomNodes]{}, skyArrivals[2 * kHomNodes]{};
+    T beamArrivals[2 * kHomNodes]{}, skyArrivals[2 * kHomNodes]{};
     for (int node = 0; node < kHomNodes; ++node) {
         beamArrivals[2 * node + 1] = beam[node];
         if (skySum > 0.0) skyArrivals[2 * node + 1] = sky[node] / skySum;
     }
-    double soilArea[kHomNodes]{}, leafArea[kHomNodes]{}, sunlitArea[kHomNodes]{};
+    T soilArea[kHomNodes]{}, leafArea[kHomNodes]{}, sunlitArea[kHomNodes]{};
     for (int node = 0; node < kHomNodes; ++node) {
         if (nodes.soil[node]) {
             soilArea[node] = nodes.capacity[node];
-            sunlitArea[node] = lit ? std::min(beam[node], soilArea[node]) : 0.0;
+            sunlitArea[node] = lit ? ad::min(beam[node], soilArea[node]) : T(0.0);
         } else {
             leafArea[node] = nodes.capacity[node] / (4.0 * kG);
-            sunlitArea[node] = lit ? std::min(beam[node] / extinction, leafArea[node]) : 0.0;
+            sunlitArea[node] = lit ? ad::min(beam[node] / extinction, leafArea[node]) : T(0.0);
         }
     }
-    double soilSunlit = 0.0, laiSunlit = 0.0, soilAreaTotal = 0.0, leafAreaTotal = 0.0;
+    T soilSunlit(0.0), laiSunlit(0.0), soilAreaTotal(0.0), leafAreaTotal(0.0);
     for (int node = 0; node < kHomNodes; ++node) {
         if (nodes.soil[node]) { soilSunlit += sunlitArea[node]; soilAreaTotal += soilArea[node]; }
         else { laiSunlit += sunlitArea[node]; leafAreaTotal += leafArea[node]; }
     }
-    result.soilSunlitFraction = soilSunlit;
-    result.laiSunlit = laiSunlit;
+    out.soilSunlitFraction = soilSunlit;
+    out.laiSunlit = laiSunlit;
 
-    const auto mean = [&](const double* values, bool soilMask, bool sunlitPart) {
-        const double* area = soilMask ? soilArea : leafArea;
-        double weightSum = 0.0;
+    const auto mean = [&](const T* values, bool soilMask, bool sunlitPart) {
+        const T* area = soilMask ? soilArea : leafArea;
+        T weightSum(0.0);
         for (int node = 0; node < kHomNodes; ++node) {
             if (nodes.soil[node] != soilMask || !(area[node] > 0.0)) continue;
             weightSum += sunlitPart ? sunlitArea[node] : (area[node] - sunlitArea[node]);
         }
         const bool fallback = !(weightSum > 1e-12);
-        double total = 0.0;
+        T total(0.0);
         for (int node = 0; node < kHomNodes; ++node) {
             if (nodes.soil[node] != soilMask || !(area[node] > 0.0)) continue;
-            const double weight = fallback ? area[node] : (sunlitPart ? sunlitArea[node] : (area[node] - sunlitArea[node]));
+            const T weight = fallback ? area[node] : (sunlitPart ? sunlitArea[node] : (area[node] - sunlitArea[node]));
             total += values[node] / area[node] * weight;
         }
-        const double normalizer = fallback ? (soilMask ? soilAreaTotal : leafAreaTotal) : weightSum;
-        return normalizer > 0.0 ? total / normalizer : 0.0;
+        const T normalizer = fallback ? (soilMask ? soilAreaTotal : leafAreaTotal) : weightSum;
+        return normalizer > 0.0 ? total / normalizer : T(0.0);
     };
 
-    double directSoil = 0.0, directLeaf = 0.0, diffuseSoilSun = 0.0, diffuseSoilShade = 0.0;
-    double diffuseLeafSun = 0.0, diffuseLeafShade = 0.0, soilMean = 0.0, leafMean = 0.0;
-    double absorbed = 0.0, incident = 0.0;
-    double parDirect = 0.0, parDiffuse = 0.0, parDiffuseSun = 0.0, parDiffuseShade = 0.0;
-
-    if (!(lai > 0.0)) {
-        for (size_t bin = 0; bin < sun.size(); ++bin) {
-            const double esun = lit ? directScale * sun.direct[bin] : 0.0;
-            const double esky = diffuseScale * sun.diffuse[bin];
-            const double soil = std::clamp(static_cast<double>((*spectra.soilReflectance)[bin]), 0.0, 1.0);
-            const double direct = esun * (1.0 - soil);
-            const double diffuse = esky * (1.0 - soil);
-            directSoil += direct;
-            diffuseSoilSun += diffuse;
-            diffuseSoilShade += diffuse;
-            absorbed += direct + diffuse;
-            incident += esun + esky;
-        }
-        result.soilDirect = directSoil;
-        result.soilDiffuseSun = result.soilDiffuseShade = result.soilMean = diffuseSoilSun;
-        result.soilSunlitFraction = lit ? 1.0 : 0.0;
-        result.albedo = incident > 0.0 ? 1.0 - absorbed / incident : 0.0;
-        return result;
-    }
-
+    double incident = 0.0;
     for (size_t bin = 0; bin < sun.size(); ++bin) {
         const double esun = lit ? directScale * sun.direct[bin] : 0.0;
         const double esky = diffuseScale * sun.diffuse[bin];
-        const double rho = std::clamp(static_cast<double>((*spectra.leafReflectance)[bin]), 0.0, 1.0);
-        const double tau = std::min(std::clamp(static_cast<double>((*spectra.leafTransmittance)[bin]), 0.0, 1.0), 1.0 - rho);
-        const double soil = std::clamp(static_cast<double>((*spectra.soilReflectance)[bin]), 0.0, 1.0);
-        double beamFirst[kHomNodes], beamTotal[kHomNodes], skyFirst[kHomNodes], skyTotal[kHomNodes];
-        homAbsorbedPair(nodes, soil, rho, tau, beamArrivals, skyArrivals,
-                        beamFirst, beamTotal, skyFirst, skyTotal);
-        double direct[kHomNodes], diffuse[kHomNodes];
-        double directSoilBand = 0.0, directLeafBand = 0.0;
+        const double rho = std::clamp(static_cast<double>(leafReflectance[bin]), 0.0, 1.0);
+        const double tau = std::min(std::clamp(static_cast<double>(leafTransmittance[bin]), 0.0, 1.0), 1.0 - rho);
+        const T soil = ad::clamp(T(soilValue(soilSpectrum[bin])), 0.0, 1.0);
+        T beamFirst[kHomNodes], beamTotal[kHomNodes], skyFirst[kHomNodes], skyTotal[kHomNodes];
+        homAbsorbedPair<T>(nodes, soil, rho, tau, beamArrivals, skyArrivals, beamFirst, beamTotal, skyFirst, skyTotal);
+        T direct[kHomNodes], diffuse[kHomNodes];
+        T directSoilBand(0.0), directLeafBand(0.0);
         for (int node = 0; node < kHomNodes; ++node) {
             direct[node] = esun * beamFirst[node];
             diffuse[node] = esun * beamTotal[node] + esky * (skyFirst[node] + skyTotal[node]);
-            absorbed += direct[node] + diffuse[node];
+            out.absorbed += direct[node] + diffuse[node];
             if (nodes.soil[node]) directSoilBand += direct[node];
             else directLeafBand += direct[node];
         }
         incident += esun + esky;
-        directSoil += soilSunlit > 1e-12 ? directSoilBand / soilSunlit : 0.0;
-        directLeaf += laiSunlit > 1e-12 ? directLeafBand / laiSunlit : 0.0;
-        const double soilSunBand = mean(diffuse, true, true);
-        const double soilShadeBand = mean(diffuse, true, false);
-        const double leafSunBand = mean(diffuse, false, true);
-        const double leafShadeBand = mean(diffuse, false, false);
-        diffuseSoilSun += soilSunBand;
-        diffuseSoilShade += soilShadeBand;
-        diffuseLeafSun += leafSunBand;
-        diffuseLeafShade += leafShadeBand;
-        double soilSum = 0.0, leafSum = 0.0;
-        for (int node = 0; node < kHomNodes; ++node)
-            (nodes.soil[node] ? soilSum : leafSum) += diffuse[node];
-        const double soilMeanBand = soilAreaTotal > 0.0 ? soilSum / soilAreaTotal : 0.0;
-        const double leafMeanBand = leafAreaTotal > 0.0 ? leafSum / leafAreaTotal : 0.0;
-        soilMean += soilMeanBand;
-        leafMean += leafMeanBand;
+        out.soilDirect += soilSunlit > 1e-12 ? directSoilBand / soilSunlit : T(0.0);
+        out.leafDirect += laiSunlit > 1e-12 ? directLeafBand / laiSunlit : T(0.0);
+        const T soilSunBand = mean(diffuse, true, true);
+        const T soilShadeBand = mean(diffuse, true, false);
+        const T leafSunBand = mean(diffuse, false, true);
+        const T leafShadeBand = mean(diffuse, false, false);
+        out.soilDiffuseSun += soilSunBand;
+        out.soilDiffuseShade += soilShadeBand;
+        out.leafDiffuseSun += leafSunBand;
+        out.leafDiffuseShade += leafShadeBand;
+        T soilSum(0.0), leafSum(0.0);
+        for (int node = 0; node < kHomNodes; ++node) (nodes.soil[node] ? soilSum : leafSum) += diffuse[node];
+        const T soilMeanBand = soilAreaTotal > 0.0 ? soilSum / soilAreaTotal : T(0.0);
+        const T leafMeanBand = leafAreaTotal > 0.0 ? leafSum / leafAreaTotal : T(0.0);
+        out.soilMean += soilMeanBand;
+        out.leafMean += leafMeanBand;
         const double photons = sun.photon[bin];
         if (photons > 0.0) {
-            parDirect += (laiSunlit > 1e-12 ? directLeafBand / laiSunlit : 0.0) * photons;
-            parDiffuse += leafMeanBand * photons;
-            parDiffuseSun += leafSunBand * photons;
-            parDiffuseShade += leafShadeBand * photons;
+            out.parLeafDirect += (laiSunlit > 1e-12 ? directLeafBand / laiSunlit : T(0.0)) * photons;
+            out.parLeafDiffuse += leafMeanBand * photons;
+            out.parLeafDiffuseSun += leafSunBand * photons;
+            out.parLeafDiffuseShade += leafShadeBand * photons;
         }
     }
-    result.soilDirect = directSoil;
-    result.leafDirect = directLeaf;
-    result.soilDiffuseSun = diffuseSoilSun;
-    result.soilDiffuseShade = diffuseSoilShade;
-    result.leafDiffuseSun = diffuseLeafSun;
-    result.leafDiffuseShade = diffuseLeafShade;
-    result.soilMean = soilMean;
-    result.leafMean = leafMean;
-    result.parLeafDirect = parDirect;
-    result.parLeafDiffuse = parDiffuse;
-    result.parLeafDiffuseSun = parDiffuseSun;
-    result.parLeafDiffuseShade = parDiffuseShade;
-    result.albedo = incident > 0.0 ? 1.0 - absorbed / incident : 0.0;
-    return result;
+    out.incident = T(incident);
+    return out;
 }
+
+template ShortwaveComponentsT<double> shortwaveComponents<double, std::vector<float>>(
+    const SolarBins&, const std::vector<float>&, const std::vector<float>&, const std::vector<float>&, const double&,
+    double, double, double, bool);
+template ShortwaveComponentsT<Ad> shortwaveComponents<Ad, std::vector<Ad>>(
+    const SolarBins&, const std::vector<float>&, const std::vector<float>&, const std::vector<Ad>&, const Ad&,
+    double, double, double, bool);
+template ShortwaveComponentsT<Ad> shortwaveComponents<Ad, std::vector<float>>(
+    const SolarBins&, const std::vector<float>&, const std::vector<float>&, const std::vector<float>&, const Ad&,
+    double, double, double, bool);
 
 }  // namespace stream

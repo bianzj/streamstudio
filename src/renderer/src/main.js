@@ -2809,7 +2809,7 @@ function hideExampleDialog() { $('#exampleDialog').hidden = true }
 
 function renderExampleSummary() {
   const example = state.examples?.find((item) => item.id === $('#exampleSelect').value)
-  $('#exampleSummary').textContent = example ? `${t('推荐模式')}：${example.recommendedMode} · ${example.focus.map((item) => t(item)).join('、')}` : ''
+  $('#exampleSummary').textContent = example ? `${t('推荐模式')}：${example.recommendedMode} · ${example.focus.map((item) => t(item)).join('、')}${example.note ? ` · ${t(example.note)}` : ''}` : ''
 }
 
 async function showExampleDialog() {
@@ -2818,7 +2818,14 @@ async function showExampleDialog() {
     const { examples, directory } = await api.listExamples()
     if (!examples.length) throw new Error('没有可用的示例工程')
     state.examples = examples
-    $('#exampleSelect').innerHTML = examples.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(t(item.label))}</option>`).join('')
+    const groups = new Map()
+    for (const item of [...examples].sort((a, b) => Number(a.tier === 'technical') - Number(b.tier === 'technical'))) {
+      const group = `${t(item.tier === 'technical' ? '技术演示' : '内置精选')} · ${t(item.categoryLabel || '其他案例')}`
+      if (!groups.has(group)) groups.set(group, [])
+      groups.get(group).push(item)
+    }
+    $('#exampleSelect').innerHTML = [...groups].map(([label, items]) =>
+      `<optgroup label="${escapeHtml(label)}">${items.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(t(item.label))}</option>`).join('')}</optgroup>`).join('')
     $('#exampleDirectory').value = appStorage.getItem('histreamExampleDirectory') || directory
     renderExampleSummary()
     $('#exampleDialog').hidden = false
@@ -5574,16 +5581,6 @@ function facetIndices(result, side) {
   if (side === 'front') return Array.from({ length: result.facetCount }, (_, index) => index * 2)
   if (side === 'back') return Array.from({ length: result.facetCount }, (_, index) => index * 2 + 1)
   return Array.from({ length: total }, (_, index) => index)
-}
-
-function facetStats(values, indices) {
-  let minimum = Infinity, maximum = -Infinity
-  for (const index of indices) {
-    const value = Number(values[index])
-    if (Number.isFinite(value)) { minimum = Math.min(minimum, value); maximum = Math.max(maximum, value) }
-  }
-  if (!Number.isFinite(minimum)) return { minimum: 0, maximum: 0 }
-  return { minimum, maximum }
 }
 
 function facetStatsForSide(values, facetCount, side) {

@@ -1,4 +1,6 @@
 #pragma once
+#include "dual.h"
+
 #include <cmath>
 
 namespace stream {
@@ -18,6 +20,20 @@ inline double inversePlanck(double radiance, double wavelengthUm)
 {
     if (!(radiance > 0.0)) return std::nan("");
     return kPlanckC2 / (wavelengthUm * std::log1p(kPlanckC1 / (radiance * std::pow(wavelengthUm, 5.0))));
+}
+
+// Differentiable forms (T = double or Ad); same formulas as above.
+template <class T>
+T planckT(const T& temperatureK, double wavelengthUm)
+{
+    return kPlanckC1 / std::pow(wavelengthUm, 5.0) / ad::expm1(kPlanckC2 / (wavelengthUm * temperatureK));
+}
+
+template <class T>
+T inversePlanckT(const T& radiance, double wavelengthUm)
+{
+    if (!(radiance > 0.0)) return T(std::nan(""));
+    return kPlanckC2 / (wavelengthUm * ad::log1p(kPlanckC1 / (radiance * std::pow(wavelengthUm, 5.0))));
 }
 
 }  // namespace stream

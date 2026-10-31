@@ -213,17 +213,29 @@ Resistances aerodynamicResistances(const EnergySurface& surface, const Forcing& 
 }
 
 // Smaller root of a x^2 + b x + c.
-double smallerRoot(double a, double b, double c)
+template <class T>
+T smallerRoot(double a, const T& b, const T& c)
 {
     if (a == 0.0) return -c / b;
-    return (-b - std::sqrt(std::max(b * b - 4.0 * a * c, 0.0))) / (2.0 * a);
+    return (-b - ad::sqrt(ad::max(b * b - 4.0 * a * c, 0.0))) / (2.0 * a);
 }
 
-// Farquhar / Ball-Berry leaf resistance [s m-1] per unit leaf area, with the g0 conductance floor.
-double stomatalResistance(const EnergySurface& surface, double leafTemperature, double par, const Forcing& forcing,
-                          double density)
+template <class T>
+T saturationVapourPressureT(const T& celsius)
 {
-    if (surface.leaf.pathway != 3 && surface.leaf.pathway != 4) return 625000.0;
+    return 6.107 * ad::pow(10.0, 7.5 * celsius / (237.3 + celsius));
+}
+
+template <class T>
+T latentHeatT(const T& kelvin) { return (2.501 - 0.002361 * (kelvin - 273.15)) * 1.0e6; }
+
+// Farquhar / Ball-Berry leaf resistance [s m-1] per unit leaf area, with the g0 conductance floor.
+// Templated on the leaf temperature, PAR and Vcmax25 (the EB control of the assimilation).
+template <class T>
+T stomatalResistanceT(const EnergySurface& surface, const T& leafTemperature, const T& par, const T& vcmax25,
+                      const Forcing& forcing, double density)
+{
+    if (surface.leaf.pathway != 3 && surface.leaf.pathway != 4) return T(625000.0);
     const bool c4 = surface.leaf.pathway == 4;
     const double effcon = c4 ? 1.0 / 6.0 : 1.0 / 5.0;
     const double slti = surface.leaf.temperature[0], shti = surface.leaf.temperature[1];
@@ -234,58 +246,60 @@ double stomatalResistance(const EnergySurface& surface, double leafTemperature, 
     const double p = std::max(forcing.p, 1e-6);
     const double ca = surface.co2;
     const double oxygen = c4 ? 0.0 : (surface.o2 * 1e-3) * (p * 1e-3);
-    const double kpep25 = (surface.leaf.vcmax / 56.0) * 1e6;
-    const double kd = std::max(0.8738, 0.0301 * (leafTemperature - 273.15) + 0.0773);
-    const double qt = 0.1 * (leafTemperature - tref) * tcor;
-    const double th = 1.0 + tcor * std::exp(shti * (leafTemperature - thh));
-    const double tl = 1.0 + tcor * std::exp(slti * (thl - leafTemperature));
-    const double kc = kc25 * std::exp(std::log(2.1) * qt);
-    const double ko = ko25 * std::exp(std::log(1.2) * qt);
-    const double kpep = kpep25 * std::exp(std::log(1.8) * qt);
+    const T kpep25 = (vcmax25 / 56.0) * 1e6;
+    const T kd = ad::max(0.8738, 0.0301 * (leafTemperature - 273.15) + 0.0773);
+    const T qt = 0.1 * (leafTemperature - tref) * tcor;
+    const T th = 1.0 + tcor * ad::exp(shti * (leafTemperature - thh));
+    const T tl = 1.0 + tcor * ad::exp(slti * (thl - leafTemperature));
+    const T kc = kc25 * ad::exp(std::log(2.1) * qt);
+    const T ko = ko25 * ad::exp(std::log(1.2) * qt);
+    const T kpep = kpep25 * ad::exp(std::log(1.8) * qt);
     const double stress = surface.leaf.stress;
-    double vcmax, mm, vsC3;
+    T vcmax, mm, vsC3;
     double minCi;
     if (!c4) {
-        vcmax = surface.leaf.vcmax * std::exp(std::log(2.1) * qt) / th * stress;
+        vcmax = vcmax25 * ad::exp(std::log(2.1) * qt) / th * stress;
         mm = kc * (1.0 + oxygen / ko);
-        vsC3 = surface.leaf.vcmax / 2.0 * std::exp(std::log(1.8) * qt);
+        vsC3 = vcmax25 / 2.0 * ad::exp(std::log(1.8) * qt);
         minCi = 0.3;
     } else {
-        vcmax = surface.leaf.vcmax * std::exp(std::log(2.1) * qt) / (th * tl) * stress;
-        mm = 0.0;
-        vsC3 = 0.0;
+        vcmax = vcmax25 * ad::exp(std::log(2.1) * qt) / (th * tl) * stress;
+        mm = T(0.0);
+        vsC3 = T(0.0);
         minCi = 0.1;
     }
-    const double specificity = 2600.0 * std::exp(std::log(0.75) * qt);
-    const double rd = surface.leaf.respiration * surface.leaf.vcmax * std::exp(std::log(1.8) * qt) /
-                      (1.0 + std::exp(1.3 * (leafTemperature - trdm)));
-    const double po0 = 4.0 / (0.05 + kd + 4.0);
-    const double je = 0.5 * po0 * par;
-    const double gamma = 0.5 * oxygen / specificity;
-    const double rh = std::min(1.0, forcing.ea / std::max(saturationVapourPressure(leafTemperature - 273.15), 1e-6));
+    const T specificity = 2600.0 * ad::exp(std::log(0.75) * qt);
+    const T rd = surface.leaf.respiration * vcmax25 * ad::exp(std::log(1.8) * qt) /
+                 (1.0 + ad::exp(1.3 * (leafTemperature - trdm)));
+    const T po0 = 4.0 / (0.05 + kd + 4.0);
+    const T je = 0.5 * po0 * par;
+    const T gamma = 0.5 * oxygen / specificity;
+    const T rh = ad::min(T(1.0), forcing.ea / ad::max(saturationVapourPressureT(leafTemperature - 273.15), 1e-6));
     const double ppm2bar = 1e-6 * (p * 1e-3);
     const double cs = ca * ppm2bar;
-    const double ci = std::max(minCi * cs, cs * (1.0 - 1.6 / (surface.leaf.ballBerrySlope * rh)));
-    const double vc = c4 ? vcmax : vcmax * (ci - gamma) / (mm + ci);
-    const double vs = c4 ? kpep * ci : vsC3;
-    const double ve = c4 ? je * effcon : je * (ci - gamma) / (ci + 2.0 * gamma) * effcon;
-    const double v = smallerRoot(0.8, -(vc + ve), vc * ve);
-    const double ag = smallerRoot(0.98, -(v + vs), v * vs);
-    const double assimilation = ag - rd;
-    double gs = 1.6 * assimilation * ppm2bar / std::max(cs - ci, 1e-12);
-    gs = std::max(std::isfinite(gs) ? gs : 0.0, surface.stomatalG0);
+    const T ci = ad::max(T(minCi * cs), cs * (1.0 - 1.6 / (surface.leaf.ballBerrySlope * rh)));
+    const T vc = c4 ? vcmax : vcmax * (ci - gamma) / (mm + ci);
+    const T vs = c4 ? kpep * ci : vsC3;
+    const T ve = c4 ? je * effcon : je * (ci - gamma) / (ci + 2.0 * gamma) * effcon;
+    const T v = smallerRoot<T>(0.8, -(vc + ve), vc * ve);
+    const T ag = smallerRoot<T>(0.98, -(v + vs), v * vs);
+    const T assimilation = ag - rd;
+    T gs = 1.6 * assimilation * ppm2bar / ad::max(cs - ci, 1e-12);
+    gs = ad::max(ad::isfinite(gs) ? gs : T(0.0), surface.stomatalG0);
     return (density / (kMAir * 1e-3)) / gs;
 }
 
-double soilSurfaceResistance(const EnergySurface& surface)
+template <class T>
+T soilSurfaceResistanceT(const EnergySurface& surface, const T& moisture)
 {
-    if (!surface.ground.moistureResistance) return std::max(surface.ground.fixedResistance, 0.0);
+    if (!surface.ground.moistureResistance) return T(std::max(surface.ground.fixedResistance, 0.0));
     const double saturation = std::max(surface.ground.saturatedMoisture, 1e-6);
-    const double wetness = std::clamp(surface.soilMoisture / saturation, 0.0, 1.0);
-    return std::exp(8.206 - 4.255 * wetness);
+    const T wetness = ad::clamp(moisture / saturation, 0.0, 1.0);
+    return ad::exp(8.206 - 4.255 * wetness);
 }
 
-struct ComponentFlux { double net = 0, sensible = 0, latent = 0, ground = 0, residual = 0; };
+template <class T> struct ComponentFluxT { T net{}, sensible{}, latent{}, ground{}, residual{}; };
+using ComponentFlux = ComponentFluxT<double>;
 struct Fluxes { ComponentFlux soilSunlit, soilShaded, leafSunlit, leafShaded; };
 
 struct Solution {
@@ -298,83 +312,104 @@ struct Solution {
     bool closed = false;
 };
 
-void fluxes(const EnergySurface& surface, const Forcing& forcing, const ShortwaveAbsorption& shortwave,
-            double szaDeg, bool sunlit, double inverseObukhov, double density, double dtSeconds, double sceneSensible,
-            EnergyState& state, Solution& solution)
+template <class T>
+struct BalancesT {
+    ComponentFluxT<T> soilSunlit, soilShaded, leafSunlit, leafShaded;
+    T soilResistance{}, leafResistanceSun = T(625000.0), leafResistanceShade = T(625000.0);
+};
+
+// The four component balances at fixed aerodynamic resistances (one implementation for the forward solve and
+// for the implicit derivatives of the assimilation).
+template <class T>
+BalancesT<T> balances(const EnergySurface& surface, const EnergyInputsT<T>& in, const Forcing& forcing,
+                      double szaDeg, bool sunlit, double dtSeconds, const EnergyState& thermal,
+                      const Resistances& aero, double density)
 {
-    const double lai = std::max(surface.lai, 0.0);
+    BalancesT<T> out;
+    const T lai = ad::max(in.lai, 0.0);
     const double eToQ = kMH2O / kMAir / std::max(forcing.p, 1e-6);
     const double qa = forcing.ea * eToQ;
     const double ta = forcing.ta;
     const bool leaves = lai > 0.0;
 
-    HomCanopy nodes(lai);
-    LongwaveAbsorption longwave;
+    LongwaveAbsorptionT<T> longwave;
     if (leaves) {
-        longwave = homLongwave(nodes, surface.leafEmissivity, surface.ground.emissivity, forcing.longwave,
-                               state.soilSunlit, state.soilShaded, state.leafSunlit, state.leafShaded,
-                               szaDeg, sunlit);
+        const HomCanopyT<T> nodes(lai);
+        longwave = homLongwave<T>(nodes, T(surface.leafEmissivity), in.soilEmissivity, forcing.longwave,
+                                  in.soilSunlit, in.soilShaded, in.leafSunlit, in.leafShaded, szaDeg, sunlit);
     } else {
-        longwave.soilSun = longwave.soilShade = surface.ground.emissivity * forcing.longwave;
+        longwave.soilSun = longwave.soilShade = in.soilEmissivity * forcing.longwave;
     }
-    const double soilIncomingSun = shortwave.soilDirect + shortwave.soilDiffuseSun + longwave.soilSun;
-    const double soilIncomingShade = shortwave.soilDiffuseShade + longwave.soilShade;
-    const double leafIncomingSun = shortwave.leafDirect + shortwave.leafDiffuseSun + longwave.leafSun;
-    const double leafIncomingShade = shortwave.leafDiffuseShade + longwave.leafShade;
+    const T soilIncomingSun = in.soilDirect + in.soilDiffuseSun + longwave.soilSun;
+    const T soilIncomingShade = in.soilDiffuseShade + longwave.soilShade;
+    const T leafIncomingSun = in.leafDirect + in.leafDiffuseSun + longwave.leafSun;
+    const T leafIncomingShade = in.leafDiffuseShade + longwave.leafShade;
 
-    const Resistances aero = aerodynamicResistances(surface, forcing, inverseObukhov, density, sceneSensible);
     const double raLeaf = std::max(aero.leaf, 1.0);
     const double raSoil = std::max(aero.soil, 1.0);
-    const double rss = std::max(soilSurfaceResistance(surface), 0.0);
-    solution.aero = aero;
-    solution.soilResistance = rss;
-    solution.density = density;
-
-    double leafResistanceSun = 625000.0, leafResistanceShade = 625000.0;
+    out.soilResistance = ad::max(soilSurfaceResistanceT<T>(surface, in.soilMoisture), 0.0);
     if (leaves) {
-        const double parSun = shortwave.parLeafDirect + shortwave.parLeafDiffuseSun;
-        const double parShade = shortwave.parLeafDiffuseShade;
-        leafResistanceSun = stomatalResistance(surface, state.leafSunlit, parSun, forcing, density) / lai;
-        leafResistanceShade = stomatalResistance(surface, state.leafShaded, parShade, forcing, density) / lai;
+        out.leafResistanceSun = stomatalResistanceT<T>(surface, in.leafSunlit, in.parSun, in.vcmax, forcing, density) / lai;
+        out.leafResistanceShade = stomatalResistanceT<T>(surface, in.leafShaded, in.parShade, in.vcmax, forcing, density) / lai;
     }
-    solution.leafResistanceSun = leafResistanceSun;
-    solution.leafResistanceShade = leafResistanceShade;
 
-    const auto component = [&](double temperature, double ra, double rs, double incoming, double factor, double emissivity) {
-        ComponentFlux flux;
+    const auto component = [&](const T& temperature, double ra, const T& rs, const T& incoming, const T& factor,
+                               const T& emissivity) {
+        ComponentFluxT<T> flux;
         const double resistanceAero = std::max(ra, 1.0);
-        const double resistanceSurface = std::max(rs, 0.0);
-        const double qi = saturationVapourPressure(temperature - 273.15) * eToQ;
-        const double lambda = latentHeat(temperature);
+        const T resistanceSurface = ad::max(rs, 0.0);
+        const T qi = saturationVapourPressureT(temperature - 273.15) * eToQ;
+        const T lambda = latentHeatT(temperature);
         flux.latent = density / (resistanceAero + resistanceSurface) * lambda * (qi - qa);
         flux.sensible = density * kCP / resistanceAero * (temperature - ta);
-        flux.net = incoming - emissivity * kSigma * std::pow(temperature, 4.0) * factor;
+        flux.net = incoming - emissivity * kSigma * ad::pow(temperature, 4.0) * factor;
         flux.residual = flux.net - flux.latent - flux.sensible;
         return flux;
     };
 
-    Fluxes result;
     if (leaves) {
-        result.leafSunlit = component(state.leafSunlit, raLeaf, leafResistanceSun, lai * leafIncomingSun, 2.0 * lai,
-                                      surface.leafEmissivity);
-        result.leafShaded = component(state.leafShaded, raLeaf, leafResistanceShade, lai * leafIncomingShade, 2.0 * lai,
-                                      surface.leafEmissivity);
+        out.leafSunlit = component(in.leafSunlit, raLeaf, out.leafResistanceSun, lai * leafIncomingSun, 2.0 * lai,
+                                   T(surface.leafEmissivity));
+        out.leafShaded = component(in.leafShaded, raLeaf, out.leafResistanceShade, lai * leafIncomingShade, 2.0 * lai,
+                                   T(surface.leafEmissivity));
     }
-    result.soilSunlit = component(state.soilSunlit, raSoil, rss, soilIncomingSun, 1.0, surface.ground.emissivity);
-    result.soilShaded = component(state.soilShaded, raSoil, rss, soilIncomingShade, 1.0, surface.ground.emissivity);
+    out.soilSunlit = component(in.soilSunlit, raSoil, out.soilResistance, soilIncomingSun, T(1.0), in.soilEmissivity);
+    out.soilShaded = component(in.soilShaded, raSoil, out.soilResistance, soilIncomingShade, T(1.0), in.soilEmissivity);
 
     const ThermalMaterial material = surface.ground.material();
-    const auto groundFlux = [&](double temperature, double net, SoilThermalState& thermal) {
+    const auto groundFlux = [&](const T& temperature, const T& net, const SoilThermalState& state) -> T {
         switch (surface.soilHeatMethod) {
             case SoilHeatMethod::Direct: return net * surface.soilHeatFraction;
-            case SoilHeatMethod::Surface: return surfaceHeatFlux(temperature, thermal, dtSeconds, material.inertia());
-            case SoilHeatMethod::Depth: default: return depthHeatFlux(temperature, thermal, dtSeconds, material);
+            case SoilHeatMethod::Surface: return surfaceHeatFluxT<T>(temperature, state, dtSeconds, in.soilInertia);
+            case SoilHeatMethod::Depth: default:
+                // The implicit column is linear in the surface temperature: G = intercept + slope T.
+                depthHeatFlux(ad::value(temperature), state, dtSeconds, material);
+                if (!state.depthCached) return T(0.0);
+                return state.depthIntercept + state.depthSlope * temperature;
         }
     };
-    result.soilSunlit.ground = groundFlux(state.soilSunlit, result.soilSunlit.net, state.soilSunState);
-    result.soilShaded.ground = groundFlux(state.soilShaded, result.soilShaded.net, state.soilShadeState);
-    result.soilSunlit.residual -= result.soilSunlit.ground;
-    result.soilShaded.residual -= result.soilShaded.ground;
+    out.soilSunlit.ground = groundFlux(in.soilSunlit, out.soilSunlit.net, thermal.soilSunState);
+    out.soilShaded.ground = groundFlux(in.soilShaded, out.soilShaded.net, thermal.soilShadeState);
+    out.soilSunlit.residual -= out.soilSunlit.ground;
+    out.soilShaded.residual -= out.soilShaded.ground;
+    return out;
+}
+
+void fluxes(const EnergySurface& surface, const Forcing& forcing, const ShortwaveAbsorption& shortwave,
+            double szaDeg, bool sunlit, double inverseObukhov, double density, double dtSeconds, double sceneSensible,
+            EnergyState& state, Solution& solution)
+{
+    const double lai = std::max(surface.lai, 0.0);
+    const bool leaves = lai > 0.0;
+    const EnergyInputsT<double> inputs = energyInputs(surface, shortwave, state);
+    const Resistances aero = aerodynamicResistances(surface, forcing, inverseObukhov, density, sceneSensible);
+    solution.aero = aero;
+    solution.density = density;
+    const BalancesT<double> b = balances<double>(surface, inputs, forcing, szaDeg, sunlit, dtSeconds, state, aero, density);
+    solution.soilResistance = b.soilResistance;
+    solution.leafResistanceSun = b.leafResistanceSun;
+    solution.leafResistanceShade = b.leafResistanceShade;
+    Fluxes result{b.soilSunlit, b.soilShaded, b.leafSunlit, b.leafShaded};
 
     const double soilSunFraction = std::clamp(shortwave.soilSunlitFraction, 0.0, 1.0);
     const double laiSunlit = std::clamp(shortwave.laiSunlit, 0.0, lai);
@@ -389,7 +424,7 @@ void fluxes(const EnergySurface& surface, const Forcing& forcing, const Shortwav
     solution.gustResidual = std::abs(sceneH - sceneSensible);
     solution.sceneSensible = sceneH;
     solution.fluxes = result;
-    double maximum = std::abs(result.soilSunlit.residual) + std::abs(result.soilShaded.residual);
+    double maximum;
     if (leaves) maximum = std::max({std::abs(result.soilSunlit.residual), std::abs(result.soilShaded.residual),
                                     std::abs(result.leafSunlit.residual), std::abs(result.leafShaded.residual)});
     else maximum = std::max(std::abs(result.soilSunlit.residual), std::abs(result.soilShaded.residual));
@@ -419,6 +454,68 @@ void updateTemperature(double& temperature, double residual, double ra, double r
 }
 
 }  // namespace
+
+EnergyInputsT<double> energyInputs(const EnergySurface& surface, const ShortwaveAbsorption& shortwave,
+                                   const EnergyState& state)
+{
+    EnergyInputsT<double> in;
+    in.soilSunlit = state.soilSunlit;
+    in.soilShaded = state.soilShaded;
+    in.leafSunlit = state.leafSunlit;
+    in.leafShaded = state.leafShaded;
+    in.lai = surface.lai;
+    in.soilMoisture = surface.soilMoisture;
+    in.vcmax = surface.leaf.vcmax;
+    in.soilEmissivity = surface.ground.emissivity;
+    in.soilInertia = surface.ground.material().inertia();
+    in.soilDirect = shortwave.soilDirect;
+    in.soilDiffuseSun = shortwave.soilDiffuseSun;
+    in.soilDiffuseShade = shortwave.soilDiffuseShade;
+    in.leafDirect = shortwave.leafDirect;
+    in.leafDiffuseSun = shortwave.leafDiffuseSun;
+    in.leafDiffuseShade = shortwave.leafDiffuseShade;
+    in.parSun = shortwave.parLeafDirect + shortwave.parLeafDiffuseSun;
+    in.parShade = shortwave.parLeafDiffuseShade;
+    in.soilSunlitFraction = shortwave.soilSunlitFraction;
+    in.laiSunlit = shortwave.laiSunlit;
+    return in;
+}
+
+template <class T>
+std::array<T, 4> energyResiduals(const EnergySurface& surface, const EnergyInputsT<T>& inputs, const Forcing& forcing,
+                                 double szaDeg, bool sunlit, double dtSeconds, const EnergyState& history,
+                                 double inverseObukhov, double sceneSensible)
+{
+    const double density = airDensity(forcing);
+    const Resistances aero = aerodynamicResistances(surface, forcing, inverseObukhov, density, sceneSensible);
+    const BalancesT<T> b = balances<T>(surface, inputs, forcing, szaDeg, sunlit, dtSeconds, history, aero, density);
+    const bool leaves = ad::value(inputs.lai) > 0.0;
+    return {b.soilSunlit.residual, b.soilShaded.residual,
+            leaves ? b.leafSunlit.residual : T(0.0), leaves ? b.leafShaded.residual : T(0.0)};
+}
+
+template <class T>
+void johansenSoilThermal(double saturatedMoisture, const T& moisture, T& conductivity, T& volumetricCapacity)
+{
+    // Johansen (coarse soil): dry sand ~0.2 W m-1 K-1 / inertia ~600, wet soil ~1.4 / ~1900.
+    const double porosity = std::clamp(saturatedMoisture, 0.2, 0.7);
+    const T theta = ad::clamp(moisture, 0.0, porosity);
+    const double bulk = (1.0 - porosity) * 2700.0;
+    const double dry = (0.135 * bulk + 64.7) / (2700.0 - 0.947 * bulk);
+    const double saturated = std::pow(3.0, 1.0 - porosity) * std::pow(0.57, porosity);
+    const T saturation = theta / porosity;
+    const T kersten = saturation > 0.05 ? ad::clamp(0.7 * ad::log10(saturation) + 1.0, 0.0, 1.0) : T(0.0);
+    conductivity = dry + kersten * (saturated - dry);
+    volumetricCapacity = (1.0 - porosity) * 2.0e6 + theta * 4.18e6;
+}
+
+template std::array<double, 4> energyResiduals<double>(const EnergySurface&, const EnergyInputsT<double>&,
+                                                       const Forcing&, double, bool, double, const EnergyState&,
+                                                       double, double);
+template std::array<Ad, 4> energyResiduals<Ad>(const EnergySurface&, const EnergyInputsT<Ad>&, const Forcing&, double,
+                                               bool, double, const EnergyState&, double, double);
+template void johansenSoilThermal<double>(double, const double&, double&, double&);
+template void johansenSoilThermal<Ad>(double, const Ad&, Ad&, Ad&);
 
 EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& forcing,
                                   const ShortwaveAbsorption& shortwave, double szaDeg, bool sunlit,

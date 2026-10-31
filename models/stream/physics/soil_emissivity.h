@@ -19,6 +19,8 @@
 // models/histream/src/base/soil_tir_emissivity.h holds the three-dimensional
 // counterpart; keep the two in step.
 
+#include "dual.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -60,6 +62,23 @@ inline double soilEmissivityAtMoisture(double dryEmissivity, double wetEmissivit
     const double dry = std::clamp(std::isfinite(dryEmissivity) ? dryEmissivity : 0.955, 0.0, 1.0);
     const double wet = soilSaturatedEmissivity(dry, wetEmissivity);
     return std::clamp(dry + (wet - dry) * soilWetWeight(moisture), 0.0, 1.0);
+}
+
+// Differentiable forms (T = double or Ad) of the two functions above.
+template <class T>
+T soilWetWeightT(const T& moisture)
+{
+    if (!ad::isfinite(moisture)) return T(0.0);
+    const T above = ad::max(ad::clamp(moisture, 0.0, 1.0) - kSoilDryWaterContent, 0.0);
+    return T(1.0) - ad::exp(-above / kSoilWaterContentScale);
+}
+
+template <class T>
+T soilEmissivityAtMoistureT(double dryEmissivity, double wetEmissivity, const T& moisture)
+{
+    const double dry = std::clamp(std::isfinite(dryEmissivity) ? dryEmissivity : 0.955, 0.0, 1.0);
+    const double wet = soilSaturatedEmissivity(dry, wetEmissivity);
+    return ad::clamp(dry + (wet - dry) * soilWetWeightT(moisture), 0.0, 1.0);
 }
 
 }  // namespace stream

@@ -1082,69 +1082,59 @@ min(x) <= min(B(LST))
 
 温差约束实际实现为 B_λ(T_mean + d/2) - B_10.8(T_mean - d/2)，是以平均温度 T_mean 为参考的辐射差近似，不是精确的 B^-1(x_i) - B^-1(x_j)；λ ≠ 10.8 μm 时存在系统偏差。包络约束的 `max/min` 使可行域非光滑且可能多分支。历史实现还存在不检查优化 `success/status`、查询后不重算其他分量等问题，使用时必须把收敛状态写入产品。
 
-### 15.6 STREAM 内建温度反演与同化接口
+### 15.6 STREAM 内建同化：可微算子与 MAP 分析（当前实现）
 
-**内建温度反演（当前实现，`models/stream/app/inversion.cpp`）。** 观测算子与正向成像共用同一套权重（`app/thermal_view.cpp`）：
+**运行方式。** 工作台只区分“直接模拟”和“同化”。同化的观测有三类：亮温（每个热红外波段一个观测，可加其他视角）、地表温度（按地类固定发射率归一的 LST，10.5 μm）、组分温度（Tss/Tsh/Tcs/Tch）。实现见 `models/stream/app/assimilation.cpp`；观测误差、背景误差与迭代参数是该文件中的固定默认值，不在界面暴露。发射率不作为控制变量。
 
-```text
-L_j = sum_k w_jk(θv_j, φv_j, θs) * B(λ_j, T_k)
-w_jk = 四组分比例_k * 组分发射率_k + hom3 多次散射项_k
-y_j = B^-1(λ_j, L_j)                亮温观测
-y_j = B^-1(λ_j, L_j / ε_fix,j)      LST 产品观测
-```
+**控制变量。**
 
-导数由 Planck 链解析给出：
+| 背景 | 控制变量 x | 组分温度 |
+|---|---|---|
+| RT（给定组分温度） | Tss、Tsh、Tcs、Tch | 即控制变量 |
+| EB（ERA5 能量平衡） | 土壤水分 θ、Vcmax25 | 由能量平衡解 T(x) 给出 |
+| 任一背景 + 光学反射率观测 | 追加 LAI | — |
 
-```text
-dy_j/dT_k = w_jk * B'(λ_j, T_k) / (d_j * B'(λ_j, y_j))
-```
-
-其中 d_j 对亮温观测取 1、对 LST 产品取 ε_fix,j。
-
-LST 取四组分同温 T，对 1/σ² 加权残差做 Gauss–Newton；发射率误差 σ_ε 按 σ_ε · B(T) / B'(y_j) 并入观测方差，后验 1σ 为信息量的平方根倒数。
-
-LSCT 求 MAP 解：
+**观测算子就是正向成像。** 热红外与成像共用 `thermalPixel`（`app/thermal_view.cpp`），包括面元坡面几何与山包/山脊复合面元：
 
 ```text
-J(x) = sum_j (y_j - h_j(x))^2 / σ_j^2 + (x - x_b)^T B^-1 (x - x_b)
-B = σ_b^2 [ (1 - r) I + r 1 1^T ]
-C_post = ( H^T R^-1 H + B^-1 )^-1
-DFS = m - tr( C_post B^-1 )
+L_j = Σ_k w_jk(LAI, ε_s(θ), θv_j, φv_j, θs) · B(λ_j, T_k)
+w_jk = 四组分比例_k(LAI) · 组分发射率_k + hom3 多次散射项_k
+y_j = B⁻¹(λ_j, L_j)                     亮温
+y   = B⁻¹(λ, L / Σ_k w_k(ε_fix))         地表温度（固定发射率约定）
+y_k = T_k                                组分温度
+ρ_b = canopyReflectance(LAI, ρ_leaf, ρ_soil(θ), geometry, diffuse)   光学
 ```
 
-背景 x_b 取本次运行的组分温度（RT 输入或 EB 解），m 为可观测组分数（权重和低于 1e-4 的组分保留背景值）。可选 s×s 同地类窗口共享四组分温度以增加方程数。DFS 低于 1 标记为信息量不足；后验组分温度同时用于本次热红外成像，使输出亮温即后验状态的正向图像。由于观测算子与正向模型逐项一致，反演 STREAM 自身模拟的无噪声影像时可回到生成温度。
+**可微算子（预存在模型中）。** 物理核（`physics/canopy`、`radiosity`、`shortwave`、`energy`、`heat_conduction`、`soil_emissivity`、`brightness`）都是标量类型模板：正向模拟用 `double`，同化用 `Dual<8>`（`physics/dual.h`，前向自动微分）运行同一份代码，得到四组分比例、hom3 5×5 求解、土壤含水量/Hapke 发射率、Planck 与冠层反射率对 x 的精确导数。导数的公式在编译时固定，数值随每个像元的状态在运行时算出。分支与限幅按当前值取活动分支的导数。BSM 土壤反射率对 θ 的导数取 1/1000 网格上相邻两格的差商。
 
-**联合同化接口（扩展方向）。** 同化的观测算子是 STREAM 的单像元正向链：
+**EB 背景：收敛点隐式微分。** 过境时刻四组分能量平衡残差（Rn − H − LE − G）在收敛点满足 R(T, x) = 0，因此
 
 ```text
-H_optical(x) = canopyReflectance(band, LAI, rho_leaf, rho_soil, geometry, diffuse)
-H_tir(x)     = sum_k w_k(x, geometry) * Planck_band(T_k)
+dT/dx = −(∂R/∂T)⁻¹ ∂R/∂x,      H = ∂h/∂T · dT/dx + ∂h/∂x
 ```
 
-可微性按模块区分（对应 `models/stream/physics/`）：
+∂R/∂T 与 ∂R/∂x 由同一次对偶数残差计算得到（`energyResiduals<Ad>`），每像元一次 4×4 求解（无叶片时 2×2）。θ 通过土壤发射率、土壤表面阻抗（Sellers 选项）、Johansen 热惯量（含水量选项）与土壤短波反照率进入 R；Vcmax 通过 Farquhar/Ball–Berry 气孔阻抗进入；LAI 通过 hom3 辐射、组分比例与短波吸收进入。稳定度 1/L、阵风通量与过境前的土壤热历史在求导时冻结，非线性部分由 Gauss–Newton 每次迭代重新求解能量平衡来修正。
 
-- **RT 链可直接可微**：四组分比例、`hom3` 节点辐射度、有效发射率、Planck 与亮温都由 `exp/log/sqrt` 与 5×5 线性求解组成，光滑可导；
-- **EB 链不要逐迭代求导**：`updateTemperature` 的限幅（±1.5 K、240–380 K）、区间割线与分支判据都是折点，应使用隐式微分或弱约束。
-
-隐式微分：收敛后四组分残差满足 R(T, x) = 0，则
+**MAP 分析（每像元）。**
 
 ```text
-dT/dx = - (dR/dT)^-1 (dR/dx)
+J(x) = Σ_j (y_j − h_j(x))² / σ_j² + (x − x_b)ᵀ B⁻¹ (x − x_b)
+x_{i+1} = x_b + (Hᵀ R⁻¹ H + B⁻¹)⁻¹ Hᵀ R⁻¹ [ y − h(x_i) + H (x_i − x_b) ]
+C_a = (Hᵀ R⁻¹ H + B⁻¹)⁻¹,   DFS = n − tr(C_a B⁻¹)
 ```
 
-只需一次 4×4 线性求解。弱约束 4D-Var 则把 Tss/Tsh/Tls/Tlh 也作为控制变量，把能量平衡残差作为惩罚项：
+控制变量限制在物理范围内（温度 150–400 K，θ 0.02–0.60，Vcmax 5–250，LAI 0–10）；最大步长低于 1e-3 倍背景 σ 时收敛。EB 背景下组分温度的分析 1σ 按 gₖᵀ C_a gₖ 传播（gₖ = dTₖ/dx）。分析场随后替换本次成像的组分温度、土壤水分与 LAI，输出影像即分析场的正向图像。
 
-```text
-J = 观测项 + 先验项 + lambda_EB || R(T, x) ||^2
-```
+| 默认值 | 取值 |
+|---|---|
+| 观测误差 σ_o | 亮温 0.5 K；地表温度 1.0 K；组分温度 2.0 K；反射率 0.02 |
+| 背景误差 σ_b | 组分温度 5 K，组分间相关 0.5；θ 0.10 m³/m³；Vcmax 30%（≥ 10）；LAI 30%（≥ 0.5） |
+| 迭代 | RT 最多 20 次，EB 最多 10 次（每次重解能量平衡） |
+| 质量位 | 0 输入无效/无观测，2 越界或到达边界，3 失败，4 病态，8 DFS < 0.2，9 未收敛 |
 
-后验不确定性用 Laplace 近似：
+**单独的温度反演（保留，`app/inversion.cpp`）。** 引擎配置的 `inversion` 块仍提供 LST（四组分同温加权 Gauss–Newton，发射率误差传播）与 LSCT（MAP，可选同地类 s×s 窗口）反演，导数由 Planck 链解析给出：dy_j/dT_k = w_jk B′(λ_j, T_k) / (d_j B′(λ_j, y_j))，d_j 对亮温取 1、对 LST 取 ε_fix。工作台不再单独列出，二者不能与同化同时使用。
 
-```text
-C_post = ( J^T R^-1 J + B^-1 )^-1
-```
-
-角色分工：HiStream 提供三维场景与 OSSE 真值样本；STREAM 提供 H(x)；STREAM-NET 只修正正向亮温残差、可作为观测偏差修正或初值，不能当作物理反演器；LS4T 负责把卫星观测落成 LST/LSCT 产品。
+角色分工：HiStream 提供三维场景与 OSSE 真值样本；STREAM 提供可微的 H(x) 与分析；STREAM-NET 只修正正向亮温残差，不作为物理反演器；LS4T 负责把卫星观测落成 LST/LSCT 产品，可直接作为“地表温度”“组分温度”同化的观测。
 
 单像元原型（`tools/stream-inverse/`，亮温噪声 0.3 K）的数值证据：
 
@@ -1157,8 +1147,7 @@ C_post = ( J^T R^-1 J + B^-1 )^-1
 | 观测 RMSE | 0.17 K |
 | Jacobian 条件数 | 约 5.8e3 |
 
-结论与 15.1 一致：LAI 与等效温度可识别，**单个晴/阴组分温度在单角度多波段亮温下不可独立反演**。需要多角度、多波段热红外、光学 BRF、时间序列或更强先验，这不是优化器问题。
-
+结论与 15.1 一致：LAI 与等效温度可识别，**单个晴/阴组分温度在单角度多波段亮温下不可独立反演**；同化中这表现为 DFS 接近 1、分析主要由背景决定。需要多角度、光学 BRF、时间序列或 EB 背景的物理约束，这不是优化器问题。
 ### 15.7 产品、质量与验证
 
 产品分层沿用卫星产品的既有约定：

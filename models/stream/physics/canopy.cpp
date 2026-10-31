@@ -28,22 +28,23 @@ double leafCorrelation(double hotspot, double sunZenith, double viewZenith, doub
 
 // Two-layer approximation of the sunlit visible leaf fraction inside the covered phase
 // (hotspot.two_layer_sunlit_leaf, with c = 0 for the homogeneous canopy).
-double twoLayerSunlitLeaf(double lai, double viewGap, double sunGap, double sunlitSoil)
+template <class T>
+T twoLayerSunlitLeaf(const T& lai, const T& viewGap, const T& sunGap, const T& sunlitSoil)
 {
-    const double pv = std::clamp(viewGap, 1e-12, 1.0);
-    const double ps = std::clamp(sunGap, 1e-12, 1.0);
-    const double pss = std::max(sunlitSoil, 1e-300);
-    const double kv = -std::log(pv) / lai;
-    const double ks = -std::log(ps) / lai;
-    const double overlap = std::clamp(std::log(pss / (pv * ps)) / lai, 0.0, std::min(kv, ks));
-    const double index = std::max(0.82 - 0.08 * lai, 0.02);
-    const double upper = std::sqrt((-std::log(1.0 - (1.0 - pv) * index) / std::max(kv * lai, 1e-12)) *
-                                   (-std::log(1.0 - (1.0 - ps) * index) / std::max(ks * lai, 1e-12)));
-    const double laiUpper = lai * upper;
-    const double laiBottom = lai * (1.0 - upper);
-    const double litBackground = std::exp(-(ks + kv - overlap) * laiUpper);
-    const double litBottom = 1.0 - std::exp(-overlap * laiBottom);
-    return std::clamp(1.0 - std::exp(-kv * laiUpper) + litBottom * litBackground, 0.0, 1.0 - pv);
+    const T pv = ad::clamp(viewGap, 1e-12, 1.0);
+    const T ps = ad::clamp(sunGap, 1e-12, 1.0);
+    const T pss = ad::max(sunlitSoil, 1e-300);
+    const T kv = -ad::log(pv) / lai;
+    const T ks = -ad::log(ps) / lai;
+    const T overlap = ad::clamp(ad::log(pss / (pv * ps)) / lai, T(0.0), ad::min(kv, ks));
+    const T index = ad::max(0.82 - 0.08 * lai, 0.02);
+    const T upper = ad::sqrt((-ad::log(T(1.0) - (T(1.0) - pv) * index) / ad::max(kv * lai, 1e-12)) *
+                             (-ad::log(T(1.0) - (T(1.0) - ps) * index) / ad::max(ks * lai, 1e-12)));
+    const T laiUpper = lai * upper;
+    const T laiBottom = lai * (T(1.0) - upper);
+    const T litBackground = ad::exp(-(ks + kv - overlap) * laiUpper);
+    const T litBottom = T(1.0) - ad::exp(-overlap * laiBottom);
+    return ad::clamp(T(1.0) - ad::exp(-kv * laiUpper) + litBottom * litBackground, T(0.0), T(1.0) - pv);
 }
 
 // Gauss-Legendre nodes and weights on [-1, 1].
@@ -114,24 +115,30 @@ void volumeScattering(double sunZenith, double viewZenith, double relativeAzimut
 
 }  // namespace
 
-FourFractions canopyFractions(double lai, double hotspot, double sunZenith, double viewZenith,
-                              double relativeAzimuth)
+template <class T>
+FourFractionsT<T> canopyFractionsT(const T& lai, double hotspot, double sunZenith, double viewZenith,
+                                   double relativeAzimuth)
 {
-    FourFractions result;
-    if (!(lai > 0.0)) { result.soilSun = 1.0; return result; }
+    FourFractionsT<T> result;
+    if (!(lai > 0.0)) { result.soilSun = T(1.0); return result; }
     const double muS = std::max(cosine(sunZenith), 1e-6), muV = std::max(cosine(viewZenith), 1e-6);
     const double ks = kG / muS, kv = kG / muV;
-    const double gs = std::exp(-ks * lai), gv = std::exp(-kv * lai);
-    const double ts = ks * lai, tv = kv * lai;
+    const T gs = ad::exp(-ks * lai), gv = ad::exp(-kv * lai);
+    const T ts = ks * lai, tv = kv * lai;
     const double correlation = leafCorrelation(hotspot, sunZenith, viewZenith, relativeAzimuth);
-    const double shared = std::min({tv, ts, std::sqrt(tv * ts) * correlation});
-    const double joint = std::exp(-(ts + tv - shared));  // sunlit soil
-    const double leafSun = twoLayerSunlitLeaf(lai, gv, gs, joint);
-    result.soilSun = std::clamp(joint, 0.0, gv);
-    result.soilShade = std::max(0.0, gv - result.soilSun);
-    result.leafSun = std::clamp(leafSun, 0.0, std::max(0.0, 1.0 - gv));
-    result.leafShade = std::max(0.0, 1.0 - gv - result.leafSun);
+    const T shared = ad::min(ad::min(tv, ts), ad::sqrt(tv * ts) * correlation);
+    const T joint = ad::exp(-(ts + tv - shared));  // sunlit soil
+    const T leafSun = twoLayerSunlitLeaf<T>(lai, gv, gs, joint);
+    result.soilSun = ad::clamp(joint, T(0.0), gv);
+    result.soilShade = ad::max(0.0, gv - result.soilSun);
+    result.leafSun = ad::clamp(leafSun, T(0.0), ad::max(0.0, T(1.0) - gv));
+    result.leafShade = ad::max(0.0, T(1.0) - gv - result.leafSun);
     return result;
+}
+
+FourFractions canopyFractions(double lai, double hotspot, double sunZenith, double viewZenith, double relativeAzimuth)
+{
+    return canopyFractionsT<double>(lai, hotspot, sunZenith, viewZenith, relativeAzimuth);
 }
 
 SphericalCoefficients sphericalCoefficients(double sunZenith, double viewZenith, double relativeAzimuth)
@@ -154,33 +161,46 @@ SphericalCoefficients sphericalCoefficients(double sunZenith, double viewZenith,
     return result;
 }
 
-double canopyReflectance(double lai, double hotspot, double sunZenith, double sunAzimuth, double viewZenith,
-                         double viewAzimuth, double leafReflectance, double leafTransmittance,
-                         double soilReflectance, double diffuseFraction, bool sunlit)
+template <class T>
+T canopyReflectanceT(const T& lai, double hotspot, double sunZenith, double sunAzimuth, double viewZenith,
+                     double viewAzimuth, double leafReflectance, double leafTransmittance, const T& soilReflectance,
+                     double diffuseFraction, bool sunlit)
 {
     const double direct = sunlit ? 1.0 - diffuseFraction : 0.0;
     if (!(lai > 1e-10)) return direct * soilReflectance + diffuseFraction * soilReflectance;
     const double relative = std::fmod(viewAzimuth - sunAzimuth + 540.0, 360.0) - 180.0;
-    FourFractions parts = canopyFractions(lai, hotspot, sunZenith, viewZenith, std::abs(relative));
+    FourFractionsT<T> parts = canopyFractionsT<T>(lai, hotspot, sunZenith, viewZenith, std::abs(relative));
     if (!sunlit) {
-        parts = FourFractions{0.0, parts.soilSun + parts.soilShade, 0.0, parts.leafSun + parts.leafShade};
+        parts = FourFractionsT<T>{T(0.0), parts.soilSun + parts.soilShade, T(0.0), parts.leafSun + parts.leafShade};
     }
     const auto coefficients = sphericalCoefficients(std::min(sunZenith, 89.9), std::min(viewZenith, 89.9), std::abs(relative));
-    const double single = direct * ((coefficients.sob * leafReflectance + coefficients.sof * leafTransmittance) /
-                                        std::max(coefficients.ko, 1e-9) * parts.leafSun +
-                                    soilReflectance * parts.soilSun);
-    const HomCanopy nodes(lai);
-    double multiple = 0.0;
+    const T single = direct * ((coefficients.sob * leafReflectance + coefficients.sof * leafTransmittance) /
+                                   std::max(coefficients.ko, 1e-9) * parts.leafSun +
+                               soilReflectance * parts.soilSun);
+    const HomCanopyT<T> nodes(lai);
+    T multiple(0.0);
     if (direct > 0.0 && sunZenith < 90.0) {
-        const auto beam = homBeamMultiple(nodes, soilReflectance, leafReflectance, leafTransmittance,
-                                          sunZenith, viewZenith);
+        const auto beam = homBeamMultiple<T>(nodes, soilReflectance, leafReflectance, leafTransmittance,
+                                             sunZenith, viewZenith);
         multiple += direct * (beam.canopy + beam.soil);
     }
     if (diffuseFraction > 0.0) {
-        const auto sky = homSkyMultiple(nodes, soilReflectance, leafReflectance, leafTransmittance, viewZenith);
+        const auto sky = homSkyMultiple<T>(nodes, soilReflectance, leafReflectance, leafTransmittance, viewZenith);
         multiple += diffuseFraction * (sky.canopy + sky.soil);
     }
     return single + multiple;
 }
+
+double canopyReflectance(double lai, double hotspot, double sunZenith, double sunAzimuth, double viewZenith,
+                         double viewAzimuth, double leafReflectance, double leafTransmittance,
+                         double soilReflectance, double diffuseFraction, bool sunlit)
+{
+    return canopyReflectanceT<double>(lai, hotspot, sunZenith, sunAzimuth, viewZenith, viewAzimuth, leafReflectance,
+                                      leafTransmittance, soilReflectance, diffuseFraction, sunlit);
+}
+
+template FourFractionsT<Ad> canopyFractionsT<Ad>(const Ad&, double, double, double, double);
+template Ad canopyReflectanceT<Ad>(const Ad&, double, double, double, double, double, double, double, const Ad&,
+                                   double, bool);
 
 }  // namespace stream

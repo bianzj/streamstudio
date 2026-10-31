@@ -420,9 +420,10 @@ add_custom_target(histream_runtime_resources ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_BINARY_DIR}/shader/raytracing"
             "$<TARGET_FILE_DIR:${PROJNAME}>/shader/raytracing"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "$<IF:$<CONFIG:Debug>,${VCPKG_INSTALLED_DIR}/x64-windows/debug/bin,${VCPKG_INSTALLED_DIR}/x64-windows/bin>"
-            "$<TARGET_FILE_DIR:${PROJNAME}>"
+    COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=$<IF:$<CONFIG:Debug>,${VCPKG_INSTALLED_DIR}/x64-windows/debug/bin,${VCPKG_INSTALLED_DIR}/x64-windows/bin>"
+            "-DDESTINATION_DIR=$<TARGET_FILE_DIR:${PROJNAME}>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/copy-runtime-dependencies.cmake"
     # Mesa lavapipe CPU Vulkan driver for the computeBackend=cpu/auto paths.
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/lavapipe"

@@ -1,0 +1,44 @@
+{
+  "scope": "Requested overpass only; numerical convergence is not field accuracy",
+  "solved": 180408,
+  "converged": 180326,
+  "not_converged": 82,
+  "converged_percent": 99.9545474701787,
+  "stability_converged": 180368,
+  "stability_not_converged": 40,
+  "stability_converged_but_joint_failed": 42,
+  "residual_W_m2": {
+    "all": {
+      "count": 180408,
+      "mean": 0.27956902980804443,
+      "median": 0.26977086067199707,
+      "p95": 0.46876847743988037,
+      "max": 28.765329360961914
+    },
+    "converged": {
+      "count": 180326,
+      "mean": 0.2760210633277893,
+      "median": 0.2696918845176697,
+      "p95": 0.4685034155845642,
+      "max": 4.916980266571045
+    },
+    "not_converged": {
+      "count": 82,
+      "mean": 8.081926345825195,
+      "median": 6.402406692504883,
+      "p95": 18.250099182128906,
+      "max": 28.765329360961914
+    }
+  },
+  "nonconverged_by_landclass": {
+    "4": 82
+  },
+  "failed_iteration_counts": {
+    "50": 82
+  },
+  "water_pixels_not_in_convergence_denominator": 1774,
+  "elevation_correction_applied": false,
+  "elapsed_seconds": 2.1617209,
+  "crs": "EPSG:32650",
+  "summary_matches_raster": true
+}

@@ -1,0 +1,13 @@
+{
+  "kind":"stream-components",
+  "schemaVersion":1,
+  "overpass":"2019-08-15T02:30:00Z",
+  "source":"eb",
+  "file":"components.tif",
+  "bands":[
+    "Tss sunlit soil temperature (K)",
+    "Tsh shaded soil temperature (K)",
+    "Tcs sunlit leaf temperature (K)",
+    "Tch shaded leaf temperature (K)"
+  ]
+}

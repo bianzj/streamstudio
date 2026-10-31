@@ -1,11 +1,10 @@
 {
   "kind": "stream-image-project",
   "schemaVersion": 2,
-  "name": "Landsat 8/9 北京市 300 m · ERA5 单日驱动 EB（2019-08-15）",
-  "description": "2019-08-15 02:55 UTC（北京时间 10:55）天底观测；组分温度由 ERA5 2019-08-15 单日逐小时数据驱动能量平衡求解；LAI 为 2019-08-13 至 08-20 的 Landsat 8 天合成。 内置示例为 300 m 版本（30 m 输入按 10×10 聚合）；重新运行约需数秒。",
+  "name": "北京市 Landsat 300 m · ERA5能量平衡",
+  "description": "内置精选：Landsat 300 m区域光学与热红外影像模拟。参考运行综合收敛180326/180408（99.95%），82个异常像元保留质量标记。数值收敛不代表独立观测精度。",
   "scene": {
-    "name": "landsat_beijing_eb",
-    "outputRoot": "runs",
+    "name": "stream_beijing_300m_landsat",
     "locationSource": "georef",
     "overpass": "2019-08-15T02:55:00Z",
     "displayTimezone": 8,
@@ -104,7 +103,20 @@
       "elevationCorrection": true,
       "components": {
         "source": "fields"
+      },
+      "energy": {
+        "scheme": "tirt",
+        "soilHeatMethod": "surface",
+        "temperatureMethod": "robust",
+        "diffuseFraction": 0.2,
+        "enforceSolarLimit": true,
+        "spectralBinNm": 50,
+        "soilResistance": {
+          "method": "constant",
+          "value": 200
+        }
       }
-    }
+    },
+    "outputRoot": "output"
   }
 }

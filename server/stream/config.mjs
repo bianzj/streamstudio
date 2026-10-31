@@ -45,8 +45,9 @@ function filePaths(scene) {
   const inversion = scene.inversion || {}
   const observationFields = (Array.isArray(inversion.observations) ? inversion.observations : [])
     .flatMap((item) => [item?.value, item?.vza, item?.vaa])
+  const viewFields = (Array.isArray(scene.assimilation?.views) ? scene.assimilation.views : []).flatMap((item) => [item?.vza, item?.vaa])
   const fields = [...Object.values(scene.surface || {}), ...Object.values(scene.view || {}),
-    ...COMPONENT_KEYS.map((key) => scene.temperature?.components?.[key]), ...observationFields, inversion.mask]
+    ...COMPONENT_KEYS.map((key) => scene.temperature?.components?.[key]), ...observationFields, inversion.mask, ...viewFields]
   return fields.filter((field) => field && typeof field === 'object' && String(field.file || '').trim())
 }
 
@@ -56,6 +57,12 @@ export function mapStreamScenePaths(scene, convert) {
   if (components && String(components.file || '').trim()) components.file = convert(components.file)
   const era5 = scene.temperature?.era5
   if (era5 && String(era5.pack || '').trim()) era5.pack = convert(era5.pack)
+  const assimilation = scene.assimilation
+  if (assimilation && typeof assimilation === 'object') {
+    for (const key of ['data', 'optical']) if (String(assimilation[key] || '').trim()) assimilation[key] = convert(assimilation[key])
+    for (const view of Array.isArray(assimilation.views) ? assimilation.views : [])
+      if (view && String(view.data || '').trim()) view.data = convert(view.data)
+  }
   if (String(scene.outputRoot || '').trim()) scene.outputRoot = convert(scene.outputRoot, 'output')
   return scene
 }
@@ -200,6 +207,33 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     return block
   }
 
+  // Run mode: 直接模拟 or 同化. Only the data and the observation kind are user choices; observation and background
+  // errors, iteration and controls are engine defaults (models/stream/app/assimilation.cpp).
+  function assimilationKind(scene) {
+    const source = scene.assimilation
+    if (!source || typeof source !== 'object' || source.mode !== 'assimilate') return 'none'
+    return ['brightness', 'lst', 'components'].includes(source.observation) ? source.observation : 'brightness'
+  }
+
+  function buildAssimilation(source, observation, { thermalEnabled, opticalEnabled }) {
+    const label = observation === 'brightness' ? '亮温观测文件' : observation === 'lst' ? '地表温度观测文件' : '组分温度观测文件'
+    const block = { observation, data: existingFile(source.data, label) }
+    if (observation === 'brightness' && !thermalEnabled) throw new Error('同化亮温需要启用热红外波段（观测文件每个波段对应一个热红外波段）')
+    if (String(source.optical || '').trim()) {
+      if (!opticalEnabled) throw new Error('光学反射率观测需要启用光学波段（文件每个波段对应一个光学波段）')
+      block.optical = existingFile(source.optical, '光学反射率观测文件')
+    }
+    const views = observation === 'brightness' && Array.isArray(source.views) ? source.views : []
+    if (views.length > 16) throw new Error('附加观测视角不能超过 16 个')
+    const used = views.filter((item) => String(item?.data || '').trim())
+    if (used.length) block.views = used.map((item, index) => ({
+      data: existingFile(item.data, `附加视角 ${index + 1} 亮温文件`),
+      vza: inputField(item.vza, `附加视角 ${index + 1} 天顶角 VZA`, { required: true }),
+      vaa: inputField(item.vaa, `附加视角 ${index + 1} 方位角 VAA`, { required: true })
+    }))
+    return block
+  }
+
   function buildEngineConfig(input, { outputDir, dataDir }) {
     const scene = migrateScene(input)
     if (!scene) throw new Error('缺少影像模拟配置')
@@ -208,8 +242,10 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     if (!match || Number.isNaN(Date.parse(overpass))) throw new Error('过境时刻须为 UTC，格式 YYYY-MM-DDTHH:MM:SSZ')
     const opticalEnabled = Boolean(scene.optical?.enabled)
     const thermalEnabled = Boolean(scene.thermal?.enabled)
-    const inversionTarget = ['lst', 'lsct'].includes(scene.inversion?.target) ? scene.inversion.target : 'none'
-    if (!opticalEnabled && !thermalEnabled && inversionTarget === 'none') throw new Error('请至少启用光学、热红外模拟或反演')
+    const assimilation = assimilationKind(scene)
+    // The standalone LST / LSCT retrieval stays engine-accessible but is not combined with assimilation.
+    const inversionTarget = assimilation === 'none' && ['lst', 'lsct'].includes(scene.inversion?.target) ? scene.inversion.target : 'none'
+    if (!opticalEnabled && !thermalEnabled && inversionTarget === 'none' && assimilation === 'none') throw new Error('请至少启用光学、热红外模拟或同化')
     const opticalBands = opticalEnabled ? bands(scene.optical?.bands, '光学', 400, 2400) : []
     const thermalBands = thermalEnabled ? bands(scene.thermal?.bands, '热红外', 3, 20) : []
     if (opticalEnabled && !opticalBands.length) throw new Error('请至少添加一个光学波段')
@@ -304,8 +340,8 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
         } }
     } else {
       const components = {}
-      // LSCT inversion needs the RT component temperatures as its background even without thermal imaging.
-      if (thermalEnabled || inversionTarget === 'lsct') {
+      // LSCT inversion and the RT assimilation need the component temperatures as background even without thermal imaging.
+      if (thermalEnabled || inversionTarget === 'lsct' || assimilation !== 'none') {
         const input = temperatureInput.components || {}
         // DEFERRED[中] 错误处理: 组分温度常数要求 K，但不校验范围；用户按 °C 输入 25 会被当成 25 K，热红外结果完全错误而无提示；建议：常数限定在约 150–400 K，低于 150 时提示“是否误填为 °C”
         if (input.source === 'package') components.file = existingFile(input.file, '组分温度文件（components.tif）')
@@ -325,6 +361,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
       threads: Math.max(0, Math.min(256, Math.trunc(Number(scene.threads) || 0)))
     }
     if (inversionTarget !== 'none') config.inversion = buildInversion(scene.inversion, inversionTarget)
+    if (assimilation !== 'none') config.assimilation = buildAssimilation(scene.assimilation, assimilation, { thermalEnabled, opticalEnabled })
     const region = scene.region
     if (region && region.enabled) {
       const values = ['startRow', 'endRow', 'startColumn', 'endColumn'].map((key) => Number(region[key]))

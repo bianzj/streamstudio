@@ -1,0 +1,140 @@
+{
+  "kind": "stream-bundled-example-reference",
+  "schemaVersion": 1,
+  "referenceDate": "2026-10-31",
+  "referenceRunId": "convergence-current-20261031",
+  "engineSHA256": "b7c504fd9608b74fdfbc48aa11c2a2870656e3ece1a0f7b21b32f42edcc8cfe1",
+  "originalSummarySHA256": "1ceab1bce642ba7837409f3206cd240bb15770fbf8b6789bacac758fa6f9148c",
+  "packagedSummarySHA256": "f94360c68dab950b23c88446cb2a7c6a87d3a04e4876d845267ab3b30f3fe9a1",
+  "metadataChange": "Only ERA5 package path in summary made relative; raster and diagnostic values copied unchanged",
+  "convergence": {
+    "scope": "Native diagnostics at requested overpass only; no independent field validation",
+    "solved": 17241,
+    "converged": 17037,
+    "not_converged": 204,
+    "converged_percent": 98.81677396902732,
+    "stability_converged": 17080,
+    "stability_not_converged": 161,
+    "stability_converged_but_joint_failed": 43,
+    "residual_W_m2": {
+      "all": {
+        "count": 17241,
+        "mean": 1.3431681394577026,
+        "median": 0.28605955839157104,
+        "p95": 0.4833289384841919,
+        "max": 741.5607299804688
+      },
+      "converged": {
+        "count": 17037,
+        "mean": 0.29733219742774963,
+        "median": 0.2839685380458832,
+        "p95": 0.47823822498321533,
+        "max": 4.922580718994141
+      },
+      "not_converged": {
+        "count": 204,
+        "mean": 88.68585205078125,
+        "median": 29.155664443969727,
+        "p95": 558.564697265625,
+        "max": 741.5607299804688
+      }
+    },
+    "nonconverged_by_landclass": {
+      "4": 76,
+      "5": 5,
+      "12": 123
+    },
+    "summary_matches_raster": true,
+    "elevation_correction_applied": false,
+    "water_pixels_not_in_convergence_denominator": 111,
+    "elapsed_seconds": 1.0964464,
+    "crs": "EPSG:4326"
+  },
+  "files": [
+    {
+      "file": "inputs/ahi_vaa.tif",
+      "bytes": 7243,
+      "sha256": "78dd29e9a7d3e3d40b9d8f386e08393b82887d01e91c6373c7ee9f90f1ec4167"
+    },
+    {
+      "file": "inputs/ahi_vza.tif",
+      "bytes": 7799,
+      "sha256": "de16b71adfc8a0168b549322a9a11a1976a2694a04d92d300f6fc5e175de52b0"
+    },
+    {
+      "file": "inputs/dem.tif",
+      "bytes": 57194,
+      "sha256": "303c5ba42aad3a755bca23a19728d6c3a561485c44f093f5d53d570eed8b3987"
+    },
+    {
+      "file": "inputs/inputs-summary.json",
+      "bytes": 721,
+      "sha256": "bb6efc99cc1f9e6ec0611e2b9f4f35b69dfac6b382e3104691bdfb2f6b3e0ec6"
+    },
+    {
+      "file": "inputs/lai.tif",
+      "bytes": 57800,
+      "sha256": "2355cf65ba1238830e4de1e08ed1604047064936e5326a0baade9c618b3a9d1c"
+    },
+    {
+      "file": "inputs/lai_source.tif",
+      "bytes": 2336,
+      "sha256": "0fc5b15cc0114d32c03afbe9447504d323547db3bc129ad9479c6efb118ffeb1"
+    },
+    {
+      "file": "inputs/type.tif",
+      "bytes": 6514,
+      "sha256": "1764ecdad9d75fed05963895c1e92c8c8a094fdf160c8b3ee524ba70b519b73c"
+    },
+    {
+      "file": "era5/era5-pack.json",
+      "bytes": 1617,
+      "sha256": "19e99328c22ed908eca22db934e16dae20a8cbcbb0fd3c5a8c7a804f98f217b5"
+    },
+    {
+      "file": "era5/era5_beijing_20190815.nc",
+      "bytes": 204874,
+      "sha256": "2cbc8638aefb99d9e7c8a05df0b17bb5e26d8e89e65098bcc6891df13d125829"
+    },
+    {
+      "file": "reference/components.json",
+      "bytes": 306,
+      "sha256": "2867c26398b8220d73e4258170c8763a32556c75efa6b9b58f38c16d1a47420a"
+    },
+    {
+      "file": "reference/components.tif",
+      "bytes": 223145,
+      "sha256": "6abc53f98e65815d6d5023c93864211a0aea2fc07e00e1a55d8689868c428076"
+    },
+    {
+      "file": "reference/optical_reflectance.tif",
+      "bytes": 447832,
+      "sha256": "69883ecfcb29989757d3afe3ea946b1634237298b61f8e4766e4da3112829fed"
+    },
+    {
+      "file": "reference/tir_brightness_temperature.tif",
+      "bytes": 107301,
+      "sha256": "535b6024b3cf83d7970bc6d30092c7307a1c3d7342f8729f7be4dbf4a64e5fdd"
+    },
+    {
+      "file": "reference/tir_surface_temperature.tif",
+      "bytes": 98979,
+      "sha256": "e90b9fd2bbdf479abcfc09c8626436424f9054ffe0a83c2a77218df98a284305"
+    },
+    {
+      "file": "reference/convergence_mask.tif",
+      "bytes": 6289,
+      "sha256": "7499a307c389811d103eef94dbb0d7857e0ec25093b3a93e93467c176af7b507"
+    },
+    {
+      "file": "reference/nonconverged_pixels.csv",
+      "bytes": 18135,
+      "sha256": "69157cda36eaed0253fdc4d2d9eb28a42d12852329e6ff578ced725b6587ff62"
+    },
+    {
+      "file": "reference/convergence-verification.json",
+      "bytes": 1185,
+      "sha256": "db0effbf01fb68ae360bd8fd2d47fdcf9efc6878d7c7c90c0c1b28729e94b7b6"
+    }
+  ]
+}

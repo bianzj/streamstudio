@@ -2061,7 +2061,9 @@ function readProject(inputPath) {
 function ensureDefaultSceneAsset(project, baseDir) {
   const items = project?.configuration?.objects?.items
   if (!Array.isArray(items) || !items.length) return false
-  const first = items.find((item) => !String(item.fileName || '').trim())
+  // Parametric vegetation uses shape/dimensions and deliberately has no OBJ.
+  // Opening such a project must not replace its canopy with a default house.
+  const first = items.find((item) => item.type !== 'Vegetation' && !String(item.fileName || '').trim())
   if (!first || !existsSync(defaultSceneAsset)) return false
   first.fileName = DEFAULT_SCENE_MODEL
   const destination = join(baseDir, DEFAULT_SCENE_MODEL)
@@ -2380,7 +2382,10 @@ function listExamples() {
   const catalog = JSON.parse(readFileSync(catalogPath, 'utf8').replace(/^\uFEFF/, ''))
   return (catalog.examples || [])
     .filter((entry) => entry.project && existsSync(resolve(RESOURCE_ROOT, entry.project)))
-    .map(({ id, label, recommendedMode, focus }) => ({ id, label, recommendedMode, focus: focus || [] }))
+    .map(({ id, label, recommendedMode, focus, category, categoryLabel, tier, note }) => ({
+      id, label, recommendedMode, focus: focus || [], category: category || 'other',
+      categoryLabel: categoryLabel || '其他案例', tier: tier || 'featured', note: note || ''
+    }))
 }
 
 function defaultExampleDirectory() {

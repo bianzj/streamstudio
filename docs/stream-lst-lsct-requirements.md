@@ -2,7 +2,7 @@
 
 状态：需求草案（2026-10-27）。反演目标限定为 **LST（Land Surface Temperature，地表温度）** 与 **LSCT（Land Surface Component Temperature，组分温度：Tss/Tsh/Tls/Tlh）**；LAI、土壤水分、发射率、大气等作为输入/先验，不作为本轮反演变量。精度指标为建议目标，需用实际验证数据确认。
 
-落地状态（2026-10-30）：反演算法由 **LS4T**（`C:\work\ls4t`）承担，它的定位就是为 HiStream 与 STREAM 的同化提供 LST/LSCT 产品、角度/时间/空间归一化与降尺度链条；本文的方法已分别写入[模型理论手册第 15 章](theory-manual.md#15-地表温度与组分温度反演)与[模型使用手册 5.3 节](user-manual.md#53-地表温度与组分温度反演lst--lsct)，数据契约与已知缺口见 [lst-lsct-inversion.md](lst-lsct-inversion.md)。Stream Studio 引擎与工作台已内建以 STREAM 正向热红外模型为观测算子的 LST / LSCT 温度反演（`inversion` 配置块、“温度反演”面板，见 lst-lsct-inversion.md 第 6 节）；LAI、土壤水分等参数的联合同化仍属扩展方向。
+落地状态（2026-10-30）：反演算法由 **LS4T**（`C:\work\ls4t`）承担，它的定位就是为 HiStream 与 STREAM 的同化提供 LST/LSCT 产品、角度/时间/空间归一化与降尺度链条；本文的方法已分别写入[模型理论手册第 15 章](theory-manual.md#15-地表温度与组分温度反演)与[模型使用手册 5.3 节](user-manual.md#53-地表温度与组分温度反演lst--lsct)，数据契约与已知缺口见 [lst-lsct-inversion.md](lst-lsct-inversion.md)。Stream Studio 引擎与工作台已内建以 STREAM 正向模型为观测算子的同化（“运行方式”：直接模拟 / 同化亮温、地表温度、组分温度；`assimilation` 配置块；RT 背景更新四组分温度，EB 背景更新土壤水分与 Vcmax，有光学观测时更新 LAI，雅可比由模型内置的对偶数可微算子给出），单独的 LST / LSCT 反演保留为 `inversion` 配置块（见 lst-lsct-inversion.md 第 6 节）。
 
 ## 0. 分工前提
 

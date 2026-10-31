@@ -1,6 +1,6 @@
 # 地表温度与组分温度反演：方法与接口
 
-状态：算法与接口说明（2026-10-30）。本文说明 STREAM / HiStream 体系里的 **LST（地表温度）** 与 **LSCT（地表组分温度）** 反演：算法由 LS4T（`C:\work\ls4t`）承担，STREAM 提供影像级观测算子与像元产品，HiStream 提供三维样本与 OSSE 真值。STREAM 引擎与 Stream Studio 工作台已内建**以 STREAM 正向热红外模型为观测算子**的 LST / LSCT 影像反演（第 6 节，`inversion` 配置块、工作台“温度反演”面板）；卫星级分裂窗与多传感器产品链仍由 LS4T 承担，`tools/stream-inverse/` 是单像元可微原型。本文逐项标注实际状态，不把规划能力写成已有功能。
+状态：算法与接口说明（2026-10-30）。本文说明 STREAM / HiStream 体系里的 **LST（地表温度）** 与 **LSCT（地表组分温度）** 反演：算法由 LS4T（`C:\work\ls4t`）承担，STREAM 提供影像级观测算子与像元产品，HiStream 提供三维样本与 OSSE 真值。STREAM 引擎与 Stream Studio 工作台已内建**以 STREAM 正向模型为观测算子**的同化（第 7 节，`assimilation` 配置块、工作台“运行方式 → 同化”，雅可比由模型内置的可微算子给出）与 LST / LSCT 影像反演（第 6 节，`inversion` 配置块）；卫星级分裂窗与多传感器产品链仍由 LS4T 承担，`tools/stream-inverse/` 是单像元可微原型。本文逐项标注实际状态，不把规划能力写成已有功能。
 
 物理推导与公式见[模型理论手册第 15 章](theory-manual.md#15-地表温度与组分温度反演)；界面与输入输出说明见[模型使用手册 5.3 节](user-manual.md#53-地表温度与组分温度反演lst--lsct)。需求与精度目标见 [stream-lst-lsct-requirements.md](stream-lst-lsct-requirements.md)，可微同化路线见 [stream-differentiable-assimilation](superpowers/plans/2026-10-27-stream-differentiable-assimilation.md)。
 
@@ -116,34 +116,34 @@ J(x) = Σ_j (y_j − h_j(x))² / σ_j² + (x − x_b)ᵀ B⁻¹ (x − x_b)
 
 观测缺省 VZA/VAA 时沿用场景的观测几何；观测值超出 150–400 K（多为单位错误）会被剔除并计数。只启用反演、不启用光学/热红外成像也可运行；LSCT 在 RT 模式下必须提供四组分温度作为背景场。结果摘要写入 `scene_summary.json` 的 `inversion` 字段（方法、观测、成功/失败/云/越界/未收敛计数、平均残差与 DFS、各产品统计）。
 
-**工作台。** 参数面板“温度反演”：选择 不反演 / LST / LSCT；逐个添加观测（亮温栅格或常数、波长、σ、可选独立视角），或“按热红外波段添加”；LSCT 设置背景 σ、组分相关、窗口与迭代次数，LST 设置发射率误差；可选云掩膜。运行按钮变为“运行反演”，结果下拉框列出反演产品，运行摘要显示成功像元、平均残差与平均 DFS。
+**工作台。** 单独的温度反演面板已并入“运行方式 → 同化”（第 7 节）：同化“地表温度”“组分温度”覆盖原 LST / LSCT 面板的用途，`inversion` 块保留为脚本接口，不能与 `assimilation` 同时使用；旧工程打开时转换为同化设置。
 
 **可识别性提示。** 单角度观测只约束组分的加权组合，LSCT 结果主要由背景决定（DFS 接近 1，质量位 8 常见）；多角度观测或窗口才能分离组分。不同波长的亮温几乎不提供组分温度的独立信息。
 
-## 7. 同化接口（扩展方向）
+## 7. 同化（当前实现）
 
-第 6 节只反演温度。LAI、土壤水分等结构/水分参数的联合反演与 EnKF 同化尚未实现，`models/stream/PORTING.md` 把 EnKF 列为未移植项。规划的扩展接口如下：
+工作台“运行方式”分为**直接模拟**与**同化**；同化给定观测数据并选择其类型（亮温 / 地表温度 / 组分温度）即可运行，其余参数为内置默认值。代码：`models/stream/app/assimilation.cpp`（分析）、`physics/dual.h`（对偶数前向自动微分）、模板化的物理核（`physics/canopy`、`radiosity`、`shortwave`、`energy`、`heat_conduction`、`soil_emissivity`、`brightness`）、`app/thermal_view.cpp`（与成像共用的 `thermalPixel` 观测算子）、`app/image.cpp`（EB 单像元重解与隐式微分）。
 
 ```jsonc
-"inverse": {
-  "enabled": true,
-  "method": "gauss-newton",          // 或 "lbfgs" / "enkf"
-  "control": ["lai", "soilMoisture", "temperature"],
-  "observations": {
-    "optical": { "file": "obs_reflectance.tif", "bands": ["B4", "B5"] },
-    "thermal": { "file": "obs_bt.tif", "bands": ["B10", "B11"] }
-  },
-  "prior": { "lai": { "mean": 3.0, "sd": 1.0 }, "soilMoisture": { "mean": 0.25, "sd": 0.08 } },
-  "maxIterations": 20,
-  "outputUncertainty": true
+"assimilation": {
+  "observation": "brightness",              // "brightness" | "lst" | "components"
+  "data": "obs_bt.tif",                     // 亮温：波段数 = 热红外波段数；LST：1 波段；组分：4 波段
+  "optical": "obs_reflectance.tif",         // 可选，波段数 = 光学波段数；给出时更新 LAI
+  "views": [{ "data": "obs_bt_55.tif", "vza": { "value": 55 }, "vaa": { "value": 90 } }]   // 仅亮温
 }
 ```
 
-该块尚未被 `stream-image-config` 接受，属于规划接口。观测算子、代价函数与不确定性的公式见理论手册 15.6 节。
+| 背景 | 控制变量 | 雅可比 |
+|---|---|---|
+| RT | Tss/Tsh/Tcs/Tch（+ LAI） | 对偶数前向自动微分贯通四组分权重、hom3、土壤发射率、Planck、冠层反射率 |
+| EB | 土壤水分、Vcmax（+ LAI） | 同上，组分温度对控制变量的导数由过境时刻能量平衡收敛点隐式微分 dT/dx = −(∂R/∂T)⁻¹∂R/∂x 给出 |
 
+发射率不是控制变量。默认值：σ_o 亮温 0.5 K、LST 1.0 K、组分 2.0 K、反射率 0.02；σ_b 组分温度 5 K（相关 0.5）、土壤水分 0.10、Vcmax 30%、LAI 30%；RT 20 次、EB 10 次 Gauss–Newton 迭代。输出 `analysis_components.tif`、`background_components.tif`、`analysis_uncertainty.tif`、`analysis_qa.tif`（质量位、O−B、O−A、O−A RMS、DFS、观测数、迭代），EB 或有光学时加 `analysis_controls.tif`、`background_controls.tif`，EB 加 `analysis_fluxes.tif`；同次 `optical_*`/`tir_*` 为分析场的正向图像。摘要写入 `scene_summary.json` 的 `assimilation` 字段。公式见理论手册 15.6 节。
+
+尚未实现：EnKF / 时间序列 4D-Var、跨像元的空间背景相关、过境前土壤热历史的导数（求导时冻结）。
 ## 8. 实现边界与已知缺口
 
-1. **内建反演只到温度**：`inversion` 块反演 LST/LSCT，不反演 LAI、土壤水分、发射率；`inverse` 联合同化块不被引擎接受；
+1. **同化范围**：`assimilation` 更新组分温度（RT）或土壤水分 + Vcmax（EB），有光学观测时更新 LAI；不更新发射率；没有 EnKF / 时间序列同化；`inversion` 块只反演 LST/LSCT；
 2. **不确定度**：STREAM 内建反演给出 LST 1σ 与 LSCT 后验标准差；LS4T 的 L2LST `uncertainty` 仍是调用者给定的常数，LS4T 的 LSCT 求解器没有后验标准差字段；
 3. **大气**：STREAM 是冠层顶结果，不做大气校正；内建反演的亮温观测须先做大气校正，否则大气误差会被吸进地表温度；
 4. **发射率**：只有分裂窗路径用的混合有效发射率，没有多通道温度—发射率分离（TES）实现；ASTER 模块不含 TES；
@@ -152,7 +152,7 @@ J(x) = Σ_j (y_j − h_j(x))² / σ_j² + (x − x_b)ᵀ B⁻¹ (x − x_b)
 7. **优化器状态未检查**：部分历史窗口函数不检查 `success/status`，不收敛结果可能与收敛结果同样入库；
 8. **传感器系数**：分裂窗系数按传感器与大气条件标定，跨场景泛化没有独立地面验证证据；MODIS 入口不等同官方 MODIS LST 算法；
 9. **双实现漂移**：`tools/stream-inverse/` 与 `models/stream/physics/` 的常数、分支和默认值必须保持一致，改动需同步；
-10. **内建反演的几何与窗口**：地形坡面模式下观测权重按水平地表计算；窗口只按地类筛选邻域，不检查空间相似性或最少有效像元比例；分裂窗不在 STREAM 内实现（STREAM 用物理观测算子直接拟合，分裂窗系数路线由 LS4T 承担）。
+10. **内建反演的几何与窗口**：`inversion` 块在地形坡面模式下观测权重按水平地表计算（`assimilation` 已与成像共用地形处理）；窗口只按地类筛选邻域，不检查空间相似性或最少有效像元比例；分裂窗不在 STREAM 内实现（STREAM 用物理观测算子直接拟合，分裂窗系数路线由 LS4T 承担）。
 
 ## 9. 验证要求
 

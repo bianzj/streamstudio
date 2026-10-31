@@ -1,4 +1,6 @@
 #pragma once
+#include "dual.h"
+
 #include <utility>
 #include <vector>
 
@@ -45,5 +47,20 @@ double admissibleDiffuseFraction(double globalShortwave, double szaDeg, int dayO
 ShortwaveAbsorption absorbShortwave(const SolarBins& sun, const OpticalSpectra& spectra, double lai,
                                     double globalShortwave, double szaDeg, int dayOfYear, double requestedFraction,
                                     bool enforceLimit, bool sunlit);
+
+// Component absorption at a fixed diffuse fraction on any scalar type (double or Ad). absorbShortwave uses the
+// double instance; the assimilation differentiates it with respect to LAI and the per-bin soil reflectance.
+template <class T>
+struct ShortwaveComponentsT {
+    T soilDirect{}, leafDirect{}, soilDiffuseSun{}, soilDiffuseShade{}, leafDiffuseSun{}, leafDiffuseShade{};
+    T soilMean{}, leafMean{}, parLeafDirect{}, parLeafDiffuse{}, parLeafDiffuseSun{}, parLeafDiffuseShade{};
+    T soilSunlitFraction{}, laiSunlit{}, absorbed{}, incident{};
+};
+// soil: per-bin reflectance (std::vector<float> or std::vector<Ad>).
+template <class T, class SoilSpectrum>
+ShortwaveComponentsT<T> shortwaveComponents(const SolarBins& sun, const std::vector<float>& leafReflectance,
+                                            const std::vector<float>& leafTransmittance, const SoilSpectrum& soil,
+                                            const T& lai, double globalShortwave, double diffuseFraction,
+                                            double szaDeg, bool sunlit);
 
 }  // namespace stream

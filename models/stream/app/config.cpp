@@ -168,8 +168,43 @@ ImageConfig readImageConfig(const std::string& path)
         if (inv.window < 1 || inv.window > 9 || inv.window % 2 == 0) throw std::runtime_error("反演窗口须为 1–9 的奇数");
         if (inv.maxIterations < 1 || inv.maxIterations > 100) throw std::runtime_error("反演迭代次数须在 1–100");
     }
-    if (!config.opticalEnabled && !config.thermalEnabled && !config.inversion.enabled())
-        throw std::runtime_error("请至少启用光学、热红外模拟或反演");
+    const auto assimilation = root.GetObj("assimilation");
+    if (assimilation.IsValid() && assimilation.GetType() == CPLJSONObject::Type::Object) {
+        auto& as = config.assimilation;
+        const auto observation = assimilation.GetString("observation", "none");
+        if (observation == "brightness") as.observation = AssimilationObservation::Brightness;
+        else if (observation == "lst") as.observation = AssimilationObservation::Lst;
+        else if (observation == "components") as.observation = AssimilationObservation::Components;
+        else if (observation != "none") throw std::runtime_error("assimilation.observation 须为 brightness、lst、components 或 none");
+        if (as.enabled()) {
+            as.data = assimilation.GetString("data", "");
+            if (as.data.empty()) throw std::runtime_error("同化需要观测数据文件");
+            as.optical = assimilation.GetString("optical", "");
+            const auto views = assimilation.GetArray("views");
+            if (views.IsValid()) {
+                if (views.Size() > 16) throw std::runtime_error("同化的附加观测视角不能超过 16 个");
+                if (views.Size() > 0 && as.observation != AssimilationObservation::Brightness)
+                    throw std::runtime_error("附加观测视角只用于同化亮温");
+                for (int index = 0; index < views.Size(); ++index) {
+                    const auto item = views[index];
+                    AssimilationView view;
+                    view.data = item.GetString("data", "");
+                    view.vza = readField(item, "vza");
+                    view.vaa = readField(item, "vaa");
+                    if (view.data.empty() || !view.vza.present() || !view.vaa.present())
+                        throw std::runtime_error("附加观测视角 " + std::to_string(index + 1) + " 需要亮温文件与 VZA/VAA");
+                    as.views.push_back(view);
+                }
+            }
+            if (as.observation == AssimilationObservation::Brightness && !config.thermalEnabled)
+                throw std::runtime_error("同化亮温需要启用热红外波段（观测文件每个波段对应一个热红外波段）");
+            if (!as.optical.empty() && !config.opticalEnabled)
+                throw std::runtime_error("光学反射率观测需要启用光学波段（文件每个波段对应一个光学波段）");
+            if (config.inversion.enabled()) throw std::runtime_error("同化与单独的温度反演（inversion）不能同时使用");
+        }
+    }
+    if (!config.opticalEnabled && !config.thermalEnabled && !config.inversion.enabled() && !config.assimilation.enabled())
+        throw std::runtime_error("请至少启用光学、热红外模拟、反演或同化");
 
     const auto temperature = root.GetObj("temperature");
     const auto mode = temperature.GetString("mode", "rt");

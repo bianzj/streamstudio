@@ -19,9 +19,9 @@ const THERMAL_PRESETS = {
   slstr: { label: 'Sentinel-3 SLSTR S8/S9', bands: [['S8', 10.85, 0.9], ['S9', 12.0, 1.0]] },
   broadband: { label: '单波段 10.5 μm', bands: [['TIR', 10.5, 0]] }
 }
-const INVERSION_TARGETS = { none: '不反演', lst: 'LST 地表温度', lsct: 'LSCT 组分温度' }
-const OBSERVATION_KINDS = { brightness: '亮温', lst: 'LST 产品' }
-// "file path or constant" text inputs of the inversion panel.
+const RUN_MODES = { simulate: '直接模拟', assimilate: '同化' }
+const ASSIMILATION_OBSERVATIONS = { brightness: '亮温', lst: '地表温度', components: '组分温度' }
+// "file path or constant" text inputs of the run-mode panel.
 const parseSource = (text) => {
   const value = String(text ?? '').trim()
   if (!value) return {}
@@ -47,7 +47,14 @@ const PRODUCTS = {
   'lsct.tif': { label: '反演 · 组分温度 LSCT', kind: 'thermal', unit: 'K', digits: 2, colormap: 'inferno' },
   'lsct_uncertainty.tif': { label: '反演 · LSCT 不确定度 1σ', kind: 'sigma', unit: 'K', digits: 3, colormap: 'viridis' },
   'lsct_qa.tif': { label: '反演 · LSCT 质量、残差与 DFS', kind: 'qa', unit: '', digits: 3, colormap: 'viridis' },
-  'lsct_fractions.tif': { label: '反演 · 组分辐射占比', kind: 'fraction', unit: '', digits: 3, colormap: 'viridis' }
+  'lsct_fractions.tif': { label: '反演 · 组分辐射占比', kind: 'fraction', unit: '', digits: 3, colormap: 'viridis' },
+  'analysis_components.tif': { label: '同化 · 分析组分温度', kind: 'thermal', unit: 'K', digits: 2, colormap: 'inferno' },
+  'background_components.tif': { label: '同化 · 背景组分温度', kind: 'thermal', unit: 'K', digits: 2, colormap: 'inferno' },
+  'analysis_uncertainty.tif': { label: '同化 · 分析不确定度 1σ', kind: 'sigma', unit: '', digits: 3, colormap: 'viridis' },
+  'analysis_qa.tif': { label: '同化 · 质量、O−B/O−A 与 DFS', kind: 'qa', unit: '', digits: 3, colormap: 'viridis' },
+  'analysis_controls.tif': { label: '同化 · 分析控制变量（土壤水分/Vcmax/LAI）', kind: 'forcing', unit: '', digits: 3, colormap: 'viridis' },
+  'background_controls.tif': { label: '同化 · 背景控制变量', kind: 'forcing', unit: '', digits: 3, colormap: 'viridis' },
+  'analysis_fluxes.tif': { label: '同化 · 分析能量通量', kind: 'flux', unit: 'W m⁻²', digits: 1, colormap: 'rdylbu' }
 }
 const BAND_LABELS = [
   [/^Tss sunlit soil temperature \(K\)$/, '光照土壤 Tss'], [/^Tsh shaded soil temperature \(K\)$/, '阴影土壤 Tsh'],
@@ -65,7 +72,15 @@ const BAND_LABELS = [
   [/^LST \(K\)$/, 'LST'], [/^LST uncertainty/, 'LST 1σ K'], [/^quality flags$/, '质量标记（位）'], [/^residual RMS/, '残差 RMS K'],
   [/^observations used$/, '参与观测数'], [/^effective emissivity$/, '有效发射率'], [/^degrees of freedom for signal$/, '信号自由度 DFS'],
   [/^Tss uncertainty/, 'Tss 1σ K'], [/^Tsh uncertainty/, 'Tsh 1σ K'], [/^Tcs uncertainty/, 'Tcs 1σ K'], [/^Tch uncertainty/, 'Tch 1σ K'],
-  [/^Tss radiance share$/, 'Tss 辐射占比'], [/^Tsh radiance share$/, 'Tsh 辐射占比'], [/^Tcs radiance share$/, 'Tcs 辐射占比'], [/^Tch radiance share$/, 'Tch 辐射占比']
+  [/^Tss radiance share$/, 'Tss 辐射占比'], [/^Tsh radiance share$/, 'Tsh 辐射占比'], [/^Tcs radiance share$/, 'Tcs 辐射占比'], [/^Tch radiance share$/, 'Tch 辐射占比'],
+  [/^analysis Tss/, '分析 Tss'], [/^analysis Tsh/, '分析 Tsh'], [/^analysis Tcs/, '分析 Tcs'], [/^analysis Tch/, '分析 Tch'],
+  [/^background Tss/, '背景 Tss'], [/^background Tsh/, '背景 Tsh'], [/^background Tcs/, '背景 Tcs'], [/^background Tch/, '背景 Tch'],
+  [/^Tss analysis 1-sigma/, 'Tss 1σ K'], [/^Tsh analysis 1-sigma/, 'Tsh 1σ K'], [/^Tcs analysis 1-sigma/, 'Tcs 1σ K'], [/^Tch analysis 1-sigma/, 'Tch 1σ K'],
+  [/^soil moisture analysis 1-sigma/, '土壤水分 1σ'], [/^Vcmax25 analysis 1-sigma/, 'Vcmax 1σ'], [/^LAI analysis 1-sigma/, 'LAI 1σ'],
+  [/^QA flags$/, '质量标记（位）'], [/^mean O-B thermal/, 'O−B 均值 K'], [/^mean O-A thermal/, 'O−A 均值 K'], [/^RMS O-A thermal/, 'O−A RMS K'],
+  [/^analysis soil moisture/, '分析土壤水分'], [/^analysis Vcmax25/, '分析 Vcmax'], [/^analysis LAI$/, '分析 LAI'],
+  [/^background soil moisture/, '背景土壤水分'], [/^background Vcmax25/, '背景 Vcmax'], [/^background LAI$/, '背景 LAI'],
+  [/^analysis net radiation/, '分析净辐射 Rn'], [/^analysis sensible heat/, '分析显热 H'], [/^analysis latent heat/, '分析潜热 LE'], [/^analysis ground heat/, '分析土壤热通量 G']
 ]
 const COMPOSITES = [
   { key: 'true', label: '真彩色', targets: [655, 560, 482] },
@@ -160,7 +175,7 @@ function defaults() {
   const today = new Date().toISOString().slice(0, 10)
   return {
     name: 'image01', outputRoot: '', overpass: `${today}T03:00:00Z`, displayTimezone: 8, threads: 0,
-    inversion: defaultInversion(),
+    assimilation: defaultAssimilation(),
     surface: { type: {}, lai: {}, soilMoisture: {}, dem: {}, latitude: {}, longitude: {} },
     locationSource: 'georef',
     view: { vza: { value: 0 }, vaa: { value: 0 } },
@@ -192,13 +207,13 @@ function normalizeScene(saved) {
   for (const field of ALL_FIELDS) setPath(form, field.path, normalizeField(getPath(form, field.path), field.mode))
   form.optical.bands = (form.optical.bands || []).map((band) => ({ ...band }))
   form.thermal.bands = (form.thermal.bands || []).map((band) => ({ ...band }))
-  form.inversion = normalizeInversion(scene.inversion, scene.assimilation)
-  delete form.assimilation
+  form.assimilation = normalizeAssimilation(scene.assimilation, scene.inversion)
+  delete form.inversion
   return form
 }
 
-function defaultInversion() {
-  return { target: 'none', observations: [], prior: { sd: 5, correlation: 0 }, emissivitySd: 0.01, window: 1, maxIterations: 20, mask: {} }
+function defaultAssimilation() {
+  return { mode: 'simulate', observation: 'brightness', data: '', optical: '', views: [] }
 }
 
 const sourceObject = (value) => {
@@ -207,24 +222,25 @@ const sourceObject = (value) => {
   return value.value !== undefined && value.value !== null && String(value.value).trim() !== '' && Number.isFinite(Number(value.value)) ? { value: Number(value.value) } : {}
 }
 
-// Earlier versions only stored a "targets + observations" selection; a TIR-constrained LST/LSCT selection becomes the target.
-function normalizeInversion(saved, legacy) {
-  const base = defaultInversion()
-  const source = saved && typeof saved === 'object' ? saved : {}
-  let target = Object.hasOwn(INVERSION_TARGETS, source.target) ? source.target : 'none'
-  if (!saved && legacy?.observations?.includes?.('tir')) target = legacy.targets?.includes?.('lsct') ? 'lsct' : legacy.targets?.includes?.('lst') ? 'lst' : 'none'
-  const number = (value, fallback) => value === '' || value === null || value === undefined || !Number.isFinite(Number(value)) ? fallback : Number(value)
-  return {
-    target,
-    observations: (Array.isArray(source.observations) ? source.observations : []).slice(0, 32).map((item, index) => ({
-      name: String(item?.name || `obs${index + 1}`), kind: item?.kind === 'lst' ? 'lst' : 'brightness',
-      value: sourceObject(item?.value), wavelength: number(item?.wavelength, 10.5), sigma: number(item?.sigma, 0.5),
-      vza: sourceObject(item?.vza), vaa: sourceObject(item?.vaa)
-    })),
-    prior: { sd: number(source.prior?.sd, base.prior.sd), correlation: number(source.prior?.correlation, base.prior.correlation) },
-    emissivitySd: number(source.emissivitySd, base.emissivitySd), window: number(source.window, base.window),
-    maxIterations: number(source.maxIterations, base.maxIterations), mask: sourceObject(source.mask)
+// Earlier versions had a separate LST/LSCT "温度反演" panel; a saved retrieval with one observation file becomes an
+// assimilation of that file (LST product -> 地表温度, brightness -> 亮温). Everything else starts as 直接模拟.
+function normalizeAssimilation(saved, legacyInversion) {
+  const base = defaultAssimilation()
+  if (saved && typeof saved === 'object' && (saved.mode === 'simulate' || saved.mode === 'assimilate')) {
+    return {
+      mode: saved.mode,
+      observation: Object.hasOwn(ASSIMILATION_OBSERVATIONS, saved.observation) ? saved.observation : base.observation,
+      data: String(saved.data || '').trim(), optical: String(saved.optical || '').trim(),
+      views: (Array.isArray(saved.views) ? saved.views : []).slice(0, 16).map((item) => ({
+        data: String(item?.data || '').trim(), vza: sourceObject(item?.vza), vaa: sourceObject(item?.vaa)
+      }))
+    }
   }
+  const legacy = legacyInversion && typeof legacyInversion === 'object' ? legacyInversion : null
+  const first = Array.isArray(legacy?.observations) ? legacy.observations.find((item) => item?.value?.file) : null
+  if (legacy && ['lst', 'lsct'].includes(legacy.target) && first)
+    return { ...base, mode: 'assimilate', observation: first.kind === 'lst' ? 'lst' : 'brightness', data: String(first.value.file) }
+  return base
 }
 
 function exportField(field) {
@@ -501,151 +517,133 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     </section>`
   }
 
-  // ---------- inversion (LST / LSCT) ----------
-  function observationCard(item, index) {
-    const text = (name, value, placeholder, title = '') => `<input class="input" data-obs-field="${name}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" spellcheck="false"${title ? ` title="${escapeHtml(title)}"` : ''}>`
-    return `<div class="sw-obs" data-obs="${index}">
-      <div class="sw-obs-head">
-        <input class="input" data-obs-field="name" value="${escapeHtml(item.name)}" maxlength="40" title="观测名称">
-        <select class="select" data-obs-field="kind">${Object.entries(OBSERVATION_KINDS).map(([key, label]) => `<option value="${key}"${item.kind === key ? ' selected' : ''}>${label}</option>`).join('')}</select>
-        <button class="icon-button" type="button" data-remove-obs title="删除观测">×</button>
-      </div>
-      <div class="sw-path">${text('value', sourceText(item.value), '亮温 GeoTIFF 路径或常数（K）')}<button class="icon-button" type="button" data-obs-browse="value" title="选择文件"><svg><use href="#i-folder"/></svg></button></div>
+  // ---------- run mode: 直接模拟 / 同化 ----------
+  // Only the data and what they are is asked for; observation / background errors, iteration and the controls
+  // (RT: four component temperatures, EB: soil moisture + Vcmax, + LAI with reflectances) are engine defaults.
+  function viewCard(item, index) {
+    const text = (name, value, placeholder) => `<input class="input" data-view-field="${name}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" spellcheck="false">`
+    return `<div class="sw-obs" data-view="${index}">
+      <div class="sw-obs-head"><span class="sw-obs-title">附加视角 ${index + 1}</span><button class="icon-button" type="button" data-remove-view title="删除视角">×</button></div>
+      <div class="sw-path">${text('data', item.data || '', '该视角亮温 GeoTIFF（波段同热红外波段）')}<button class="icon-button" type="button" data-view-browse title="选择文件"><svg><use href="#i-folder"/></svg></button></div>
       <div class="sw-row-4">
-        <label><span>波长 μm</span><input class="input" data-obs-field="wavelength" data-number type="number" min="3" max="20" step="any" value="${escapeHtml(item.wavelength)}"></label>
-        <label><span>误差 σ K</span><input class="input" data-obs-field="sigma" data-number type="number" min="0.01" max="10" step="any" value="${escapeHtml(item.sigma)}"></label>
-        <label><span>天顶角</span>${text('vza', sourceText(item.vza), '同场景', '留空沿用“观测几何”；可填常数（°）或栅格路径')}</label>
-        <label><span>方位角</span>${text('vaa', sourceText(item.vaa), '同场景', '留空沿用“观测几何”；可填常数（°）或栅格路径')}</label>
+        <label><span>天顶角</span>${text('vza', sourceText(item.vza), '常数（°）或栅格')}</label>
+        <label><span>方位角</span>${text('vaa', sourceText(item.vaa), '常数（°）或栅格')}</label>
       </div>
     </div>`
   }
 
-  function inversionGroup() {
-    const inv = form.inversion
-    const segment = (value, label) => `<button type="button" data-inversion-target="${value}"${inv.target === value ? ' class="active"' : ''}>${label}</button>`
-    const number = (path, label, attrs) => `<label><span>${label}</span><input class="input" data-inv="${path}" data-number type="number" ${attrs} value="${escapeHtml(getPath(inv, path))}"></label>`
-    return group('inversion', '温度反演', `
-      <div class="segmented sw-block-seg sw-seg-3">${Object.entries(INVERSION_TARGETS).map(([key, label]) => segment(key, label)).join('')}</div>
-      <div id="swInvBody"${inv.target === 'none' ? ' hidden' : ''}>
-        <div class="sw-obs-list" id="swObservations">${inv.observations.map(observationCard).join('')}</div>
-        <div class="sw-obs-actions">
-          <button class="button ghost sw-add" type="button" data-add-obs><svg><use href="#i-plus"/></svg>添加观测</button>
-          <button class="button ghost sw-add" type="button" data-obs-from-thermal title="按“热红外波段”表的波段名与中心波长各建一个观测">按热红外波段添加</button>
+  function assimilationGroup() {
+    const as = form.assimilation
+    const modeButton = (value, label) => `<button type="button" data-run-mode="${value}"${as.mode === value ? ' class="active"' : ''}>${label}</button>`
+    const kindButton = (value, label) => `<button type="button" data-assim-observation="${value}"${as.observation === value ? ' class="active"' : ''}>${label}</button>`
+    const path = (key, placeholder) => `<div class="sw-path"><input class="input" data-assim="${key}" value="${escapeHtml(as[key] || '')}" placeholder="${escapeHtml(placeholder)}" spellcheck="false"><button class="icon-button" type="button" data-assim-browse="${key}" title="选择文件"><svg><use href="#i-folder"/></svg></button></div>`
+    return group('assimilation', '运行方式', `
+      <div class="segmented sw-block-seg">${Object.entries(RUN_MODES).map(([key, label]) => modeButton(key, label)).join('')}</div>
+      <div id="swAssimBody"${as.mode === 'assimilate' ? '' : ' hidden'}>
+        <div class="segmented sw-block-seg sw-seg-3">${Object.entries(ASSIMILATION_OBSERVATIONS).map(([key, label]) => kindButton(key, label)).join('')}</div>
+        <label class="sw-row"><span>观测数据</span>${path('data', '')}</label>
+        <label class="sw-row"><span>光学反射率</span>${path('optical', '可选；给出时同时更新 LAI')}</label>
+        <div id="swAssimViews"${as.observation === 'brightness' ? '' : ' hidden'}>
+          <div class="sw-obs-list" id="swViewList">${as.views.map(viewCard).join('')}</div>
+          <div class="sw-obs-actions"><button class="button ghost sw-add" type="button" data-add-view><svg><use href="#i-plus"/></svg>添加其他视角</button></div>
         </div>
-        <div class="sw-row-4" id="swInvLsct"${inv.target === 'lsct' ? '' : ' hidden'}>
-          ${number('prior.sd', '背景 σ K', 'min="0.1" max="100" step="any"')}
-          ${number('prior.correlation', '组分相关', 'min="0" max="0.95" step="0.05"')}
-          ${number('window', '窗口', 'min="1" max="9" step="2"')}
-          ${number('maxIterations', '迭代', 'min="1" max="100" step="1"')}
-        </div>
-        <div class="sw-row-4" id="swInvLst"${inv.target === 'lst' ? '' : ' hidden'}>
-          ${number('emissivitySd', '发射率误差', 'min="0" max="0.1" step="0.001"')}
-          ${number('maxIterations', '迭代', 'min="1" max="100" step="1"')}
-        </div>
-        <label class="sw-row"><span>云掩膜</span><div class="sw-path"><input class="input" data-inv="mask" value="${escapeHtml(inv.mask?.file || '')}" placeholder="可选；非 0 像元不参与反演" spellcheck="false"><button class="icon-button" type="button" data-inv-browse="mask" title="选择文件"><svg><use href="#i-folder"/></svg></button></div></label>
-        <p class="sw-hint" id="swInvHint"></p>
+        <p class="sw-hint" id="swAssimHint"></p>
       </div>
-      <p class="sw-hint" id="swInvSummary"></p>`)
+      <p class="sw-hint" id="swAssimSummary"></p>`)
   }
 
-  function rerenderObservations() {
-    const list = $('#swObservations')
-    if (list) list.innerHTML = form.inversion.observations.map(observationCard).join('')
+  function rerenderViews() {
+    const list = $('#swViewList')
+    if (list) list.innerHTML = form.assimilation.views.map(viewCard).join('')
   }
 
-  function syncInversionUI() {
-    const summary = $('#swInvSummary')
+  const assimilating = () => form.assimilation.mode === 'assimilate'
+
+  function syncAssimilationUI() {
+    const summary = $('#swAssimSummary')
     const button = $('#swRun')
     const label = $('#swRunLabel')
     if (!summary || !button || !label) return
-    const inv = form.inversion
-    const background = form.temperature.mode === 'eb' ? 'EB 能量平衡解' : 'RT 给定的四组分温度'
-    $('#swInvBody').hidden = inv.target === 'none'
-    $('#swInvLsct').hidden = inv.target !== 'lsct'
-    $('#swInvLst').hidden = inv.target !== 'lst'
-    const hint = $('#swInvHint')
-    if (inv.target === 'lst') {
-      summary.textContent = `LST：每个像元求一个辐射温度（四组分同温），用 ${inv.observations.length} 个观测按 1/σ² 加权的 Gauss–Newton 拟合；输出 lst.tif、lst_uncertainty.tif、lst_qa.tif。`
-      hint.textContent = '观测模型与正向成像相同（TiRT 四组分权重 + hom3 多次散射 + 土壤方向发射率），冠层顶、无大气：亮温须先做大气校正。“LST 产品”类型按地类固定发射率归一。'
-    } else if (inv.target === 'lsct') {
-      summary.textContent = `LSCT：以${background}为背景场，MAP Gauss–Newton 求 Tss/Tsh/Tcs/Tch；输出 lsct.tif、不确定度、QA（残差、DFS）、组分辐射占比；后验组分温度同时用于本次热红外成像。`
-      hint.textContent = '单角度观测只能约束组分的加权组合，结果主要由背景场决定（DFS 接近 1）；多角度或窗口（3×3、5×5 同地类像元共享组分温度）才能分离组分。QA 位：0 输入无效、1 云、2 越界、3 失败、4 病态、8 信息量不足、9 未收敛。'
-    } else summary.textContent = '不反演：使用温度来源直接正向模拟。'
-    label.textContent = inv.target === 'none' ? '运行模拟' : '运行反演'
+    const as = form.assimilation
+    const eb = form.temperature.mode === 'eb'
+    const on = assimilating()
+    $('#swAssimBody').hidden = !on
+    $('#swAssimViews').hidden = as.observation !== 'brightness'
+    for (const item of root.querySelectorAll('[data-run-mode]')) item.classList.toggle('active', item.dataset.runMode === as.mode)
+    for (const item of root.querySelectorAll('[data-assim-observation]')) item.classList.toggle('active', item.dataset.assimObservation === as.observation)
+    const dataInput = $('[data-assim="data"]')
+    if (dataInput) dataInput.placeholder = as.observation === 'brightness'
+      ? `亮温 GeoTIFF，${form.thermal.bands.length || 'N'} 个波段，依次对应热红外波段`
+      : as.observation === 'lst' ? '地表温度 GeoTIFF，1 个波段（K）' : '组分温度 GeoTIFF，4 个波段 Tss/Tsh/Tcs/Tch（K）'
+    const hint = $('#swAssimHint')
+    if (on) {
+      const controls = eb ? '土壤水分与 Vcmax（组分温度由能量平衡给出）' : '四组分温度 Tss/Tsh/Tcs/Tch'
+      summary.textContent = `同化${ASSIMILATION_OBSERVATIONS[as.observation]}：以${eb ? 'EB 能量平衡' : 'RT 给定组分温度'}为背景，更新${controls}${as.optical ? ' 与 LAI' : ''}；输出 analysis_* 与 background_*，模拟影像按分析场生成。`
+      hint.textContent = '观测为 NaN 的像元视为缺测。观测误差、背景误差与迭代参数使用内置默认值；雅可比由模型内置的可微算子精确给出。'
+    } else summary.textContent = '直接模拟：按温度来源正向生成光学与热红外影像。'
+    const temperatureTitle = root.querySelector('[data-group="temperature"] .sw-group-toggle')
+    if (temperatureTitle) temperatureTitle.lastChild.textContent = on ? '背景场' : '温度来源'
+    label.textContent = on ? '运行同化' : '运行模拟'
     button.title = 'F5'
     button.disabled = running || !(status?.executableExists && status?.dataReady)
-    const element = $('[data-summary="inversion"]')
-    if (element) element.textContent = inv.target === 'none' ? '未启用' : `${inv.target.toUpperCase()} · ${inv.observations.length} 个观测`
+    const element = $('[data-summary="assimilation"]')
+    if (element) element.textContent = on ? `同化 · ${ASSIMILATION_OBSERVATIONS[as.observation]}` : '直接模拟'
   }
 
-  function thermalObservations() {
-    const existing = new Set(form.inversion.observations.map((item) => item.name))
-    const added = form.thermal.bands.filter((band) => !existing.has(band.name)).map((band) => ({
-      name: band.name, kind: 'brightness', value: {}, wavelength: Number(band.center) || 10.5, sigma: 0.5, vza: {}, vaa: {}
-    }))
-    form.inversion.observations.push(...added.slice(0, 32 - form.inversion.observations.length))
-    return added.length
-  }
-
-  // Returns true when the event belonged to the inversion panel.
-  function onInversionInput(event) {
+  // Returns true when the event belonged to the run-mode panel.
+  function onAssimilationInput(event) {
     const target = event.target
-    if (target.dataset.inv) {
-      const key = target.dataset.inv
-      if (key === 'mask') form.inversion.mask = target.value.trim() ? { file: target.value.trim() } : {}
-      else setPath(form.inversion, key, target.value === '' ? '' : Number(target.value))
+    if (target.dataset.assim) {
+      form.assimilation[target.dataset.assim] = target.value.trim()
       markDirty()
+      syncAssimilationUI()
       return true
     }
-    const card = target.closest('[data-obs]')
-    if (!card || !target.dataset.obsField) return false
-    const item = form.inversion.observations[Number(card.dataset.obs)]
-    const field = target.dataset.obsField
-    if (['value', 'vza', 'vaa'].includes(field)) item[field] = parseSource(target.value)
-    else if (field === 'wavelength' || field === 'sigma') item[field] = target.value === '' ? '' : Number(target.value)
-    else item[field] = target.value
+    const card = target.closest('[data-view]')
+    if (!card || !target.dataset.viewField) return false
+    const item = form.assimilation.views[Number(card.dataset.view)]
+    const field = target.dataset.viewField
+    item[field] = field === 'data' ? target.value.trim() : parseSource(target.value)
     markDirty()
-    syncInversionUI()
     return true
   }
 
-  async function onInversionClick(button) {
-    if (button.dataset.inversionTarget) {
-      form.inversion.target = button.dataset.inversionTarget
-      for (const item of root.querySelectorAll('[data-inversion-target]')) item.classList.toggle('active', item === button)
-      if (form.inversion.target !== 'none' && !form.inversion.observations.length && form.thermal.bands.length) {
-        thermalObservations()
-        rerenderObservations()
-      }
+  async function onAssimilationClick(button) {
+    if (button.dataset.runMode) {
+      form.assimilation.mode = button.dataset.runMode
+      // Brightness assimilation reads one band per thermal band, so the thermal bands must be active.
+      if (assimilating() && form.assimilation.observation === 'brightness' && !form.thermal.enabled) enableThermal()
       markDirty()
-      syncInversionUI()
+      syncAssimilationUI()
       return true
     }
-    if (button.hasAttribute('data-add-obs') || button.hasAttribute('data-obs-from-thermal')) {
-      if (form.inversion.observations.length >= 32) { toast('观测过多', '反演观测不能超过 32 个', 'error'); return true }
-      if (button.hasAttribute('data-add-obs')) {
-        const index = form.inversion.observations.length + 1
-        form.inversion.observations.push({ name: `obs${index}`, kind: 'brightness', value: {}, wavelength: 10.5, sigma: 0.5, vza: {}, vaa: {} })
-      } else if (!thermalObservations()) { toast('没有新的热红外波段', '热红外波段表中的波段都已添加为观测', 'error'); return true }
-      rerenderObservations()
+    if (button.dataset.assimObservation) {
+      form.assimilation.observation = button.dataset.assimObservation
+      if (form.assimilation.observation === 'brightness' && !form.thermal.enabled) enableThermal()
       markDirty()
-      syncInversionUI()
+      syncAssimilationUI()
       return true
     }
-    if (button.hasAttribute('data-remove-obs')) {
-      form.inversion.observations.splice(Number(button.closest('[data-obs]').dataset.obs), 1)
-      rerenderObservations()
+    if (button.hasAttribute('data-add-view')) {
+      if (form.assimilation.views.length >= 16) { toast('视角过多', '附加观测视角不能超过 16 个', 'error'); return true }
+      form.assimilation.views.push({ data: '', vza: {}, vaa: {} })
+      rerenderViews()
       markDirty()
-      syncInversionUI()
       return true
     }
-    if (button.dataset.obsBrowse || button.dataset.invBrowse) {
+    if (button.hasAttribute('data-remove-view')) {
+      form.assimilation.views.splice(Number(button.closest('[data-view]').dataset.view), 1)
+      rerenderViews()
+      markDirty()
+      return true
+    }
+    if (button.dataset.assimBrowse || button.hasAttribute('data-view-browse')) {
       try {
         const result = await api.pick('file')
         if (!result?.path) return true
-        const input = button.dataset.obsBrowse
-          ? button.closest('[data-obs]').querySelector(`[data-obs-field="${button.dataset.obsBrowse}"]`)
-          : $('[data-inv="mask"]')
+        const input = button.dataset.assimBrowse
+          ? $(`[data-assim="${button.dataset.assimBrowse}"]`)
+          : button.closest('[data-view]').querySelector('[data-view-field="data"]')
         input.value = result.path
         input.dispatchEvent(new Event('input', { bubbles: true }))
       } catch (error) { toast('无法打开选择窗口', error.message, 'error') }
@@ -654,6 +652,11 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return false
   }
 
+  function enableThermal() {
+    form.thermal.enabled = true
+    const toggle = root.querySelector('[data-path="thermal.enabled"]')
+    if (toggle) { toggle.checked = true; toggle.dispatchEvent(new Event('change', { bubbles: true })) }
+  }
   function overpassParts() {    const text = String(form.overpass || '')
     return { date: text.slice(0, 10), time: text.slice(11, 19).padEnd(8, ':00').slice(0, 8) }
   }
@@ -716,7 +719,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       </div>`
     $('#swParams').innerHTML = [
       modeCards,
-      inversionGroup(),
+      assimilationGroup(),
       inputLabel,
       group('location', '位置与过境时刻', `
         <div class="segmented sw-block-seg" data-location>
@@ -755,7 +758,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     ].join('')
     syncGroups()
     renderInspections()
-    syncInversionUI()
+    syncAssimilationUI()
   }
 
   function syncGroups() {
@@ -794,7 +797,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const element = $(`[data-summary="${key}"]`)
       if (element) element.textContent = text
     }
-    syncInversionUI()
+    syncAssimilationUI()
   }
 
   function renderHeader() {
@@ -866,7 +869,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
 
   function onParamInput(event) {
     const target = event.target
-    if (onInversionInput(event)) return
+    if (onAssimilationInput(event)) return
     if (target.dataset.overpass) {
       const { date, time } = overpassParts()
       const next = target.dataset.overpass === 'date' ? { date: target.value, time } : { date, time: target.value }
@@ -908,7 +911,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
   async function onParamClick(event) {
     const button = event.target.closest('button')
     if (!button) return
-    if (await onInversionClick(button)) return
+    if (await onAssimilationClick(button)) return
     const groupElement = button.closest('.sw-group')
     if (button.classList.contains('sw-group-toggle')) {
       const open = !groupElement.classList.contains('open')
@@ -1004,7 +1007,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     const t = form.temperature
     const fields = [...SURFACE_FIELDS.filter((spec) => spec.path !== 'surface.soilMoisture' || !(t.mode === 'eb' && t.soilMoisture.source === 'era5')),
       ...GEOMETRY_FIELDS.map((spec) => spec), ...(form.locationSource === 'input' ? LOCATION_FIELDS.map((spec) => ({ ...spec, required: true })) : [])]
-    if (t.mode === 'rt' && (form.thermal.enabled || form.inversion.target === 'lsct')) fields.push(...(t.components.source === 'package' ? [PACKAGE_FIELD] : COMPONENT_FIELDS))
+    if (t.mode === 'rt' && (form.thermal.enabled || assimilating())) fields.push(...(t.components.source === 'package' ? [PACKAGE_FIELD] : COMPONENT_FIELDS))
     return fields
   }
 
@@ -1019,17 +1022,19 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const info = field.mode === 'file' && field.file.trim() ? inspections.get(field.file.trim()) : null
       if (info && !info.exists) flag(spec.path, `${spec.label}：${info.error || '文件不存在'}`)
     }
-    const inv = form.inversion
-    if (!form.optical.enabled && !form.thermal.enabled && inv.target === 'none') problems.push('请至少启用光学、热红外波段或温度反演')
-    if (inv.target !== 'none') {
-      if (!inv.observations.length) problems.push('温度反演至少需要一个热红外观测')
-      inv.observations.forEach((item, index) => {
-        const name = item.name || `观测 ${index + 1}`
-        if (!item.value.file && item.value.value === undefined) problems.push(`观测 ${name} 缺少亮温栅格或常数`)
-        if (!(Number(item.wavelength) >= 3 && Number(item.wavelength) <= 20)) problems.push(`观测 ${name} 的波长须在 3–20 μm`)
-        if (!(Number(item.sigma) > 0 && Number(item.sigma) <= 10)) problems.push(`观测 ${name} 的误差 σ 须在 0–10 K`)
-      })
-      if (inv.target === 'lsct' && !(Number(inv.window) >= 1 && Number(inv.window) <= 9 && Number(inv.window) % 2 === 1)) problems.push('反演窗口须为 1–9 的奇数')
+    const as = form.assimilation
+    if (!form.optical.enabled && !form.thermal.enabled && !assimilating()) problems.push('请至少启用光学或热红外波段')
+    if (assimilating()) {
+      const label = ASSIMILATION_OBSERVATIONS[as.observation]
+      if (!as.data) problems.push(`同化${label}需要观测数据文件`)
+      if (as.observation === 'brightness' && !form.thermal.enabled) problems.push('同化亮温需要启用热红外波段（观测文件每个波段对应一个热红外波段）')
+      if (as.optical && !form.optical.enabled) problems.push('光学反射率观测需要启用光学波段')
+      if (as.observation === 'brightness')
+        as.views.forEach((item, index) => {
+          if (!item.data) return
+          if (!item.vza.file && item.vza.value === undefined) problems.push(`附加视角 ${index + 1} 缺少天顶角`)
+          if (!item.vaa.file && item.vaa.value === undefined) problems.push(`附加视角 ${index + 1} 缺少方位角`)
+        })
     }
     if (form.optical.enabled && !form.optical.bands.length) problems.push('请至少添加一个光学波段')
     if (form.thermal.enabled && !form.thermal.bands.length) problems.push('请至少添加一个热红外波段')
@@ -1055,7 +1060,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
     delete scene.optical.preset
     delete scene.thermal.preset
-    if (scene.inversion?.target === 'none') delete scene.inversion
+    delete scene.inversion
+    if (scene.assimilation?.mode !== 'assimilate') delete scene.assimilation
     return { ...scene, projectPath }
   }
 
@@ -1197,7 +1203,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       currentJob = job.id
       setRunning(true)
       setRunState('running', status?.running ? '等待中' : '启动引擎', 0)
-      addLog(`开始运行（${form.temperature.mode === 'eb' ? 'EB · ERA5 能量平衡' : 'RT · 已知组分温度'}${form.inversion.target === 'none' ? '' : ` + ${INVERSION_TARGETS[form.inversion.target]}反演`}）`)
+      addLog(`开始运行（${form.temperature.mode === 'eb' ? 'EB · ERA5 能量平衡' : 'RT · 已知组分温度'}${assimilating() ? ` + 同化${ASSIMILATION_OBSERVATIONS[form.assimilation.observation]}` : ''}）`)
       const buffered = pendingEvents.filter((event) => event.job?.id === job.id)
       pendingEvents = []
       for (const event of buffered) handleEvent(event)
@@ -1298,6 +1304,16 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
         ['平均残差', Number.isFinite(summary.inversion.meanResidualK) ? `${summary.inversion.meanResidualK.toFixed(3)} K` : '—'],
         ...(summary.inversion.target === 'lsct' ? [['平均 DFS', Number.isFinite(summary.inversion.meanDegreesOfFreedom) ? summary.inversion.meanDegreesOfFreedom.toFixed(2) : '—'],
           ['信息量不足', summary.inversion.counts?.lowSupportPixels]] : [])] : []),
+      ...(summary.assimilation ? (() => {
+        const as = summary.assimilation
+        const kinds = { brightness: '亮温', lst: '地表温度', components: '组分温度' }
+        const k = (value) => Number.isFinite(value) ? `${value.toFixed(3)} K` : '—'
+        return [['运行方式', `同化${kinds[as.observation] || ''} · ${as.background === 'eb' ? 'EB 背景' : 'RT 背景'}`],
+          ['控制变量', (as.controls || []).join('、')],
+          ['同化像元', as.analysedPixels], ['无观测', as.noObservationPixels], ['失败', as.failedPixels], ['未收敛', as.notConvergedPixels],
+          ['平均 O−B', k(as.meanOmbK)], ['平均 O−A', k(as.meanOmaK)],
+          ['平均 DFS', Number.isFinite(as.meanDegreesOfFreedom) ? as.meanDegreesOfFreedom.toFixed(2) : '—'], ['信息量不足', as.lowSupportPixels]]
+      })() : []),
       ['网格', grid ? `${grid.width} × ${grid.height}` : '—'],
       ['光学有效', counts.opticalPixels], ['热红外有效', counts.thermalPixels],
       ['水体与填充', counts.waterOrFillPixels], ['未知地类', counts.unknownTypePixels],
@@ -1644,6 +1660,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       if (file === 'lst_uncertainty.tif') return stats.filter((item) => /^LST uncertainty/.test(item.name))
       if (file === 'lsct.tif') return stats.filter((item) => /temperature \(K\)$/.test(item.name))
     }
+    if (file === 'analysis_components.tif') return (summary.assimilation?.statistics || []).filter((item) => /^analysis T/.test(item.name))
+    if (file === 'analysis_qa.tif') return (summary.assimilation?.statistics || []).filter((item) => !/^analysis T/.test(item.name))
     return []
   }
 
@@ -1652,7 +1670,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     const info = productInfo()
     const active = new Set(view.layers.map((layer) => layer.band))
     const unit = unitLabel()
-    const named = ['components.tif', 'eb_fluxes.tif', 'lst.tif', 'lst_uncertainty.tif', 'lsct.tif'].includes(fileName(view.product))
+    const named = ['components.tif', 'eb_fluxes.tif', 'lst.tif', 'lst_uncertainty.tif', 'lsct.tif', 'analysis_components.tif', 'analysis_qa.tif'].includes(fileName(view.product))
     $('#swBandStats').innerHTML = rows.length ? `<thead><tr><th>波段</th><th>最小</th><th>平均</th><th>最大</th></tr></thead><tbody>${rows.map((item, index) => `
       <tr class="${active.has(index) ? 'active' : ''}" data-band-row="${index}" title="${escapeHtml(item.name)}，有效像元 ${Number(item.validPixels || 0).toLocaleString('en-US')}">
         <td>${escapeHtml(named ? bandLabel(item.name) : shortBand(item.name))}</td><td>${formatValue(item.minimum, info.digits)}</td><td>${formatValue(item.mean, info.digits)}</td><td>${formatValue(item.maximum, info.digits)}</td></tr>`).join('')}</tbody>

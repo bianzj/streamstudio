@@ -807,6 +807,9 @@ body { font-size: 14px; font-weight: 500; }
 .sw-obs-head { display:grid; grid-template-columns:minmax(0,1fr) 96px 26px; gap:6px; align-items:center; }
 .sw-obs-head .icon-button { width:26px; height:26px; border:0; background:transparent; font-size:16px; line-height:1; }
 .sw-obs-head .icon-button:hover { color:var(--red); background:rgba(217,75,91,.08); }
+.sw-obs-head:has(.sw-obs-title) { grid-template-columns:minmax(0,1fr) 26px; }
+.sw-obs-title { font-size:12px; color:var(--muted); }
+.sw-obs .sw-row-4:has(> label:nth-child(2):last-child) { grid-template-columns:1fr 1fr; }
 .sw-obs .sw-row-4 .input { height:28px; padding:0 6px; }
 .sw-obs-actions { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
 .sw-subhead { margin:4px 0 -4px; color:var(--muted); font-size:12px; font-weight:750; }

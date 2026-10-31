@@ -102,21 +102,31 @@ void initializeColumn(std::vector<double>& profile, double surface, double level
     }
 }
 
-double surfaceHeatFlux(double temperature, const SoilThermalState& state, double dtSeconds, double inertia)
+template <class T>
+T surfaceHeatFluxT(const T& temperature, const SoilThermalState& state, double dtSeconds, const T& inertia)
 {
     const double dt = std::max(dtSeconds, 1.0);
-    double newer = temperature, elapsed = 0.0, weighted = 0.0;
+    double elapsed = 0.0;
+    T weighted(0.0);
     for (size_t index = 0; index < state.history.size(); ++index) {
         const double duration = index == 0 ? dt : (index - 1 < state.intervals.size() ? state.intervals[index - 1] : dt);
         const double interval = std::max(duration, 1.0);
         const double end = std::min(elapsed + interval, kHistorySeconds);
+        const T newer = index == 0 ? temperature : T(state.history[index - 1]);
         weighted += (newer - state.history[index]) / interval * (std::sqrt(end) - std::sqrt(elapsed));
         elapsed += interval;
         if (elapsed >= kHistorySeconds) break;
-        newer = state.history[index];
     }
     return 2.0 * inertia / std::sqrt(3.14159265358979323846) * weighted;
 }
+
+double surfaceHeatFlux(double temperature, const SoilThermalState& state, double dtSeconds, double inertia)
+{
+    return surfaceHeatFluxT<double>(temperature, state, dtSeconds, inertia);
+}
+
+template double surfaceHeatFluxT<double>(const double&, const SoilThermalState&, double, const double&);
+template Ad surfaceHeatFluxT<Ad>(const Ad&, const SoilThermalState&, double, const Ad&);
 
 double depthHeatFlux(double temperature, const SoilThermalState& state, double dtSeconds, const ThermalMaterial& material)
 {

@@ -43,6 +43,26 @@ struct InversionConfig {
     double tolerance = 1e-3;       // K
     bool enabled() const { return target != InversionTarget::None; }
 };
+// Run mode "同化": the user supplies observations and picks what they are; every other setting (observation
+// errors, background errors, iteration) is a built-in default of app/assimilation.cpp.
+//   brightness: brightness temperatures, one band per thermal band (scene view; optional extra views)
+//   lst       : one radiometric LST band (10.5 um, fixed class emissivity convention)
+//   components: four component temperatures Tss/Tsh/Tcs/Tch
+// RT runs control the four component temperatures; EB runs control soil moisture and Vcmax (temperatures follow
+// from the energy balance by implicit differentiation). An optional reflectance file adds LAI as a control.
+enum class AssimilationObservation { None, Brightness, Lst, Components };
+struct AssimilationView {
+    std::string data;  // one band per thermal band
+    Field vza, vaa;
+};
+struct AssimilationConfig {
+    AssimilationObservation observation = AssimilationObservation::None;
+    std::string data;
+    std::vector<AssimilationView> views;  // brightness only
+    std::string optical;                  // optional: one band per optical band
+    bool enabled() const { return observation != AssimilationObservation::None; }
+};
+
 // Surface orientation used by the shortwave forcing: none (horizontal), one plane for the whole scene,
 // a per-pixel slope/aspect facet field from the DEM (facet method), or a statistical hill composite
 // (sub-pixel cone facets + density).
@@ -107,6 +127,7 @@ struct ImageConfig {
     int maxIterations = 50;
     int maxStabilityIterations = 60;
     InversionConfig inversion;
+    AssimilationConfig assimilation;
     int threads = 0;
 };
 

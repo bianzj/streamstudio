@@ -1,4 +1,6 @@
 #pragma once
+#include "dual.h"
+
 #include <cmath>
 #include <vector>
 
@@ -24,6 +26,9 @@ struct ThermalMaterial {
 
 // Semi-infinite surface flux from the piecewise-linear 7 h temperature history [W m-2].
 double surfaceHeatFlux(double temperature, const SoilThermalState& state, double dtSeconds, double inertia);
+// Same flux on any scalar type (double or Ad): linear in the current temperature and in the thermal inertia.
+template <class T>
+T surfaceHeatFluxT(const T& temperature, const SoilThermalState& state, double dtSeconds, const T& inertia);
 
 // Finite-volume soil column flux: top-layer conduction plus half-layer storage [W m-2].
 double depthHeatFlux(double temperature, const SoilThermalState& state, double dtSeconds, const ThermalMaterial& material);

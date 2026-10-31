@@ -1,4 +1,5 @@
 #include "image.h"
+#include "assimilation.h"
 #include "config.h"
 #include "inversion.h"
 #include "thermal_view.h"
@@ -330,6 +331,8 @@ int runImage(const std::string& configPath)
                 if (std::isfinite(soilMoisture[pixel])) moistureUsed[moistureStep(soilMoisture[pixel])] = 1;
                 else if (eb) moistureUsed[moistureStep(classes.defaultSoilMoisture)] = 1;
             }
+        // The analysis can move soil moisture anywhere and needs neighbouring steps for dρ/dθ: build every step.
+        if (config.assimilation.enabled()) std::fill(moistureUsed.begin(), moistureUsed.end(), 1);
         #pragma omp parallel for schedule(dynamic, 8)
         for (int step = 0; step <= kMoistureSteps; ++step) {
             if (!moistureUsed[step]) continue;
@@ -356,7 +359,8 @@ int runImage(const std::string& configPath)
     constexpr int kFluxBands = 18;
     // LSCT inversion uses the run's component temperatures (RT input or EB solution) as its background.
     const bool lsctInversion = config.inversion.target == InversionTarget::Lsct;
-    const bool needComponents = config.thermalEnabled || eb || lsctInversion;
+    const bool assimilate = config.assimilation.enabled();
+    const bool needComponents = config.thermalEnabled || eb || lsctInversion || assimilate;
     const UtcTime overpassTime = utcFromSeconds(overpass);
     const int dayOfYear = static_cast<int>(daysFromCivil(overpassTime.year, overpassTime.month, overpassTime.day) -
                                            daysFromCivil(overpassTime.year, 1, 1)) + 1;
@@ -447,20 +451,253 @@ int runImage(const std::string& configPath)
             log("地形辐射：面元法，逐像元坡度/坡向（DEM）" + (invalid ? "，无效像元 " + std::to_string(invalid) : ""));
         }
     }
+    // ---- EB pixel machinery: one implementation for the forward solve and the assimilation re-solve ----
+    const std::vector<float> noSpectrum;
+    const int64_t ebDayStartHour = static_cast<int64_t>(std::llround(dayStart / 3600.0));
+    const int64_t ebDayLastHour = std::min<int64_t>(ebDayStartHour + 23, pack.lastHour());
+    const auto validForcing = [](const Forcing& f) {
+        return std::isfinite(f.ta) && std::isfinite(f.ea) && std::isfinite(f.p) && std::isfinite(f.wind) &&
+               std::isfinite(f.shortwave) && std::isfinite(f.longwave);
+    };
+    const auto pixelForcing = [&](size_t pixel) {
+        double shift = 0.0;
+        if (elevationCorrection && std::isfinite(dem[pixel])) {
+            const double orography = pack.at("z", 0, pack.weights(latitude[pixel], longitude[pixel])) / kGravity;
+            if (std::isfinite(orography)) shift = dem[pixel] - orography;
+        }
+        return PixelForcing(pack, latitude[pixel], longitude[pixel], shift,
+                            terrainSlope.empty() ? 0.0 : terrainSlope[pixel],
+                            terrainAspect.empty() ? 0.0 : terrainAspect[pixel],
+                            config.diffuseFraction,
+                            coneSlope.empty() ? 0.0 : coneSlope[pixel],
+                            coneDensity.empty() ? 0.0 : coneDensity[pixel],
+                            ridgeSlope.empty() ? 0.0 : ridgeSlope[pixel],
+                            ridgeAspect.empty() ? 0.0 : ridgeAspect[pixel],
+                            ridgeDensity.empty() ? 0.0 : ridgeDensity[pixel],
+                            config.terrainEndFraction);
+    };
+    const auto buildSurface = [&](const ClassParameters& entry, double leafArea, double moisture, double vcmax) {
+        EnergySurface surface;
+        surface.lai = leafArea;
+        surface.height = entry.canopy.height;
+        surface.leafWidth = entry.canopy.leafWidth;
+        surface.hotspot = entry.canopy.hotspot;
+        surface.leafEmissivity = config.leafEmissivity;
+        surface.soilMoisture = moisture;
+        // DEFERRED[低] 物理: 冰雪（15）按普通平面地面处理：没有 273.15 K 上限，没有融化潜热，饱和水汽压也用的是水面 Tetens；中午强辐射下雪面温度可能算到 0 °C 以上，这在物理上不可能；建议：冰雪地类把 T 限制在 ≤273.15 K（超出部分能量计入融化），饱和水汽压改用冰面公式
+        surface.ground = entry.ground;
+        if (entry.groundKind == GroundKind::Soil) {
+            // Wet soil emits more: the broadband emissivity follows the
+            // pixel water content between the dry value and saturation.
+            surface.ground.emissivity = soilEmissivityAtMoisture(config.soilEmissivity, config.soilEmissivityWet, surface.soilMoisture);
+            surface.ground.conductivity = config.soilConductivity;
+            surface.ground.volumetricCapacity = config.soilVolumetricCapacity;
+            surface.ground.moistureResistance = config.soilResistanceFromMoisture;
+            surface.ground.fixedResistance = config.soilResistance;
+            if (config.soilThermalFromMoisture)
+                johansenSoilThermal<double>(surface.ground.saturatedMoisture, surface.soilMoisture,
+                                            surface.ground.conductivity, surface.ground.volumetricCapacity);
+        }
+        surface.leaf = entry.photosynthesis;
+        surface.leaf.vcmax = static_cast<float>(vcmax);
+        surface.aero = classes.aerodynamics;
+        surface.aero.minWindSpeed = config.minWindSpeed;
+        surface.aero.maxResistance = config.maxAerodynamicResistance;
+        if (config.heatRoughnessKb > 0.0) surface.ground.heatRoughnessKb = config.heatRoughnessKb;
+        surface.referenceHeight = config.referenceHeight;
+        surface.co2 = classes.co2;
+        surface.o2 = classes.o2;
+        surface.stomatalG0 = config.stomatalG0;
+        surface.diffuseFraction = config.diffuseFraction;
+        surface.enforceSolarLimit = config.enforceSolarLimit;
+        surface.dayOfYear = dayOfYear;
+        surface.soilHeatMethod = config.soilHeatMethod;
+        surface.robustTemperature = config.robustTemperature;
+        surface.soilHeatFraction = config.soilHeatFraction;
+        surface.maxIterations = config.maxIterations;
+        surface.maxStabilityIterations = config.maxStabilityIterations;
+        return surface;
+    };
+    const auto groundBins = [&](const ClassParameters& entry, int code, double moisture) -> const std::vector<float>& {
+        return entry.groundKind == GroundKind::Flat ? flatGroundBins.at(code) : soilBins[moistureStep(static_cast<float>(moisture))];
+    };
+    const auto leafBins = [&](int code, const std::vector<float>*& rho, const std::vector<float>*& tau) {
+        const auto leafRho = leafRhoBins.find(code), leafTau = leafTauBins.find(code);
+        rho = leafRho != leafRhoBins.end() ? &leafRho->second : &noSpectrum;
+        tau = leafTau != leafTauBins.end() ? &leafTau->second : &noSpectrum;
+    };
+    const auto initialState = [&](const PixelForcing& forcing) {
+        // TIRTEB initialises soil and leaf temperatures with the first simulated day's mean air temperature.
+        double initialSum = 0.0;
+        int initialCount = 0;
+        for (int64_t hour = ebDayStartHour; hour <= ebDayLastHour; ++hour) {
+            const double value = forcing.temperature("t2m", static_cast<double>(hour) * 3600.0);
+            if (std::isfinite(value)) { initialSum += value; ++initialCount; }
+        }
+        const double initial = initialCount > 0 ? initialSum / initialCount : forcing.temperature("t2m", dayStart);
+        // Soil starts from the ERA5 skin temperature at 00 UTC (the pack already carries skt, stl1 and stl2,
+        // which the run log promises); the 2 m column is anchored to the ERA5 soil levels. Leaves hold no heat
+        // and converge in one step, so they keep the day-mean air temperature. With the day-mean air start the
+        // soil was up to 6 K too warm at 06-08 local time and the first step had G = 0 (empty history).
+        const double skin = forcing.temperature("skt", dayStart);
+        const double level1 = forcing.temperature("stl1", dayStart);
+        const double level2 = pack.available("stl2") ? forcing.temperature("stl2", dayStart) : level1;
+        const bool soilFromEra5 = std::isfinite(skin) && skin > 180.0 && skin < 340.0;
+        const double soilInitial = soilFromEra5 ? skin : initial;
+        EnergyState state;
+        state.soilSunlit = state.soilShaded = soilInitial;
+        state.leafSunlit = state.leafShaded = initial;
+        state.soilSunState.history = {soilInitial};
+        state.soilShadeState.history = {soilInitial};
+        if (soilFromEra5 && config.soilHeatMethod == SoilHeatMethod::Depth) {
+            initializeColumn(state.soilSunState.profile, soilInitial,
+                             std::isfinite(level1) ? level1 : soilInitial, std::isfinite(level2) ? level2 : soilInitial);
+            state.soilShadeState.profile = state.soilSunState.profile;
+        }
+        return state;
+    };
+    struct EbRun {
+        EnergyDiagnostics result;
+        double partitionLimited = 0.0, diffuse = std::numeric_limits<double>::quiet_NaN();
+        EnergyState before;  // state entering the overpass node (soil heat history of the implicit derivative)
+        Forcing meteo;
+        ShortwaveAbsorption shortwave;
+        double sza = 0.0, dt = 3600.0;
+    };
+    const auto marchNodes = [&](size_t pixel, const EnergySurface& surface, const OpticalSpectra& spectra, double leafArea,
+                                const PixelForcing& forcing, EnergyState& state, EbRun& run) {
+        for (size_t node = 0; node < nodes.size(); ++node) {
+            const double time = nodes[node];
+            const Sun sun = solarPosition(time, latitude[pixel], longitude[pixel], dem[pixel]);
+            if (!sun.ok) return false;
+            const Forcing meteo = forcing.at(time);
+            if (!validForcing(meteo)) return false;
+            // DEFERRED[低] 物理: meteo.shortwave 由 NOAA 近似 cos(SZA) 决定是否大于 0，而这里的 sunlit 用的是 SPA 天顶角。日出日落附近可能出现 SPA SZA≥90 而短波>0 的情况；enforceSolarLimit=true 时直射上限为 0，会全部转成漫射，没有问题；但 enforceSolarLimit=false 时 absorbShortwave 在 !lit 下令 esun=0，直射部分 (1−fd)·SW 被直接丢掉，能量不守恒；建议：两处用同一套太阳位置，或者 !lit 时把直射全部计入漫射
+            const ShortwaveAbsorption shortwave = absorbShortwave(
+                solarBins, spectra, leafArea, meteo.shortwave, sun.zenith, dayOfYear, config.diffuseFraction,
+                config.enforceSolarLimit, sun.zenith < 90.0);
+            run.partitionLimited = shortwave.partitionLimited ? 1.0 : 0.0;
+            run.diffuse = shortwave.diffuseFraction;
+            const double dt = node ? time - nodes[node - 1] : 3600.0;
+            if (node + 1 == nodes.size()) {
+                run.before = state;
+                run.meteo = meteo;
+                run.shortwave = shortwave;
+                run.sza = sun.zenith;
+                run.dt = dt;
+            }
+            run.result = solveEnergyNode(surface, meteo, shortwave, sun.zenith, sun.zenith < 90.0, dt, state);
+        }
+        return true;
+    };
+    // Assimilation: re-solve one pixel at the analysed controls and linearise the overpass energy balance.
+    // R(T, x) = 0 at the converged node, so dT/dx = -(dR/dT)^-1 dR/dx; R, dR/dT and dR/dx come from one Dual
+    // evaluation of the same component balances (soil moisture: soil emissivity, soil resistance, Johansen inertia,
+    // BSM soil albedo of the absorbed shortwave; Vcmax: stomatal resistance; LAI: hom3 radiation and fractions).
+    // The soil heat history before the overpass node is held fixed (derivative of the last node only).
+    EbSolver ebSolver = [&](size_t pixel, const EbControls& controls, EbOutcome& outcome) -> bool {
+        const auto* entry = classes.find(type[pixel]);
+        if (!entry || entry->surface != SurfaceKind::Vegetation || !validLocation(pixel)) return false;
+        const double leafArea = std::clamp(controls.lai, 0.0, 100.0);
+        const double moisture = std::clamp(controls.moisture, 0.0, 1.0);
+        const PixelForcing forcing = pixelForcing(pixel);
+        if (!validForcing(forcing.at(overpass))) return false;
+        const int code = static_cast<int>(std::lround(type[pixel]));
+        const EnergySurface surface = buildSurface(*entry, leafArea, moisture, controls.vcmax);
+        const std::vector<float>& ground = groundBins(*entry, code, moisture);
+        const std::vector<float>* rho = nullptr;
+        const std::vector<float>* tau = nullptr;
+        leafBins(code, rho, tau);
+        if ((leafArea > 0 && rho->empty()) || ground.empty()) return false;
+        const OpticalSpectra spectra{rho, tau, &ground};
+        EnergyState state = initialState(forcing);
+        EbRun run;
+        if (!marchNodes(pixel, surface, spectra, leafArea, forcing, state, run)) return false;
+        const bool leaves = leafArea > 0.0;
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        outcome.temperatures = {state.soilSunlit, state.soilShaded, leaves ? state.leafSunlit : nan, leaves ? state.leafShaded : nan};
+        outcome.fluxes = {run.result.netRadiation, run.result.sensible, run.result.latent, run.result.ground};
+        for (auto& row : outcome.gradient) row.fill(0.0);
+
+        const EnergyInputsT<double> base = energyInputs(surface, run.shortwave, state);
+        EnergyInputsT<Ad> x;
+        x.soilSunlit = Ad::seed(base.soilSunlit, 0);
+        x.soilShaded = Ad::seed(base.soilShaded, 1);
+        x.leafSunlit = Ad::seed(base.leafSunlit, 2);
+        x.leafShaded = Ad::seed(base.leafShaded, 3);
+        x.soilMoisture = Ad::seed(moisture, 4);
+        x.vcmax = Ad::seed(base.vcmax, 5);
+        x.lai = Ad::seed(leafArea, 6);
+        const bool soil = entry->groundKind == GroundKind::Soil;
+        x.soilEmissivity = soil ? soilEmissivityAtMoistureT<Ad>(config.soilEmissivity, config.soilEmissivityWet, x.soilMoisture)
+                                : Ad(surface.ground.emissivity);
+        if (soil && config.soilThermalFromMoisture) {
+            Ad conductivity, capacity;
+            johansenSoilThermal<Ad>(surface.ground.saturatedMoisture, x.soilMoisture, conductivity, capacity);
+            x.soilInertia = ad::sqrt(conductivity * capacity);
+        } else x.soilInertia = Ad(base.soilInertia);
+        if (run.meteo.shortwave > 0.0) {
+            // BSM soil albedo per solar bin, with its moisture slope from the neighbouring tabulated steps.
+            std::vector<Ad> soilSpectrum(ground.size());
+            const int step = moistureStep(static_cast<float>(moisture));
+            const int lower = std::max(step - 1, 0), upper = std::min(step + 1, kMoistureSteps);
+            const bool slope = soil && upper > lower && soilBins[lower].size() == ground.size() && soilBins[upper].size() == ground.size();
+            for (size_t bin = 0; bin < ground.size(); ++bin) {
+                const double gradient = slope ? (soilBins[upper][bin] - soilBins[lower][bin]) * kMoistureSteps / (upper - lower) : 0.0;
+                soilSpectrum[bin] = Ad(ground[bin]) + gradient * (x.soilMoisture - moisture);
+            }
+            const auto sw = shortwaveComponents<Ad, std::vector<Ad>>(solarBins, *rho, *tau, soilSpectrum, x.lai, run.meteo.shortwave,
+                                                                     run.shortwave.diffuseFraction, run.sza, run.sza < 90.0);
+            x.soilDirect = sw.soilDirect;
+            x.soilDiffuseSun = sw.soilDiffuseSun;
+            x.soilDiffuseShade = sw.soilDiffuseShade;
+            x.leafDirect = sw.leafDirect;
+            x.leafDiffuseSun = sw.leafDiffuseSun;
+            x.leafDiffuseShade = sw.leafDiffuseShade;
+            x.parSun = sw.parLeafDirect + sw.parLeafDiffuseSun;
+            x.parShade = sw.parLeafDiffuseShade;
+            x.soilSunlitFraction = sw.soilSunlitFraction;
+            x.laiSunlit = sw.laiSunlit;
+        }
+        const auto residual = energyResiduals<Ad>(surface, x, run.meteo, run.sza, run.sza < 90.0, run.dt, run.before,
+                                                  state.inverseObukhov, state.sceneSensible);
+        const int size = leaves ? 4 : 2;
+        double a[4][4]{}, b[4][3]{};
+        for (int i = 0; i < size; ++i) {
+            for (int j = 0; j < size; ++j) a[i][j] = residual[i].d[j];
+            for (int c = 0; c < 3; ++c) b[i][c] = -residual[i].d[4 + c];
+        }
+        for (int column = 0; column < size; ++column) {
+            int pivot = column;
+            for (int row = column + 1; row < size; ++row)
+                if (std::abs(a[row][column]) > std::abs(a[pivot][column])) pivot = row;
+            if (!(std::abs(a[pivot][column]) > 1e-9) || !std::isfinite(a[pivot][column])) return true;  // no usable derivative
+            if (pivot != column) {
+                for (int k = 0; k < size; ++k) std::swap(a[column][k], a[pivot][k]);
+                for (int k = 0; k < 3; ++k) std::swap(b[column][k], b[pivot][k]);
+            }
+            for (int row = 0; row < size; ++row) {
+                if (row == column) continue;
+                const double factor = a[row][column] / a[column][column];
+                for (int k = 0; k < size; ++k) a[row][k] -= factor * a[column][k];
+                for (int k = 0; k < 3; ++k) b[row][k] -= factor * b[column][k];
+            }
+        }
+        for (int i = 0; i < size; ++i)
+            for (int c = 0; c < 3; ++c) {
+                const double value = b[i][c] / a[i][i];
+                outcome.gradient[i][c] = std::isfinite(value) ? value : 0.0;
+            }
+        return true;
+    };
+
     if (eb) {
         progress(10, "能量平衡求解");
-        const std::vector<float> noSpectrum;
-        const int64_t dayStartHour = static_cast<int64_t>(std::llround(dayStart / 3600.0));
-        const int64_t dayLastHour = std::min<int64_t>(dayStartHour + 23, pack.lastHour());
         for (auto& band : components) band.assign(pixels, kNaN);
         forcingOut.assign(7, std::vector<float>(pixels, kNaN));
         fluxOut.assign(kFluxBands, std::vector<float>(pixels, kNaN));
         std::atomic<int> rowsDone{0};
         const int rowCount = endRow - startRow;
-        const auto validForcing = [](const Forcing& f) {
-            return std::isfinite(f.ta) && std::isfinite(f.ea) && std::isfinite(f.p) && std::isfinite(f.wind) &&
-                   std::isfinite(f.shortwave) && std::isfinite(f.longwave);
-        };
         #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing)
         for (int row = startRow; row < endRow; ++row) {
             for (int column = startColumn; column < endColumn; ++column) {
@@ -470,21 +707,7 @@ int runImage(const std::string& configPath)
                 const float leafArea = lai[pixel];
                 // DEFERRED[中] 错误处理: LAI 上限 100 太宽。MODIS LAI（×0.1）的填充码 249–254（水体、裸地、冰雪、城市等）若未声明为 nodata，经 scale 后变成 24.9–25.4，会被当成有效 LAI 参与 EB 与成像；另外这条检查放在水体分支前面，水体像元的 LAI 一旦是 nodata，就连 skt 也拿不到；建议：把上限收紧到约 10–15，超限时记日志计数；水体判断移到 LAI 检查之前
                 if (!std::isfinite(leafArea) || leafArea < 0 || leafArea > 100) continue;
-                double shift = 0.0;
-                if (elevationCorrection && std::isfinite(dem[pixel])) {
-                    const double orography = pack.at("z", 0, pack.weights(latitude[pixel], longitude[pixel])) / kGravity;
-                    if (std::isfinite(orography)) shift = dem[pixel] - orography;
-                }
-                const PixelForcing forcing(pack, latitude[pixel], longitude[pixel], shift,
-                                           terrainSlope.empty() ? 0.0 : terrainSlope[pixel],
-                                           terrainAspect.empty() ? 0.0 : terrainAspect[pixel],
-                                           config.diffuseFraction,
-                                           coneSlope.empty() ? 0.0 : coneSlope[pixel],
-                                           coneDensity.empty() ? 0.0 : coneDensity[pixel],
-                                           ridgeSlope.empty() ? 0.0 : ridgeSlope[pixel],
-                                           ridgeAspect.empty() ? 0.0 : ridgeAspect[pixel],
-                                           ridgeDensity.empty() ? 0.0 : ridgeDensity[pixel],
-                                           config.terrainEndFraction);
+                const PixelForcing forcing = pixelForcing(pixel);
                 const Forcing atOverpass = forcing.at(overpass);
                 // FIXED[中] 错误处理: 原来只检查 ta 和 longwave，d2m/sp/u10/v10/ssrd 缺测时 ea/p/wind/shortwave 为 NaN，残差变 NaN、组分温度停在初值却看似有效；已修复：用 validForcing 对 ta/ea/p/wind/shortwave/longwave 全部做 isfinite 检查，并在逐时次循环里同样检查 meteo，无效像元计入 ebNoForcing/ebFailed
                 if (!validForcing(atOverpass)) { ++ebNoForcing; continue; }
@@ -497,108 +720,21 @@ int runImage(const std::string& configPath)
                     continue;
                 }
                 const int code = static_cast<int>(std::lround(type[pixel]));
-                EnergySurface surface;
-                surface.lai = leafArea;
-                surface.height = entry->canopy.height;
-                surface.leafWidth = entry->canopy.leafWidth;
-                surface.hotspot = entry->canopy.hotspot;
-                surface.leafEmissivity = config.leafEmissivity;
-                surface.soilMoisture = std::isfinite(soilMoisture[pixel]) ? soilMoisture[pixel] : classes.defaultSoilMoisture;
-                // DEFERRED[低] 物理: 冰雪（15）按普通平面地面处理：没有 273.15 K 上限，没有融化潜热，饱和水汽压也用的是水面 Tetens；中午强辐射下雪面温度可能算到 0 °C 以上，这在物理上不可能；建议：冰雪地类把 T 限制在 ≤273.15 K（超出部分能量计入融化），饱和水汽压改用冰面公式
-                surface.ground = entry->ground;
-                if (entry->groundKind == GroundKind::Soil) {
-                    // Wet soil emits more: the broadband emissivity follows the
-                    // pixel water content between the dry value and saturation.
-                    surface.ground.emissivity = soilEmissivityAtMoisture(
-                        config.soilEmissivity, config.soilEmissivityWet, surface.soilMoisture);
-                    surface.ground.conductivity = config.soilConductivity;
-                    surface.ground.volumetricCapacity = config.soilVolumetricCapacity;
-                    surface.ground.moistureResistance = config.soilResistanceFromMoisture;
-                    surface.ground.fixedResistance = config.soilResistance;
-                    if (config.soilThermalFromMoisture) {
-                        // Johansen (coarse soil): dry sand ~0.2 W m-1 K-1 / inertia ~600, wet soil ~1.4 / ~1900.
-                        const double porosity = std::clamp(surface.ground.saturatedMoisture, 0.2, 0.7);
-                        const double theta = std::clamp(surface.soilMoisture, 0.0, porosity);
-                        const double bulk = (1.0 - porosity) * 2700.0;
-                        const double dry = (0.135 * bulk + 64.7) / (2700.0 - 0.947 * bulk);
-                        const double saturated = std::pow(3.0, 1.0 - porosity) * std::pow(0.57, porosity);
-                        const double saturation = theta / porosity;
-                        const double kersten = saturation > 0.05 ? std::clamp(0.7 * std::log10(saturation) + 1.0, 0.0, 1.0) : 0.0;
-                        surface.ground.conductivity = dry + kersten * (saturated - dry);
-                        surface.ground.volumetricCapacity = (1.0 - porosity) * 2.0e6 + theta * 4.18e6;
-                    }
-                }
-                surface.leaf = entry->photosynthesis;
-                surface.aero = classes.aerodynamics;
-                surface.aero.minWindSpeed = config.minWindSpeed;
-                surface.aero.maxResistance = config.maxAerodynamicResistance;
-                if (config.heatRoughnessKb > 0.0) surface.ground.heatRoughnessKb = config.heatRoughnessKb;
-                surface.referenceHeight = config.referenceHeight;
-                surface.co2 = classes.co2;
-                surface.o2 = classes.o2;
-                surface.stomatalG0 = config.stomatalG0;
-                surface.diffuseFraction = config.diffuseFraction;
-                surface.enforceSolarLimit = config.enforceSolarLimit;
-                surface.dayOfYear = dayOfYear;
-                surface.soilHeatMethod = config.soilHeatMethod;
-                surface.robustTemperature = config.robustTemperature;
-                surface.soilHeatFraction = config.soilHeatFraction;
-                surface.maxIterations = config.maxIterations;
-                surface.maxStabilityIterations = config.maxStabilityIterations;
-                const std::vector<float>& ground = entry->groundKind == GroundKind::Flat ? flatGroundBins.at(code) : soilBins[moistureStep(surface.soilMoisture)];
-                const auto leafRho = leafRhoBins.find(code), leafTau = leafTauBins.find(code);
-                const std::vector<float>& rho = leafRho != leafRhoBins.end() ? leafRho->second : noSpectrum;
-                const std::vector<float>& tau = leafTau != leafTauBins.end() ? leafTau->second : noSpectrum;
-                if ((leafArea > 0 && rho.empty()) || ground.empty()) { ++ebFailed; continue; }
-                const OpticalSpectra spectra{&rho, &tau, &ground};
-
-                // TIRTEB initialises soil and leaf temperatures with the first simulated day's mean air temperature.
-                double initialSum = 0.0;
-                int initialCount = 0;
-                for (int64_t hour = dayStartHour; hour <= dayLastHour; ++hour) {
-                    const double value = forcing.temperature("t2m", static_cast<double>(hour) * 3600.0);
-                    if (std::isfinite(value)) { initialSum += value; ++initialCount; }
-                }
-                const double initial = initialCount > 0 ? initialSum / initialCount : forcing.temperature("t2m", dayStart);
-                // Soil starts from the ERA5 skin temperature at 00 UTC (the pack already carries skt, stl1 and stl2,
-                // which the run log promises); the 2 m column is anchored to the ERA5 soil levels. Leaves hold no heat
-                // and converge in one step, so they keep the day-mean air temperature. With the day-mean air start the
-                // soil was up to 6 K too warm at 06-08 local time and the first step had G = 0 (empty history).
-                const double skin = forcing.temperature("skt", dayStart);
-                const double level1 = forcing.temperature("stl1", dayStart);
-                const double level2 = pack.available("stl2") ? forcing.temperature("stl2", dayStart) : level1;
-                const bool soilFromEra5 = std::isfinite(skin) && skin > 180.0 && skin < 340.0;
-                const double soilInitial = soilFromEra5 ? skin : initial;
-                EnergyState state;
-                state.soilSunlit = state.soilShaded = soilInitial;
-                state.leafSunlit = state.leafShaded = initial;
-                state.soilSunState.history = {soilInitial};
-                state.soilShadeState.history = {soilInitial};
-                if (soilFromEra5 && config.soilHeatMethod == SoilHeatMethod::Depth) {
-                    initializeColumn(state.soilSunState.profile, soilInitial,
-                                     std::isfinite(level1) ? level1 : soilInitial, std::isfinite(level2) ? level2 : soilInitial);
-                    state.soilShadeState.profile = state.soilSunState.profile;
-                }
-
-                EnergyDiagnostics result;
-                bool solved = true;
-                double partitionLimited = 0.0;
-                for (size_t node = 0; node < nodes.size(); ++node) {
-                    const double time = nodes[node];
-                    const Sun sun = solarPosition(time, latitude[pixel], longitude[pixel], dem[pixel]);
-                    if (!sun.ok) { solved = false; break; }
-                    const Forcing meteo = forcing.at(time);
-                    if (!validForcing(meteo)) { solved = false; break; }
-                    // DEFERRED[低] 物理: meteo.shortwave 由 NOAA 近似 cos(SZA) 决定是否大于 0，而这里的 sunlit 用的是 SPA 天顶角。日出日落附近可能出现 SPA SZA≥90 而短波>0 的情况；enforceSolarLimit=true 时直射上限为 0，会全部转成漫射，没有问题；但 enforceSolarLimit=false 时 absorbShortwave 在 !lit 下令 esun=0，直射部分 (1−fd)·SW 被直接丢掉，能量不守恒；建议：两处用同一套太阳位置，或者 !lit 时把直射全部计入漫射
-                    const ShortwaveAbsorption shortwave = absorbShortwave(
-                        solarBins, spectra, leafArea, meteo.shortwave, sun.zenith, dayOfYear, config.diffuseFraction,
-                        config.enforceSolarLimit, sun.zenith < 90.0);
-                    partitionLimited = shortwave.partitionLimited ? 1.0 : 0.0;
-                    diffuseFractionOut[pixel] = static_cast<float>(shortwave.diffuseFraction);
-                    result = solveEnergyNode(surface, meteo, shortwave, sun.zenith, sun.zenith < 90.0,
-                                             node ? time - nodes[node - 1] : 3600.0, state);
-                }
+                const double moisture = std::isfinite(soilMoisture[pixel]) ? soilMoisture[pixel] : classes.defaultSoilMoisture;
+                const EnergySurface surface = buildSurface(*entry, leafArea, moisture, entry->photosynthesis.vcmax);
+                const std::vector<float>& ground = groundBins(*entry, code, surface.soilMoisture);
+                const std::vector<float>* rho = nullptr;
+                const std::vector<float>* tau = nullptr;
+                leafBins(code, rho, tau);
+                if ((leafArea > 0 && rho->empty()) || ground.empty()) { ++ebFailed; continue; }
+                const OpticalSpectra spectra{rho, tau, &ground};
+                EnergyState state = initialState(forcing);
+                EbRun run;
+                const bool solved = marchNodes(pixel, surface, spectra, leafArea, forcing, state, run);
+                if (std::isfinite(run.diffuse)) diffuseFractionOut[pixel] = static_cast<float>(run.diffuse);
                 if (!solved) { ++ebFailed; continue; }
+                const EnergyDiagnostics& result = run.result;
+                const double partitionLimited = run.partitionLimited;
                 components[0][pixel] = static_cast<float>(state.soilSunlit);
                 components[1][pixel] = static_cast<float>(state.soilShaded);
                 components[2][pixel] = static_cast<float>(state.leafSunlit);
@@ -624,7 +760,7 @@ int runImage(const std::string& configPath)
             std::to_string(ebStable) + " 个），水体取 ERA5 表皮温度 " +
             std::to_string(ebWaterPixels) + " 个" + (ebFailed ? "，未能求解 " + std::to_string(ebFailed) + " 个" : "") +
             (ebNoForcing ? "，ERA5 无有效值（如 ERA5-Land 海面）跳过 " + std::to_string(ebNoForcing) + " 个" : ""));
-    } else if (config.thermalEnabled || lsctInversion) {
+    } else if (config.thermalEnabled || lsctInversion || assimilate) {
         const char* labels[] = {"光照土壤温度", "阴影土壤温度", "光照叶片温度", "阴影叶片温度"};
         if (!config.componentsFile.empty()) {
             auto dataset = openRaster(config.componentsFile, "组分温度文件");
@@ -649,7 +785,7 @@ int runImage(const std::string& configPath)
     std::vector<std::vector<float>> solar(2, std::vector<float>(pixels, kNaN));
     // One Hapke directional-emissivity table pair per soil class: dry anchor and saturation anchor.
     std::map<int, MoistureSoilEmissivity> soilEmissivityTables;
-    if ((config.thermalEnabled || config.inversion.enabled()) && config.hapkeSoilEmissivity) {
+    if ((config.thermalEnabled || config.inversion.enabled() || assimilate) && config.hapkeSoilEmissivity) {
         for (int code = 0; code < 256; ++code) {
             if (!typeUsed[code]) continue;
             const auto& entry = classes.classes[code];
@@ -689,10 +825,46 @@ int runImage(const std::string& configPath)
         }
     }
 
+    // ---------------- assimilation ----------------
+    // The analysis replaces the component temperatures (and LAI / soil moisture when they are controls), so every
+    // simulated product of this run is the forward image of the analysed state; the background is kept separately.
+    const double assimilationStart = eb ? 70 : 20, assimilationSpan = assimilate ? (eb ? 15 : 35) : 0;
+    AssimilationResult assimilationResult;
+    std::vector<float> imagingLai = lai;
+    // Terrain of the thermal observation operator, shared by the imaging loop and the assimilation.
+    TerrainFields terrainFields;
+    terrainFields.mode = config.terrainRadiation;
+    terrainFields.slope = &terrainSlope;
+    terrainFields.aspect = &terrainAspect;
+    terrainFields.coneSlope = &coneSlope;
+    terrainFields.coneDensity = &coneDensity;
+    terrainFields.ridgeSlope = &ridgeSlope;
+    terrainFields.ridgeAspect = &ridgeAspect;
+    terrainFields.ridgeDensity = &ridgeDensity;
+    terrainFields.endFraction = config.terrainEndFraction;
+    std::vector<double> thermalWavelengths;
+    for (const auto& band : config.thermalBands) thermalWavelengths.push_back(band.center);
+    if (assimilate) {
+        const AssimilationInputs inputs{config, classes, grid, type, lai, vza, vaa, latitude, longitude, dem, soilMoisture,
+                                        eb ? &diffuseFractionOut : nullptr, eb && !forcingOut.empty() ? &forcingOut[4] : nullptr,
+                                        soilEmissivityTables, terrainFields, leafBandReflectance, leafBandTransmittance,
+                                        soilBandReflectance, startRow, endRow, startColumn, endColumn, overpass, eb,
+                                        eb ? ebSolver : EbSolver{}, assimilationStart, assimilationSpan};
+        assimilationResult = runAssimilation(inputs, components);
+        if (eb) ebComponents = components;
+        components = assimilationResult.components;
+        for (size_t p = 0; p < pixels; ++p) {
+            if (!assimilationResult.analysed[p]) continue;
+            if (std::isfinite(assimilationResult.lai[p])) imagingLai[p] = assimilationResult.lai[p];
+            if (std::isfinite(assimilationResult.soilMoisture[p])) soilMoisture[p] = assimilationResult.soilMoisture[p];
+        }
+    }
+
     long long invalidInput = 0, invalidType = 0, waterPixels = 0, nightPixels = 0, opticalPixels = 0, thermalPixels = 0, thermalFailed = 0, solarFailed = 0;
     std::atomic<int> rowsDone{0};
     const int rowCount = endRow - startRow;
-    const double imageStart = inversionSpan > 0 ? inversionStart + inversionSpan : (eb ? 70 : 25);
+    const double imageStart = assimilationSpan > 0 ? assimilationStart + assimilationSpan
+                            : inversionSpan > 0 ? inversionStart + inversionSpan : (eb ? 70 : 25);
     const double imageSpan = 90 - imageStart;
     progress(imageStart, "逐像元成像");
     #pragma omp parallel for schedule(dynamic, 4) reduction(+:invalidInput, invalidType, waterPixels, nightPixels, opticalPixels, thermalPixels, thermalFailed, solarFailed)
@@ -702,7 +874,7 @@ int runImage(const std::string& configPath)
             const auto* entry = classes.find(type[pixel]);
             if (!entry) { ++invalidType; continue; }
             const float viewZenith = vza[pixel], viewAzimuth = vaa[pixel];
-            const float leafArea = lai[pixel];
+            const float leafArea = imagingLai[pixel];  // analysed LAI when the assimilation controls it
             if (!validLocation(pixel) || !std::isfinite(viewZenith) || viewZenith < 0 || viewZenith >= 90 || !std::isfinite(viewAzimuth) ||
                 viewAzimuth < -360 || viewAzimuth > 360 || !std::isfinite(leafArea) || leafArea < 0 || leafArea > 100) { ++invalidInput; continue; }
             const Sun sun = solarPosition(overpass, latitude[pixel], longitude[pixel], dem[pixel]);
@@ -764,136 +936,27 @@ int runImage(const std::string& configPath)
             }
 
             if (config.thermalEnabled && entry->surface != SurfaceKind::Fill) {
-                if (backface) { ++thermalFailed; continue; }
-                const double leafEmissivity = std::clamp(1.0 - entry->leaf.reflTir - entry->leaf.transTir, 0.01, 1.0);
-                // Dry (class) value: the retrieval convention normalises by it.
-                const double soilEmissivityFixed = std::clamp(static_cast<double>(entry->ground.emissivity), 0.01, 1.0);
-                const bool hapke = config.hapkeSoilEmissivity && entry->groundKind == GroundKind::Soil;
+                // Shared observation operator (app/thermal_view.cpp): the assimilation evaluates exactly this code on
+                // dual numbers, so a simulated image and the analysis operator can never drift apart. Facet slope
+                // geometry and hill / ridge sub-pixel composites are handled inside thermalSceneAt / thermalPixel.
+                ThermalScene scene;
+                if (!thermalSceneAt(terrainFields, pixel, sza, saa, viewZenith, viewAzimuth, scene)) { ++thermalFailed; continue; }
+                setThermalMaterial(scene, config, *entry, soilEmissivityTables, code);
                 // Physical value: wetter soil emits more, so the radiance synthesis uses the water-content value.
                 const double pixelMoisture = std::isfinite(soilMoisture[pixel])
                     ? static_cast<double>(soilMoisture[pixel])
                     : static_cast<double>(classes.defaultSoilMoisture);
-                const double soilEmissivityMoist = entry->groundKind == GroundKind::Soil
-                    ? soilEmissivityAtMoisture(soilEmissivityFixed, config.soilEmissivityWet, pixelMoisture)
-                    : soilEmissivityFixed;
-                const HomCanopy nodes(leafArea);
-                const double relativeLocal = std::fmod(viewAzimuth - saa, 360.0);
-                const auto weightsAt = [&](double localSza, double localView, double soilEmissivityValue, std::array<double, 4>& target) {
-                    target = thermalWeights(nodes, leafArea, entry->canopy.hotspot, localSza, localView, relativeLocal,
-                                            leafEmissivity, soilEmissivityValue);
-                };
-                std::array<double, 4> weights{}, weightsFixed{};
-                weightsAt(thermalSza, thermalView, hapke ? soilEmissivityTables.at(code).at(thermalView, pixelMoisture) : soilEmissivityMoist, weights);
-                // Retrieval convention: the reported LST divides by the fixed dry class emissivity, so the
-                // moisture / view-angle signal stays in the radiance instead of being normalised away.
-                if (config.referenceSurfaceTemperature)
-                    weightsAt(thermalSza, thermalView, soilEmissivityFixed, weightsFixed);
-                else weightsFixed = weights;
-                try {
+                const std::array<double, 4> temperatures{components[0][pixel], components[1][pixel],
+                                                         components[2][pixel], components[3][pixel]};
+                std::vector<double> bandBrightness, bandSurface;
+                if (thermalPixel<double>(scene, temperatures, static_cast<double>(leafArea), pixelMoisture, thermalWavelengths,
+                                         bandBrightness, bandSurface)) {
                     for (size_t band = 0; band < config.thermalBands.size(); ++band) {
-                        const double wavelength = config.thermalBands[band].center;
-                        const bool hillMode = config.terrainRadiation == TerrainRadiation::Hill && !coneSlope.empty();
-                        const bool ridgeMode = config.terrainRadiation == TerrainRadiation::Ridge && !ridgeSlope.empty();
-                        if (hillMode || ridgeMode) {
-                            const double beta = (hillMode ? coneSlope[pixel] : ridgeSlope[pixel]) * kPi / 180.0;
-                            const double coverage = std::clamp(static_cast<double>(hillMode ? coneDensity[pixel] : ridgeDensity[pixel]), 0.0, 1.0);
-                            const double strike = ridgeMode ? ridgeAspect[pixel] * kPi / 180.0 : 0.0;
-                            const int facetCount = hillMode ? 12 : 4;
-                            const double endFraction = std::clamp(config.terrainEndFraction, 0.0, 0.5);
-                            const double vzaRad = viewZenith * kPi / 180.0;
-                            const double vaaRad = viewAzimuth * kPi / 180.0;
-                            const double szaRad = sza * kPi / 180.0;
-                            const double saaRad = saa * kPi / 180.0;
-                            double radiance = 0.0, effective = 0.0, area = 0.0;
-                            const auto addFacet = [&](double localSza, double localView, double facetArea, double cosView) {
-                                std::array<double, 4> w{}, wf{};
-                                const double soilE = hapke ? std::clamp(soilEmissivityTables.at(code).at(localView, pixelMoisture), 0.01, 1.0) : soilEmissivityMoist;
-                                weightsAt(localSza, localView, soilE, w);
-                                if (config.referenceSurfaceTemperature) weightsAt(localSza, localView, soilEmissivityFixed, wf); else wf = w;
-                                double L = 0.0, E = 0.0;
-                                for (int component = 0; component < 4; ++component) {
-                                    const double temperature = components[component][pixel];
-                                    if (!std::isfinite(temperature)) {
-                                        if (w[component] > 0.0 || wf[component] > 0.0) throw std::runtime_error("组分温度无效");
-                                        continue;
-                                    }
-                                    if (w[component] > 0.0) L += w[component] * planck(temperature, wavelength);
-                                    if (wf[component] > 0.0) E += wf[component];
-                                }
-                                const double projection = facetArea * cosView;
-                                radiance += projection * L;
-                                effective += projection * E;
-                                area += projection;
-                            };
-                            for (int facet = 0; facet < facetCount; ++facet) {
-                                double facetBeta = beta;
-                                double facetPhi = 0.0;
-                                double facetWeight = 0.0;
-                                if (hillMode) {
-                                    facetPhi = facet * 30.0 * kPi / 180.0;
-                                    facetWeight = 1.0 / 12.0;
-                                } else if (facet < 2) {
-                                    facetPhi = strike + (facet == 0 ? 0.5 * kPi : -0.5 * kPi);
-                                    facetWeight = 0.5 * (1.0 - endFraction);
-                                } else {
-                                    facetBeta = 0.5 * kPi;
-                                    facetPhi = strike + (facet == 2 ? 0.0 : kPi);
-                                    facetWeight = 0.5 * endFraction;
-                                }
-                                const double cosView = std::cos(facetBeta) * std::cos(vzaRad) +
-                                                       std::sin(facetBeta) * std::sin(vzaRad) * std::cos(vaaRad - facetPhi);
-                                if (cosView <= 0.0) continue;
-                                const double localView = std::acos(std::clamp(cosView, -1.0, 1.0)) * 180.0 / kPi;
-                                const double cosSun = std::cos(facetBeta) * std::cos(szaRad) +
-                                                      std::sin(facetBeta) * std::sin(szaRad) * std::cos(saaRad - facetPhi);
-                                const double localSza = std::acos(std::clamp(cosSun, -1.0, 1.0)) * 180.0 / kPi;
-                                addFacet(localSza, localView, coverage * facetWeight, cosView);
-                            }
-                            {
-                                std::array<double, 4> w{}, wf{};
-                                const double soilE = hapke ? std::clamp(soilEmissivityTables.at(code).at(thermalView, pixelMoisture), 0.01, 1.0) : soilEmissivityMoist;
-                                weightsAt(thermalSza, thermalView, soilE, w);
-                                if (config.referenceSurfaceTemperature) weightsAt(thermalSza, thermalView, soilEmissivityFixed, wf); else wf = w;
-                                double L = 0.0, E = 0.0;
-                                for (int component = 0; component < 4; ++component) {
-                                    const double temperature = components[component][pixel];
-                                    if (!std::isfinite(temperature)) {
-                                        if (w[component] > 0.0 || wf[component] > 0.0) throw std::runtime_error("组分温度无效");
-                                        continue;
-                                    }
-                                    if (w[component] > 0.0) L += w[component] * planck(temperature, wavelength);
-                                    if (wf[component] > 0.0) E += wf[component];
-                                }
-                                const double cosView = std::cos(thermalView * kPi / 180.0);
-                                const double projection = (1.0 - coverage) * cosView;
-                                radiance += projection * L;
-                                effective += projection * E;
-                                area += projection;
-                            }
-                            if (!(radiance > 0.0) || !(area > 0.0)) throw std::runtime_error("无效辐亮度");
-                            const double meanRadiance = radiance / area;
-                            const double meanEffective = std::clamp(effective / area, 1e-6, 1.0);
-                            brightness[band][pixel] = static_cast<float>(inversePlanck(meanRadiance, wavelength));
-                            surfaceTemperature[band][pixel] = static_cast<float>(inversePlanck(meanRadiance / meanEffective, wavelength));
-                        } else {
-                            double radiance = 0.0, effective = 0.0;
-                            for (int component = 0; component < 4; ++component) {
-                                const double temperature = components[component][pixel];
-                                if (!std::isfinite(temperature)) {
-                                    if (weights[component] > 0.0 || weightsFixed[component] > 0.0) throw std::runtime_error("组分温度无效");
-                                    continue;
-                                }
-                                if (weights[component] > 0.0) radiance += weights[component] * planck(temperature, wavelength);
-                                if (weightsFixed[component] > 0.0) effective += weightsFixed[component];
-                            }
-                            if (!(radiance > 0.0)) throw std::runtime_error("无效辐亮度");
-                            effective = std::clamp(effective, 1e-6, 1.0);
-                            brightness[band][pixel] = static_cast<float>(inversePlanck(radiance, wavelength));
-                            surfaceTemperature[band][pixel] = static_cast<float>(inversePlanck(radiance / effective, wavelength));
-                        }
+                        brightness[band][pixel] = static_cast<float>(bandBrightness[band]);
+                        surfaceTemperature[band][pixel] = static_cast<float>(bandSurface[band]);
                     }
                     ++thermalPixels;
-                } catch (const std::exception&) {
+                } else {
                     for (size_t band = 0; band < config.thermalBands.size(); ++band) brightness[band][pixel] = surfaceTemperature[band][pixel] = kNaN;
                     ++thermalFailed;
                 }
@@ -943,6 +1006,12 @@ int runImage(const std::string& configPath)
         summary.Add("inversion", inversionResult.summary);
         if (lsctInversion) temperatureInfo.Add("posterior", "lsct");
     }
+    if (assimilate) {
+        for (const auto& name : assimilationResult.products) products.Add(name);
+        summary.Add("assimilation", assimilationResult.summary);
+        temperatureInfo.Add("posterior", "assimilation");
+        summary.Add("runMode", "assimilation");
+    } else summary.Add("runMode", "simulation");
 
     if (config.opticalEnabled) {
         std::vector<std::string> names;
