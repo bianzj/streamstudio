@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 from datetime import date
 import re
@@ -15,6 +16,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     BaseDocTemplate,
+    CondPageBreak,
     Frame,
     KeepTogether,
     PageBreak,
@@ -37,6 +39,7 @@ FONT_REGULAR = Path(r"C:\Windows\Fonts\Deng.ttf")
 FONT_BOLD = Path(r"C:\Windows\Fonts\Dengb.ttf")
 pdfmetrics.registerFont(TTFont("StreamCN", str(FONT_REGULAR)))
 pdfmetrics.registerFont(TTFont("StreamCN-Bold", str(FONT_BOLD)))
+pdfmetrics.registerFont(TTFont("StreamMath", r"C:\Windows\Fonts\segoeui.ttf"))
 pdfmetrics.registerFontFamily(
     "StreamCN",
     normal="StreamCN",
@@ -123,6 +126,16 @@ def latex_plain(value: str) -> str:
     return value
 
 
+def symbol_markup(value: str) -> str:
+    """Use a covered font for scientific characters missing from the CJK face."""
+    primary = pdfmetrics.getFont("StreamCN").face.charToGlyph
+    fallback = pdfmetrics.getFont("StreamMath").face.charToGlyph
+    return re.sub(r"[^\x00-\x7f]", lambda m:
+                  f'<font name="StreamMath">{m.group(0)}</font>'
+                  if ord(m.group(0)) not in primary and ord(m.group(0)) in fallback
+                  else m.group(0), value)
+
+
 def inline_markup(value: str) -> str:
     value = latex_plain(value)
     value = html.escape(value.strip(), quote=False)
@@ -150,7 +163,7 @@ def inline_markup(value: str) -> str:
         lambda match: f'<font color="#145A78">{codes[int(match.group(1))]}</font>',
         value,
     )
-    return value
+    return symbol_markup(value)
 
 
 def split_table_row(line: str) -> list[str]:
@@ -313,6 +326,30 @@ def make_styles():
 
 
 def code_box(lines: list[str], styles, math_mode: bool = False) -> Table:
+    if math_mode:
+        # Optional vector equations preserve fractions, integrals and subscripts.
+        expression = "\n".join(lines).strip()
+        key = hashlib.sha256(expression.encode("utf-8")).hexdigest()
+        vector = ROOT / "docs" / "figures" / "equations" / f"{key}.svg"
+        if vector.exists():
+            from svglib.svglib import svg2rlg
+            drawing = svg2rlg(str(vector))
+            if drawing is None:
+                raise ValueError(f"Cannot read equation SVG: {vector}")
+            tags = re.findall(r"\\tag\{([^{}]*)\}", expression)
+            scale = min(1.0, 143 * mm / drawing.width)
+            drawing.scale(scale, scale)
+            drawing.width *= scale
+            drawing.height *= scale
+            label = Paragraph(html.escape("; ".join(tags)), styles["table"])
+            return Table([[drawing, label]], colWidths=[150 * mm, 24 * mm], style=TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), PALE),
+                ("BOX", (0, 0), (-1, -1), 0.5, LINE),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3 * mm),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 3 * mm),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3 * mm),
+            ]))
     cleaned = []
     if math_mode:
         # Convert the whole display block at once: \frac numerators and
@@ -322,7 +359,7 @@ def code_box(lines: list[str], styles, math_mode: bool = False) -> Table:
         lines = [re.sub(r"\s+", " ", expression).strip()]
     for line in lines:
         line = line.replace("\t", "    ")
-        cleaned.append(html.escape(line, quote=False) if line else "&#160;")
+        cleaned.append(symbol_markup(html.escape(line, quote=False)) if line else "&#160;")
     paragraph = Paragraph("<br/>".join(cleaned), styles["code"])
     table = Table([[paragraph]], colWidths=[174 * mm], hAlign="LEFT")
     table.setStyle(
@@ -430,7 +467,7 @@ def markdown_story(source: Path, styles):
         if stripped.startswith("## "):
             flush_paragraph()
             if chapter_seen:
-                story.append(PageBreak())
+                story.append(CondPageBreak(70 * mm))
             chapter_seen = True
             heading = Paragraph(inline_markup(stripped[3:]), styles["h1"])
             heading.toc_level = 0
@@ -512,7 +549,7 @@ def cover(title: str, subtitle: str, styles):
         Table(
             [
                 [Paragraph("软件版本", styles["table"]), Paragraph(VERSION, styles["table"])],
-                [Paragraph("工程格式", styles["table"]), Paragraph("schemaVersion = 6", styles["table"])],
+                [Paragraph("工程格式", styles["table"]), Paragraph("三维 v6 / 遥感影像 v2", styles["table"])],
                 [Paragraph("更新日期", styles["table"]), Paragraph(BUILD_DATE, styles["table"])],
             ],
             colWidths=[35 * mm, 70 * mm],
@@ -584,8 +621,8 @@ def main():
     build_manual(
         ROOT / "docs" / "theory-manual.md",
         OUTPUT_DIR / "Stream_Studio_Theory_Manual_CN.pdf",
-        "Stream Studio 理论手册",
-        "三维辐射传输、能量平衡与多过程耦合基础",
+        "Stream Studio 理论与方法",
+        "三维与遥感像元：辐射传输、能量平衡和同化",
     )
     print(OUTPUT_DIR / "Stream_Studio_User_Manual_CN.pdf")
     print(OUTPUT_DIR / "Stream_Studio_Theory_Manual_CN.pdf")

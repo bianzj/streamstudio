@@ -3,7 +3,7 @@
 Stream Studio 中与 HiStream 三维引擎相互独立的影像级引擎：一次运行对应一个过境时刻，输出整景光学反射率、热红外亮温与方向温度。组分温度有两种来源：
 
 - **RT**：已知组分温度，直接给出 Tss/Tsh/Tcs/Tch（常数、单波段/24 波段栅格，或 4 波段 `components.tif`）；
-- **EB**：未知温度，由 ERA5 / ERA5-Land 逐小时数据（一天到一年的数据包）驱动，从过境当天 00 UTC 逐时次求解四组分能量平衡到过境时刻，再成像。物理与默认值对齐 TiRT/TIRTEB：`hom3` 节点辐射度全阶长波与短波、均匀冠层标准热点闭合、Raupach 气动阻抗（含对流阵风与 400 s m⁻¹ 分段限幅）、Farquhar 气孔 `g0` 下限、1/L 割线稳定度、7 h 表面热历史或 2 m 土柱。
+- **EB**：未知温度，由 ERA5 / ERA5-Land 逐小时数据（一天到一年的数据包）驱动，从过境当天 00 UTC 逐时次求解四组分能量平衡到过境时刻，再成像。物理与默认值对齐 TiRT/TIRTEB：`hom3` 节点辐射度全阶长波与短波、均匀冠层标准热点闭合、Raupach 气动阻抗（含对流阵风与 400 s m⁻¹ 分段限幅）、Farquhar 气孔 `g0` 下限、1/L 松弛稳定度、7 h 表面热历史或 2 m 土柱。
 
 本目录是 STREAM 的唯一源码；物理基准、模块对照以及与 TIRTEB 的有意差异见 [PORTING.md](PORTING.md)。
 
@@ -65,7 +65,7 @@ stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...
 | --- | --- | --- |
 | `scheme` | `tirt` | 仅接受 `tirt`（兼容旧值 `tirt-analytic`） |
 | `soilHeatMethod` | `surface` | `surface` 7 h 温度历史；`depth` 2 m 土柱；`direct` 净辐射比例 |
-| `temperatureMethod` | `robust` | `robust`（WC=0.08 残差修正）或 `direct`（含潜热导数的近似导数） |
+| `temperatureMethod` | `robust` | `robust`（0.8 阻尼牛顿，单步最多 5 K）或 `direct`（含潜热导数的近似导数） |
 | `diffuseFraction` | `0.2` | 直/散分配；`-1` 为 Erbs 反算 |
 | `enforceSolarLimit` | `true` | 晴空 DNI 上限，超出直射转漫射 |
 | `soilResistance.method` | `constant` | `constant` 或 `sellers`（含水量关系） |

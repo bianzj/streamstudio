@@ -22,7 +22,7 @@ constexpr double kMH2O = 18.0;
 constexpr double kSigma = 5.67e-8;
 constexpr double kResidualThreshold = 5.0;
 constexpr double kInnerThreshold = 1e-4;
-// DEFERRED[低] 可维护性: 实现与文档不一致：PORTING/README 写的是 robust=WC 0.08 残差修正、单步 ±1.5 K、1/L 割线 + 符号区间（容差 1e-7+1e-6|target|），代码实际是 0.8 阻尼牛顿、单步 kMaxStep=5 K、1/L 按 0.5 松弛（容差 1e-4+2%|target|）；建议：统一文档与 scene_summary 元数据，或恢复文档所述算法
+// Keep README, PORTING and scene_summary stability descriptions consistent with these tolerances.
 constexpr double kNewtonRelaxRobust = 0.8;   // damped Newton for the default "robust" temperature method
 constexpr double kInnerResidual = 0.5;       // W m-2, component energy-balance residual for convergence
 constexpr double kGustTolerance = 1.0;       // W m-2, scene sensible heat used for the convective gust velocity

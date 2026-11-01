@@ -2,7 +2,26 @@
 
 Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两个相互独立的引擎：STREAM 影像级引擎（`stream.exe`）和 STREAM 的高分辨率三维扩展 HiStream（`histream.exe`）。源码、编译结果和运行文件均集中在本项目目录。
 
-当前版本 **2.0.0**：产品已从 HiStream Studio 更名为 Stream Studio，并集成 STREAM 影像级引擎。应用标识改为 `cn.stream.studio`，桌面程序为 `StreamStudio.exe`，安装包为 `Stream-Studio-Setup-<version>-x64-slim.exe`。由于应用标识改变，安装前请先卸载旧版；用户数据首次启动时从旧版目录迁移到 `%APPDATA%\Stream Studio`，桌面数据目录改为 `%LOCALAPPDATA%\StreamStudio`，默认输出与示例目录改为 `文档\Stream Studio`，环境变量前缀为 `STREAM_STUDIO_*`。2.0 的兼容边界见 [2.0 发布说明](docs/release-2.0.0.md)；1.1.4 的功能变更见 [1.1.4 发布说明](docs/release-1.1.4.md)，基础修复见 [1.1.3 修复说明](docs/release-1.1.3.md)。
+当前版本 **2.0.1**，发布内容与验证范围见 [2.0.1 发布说明](docs/release-2.0.1.md)。
+
+下载：[Windows 安装程序、手册与案例包](https://github.com/bianzj/streamstudio/releases/tag/v2.0.1)。
+
+产品已从 HiStream Studio 更名为 Stream Studio，并集成 STREAM 影像级引擎。应用标识改为 `cn.stream.studio`，桌面程序为 `StreamStudio.exe`，安装包为 `Stream-Studio-Setup-<version>-x64-slim.exe`。由于应用标识改变，安装前请先卸载旧版；用户数据首次启动时从旧版目录迁移到 `%APPDATA%\Stream Studio`，桌面数据目录改为 `%LOCALAPPDATA%\StreamStudio`，默认输出与示例目录改为 `文档\Stream Studio`，环境变量前缀为 `STREAM_STUDIO_*`。命名迁移历史见 [2.0 历史发布说明](docs/release-2.0.0.md)；1.1.4 的功能变更见 [1.1.4 发布说明](docs/release-1.1.4.md)，基础修复见 [1.1.3 修复说明](docs/release-1.1.3.md)。
+
+## 安装与案例入口
+
+本机已有交付按以下入口使用：
+
+| 内容 | 入口 |
+| --- | --- |
+| Windows x64 安装包、两本手册、测试报告与验证记录 | `D:\releases\StreamStudio\2.0.1`；安装器为 `Stream-Studio-Setup-2.0.1-x64-slim.exe` |
+| 五个内置精选案例 | 安装后从案例库打开；源码索引为 [`assets/examples/catalog.json`](assets/examples/catalog.json) |
+| 九个外部培训案例 | `D:\examples`；单独分发包为 `D:\releases\StreamStudio\StreamStudio-案例包-20261031.zip` |
+| 案例分类与研究资料导航 | [案例库与培训目录](docs/example-library.md) |
+
+五个内置案例为玉米、森林、城市、MODIS-ERA5 和 Landsat-ERA5。外部案例按各自 `README.md` 操作，从 `project.json` 打开；LSCT 条目读取已有组分温度，用于 RT 演示。上述磁盘路径为当前开发机的交付位置，分发后以解压位置为准。
+
+2.0.1 已有发布报告记录七项运行检查和三个 4×4 像元区域的数值核查。干净 Windows 环境的安装/升级/卸载、全部三维模式、同化与温度反演的专项验证仍待完成；详见 [2.0.1 发布说明](docs/release-2.0.1.md)。
 
 ## 命名约定
 
@@ -69,7 +88,7 @@ Stream Studio 内置两个互相独立的引擎：HiStream（`histream.exe`）�
 菜单栏“遥感影像模拟”打开 STREAM 工作台。一次模拟对应一个 UTC 过境时刻，输入地表类型 IGBP、LAI、土壤水分、DEM、经纬度（可由 GeoTIFF 地理参考换算）和观测天顶/方位角，得到整景光学反射率（PROSPECT + BSM + STREAM 方向闭合）和热红外亮温。组分温度有两种来源：
 
 - **RT**：已知组分温度，给出 Tss/Tsh/Tcs/Tch（常数、栅格或 4 波段组分温度文件）；
-- **EB**：未知温度，用登记好的 ERA5 / ERA5-Land 数据包（一天到一年均可）驱动，从过境当天 00 UTC 逐时次求解四组分能量平衡（tirt 解析长波、Farquhar 气孔、强迫–恢复土壤热）到过境时刻；土壤水分取 ERA5 或用户输入，城市按四组分简化。内置示例“北京市 Landsat 影像-ERA5 单日驱动”附带 2019-08-15 单日 ERA5 数据。
+- **EB**：未知温度，用登记好的 ERA5 / ERA5-Land 数据包（一天到一年均可）驱动，从过境当天 00 UTC 逐时次求解四组分能量平衡（`hom3` 节点辐射度、Farquhar 气孔；土壤热默认采用 7 h 表面温度历史卷积）到过境时刻；土壤水分取 ERA5 或用户输入，城市按四组分简化。内置示例“北京市 Landsat 影像-ERA5 单日驱动”附带 2019-08-15 单日 ERA5 数据。
 
 结果为保留原网格和坐标系的 GeoTIFF。使用方法见[模型使用手册 5.2 节](docs/user-manual.md#52-遥感影像模拟stream)，引擎与物理模块说明见 [models/stream/README.md](models/stream/README.md) 和 [models/stream/PORTING.md](models/stream/PORTING.md)。
 

@@ -10,7 +10,7 @@
 | `physics/radiosity.*` | `base/node_radiosity.py` 的 `hom3` 调度、`base/canopy_closure.py` | 均匀冠层两层的 5 状态节点系统：交换因子、全阶短波/长波、有效发射率、方向多次散射 |
 | `physics/canopy.*` | `base/canopy_closure.py` fractions/reflectance、`base/hotspot.py`、`base/row_closure.py`、`base/vnir.py` | 均匀冠层标准闭合：双尺度热点、两层光照叶近似、球面叶片一次散射系数 |
 | `physics/shortwave.*` | `base/tirteb_radiation.py` `_plane_prepare_shortwave`、`base/radiation.py` 直散分配 | 默认 50 nm 分组（约 41 个波段）节点辐射度吸收，`spectralBinNm` 可设 1 做 1 nm 全谱；0.8/0.2 直散分配、晴空 DNI 限幅、PAR |
-| `physics/energy.*` | `base/pipeline.py`、`base/aerodynamic.py`、`base/eb.py`、`base/biochemical.py`、`base/evapo.py` | TIRTEB 组件能量平衡、气动/气孔阻抗、温度修正、1/L 割线求解 |
+| `physics/energy.*` | `base/pipeline.py`、`base/aerodynamic.py`、`base/eb.py`、`base/biochemical.py`、`base/evapo.py` | TIRTEB 组件能量平衡、气动/气孔阻抗、温度修正、1/L 松弛求解 |
 | `physics/heat_conduction.*` | `base/heat_conduction.py` | `surface` 7 h 温度历史卷积（TIRTEB 为 48 h）、`depth` 2 m 土柱（16 节点，向后欧拉） |
 | `physics/brightness.h` | `base/brightness.py` / TiRT c1、c2 | Planck 辐亮度与反演亮温 |
 | `forcing/*` | 无（TiRT 读 CSV 气象） | 直接读 ERA5 / ERA5-Land NetCDF |
@@ -26,7 +26,7 @@
 - **气动**：Raupach `d`、`z0`（`G1=max(3.3,(Cs+Cr·LAI/2)^-1/2)`），冠层上方/叶边界/冠层内到土壤分段阻抗，每段上限 400 s m⁻¹；有效风速 `sqrt(u²+wstar²)`，`wstar` 由场景显热；LAI<0.5 时按 smoothstep 混合到裸土；稳定层结全廓线统一 `xeff=min(1/L,1/zref)`。
 - **气孔**：Farquhar/Ball-Berry，净光合 ≤0 时不再取 625000 s m⁻¹，而是 `stomatal_g0=0.01 mol m⁻² s⁻¹` 下限；阻抗换算用 `rho_air/M_air`。
 - **温度修正**：默认 `temperature_method=robust`（0.8 阻尼、单步上限 5 K，最多 50 次迭代），可设 `direct`（含潜热导数的近似导数）；温度保护范围 240–380 K。
-- **稳定度**：内层残差 ≤1e-4 W m⁻² 且阵风 H 残差 ≤1e-4 才进入符号区间；`1/L` 只用 H（`-κgH/(ρcpTa u*³)`），区间割线限 10%–90%，容差 `1e-7+1e-6|target|+|c|·1e-4/u*³`。
+- **稳定度**：`1/L` 按 0.5 松弛更新，限制在 ±5 m⁻¹，目标仅使用 H（`-κgH/(ρcpTa u*³)`）。迭代中要求组分最大能量残差 ≤0.5 W m⁻²、阵风显热残差 ≤1 W m⁻²、稳定度残差 ≤`1e-4+0.02|target|` m⁻¹。返回前重新计算，最终验收分别使用 5 W m⁻²、2 W m⁻²及两倍上述稳定度容差；最终 QA 与迭代提前退出条件不同。
 - **土壤热**：默认 `surface`（7 h 温度历史卷积，保存真实时间间隔）；`depth` 为 2 m 土柱，表层通量含半格储热；`direct` 为 `G = f·Rn`。
 - **初值**：土壤与叶片取首日平均气温；热历史与土柱从该温度自洽推进。
 - **水体（17）**：不求能量平衡，四组分取过境时刻插值的 ERA5 `skt`。

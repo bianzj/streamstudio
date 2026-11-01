@@ -1095,8 +1095,7 @@ int runImage(const std::string& configPath)
         temperatureInfo.Add("solvedPixels", static_cast<GInt64>(ebPixels));
         temperatureInfo.Add("convergedPixels", static_cast<GInt64>(ebConverged));
         temperatureInfo.Add("stabilityConvergedPixels", static_cast<GInt64>(ebStable));
-        // DEFERRED[低] 可维护性: 这段元数据写的是"1/L 割线 + 符号区间，容差 1e-7+1e-6|target|"，但 energy.cpp 实际是 0.5 松弛迭代，容差 1e-4+2%|target|，结果文件描述与实现不符；建议：按实现更新文字（README/PORTING 同理）
-        temperatureInfo.Add("stability", "Monin-Obukhov coupled solve: 1/L secant with sign bracket, H-only buoyancy, tolerance 1e-7 + 1e-6|target|");
+        temperatureInfo.Add("stability", "Monin-Obukhov coupled solve: 1/L fixed-point relaxation 0.5, H-only buoyancy; iteration tolerance 1e-4 + 0.02|target| (m-1), final acceptance 2x iteration tolerance");
         temperatureInfo.Add("energyScheme", "tirt");
         temperatureInfo.Add("soilHeatMethod", config.soilHeatMethod == SoilHeatMethod::Depth ? "depth" :
                                                config.soilHeatMethod == SoilHeatMethod::Surface ? "surface" : "direct");
