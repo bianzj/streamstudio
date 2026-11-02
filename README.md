@@ -10,18 +10,18 @@ Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两�
 
 ## 安装与案例入口
 
-本机已有交付按以下入口使用：
+开发源码、测试和文档位于 C:/work/streamstudio，通过 GitHub 进行日常更新；小更新以相关测试检查为准，不自动升级为正式发布。完整约定见 [开发更新与用户发布](docs/development-and-release.md)。
 
 | 内容 | 入口 |
 | --- | --- |
-| Windows x64 安装包、两本手册、测试报告与验证记录 | `D:\releases\StreamStudio\2.0.1`；安装器为 `Stream-Studio-Setup-2.0.1-x64-slim.exe` |
-| 五个内置精选案例 | 安装后从案例库打开；源码索引为 [`assets/examples/catalog.json`](assets/examples/catalog.json) |
-| 九个外部培训案例 | `D:\examples`；单独分发包为 `D:\releases\StreamStudio\StreamStudio-案例包-20261031.zip` |
-| 案例分类与研究资料导航 | [案例库与培训目录](docs/example-library.md) |
+| 用户安装包、两本手册、四个核验案例 | D:/发布/streamstudio/2.0.1 |
+| 五个原有内置精选案例 | 安装后从案例库打开；源码索引 [assets/examples/catalog.json](assets/examples/catalog.json) |
+| 九个培训候选与研究导航 | 原 D:/examples 保留；见 [案例目录](docs/example-library.md) |
+| 测试脚本和验收摘要 | tools/check-user-release-cases.mjs、[本次验收范围](docs/testing/user-release-cases-20261101.md) |
 
-五个内置案例为玉米、森林、城市、MODIS-ERA5 和 Landsat-ERA5。外部案例按各自 `README.md` 操作，从 `project.json` 打开；LSCT 条目读取已有组分温度，用于 RT 演示。上述磁盘路径为当前开发机的交付位置，分发后以解压位置为准。
+随附四例为 MODIS-ERA5、Landsat-ERA5、MODIS-LSCT、Landsat-LSCT；默认 4×4 区域已通过影像引擎检查。请先将案例文件夹复制到全英文可写路径，再在软件中打开 project.json；当前 ERA5 读取不能保证支持中文路径。LSCT 条目读取已有组分温度用于正向模拟，不做温度反演。
 
-2.0.1 已有发布报告记录七项运行检查和三个 4×4 像元区域的数值核查。干净 Windows 环境的安装/升级/卸载、全部三维模式、同化与温度反演的专项验证仍待完成；详见 [2.0.1 发布说明](docs/release-2.0.1.md)。
+本次不改安装器和版本号。干净环境安装、全部三维模式及科学精度等尚未完成的验收仍保留原范围，见 [2.0.1 发布说明](docs/release-2.0.1.md)。
 
 ## 命名约定
 
@@ -150,7 +150,7 @@ CMake 编译仍需要本机 Vulkan SDK、Visual Studio 和 vcpkg 依赖。`eFace
 
 ## SCOPE 对比资料
 
-唯一保留的一组对比资料位于本机外部目录 `D:\cases\StreamStudio\模型对比\SCOPE`，不随项目源码或安装包分发。只有用户明确要求与 SCOPE 对比时才执行；日常开发、修复、构建、打包和发布不运行任何测试或对比。历史对比说明与结果保存在该目录。
+唯一保留的一组对比资料位于本机外部目录 `D:\cases\StreamStudio\模型对比\SCOPE`，不随项目源码或安装包分发。只有用户明确要求与 SCOPE 对比时才执行；日常开发仅做当前任务相关测试，不自动运行 SCOPE 对比或扩大为正式发布。历史对比说明与结果保存在该目录。
 
 ## 主要参考文献
 

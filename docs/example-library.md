@@ -1,5 +1,11 @@
 # 案例库与培训目录
 
+## 用户发布
+
+D:/发布/streamstudio/2.0.1 将安装器、用户手册和四个已核验的影像案例放在同一版本目录。examples 下为 MODIS-ERA5、Landsat-ERA5、MODIS-LSCT、Landsat-LSCT，默认 4×4、2 线程；运行前复制到全英文可写路径。详见 [验收记录](testing/user-release-cases-20261101.md)。五个外部三维培训候选尚无本轮完整运行验收，保留在原 D:/examples 和研究归档，不把它们标为本轮验收交付。安装器原内置案例保持不变。
+
+完整研究历史与维护资料不自动进入用户发布。此前误归集的大包完整保存在 D:/cases/StreamStudio/发布整理归档/20261101-开发与研究资料。
+
 ## 项目内部
 
 assets/examples提供五个精选案例：玉米、森林、城市、MODIS能量平衡、Landsat能量平衡。唯一内置索引为assets/examples/catalog.json；玉米曲面光伏技术演示已撤下。
