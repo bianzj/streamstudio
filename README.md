@@ -14,7 +14,7 @@ Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两�
 
 | 内容 | 入口 |
 | --- | --- |
-| 用户安装包、两本手册、九个随附案例（四个已核验影像案例 + 五个三维培训案例） | D:/发布/streamstudio/2.0.1；见 [案例目录](docs/example-library.md) |
+| 用户安装包、两本手册、九个随附案例（四个已核验影像案例 + 五个三维培训案例） | D:/releases/streamstudio/2.0.1；见 [案例目录](docs/example-library.md) |
 | 五个原有内置精选案例 | 安装后从案例库打开；源码索引 [assets/examples/catalog.json](assets/examples/catalog.json) |
 | 研究案例与导航 | D:/cases/StreamStudio；原 D:/examples 已于 2026-11-04 并入发布目录 |
 | 测试脚本和验收摘要 | tools/check-user-release-cases.mjs、[本次验收范围](docs/testing/user-release-cases-20261101.md) |
