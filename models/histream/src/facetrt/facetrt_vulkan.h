@@ -89,6 +89,11 @@ struct EnergySnapshot
     std::vector<SurfaceOptics> optics;
     SolveResult radiation;
 };
+struct EnergyStatistics
+{
+    std::array<float, 5> maxima{};
+    uint32_t failingFacets{};
+};
 
 struct SpectralPush
 {
@@ -166,7 +171,7 @@ class FacetrtVulkan
     void beginEnergyNode(const EnergyPush &push, const std::vector<float> &parameters, const std::vector<float> &inputs,
                          const std::vector<float> &temperatures);
     void updateEnergyInputs(const std::vector<float> &inputs);
-    std::array<float, 5> evaluateEnergy(float skyRadiosity);
+    EnergyStatistics evaluateEnergy(float skyRadiosity);
     float updateEnergyTemperature();
     EnergySnapshot readEnergyState(bool includeRadiation = false);
 
@@ -233,7 +238,7 @@ class FacetrtVulkan
     void computeBarrier(VkCommandBuffer commandBuffer) const;
     void recordSpectral(VkCommandBuffer commandBuffer, const SpectralPush &push);
     void destroySpectralResources();
-    std::array<float, 5> readEnergyStatistics();
+    EnergyStatistics readEnergyStatistics();
 
     void destroyVisibilityResources();
     void destroySolveResources();

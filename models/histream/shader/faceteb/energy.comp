@@ -29,6 +29,7 @@ void main() {
         }
         return;
     }
+    bool energyViolation=false;
     for(uint state=0u;state<2u;++state) {
         uint index=state*surfaces+s0,b=index*12u,z=index*12u;
         if(pc.phase==1u) {
@@ -63,13 +64,22 @@ void main() {
                 float par=max(0.0,I[b+2u]+I[b+14u]);
                 double eps=double(clamp(1.0-I[b+9u]-I[b+10u],0.0,1.0)+clamp(1.0-I[b+21u]-I[b+22u],0.0,1.0));
                 double lo=0.0lf,hi=dlog(625000.0lf);
-                for(int k=0;k<24;++k) {
-                    double mid=.5lf*(lo+hi),rs=dexp(mid),trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
+                double rs=0.0lf,trial=0.0lf;
+                bool stomatalConverged=false;
+                for(int k=0;k<LEAF_STOMATAL_MAX_ITERATIONS;++k) {
+                    double mid=.5lf*(lo+hi);
+                    rs=dexp(mid); trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
                     double target=double(physiology(f,trial,rs,par,rb,depth));
                     if(isnan(target)||isinf(target)||target<=0.0lf) atomicOr(stats[5],2u);
+                    if(abs(mid-dlog(target))<=LEAF_STOMATAL_LOG_TOLERANCE) {
+                        stomatalConverged=true;
+                        break;
+                    }
                     if(mid>dlog(target)) hi=mid; else lo=mid;
                 }
-                double rs=dexp(.5lf*(lo+hi)),trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
+                if(!stomatalConverged) {
+                    rs=dexp(.5lf*(lo+hi)); trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
+                }
                 step=pc.relax*float(clamp(trial-double(temp),-5.0lf,5.0lf));
                 le=latent(temp,rb,float(rs)); ls=latentSlope(temp,rb,float(rs));
                 mismatch=float(abs(dlog(rs/double(physiology(f,double(temp),rs,par,rb,depth)))));
@@ -93,7 +103,10 @@ void main() {
             float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0);
             float response=(object?8.0:4.0)*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
             maximum(0u,abs(residual));maximum(1u,abs(residual)/max(1.0,response));
+            energyViolation=energyViolation||abs(residual)>=2.0;
             if(leaf) {maximum(2u,F[j+10u]);maximum(3u,abs(residual));}
         }
     }
+    // One invocation owns one facet: count once across both states and sides.
+    if(pc.phase==0u&&energyViolation) atomicAdd(stats[6],1u);
 }

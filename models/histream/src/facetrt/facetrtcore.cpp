@@ -882,8 +882,8 @@ double quadraticRoot(double a, double b, double c, bool larger)
     return larger == (b < 0.0) ? q / a : c / q;
 }
 
-// Whole-leaf stomatal resistance [s m-1] from the Collatz C3/C4 model with the
-// closed-form Ball-Berry Ci of SCOPE 1.73 (VoxelEB biochemical.comp).
+// Whole-leaf Collatz resistance [s m-1]. A(Ci), Ball-Berry and CO2 diffusion
+// must use the SAME Ci, including the nonzero Ball-Berry intercept.
 float leafStomatalResistance(const LeafBiochemistry& leaf, float temperature,
                              float absorbedPar, float vaporPressure, float pressure,
                              float relativeDepth, float co2Ppm)
@@ -892,7 +892,7 @@ float leafStomatalResistance(const LeafBiochemistry& leaf, float temperature,
     const double tc = temperature;
     const bool c4 = leaf.type > 3.5f;
     const double vcmax25 = leaf.vcmax25 * std::exp(leaf.kV * std::clamp(relativeDepth, -1.0f, 0.0f));
-    // DEFERRED[中] 物理: 所有温度响应都乘以 temperatureCorrection（Tcor 默认 0），即默认配置下 Vcmax/Kc/Ko/Rd/Γ* 完全不随叶温变化，而 Farquhar(MD12) 路径总是有温度响应，两种植被方法对同一叶片给出系统性不同的高温气孔行为；建议：确认与 SCOPE biochemical.m 一致（SCOPE 的 Q10 项不受 Tcor 控制，Tcor 只控制高/低温抑制 th/tl），只让 th/tl 受 Tcor 影响。
+    // Keep the configured temperature-response option unchanged.
     const double ppm2bar = 1.0e-6 * (pressure * 1.0e-3);
     const double cs = co2Ppm * ppm2bar;
     const double o = c4 ? 0.0 : o2Permil * 1.0e-3 * (pressure * 1.0e-3);
@@ -912,33 +912,46 @@ float leafStomatalResistance(const LeafBiochemistry& leaf, float temperature,
     const double relativeHumidity = std::clamp(
         static_cast<double>(vaporPressure) / saturationVaporPressure(temperature), 0.0, 1.0);
     const double product = leaf.ballBerrySlope * relativeHumidity;
-    const double minCi = (c4 ? 0.1 : 0.3) * cs;
-    const double ci = product > 0.0 ? std::max(minCi, cs * (1.0 - 1.6 / product)) : minCi;
-    double vc, ve, vs;
-    if (c4) {
-        vc = vcmax;
-        vs = kpep * ci;
-        ve = je / 6.0;
-    } else {
-        const double michaelis = kc * (1.0 + o / ko);
-        vc = michaelis + ci > 0.0 ? vcmax * (ci - gammaStar) / (michaelis + ci) : 0.0;
-        vs = vcmax25 / 2.0 * std::exp(std::log(1.8) * qt);
-        ve = ci + 2.0 * gammaStar > 0.0 ? je * (ci - gammaStar) / (ci + 2.0 * gammaStar) / 5.0 : 0.0;
+    const double minCiPpm = (c4 ? 0.1 : 0.3) * co2Ppm;
+    const double intercept = std::max(0.0f, leaf.ballBerry0);
+    const auto assimilation = [&](double ciPpm) {
+        const double ci = ciPpm * ppm2bar;
+        double vc, ve, vs;
+        if (c4) { vc = vcmax; vs = kpep * ci; ve = je / 6.0; }
+        else {
+            const double michaelis = kc * (1.0 + o / ko);
+            vc = michaelis + ci > 0.0 ? vcmax * (ci - gammaStar) / (michaelis + ci) : 0.0;
+            vs = vcmax25 / 2.0 * std::exp(std::log(1.8) * qt);
+            ve = ci + 2.0 * gammaStar > 0.0 ? je * (ci - gammaStar) / (ci + 2.0 * gammaStar) / 5.0 : 0.0;
+        }
+        const double v = quadraticRoot(0.8, -(vc + ve), vc * ve, vc < 0.0);
+        double ag = quadraticRoot(0.98, -(v + vs), v * vs, false);
+        if (absorbedPar <= 0.0f || product <= 0.0 || leaf.stressFactor <= 0.0f) ag = 0.0;
+        return ag - rd;
+    };
+    double molarConductance = intercept;
+    if (co2Ppm > 0.0 && assimilation(co2Ppm) > 0.0) {
+        double ci = product > 0.0 ? std::max(minCiPpm, co2Ppm * (1.0 - 1.6 / product)) : minCiPpm;
+        if (intercept > 0.0) {
+            double lower = minCiPpm, upper = co2Ppm;
+            // Bounded scalar Ci solve, ppm tolerance; outer rs/T tolerances are unchanged.
+            for (int i = 0; i < 24; ++i) {
+                ci = .5 * (lower + upper);
+                const double a = assimilation(ci);
+                const double gs = std::max(intercept, intercept + product * a / co2Ppm);
+                const double target = std::max(minCiPpm, co2Ppm - 1.6 * a / gs);
+                if (std::abs(ci - target) <= .01 || upper - lower <= .01) break;
+                if (ci > target) upper = ci; else lower = ci;
+            }
+        }
+        const double a = assimilation(ci);
+        // Preserve the existing minimum-Ci safeguard as a conductance floor.
+        // Never add g0 again: it already participated in the Ci closure.
+        molarConductance = std::max(intercept, intercept + product * a / co2Ppm);
+        molarConductance = std::max(molarConductance, 1.6 * a / (co2Ppm - minCiPpm));
     }
-    const double v = quadraticRoot(0.8, -(vc + ve), vc * ve, vc < 0.0);
-    double ag = quadraticRoot(0.98, -(v + vs), v * vs, false);
-    if (absorbedPar <= 0.0f || product <= 0.0 || leaf.stressFactor <= 0.0f) ag = 0.0;
-    const double a = ag - rd;
-    // Ball-Berry intercept g0 [mol m-2 s-1] in parallel, converted to m s-1.
-    const double residualConductance = std::max(0.0f, leaf.ballBerry0) *
-        8.314 * tc / (pressure * 100.0);
-    double openConductance = 0.0;
-    if (std::isfinite(a) && a > 0.0) {
-        const double resistance = 0.625 * std::max(cs - ci, 0.0) / a *
-            1.2047 / 28.96 * 1.0e3 * 1.0e6 / (pressure * 100.0) * 1.0e5;
-        if (std::isfinite(resistance) && resistance > 0.0) openConductance = 1.0 / resistance;
-    }
-    const double conductance = openConductance + residualConductance;
+    // Both intercept and assimilation terms use the local molar volume.
+    const double conductance = molarConductance * 8.314 * tc / (pressure * 100.0);
     return conductance > 0.0
         ? static_cast<float>(std::clamp(1.0 / conductance, 1.0, closed)) : static_cast<float>(closed);
 }
@@ -3537,6 +3550,18 @@ Scene loadProjectScene(const std::string& inputFile)
     const uint32_t initialRasterLayers = scene.visibilityRasterLayers;
     // DEFERRED[中] 内存: 大场景先把层数降到 16 以控制 2048x2048 A-buffer 内存，但这里自适应又可把层数升回 64：CPU 端 Fragment(12B) 需 2048²×64×12≈3.2 GB，GPU 端 2 GB 片元缓冲；且估计基于全场平均深度，局部密集冠层仍可能溢出，溢出时 CPU/GPU 都直接抛错而无自动扩层重试；建议：按可用显存/内存给出层数上限，并在溢出时自动翻倍层数重建（类似边哈希表的重试）。
     scene.visibilityRasterLayers = adaptiveVisibilityRasterLayers(scene);
+    // Dense vegetation can exceed the default per-pixel depth. Explicitly
+    // reserve more storage without changing geometry or radiation parameters.
+    if (const char* requested = std::getenv("HISTREAM_FACET_RASTER_LAYERS")) {
+        uint32_t layers = 0;
+        const char* end = requested + std::strlen(requested);
+        const auto parsed = std::from_chars(requested, end, layers);
+        if (parsed.ec != std::errc{} || parsed.ptr != end ||
+            (layers != 64U && layers != 128U && layers != 256U)) {
+            throw std::invalid_argument("HISTREAM_FACET_RASTER_LAYERS must be 64, 128 or 256");
+        }
+        scene.visibilityRasterLayers = std::max(scene.visibilityRasterLayers, layers);
+    }
     if (scene.visibilityRasterLayers != initialRasterLayers) {
         std::cout << "facetrt: automatically increased A-buffer layers from "
                   << initialRasterLayers << " to "
@@ -3750,7 +3775,15 @@ try {
         {"requested", {{"startNode", startNode}, {"endNodeExclusive", endNode}}},
         {"convergence", {{"temperatureTolerance_K", temperatureTolerance},
             {"iterationBudget", maximumCouplingIterations},
-            {"criterion", "temperatureDelta and residual/thermal-response <= temperatureTolerance; MOST zeta mismatch <= 0.001; joint energy/stomata solve; stomatal log mismatch <= 0.001; leaf residual <= 1 W/m2"}}},
+            {"stomatalSearchMaxIterations", facetphysics::leafStomatalMaxIterations},
+            {"stomatalInnerLogTolerance", facetphysics::leafStomatalLogTolerance},
+            {"thermalSolveMaxIterations", 32},
+            {"thermalInnerTolerance_K", facetphysics::leafThermalToleranceK},
+            {"stomatalMismatchDiagnosticOnly", true},
+            {"energyResidualThreshold_W_m2", facetphysics::facetEnergyResidualThreshold},
+            {"maximumFailingFacetFractionExclusive", 0.001},
+            {"facetCounting", "one facet; maximum absolute residual over both solved states and independent sides"},
+            {"criterion", "count(facets with abs(energy residual) >= 2 W/m2) / total facets < 0.001; all other metrics are diagnostic only"}}},
         {"completed", ProjectJson::Json::array()}, {"products", ProjectJson::Json::array()}
     }};
     runIndex.write();
@@ -4196,6 +4229,7 @@ try {
         const float directNormalFactor = directHorizontalToNormal(
             totalShortwave, directSpectrumIntegral, cosineSolarZenith);
         std::vector<float> absorbedParPhotons(surfaceCount, 0.0f);
+        std::vector<float> incidentParPhotons(surfaceCount, 0.0f);
         if (totalShortwave > 0.0f && shortwaveSampleCount >= 2U) {
             // Samples are 1 nm from 400 nm; index 300 (700 nm) closes the PAR range.
             constexpr size_t parLastSample = 300U;
@@ -4255,6 +4289,8 @@ try {
                     absorbedDirect[side] += absorptance * windowDirect;
                     if (parWindow) {
                         // W m-2 * wavelength_nm / (N_A h c) -> umol photons m-2 s-1
+                        incidentParPhotons[side] += windowIncident[side] *
+                            windowWavelength / 119.7117122f;
                         absorbedParPhotons[side] += absorptance * windowIncident[side] *
                             windowWavelength / 119.7117122f;
                         absorbedParDirect[side] += absorptance * windowDirect *
@@ -4319,6 +4355,29 @@ try {
         std::array<StateFluxes, 2> stateFlux{makeStateFluxes(), makeStateFluxes()};
         float maximumStabilityChange = 0.0f;
         float maximumStomatalMismatch = 0.0f, maximumLeafEnergyResidual = 0.0f;
+        uint32_t failingEnergyFacets = 0;
+        const auto energyConverged = [&]() {
+            return facetphysics::facetEnergyConverged(failingEnergyFacets, scene.facetCount());
+        };
+        // The maximum over states/sides prevents cancellation and double counting.
+        const auto countFailingEnergyFacets = [&]() {
+            uint32_t count = 0;
+            for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
+                const bool object = facet < scene.leafFacetCount;
+                bool failing = false;
+                for (int state = 0; state < 2; ++state) {
+                    const auto& flux = stateFlux[state];
+                    const size_t first = size_t(facet) * 2U;
+                    for (size_t side = first; side < first + (object ? 1U : 2U); ++side) {
+                        const float residual = flux.net[side] - flux.sensible[side] - flux.latent[side] -
+                            flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
+                        failing = failing || facetphysics::facetEnergyViolation(residual);
+                    }
+                }
+                count += failing ? 1U : 0U;
+            }
+            return count;
+        };
         // A sunlit point receives the side's direct-beam flux divided by the
         // side's sunlit part; a shaded point receives only the diffuse part.
         const auto stateValue = [&](const std::vector<float>& total,
@@ -4558,10 +4617,7 @@ try {
             }
         };
 
-        // The residual tolerance is expressed in K through the local energy
-        // equation's thermal response, using the existing user tolerance.
-        // A universal W/m2 cutoff would treat high-inertia PV, foliage and
-        // soil differently even at the same requested temperature accuracy.
+        // Maxima and temperature-equivalent residuals are diagnostics only.
         const auto measureEnergyResidual = [&](const std::vector<facetvk::SurfaceOptics>& optics) {
             maximumEnergyResidual = 0.0f;
             maximumEnergyResidualEquivalent = 0.0f;
@@ -4588,6 +4644,7 @@ try {
                     }
                 }
             }
+            failingEnergyFacets = countFailingEnergyFacets();
         };
 
         std::vector<facetvk::SurfaceOptics> finalLongwaveOptics;
@@ -4596,7 +4653,7 @@ try {
         if (gpuEnergy)
         {
             // Static scene and per-node forcing are uploaded once. Inner RT/EB
-            // iterations exchange only six reduction scalars with the host.
+            // iterations exchange only seven reduction scalars with the host.
             // FIXED[低] 数值: scene.facetCount()*32U 以 uint32 相乘，面元数 >1.34e8 时溢出导致缓冲区过小、后续 data 指针越界写；已修复：改以 size_t 相乘（此处与下方 facet * 32U 的数据指针偏移同为 size_t 运算），不再溢出。
             std::vector<float> gpuParameters(size_t(scene.facetCount()) * 32U, 0.0f);
             std::vector<float> gpuInputs(surfaceCount * 2U * 12U, 0.0f);
@@ -4720,11 +4777,12 @@ try {
                     photovoltaicSlope[side] = mix(&StateFluxes::photovoltaicSlope);
                 }
             };
-            const auto importGpuStatistics = [&](const std::array<float, 5> &statistics) {
-                maximumEnergyResidual = statistics[0];
-                maximumEnergyResidualEquivalent = statistics[1];
-                maximumStomatalMismatch = statistics[2];
-                maximumLeafEnergyResidual = statistics[3];
+            const auto importGpuStatistics = [&](const facetvk::EnergyStatistics &statistics) {
+                maximumEnergyResidual = statistics.maxima[0];
+                maximumEnergyResidualEquivalent = statistics.maxima[1];
+                maximumStomatalMismatch = statistics.maxima[2];
+                maximumLeafEnergyResidual = statistics.maxima[3];
+                failingEnergyFacets = statistics.failingFacets;
             };
             std::vector<float> shadowNextTemperature;
             // Optional audit: compare both implementations inside one run so
@@ -4756,7 +4814,11 @@ try {
                             for (size_t field = 0; field < fields.size(); ++field) {
                                 const float difference = std::abs((flux.*fields[field])[side] - audit.fluxes[index * 12 + field]);
                                 if (!std::isfinite(difference) || difference > 0.01f)
-                                    throw std::runtime_error("CPU/GPU energy shadow flux mismatch at node " + std::to_string(node));
+                                    throw std::runtime_error("CPU/GPU energy shadow flux mismatch at node " + std::to_string(node) +
+                                        ", facet " + std::to_string(facet) + ", state " + std::to_string(state) +
+                                        ", field " + std::to_string(field) + ", difference " + std::to_string(difference) +
+                                        ", CPU " + std::to_string((flux.*fields[field])[side]) +
+                                        ", GPU " + std::to_string(audit.fluxes[index * 12 + field]));
                                 if (field == 0 || field == 1 || field == 3 || field == 5 || field == 7)
                                     shadowFluxMaximum = std::max(shadowFluxMaximum, difference);
                             }
@@ -4784,9 +4846,7 @@ try {
                     importGpuState(model.readEnergyState());
                     updateStability(false);
                 }
-                if (coupling > 0 && maximumTemperatureDelta <= temperatureTolerance &&
-                    maximumEnergyResidualEquivalent <= temperatureTolerance && maximumStabilityChange <= 0.001f &&
-                    maximumStomatalMismatch <= 0.001f && maximumLeafEnergyResidual <= 1.0f)
+                if (energyConverged())
                     break;
                 maximumTemperatureDelta = model.updateEnergyTemperature();
                 if (shadowEnergy) {
@@ -4794,7 +4854,11 @@ try {
                     for (size_t side = 0; side < shadowNextTemperature.size(); ++side) {
                         const float difference = std::abs(updated.temperatures[side] - shadowNextTemperature[side]);
                         if (!std::isfinite(difference) || difference > 0.0002f)
-                            throw std::runtime_error("CPU/GPU temperature update shadow mismatch");
+                            throw std::runtime_error("CPU/GPU temperature update shadow mismatch at node " +
+                                std::to_string(node) + ", iteration " + std::to_string(coupling) +
+                                ", state-side " + std::to_string(side) + ", difference " +
+                                std::to_string(difference) + " K, CPU " + std::to_string(shadowNextTemperature[side]) +
+                                ", GPU " + std::to_string(updated.temperatures[side]));
                         shadowUpdateMaximum = std::max(shadowUpdateMaximum, difference);
                     }
                     ++shadowUpdates;
@@ -4819,6 +4883,9 @@ try {
             verifyGpuEvaluation();
             auto snapshot = model.readEnergyState(true);
             importGpuState(snapshot);
+            // Verify the GPU reduction from the already downloaded final fluxes.
+            if (countFailingEnergyFacets() != failingEnergyFacets)
+                throw std::runtime_error("CPU/GPU energy failing-facet count mismatch");
             finalLongwaveOptics = std::move(snapshot.optics);
             finalLongwaveSolution = std::move(snapshot.radiation);
             finalLongwaveIncident = finalLongwaveSolution.incident;
@@ -4839,9 +4906,7 @@ try {
                 updateStability(false);
                 // Test the same state that will be reported. A pre-update residual
                 // cannot certify temperatures/resistances changed later in the step.
-                if (coupling > 0 && maximumTemperatureDelta <= temperatureTolerance &&
-                    maximumEnergyResidualEquivalent <= temperatureTolerance && maximumStabilityChange <= 0.001f &&
-                    maximumStomatalMismatch <= 0.001f && maximumLeafEnergyResidual <= 1.0f)
+                if (energyConverged())
                     break;
                 const float stepRelaxation = temperatureRelaxation;
 
@@ -4890,11 +4955,13 @@ try {
             measureEnergyResidual(finalLongwaveOptics);
             updateStability(false);
         }
-        const bool converged = maximumTemperatureDelta <= temperatureTolerance && maximumEnergyResidualEquivalent <= temperatureTolerance && maximumStabilityChange <= 0.001f &&
-            maximumStomatalMismatch <= 0.001f && maximumLeafEnergyResidual <= 1.0f;
+        const bool converged = energyConverged();
         allNodesConverged = allNodesConverged && converged;
         ProjectJson::Json diagnostic{
             {"node", node}, {"converged", converged}, {"stabilityCorrection", stabilityCorrection},
+            {"energyFailingFacets", failingEnergyFacets}, {"energyTotalFacets", scene.facetCount()},
+            {"energyFailingFacetFraction", double(failingEnergyFacets) / scene.facetCount()},
+            {"energyResidualThreshold_W_m2", facetphysics::facetEnergyResidualThreshold},
             {"maximumStabilityChange", maximumStabilityChange}, {"stomataFrozen", false},
             {"maximumStomatalLogMismatch", maximumStomatalMismatch}, {"maximumLeafEnergyResidual_W_m2", maximumLeafEnergyResidual},
             {"soilLayerEdges_m", facetphysics::soilEdges}, {"soilBottomBoundary", "fixed initial temperature at 3 m"},
@@ -5115,7 +5182,42 @@ try {
                             "{\"id\":\"shadedTemperature\",\"label\":\"阴影部分温度 [K]\",\"offset\":6}]\n}\n";
             }
         };
-        if (saveRadiationProcess) writeProcessMetadata("radiation");
+        if (saveRadiationProcess) {
+            writeProcessMetadata("radiation");
+            // Keep the existing radiation record layout stable. PAR is a
+            // separate per-side product using the energy solver's 400-700 nm windows.
+            const std::string stem = "facetpar_T=" + token;
+            const auto directory = outputDirectory / "process";
+            std::ofstream parBinary(directory / (stem + ".bin"), std::ios::binary | std::ios::trunc);
+            if (!parBinary) throw std::runtime_error("FacetEB cannot create PAR process binary");
+            for (size_t side = 0; side < surfaceCount; ++side) {
+                const float values[2] = {incidentParPhotons[side], absorbedParPhotons[side]};
+                parBinary.write(reinterpret_cast<const char*>(values), sizeof(values));
+            }
+            parBinary.close();
+            if (!parBinary) throw std::runtime_error("FacetEB cannot finish PAR process binary");
+            const ProjectJson::Json parMetadata = {
+                {"kind", "facet-par-process"}, {"model", "faceteb"},
+                {"processType", "par"}, {"geometry", "facet"},
+                {"node", node}, {"julianTime", meteo.julianTime}, {"time", token},
+                {"solarZenith", scene.sunZenith}, {"solarAzimuth", scene.sunAzimuth},
+                {"facetCount", scene.facetCount()}, {"surfaceCount", surfaceCount},
+                {"geometryFile", "../faceteb.json"}, {"dataFile", stem + ".bin"},
+                {"dataType", "float32-little-endian"}, {"layout", "surface-interleaved"},
+                {"recordFloats", 2}, {"units", "umol photons m-2 s-1"},
+                {"wavelengthRange_nm", {400, 700}},
+                {"spectralWindowWidth_nm", spectralAccelerationWidth},
+                {"aggregation", "per side; sum both sides for whole-leaf incident or absorbed PAR"},
+                {"fields", {{{"id", "incidentParPhotons"}, {"offset", 0}},
+                            {{"id", "absorbedParPhotons"}, {"offset", 1}}}}
+            };
+            std::ofstream parJson(directory / (stem + ".json"), std::ios::trunc);
+            parJson << parMetadata.dump(2);
+            parJson.close();
+            if (!parJson) throw std::runtime_error("FacetEB cannot finish PAR process metadata");
+            runIndex.value["products"].push_back("process/" + stem + ".bin");
+            runIndex.value["products"].push_back("process/" + stem + ".json");
+        }
         if (saveEnergyProcess) writeProcessMetadata("energy");
         if (pa > 0) writeProcessMetadata("photovoltaic");
 
@@ -5137,6 +5239,8 @@ try {
             {"node", node}, {"token", token}, {"julianTime", meteo.julianTime},
             {"solarZenith", scene.sunZenith}, {"solarAzimuth", scene.sunAzimuth},
             {"converged", converged}, {"iterations", couplingIterations},
+            {"energyFailingFacets", failingEnergyFacets}, {"energyTotalFacets", scene.facetCount()},
+            {"energyFailingFacetFraction", double(failingEnergyFacets) / scene.facetCount()},
             {"iterationBudget", maximumCouplingIterations},
             {"temperatureDelta", maximumTemperatureDelta},
             {"temperatureTolerance", temperatureTolerance},

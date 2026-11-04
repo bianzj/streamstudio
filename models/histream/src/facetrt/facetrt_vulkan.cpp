@@ -155,8 +155,8 @@ void FacetrtVulkan::initialize(const Config& config, const std::string& shaderDi
     if (config.rasterWidth == 0 || config.rasterHeight == 0) {
         throw std::invalid_argument("Raster dimensions must be positive");
     }
-    if (config.maxFragmentsPerPixel == 0 || config.maxFragmentsPerPixel > 64) {
-        throw std::invalid_argument("maxFragmentsPerPixel must be in [1, 64]");
+    if (config.maxFragmentsPerPixel == 0 || config.maxFragmentsPerPixel > 256) {
+        throw std::invalid_argument("maxFragmentsPerPixel must be in [1, 256]");
     }
     m_config = config;
     m_shaderDirectory = shaderDirectory;
@@ -1380,7 +1380,7 @@ void FacetrtVulkan::createEnergyResources()
     m_energyInputs = createBuffer(states * 12 * sizeof(float), usage, device);
     m_energyTemperatures = createBuffer(states * sizeof(float), usage, device);
     m_energyFluxes = createBuffer(states * 12 * sizeof(float), usage, device);
-    m_energyStats = createBuffer(6 * sizeof(uint32_t), usage,
+    m_energyStats = createBuffer(7 * sizeof(uint32_t), usage,
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
     for (uint32_t i = 0; i < bindings.size(); ++i)
@@ -1496,20 +1496,21 @@ void FacetrtVulkan::recordEnergy(VkCommandBuffer commandBuffer, uint32_t phase)
     vkCmdDispatch(commandBuffer, (m_facetCount + 63U) / 64U, 1, 1);
     computeBarrier(commandBuffer);
 }
-std::array<float, 5> FacetrtVulkan::readEnergyStatistics()
+EnergyStatistics FacetrtVulkan::readEnergyStatistics()
 {
     void *mapped = nullptr;
     require(vkMapMemory(m_device, m_energyStats.memory, 0, m_energyStats.size, 0, &mapped), "energy statistics map");
-    std::array<uint32_t, 6> bits{};
+    std::array<uint32_t, 7> bits{};
     std::memcpy(bits.data(), mapped, sizeof(bits));
     vkUnmapMemory(m_device, m_energyStats.memory);
     if (bits[5])
         throw std::runtime_error("GPU energy calculation produced a nonfinite state or invalid physiology");
-    std::array<float, 5> values{};
-    std::memcpy(values.data(), bits.data(), sizeof(values));
+    EnergyStatistics values;
+    std::memcpy(values.maxima.data(), bits.data(), sizeof(values.maxima));
+    values.failingFacets = bits[6];
     return values;
 }
-std::array<float, 5> FacetrtVulkan::evaluateEnergy(float skyRadiosity)
+EnergyStatistics FacetrtVulkan::evaluateEnergy(float skyRadiosity)
 {
     VkCommandBuffer cmd = beginCommands();
     vkCmdFillBuffer(cmd, m_energyStats.buffer, 0, m_energyStats.size, 0);
@@ -1526,7 +1527,7 @@ float FacetrtVulkan::updateEnergyTemperature()
     vkCmdFillBuffer(cmd, m_energyStats.buffer, 0, m_energyStats.size, 0);
     recordEnergy(cmd, 1);
     endCommands(cmd);
-    return readEnergyStatistics()[4];
+    return readEnergyStatistics().maxima[4];
 }
 EnergySnapshot FacetrtVulkan::readEnergyState(bool includeRadiation)
 {

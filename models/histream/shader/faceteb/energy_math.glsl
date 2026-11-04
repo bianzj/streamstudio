@@ -1,3 +1,7 @@
+// Keep aligned with facetrt/energyphysics.h.
+const int LEAF_STOMATAL_MAX_ITERATIONS=24;
+const double LEAF_STOMATAL_LOG_TOLERANCE=0.01lf;
+const double LEAF_THERMAL_TOLERANCE_K=0.01lf;
 // FP64 elementary functions: GLSL's transcendental intrinsics are float-only.
 // Range reduction and convergent series retain the CPU solver's double roots.
 double dexp(double x) {
@@ -42,6 +46,16 @@ float latentSlope(float t,float rb,float rs) {
     float deficit=0.622*max(0.0,saturation(t)-pc.vapor)/max(100.0,pc.pressure);
     return max(0.0,pc.rho/max(1.0,rb+rs)*(-2361.0*deficit+L*0.622*saturationSlope(t)/max(100.0,pc.pressure)));
 }
+double collatzAssimilation(double ci,bool c4,double vcmax,double kpep,double je,
+                          double michaelis,double gamma,double sink,double rd,bool photosynthesizing) {
+    if(!photosynthesizing) return -rd;
+    double vc,ve,vs;
+    if(c4) {vc=vcmax; vs=kpep*ci; ve=je/6.0lf;}
+    else {vc=michaelis+ci>0.0lf?vcmax*(ci-gamma)/(michaelis+ci):0.0lf;
+        vs=sink; ve=ci+2.0lf*gamma>0.0lf?je*(ci-gamma)/(ci+2.0lf*gamma)/5.0lf:0.0lf;}
+    double v=quadratic(.8lf,-(vc+ve),vc*ve,vc<0.0lf);
+    return quadratic(.98lf,-(v+vs),v*vs,false)-rd;
+}
 float collatz(uint f,float t,float par,float vapor,float depth) {
     uint p=f*32u;
     bool c4=P[p+16u]>3.5;
@@ -60,20 +74,29 @@ float collatz(uint f,float t,float par,float vapor,float depth) {
     double kd=max(.8738lf,.0301lf*(tc-273.15lf)+.0773lf);
     double je=.5lf*4.0lf/(.05lf+kd+4.0lf)*double(max(0.0,par));
     double gamma=.5lf*o/specificity, rh=clamp(double(vapor)/double(saturation(t)),0.0lf,1.0lf);
-    double product=double(P[p+11u])*rh, minCi=(c4?.1lf:.3lf)*cs;
-    double ci=product>0.0lf?max(minCi,cs*(1.0lf-1.6lf/product)):minCi;
-    double vc,ve,vs;
-    if(c4) {vc=vcmax; vs=kpep*ci; ve=je/6.0lf;}
-    else {double mm=kc*(1.0lf+o/ko); vc=mm+ci>0.0lf?vcmax*(ci-gamma)/(mm+ci):0.0lf;
-        vs=vmax/2.0lf*dexp(dlog(1.8lf)*qt); ve=ci+2.0lf*gamma>0.0lf?je*(ci-gamma)/(ci+2.0lf*gamma)/5.0lf:0.0lf;}
-    double v=quadratic(.8lf,-(vc+ve),vc*ve,vc<0.0lf);
-    double ag=quadratic(.98lf,-(v+vs),v*vs,false);
-    if(par<=0.0||product<=0.0lf||P[p+15u]<=0.0) ag=0.0lf;
-    double a=ag-rd, conductance=double(max(0.0,P[p+12u]))*8.314lf*tc/double(pc.pressure*100.0);
-    if(!isnan(a)&&!isinf(a)&&a>0.0lf) {
-        double resistance=.625lf*max(cs-ci,0.0lf)/a*1.2047lf/28.96lf*1.e3lf*1.e6lf/double(pc.pressure*100.0)*1.e5lf;
-        if(!isnan(resistance)&&!isinf(resistance)&&resistance>0.0lf) conductance+=1.0lf/resistance;
+    double product=double(P[p+11u])*rh, csPpm=double(pc.co2);
+    double minCiPpm=(c4?.1lf:.3lf)*csPpm, intercept=double(max(0.0,P[p+12u]));
+    double mm=kc*(1.0lf+o/ko), sink=vmax/2.0lf*dexp(dlog(1.8lf)*qt);
+    bool photosynthesizing=par>0.0&&product>0.0lf&&P[p+15u]>0.0;
+    double molarConductance=intercept;
+    if(csPpm>0.0lf&&collatzAssimilation(cs,c4,vcmax,kpep,je,mm,gamma,sink,rd,photosynthesizing)>0.0lf) {
+        double ci=product>0.0lf?max(minCiPpm,csPpm*(1.0lf-1.6lf/product)):minCiPpm;
+        if(intercept>0.0lf) {
+            double lower=minCiPpm,upper=csPpm;
+            for(int i=0;i<24;++i) {
+                ci=.5lf*(lower+upper);
+                double a=collatzAssimilation(ci*ppm,c4,vcmax,kpep,je,mm,gamma,sink,rd,photosynthesizing);
+                double gs=max(intercept,intercept+product*a/csPpm);
+                double target=max(minCiPpm,csPpm-1.6lf*a/gs);
+                if(abs(ci-target)<=.01lf||upper-lower<=.01lf) break;
+                if(ci>target) upper=ci; else lower=ci;
+            }
+        }
+        double a=collatzAssimilation(ci*ppm,c4,vcmax,kpep,je,mm,gamma,sink,rd,photosynthesizing);
+        molarConductance=max(intercept,intercept+product*a/csPpm);
+        molarConductance=max(molarConductance,1.6lf*a/(csPpm-minCiPpm));
     }
+    double conductance=molarConductance*8.314lf*tc/double(pc.pressure*100.0);
     return conductance>0.0lf?float(clamp(1.0lf/conductance,1.0lf,625000.0lf)):625000.0;
 }
 double arrhenius(double activation,double t) { return dexp(activation*(t-298.15lf)/(298.15lf*(8.31lf*t/1000.0lf))); }
@@ -133,7 +156,10 @@ double thermal(float initial,double rs,float rb,float net,double eps,float condu
         double residual=double(net)-eps*double(SIGMA)*(fourth(t)-fourth(double(initial)))-double(conductance)*(t-double(pc.air))-
             double(latent(float(t),rb,float(rs)))-double(storage)*(t-double(previous));
         double response=4.0lf*eps*double(SIGMA)*t*t*t+double(conductance)+double(storage)+double(latentSlope(float(t),rb,float(rs)));
-        if(abs(residual)<.0005lf||upper-lower<.00001lf) break;
+        double correction=residual/max(1.0lf,response);
+        if(abs(correction)<=LEAF_THERMAL_TOLERANCE_K)
+            return clamp(t+correction,lower,upper);
+        if(upper-lower<=LEAF_THERMAL_TOLERANCE_K) break;
         if(residual>0.0lf) lower=t; else upper=t;
         double trial=t+residual/max(1.0lf,response);
         t=trial>lower&&trial<upper?trial:.5lf*(lower+upper);
