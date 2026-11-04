@@ -2741,7 +2741,11 @@ async function loadActualScene(config) {
 }
 
 function loadXml(result) {
-  if (result?.streamProject) { streamWorkspace.openProject(result.streamProject); return }
+  if (result?.streamProject) {
+    Promise.resolve(streamWorkspace.openProject(result.streamProject))
+      .catch((error) => toast('无法打开影像模拟工程', error?.message || String(error), 'error'))
+    return
+  }
   // FIXED[中|错误处理]: 本函数和 chooseXml 都不检查 state.running，运行中切换工程会改写 outputDir/inputPath，运行结束事件落到新工程上；已修复：运行中拒绝切换工程（沿用“打开示例”的同一提示）
   if (state.running) { toast('无法打开工程', '模拟运行中，不能更换工程', 'error'); return }
   streamWorkspace.close()
@@ -7263,7 +7267,9 @@ const ENGINE_REJECTED_HINT = '自定义引擎不在允许列表中：请将该�
 
 async function chooseEngine() {
   if (state.mode === 'eFacetRT' || state.mode === 'eFacetEB') { toast('HiStream Facet 引擎', state.executable); return }
-  const path = await api.chooseExecutable(t(ENGINE_PROMPT))
+  let path
+  try { path = await api.chooseExecutable(t(ENGINE_PROMPT)) }
+  catch (error) { toast('无法设置引擎', error.message, 'error'); return }
   if (path === null) return
   if (!path || path === state.defaultExecutable) {
     state.executable = state.defaultExecutable; state.executableExists = state.defaultExecutableExists

@@ -182,6 +182,14 @@ int runImage(const std::string& configPath)
         geographicFromGrid(grid, latitude, longitude);
         log("经纬度由地表类型文件的地理参考换算（WGS84）");
     }
+    // Accept 0–360 longitudes: fold everything into [-180, 180) so such pixels are not silently dropped.
+    long long longitudeWrapped = 0;
+    for (auto& lon : longitude)
+        if (std::isfinite(lon) && (lon >= 180.0f || lon < -180.0f) && lon <= 360.0f && lon >= -360.0f) {
+            lon = static_cast<float>(std::fmod(static_cast<double>(lon) + 540.0, 360.0) - 180.0);
+            ++longitudeWrapped;
+        }
+    if (longitudeWrapped) log("经度已从 0–360 制换算到 ±180，共 " + std::to_string(longitudeWrapped) + " 个像元");
 
     int startRow = 0, endRow = grid.height, startColumn = 0, endColumn = grid.width;
     if (config.region) {
@@ -428,10 +436,21 @@ int runImage(const std::string& configPath)
             const double dx = grid.transform[1];
             const double dy = -grid.transform[5];
             if (!(dx > 0.0) || !(dy > 0.0)) throw std::runtime_error("面元法的 DEM 像元尺寸无效");
+            // Geographic grids store pixel sizes in degrees; convert to metres with the local latitude so
+            // dz/dx is not inflated by ~1e5 (which would make every slope ~90 degrees).
+            const bool geographicGrid = gridIsGeographic(grid);
+            if (geographicGrid) log("地形辐射：DEM 为经纬度坐标，像元尺寸按纬度换算为米");
             long long invalid = 0;
             for (int row = 1; row < grid.height - 1; ++row) {
                 for (int column = 1; column < grid.width - 1; ++column) {
                     const size_t p = static_cast<size_t>(row) * grid.width + column;
+                    double dxMetres = dx, dyMetres = dy;
+                    if (geographicGrid) {
+                        const double lat = latitude[p];
+                        if (!std::isfinite(lat) || std::abs(lat) >= 89.9) { ++invalid; continue; }
+                        dxMetres = dx * 111320.0 * std::cos(lat * kPi / 180.0);
+                        dyMetres = dy * 110540.0;
+                    }
                     const double z1 = dem[p - grid.width - 1], z2 = dem[p - grid.width], z3 = dem[p - grid.width + 1];
                     const double z4 = dem[p - 1], z6 = dem[p + 1];
                     const double z7 = dem[p + grid.width - 1], z8 = dem[p + grid.width], z9 = dem[p + grid.width + 1];
@@ -440,8 +459,8 @@ int runImage(const std::string& configPath)
                         ++invalid;
                         continue;
                     }
-                    const double dzdx = ((z3 + 2 * z6 + z9) - (z1 + 2 * z4 + z7)) / (8.0 * dx);
-                    const double dzds = ((z7 + 2 * z8 + z9) - (z1 + 2 * z2 + z3)) / (8.0 * dy);
+                    const double dzdx = ((z3 + 2 * z6 + z9) - (z1 + 2 * z4 + z7)) / (8.0 * dxMetres);
+                    const double dzds = ((z7 + 2 * z8 + z9) - (z1 + 2 * z2 + z3)) / (8.0 * dyMetres);
                     terrainSlope[p] = static_cast<float>(std::atan(std::hypot(dzdx, dzds)) * 180.0 / kPi);
                     double aspect = std::atan2(-dzdx, dzds) * 180.0 / kPi;
                     if (aspect < 0.0) aspect += 360.0;

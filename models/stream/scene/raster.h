@@ -37,6 +37,9 @@ GDALDatasetUniquePtr openRaster(const std::string& file, const std::string& labe
 std::vector<float> readBand(GDALDataset& dataset, int band, const Grid& grid, const std::string& label);
 std::vector<float> fieldRaster(const Field& field, const Grid& grid, const std::string& label, double fallback, bool required);
 
+// True when the grid CRS is geographic (pixel sizes are in degrees, not metres).
+bool gridIsGeographic(const Grid& grid);
+
 // WGS84 latitude/longitude of every pixel centre from the grid's geotransform and CRS.
 void geographicFromGrid(const Grid& grid, std::vector<float>& latitude, std::vector<float>& longitude);
 

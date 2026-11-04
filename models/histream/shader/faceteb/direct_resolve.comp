@@ -1,6 +1,6 @@
 #version 460
 
-#define MAX_FRAGMENTS 64u
+#define MAX_FRAGMENTS 256u  // must cover HISTREAM_FACET_RASTER_LAYERS (64/128/256); same as facetrt
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 

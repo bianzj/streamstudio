@@ -383,6 +383,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
   let run = null
   let packs = []
   let currentJob = null
+  let currentJobOutput = null
   let pendingEvents = []
   let unsubscribe = null
   let inspections = new Map()
@@ -900,7 +901,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (bandRow && target.dataset.band) {
       const kind = bandRow.parentElement.dataset.bands
       const band = form[kind].bands[Number(bandRow.dataset.index)]
-      band[target.dataset.band] = target.dataset.band === 'name' ? target.value : Number(target.value)
+      // An emptied numeric cell stays '' so validation reports it instead of silently using 0.
+      band[target.dataset.band] = target.dataset.band === 'name' ? target.value
+        : target.value.trim() === '' ? '' : Number(target.value)
       form[kind].preset = 'custom'
       const select = $(`[data-preset="${kind}"]`)
       if (select) select.value = 'custom'
@@ -1082,6 +1085,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     inspectToken += 1
     clearTimeout(inspectTimer)
     currentJob = null
+    currentJobOutput = null
     pendingEvents = []
     starting = false
     setRunning(false)
@@ -1201,6 +1205,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       catch (error) { if (isCurrent()) currentJob = null; throw error }
       if (!isCurrent()) return
       currentJob = job.id
+      currentJobOutput = job.outputDir || null
       setRunning(true)
       setRunState('running', status?.running ? '等待中' : '启动引擎', 0)
       addLog(`开始运行（${form.temperature.mode === 'eb' ? 'EB · ERA5 能量平衡' : 'RT · 已知组分温度'}${assimilating() ? ` + 同化${ASSIMILATION_OBSERVATIONS[form.assimilation.observation]}` : ''}）`)
@@ -1248,6 +1253,23 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const mine = [status.running, ...status.queue].find((job) => job?.kind === 'image' && job.id === currentJob)
       setRunning(Boolean(mine) || (currentJob === 'pending' && running))
       if (mine) setRunState('running', mine.stage || '运行中', mine.progress)
+      else if (Number.isInteger(currentJob)) {
+        // FIXED[中] Bug: 断线期间任务已结束、job-closed 丢失时 currentJob 不会清空，运行卡片一直停在运行中；
+        // 已修复：任务既不在运行也不在排队时，清空 currentJob 并按输出目录读取最终结果
+        const outputDir = currentJobOutput
+        currentJob = null
+        currentJobOutput = null
+        const stillCurrent = () => generation === projectGeneration && jobToken === jobGeneration && currentJob === null
+        if (!outputDir) setRunState('idle', '运行已结束', 0)
+        else {
+          try {
+            const info = await api.runInfo(outputDir)
+            if (stillCurrent()) showRun(info)
+          } catch {
+            if (stillCurrent()) setRunState('idle', '运行已结束', 0, '未能读取运行结果，请在结果列表中查看')
+          }
+        }
+      }
     } catch (error) {
       if (generation !== projectGeneration || jobToken !== jobGeneration) return
       $('#swEngine').dataset.state = 'missing'
@@ -1746,7 +1768,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const y = layer.originY - (sourceRow + .5) * layer.pixelSizeY
       // FIXED[中] Bug: layer.crs 来自 server.mjs 的 readTiff，它只解析投影 EPSG（3072），经纬度栅格得到的是 GeoAscii 引文或“经纬度坐标”，从不会是 "EPSG:4326"；isGeographic 判断失败，于是把度数当成“X / Y … m”显示，而且不显示经纬度；另外南纬、西经会显示成负的 °N/°E；已修复：改用 layer.unit === '°' 或 EPSG:4326 判定经纬度栅格（并回退到 [y, x]），经纬度按符号显示 N/S、E/W，经纬度栅格不再输出带 m 的 X/Y 行
       const geographicLayer = isGeographic(layer.crs) || layer.unit === '°'
-      const geo = geographicLayer ? geographic(layer.crs, x, y) || [y, x] : null
+      const geo = geographicLayer ? geographic(layer.crs, x, y) || [y, x] : geographic(layer.crs, x, y)
       if (!geographicLayer) parts.push(`<span title="${escapeHtml(crsLabel(layer.crs))}"><em>X / Y</em>${x.toLocaleString('en-US', { maximumFractionDigits: 1 })}, ${y.toLocaleString('en-US', { maximumFractionDigits: 1 })} m</span>`)
       if (geo) parts.push(`<span><em>经纬度</em>${Math.abs(geo[0]).toFixed(5)}°${geo[0] < 0 ? 'S' : 'N'}, ${Math.abs(geo[1]).toFixed(5)}°${geo[1] < 0 ? 'W' : 'E'}</span>`)
     }
@@ -2009,6 +2031,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const isCurrent = () => generation === projectGeneration && jobToken === jobGeneration && currentJob === null
       setRunning(false)
       currentJob = null
+      currentJobOutput = null
       const ok = event.status === 'completed'
       addLog(ok ? `模拟完成，耗时 ${(event.elapsed / 1000).toFixed(1)} 秒` : event.status === 'stopped' ? '模拟已停止' : `模拟失败，退出码 ${event.code ?? '—'}`, ok ? 'success' : 'error')
       if (job.outputDir) {

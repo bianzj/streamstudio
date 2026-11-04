@@ -237,8 +237,11 @@ async function resetSimulationProcesses() {
 }
 
 
+// FIXED[中] 安全: 页面可被其他网站用 iframe 嵌入（点击劫持）；已修复：所有响应都带 X-Frame-Options 与 CSP frame-ancestors
+const FRAME_HEADERS = { 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "frame-ancestors 'none'" }
+
 function json(response, status, value) {
-  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...FRAME_HEADERS })
   response.end(JSON.stringify(value))
 }
 
@@ -4292,10 +4295,13 @@ async function api(request, response, url) {
     if (!child) return json(response, 200, { stopped: false })
     child.histreamStopped = true
     if (child.facetWorker) void child.facetWorker.terminate()
-    // FIXED[低] 错误处理: taskkill 子进程没有 'error'/'exit' 监听，失败时无人知晓，且无论是否结束都立即返回 stopped:true；已修复：捕获本次要停的 child 并加 'error' 监听，taskkill 无法启动时退回 child.kill()，避免未捕获异常（仍未等待 taskkill 结果）
+    // FIXED[低] 错误处理: 原先只在 taskkill 无法启动时退回 kill，不检查退出码；已修复：与 STREAM 版一致，taskkill 退出码非 0 时也退回 child.kill()
     const stopping = child
-    if (process.platform === 'win32') spawn('taskkill', ['/pid', String(stopping.pid), '/T', '/F'], { windowsHide: true }).on('error', () => stopping.kill())
-    else stopping.kill('SIGTERM')
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(stopping.pid), '/T', '/F'], { windowsHide: true })
+        .on('error', () => stopping.kill())
+        .on('close', (code) => { if (code !== 0) stopping.kill() })
+    } else stopping.kill('SIGTERM')
     return json(response, 200, { stopped: true })
   }
   if (request.method === 'POST' && url.pathname === '/api/reset') {
@@ -4374,10 +4380,13 @@ async function api(request, response, url) {
       return json(response, 400, { error: error.message })
     }
   }
-  // FIXED[中] 安全: 可以让资源管理器打开任意已存在的路径，包括 \\host\share 这样的 UNC 路径（会向远程主机发起 SMB/NTLM 认证）；spawn 也没有监听 'error'，explorer 启动失败会变成未捕获异常；已修复：spawn 加 .on('error', () => {}) 和 .unref()（路径范围与 UNC 拒绝未收窄，属安全策略变更）
+  // FIXED[中] 安全: 可以让资源管理器打开任意已存在的路径，包括 \\host\share 这样的 UNC 路径（会向远程主机发起 SMB/NTLM 认证）；已修复：spawn 加 error 监听与 unref，并拒绝 UNC / 设备路径（\\ 或 // 开头）
   if (request.method === 'POST' && url.pathname === '/api/open') {
     const data = await body(request)
-    const path = resolve(normalizeHostPath(data.path || projectDir || envSetting('STREAM_STUDIO_DATA_ROOT', 'HISTREAM_STUDIO_DATA_ROOT') || PROJECT_ROOT))
+    const requested = normalizeHostPath(data.path || projectDir || envSetting('STREAM_STUDIO_DATA_ROOT', 'HISTREAM_STUDIO_DATA_ROOT') || PROJECT_ROOT)
+    if (/^[\\/]{2}/.test(requested)) return json(response, 400, { error: '不支持打开网络（UNC）路径' })
+    const path = resolve(requested)
+    if (/^[\\/]{2}/.test(path)) return json(response, 400, { error: '不支持打开网络（UNC）路径' })
     if (!existsSync(path)) return json(response, 400, { error: `找不到路径：${path}` })
     if (process.platform === 'win32') spawn('explorer.exe', statSync(path).isFile() ? ['/select,', path] : [path], { detached: true, windowsHide: true }).on('error', () => {}).unref()
     return json(response, 200, { ok: true, path: windowsPath(path) })
@@ -4401,7 +4410,7 @@ const server = createServer(async (request, response) => {
     if (!existsSync(path) || !statSync(path).isFile()) path = join(GUI_OUTPUT_DIR, 'index.html')
     if (!existsSync(path)) return json(response, 404, { error: '文件不存在' })
     // FIXED[低] 兼容性: mime 按扩展名大小写敏感查找，且缺 .mjs/.wasm/.json/.ico/.woff2 等类型，.mjs 模块脚本会因 octet-stream 被浏览器拒绝执行；已修复：扩展名先 toLowerCase 再查表并补全这些类型，同时加 X-Content-Type-Options: nosniff（未加 CSP）
-    response.writeHead(200, { 'Content-Type': mime[extname(path).toLowerCase()] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff' })
+    response.writeHead(200, { 'Content-Type': mime[extname(path).toLowerCase()] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff', ...FRAME_HEADERS })
     createReadStream(path).on('error', () => response.destroy()).pipe(response)
   } catch (error) {
     if (response.headersSent) response.destroy()

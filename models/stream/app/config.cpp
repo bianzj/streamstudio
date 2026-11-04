@@ -229,8 +229,9 @@ ImageConfig readImageConfig(const std::string& path)
             throw std::runtime_error("temperatureMethod 须为 robust 或 direct");
         config.robustTemperature = temperatureMethod == "robust";
         config.diffuseFraction = energy.GetDouble("diffuseFraction", 0.2);
-        if (!std::isfinite(config.diffuseFraction) || config.diffuseFraction < -1.0 || config.diffuseFraction > 1.0)
-            throw std::runtime_error("diffuseFraction 须在 -1 与 1 之间（-1 为 Erbs）");
+        if (!std::isfinite(config.diffuseFraction) ||
+            !(config.diffuseFraction == -1.0 || (config.diffuseFraction >= 0.0 && config.diffuseFraction <= 1.0)))
+            throw std::runtime_error("diffuseFraction 须为 -1（Erbs）或 0 到 1 之间的数");
         config.enforceSolarLimit = energy.GetBool("enforceSolarLimit", true);
         const auto resistance = energy.GetObj("soilResistance");
         if (resistance.IsValid() && resistance.GetType() == CPLJSONObject::Type::Object) {
@@ -244,7 +245,11 @@ ImageConfig readImageConfig(const std::string& path)
         config.maxAerodynamicResistance = energy.GetDouble("maxAerodynamicResistance", 400.0);
         config.referenceHeight = energy.GetDouble("referenceHeight", 15.0);
         config.heatRoughnessKb = energy.GetDouble("heatRoughnessKb", -1.0);
-        if (config.heatRoughnessKb > 20) throw std::runtime_error("heatRoughnessKb 须在 0–20 之间（<=0 表示按地类）");;
+        if (!std::isfinite(config.heatRoughnessKb) || config.heatRoughnessKb > 20)
+            throw std::runtime_error("heatRoughnessKb 须在 0–20 之间（<=0 表示按地类）");
+        // maxAerodynamicResistance <= 0 deliberately means "no cap" (energy.cpp resistanceCap).
+        if (!std::isfinite(config.maxAerodynamicResistance))
+            throw std::runtime_error("maxAerodynamicResistance 须为数值（<=0 表示不限幅）");
         config.soilEmissivity = energy.GetDouble("soilEmissivity", 0.955);
         // Negative selects the built-in dry-to-wet gain; otherwise it is the
         // emissivity at saturation and must be a valid value above the dry one.
@@ -266,6 +271,8 @@ ImageConfig readImageConfig(const std::string& path)
         if (soilThermal != "constant" && soilThermal != "moisture") throw std::runtime_error("soilThermal 须为 constant 或 moisture");
         config.soilThermalFromMoisture = soilThermal == "moisture";
         config.soilHeatFraction = energy.GetDouble("soilHeatFraction", 0.25);
+        if (!(config.soilHeatFraction >= 0.0 && config.soilHeatFraction <= 1.0))
+            throw std::runtime_error("soilHeatFraction 须在 0 与 1 之间");
         config.solarBinWidth = energy.GetInteger("spectralBinNm", 50);
         if (config.solarBinWidth < 1 || config.solarBinWidth > 100) throw std::runtime_error("spectralBinNm 须在 1–100 nm 之间");
         config.maxIterations = energy.GetInteger("maxIterations", 50);

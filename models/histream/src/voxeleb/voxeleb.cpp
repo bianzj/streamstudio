@@ -474,6 +474,12 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
 
 bool Voxeleb::destroy(std::shared_ptr<VoxelebIO> & modelio){
 
+    // FIXED[中] GPU同步: 原先在销毁缓冲/SBT/AS/描述符/管线之后才 vkDeviceWaitIdle，异常路径下会销毁仍在执行的资源；已修复：与 Voxelrt::destroy 一致，先等待设备空闲再销毁。
+    const VkResult waitIdleResult = vkDeviceWaitIdle(modelio->m_device);
+    if (waitIdleResult != VK_SUCCESS) {
+        std::cerr << "Voxeleb::destroy: vkDeviceWaitIdle failed, VkResult="
+                  << static_cast<int>(waitIdleResult) << std::endl;
+    }
     m_pBuffer->destroy(modelio);
     modelio->m_sbtWrapper.destroy();
     modelio->m_pAccelStruct->m_rtBuilder.destroy();
@@ -482,9 +488,6 @@ bool Voxeleb::destroy(std::shared_ptr<VoxelebIO> & modelio){
     m_pPipeline->destroy(modelio);
     m_pCommand->destroy(modelio);
 
-
-
-    vkDeviceWaitIdle(modelio->m_device);
     modelio->m_genCmdBuf.deinit();
     modelio->m_pAlloc->deinit();
     

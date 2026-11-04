@@ -93,9 +93,16 @@ public:
         PropertyXml soilProperty{};
         soilProperty.name = "soil";
         soilProperty.type = Type::SOIL;
-        // DEFERRED[高] Bug: SoilSet 字段顺序为 method, rss, cs, rhos, lambdas, Tsoil, smc, SatWater，这里按位置初始化后 Tsoil=0.25、smc=25.0，两值互换（注释里 Tsoil≈25、smc≈0.25）；土壤温度初值/含水量严重错误（smc=25 超过饱和含水量 0.45），影响土壤蒸发阻抗与热传导；建议：改为指定成员赋值（soilset.Tsoil=25, soilset.smc=0.25），避免位置聚合初始化。
-        soilProperty.soilset = SoilSet{1, 2000.0f, 1180.0f, 1800.0f,
-                                       1.55f, 0.25f, 25.0f, 0.45f};
+        // FIXED[高] Bug: 按位置初始化时 Tsoil 与 smc 互换（Tsoil=0.25、smc=25 超过饱和含水量）；已修复：改为按成员名赋值。
+        soilProperty.soilset = SoilSet{};
+        soilProperty.soilset.method = 1;
+        soilProperty.soilset.rss = 2000.0f;
+        soilProperty.soilset.cs = 1180.0f;
+        soilProperty.soilset.rhos = 1800.0f;
+        soilProperty.soilset.lambdas = 1.55f;
+        soilProperty.soilset.Tsoil = 25.0f;
+        soilProperty.soilset.smc = 0.25f;
+        soilProperty.soilset.SatWater = 0.45f;
         soilProperty.soilset.brdfModel = 1;
         soilProperty.soilset.hapkeB0 = 1.0f;
         soilProperty.soilset.hapkeH = 0.1f;

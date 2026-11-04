@@ -44,9 +44,12 @@ export const webApi = {
   listExamples: () => request('/api/examples'),
   openExample: (id, directory) => post('/api/examples/open', { id, directory }),
   chooseExecutable: async (message) => {
-    const value = window.prompt(message, appStorage.getItem('histreamExecutable') || '')
-    if (value === null) return null
-    const path = value.trim()
+    // FIXED[中] 兼容性: Electron 不支持 window.prompt（抛错或返回 undefined），原先 value.trim() 会抛 TypeError；已修复：捕获异常并把 undefined 视同取消
+    let value
+    try { value = window.prompt(message, appStorage.getItem('histreamExecutable') || '') }
+    catch { throw new Error('当前窗口不支持输入对话框，请在浏览器模式（npm start 后访问 http://127.0.0.1:4173）中设置自定义引擎路径') }
+    if (value === null || value === undefined) return null
+    const path = String(value).trim()
     if (path) appStorage.setItem('histreamExecutable', path)
     else appStorage.removeItem('histreamExecutable')
     return path

@@ -173,8 +173,16 @@ void XmlExamples::createVoxelebxml(){
 
     PropertyXml propertyXml1,propertyXml2,propertyXml3;
     propertyXml1 = {"soilset",Type::SOIL};
-    // DEFERRED[中] Bug: 与 xmlexamples.h 中最小示例相同，按位置初始化后 Tsoil=0.25、smc=25（字段顺序 …lambdas, Tsoil, smc, SatWater），土壤温度与含水量互换；建议：用指定成员赋值。
-    propertyXml1.soilset = SoilSet{1,2000,1180,1800,1.55,0.25,25,0.45};
+    // FIXED[中] Bug: 按位置初始化时 Tsoil 与 smc 互换（Tsoil=0.25、smc=25）；已修复：改为按成员名赋值，Tsoil=25、smc=0.25。
+    propertyXml1.soilset = SoilSet{};
+    propertyXml1.soilset.method = 1;
+    propertyXml1.soilset.rss = 2000;
+    propertyXml1.soilset.cs = 1180;
+    propertyXml1.soilset.rhos = 1800;
+    propertyXml1.soilset.lambdas = 1.55f;
+    propertyXml1.soilset.Tsoil = 25;
+    propertyXml1.soilset.smc = 0.25f;
+    propertyXml1.soilset.SatWater = 0.45f;
 
     propertyXml2 = {"leafbio",Type::VEGETATION};
     propertyXml2.leafbio = LeafBio{80,9,0.01,3,0.6396,0.015,

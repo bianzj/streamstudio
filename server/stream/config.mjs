@@ -153,8 +153,10 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     if (list.length > 64) throw new Error(`${label}波段不能超过 64 个`)
     return list.map((item, index) => {
       const name = String(item?.name || `B${index + 1}`).replace(/[,{}\r\n]/g, ' ').trim().slice(0, 40) || `B${index + 1}`
-      const center = Number(item?.center)
-      const fwhm = Number(item?.fwhm ?? 0)
+      // FIXED[低] Bug: 带宽输入框清空后 Number('') 得 0，结果静默变成单色波段；已修复：空串视为无效（缺省字段仍按 0 处理）
+      const blank = (value) => typeof value === 'string' && value.trim() === ''
+      const center = blank(item?.center) ? NaN : Number(item?.center)
+      const fwhm = blank(item?.fwhm) ? NaN : Number(item?.fwhm ?? 0)
       if (!Number.isFinite(center) || center < low || center > high) throw new Error(`${label}波段 ${name} 的中心波长须在 ${low}–${high} 之间`)
       if (!Number.isFinite(fwhm) || fwhm < 0 || fwhm > (high - low)) throw new Error(`${label}波段 ${name} 的带宽无效`)
       if (label === '热红外' && fwhm > 2 * (center - 0.1)) throw new Error(`${label}波段 ${name} 的带宽不能超过 ${Number((2 * (center - 0.1)).toFixed(3))} μm`)
@@ -364,7 +366,8 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     if (assimilation !== 'none') config.assimilation = buildAssimilation(scene.assimilation, assimilation, { thermalEnabled, opticalEnabled })
     const region = scene.region
     if (region && region.enabled) {
-      const values = ['startRow', 'endRow', 'startColumn', 'endColumn'].map((key) => Number(region[key]))
+      // FIXED[低] Bug: 输入框清空后为 ''，Number('') 得 0，起始行列被静默当作 0；已修复：空值视为无效
+      const values = ['startRow', 'endRow', 'startColumn', 'endColumn'].map((key) => (String(region[key] ?? '').trim() === '' ? NaN : Number(region[key])))
       if (!values.every((value) => Number.isInteger(value) && value >= 0)) throw new Error('行列范围须为非负整数')
       const [startRow, endRow, startColumn, endColumn] = values
       if (startRow >= endRow || startColumn >= endColumn) throw new Error('行列范围的终点须大于起点（终点不包含）')

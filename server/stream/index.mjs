@@ -127,9 +127,10 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
       emit({ type: 'job-log', job: summary(job), level: /^(ERROR|Warning) \d+: /.test(text) ? 'diagnostic' : 'error', text })
     })
     // FIXED[中] 错误处理: spawn 失败（ENOENT/EACCES/ENAMETOOLONG）时这里只记日志，Node 不保证之后会触发 close，任务会一直占着 active，串行队列永久阻塞；已修复：error 回调同样调用 finish(job, 'failed', ...)，finish 用 job.finished 去重，避免与 close 重复结束
+    // FIXED[中] 并发: 'error' 在进程仍存活时也可能触发（例如 kill 失败），此时直接 finish 会让队列启动下一个引擎、旧进程成为孤儿；已修复：只有 spawn 本身失败（没有 pid）时才在 error 里结束任务，其余情况等 'close'
     child.on('error', (error) => {
       emit({ type: 'job-log', job: summary(job), level: 'error', text: error.message })
-      finish(job, 'failed', null, error.message)
+      if (!child.pid) finish(job, 'failed', null, error.message)
     })
     child.on('close', (code) => {
       const status = job.stopped ? 'stopped' : job.successCodes.includes(code) ? 'completed' : 'failed'

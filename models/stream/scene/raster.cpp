@@ -120,6 +120,14 @@ std::vector<float> fieldRaster(const Field& field, const Grid& grid, const std::
     return std::vector<float>(grid.size(), static_cast<float>(fallback));
 }
 
+bool gridIsGeographic(const Grid& grid)
+{
+    if (grid.projection.empty()) return false;
+    OGRSpatialReference source;
+    if (source.importFromWkt(grid.projection.c_str()) != OGRERR_NONE) return false;
+    return source.IsGeographic() != 0;
+}
+
 void geographicFromGrid(const Grid& grid, std::vector<float>& latitude, std::vector<float>& longitude)
 {
     if (!grid.hasTransform || grid.projection.empty()) throw std::runtime_error("地表类型文件没有地理参考，请提供纬度/经度栅格或常数");

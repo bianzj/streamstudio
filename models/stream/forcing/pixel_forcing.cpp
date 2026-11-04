@@ -1,6 +1,7 @@
 #include "pixel_forcing.h"
 #include "utc.h"
 #include "../physics/constants.h"
+#include "../physics/shortwave.h"
 
 #include <algorithm>
 #include <cmath>
@@ -106,6 +107,9 @@ double PixelForcing::shortwave(double unixSeconds) const
     else if (validA) value = fluxA / muA * mu;
     else if (validB) value = fluxB / muB * mu;
     else value = (1 - f) * fluxA + f * fluxB;
+    // The configured fraction may be -1 (Erbs); resolve it from the horizontal flux before tilting so the
+    // direct/diffuse weights below always lie in [0, 1].
+    const double diffuse = requestedDiffuseFraction(std::max(value, 0.0), std::acos(std::min(mu, 1.0)) * 180.0 / kPi, diffuse_);
     if (coneDensity_ > 0.0 && mu > 0.0) {
         // Statistical cone: facets of slope beta uniformly distributed in azimuth; density d of the pixel
         // is covered by cones and the rest is flat. The direct term averages max(0, cosI) over the facets.
@@ -122,8 +126,8 @@ double PixelForcing::shortwave(double unixSeconds) const
         }
         const double direct = (coneDensity_ * average + (1.0 - coneDensity_) * mu) / mu;
         const double skyView = 0.5 * (1.0 + std::cos(coneSlope_));
-        const double diffuse = coneDensity_ * skyView + (1.0 - coneDensity_);
-        value *= (1.0 - diffuse_) * direct + diffuse_ * diffuse;
+        const double skyTerm = coneDensity_ * skyView + (1.0 - coneDensity_);
+        value *= (1.0 - diffuse) * direct + diffuse * skyTerm;
         return std::clamp(value, 0.0, 1400.0);
     }
     if (ridgeDensity_ > 0.0 && mu > 0.0) {
@@ -147,8 +151,8 @@ double PixelForcing::shortwave(double unixSeconds) const
         }
         const double direct = (ridgeDensity_ * sum + (1.0 - ridgeDensity_) * mu) / mu;
         const double skyView = (1.0 - endFraction) * 0.5 * (1.0 + std::cos(ridgeSlope_)) + endFraction * 0.5;
-        const double diffuse = ridgeDensity_ * skyView + (1.0 - ridgeDensity_);
-        value *= (1.0 - diffuse_) * direct + diffuse_ * diffuse;
+        const double skyTerm = ridgeDensity_ * skyView + (1.0 - ridgeDensity_);
+        value *= (1.0 - diffuse) * direct + diffuse * skyTerm;
         return std::clamp(value, 0.0, 1400.0);
     }
     if (slope_ > 1e-6) {
@@ -158,7 +162,7 @@ double PixelForcing::shortwave(double unixSeconds) const
             std::sin(slope_) * std::sqrt(std::max(0.0, 1.0 - mu * mu)) * std::cos(azimuth - aspect_);
         const double directRatio = cosIncidence > 0.0 ? cosIncidence / mu : 0.0;
         const double skyView = 0.5 * (1.0 + std::cos(slope_));
-        value *= (1.0 - diffuse_) * directRatio + diffuse_ * skyView;
+        value *= (1.0 - diffuse) * directRatio + diffuse * skyView;
         return std::clamp(value, 0.0, 1400.0);
     }
     return std::clamp(value, 0.0, 1400.0 * mu);
