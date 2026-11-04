@@ -1,6 +1,6 @@
 // 内置示例端到端验证脚本（只通过 HTTP API 驱动，不直接启动引擎）
 // 用法: node review/run-examples.mjs <baseUrl> [exampleId]
-// 结果写入 review/examples-run/<timestamp>/
+// 结果写入 .test/examples-run/<timestamp>/（项目忽略目录，原始日志不入库）
 
 import { mkdirSync, writeFileSync, readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
@@ -10,7 +10,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const base = process.argv[2] || 'http://127.0.0.1:4799'
 const onlyId = process.argv[3] || ''
 const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-const outRoot = join(here, 'examples-run', stamp)
+const outRoot = join(here, '..', '.test', 'examples-run', stamp)
 const examplesRoot = join(outRoot, 'projects')
 mkdirSync(examplesRoot, { recursive: true })
 

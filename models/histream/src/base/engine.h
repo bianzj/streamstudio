@@ -34,7 +34,6 @@ public:
 private:
     std::string facetShaderDirectory(const char* name) const;
 
-    // FIXED[低] 未初始化: m_mode 无默认值，input() 收到未识别的模式字符串时保持未初始化，create/run/destroy 按垃圾值分支；已修复：m_mode 默认初始化为 eRaytracing，input() 对未知模式抛 std::runtime_error。
     Mode m_mode{};
     std::string m_inputPath;
     std::string m_outputPath;

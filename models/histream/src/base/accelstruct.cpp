@@ -86,7 +86,6 @@ bool AccelStruct::createAccelStruct(VkDevice device, std::shared_ptr<MeshIO> &me
         VkAccelerationStructureInstanceKHR rayInst{};
         rayInst.transform = nvvk::toTransformMatrixKHR(instanceio->instances[i].object2worldMatrix);  // Position of the instance
         rayInst.instanceCustomIndex = i;                       // gl_InstanceCustomIndexEXT
-        // FIXED[中] 安全: meshId 未校验是否 < BLAS 数量，越界时 getBlasDeviceAddress 越界访问；已修复：构建实例前校验 meshId ∈ [0, BLAS 数量)，越界抛 std::runtime_error 并报出实例下标、meshId 与网格数量；instanceCustomIndex 的 24 位截断需改场景组织，仍为 DEFERRED。
         const int meshId = instanceio->instances[i].meshId;
         if (meshId < 0 || static_cast<std::size_t>(meshId) >= meshio->m_bufferMeshes.size()) {
             throw std::runtime_error("Instance " + std::to_string(i) + " references invalid meshId "

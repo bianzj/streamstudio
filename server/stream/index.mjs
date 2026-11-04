@@ -30,7 +30,6 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   const defaultOutputRoot = () => windowsPath(join(documents, 'stream'))
   const era5Directory = () => join(documents, 'era5-packs')
 
-  // FIXED[低] 错误处理: 向已断开的 SSE 响应写入时没有 error 监听；已修复：SSE 响应注册 'error' → 从 clients 移除（避免写入已断开连接后无监听者抛未捕获异常）；心跳 ': ping' 未加
   function emit(payload) {
     const line = `data: ${JSON.stringify(payload)}\n\n`
     for (const response of clients) response.write(line)
@@ -61,7 +60,6 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     writeFileSync(join(job.outputDir, 'run-manifest.json'), JSON.stringify(job.manifest, null, 2) + '\n', 'utf8')
   }
 
-  // FIXED[低] 可维护性: 产品列表只排除 run-manifest/run-config，输入副本 scene.json 和 scene_summary.json 也会被当成“产品”写进 manifest 并返回前端；已修复：排除名单同时包含 scene.json / scene_summary.json
   const products = (directory) => existsSync(directory)
     ? readdirSync(directory).filter((name) => PRODUCT_FILE.test(name) && !['run-manifest.json', 'run-config.json', 'scene.json', 'scene_summary.json'].includes(name)).map((name) => windowsPath(join(directory, name)))
     : []
@@ -126,8 +124,6 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
       // GDAL/PROJ library diagnostics ("ERROR 1: PROJ: ...", "Warning 1: ...") are not engine failures.
       emit({ type: 'job-log', job: summary(job), level: /^(ERROR|Warning) \d+: /.test(text) ? 'diagnostic' : 'error', text })
     })
-    // FIXED[中] 错误处理: spawn 失败（ENOENT/EACCES/ENAMETOOLONG）时这里只记日志，Node 不保证之后会触发 close，任务会一直占着 active，串行队列永久阻塞；已修复：error 回调同样调用 finish(job, 'failed', ...)，finish 用 job.finished 去重，避免与 close 重复结束
-    // FIXED[中] 并发: 'error' 在进程仍存活时也可能触发（例如 kill 失败），此时直接 finish 会让队列启动下一个引擎、旧进程成为孤儿；已修复：只有 spawn 本身失败（没有 pid）时才在 error 里结束任务，其余情况等 'close'
     child.on('error', (error) => {
       emit({ type: 'job-log', job: summary(job), level: 'error', text: error.message })
       if (!child.pid) finish(job, 'failed', null, error.message)
@@ -140,7 +136,6 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
 
   function stop(id) {
     const target = Number(id)
-    // FIXED[低] Bug: id 缺省（undefined/null）时会停止当前任意任务（包括 ERA5 登记）；传入非数字 id（如前端的 'pending'）时 Number() 得到 NaN，静默返回 stopped:false；已修复：id 非整数时抛错（路由层转成 400），不再退化成“停任意任务”
     if (id === undefined || id === null || !Number.isInteger(target)) throw new Error('任务 id 无效')
     const queued = queue.findIndex((job) => job.id === target)
     if (queued >= 0) {
@@ -152,7 +147,6 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     active.stopped = true
     if (process.platform === 'win32') {
       const child = active.child
-      // FIXED[低] 错误处理: 只处理 taskkill 启动失败，不检查它的退出码；已修复：监听 taskkill 的 close，退出码非 0 时退回 child.kill()
       spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
         .on('error', () => child.kill())
         .on('close', (code) => { if (code !== 0) child.kill() })
@@ -270,7 +264,6 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
       kind: 'era5', label: label || 'ERA5 数据包', successCodes: [0, 3],
       // DEFERRED[中] Bug: 所有 NetCDF 路径直接作为命令行参数，Windows CreateProcess 命令行上限约 32767 字符，按天下载的一年数据（数百个长路径）会让 spawn 失败（ENAMETOOLONG），并落入 launch 中 error 后不一定触发 close 的问题；建议：把文件列表写入临时清单文件，用 --files-from <list> 之类的参数传给引擎
       start() { launch(job, ['era5-register', index, '--product', product, ...files.map(windowsPath)]) },
-      // FIXED[低] 资源泄漏: 任务失败或被停止时，引擎可能已写出不完整的 pack-*.json，这里不清理，之后会出现在列表中；已修复：status 非 completed 时删除该索引文件
       collect(status) {
         if (status !== 'completed') {
           try { if (existsSync(index)) unlinkSync(index) } catch {}
@@ -380,7 +373,6 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     if (job.manifest) {
       try { writeManifest(job, { status: 'stopped', exitCode: null, finishedAt: new Date().toISOString(), products: products(job.outputDir).map((path) => basename(path)) }) } catch {}
     }
-    // FIXED[低] 资源泄漏: 退出时只 kill 引擎主进程，Windows 下不像 stop() 那样用 taskkill /T 结束整个进程树；已修复：win32 下同步执行 taskkill /T /F 结束进程树（ERA5 未完成索引的清理未加）
     if (process.platform === 'win32') {
       try { spawnSync('taskkill', ['/pid', String(job.child.pid), '/T', '/F'], { windowsHide: true }) } catch { job.child.kill('SIGTERM') }
     } else job.child.kill('SIGTERM')

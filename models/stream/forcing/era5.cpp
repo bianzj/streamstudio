@@ -177,7 +177,6 @@ FileScan scanFile(const NcFile& file)
     const int time = file.firstVariable(kTimeNames);
     int timeDimension = -1;
     if (time >= 0) {
-        // FIXED[中] 内存: 原来没有先检查时间变量的维数就把 dimid 写进单个 int，valid_time 为二维 (time, step)（cfgrib/xarray 由 GRIB 转换的 ERA5-Land 常见）时会越界写栈；已修复：先 nc_inq_varndims 并要求 ndims==1，否则报错提示先展开 step，同时检查 nc_inq_vardimid 的返回值
         int timeDimensions = 0;
         if (nc_inq_varndims(file.id(), time, &timeDimensions) != NC_NOERR || timeDimensions != 1)
             throw std::runtime_error("ERA5 时间变量必须是一维 time/valid_time（来自 GRIB 的 (time, step) 请先展开 step）：" + utf8FromPath(file.path()));
@@ -229,7 +228,6 @@ Layout layoutOf(const NcFile& file, const std::string& name)
         nc_inq_dimlen(file.id(), dims[axis], &length);
         layout.lengths.push_back(length);
         const auto dimension = file.dimensionName(dims[axis]);
-        // FIXED[低] 错误处理: 原来按维度名识别时间轴，而 scanFile 按时间变量的 dimid 判断 timed，两者不一致，时间维名称不是 valid_time/time 时 timeAxis=-1，readFrame 会把整条时间轴当作"额外轴"读入并取第一个有效值，所有时次静默变成同一帧；已修复：用时间变量的 dimid（与 scanFile 相同的 firstVariable(kTimeNames)）定位时间轴；未知额外维仍按首个有效成员读取
         if (dims[axis] == timeDimension) layout.timeAxis = axis;
         else if (dimension == "latitude" || dimension == "lat") layout.latitudeAxis = axis;
         else if (dimension == "longitude" || dimension == "lon") layout.longitudeAxis = axis;

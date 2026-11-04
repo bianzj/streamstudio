@@ -235,7 +235,6 @@ int runImage(const std::string& configPath)
         int64_t lastHour = static_cast<int64_t>(std::ceil(overpass / 3600.0)) + 1;
         // TIRTEB initialises with the mean air temperature of the whole first simulated day.
         const int64_t dayLastHour = static_cast<int64_t>(std::llround(dayStart / 3600.0)) + 23;
-        // FIXED[中] Bug: pack.lastHour() 返回 lastHour_，只在后面的 pack.load() 里赋值，此处恒为默认值 -1，条件永远不成立、lastHour 不会延到当天 23 UTC；已修复：改用已有的 pack.covers(variables, dayStartHour, dayLastHour, gap) 判断数据包是否覆盖当天末小时，覆盖时才延长 lastHour（gap 提前声明，未新增常量）
         const int64_t dayStartHour = static_cast<int64_t>(std::llround(dayStart / 3600.0));
         std::string gap;
         if (pack.covers(variables, dayStartHour, dayLastHour, gap)) lastHour = std::max(lastHour, dayLastHour);
@@ -728,7 +727,6 @@ int runImage(const std::string& configPath)
                 if (!std::isfinite(leafArea) || leafArea < 0 || leafArea > 100) continue;
                 const PixelForcing forcing = pixelForcing(pixel);
                 const Forcing atOverpass = forcing.at(overpass);
-                // FIXED[中] 错误处理: 原来只检查 ta 和 longwave，d2m/sp/u10/v10/ssrd 缺测时 ea/p/wind/shortwave 为 NaN，残差变 NaN、组分温度停在初值却看似有效；已修复：用 validForcing 对 ta/ea/p/wind/shortwave/longwave 全部做 isfinite 检查，并在逐时次循环里同样检查 meteo，无效像元计入 ebNoForcing/ebFailed
                 if (!validForcing(atOverpass)) { ++ebNoForcing; continue; }
                 const double values[7] = {atOverpass.ta, atOverpass.ea, atOverpass.p, atOverpass.wind, atOverpass.shortwave, atOverpass.longwave, soilMoisture[pixel]};
                 for (int k = 0; k < 7; ++k) forcingOut[k][pixel] = static_cast<float>(values[k]);
@@ -938,7 +936,6 @@ int runImage(const std::string& configPath)
                         for (size_t band = 0; band < config.opticalBands.size(); ++band) {
                             const double ground = entry->groundKind == GroundKind::Flat ? entry->groundReflectance : soilBandReflectance[moistureStep(moisture)][band];
                             const double lr = leafR[band], lt = std::min(leafT[band], 1.0 - leafR[band]);
-                            // FIXED[中] Bug: EB 模式下若该像元没有算出 diffuseFractionOut（ebNoForcing、SPA 失败等）或处于 RT 模式，会回退到 config.diffuseFraction，该值可为 −1（Erbs），使 canopyReflectance 里 direct=2、diffuse=−1；已修复：回退值不在 [0,1] 时用 requestedDiffuseFraction 现算（EB 有短波值时用该值，否则按 0 短波），不再把 −1 传进反射率
                             double diffuse = eb && std::isfinite(diffuseFractionOut[pixel])
                                 ? diffuseFractionOut[pixel] : config.diffuseFraction;
                             if (!(diffuse >= 0.0 && diffuse <= 1.0))
@@ -1096,7 +1093,6 @@ int runImage(const std::string& configPath)
         componentsInfo.Add("bands", bandList);
         CPLJSONDocument componentsDocument;
         componentsDocument.SetRoot(componentsInfo);
-        // FIXED[低] 错误处理: components.json 的 Save 返回值原来没有检查（scene_summary.json 有检查），写失败时后续 RT 复用会找不到元数据；已修复：与 scene_summary.json 一致，Save 返回 false 时抛异常
         if (!componentsDocument.Save(utf8FromPath(outputDir / "components.json"))) throw std::runtime_error("无法写出 components.json");
 
         CPLJSONObject era5Info;

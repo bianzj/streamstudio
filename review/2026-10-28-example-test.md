@@ -36,10 +36,10 @@
 
 - `review/run-examples.mjs`（测试驱动）
 - `review/compare-summary.mjs`（结果对比）
-- `review/examples-run/2026-10-28T09-50-43-706Z/`（逐示例日志 `*.log` 与 `summary.json`）
+- 原始日志与 `summary.json`：2026-11-04 起移到项目忽略目录 `.test/examples-run/2026-10-28T09-50-43-706Z/`，不再入库
 
 > 大体积产物（约 1.5 GB 的 TIFF/BIN/CSV）在核对完成后已清理，仅保留日志与汇总；
-> 需要复现时重新执行 `review/run-examples.mjs <baseUrl>` 即可。
+> 需要复现时重新执行 `review/run-examples.mjs <baseUrl>` 即可，结果写入 `.test/examples-run/`。
 
 ## 质量指标
 

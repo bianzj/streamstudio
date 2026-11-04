@@ -31,7 +31,6 @@ std::vector<std::string> myFunction::mySplitStr(const std::string& str, const st
 {
     std::vector<std::string> res;
     if ("" == str) return res;
-    // FIXED[中] 内存: strs 与 d 两个 new char[] 从未 delete[]，每次调用都泄漏（mySplitInt/mySplitFloat 同样）；已修复：三个 mySplit* 均改为基于 std::string::find_first_of 的无堆分配分割，不再 new char[]，函数签名与全部调用点不变。
     std::size_t begin = str.find_first_not_of(delim);
     while (begin != std::string::npos) {
         const std::size_t end = str.find_first_of(delim, begin);

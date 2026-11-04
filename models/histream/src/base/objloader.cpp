@@ -879,7 +879,6 @@ void ObjLoader::clearCurrentInfo()
 
 
 // 在类中实现该函数
-// FIXED[中] 未初始化: m_worldOrigin/m_worldSize 从未被赋值（nvmath::vec3f 默认不清零），范围判断与归一化使用垃圾值，m_worldSize 为 0 时还会除零；m_heightmap 为空时 at<float> 越界；已修复：getHeightAt 入口先判 m_heightmap 为空、再判 m_worldSize.x/y 非正（含 NaN），命中即返回，creatBackgroundFromDEM 中按 sceneSize 设置 m_worldOrigin={-sceneSize.x/2,0,-sceneSize.y/2}、m_worldSize=sceneSize。
 float ObjLoader::getHeightAt(float worldX, float worldZ)
 {
     // 注意：先判空再读 m_worldSize，避免 heightmap 尚未生成时读到未初始化成员。
@@ -984,7 +983,6 @@ void ObjLoader::creatBackgroundFromDEM(const std::string& filename,
 
     // Resample the complete DEM extent onto the configured scene extent:
     // rows run north-south along sceneSize.x, columns east along sceneSize.y.
-    // FIXED[低] 数值: 未校验 sceneSize.x/y 为有限正数（NaN/inf 时 ceil(...) 转 int 属未定义行为，cv::resize 可能抛异常或分配巨量内存）；已修复：creatBackgroundFromDEM 入口检查 std::isfinite 且 >0，不满足时抛出 std::runtime_error。
     const float requestedStep = std::max(targetStep, 0.01f);
     const float cappedStep = std::max(
         requestedStep,
@@ -1104,7 +1102,6 @@ void ObjLoader::interpolateZValues(nvmath::vec3f sceneSize, float* tempx, float*
         // 不需要 +0.5 了，因为输入本身就是从 0 开始的
         // Position-file columns are north and east respectively; the engine
         // axes are +X north, +Y up and +Z east.
-        // FIXED[低] 数值: sceneSize.x 或 y 为 0 时 wx==0 仍通过范围检查，0/0 得 NaN，(int)NaN 属未定义行为并作为下标访问 m_heightmap；已修复：函数开头校验 sceneSize.x/y 有限且 >0，不满足时打印错误并直接返回，不再做归一化。
         float u = wy / sceneSize.y;
         float v = 1.0f - wx / sceneSize.x;
 

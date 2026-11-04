@@ -164,7 +164,6 @@ void Engine::input(std::string path, std::string V, std::string outputPath){
 
 bool Engine::create() {
 
-    // FIXED[中] 未初始化: eRaytracing/eVoxelEB/eVoxelRT 分支直接解引用求解器指针，未调用 input()/init() 时为空指针崩溃（destroy() 已判空）；已修复：入口按模式判空求解器与 IO 指针，未初始化时抛出带说明的 runtime_error（run() 同改，main 已有异常捕获）。
     if (!((m_mode == Mode::eFacetRT && m_pFacetrt && m_pFacetrtio) ||
           (m_mode == Mode::eFacetEB && m_pFaceteb && m_pFacetebio) ||
           (m_mode == Mode::eRaytracing && m_pRaytracing && m_pRaytracingio) ||
@@ -218,8 +217,6 @@ std::string Engine::facetShaderDirectory(const char* name) const
 }
 
 int Engine::run() {
-    // FIXED[中] 未初始化: 求解器虽已用 && 短路判空，但 IO 指针未判空且未初始化时静默返回 1；已修复：入口按模式判空求解器与 IO 指针，未初始化时抛出带说明的 runtime_error（与 create() 一致）。
-    // FIXED[中] 未初始化: run() 入口判空漏掉 m_pFileio，eRaytracing/eVoxelEB/eVoxelRT 分支把空 shared_ptr 传给求解器 run()（前轮补漏发现，原文件未标注）；已修复：这三个分支的守卫条件补 && m_pFileio，未初始化时抛出与 create() 一致的 runtime_error（create() 未使用 m_pFileio，无需改动）。
     if (!((m_mode == Mode::eFacetRT && m_pFacetrt && m_pFacetrtio) ||
           (m_mode == Mode::eFacetEB && m_pFaceteb && m_pFacetebio) ||
           (m_mode == Mode::eRaytracing && m_pRaytracing && m_pRaytracingio && m_pFileio) ||
@@ -258,7 +255,6 @@ void Engine::destroy() {
         if (m_pFaceteb) m_pFaceteb->destroy(m_pFacetebio);
         return;
     }
-    // FIXED[低] 错误处理: 未判空直接解引用 m_pRaytracing/m_pVoxeleb/m_pVoxelrt，且 appSetting.destroy() 对未创建的 surface 调用 vkDestroySurfaceKHR；已修复：与 Facet 分支一致先判空，AppSetting::destroy() 仅在 m_surface 非空时销毁 surface。
     if(m_mode == Mode::eRaytracing) {
         if (m_pRaytracing) m_pRaytracing->destroy(m_pRaytracingio);
     }

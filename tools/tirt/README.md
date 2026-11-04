@@ -2,6 +2,8 @@
 
 TiRT (Terrestrial Inhomogeneous Radiative Transfer) is a land-surface radiative transfer model for vegetation, terrain, urban surfaces, and coupled scenes.
 
+> **本目录说明（Stream Studio）**：这里是独立项目 TiRT（上游仓库 `C:\work\tirt`）的模型代码副本，供 STREAM 引擎的 TIRTEB 对齐与核对使用，只保留 `base/`、`data/`、`run.py`、`tirteb_run.py` 和两个输入模板。下文提到的 `docs/`、`gui/`、`PROJECT_FILES.md`、安装包与发布目录都在上游项目中，本仓库不包含。命令请在 `tools\tirt` 目录下运行；运行结果写入 `cases/`（已被 .gitignore 忽略），不要提交回仓库。
+
 文档：
 
 - 项目代码说明：[PROJECT_FILES.md](PROJECT_FILES.md)
@@ -78,7 +80,7 @@ LAI 输入支持单个值或分号分隔的列表（如 `1;3;5`）。多 LAI 时
 建议使用 Python 3.10+。
 
 ```powershell
-cd C:\work\tirt
+cd C:\work\streamstudio\tools\tirt
 py -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
@@ -273,7 +275,7 @@ tirt/
 用 VS Code 打开项目根目录：
 
 ```powershell
-code C:\work\tirt
+code C:\work\streamstudio\tools\tirt
 ```
 
 选择 Python 解释器：
@@ -295,10 +297,10 @@ from base.xxx import *
 
 #### No module named 'base'
 
-原因是 Python 搜索路径没有包含项目根目录。请从 `C:\work\tirt` 运行，或设置：
+原因是 Python 搜索路径没有包含项目根目录。请从 `C:\work\streamstudio\tools\tirt` 运行，或设置：
 
 ```powershell
-$env:PYTHONPATH="C:\work\tirt;C:\work"
+$env:PYTHONPATH="C:\work\streamstudio\tools\tirt"
 ```
 
 #### No module named 'scipy'
@@ -369,7 +371,7 @@ chmod +x start_tirt.command
 Windows 用户请安装 Miniconda，然后双击 `start_tirt.bat`。脚本首次运行会根据 `environment.yml` 创建 `tirt` 环境并安装 Python 依赖，同时安装 Electron 桌面依赖，之后启动无浏览器栏的 TiRT 窗口。也可以在 Anaconda Prompt 中执行：
 
 ```bat
-cd C:\work\tirt
+cd C:\work\streamstudio\tools\tirt
 start_tirt.bat
 ```
 

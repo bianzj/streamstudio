@@ -28,7 +28,6 @@ const COMPONENT_KEYS = ['soilSunlit', 'soilShaded', 'leafSunlit', 'leafShaded']
 const object = (value) => (value && typeof value === 'object' && !Array.isArray(value) ? value : {})
 const array = (value) => (Array.isArray(value) ? value : [])
 const clone = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)))
-// FIXED[中] 数据一致性: Number(null)/Number('')/Number(false) 都等于 0，被当作有效值而不回退；纬度/经度/时区、观测角、天顶角等为 null 或空串时会变成 0（例如位置跑到 0°N 0°E、时区变成 UTC），与 project-schema.js 的 number() 行为不一致；已修复：先按 number() 口径把 null/undefined/空白字符串视为缺失并回退，再解析数值
 const numeric = (value, fallback) => {
   if (value === null || value === undefined || (typeof value === 'string' && value.trim() === '')) return fallback
   const parsed = Number(value)
@@ -183,7 +182,6 @@ export function normalizeUnified(value = {}) {
 }
 
 function mergeHistreamEngine(base, source) {
-  // FIXED[低] 可维护性: source 中的 spectra/canopies/thermals/materials 数组以及 scene.background、objects.items 等嵌套对象按引用并入结果，未 clone（默认值一侧却 clone 了）；调用方修改归一化结果会回写到输入对象；已修复：入口对 source 做 clone()，后续合并全部基于副本
   const input = clone(object(source))
   const next = { ...base, ...input }
   next.enabled = input.enabled === undefined ? base.enabled : Boolean(input.enabled)
@@ -243,7 +241,6 @@ function histreamEngineSection(project) {
     enabled: true,
     mode: project.mode,
     scene, sensor, control,
-    // FIXED[低] 可维护性: fluid/objects 直接引用旧工程对象（objects.items 及其 placements 共享），scene/sensor/control 只是浅拷贝（scene.background 共享），而 spectra 等却做了深拷贝；统一工程被修改时会连带改动仍在内存中的 HiStream 工程；已修复：入口改为 clone(configuration)，fluid/objects/scene 等均基于副本
     fluid: object(configuration.fluid),
     objects: object(configuration.objects),
     spectra: clone(array(configuration.spectra)),
@@ -276,10 +273,8 @@ function sharedFromHistream(project, previous = {}) {
       dem: demFile ? { file: demFile, band: sameDem ? Math.max(0, Math.trunc(numeric(previousDem.band, 0))) : 0 } : previousDem,
       demInfo: scene.demInfo ?? object(previousShared.location).demInfo ?? null
     },
-    // FIXED[低] 数据一致性: year 缺省 2024，与 project-schema 默认 2019、normalizeUnified 使用的 configuration.meteo.year 不一致；下方 cpuThreads 也缺少 1024 上限（normalizeUnified 有）；已修复：cpuThreads 增加 1024 上限；year 默认数值属禁止修改项，未改动
     time: { ...object(previousShared.time), year: Math.trunc(numeric(meteo.year, 2024)) },
     sky: {
-      // FIXED[中] 数据一致性: 每次从 HiStream 保存都强制 mode: 'manual' 并丢弃 previousShared.sky，STREAM 侧设置的 'from-time'（按过境时刻计算太阳位置）被静默覆盖；已修复：先展开 previousShared.sky 并保留其 mode（仅合法值），再覆盖角度字段
       ...object(previousShared.sky),
       mode: object(previousShared.sky).mode === 'from-time' ? 'from-time' : 'manual',
       zenith: cleanNumber(light.zenith, 30),
@@ -434,7 +429,6 @@ export function normalizeStreamScene(value = {}) {
   const components = { ...base.temperature.components, ...object(temperature.components) }
   const componentsPackage = object(legacyComponentsPackage)
   if (trimPath(componentsPackage.file)) components.file = trimPath(componentsPackage.file)
-  // FIXED[低] 数据一致性: componentsPackage 位于 temperature 上而不是 components 上，这里的 delete 删错对象；下方 ...temperature 仍把 temperature.componentsPackage 原样带入结果并持久化到统一工程，与 components.file 形成两份可能不一致的路径；已修复：从 temperature 解构中剔除 componentsPackage（不再 delete 无用的 components.componentsPackage），只保留归一化后的 components.file
   return {
     ...base,
     ...scene,
@@ -523,7 +517,6 @@ export function unifiedToStreamScene(unified) {
   const shared = project.shared
   const engine = project.engines.stream
   const sharedDem = shared.location.dem.file ? { file: shared.location.dem.file, ...(shared.location.dem.band ? { band: shared.location.dem.band } : {}) } : {}
-  // FIXED[低] 数据一致性: rasterField 只保留 file/band，engine.surface/view 中栅格字段的其它属性（如 scale、nodata 或将来新增的键）在打开统一工程时被丢弃，下次保存即永久丢失；已修复：先展开 field 再规范化 file/band（band 为 0 时删除该键，其余属性保留）
   const rasterField = (field) => {
     const next = { ...field, file: trimPath(field.file) }
     const band = numeric(field.band, 0)

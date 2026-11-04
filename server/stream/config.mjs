@@ -16,7 +16,6 @@ export function localToUtc(date, time, timezone) {
   const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''))
   const clock = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(String(time || ''))
   if (!day || !clock) return ''
-  // FIXED[低] Bug: Number(null) 与 Number('') 都是 0（有限值），旧工程 timezone 为 null/空串时按 UTC+0 而不是注释里的默认 +8 换算，过境时刻偏 8 小时；与 workspace.js 的 localToUtc 是重复实现；已修复：timezone 为 null/undefined/空白串或非有限数时取默认 +8，不再被 Number() 折成 0（与 workspace.js 的重复实现未合并）
   const offset = timezone === null || timezone === undefined || String(timezone).trim() === '' || !Number.isFinite(Number(timezone)) ? 8 : Number(timezone)
   const ms = Date.UTC(Number(day[1]), Number(day[2]) - 1, Number(day[3]), Number(clock[1]), Number(clock[2]), Number(clock[3] || 0)) - offset * 3600000
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
@@ -110,7 +109,6 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     mapStreamScenePaths(stored, (file) => {
       const absolute = resolve(normalizeHostPath(String(file).trim()))
       const inside = relative(baseDir, absolute)
-      // FIXED[低] Bug: startsWith('..') 会把工程目录下以“..”开头的子目录（如 "..data\x.tif"）误判为在工程外而存成绝对路径；已修复：改为排除 inside === '..' 或以 '..' + sep 开头的路径
       return inside && inside !== '..' && !inside.startsWith(`..${sep}`) && !isAbsolute(inside) ? inside.replaceAll('\\', '/') : windowsPath(absolute)
     })
 
@@ -153,7 +151,6 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     if (list.length > 64) throw new Error(`${label}波段不能超过 64 个`)
     return list.map((item, index) => {
       const name = String(item?.name || `B${index + 1}`).replace(/[,{}\r\n]/g, ' ').trim().slice(0, 40) || `B${index + 1}`
-      // FIXED[低] Bug: 带宽输入框清空后 Number('') 得 0，结果静默变成单色波段；已修复：空串视为无效（缺省字段仍按 0 处理）
       const blank = (value) => typeof value === 'string' && value.trim() === ''
       const center = blank(item?.center) ? NaN : Number(item?.center)
       const fwhm = blank(item?.fwhm) ? NaN : Number(item?.fwhm ?? 0)
@@ -316,7 +313,6 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
             .map((key) => [key, Number(temperatureInput.energy[key])])),
           soilHeatMethod: temperatureInput.energy?.soilHeatMethod || 'surface',
           temperatureMethod: temperatureInput.energy?.temperatureMethod || 'robust',
-          // FIXED[中] Bug: Number('') 与 Number(null) 都是有限值 0，表单清空后 diffuseFraction 变成 0（而不是默认 0.2），spectralBinNm/referenceHeight/soilEmissivityK/soilResistance.value 变成 0 并导致引擎报“参数超出有效范围”；已修复：下列取值统一改用 hasNumber()，空串/空白/null 视为未提供，保持原默认值或省略该字段
           diffuseFraction: hasNumber(temperatureInput.energy?.diffuseFraction) ? Number(temperatureInput.energy.diffuseFraction) : 0.2,
           enforceSolarLimit: temperatureInput.energy?.enforceSolarLimit !== false,
           spectralBinNm: hasNumber(temperatureInput.energy?.spectralBinNm) ? Number(temperatureInput.energy.spectralBinNm) : 50,
@@ -366,7 +362,6 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     if (assimilation !== 'none') config.assimilation = buildAssimilation(scene.assimilation, assimilation, { thermalEnabled, opticalEnabled })
     const region = scene.region
     if (region && region.enabled) {
-      // FIXED[低] Bug: 输入框清空后为 ''，Number('') 得 0，起始行列被静默当作 0；已修复：空值视为无效
       const values = ['startRow', 'endRow', 'startColumn', 'endColumn'].map((key) => (String(region[key] ?? '').trim() === '' ? NaN : Number(region[key])))
       if (!values.every((value) => Number.isInteger(value) && value >= 0)) throw new Error('行列范围须为非负整数')
       const [startRow, endRow, startColumn, endColumn] = values

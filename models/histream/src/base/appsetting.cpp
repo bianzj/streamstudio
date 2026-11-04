@@ -182,7 +182,6 @@ int AppSetting::initWindow()
 	// still required, but its helper window must never flash or steal focus.
 	glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 	glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
-	// FIXED[中] 错误处理: glfwInit/glfwCreateWindow 失败此前只返回 0 且 init() 忽略，随后以空窗口创建 surface；已修复：initWindow 失败时记录 GLFW 错误并释放窗口/GLFW 后返回 0，init() 检查返回值并抛异常。
 	m_window = glfwCreateWindow(SAMPLE_WIDTH, SAMPLE_HEIGHT, PROJECT_NAME, nullptr, nullptr);
 	if (!m_window)
 	{
@@ -259,7 +258,6 @@ int AppSetting::initVulkan()
 	// scalarLayout.scalarBlockLayout = VK_TRUE;
 	// m_contextInfo.addDeviceExtension(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, true, &scalarLayout);
 
-	// FIXED[低] Bug: 手工把 AS/RT 管线/BDA 特性结构串到 enabledAtomicsFeatures.pNext，与 addDeviceExtension 已注册的同 sType 结构重复（nvvk 构建链时会覆盖 pNext，此链被丢弃，若未覆盖则违反 VUID-VkDeviceCreateInfo-pNext）；已修复：删除重复的 AS/RT 管线/BDA 手工链，只保留随扩展注册的 shader-atomic-float 特性结构。
 	VkPhysicalDeviceShaderAtomicFloatFeaturesEXT enabledAtomicsFeatures{};
 	enabledAtomicsFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
 	enabledAtomicsFeatures.pNext = nullptr;
@@ -367,7 +365,6 @@ int AppSetting::initVulkan()
 	//auto  qGCT1 = m_context.createQueue(m_contextInfo.defaultQueueGCT, "GCT1", 1.0f);
 	m_queues.push_back({ m_context.m_queueGCT.queue, m_context.m_queueGCT.familyIndex, m_context.m_queueGCT.queueIndex });
 	//m_queues.push_back({ qGCT1.queue, qGCT1.familyIndex, qGCT1.queueIndex });
-	// FIXED[低] Bug: 在 lavapipe 上 requestedQueues 被缩减为仅 GCT 后，m_queueC/m_queueT 是空句柄却仍被放进 m_queues[1]/[2]；已修复：句柄为空时回退为已创建的 GCT 队列，避免后续向 VK_NULL_HANDLE 提交。
 	const nvvk::Queue fallbackQueue = m_queues.front();
 	nvvk::Queue queueC{ m_context.m_queueC.queue, m_context.m_queueC.familyIndex, m_context.m_queueC.queueIndex };
 	nvvk::Queue queueT{ m_context.m_queueT.queue, m_context.m_queueT.familyIndex, m_context.m_queueT.queueIndex };
@@ -392,7 +389,6 @@ int AppSetting::initSurface()
 {
 	VkResult err = glfwCreateWindowSurface(m_context.m_instance, m_window, nullptr, &m_surface);
 
-	// FIXED[中] 错误处理: Release 下 assert 被移除，surface 创建失败后仍以无效 m_surface 查询 present 支持；已修复：创建失败时抛异常，查询失败或不支持 present 时记录警告并返回 0（CPU 批处理后端可能不支持 present）。
 	if (err != VK_SUCCESS)
 	{
 		throw std::runtime_error("Failed to create a GLFW Vulkan surface, VkResult = "

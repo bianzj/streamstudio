@@ -596,7 +596,6 @@ float projectionCoverageAxis(const Ctx& c, int cellX, int cellY, int cellZ,
 void buildParity(Ctx& c)
 {
     const auto& tris = c.scene->tris;
-    // FIXED[中] 数值: gx*gy*gz 以 int 相乘，体元数 >2^31 时溢出（而 cells 用 size_t 计算），parity 被分配为错误大小，后续 cellIndex 越界写；已修复：total 改为 std::size_t 逐维强制转换后相乘，parity 按该 size_t 分配；网格总数上限（阈值）未加（DEFERRED）。
     const std::size_t total = static_cast<std::size_t>(c.gx) *
                               static_cast<std::size_t>(c.gy) *
                               static_cast<std::size_t>(c.gz);
@@ -644,7 +643,6 @@ void buildParity(Ctx& c)
         const int y = r / c.gz;
         const int z = r % c.gz;
         {
-            // FIXED[高] Bug: 同一三角形的 AABB 若跨越 x 与 x+1 两个胞，会同时出现在两个胞的列表中，被测试命中一次却 cross^=1 两次而抵消，导致中心连线穿过斜面时奇偶性不翻转、封闭体内部整行填充错位；已修复：把命中的三角形按索引去重后再翻转奇偶性，hits 在行内复用避免每个体元都分配。
             std::vector<std::uint32_t> hits;
             for (int x = 0; x + 1 < c.gx; ++x) {
                 const V3 a{static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, static_cast<float>(z) + 0.5f};
@@ -1115,7 +1113,6 @@ std::string toJson(const HexResult& r, const std::string& objPath)
     std::ostringstream os;
     os << "{\n";
     os << "  \"method\": \"hex-voxel (facet projection aggregation)\",\n";
-    // FIXED[低] Bug: objPath 与 label 未做 JSON 转义，Windows 路径中的反斜杠（C:\data\tree.obj）或引号会生成非法 JSON；已修复：新增本地 jsonEscape（转义反斜杠、双引号、换行、回车、制表）并用于 objPath 与每个 label；"grid" 仍输出为含一个字符串的数组，字段语义未改（DEFERRED）。
     const auto jsonEscape = [](const std::string& in) {
         std::string out;
         out.reserve(in.size());

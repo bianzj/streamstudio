@@ -139,7 +139,6 @@ PrimMesh createVoxelDemBackground(const Background& background, float stepSize)
     mesh.meshId = 0;
     mesh.nVertices = 0;
     mesh.nIndices = 0;
-    // FIXED[低] 数值: 未检查 stepSize>0；为 0 或极小时 sceneSize/stepSize 为 inf/巨大值，static_cast<int> 属未定义行为，columns*rows 分配可能耗尽内存；已修复：入口校验 stepSize 为有限正数，否则抛异常；顶点数/格数上限与共享顶点属性能改写，仍为 DEFERRED。
     if (!(stepSize > 0.0f) || !std::isfinite(stepSize))
         throw std::runtime_error("DEM background step size must be a finite positive value: " +
                                  std::to_string(stepSize));
@@ -1111,7 +1110,6 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
                     bool closed = true;
                     for (const hexvoxel::ObjInfo& object : completeScene.objects) {
                         if (object.name != meshName) continue;
-                        // FIXED[低] 内存: 未校验 triOffset+triCount <= completeScene.tris.size()，对象表与三角形数组不一致（OBJ 解析异常）时迭代器越界属未定义行为；已修复：插入前用 size_t 求和做范围检查，越界时抛异常。
                         if (static_cast<size_t>(object.triOffset) + object.triCount >
                             completeScene.tris.size())
                             throw std::runtime_error(
@@ -1595,7 +1593,6 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
             /// model/mesh
             ///-------------------------------------
             std::string meshName = objEntity.meshNames[kmesh];
-            // FIXED[高] 内存: spectralNames[kmesh] 与下方 types[kmesh] 未做长度检查，JSON 中光谱/类型绑定条目少于 meshNames 时越界读（UB/崩溃）；已修复：spectralNames 为空时抛异常，否则用 min(kmesh, size-1) 索引；types 按 kmesh < types.size() 判断，缺省用 Type{}。
             if (objEntity.spectralNames.empty())
                 throw std::runtime_error("Missing spectral binding for OBJ mesh: " + meshName);
             const size_t meshBinding =
@@ -1650,7 +1647,6 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
                 Instance instance{};
                 instance.meshId = static_cast<uint32_t>(n_modelmesh);
                 glm::vec3 shift0 = objEntity.objDistributions[kinstance];
-                // FIXED[高] 内存: 位置直接写在 JSON 中（非文件）时 scales/rotations 不会按 objDistributions 补齐，二者条目少于位置数即越界读；已修复：进入实例循环前 resize(objDistributions.size(), 1.0f/0.0f)，索引安全。
                 float scale0 = objEntity.scales[kinstance];
                 float angle0 = objEntity.rotations[kinstance];
 
@@ -1841,8 +1837,6 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
                   (placement.z + demHeightAboveMinimum(
                       background, placement.x, placement.y)) / modelio->stepsize_surface,
                   originGroundY / modelio->stepsize_surface};
-        // FIXED[高] 内存: PrimEntity 默认 scales{1}/rotations{0} 只有 1 个元素，JSON 直接给出多个 primDistributions 而未给等长 scales/rotations 时（非文件路径），下方 scales[kinstance]/rotations[kinstance] 越界读；已修复：进入实例循环前按 primDistributions.size() resize scales/rotations（补齐 1.0f/0.0f）。
-        // FIXED[中] Bug: 下方 Instance/InstanceLink 在插入体元之前 push_back，但本次放置若没有新增体元（isValid==0：全部与已有体元重叠或越界）会 continue 而不递增 n_instance，instances.size() 与 n_instance 脱节，后续 voxelLink.instanceId 指向错误实例（变换/meshId 错位）；已修复：isValid==0 时 pop_back 刚压入的 instances/instanceLinks 再 continue，使 instances.size() 始终等于 n_instance。
 
         ///-----------------------------------------------------------------------------
         ///
@@ -1969,7 +1963,6 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
     for (size_t k = 0; k < shapeRows.size(); k++) {
         const auto& row = shapeRows[k];
 
-        // FIXED[中] 安全: 形状类型由浮点列直接强转为枚举，未校验 0..2 范围；height/width/length 未校验 >0，非法值使 createTriEntity 产生 0 个或海量体元；已修复：静默强转前校验 row[0]∈[0,2]（ShapeType 只有 CUBE/ELLIPSOID/PLANE），并校验三个尺寸为有限且非负，非法时抛出带形状文件名的异常。
         if (!std::isfinite(row[0]) || row[0] < 0.0f || row[0] > 2.0f)
             throw std::runtime_error("Crown shape type must be 0, 1 or 2: " + voxelEntity.shapefile);
         if (!(row[1] >= 0.0f) || !(row[2] >= 0.0f) || !(row[3] >= 0.0f) ||
@@ -1983,7 +1976,6 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
         PrimMesh currentVoxelModel1 = XYZ2XZY(currentVoxelModelXYZ1, 1); // (1,1,0) => (1,0,1) with  height = 0
         currentVoxelModel1.meshId = n_modelmesh;
         meshio->primMeshes.emplace_back(currentVoxelModel1); //xzy
-        // FIXED[中] 内存: meshNames/spectralNames/canopyNames/propNames 直接取 [0] 未判空，缺少任一绑定即越界；下方 MeshLink meshlink1 未值初始化（水体类型时 bioId 及 vertexAddress 等为垃圾值），thermalId 固定为 0 而忽略 thermalNames；已修复：改用 requiredMappedId/mappedId（内含空表判空与下标钳制）取首个绑定，MeshLink 改为 meshlink1{} 值初始化；thermalId 仍为 0，行为不变。
         std::string meshName1 = voxelEntity.meshNames.empty()
             ? voxelEntity.primitiveName : voxelEntity.meshNames.front();
         MeshLink meshlink1{};
@@ -2066,7 +2058,6 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
 
                 }
             }
-            // FIXED[中] Bug: isValid==0 时已经 push 实例但 n_instance 未递增，后续 voxelLink.instanceId 与 instances 下标错位（与 1844/2590 同源，原文件未标注）；已修复：pop_back 撤销本次压入
             if (isValid == 0) {
                 instanceio->instances.pop_back();
                 instanceio->instanceLinks.pop_back();
@@ -2215,7 +2206,6 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
         instanceio->instanceLinks.emplace_back(instancelink2);
 
 
-        // FIXED[中] 内存: isValids[kvoxel] 未校验 isValids.size()==voxelIds.size()（createTriEntitiesFromTif_wall 等生成器若未逐体元填写即越界读）；已修复：循环前把 isValids 补到 voxelIds.size()（int5{} 全零），保证下方索引不越界。
         if (currentVoxelModel1.isValids.size() < currentVoxelModel1.voxelIds.size())
             currentVoxelModel1.isValids.resize(currentVoxelModel1.voxelIds.size());
         int isValid = 0;
@@ -2295,7 +2285,6 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
 
     modelio->sceneSize_XYZ =  background.sceneSize;
     modelio->sceneOrigin_XYZ = background.sceneOrigin;
-    // FIXED[中] 数值: 未校验 stepsize_surface>0，为 0 时除零得到 inf，转换为 int 属未定义行为；float→int 截断使 sceneSize 不是步长整数倍时最后不足一格的条带被丢弃，而 DEM 背景用 floor、OBJ 路径用 floor(x/2+0.5) 求半宽，三处取整规则不一致可能产生半格偏移；已修复：入口校验 stepsize_surface 为有限正数，否则抛异常（取整规则的统一仍为 DEFERRED）。
     if (!(background.stepsize_surface > 0.0f) || !std::isfinite(background.stepsize_surface))
         throw std::runtime_error("Background stepsize_surface must be a finite positive value: " +
                                  std::to_string(background.stepsize_surface));
@@ -2425,7 +2414,6 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     if(background.isLad==true){
         // read lad tif
         int width = 0,height = 0, nband = 1;
-        // FIXED[中] 错误处理: readImageinout1 的返回值被忽略，LAD 影像打不开时 lads 保持为空（不会走 else 分支补 0），着色器按体元索引读取空缓冲；已修复：检查返回值，读取失败或结果为空时抛出带路径的异常，避免零长度 lads 被按体元索引；影像 width×height 与背景网格尺寸的一致性校验仍为 DEFERRED。
         if (Utils::readImageinout1(background.ladfile,surfio->lads,width, height,nband) == 0 ||
             surfio->lads.empty())
             throw std::runtime_error("Cannot read LAD image: " + background.ladfile);
@@ -2590,8 +2578,6 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
                   (placement.z + demHeightAboveMinimum(
                       background, placement.x, placement.y)) / modelio->stepsize_surface,
                   originGroundY / modelio->stepsize_surface};
-        // FIXED[高] 内存: PrimEntity 默认 scales{1}/rotations{0} 只有 1 个元素，JSON 直接给出多个 primDistributions 而未给等长 scales/rotations 时（非文件路径），下方 scales[kinstance]/rotations[kinstance] 越界读；已修复：进入实例循环前按 primDistributions.size() resize scales/rotations（补齐 1.0f/0.0f）。
-        // FIXED[中] Bug: 下方 Instance/InstanceLink 在插入体元之前 push_back，但本次放置若没有新增体元（isValid==0：全部与已有体元重叠或越界）会 continue 而不递增 n_instance，instances.size() 与 n_instance 脱节，后续 voxelLink.instanceId 指向错误实例（变换/meshId 错位）；已修复：isValid==0 时 pop_back 刚压入的 instances/instanceLinks 再 continue，使 instances.size() 始终等于 n_instance。
 
         ///-----------------------------------------------------------------------------
         ///
@@ -2718,7 +2704,6 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
     for (size_t k = 0; k < shapeRows.size(); k++) {
         const auto& row = shapeRows[k];
 
-        // FIXED[中] 安全: 形状类型由浮点列直接强转为枚举，未校验 0..2 范围；height/width/length 未校验 >0，非法值使 createTriEntity 产生 0 个或海量体元；已修复：静默强转前校验 row[0]∈[0,2]（ShapeType 只有 CUBE/ELLIPSOID/PLANE），并校验三个尺寸为有限且非负，非法时抛出带形状文件名的异常。
         if (!std::isfinite(row[0]) || row[0] < 0.0f || row[0] > 2.0f)
             throw std::runtime_error("Crown shape type must be 0, 1 or 2: " + voxelEntity.shapefile);
         if (!(row[1] >= 0.0f) || !(row[2] >= 0.0f) || !(row[3] >= 0.0f) ||
@@ -2732,7 +2717,6 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
         PrimMesh currentVoxelModel1 = XYZ2XZY(currentVoxelModelXYZ1, 1); // (1,1,0) => (1,0,1) with  height = 0
         currentVoxelModel1.meshId = n_modelmesh;
         meshio->primMeshes.emplace_back(currentVoxelModel1); //xzy
-        // FIXED[中] 内存: meshNames/spectralNames/canopyNames/propNames 直接取 [0] 未判空，缺少任一绑定即越界；下方 MeshLink meshlink1 未值初始化（水体类型时 bioId 及 vertexAddress 等为垃圾值），thermalId 固定为 0 而忽略 thermalNames；已修复：改用 requiredMappedId/mappedId（内含空表判空与下标钳制）取首个绑定，MeshLink 改为 meshlink1{} 值初始化；thermalId 仍为 0，行为不变。
         std::string meshName1 = voxelEntity.meshNames.empty()
             ? voxelEntity.primitiveName : voxelEntity.meshNames.front();
         std::string propName1 = voxelEntity.propNames.empty()
@@ -2817,7 +2801,6 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
 
                 }
             }
-            // FIXED[中] Bug: isValid==0 时已经 push 实例但 n_instance 未递增，后续 voxelLink.instanceId 与 instances 下标错位（与 1844/2590 同源，原文件未标注）；已修复：pop_back 撤销本次压入
             if (isValid == 0) {
                 instanceio->instances.pop_back();
                 instanceio->instanceLinks.pop_back();
@@ -2952,7 +2935,6 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
         instanceio->instanceLinks.emplace_back(instancelink2);
 
 
-        // FIXED[中] 内存: isValids[kvoxel] 未校验 isValids.size()==voxelIds.size()（createTriEntitiesFromTif_wall 等生成器若未逐体元填写即越界读）；已修复：循环前把 isValids 补到 voxelIds.size()（int5{} 全零），保证下方索引不越界。
         if (currentVoxelModel1.isValids.size() < currentVoxelModel1.voxelIds.size())
             currentVoxelModel1.isValids.resize(currentVoxelModel1.voxelIds.size());
         int isValid = 0;
@@ -3032,7 +3014,6 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
 
     modelio->sceneSize_XYZ =  background.sceneSize;
     modelio->sceneOrigin_XYZ = background.sceneOrigin;
-    // FIXED[中] 数值: 未校验 stepsize_surface>0，为 0 时除零得到 inf，转换为 int 属未定义行为；float→int 截断使 sceneSize 不是步长整数倍时最后不足一格的条带被丢弃，而 DEM 背景用 floor、OBJ 路径用 floor(x/2+0.5) 求半宽，三处取整规则不一致可能产生半格偏移；已修复：入口校验 stepsize_surface 为有限正数，否则抛异常（取整规则的统一仍为 DEFERRED）。
     if (!(background.stepsize_surface > 0.0f) || !std::isfinite(background.stepsize_surface))
         throw std::runtime_error("Background stepsize_surface must be a finite positive value: " +
                                  std::to_string(background.stepsize_surface));
@@ -3163,7 +3144,6 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     if(background.isLad==true){
         // read lad tif
         int width = 0,height = 0, nband = 1;
-        // FIXED[中] 错误处理: readImageinout1 的返回值被忽略，LAD 影像打不开时 lads 保持为空（不会走 else 分支补 0），着色器按体元索引读取空缓冲；已修复：检查返回值，读取失败或结果为空时抛出带路径的异常，避免零长度 lads 被按体元索引；影像 width×height 与背景网格尺寸的一致性校验仍为 DEFERRED。
         if (Utils::readImageinout1(background.ladfile,surfio->lads,width, height,nband) == 0 ||
             surfio->lads.empty())
             throw std::runtime_error("Cannot read LAD image: " + background.ladfile);
@@ -3230,7 +3210,6 @@ ObjMesh Scene::XYZ2XZY(ObjMesh model){
     temp.nIndices = model.nIndices;
     temp.nVertices = model.nVertices;
     temp.indices = model.indices;
-    // FIXED[中] 内存: 以 model.nVertices 为循环上界而非 vertices.size()，二者不同步（如加载器只填了 vector 未更新计数）时越界读；已修复：上界取 min(nVertices, vertices.size())，计数大于向量长度时不再越界（按值传参/整份复制 indices 的性能问题仍为 DEFERRED）。
     const int vertexCount = static_cast<int>(
         std::min<size_t>(model.nVertices, model.vertices.size()));
     for (int i = 0; i< vertexCount;i++)

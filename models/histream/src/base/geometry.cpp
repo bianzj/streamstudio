@@ -387,7 +387,6 @@ bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<R
     //---------------------------------------------------------
     // LIGHT AND SENSOR INI with Angle 0 and Band 0
     //---------------------------------------------------------
-    // FIXED[高] 内存: sensorxml.viewAngles 为空（配置缺省观测角）时 angles 为空，下方 angles[0] 越界读（UB/崩溃）；已修复：解析完 viewAngles 后若 angles 仍为空，则补一个天底观测 {0,0}（沿用当前太阳角），保证 angles[0] 有效；solarAngle 为 glm::vec2，无“元素个数不足”问题。
     if (modelio->angles.empty())
     {
         modelio->angles.emplace_back(Angle{0.0f, 0.0f, sza, saa});
@@ -587,7 +586,6 @@ bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<V
     //---------------------------------------------------------
     // LIGHT AND SENSOR INI with Angle 0 and Band 0
     //---------------------------------------------------------
-    // FIXED[高] 内存: viewAngles 为空时 angles[0] 越界读（同 RaytracingIO 重载）；已修复：解析完 viewAngles 后若 angles 为空，则补一个天底观测 {0,0}（沿用当前太阳角）。
     if (modelio->angles.empty())
     {
         modelio->angles.emplace_back(Angle{0.0f, 0.0f, sza, saa});
@@ -822,7 +820,6 @@ bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<V
     //---------------------------------------------------------
     // LIGHT AND SENSOR INI with Angle 0 and Band 0
     //---------------------------------------------------------
-    // FIXED[高] 内存: viewAngles 为空时 angles[0] 越界读（同 RaytracingIO 重载）；已修复：解析完 viewAngles 后若 angles 为空，则补一个天底观测 {0,0}（沿用当前太阳角）。
     if (modelio->angles.empty())
     {
         modelio->angles.emplace_back(Angle{0.0f, 0.0f, sza, saa});

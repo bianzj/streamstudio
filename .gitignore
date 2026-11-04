@@ -26,3 +26,13 @@ validation/**/log_nvprosample.txt
 **/__pycache__/
 assets/examples/**/output/
 **/log_nvprosample.txt
+# Engine build output (exe/dll/shaders) is produced by npm run build:engine, not versioned.
+models/bin_x64/
+# Editor / IDE settings
+.idea/
+.vscode/
+# Run outputs: raw logs and results belong in .test/ or D:/cases, not the repo.
+/results/
+review/examples-run/
+tools/tirt/cases/
+tools/tirt/inputs/

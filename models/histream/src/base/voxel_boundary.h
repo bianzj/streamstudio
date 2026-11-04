@@ -33,7 +33,6 @@ void emit(const Cells& cells, Emit append) {
     std::unordered_set<Cell, Hash> occupied;
     occupied.reserve(cells.size());
     for (const auto& cell : cells) occupied.insert({cell[0], cell[1], cell[2]});
-    // FIXED[低] Bug: 外层遍历的是原始 cells 而非去重后的 occupied，输入含重复体元（多个实例/子网格重叠时常见）时同一外表面被重复输出，产生重合三角形（光线求交 z-fighting、面积统计翻倍）；已修复：外层改为遍历去重后的 occupied 集合（输出顺序随哈希顺序变化，几何语义不变）。
     for (const auto& cell : occupied) {
         for (int face = 0; face < 6; ++face) {
             Cell neighbour{cell[0] + directions[face][0], cell[1] + directions[face][1],

@@ -158,7 +158,6 @@ function normalizeMaterialItem(item = {}) {
   const wood = item.energyModel === 'wood' || name === 'tree_branch_wood' || name === 'tree_trunk_wood'
   if (!wood) return { ...item, name }
   const fallback = createMaterialPresets().materials.find((entry) => entry.name === name)
-  // FIXED[中] 数据一致性: 只要 cs/specificHeat 缺失或非数字，下方就把 params 整体替换为预设值，用户填写的 rhos、lambdas、Tsoil、convectiveScale 等全部丢失；另外 Number(null)===0 使 cs:null 被判为“有参数”；已修复：params 始终 { ...预设, ...用户 } 逐字段合并，仅 cs/specificHeat 为 null/空白/非数字时单独回退预设 cs
   const source = item.params && typeof item.params === 'object' ? item.params : {}
   const solidHeatCapacity = number(source.cs ?? source.specificHeat, undefined)
   const params = { ...(fallback?.params || {}), ...source }
@@ -243,7 +242,6 @@ export function sensorViewAngles(sensor = {}, sunAzimuth = 0) {
   if (sensor.principalPlane) {
     for (const offset of [0, 90]) {
       for (let signedZenith = -75; signedZenith <= 75; signedZenith += 5) {
-        // FIXED[低] 错误处理: sunAzimuth 为非数字字符串/NaN 时 Number() 得 NaN，所有主平面角度的 VAA 都变成 NaN 并写给引擎（默认参数只覆盖 undefined）；已修复：改用 number(sunAzimuth, 0)，非数字回退 0
         add(Math.abs(signedZenith), number(sunAzimuth, 0) + offset + (signedZenith < 0 ? 180 : 0))
       }
     }
@@ -580,7 +578,6 @@ export function createDefaultProject(options = {}) {
 }
 
 export function normalizeProject(value = {}) {
-  // 入口深拷贝，避免归一化结果与输入 value 共享嵌套引用（对应下方 FIXED[低] 可维护性）。
   // 注意：server.mjs 也会在系统 Node 下调用本函数，而 package.json 未声明 engines；
   // structuredClone 需要 Node>=17。工程对象本身就是 JSON 可序列化数据，这里回退到 JSON 往返，
   // 避免旧版 Node 下加载工程直接抛 TypeError。
@@ -661,7 +658,6 @@ export function normalizeProject(value = {}) {
   )
   const sourceObjects = configuration.objects || {}
   const objectItems = (Array.isArray(sourceObjects.items) ? sourceObjects.items : defaults.configuration.objects.items)
-    // FIXED[低] 错误处理: items 中若有 null/非对象条目（手改 JSON 或旧版残留），item.materialName 抛 TypeError，整个工程无法打开；mesh 为 null 时同样崩溃（canopies 映射同理）；已修复：map 前过滤非对象条目，meshes 数组同样过滤非对象网格
     .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
     .map((item) => {
       const normalized = {
@@ -724,7 +720,6 @@ export function normalizeProject(value = {}) {
       else delete normalized.movement
       return normalized
     })
-  // FIXED[低] 可维护性: 结果只做了一层浅拷贝，objects.items[*] 的 placements/position/dimensions（非 Fire/Fog）、materials[*].params（非 wood）、thermals 等嵌套对象与输入 value 共享引用，调用方修改归一化结果会同时改动原 state.project（反之亦然）；已修复：normalizeProject 入口对 value 执行 structuredClone（与 main.js/workspace.js 既有用法一致）
   // DEFERRED[低] 兼容性: normalizeProject/parseProjectJson 不检查 value.schemaVersion（只有 validateProject 检查），高于 PROJECT_SCHEMA_VERSION 的工程被直接改写为 6 并在保存时降级（未知字段虽经 ...source 保留，但新语义可能被这里的迁移规则误改）；未修复：拒绝/只读打开更高版本涉及 schema 兼容策略，按要求保留待决策
   return {
     ...defaults,
@@ -1014,7 +1009,6 @@ function objectXml(item, index, resolvePath = (value) => value) {
   const name = xmlEscape(rawName)
   const dimensions = Array.isArray(item.dimensions) && item.dimensions.length >= 3 ? item.dimensions.join(',') : '1,1,1'
   const meshes = Array.isArray(item.meshes) && item.meshes.length ? item.meshes : []
-  // FIXED[低] Bug: 回退值 name 已经过 xmlEscape，下方 <meshNames> 再次 xmlEscape，对象名含 & < " 时被双重转义（&amp;amp;），与 objName 不一致导致网格匹配失败；另外网格名/光谱名含逗号时，逗号拼接的列表会错位；已修复：回退改用未转义的 rawName；名称含逗号问题仍待名称校验策略确认
   const meshNames = meshes.length ? meshes.map((mesh) => mesh.name).join(',') : (item.meshNames || rawName)
   const spectralNames = meshes.length ? meshes.map((mesh) => mesh.spectralName).join(',') : (item.spectralName || 'soil')
   const thermalNames = meshes.length ? meshes.map((mesh) => mesh.thermalName).join(',') : (item.thermalName || 'soil_temperature')
@@ -1052,7 +1046,6 @@ function spectrumXml(item, index, resolvePath = (value) => value) {
   const texture = item.physicalTexture || {}
   const specular = normalizeSpecular(item.specular)
   const textureFile = texture.fileName ? resolvePath(texture.fileName) : ''
-  // FIXED[中] Bug: 下一行 item.reflectance || '0.20' 把数值 0（如黑体/吸收面，或从数值输入框保存的 0）当作缺省值，导出为 0.20 反射率；已修复：改用显式缺失判断（仅 null/undefined/空白字符串回退），数值 0 原样保留
   const optical = (value, fallback) => (value === null || value === undefined || (typeof value === 'string' && value.trim() === '') ? fallback : value)
   const common = `<specularEnabled>${specular.enabled ? 1 : 0}</specularEnabled><specularFraction>${specular.fraction}</specularFraction><specularRoughness>${specular.roughness}</specularRoughness><reflectance>${xmlEscape(optical(item.reflectance, '0.20'))}</reflectance><transmittance>${xmlEscape(optical(item.transmittance, '0.0'))}</transmittance>\n        <tau_TIR>${number(item.tauTir, 0)}</tau_TIR><ref_TIR>${number(item.refTir, 0.05)}</ref_TIR>${item.refTirWet === null || item.refTirWet === undefined || item.refTirWet === '' ? '' : `<ref_TIR_wet>${number(item.refTirWet, -1)}</ref_TIR_wet>`}\n        <physicalTextureEnabled>${texture.enabled ? 1 : 0}</physicalTextureEnabled><physicalTextureFile>${xmlEscape(textureFile)}</physicalTextureFile><physicalTextureStrength>${Math.max(0, Math.min(1, number(texture.strength, 0.2)))}</physicalTextureStrength><physicalTextureRepeatSize>${Math.max(0.01, number(texture.repeatSize, 2))}</physicalTextureRepeatSize>`
   const params = item.params || {}
@@ -1075,7 +1068,6 @@ function thermalXml(item, index) {
 function materialXml(item) {
   const params = item.params || {}
   const name = xmlEscape(item.name)
-  // FIXED[中] 安全: 光伏分支用 params 的任意键直接拼成 XML 标签名，键含空格、<、> 或 "/x><y" 时生成非法 XML 或注入额外元素；已修复：输出前用 /^[A-Za-z_][\w.-]*$/ 校验标签名，非法键跳过
   // DEFERRED[低] 数据一致性: energyModel 为 wood（type 已被归一化为 Vegetation）的材质在此走 leafBio 分支，导出为叶片参数（cs/rhos/lambdas 不出现在 XML）；membrane 落到 soilSet 分支。FacetEB 引擎从 project.json 自行生成 surfaceEnergy（facetrtcore.cpp:2469 已区分 wood），但凡直接读取本 XML 的路径（如 VoxelEB 的 fileio.cpp 的 leafBio 解析）会把木质部当成叶片；未修复：需先确认 VoxelEB 是否消费此 XML，属跨引擎数据源决策
   if (item.energyModel === 'photovoltaic') return '<property><surfaceEnergy name="'+name+'"><photovoltaic>1</photovoltaic><vegetation>0</vegetation>'+Object.entries(params).filter(([k])=>typeof k === 'string' && /^[A-Za-z_][\w.-]*$/.test(k)).map(([k,v])=>'<'+k+'>'+xmlEscape(v)+'</'+k+'>').join('')+'</surfaceEnergy></property>'
   if (item.type === 'Vegetation') return `<property><leafBio name="${name}"><Vcmax>${number(params.Vcmax, 80)}</Vcmax><m>${number(params.m, 9)}</m><BallBerry>${number(params.BallBerry, 0.01)}</BallBerry><Type>${number(params.Type, 3)}</Type><kV>${number(params.kV, 0.6396)}</kV><Rdparam>${number(params.Rdparam, 0.015)}</Rdparam><Tparam>${xmlEscape(params.Tparam || '0.2,0.3,288,313,328')}</Tparam><Tyear>${number(params.Tyear, 25)}</Tyear><beta>${number(params.beta, 0.507)}</beta><kNPQs>${number(params.kNPQs, 0)}</kNPQs><qLs>${number(params.qLs, 1)}</qLs><stressfactor>${number(params.stressfactor, 1)}</stressfactor><Tcor>${number(params.Tcor, 0)}</Tcor></leafBio></property>`

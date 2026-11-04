@@ -65,7 +65,6 @@ public:
     }
     double at(double viewZenithDeg) const
     {
-        // FIXED[中] 内存: viewZenithDeg 为 NaN 时 std::clamp 原样返回 NaN，static_cast<int>(NaN) 是未定义行为（MSVC 通常得到 INT_MIN），std::min 之后 index 为负，values_[index] 越界读；已修复：先检查 !std::isfinite(viewZenithDeg)，非有限角度直接返回天底值 values_[0]，再做插值
         if (!std::isfinite(viewZenithDeg)) return values_[0];
         const double position = std::clamp(viewZenithDeg, 0.0, 90.0) / 90.0 * kSteps;
         const int index = std::min(static_cast<int>(position), kSteps - 1);

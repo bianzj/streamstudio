@@ -245,7 +245,6 @@ void configureCommon(FileIO& io, const ProjectJson& project, Mode mode) {
     sensorData.waves = project.sensorBands();
     const float cruiseHeading = route.headings.empty()
         ? ProjectJson::number(sensor, "cruiseHeading", 90.0f) : route.headings.front();
-    // FIXED[中] 错误处理: project.viewAngles() 为空时 sensorData.viewAngles 为空，Geometry::createGeometry 随后 angles[0] 越界；已修复：解析完成仍为空时补一个天底观测 {0,0}（与 Geometry 侧的回退一致）；角度范围（0<=vza<90）、zenith/azimuth/skyTemperature 范围及 sza>=90 时直射处理属于物理约定，未改动（见报告）。
     for (const auto& angle : project.viewAngles()) {
         float azimuth = angle[1];
         if (settings.isUAVtrave) {
@@ -577,7 +576,6 @@ bool FileIO::readJson(const std::string& path, Mode mode) {
                     value.name == "tree_branch_wood" ? 1.5f : 1.2f));
         } else if (value.type == Type::VEGETATION) {
             auto t = ProjectJson::numbers(params.contains("Tparam") ? params["Tparam"] : Json("0.2,0.3,288,313,328"));
-            // FIXED[低] 数值: Tparam 不足 5 个时原先用 0 补齐，后三项是温度（K），补 0 会使光合温度响应函数出现 1/T 或 exp(…/(R·T)) 的除零/溢出；已修复：缺失项改用同一分支已内置的默认 Tparam 值（0.2,0.3,288,313,328）逐位补齐并告警，不再补 0。
             if (t.size() < 5) {
                 std::cerr << "Warning: Tparam has " << t.size()
                           << " value(s); missing entries use the built-in default Tparam." << std::endl;

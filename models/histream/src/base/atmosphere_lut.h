@@ -71,7 +71,6 @@ inline void sortSpectrum(Spectrum& spectrum)
 inline Table load(const std::string& path)
 {
     Table table;
-    // FIXED[中] 安全: 窄字符 std::ifstream(path) 按 ANSI 代码页解析，中文/UTF-8 路径的 LUT 打开失败后只返回无效表，sampleAtmosphereLut 静默返回“无校正”；已修复：保留原回退行为，但打开失败时输出含完整路径的明确告警并说明大气校正被跳过（u8path 全链路属超范围，未做）。
     std::ifstream file(path);
     if (!file) {
         std::cerr << "WARNING: atmosphere LUT could not be opened: \"" << path
@@ -109,7 +108,6 @@ inline Table load(const std::string& path)
             static_cast<int>(std::lround(altitude * 1000.0f)),
             static_cast<int>(std::lround(zenith * 1000.0f))}];
         spectrum.wavelength.push_back(wavelength);
-        // FIXED[中] Bug: 波长按文件行序追加，未排序也未去重；spectralSample 依赖 wavelength 升序做 upper_bound，LUT 行顺序被打乱时插值结果错误；已修复：load 结束后对每个 Spectrum 调用 sortSpectrum，按波长把 wavelength/transmittance/pathRadiance 三个数组一起稳定排序。
         spectrum.transmittance.push_back(std::clamp(transmittance, 0.0f, 1.0f));
         spectrum.pathRadiance.push_back(std::max(0.0f, pathRadiance));
     }
@@ -126,7 +124,6 @@ inline Table load(const std::string& path)
 
 inline const Table& cached(const std::string& path)
 {
-    // FIXED[中] 并发: 函数内 static std::map 的查找与插入无锁，并行首次加载会数据竞争；已修复：为静态缓存加 std::mutex（返回的 Table 引用在 map 生命周期内稳定，查找/插入语义不变）。
     static std::mutex cacheMutex;
     static std::map<std::string, Table> cache;
     const std::lock_guard<std::mutex> lock(cacheMutex);

@@ -1,5 +1,5 @@
 # Stream Studio uses a new application identity. Uninstall HiStream Studio (or
-# StreamSim 1.x) before installing; user data is migrated on first launch.
+# the earlier StreamSim 1.x) before installing; user data is migrated on first launch.
 appId: cn.stream.studio
 productName: Stream Studio
 asar: true
@@ -41,8 +41,11 @@ extraResources:
       - "!shader/cases/**/*.spv"
       - "!shader/.idea{,/**/*}"
       - "!shader/.vscode{,/**/*}"
+      # Build-only leftovers copied in by vcpkg/CMake; the engine never reads them at run time.
+      - "!**/*.cmake"
+      - "!**/*.xlsx"
+      - "!usd/usd/resources/codegenTemplates{,/**/*}"
       - "!shader/*副本*"
-  # FIXED[中] 安全: 整个 docs 目录被打进安装包，其中有 docs/superpowers/plans/*（内部审计与修复计划）、model-remaining-issues-*.md、源 .docx 等内部开发文档；已修复：filter 白名单只打包用户手册与理论手册 PDF，排除 superpowers/、内部问题清单、release notes、figures 与 .docx 源文件
   - from: docs
     to: docs
     filter:

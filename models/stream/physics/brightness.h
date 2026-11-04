@@ -15,7 +15,6 @@ inline double planck(double temperatureK, double wavelengthUm)
     return kPlanckC1 / std::pow(wavelengthUm, 5.0) / std::expm1(kPlanckC2 / (wavelengthUm * temperatureK));
 }
 
-// FIXED[低] 错误处理: radiance≤0 时 log1p(+inf)=inf 会静默返回 0 K（radiance<0 时返回 NaN 或负温度），调用方得不到提示；已修复：radiance≤0 或非有限时显式返回 NaN（std::nan），调用方 image.cpp 已在 radiance>0 时调用，不影响有效像元
 inline double inversePlanck(double radiance, double wavelengthUm)
 {
     if (!(radiance > 0.0)) return std::nan("");

@@ -786,7 +786,6 @@ export async function loadXmlScene({ api, world, config, log, isCurrent = () => 
         let source
         if (item.type === 'Water' && item.sourceKind === 'prim') source = generatedWaterPreview(item, config)
         else {
-          // FIXED[中] 性能: 整个 OBJ 以文本读入后在主线程同步 parse，没有体积上限也没有按 fileName 缓存；大模型会长时间阻塞 UI，多个对象引用同一 OBJ 时重复读取解析；已修复：单次加载内按 fileName 缓存解析结果，复用时 clone 并克隆各 Mesh 的 geometry（UV 处理会 dispose 几何体，直接共享会破坏缓存）；体积上限与 Worker 化仍 DEFERRED
           let cached = objSourceCache.get(item.fileName)
           if (!cached) {
             const result = await api.readText(item.fileName)

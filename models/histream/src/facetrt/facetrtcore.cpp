@@ -4654,7 +4654,6 @@ try {
         {
             // Static scene and per-node forcing are uploaded once. Inner RT/EB
             // iterations exchange only seven reduction scalars with the host.
-            // FIXED[低] 数值: scene.facetCount()*32U 以 uint32 相乘，面元数 >1.34e8 时溢出导致缓冲区过小、后续 data 指针越界写；已修复：改以 size_t 相乘（此处与下方 facet * 32U 的数据指针偏移同为 size_t 运算），不再溢出。
             std::vector<float> gpuParameters(size_t(scene.facetCount()) * 32U, 0.0f);
             std::vector<float> gpuInputs(surfaceCount * 2U * 12U, 0.0f);
             std::vector<float> gpuTemperatures;

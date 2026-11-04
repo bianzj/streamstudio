@@ -47,7 +47,6 @@ bool FileIO::readXml(std::string Path, Mode mode) {
         std::cout << "could not load the test file.Error:" << mydoc.ErrorDesc() << std::endl;
         exit(1);
     }
-    // FIXED[中] 内存: 成员 RootElement 曾指向局部 mydoc，函数返回后成为悬垂指针（UAF），且空文档时 RootElement 为 nullptr 仍被解引用；已修复：文档改为函数内 static 对象（生命周期覆盖 RootElement 的全部使用），RootElement 判空，为空时报错并返回 false。
     RootElement = mydoc.RootElement(); // root node of xml
     if (RootElement == nullptr)
     {
@@ -143,7 +142,6 @@ AtmosphereXml FileIO::readAtmosphereXML(TiXmlNode* node) {
 AeroCondXml FileIO::readAeroXML(TiXmlNode *node, Mode mode) {
 
     AeroCondXml aeroCondXml{};
-    // FIXED[高] 错误处理: node/AeroNode 未判空（缺 <Attribute> 或 <Aerodynamics> 时空指针崩溃），各子元素 FirstChildElement(...)->GetText() 未判空，stoi/stof 对非法文本抛未捕获异常；多个子节点时只保留最后一个；无子节点时返回未初始化的 aeroCondXml；已修复：node 与 <Aerodynamics> 判空后返回值初始化的默认结构，循环内逐项判空（缺项时打印元素名并跳过该条），stoi/stof 用 try/catch 包裹，非法文本不再终止进程。本文件 readMeteoXML/readPropertyXML/readThermalXML/readCanopyXML/readSceneXML 的同类链式解引用另行标注。
     if (node == nullptr || node->ToElement() == nullptr) {
         std::cerr << "Error: <Attribute> element missing, cannot read <Aerodynamics>." << std::endl;
         return aeroCondXml;
@@ -205,7 +203,6 @@ MeteoXml FileIO::readMeteoXML(TiXmlNode *node, Mode mode) {
 
     MeteoXml meteoxml{};
     MeteoMeta meta{};
-    // FIXED[高] 错误处理: node 为空（XML 缺 <Meteorology>，VoxelEB 模式必经）时空指针崩溃，GetText() 返回 nullptr 时构造 std::string 为 UB；已修复：node 判空、每项先取文本再判空（缺失时抛出带字段名的异常并在本函数内捕获打印），数值解析失败同样捕获，返回默认结构而不是崩溃。
     if (node == nullptr || node->ToElement() == nullptr) {
         std::cerr << "Error: <Meteorology> element missing, cannot read meteorological settings." << std::endl;
         return meteoxml;
@@ -256,7 +253,6 @@ AtomCondXml FileIO::readAtomCondXML(TiXmlNode *node, Mode mode) {
 std::vector<PropertyXml> FileIO::readPropertyXML(TiXmlNode *node, Mode mode) {
 
     std::vector<PropertyXml> propxmls;
-    // FIXED[高] 空指针: 缺 <Attribute> 或 <Biochemistry> 时 node/chemstry_node 为空立即崩溃；已修复：两级均判空后返回空列表。
     if (node == nullptr || node->ToElement() == nullptr) {
         std::cerr << "Error: <Attribute> element missing, cannot read <Biochemistry>." << std::endl;
         return propxmls;
@@ -281,7 +277,6 @@ std::vector<PropertyXml> FileIO::readPropertyXML(TiXmlNode *node, Mode mode) {
                 propertyXml.name = "leafbio";
             }
             propertyXml.type = Type::VEGETATION;
-            // FIXED[高] 内存: Tparam 被解析 5 次（每次 mySplitFloat 都泄漏 new[]），且未检查分割结果至少 5 个元素，少于 5 个时 [3]/[4] 越界读；Attribute("name") 返回 nullptr 时赋给 std::string 崩溃（soilSet/waterSet 同）；已修复：Tparam 只解析一次存入局部 vector 并校验 size()>=5（不足时补 0 并告警），leafBio/soilSet/waterSet 的 name 均判空后赋值。
             std::vector<float> tparam;
             if (TiXmlElement* tparamEle = leafNode->FirstChildElement("Tparam")) {
                 if (tparamEle->GetText() != nullptr) {
@@ -336,7 +331,6 @@ std::vector<PropertyXml> FileIO::readPropertyXML(TiXmlNode *node, Mode mode) {
 //                    0.45
             };
             if (TiXmlElement* model = soilNode->FirstChildElement("brdfModel")) {
-                // FIXED[中] Bug: 空元素 <brdfModel/> 时 GetText() 返回 nullptr，用其构造 std::string 为 UB/崩溃（下方 waterSet 的 brdfModel 及 hapke*/refractiveIndex 等 stof(GetText()) 同理）；已修复：GetText() 先判空（空文本按非 Hapke 处理），下方 hapke*/refractiveIndex/slopeVariance/diffuseFraction 均先检查文本非空再 stof。
                 const char* modelText = model->GetText();
                 const std::string value = modelText != nullptr ? modelText : std::string();
                 propertyXml2.soilset.brdfModel =
@@ -390,7 +384,6 @@ std::vector<PropertyXml> FileIO::readPropertyXML(TiXmlNode *node, Mode mode) {
 
 bool FileIO::sonExists(std::string sonName, TiXmlElement* parentEle)
 {
-    // FIXED[中] 空指针: 父节点为空（如缺少 <Geometry>/<Control> 等父元素）时直接解引用崩溃；已修复：parentEle 为 nullptr 时返回 false。
     if (parentEle == nullptr) return false;
     //根据节点名称进行查询
     for (TiXmlElement* pEle = parentEle->FirstChildElement(); pEle; pEle = pEle->NextSiblingElement())///循环下面所有节点
@@ -434,7 +427,6 @@ std::vector<SpectralXml> FileIO::readSpectralXML(TiXmlNode *node, Mode mode) {
             TiXmlElement *spectralFileElement = Node->FirstChildElement("spectral_file");
             const char *spectralFile = spectralFileElement ? spectralFileElement->GetText() : nullptr;
             spectralXml.type = type == "file" ? spectralType::OTHER : spectralType::CUSTOM;
-            // FIXED[中] 错误处理: type=file 时通常只给 spectral_file，但这里无条件解引用 <reflectance>/<transmittance>，缺失即空指针崩溃（Prospect/BSM 分支同理）；已修复：三条分支统一通过 parseCurve 先判元素与文本是否存在，缺失时保留空曲线并打印波段名告警；path.string() 的 ANSI 转换问题保留待确认。
             const std::vector<float> reflectanceValues = parseCurve("reflectance");
             const std::vector<float> transmittanceValues = parseCurve("transmittance");
             if (reflectanceValues.empty() || transmittanceValues.empty()) {
@@ -498,7 +490,6 @@ std::vector<ThermalXml> FileIO::readThermalXML(TiXmlNode *node, Mode mode) {
     if (node == nullptr) return thermalXmls;
     TiXmlElement* thermalNode = node->FirstChildElement("Thermal");
     if (thermalNode == nullptr) return thermalXmls;
-    // FIXED[中] Bug: 起点按名字 "thermal" 查找，但迭代用无名 NextSiblingElement()，会把 <Thermal> 下其他任意元素当作 thermal 解析；Attribute("name") 为空时构造 std::string 崩溃，子元素缺失时链式解引用崩溃；已修复：迭代改为 NextSiblingElement("thermal")，name 与子元素文本均判空（thermalxml 值初始化，数值解析包 try/catch）。
     for (TiXmlElement* Node = thermalNode->FirstChildElement("thermal"); Node != NULL; Node = Node->NextSiblingElement("thermal")){
         ThermalXml thermalxml{};
         const char* thermalNameText = Node->Attribute("name");
@@ -525,7 +516,6 @@ std::vector<ThermalXml> FileIO::readThermalXML(TiXmlNode *node, Mode mode) {
 std::vector<CanopyXml> FileIO::readCanopyXML(TiXmlNode *node, Mode mode) {
 
     std::vector<CanopyXml> CanopyXmls;
-    // FIXED[中] 空指针/Bug: node 或 <Canopy> 缺失时空指针崩溃，迭代用无名 NextSiblingElement() 会把 <Canopy> 下其他元素当冠层，Attribute("name") 为空时构造 std::string 崩溃；已修复：两级判空后返回空列表，迭代改为 NextSiblingElement("canopy")，name 判空。
     if (node == nullptr || node->ToElement() == nullptr) {
         std::cerr << "Error: <Attribute> element missing, cannot read <Canopy>." << std::endl;
         return CanopyXmls;
@@ -586,7 +576,6 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
     SensorXml sensorxml;
     sensorxml.projection = Projection::PARALLAL;
     sensorxml.position = {0.0f, 0.0f, 3000.0f};
-    // FIXED[中] 错误处理: node（<Geometry>）与 sensorEle 未判空，缺失即空指针崩溃；pixelResolutionX/Y、controlBand、viewAngle 均为链式解引用；Attribute("name") 为 nullptr 时赋给 std::string 崩溃；已修复：node/<Sensor> 判空后返回默认 sensorxml，name/projection/分辨率/波段文本与 viewAngle 元素均判空，数值解析包 try/catch（SPP/CSPP/enabled/angleNum 用 readInt 取默认值），缺失项打印带元素名的告警而不是崩溃。
     if (node == nullptr || node->ToElement() == nullptr) {
         std::cerr << "Error: <Geometry> element missing, cannot read <Sensor>." << std::endl;
         return sensorxml;
@@ -630,7 +619,6 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
             }
             if (sonExists("projection", pEle))
             {
-                // FIXED[低] Bug: <projection/> 为空时 GetText() 返回 nullptr，构造 std::string 崩溃；已修复：GetText() 判空后再构造（空文本保持默认投影）。
                 const char* projectionText = pEle->FirstChildElement("projection")->GetText();
                 std::string projection = projectionText != nullptr ? projectionText : std::string();
                 std::transform(projection.begin(), projection.end(), projection.begin(),
@@ -680,7 +668,6 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
     //        temp.pixelResolutionX = std::stof(pEle->FirstChildElement("pixelResolutionX")->GetText());
     //        temp.pixelResolutionY = std::stof(pEle->FirstChildElement("pixelResolutionY")->GetText());
 
-            // FIXED[中] 空指针: 缺 <controlBand> 时 FirstChildElement 返回空指针、<controlBand/> 空文本时 GetText() 返回 nullptr，而 mySplitFloat(const std::string&) 由 nullptr 构造 std::string 即崩溃（上方 587 行的"已判空"注释此前并未落实到本行）；已修复：用同函数已有的 elementText 取文本并判空，缺失/空文本时打印告警、波段保持默认（空）。
             const char *controlBandText = elementText(pEle, "controlBand");
             if (controlBandText != nullptr) {
                 sensorxml.waves = myFunction::mySplitFloat(controlBandText, ",");
@@ -690,7 +677,6 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
 
 
             TiXmlElement* allViewAngleEle = pEle->FirstChildElement("viewAngle");
-            // FIXED[中] 错误处理: subEle->Attribute("type") 为 nullptr 时构造 std::string 崩溃；自定义角度用 mySplitFloat(...)[0]/[1] 未检查元素个数（"30" 只有一个数时 [1] 越界读）且同一文本解析两次；已修复：type 判空后构造（缺失时按空类型跳过），自定义角度只解析一次并校验 size()>=2（不足时打印告警并跳过该组），viewAngle 元素缺失时循环直接不执行。
             for (TiXmlElement* subEle = allViewAngleEle ? allViewAngleEle->FirstChildElement() : nullptr; subEle != NULL; subEle = subEle->NextSiblingElement())
             {
                 const char* viewAngleTypeText = subEle->Attribute("type");
@@ -717,7 +703,6 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
                 }
                 else if (type == "BRF")
                 {
-                    // FIXED[高] Bug: vzaStep<=0 时 for (k=0; k<=VzaMax; k+=vzaStep) 死循环并无限 push_back 直至内存耗尽；另外 SAA 是未初始化成员；已修复：SPP/CSPP/vzaMax/vzaStep 改用 readInt（缺失或非法时取 0，不再 stoi(nullptr)），并校验 VzaMax>0 且 vzaStep>0，非法时打印错误并跳过该 BRF 角度集（两个分支均已处理）；SAA 在 readXml 入口初始化为 0，readLightXML 会写入真实值。
                     if (readInt(subEle, "SPP", 0) == 1){
                         const int VzaMax = readInt(subEle, "vzaMax", 0);
                         const int vzaStep = readInt(subEle, "vzaStep", 0);
@@ -786,7 +771,6 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
                     const int isHemisphere = readInt(subEle, "enabled", 0);
                     const int hemiAngleNum = readInt(subEle, "angleNum", 0);
                     if (isHemisphere == 1 && hemiAngleNum > 0){
-                        // FIXED[中] 数值: hemiAngleNum<=0 时 sqrt(pi/k0)、360/k00 除零；迭代中 k1 由 float 截断为 int，环数增加后 k1 先变为 0 而不是 <0，下一轮 k0=0 同样除零得到 inf/NaN 角度并静默写入 viewAngles，break 条件 k1<0 几乎不会触发；pi 仅取 7 位；已修复：仅在该角度集 hemiAngleNum>0（且 enabled 解析成功）时才生成半球角度，否则跳过该角度集；break 条件由 k1<0 改为 k1<=0，避免 k0 归零后继续除零；enabled/angleNum 改用 readInt（缺失/非法不再崩溃）。pi 取值精度属数值常量，未改动（待确认）。下方高光谱分支同一段代码同样修复。
                         float theta0, theta1, theta;
                         float r0, r1;
                         int k0, k1, k00;
@@ -866,7 +850,6 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
             }
 
             // sensorxml.waves = myFunction::mySplitFloat(pEle->FirstChildElement("controlBand")->GetText(), ",");
-            // FIXED[中] 错误处理: bandsFilePath 未按 m_inputDirectory 解析相对路径（spectral_file 却会），且用窄字符 ifstream 打开；文件打不开时只打印一行仍继续，waves 为空，后续按波段数分配/循环为 0 或越界；已修复：相对路径先拼接输入目录，路径按 UTF-8（u8path）解释后交给 ifstream（Windows 下最终走宽字符 API），元素或文本缺失、文件打不开、读完 waves 仍为空时打印带路径的错误并跳过该传感器，避免空波段继续传播。
             TiXmlElement* bandsFileEle = pEle->FirstChildElement("bandsFilePath");
             const char* bandsFileText = bandsFileEle ? bandsFileEle->GetText() : nullptr;
             if (bandsFileText == nullptr || bandsFileText[0] == '\0') {
@@ -1003,7 +986,6 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
                     const int isHemisphere = readInt(subEle, "enabled", 0);
                     const int hemiAngleNum = readInt(subEle, "angleNum", 0);
                     if (isHemisphere == 1 && hemiAngleNum > 0){
-                        // FIXED[中] 数值: hemiAngleNum<=0 时 sqrt(pi/k0)、360/k00 除零；迭代中 k1 由 float 截断为 int，环数增加后 k1 先变为 0 而不是 <0，下一轮 k0=0 同样除零得到 inf/NaN 角度并静默写入 viewAngles，break 条件 k1<0 几乎不会触发；pi 仅取 7 位；已修复：仅在该角度集 hemiAngleNum>0（且 enabled 解析成功）时才生成半球角度，否则跳过该角度集；break 条件由 k1<0 改为 k1<=0，避免 k0 归零后继续除零；enabled/angleNum 改用 readInt（缺失/非法不再崩溃）。pi 取值精度属数值常量，未改动（待确认）。
                         float theta0, theta1, theta;
                         float r0, r1;
                         int k0, k1, k00;
@@ -1059,7 +1041,6 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
 
 //    sensorxml.viewAngles = {{0, 0}};
 
-    // FIXED[中] 错误处理: 成员 RootElement 依赖 readXml 中局部 mydoc 存活，且 controlnode 为空（缺 <Control>）时 ->ToElement() 空指针崩溃；已修复：readXml 的文档改为 static 保证生命周期，此处 RootElement/controlnode 均判空（sonExists 也已内部判空），缺 <Control> 时跳过这些开关项。
     TiXmlNode *controlnode = RootElement ? RootElement->FirstChild("Control") : nullptr;
     TiXmlElement *controlElement = controlnode ? controlnode->ToElement() : nullptr;
     if (sonExists("isAlbedo", controlElement))
@@ -1104,7 +1085,6 @@ LightXml FileIO::readLightXML(TiXmlNode *geometryNode, Mode mode){
 
     LightXml lightxml;
     AtomCondXml atomCondXml;
-    // FIXED[中] 空指针: geometryNode（缺 <Geometry>）与 lightEle（缺 <Light>）均未判空即链式解引用（静态复核发现，原文件未标注）；已修复：两级均判空并打印告警后返回默认 lightxml，不再崩溃。
     if (geometryNode == nullptr || geometryNode->ToElement() == nullptr) {
         std::cerr << "Error: <Geometry> element missing, cannot read <Light>." << std::endl;
         return lightxml;
@@ -1273,7 +1253,6 @@ SceneXml FileIO::readSceneXML(TiXmlNode *sceneNode, Mode mode) {
             0.0f, 1.0f);
     }
 
-    // FIXED[中] Bug: 判断的是 bgBioType 是否存在，却无条件解引用 bgBioName；只给 bgBioType 而缺 bgBioName 时空指针崩溃；两个 GetText() 也未判空；已修复：bgBioName 与 bgBioType 分别查元素并判空文本，缺 bgBioName 时沿用默认背景材质名 "soilset"，缺 bgBioType 时保持默认背景类型。
     TiXmlElement* bgNameEle = sceneNode->FirstChildElement("bgBioName");
     if (bgNameEle != nullptr && bgNameEle->GetText() != nullptr) {
         sceneXml.background.bgPropName = bgNameEle->GetText();
@@ -1293,7 +1272,6 @@ SceneXml FileIO::readSceneXML(TiXmlNode *sceneNode, Mode mode) {
         sceneXml.background.bgPropName = "soilset";
     }
 
-    // FIXED[中] 空指针: sonExists 只判断元素是否存在，<bgSpectral/> 为空文本时 GetText() 返回 nullptr，赋给 std::string 成员 bgSpectralName 即崩溃（静态复核发现，原文件未标注）；已修复：照下方 bgThermal 的既有写法先判 GetText() 非空再赋值，空文本保持默认背景光谱名。
     if (sonExists("bgSpectral", sceneNode->ToElement())) {
         if (sceneNode->FirstChildElement("bgSpectral")->GetText() != NULL) {
             sceneXml.background.bgSpectralName = sceneNode->FirstChildElement("bgSpectral")->GetText();

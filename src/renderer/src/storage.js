@@ -13,7 +13,6 @@ export const appStorage = {
     return previous
   },
   setItem(key, value) {
-    // FIXED[中] 错误处理: setItem 未捕获 QuotaExceededError / SecurityError 以及桌面 IPC 异常（preload 在失败时 throw），调用方（保存工程目录、切换语言）会直接中断；已修复：try/catch 包住两条写入路径，失败时 console.warn 告警并返回 false，成功返回 true，调用方不再中断
     try {
       if (desktop) desktop.setItem(key, value)
       else window.localStorage.setItem(key, value)

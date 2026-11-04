@@ -51,7 +51,6 @@ function readTiffHeader(path) {
     const scale = tags.get(33550) || [], tie = tags.get(33922) || []
     const description = typeof tags.get(270) === 'string' ? tags.get(270) : ''
     const names = description.match(/band names\s*=\s*\{([^}]*)\}/i)?.[1]
-    // FIXED[中] Bug: 坐标原点直接取 tie[3]/tie[4]，忽略了 tie[0]/tie[1]（对应的栅格行列不一定是 0,0）；已修复：originX = tie[3] - tie[0]*scaleX、originY = tie[4] + tie[1]*scaleY（PixelIsPoint 半像元约定与 GeoAscii 引文回退未改，仍需与 readTiff 统一）
     return {
       width: (tags.get(256) || [0])[0], height: (tags.get(257) || [0])[0], bands: (tags.get(277) || [1])[0],
       dataType: `${format === 3 ? 'Float' : format === 2 ? 'Int' : 'UInt'}${bits}`,
@@ -84,7 +83,6 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
   function rasterBand(value, band) {
     const path = resolve(normalizeHostPath(String(value || '').trim()))
     if (!/\.tiff?$/i.test(path) || !existsSync(path) || !statSync(path).isFile()) throw new Error(`找不到栅格：${windowsPath(path)}`)
-    // FIXED[低] Bug: readTiff 会把越界的波段序号静默钳到最后一个波段，前端按请求的 band 缓存，结果会显示成别的波段而没有报错；已修复：读回后用 tiff.bands 校验请求的 band，越界直接报错（nodata 的 float32 容差比较仍在 readTiff 中，未改）
     const tiff = readTiff(path, band, true)
     if (Number(band) >= tiff.bands) throw new Error(`波段序号 ${band} 超出范围：该栅格只有 ${tiff.bands} 个波段`)
     const step = Math.max(1, Math.ceil(Math.max(tiff.width, tiff.height) / 2048))

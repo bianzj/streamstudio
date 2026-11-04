@@ -418,7 +418,6 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
 
 bool Voxelrt::destroy(std::shared_ptr<VoxelrtIO> & modelio){
 
-    // FIXED[中] GPU同步: vkDeviceWaitIdle 放在销毁缓冲/描述符/管线之后才调用；若有仍在执行的提交（如异常路径跳过 waitFence），先销毁正在使用的资源是未定义行为；已修复：把 vkDeviceWaitIdle 提前到销毁任何资源之前，并检查其返回值（失败只记录，后续仍继续销毁）。
     const VkResult waitIdleResult = vkDeviceWaitIdle(modelio->m_device);
     if (waitIdleResult != VK_SUCCESS) {
         std::cerr << "Voxelrt::destroy: vkDeviceWaitIdle failed, VkResult="

@@ -24,7 +24,6 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
     nvvk::CommandPool cmdGen(m_device, m_queue.familyIndex);
 
     // spectral
-    // FIXED[高] Bug: spectral/canopy/wave/instanceLink/voxelLink/nano 只在非空时创建，但 Descriptor::createDescriptor 与 Buffer::destroy 无条件解引用这些 shared_ptr（如 meshio->m_pBufferSpectral->buffer），任一为空即空指针崩溃；已修复：spectral/canopy/wave/instanceLink/voxelLink/hex/nano 为空时仍创建 1 元素全零占位缓冲，createDescriptor 与 destroy 的解引用不会再命中空 shared_ptr；thermal 绑定缺失一项本轮未改（见下方 DEFERRED）。
     if (meshio->spectrals.size() > 0)
     {
         VkCommandBuffer cmdBufSpectral = cmdGen.createCommandBuffer();
@@ -320,33 +319,25 @@ void Buffer::destroy(std::shared_ptr<VoxelrtIO> &voxellstio){
 
     if (meshio->thermals.size() > 0) // no utilise the isTemperature
     {
-        // FIXED[中] 空指针: m_pBufferThermal 在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
         if (meshio->m_pBufferThermal) m_pAlloc->destroy(*(meshio->m_pBufferThermal));
     }
-    // FIXED[中] 空指针: destroy 无条件解引用 voxelio->m_pTempeBuffer，Buffer::create 未执行或中途失败（createBuffer 抛异常等）时为空即崩溃（静态复核发现，原文件未标注）；已修复：按同函数内 spectral/canopy 的写法先判 shared_ptr 非空再销毁。
     if (voxelio->m_pTempeBuffer) m_pAlloc->destroy(*(voxelio->m_pTempeBuffer));
 
     // 占位缓冲在 canopies 为空时也会创建，按指针判空销毁（原先按 size 判断会漏掉占位缓冲）。
     if (meshio->m_pBufferCanopy) m_pAlloc->destroy(*(meshio->m_pBufferCanopy));
     if (meshio->m_pWaterSetBuffer) m_pAlloc->destroy(*(meshio->m_pWaterSetBuffer));
-    // FIXED[中] 空指针: m_pBufferMeshLink 在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
     if (meshio->m_pBufferMeshLink) m_pAlloc->destroy(*(meshio->m_pBufferMeshLink));
 
-    // FIXED[中] 空指针: instanceLink/voxelLink/voxelNano 三个缓冲在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：逐个先判 shared_ptr 非空再销毁，销毁顺序与资源依赖关系保持不变。
     if (instanceio->m_pBufferInstanceLink) m_pAlloc->destroy(*(instanceio->m_pBufferInstanceLink));
     if (voxelio->m_pVoxelLinkBuffer) m_pAlloc->destroy(*(voxelio->m_pVoxelLinkBuffer));
     if (voxelio->m_pVoxelNanoBuffer) m_pAlloc->destroy(*(voxelio->m_pVoxelNanoBuffer));
     if (voxelio->m_pVoxelHexBuffer) m_pAlloc->destroy(*(voxelio->m_pVoxelHexBuffer));
 
-    // FIXED[中] 空指针: m_pBufferLad 在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
     if (surfio->m_pBufferLad) m_pAlloc->destroy(*(surfio->m_pBufferLad));
 
-    // FIXED[中] 空指针: m_pBufferSensor 在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
     if (voxellstio->m_pBufferSensor) m_pAlloc->destroy(*(voxellstio->m_pBufferSensor));
-    // FIXED[中] 空指针: destroy 无条件解引用 voxellstio->m_pBufferWave，create 未执行或中途失败时为空即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
     if (voxellstio->m_pBufferWave) m_pAlloc->destroy(*(voxellstio->m_pBufferWave));
    // m_pAlloc->destroy(*(voxellstio->m_pBufferWaveset));
-    // FIXED[中] 空指针: m_pBufferLight 在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
     if (voxellstio->m_pBufferLight) m_pAlloc->destroy(*(voxellstio->m_pBufferLight));
 
     for (int i = 0; i < meshio->m_bufferMeshes.size(); i++)
@@ -356,14 +347,10 @@ void Buffer::destroy(std::shared_ptr<VoxelrtIO> &voxellstio){
     }
 
 
-    // FIXED[中] 空指针: m_pDirBuffer 在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
     if (voxelio->m_pDirBuffer) m_pAlloc->destroy(*(voxelio->m_pDirBuffer));
-    // FIXED[中] 空指针: m_pRadsBuffer 在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
     if (voxelio->m_pRadsBuffer) m_pAlloc->destroy(*(voxelio->m_pRadsBuffer));
-    // FIXED[中] 空指针: m_pNetRadBuffer 在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
     if (voxelio->m_pNetRadBuffer) m_pAlloc->destroy(*(voxelio->m_pNetRadBuffer));
     //m_pAlloc->destroy(*(voxelio->m_pPnetBuffer));
-    // FIXED[中] 空指针: m_pBufferStorage 在 create 未执行或中途失败时为空，destroy 无条件解引用即崩溃（静态复核发现，原文件未标注）；已修复：先判 shared_ptr 非空再销毁。
     if (virtualio->m_pBufferStorage) m_pAlloc->destroy(*(virtualio->m_pBufferStorage));
 
 

@@ -21,7 +21,6 @@ function chooseFile(accept) {
     input.type = 'file'
     input.accept = accept
     input.oncancel = () => resolve(null)
-    // FIXED[低] 错误处理: file.text() 失败（文件被占用/过大）时 async 回调抛出的异常不会传给外层 Promise，chooseFile 永远不 resolve，调用方一直挂起；oncancel 在旧版 Chromium 中不触发，也会一直挂起；已修复：onchange 内 try/catch，读取失败 resolve(null) 并 console.warn，Promise 任意路径都会结算，不再挂起
     input.onchange = async () => {
       const file = input.files?.[0]
       if (!file) return resolve(null)
@@ -44,7 +43,6 @@ export const webApi = {
   listExamples: () => request('/api/examples'),
   openExample: (id, directory) => post('/api/examples/open', { id, directory }),
   chooseExecutable: async (message) => {
-    // FIXED[中] 兼容性: Electron 不支持 window.prompt（抛错或返回 undefined），原先 value.trim() 会抛 TypeError；已修复：捕获异常并把 undefined 视同取消
     let value
     try { value = window.prompt(message, appStorage.getItem('histreamExecutable') || '') }
     catch { throw new Error('当前窗口不支持输入对话框，请在浏览器模式（npm start 后访问 http://127.0.0.1:4173）中设置自定义引擎路径') }

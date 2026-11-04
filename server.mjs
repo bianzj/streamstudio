@@ -205,7 +205,6 @@ function taskkill(args, label) {
   })
 }
 
-// FIXED[低] Bug: resettingProcesses 置 true 后，facetWorker.terminate() 的 await 位于 try/finally 之外，若其抛错则标志永不复位，之后所有运行/重置请求都会被拒绝；已修复：terminate 移入 try 块并单独 catch，finally 一定复位标志
 async function resetSimulationProcesses() {
   if (resettingProcesses) throw new Error('模拟环境正在重置')
   resettingProcesses = true
@@ -237,7 +236,6 @@ async function resetSimulationProcesses() {
 }
 
 
-// FIXED[中] 安全: 页面可被其他网站用 iframe 嵌入（点击劫持）；已修复：所有响应都带 X-Frame-Options 与 CSP frame-ancestors
 const FRAME_HEADERS = { 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "frame-ancestors 'none'" }
 
 function json(response, status, value) {
@@ -292,7 +290,6 @@ function sha256File(path) {
   return hash
 }
 
-// FIXED[低] 性能: 每次 /api/histream-proxy/info、run、result 请求都同步 stat 并校验全部文件，首次（或 mtime 变化后）会在主线程同步计算大型体数据的 SHA256，可能阻塞事件循环数十秒；manifest 内容为 null 或非对象时，deployment.format 会抛 TypeError；已修复：解析后先确认 manifest 是普通对象再读字段（哈希仍在主线程同步计算，未改）
 function histreamProxyDeployment() {
   const configuredManifest = String(envSetting('STREAM_STUDIO_PROXY_MANIFEST', 'HISTREAM_STUDIO_PROXY_MANIFEST') || DEFAULT_HISTREAM_PROXY_MANIFEST).trim()
   if (!configuredManifest) {
@@ -474,7 +471,6 @@ function foreignRequestReason(request) {
   return ''
 }
 
-// FIXED[低] 性能: 所有接口共用 160MB 上限，请求体先整体缓冲，再 concat、toString、JSON.parse，峰值内存可达数倍；请求体为 "null" 或数字时，调用方 data.xxx 会抛 TypeError；已修复：解析结果必须是普通 JSON 对象，否则报 400（按接口分配上限未改）
 async function body(request) {
   const chunks = []
   let size = 0
@@ -766,7 +762,6 @@ function assertFacetScale(project, baseDir, mode) {
 
 const atmosphereLutCache = new Map()
 
-// FIXED[低] Bug: 缓存只按路径命中，从不检查 size/mtime。用户修改或替换 LUT 后，主线程仍沿用旧表（Worker 每次重新加载，两者结果不一致），必须重启才能生效；已修复：缓存项记录 size/mtimeMs，与原文件不一致时重新加载
 function loadAtmosphereLut(path) {
   const normalized = resolve(normalizeHostPath(path))
   if (!existsSync(normalized)) throw new Error(`找不到大气查找表：${normalized}`)
@@ -1184,7 +1179,6 @@ function processResultMetadata(path) {
 function readProcessResult(metadataPath, maximumElements = THREE_DIMENSIONAL_FACET_SAMPLE_LIMIT) {
   const metadata = processResultMetadata(metadataPath)
   if (!metadata) throw new Error('无效的三维过程结果')
-  // FIXED[低] 安全: dataFile/geometryFile 来自结果目录中的 JSON，允许 "../" 或绝对路径，读取时没有限制在元数据所在目录（删除逻辑里有 dirname 相同的检查）；字段 offset 也没有校验是否小于 recordFloats，越界时只会抛出不直观的 RangeError；已修复：字段 offset 增加 0 ≤ offset < recordFloats 校验并给出明确错误；路径未收窄（geometryFile 的默认值就是 ../faceteb.json，收窄会改变现有结果目录用法）
   const dataPath = resolve(dirname(metadataPath), String(metadata.dataFile || ''))
   if (!existsSync(dataPath)) throw new Error('找不到过程二进制数据：' + dataPath)
   const data = readFileSync(dataPath)
@@ -2011,7 +2005,6 @@ function backupLegacyProject(path) {
   } catch { return '' }
 }
 
-// FIXED[中] 错误处理: project.json 直接 writeFileSync 覆盖写入，没有采用 run-manifest 那样的“先写 .tmp 再 rename”；已修复：writeUnifiedProject 先写同目录 .tmp 再 renameSync 原子替换，失败时删除 .tmp（usd/sync.json 仍是直接覆盖写入）
 function writeUnifiedProject(path, unified) {
   const temporaryPath = path + '.tmp'
   try {
@@ -2099,7 +2092,6 @@ function migrateProject(inputPath, project) {
   return writeProject(projectJsonPath(inputPath), project)
 }
 
-// FIXED[低] Bug: 先改写全局 projectFile/projectDir，之后才 readProject/migrateProject。打开 STREAM 工程或迁移失败而抛错时，服务端已经指向新目录，GUI 却仍显示旧工程，后续导入、删除等相对路径会落到错误目录；已修复：先在局部变量里完成解析、读取与迁移，全部成功后才写全局变量（/api/run 中的先赋值后校验未改）
 function openProject(value) {
   const resolvedFile = resolveProjectFile(value)
   const stored = readProject(resolvedFile)
@@ -2580,7 +2572,6 @@ function writeFloatTiff(path, width, height, bands, values, bandNames = [], sola
   for (const part of extraData) part.buffer.copy(header, part.offset)
   // No full-image interleaved Buffer or Buffer.concat copy. Publish only a
   // complete TIFF; bounded chunks keep memory independent of file size.
-  // FIXED[低] 资源泄漏: 写入失败（磁盘满、Worker 被 terminate）时 .partial 文件不会被删除，残留在结果目录；statistics CSV 也是直接覆盖写入；已修复：写入抛错时先 closeSync 再 unlinkSync 删除 .partial，CSV 改为先写 .tmp 再 renameSync（原子替换）
   const temporaryPath = path + '.partial'
   const fd = openSync(temporaryPath, 'w')
   let writeFailed = false
@@ -2633,7 +2624,6 @@ function filenameToken(stem, key) {
   return value.slice(0, end)
 }
 
-// FIXED[低] Bug: 转换时固定按小端、无 header offset、BSQ 排列读取数据，而 readEnvi 会处理 byte order、header offset 和 interleave。引擎若输出 BIL/BIP 或带头偏移的数据，生成的 TIFF 会静默错位，随后（体元模式下）原始 .img/.hdr 还会被删除，无法恢复；已修复：byte order/interleave/header offset 不是小端+BSQ+0 时直接返回 null，既不写 TIFF 也不删除源文件（未复用 readEnvi 的索引逻辑）
 function convertEnviToTiff(headerPath, mode) {
   const metadata = enviMetadata(readFileSync(headerPath, 'utf8'))
   const width = Number(metadata.samples), height = Number(metadata.lines), bands = Number(metadata.bands)
@@ -3108,7 +3098,6 @@ function stretchedByte(value, minimum, maximum, inverted = false) {
   return Math.max(0, Math.min(255, Math.round(displayed * 255)))
 }
 
-// FIXED[低] 性能: 整个 TIFF 用 readFileSync 读入，并在主线程逐像素遍历全分辨率（dem-info、results/read、change 都会走到这里）；inflateSync 没有设置 maxOutputLength，畸形或压缩炸弹文件可能耗尽内存；已修复：inflateSync 传入按分块几何尺寸推出的 maxOutputLength，解压上限不再无限（整文件读入与主线程解析未改）
 function readTiff(path, requestedBand = 0, includeValues = false) {
   const data = readFileSync(path)
   if (data.length < 8) throw new Error('TIFF 文件头不完整')
@@ -3766,7 +3755,6 @@ async function api(request, response, url) {
       if (!file) throw new Error('未知的帮助文档')
       const path = [join(RESOURCE_ROOT, 'docs', file), join(PROJECT_ROOT, 'docs', file)].find((candidate) => existsSync(candidate))
       if (!path) throw new Error(`找不到 ${file}，请运行 tools/build-core-manuals-pdf.py 生成手册`)
-      // FIXED[低] 错误处理: spawn 返回的 ChildProcess 没有 'error' 监听，explorer 启动失败时 'error' 事件无人处理，会抛出未捕获异常，导致服务（Electron 主进程）崩溃；已修复：加 .on('error', () => {}) 并调用 .unref()
       if (process.platform === 'win32') spawn('explorer.exe', [path], { detached: true, windowsHide: true }).on('error', () => {}).unref()
       return json(response, 200, { path: windowsPath(path) })
     } catch (error) { return json(response, 400, { error: error.message }) }
@@ -3867,7 +3855,6 @@ async function api(request, response, url) {
       if (!projectDir || !projectFile) throw new Error('请先新建或打开工程')
       const sourceName = basename(String(data.name || '').trim())
       const extension = extname(sourceName).toLowerCase()
-      // FIXED[低] 安全: OBJ/气象/波谱导入只用 basename 处理文件名，没有像 DEM/纹理那样做字符白名单。Windows 上 "x.txt:s.obj" 这类名字会写入 NTFS 备用数据流，CON.obj 等保留名、末尾带点或空格的名字也会出错，而且同名文件被静默覆盖；已修复：OBJ/气象/波谱三处导入复用 DEM 导入的 stem 字符白名单（非法字符替换为 _），重名时自动加 _2 后缀，不再静默覆盖
       if (!sourceName || extension !== '.obj') throw new Error('只能导入 OBJ 文件')
       const content = sanitizeObjContent(data.content)
       if (!content.trim()) throw new Error('OBJ 文件为空')
@@ -3990,7 +3977,6 @@ async function api(request, response, url) {
       const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg' }
       if (!types[extension]) throw new Error('只能读取 PNG 或 JPG 图像')
       const path = projectAssetPath(stored, projectDir || PROJECT_ROOT)
-      // FIXED[低] 安全: pathWithin 只做字面比较，工程目录内的符号链接或 junction 可以指向任意位置的 PNG/JPG，从而读取范围外的文件；/api/project/read 用的是 realPathWithin，两处不一致；已修复：两处白名单都改用 realPathWithin（与 /api/project/read 一致）
       const allowed = (projectDir && realPathWithin(projectDir, path)) || realPathWithin(join(RESOURCE_ROOT, 'assets'), path)
       if (!allowed) throw new Error('图像必须位于当前工程或 Stream Studio assets 目录')
       if (!existsSync(path) || !statSync(path).isFile()) throw new Error(`找不到图像：${stored}`)
@@ -4031,7 +4017,6 @@ async function api(request, response, url) {
       mkdirSync(positionsDir, { recursive: true })
       const safeName = basename(String(data.name || 'object')).replace(/\.[^.]+$/, '').replace(/[^\p{L}\p{N}_-]+/gu, '_') || 'object'
       const path = data.path ? resolveAsset(data.path) : join(positionsDir, `${safeName}_position.txt`)
-      // FIXED[低] 兼容性: 用字符串 !== 比较目录，Windows 路径不区分大小写，"Positions/x.txt" 或盘符大小写不同的合法路径会被误拒；扩展名也没有限制，positions 下任意文件都可能被覆盖；已修复：改用 sameResolvedPath 比较目录，并把扩展名限定为 .txt
       if (!sameResolvedPath(dirname(path), positionsDir) || extname(path).toLowerCase() !== '.txt') throw new Error('实例分布文件必须位于当前工程 positions 目录，且为 .txt 文件')
       const lines = data.instances.map((item, index) => {
         const values = [item.x, item.y, item.z ?? 0, item.scale ?? 1, item.rotation ?? 0].map(Number)
@@ -4165,7 +4150,6 @@ async function api(request, response, url) {
       const startedAt = Date.now()
       const workingDirectory = facetMode ? dirname(engine) : projectDir
       const streamFacetSteps = data.mode === 'eFacetEB'
-      // FIXED[中] 资源泄漏: spawn 之后还要先执行 writeRunManifest/emit，才注册 'close'/'error' 监听。只要其中任一步抛错（如磁盘满、目录被删），外层 catch 只会把清单标为 failed，引擎进程继续运行且无人回收，全局 child 永远不清空，之后再也无法运行；已修复：见本路由的 catch：对已 spawn 的引擎执行 taskkill/置空并复位 child/childExecutable，清单写入也包了 try/catch
       child = spawn(engine, args, { cwd: workingDirectory, windowsHide: true,
         env: { ...process.env, HISTREAM_FACET_STEP_SYNC: streamFacetSteps ? '1' : '0' },
         stdio: [streamFacetSteps ? 'pipe' : 'ignore', 'pipe', 'pipe'] })
@@ -4174,7 +4158,6 @@ async function api(request, response, url) {
       running.histreamRun = { runId: run.runId, outputDir: windowsPath(run.outputDir), startedAt, mode: data.mode }
       writeRunManifest(run, { status: 'running', pid: running.pid, command: [engine, ...args] })
       emit({ type: 'started', pid: running.pid, runId: run.runId, outputDir: windowsPath(run.outputDir), command: `"${windowsPath(engine)}" ${args.map((item) => `"${windowsPath(item)}"`).join(' ')}` })
-      // FIXED[低] Bug: 逐块 chunk.toString() 时，跨块的多字节 UTF-8 字符（中文日志）会被截断成乱码；已修复：先 setEncoding('utf8')，data 事件拿到的是已按字符边界解码的字符串
       running.stdout.setEncoding('utf8')
       running.stderr.setEncoding('utf8')
       running.stdout.on('data', (chunk) => emit({ type: 'stdout', text: chunk.toString() }))
@@ -4219,14 +4202,12 @@ async function api(request, response, url) {
           }
         })
       }
-      // FIXED[中] Bug: 'error' 处理中不清空 child/childExecutable。spawn 失败（如 EACCES、被杀软拦截）时不能保证一定会触发 'close'，此后所有 /api/run 都会报“已有模拟任务正在运行”；这里的 writeRunManifest 一旦抛错还会变成未捕获异常；已修复：spawn 失败（没有 pid）时复位 child/childExecutable，清单写入包 try/catch
       running.on('error', (error) => {
         runtimeScene?.cleanup()
         try { writeRunManifest(run, { status: 'failed', finishedAt: new Date().toISOString(), error: error.message }) } catch {}
         if (!running.histreamReset) emit({ type: 'error', text: error.message })
         if (!running.pid && child === running) { child = null; childExecutable = '' }
       })
-      // FIXED[中] 错误处理: close 回调中 unlinkSync（finally 内和下面第二处）、writeRunManifest、runProductPaths、emit 都没有保护，任何一个抛错都会成为 EventEmitter 内的未捕获异常，使整个服务（Electron 主进程）崩溃，child 也不会被清空；已修复：整个 close 处理体抽成函数并在 try/catch/finally 中调用，finally 一定复位 child/childExecutable，抛错只上报不再崩溃（非流式出图仍在主线程，未移到 Worker）
       const completeHistreamRun = (code, signal) => {
         if (running.facetWorker) void running.facetWorker.terminate()
         if (running.histreamReset) {
@@ -4279,7 +4260,6 @@ async function api(request, response, url) {
       return json(response, 200, { pid: running.pid, inputPath: windowsPath(input), runId: run.runId, outputDir: windowsPath(run.outputDir) })
     } catch (error) {
       runtimeScene?.cleanup()
-      // 见上方 FIXED[中]（spawn 处）：本轮已启动的引擎在这里回收，避免 child/childExecutable 永不复位。
       if (child && run && child.histreamRun?.runId === run.runId) {
         const stale = child
         child = null
@@ -4295,7 +4275,6 @@ async function api(request, response, url) {
     if (!child) return json(response, 200, { stopped: false })
     child.histreamStopped = true
     if (child.facetWorker) void child.facetWorker.terminate()
-    // FIXED[低] 错误处理: 原先只在 taskkill 无法启动时退回 kill，不检查退出码；已修复：与 STREAM 版一致，taskkill 退出码非 0 时也退回 child.kill()
     const stopping = child
     if (process.platform === 'win32') {
       spawn('taskkill', ['/pid', String(stopping.pid), '/T', '/F'], { windowsHide: true })
@@ -4380,7 +4359,6 @@ async function api(request, response, url) {
       return json(response, 400, { error: error.message })
     }
   }
-  // FIXED[中] 安全: 可以让资源管理器打开任意已存在的路径，包括 \\host\share 这样的 UNC 路径（会向远程主机发起 SMB/NTLM 认证）；已修复：spawn 加 error 监听与 unref，并拒绝 UNC / 设备路径（\\ 或 // 开头）
   if (request.method === 'POST' && url.pathname === '/api/open') {
     const data = await body(request)
     const requested = normalizeHostPath(data.path || projectDir || envSetting('STREAM_STUDIO_DATA_ROOT', 'HISTREAM_STUDIO_DATA_ROOT') || PROJECT_ROOT)
@@ -4409,7 +4387,6 @@ const server = createServer(async (request, response) => {
     if (!pathWithin(GUI_OUTPUT_DIR, path)) return json(response, 404, { error: '文件不存在' })
     if (!existsSync(path) || !statSync(path).isFile()) path = join(GUI_OUTPUT_DIR, 'index.html')
     if (!existsSync(path)) return json(response, 404, { error: '文件不存在' })
-    // FIXED[低] 兼容性: mime 按扩展名大小写敏感查找，且缺 .mjs/.wasm/.json/.ico/.woff2 等类型，.mjs 模块脚本会因 octet-stream 被浏览器拒绝执行；已修复：扩展名先 toLowerCase 再查表并补全这些类型，同时加 X-Content-Type-Options: nosniff（未加 CSP）
     response.writeHead(200, { 'Content-Type': mime[extname(path).toLowerCase()] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff', ...FRAME_HEADERS })
     createReadStream(path).on('error', () => response.destroy()).pipe(response)
   } catch (error) {
@@ -4436,7 +4413,6 @@ else if (workerData?.kind === 'facet-step') {
 
 export { server, stopEngines }
 
-// FIXED[中] 资源泄漏: Windows 上 child.kill('SIGTERM') 只结束 histream.exe 本身，不结束其子进程树（/api/stop 用的是 taskkill /T /F，两处不一致）；而且 Electron 的 before-quit 不等待 'close'，本轮 run-manifest 会一直停在 running 状态；已修复：win32 下同步执行 taskkill /PID <pid> /T /F 结束进程树并置 histreamStopped（退出路径无法等到 close，run-manifest 的 stopped 状态仍未同步写入）
 function stopEngines() {
   if (child?.facetWorker) void child.facetWorker.terminate()
   if (child) {

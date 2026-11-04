@@ -68,7 +68,6 @@ function resourceRoot() {
   return app.isPackaged ? process.resourcesPath : sourceRoot
 }
 
-// FIXED[低] 错误处理: 单次 fetch 没有超时，若连接建立后服务端迟迟不响应，循环无法回到 deadline 判断，启动会无限挂起；已修复：fetch 传入 signal: AbortSignal.timeout(剩余 deadline)，超时后立即回到 deadline 判断（不新增超时数值）
 async function waitForServer(url, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs
   let lastError
@@ -165,7 +164,6 @@ async function createWindow() {
     }
   })
 
-  // FIXED[低] 安全: 页面中任何 http(s) 链接（包括结果或工程内容渲染出来的链接）都会不经确认直接交给系统浏览器打开，openExternal 返回的 Promise 也没有 catch；另外没有设置 session 的 setPermissionRequestHandler。已修复：两处 shell.openExternal 都补上 .catch() 并记录错误；白名单域名/确认弹窗与权限请求处理器属产品决策，DEFERRED
   mainWindow.webContents.setWindowOpenHandler(({ url: target }) => {
     if (/^https?:/i.test(target)) shell.openExternal(target).catch((error) => console.error(`Stream Studio: 打开外部链接失败：${error.message}`))
     return { action: 'deny' }

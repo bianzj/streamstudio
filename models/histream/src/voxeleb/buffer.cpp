@@ -707,7 +707,6 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     ///--------------------------------------------------------------------
     auto cmdBufEvapo = cmdGen.createCommandBuffer();
     // flux
-    // FIXED[低] 内存: 通量缓冲只分配不清零，显存内容未定义（先读后写会读到垃圾值甚至 NaN）；已修复：缓冲增加 TRANSFER_DST 用途，并在 cmdBufEvapo（与 tLast 上传同一次提交）中用 vkCmdFillBuffer 全零清零。
     voxelio->m_pFluxBuffer = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(static_cast<size_t>(n_voxel) * sizeof(VoxelHeatflux),
                                                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
@@ -715,7 +714,6 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     vkCmdFillBuffer(cmdBufEvapo, voxelio->m_pFluxBuffer->buffer, 0, VK_WHOLE_SIZE, 0);
     // tLast
     const float initialTemperatureC = initialTemperature - 273.15f;
-    // FIXED[低] 数值: n_voxel * TLASTNUM 为 int 乘法，n_voxel > 2.68e8 时有符号溢出（UB）；已修复：元素总数改用 size_t 计算，分配前用回除校验确认未回绕（并拒绝负的 n_voxel），溢出时抛 std::overflow_error。
     const size_t tlastElementCount = static_cast<size_t>(n_voxel) * static_cast<size_t>(TLASTNUM);
     if (n_voxel < 0
         || tlastElementCount / static_cast<size_t>(TLASTNUM) != static_cast<size_t>(n_voxel)) {

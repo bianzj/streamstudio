@@ -11,7 +11,6 @@ const KEYS = new Set([
 // only renderer preferences/drafts, never arbitrary paths supplied over IPC.
 export function createDesktopSettings(directory) {
   const path = join(directory, 'renderer-settings.json')
-  // FIXED[中] 错误处理: 设置文件损坏（手动编辑、磁盘错误、写入被截断）时 JSON.parse 或下方格式检查抛错，createWindow 失败导致应用每次启动都直接退出，用户无法自救；已修复：读取/解析/格式校验失败时把文件改名为 .corrupt 备份并以空设置继续启动
   let saved = {}
   if (existsSync(path)) {
     try {

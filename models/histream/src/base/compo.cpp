@@ -82,7 +82,6 @@ float interpolateValue(const std::vector<float>& wavelengths,
                        const std::string& label)
 {
     if (values.empty()) return fallback;
-    // FIXED[中] 错误处理: 自定义光谱的反射率/透射率个数与传感器波段数不一致时对所有波段静默返回第一个值（平坦错误光谱且无提示）；已修复：按 wavelengths/values 的较短长度插值，并对不一致组合用 std::call_once 打一次含材质名与两侧长度的告警（单值广播的既有用法保持原行为）。
     const std::size_t count = std::min(wavelengths.size(), values.size());
     if (values.size() > 1U && values.size() != wavelengths.size()) {
         static std::once_flag mismatchWarned;
@@ -218,7 +217,6 @@ void Compo::fluspect(OptCoeff fluspectCoeff, FluspectParam fluspectParam, std::v
             t12, r12, t21, r21, denom, Ra, r, D, rq, tq, a, b, bNm1, bN2_g, a2, Rsub, Tsub,
             s, j, talf, ralf, tt, Ta;
 
-    // FIXED[中] 数值: 未校验 PROSPECT 参数，N<=0 除零、N<1 使 pow(b,N-1)/Tsub 非物理、浓度为负使 Kall<0 令 expint 发散并产生被 bounded() 静默替换的 NaN；已修复：入口校验 N>=1 且 Cab/Cw/Cdm/Cs 为有限非负值，非法时抛 std::runtime_error 并报出各参数（OptCoeff 仍按值传递，改 const 引用属接口改动，未做）。
     if (!std::isfinite(N) || N < 1.0f
         || !std::isfinite(Cab) || Cab < 0.0f
         || !std::isfinite(Cw) || Cw < 0.0f
@@ -496,7 +494,6 @@ void Compo::bsm(OptCoeff bsmCoeff,BSMParam bsm,std::vector<Spectral>& spectrals)
     float f2 = B * cos(lat*rd)* sin(lon*rd);
     float f3 = B * cos(lat*rd) * cos(lon*rd);
 
-    // FIXED[中] Bug: 循环以 gsv1_.size() 为界同时索引 gsv2_/gsv3_/kw_/nw_，gsv1_ 更长时越界读；已修复：上界改为 gsv1_/gsv2_/gsv3_/kw_/nw_ 长度的最小值，两个循环共用该上界。
     const std::size_t count = std::min({gsv1_.size(), gsv2_.size(), gsv3_.size(),
                                         kw_.size(), nw_.size()});
     std::vector<float> rdry_,rwet_;

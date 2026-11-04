@@ -101,7 +101,6 @@ int Utils::readascfileinout(std::string infileName, int skip, int col, std::vect
     std::string deli(" ");
     data.clear();
 
-    // FIXED[低] 错误处理: 文件打不开时 num 保持调用方传入的旧值且函数仍返回 1，调用方无法区分"空文件"与"打开失败"；atof 对非数字字段静默返回 0；已修复：打不开时把 num 置 0、data 保持已清空并返回 0，调用方可区分失败（atof 的静默解析仍为 DEFERRED）。
     std::ifstream infile(infileName.c_str());
     if (infile.is_open())
     {
@@ -163,7 +162,6 @@ int Utils::readascfileinout(std::string infileName, int skip, int col, std::vect
 
 std::string Utils::getDirectoryPath(const std::string& fullPath)
 {
-    // FIXED[中] Bug: 只识别 '/'，Windows 原生路径（C:\a\b.obj）找不到分隔符，返回空目录/整串文件名，相对资源路径解析错误（getFileName 同理）；已修复：两个函数的分隔符集合改为 "/\\"，Windows 原生路径也能正确切分。
     size_t lastSlash = fullPath.find_last_of("/\\");
     if(lastSlash!=std::string::npos)
     {
@@ -204,14 +202,12 @@ int Utils::readImageinout1(std::string infilename,std::vector<float> &collected,
     height = poDataset->GetRasterYSize();
     nband = poDataset->GetRasterCount();
 
-    // FIXED[中] 内存: nband==0 时 GetRasterBand(1) 返回 nullptr 被解引用；sizeof(float)*width*height 中 width*height 先以 int 相乘，>2^31 像素溢出；RasterIO 返回值未检查，读取失败仍返回 1（readImageinout/readImage 同理）；已修复：nband<1 或尺寸非正时关闭数据集并返回 0（readImageinout 同步加上同样的波段/尺寸判空），像素数与字节数改用 size_t 计算，poBand/CPLMalloc 判空后再使用；RasterIO 的 CPLErr 当时仍未检查（DEFERRED），本轮已在下方 RasterIO 处补齐检查。
     if (nband < 1 || width <= 0 || height <= 0) {
         std::cout << "影像波段数或尺寸无效!" << std::endl;
         GDALClose(poDataset);
         return 0;
     }
     const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
-    // FIXED[中] 错误处理: GetRasterBand(1) 在判空之前就被解引用以取 GetRasterDataType（前轮补漏发现，原文件未标注）；已修复：先取出 poBand 并判空，再取数据类型，空指针时 GDALClose 数据集并返回 0（readImageinout/readImage 同改）。
     GDALRasterBand * poBand = poDataset->GetRasterBand(1);
     if (poBand == nullptr) {
         GDALClose(poDataset);
@@ -228,7 +224,6 @@ int Utils::readImageinout1(std::string infilename,std::vector<float> &collected,
         GDALClose(poDataset);
         return 0;
     }
-    // FIXED[中] 错误处理: RasterIO 的 CPLErr 未检查，读取失败时仍把未初始化的 bandData 当作影像返回 1（前轮补漏发现，原文件未标注）；已修复：检查 != CE_None 时 CPLFree(bandData)、GDALClose 数据集并返回 0。
     CPLErr result = poBand->RasterIO(GF_Read,0,0,width,height,bandData,width,height,GDT_Float32,0,0);
     if (result != CE_None) {
         CPLFree(bandData);
@@ -275,7 +270,6 @@ int Utils::readImageinout(std::string infilename,std::vector<std::vector<float>>
         GDALClose(poDataset);
         return 0;
     }
-    // FIXED[中] 错误处理: GetRasterBand(1) 在判空之前就被解引用以取 GetRasterDataType（前轮补漏发现，原文件未标注）；已修复：先取出 poBand 并判空，再取数据类型，空指针时 GDALClose 数据集并返回 0（readImageinout1/readImage 同改）。
     GDALRasterBand * poBand = poDataset->GetRasterBand(1);
     if (poBand == nullptr) {
         GDALClose(poDataset);
@@ -283,7 +277,6 @@ int Utils::readImageinout(std::string infilename,std::vector<std::vector<float>>
     }
     GDALDataType gBand = poBand->GetRasterDataType();
     int nBits = GDALGetDataTypeSize(gBand);
-    // FIXED[中] 内存: sizeof(float)*width*height 与 bandData+width*height 的像素数仍按 int 相乘（>2^31 像素时溢出，分配/拷贝越界）；已修复：像素数改用 size_t 逐项相乘，分配前回除校验，分配字节数与指针偏移均用 pixelCount（readImage 同改）。
     const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
     if (pixelCount / static_cast<size_t>(width) != static_cast<size_t>(height)) {
         std::cout << "影像像素数溢出!" << std::endl;
@@ -291,7 +284,6 @@ int Utils::readImageinout(std::string infilename,std::vector<std::vector<float>>
         return 0;
     }
 
-    // FIXED[中] 错误处理: GetRasterBand(kband)/CPLMalloc 返回值未判空、RasterIO 的 CPLErr 未检查，波段为空或分配/读取失败时解引用空指针或把未初始化数据当作影像返回（前轮补漏发现，原文件未标注）；已修复：三者逐一判空并检查 CE_None，失败时释放已分配的 bandData、GDALClose 数据集并返回 0。
     //std::vector<std::vector<float>> collected(nband);
     for(int kband=1;kband < nband+1;kband++)
     {
@@ -352,7 +344,6 @@ std::vector<std::vector<float>> Utils::readImage(std::string infilename) {
     int height = poDataset->GetRasterYSize();
     int nBands = poDataset->GetRasterCount();
 
-    // FIXED[中] 内存: 与 readImageinout 同源的 int 像素数乘法，bandData+width*height 在大图上溢出越界；且本函数缺少波段/尺寸判空（第 207 行注释声称已同步，实际未加）；已修复：补上 nBands<1 或尺寸非正的判空，像素数用 size_t 计算并回除校验，分配与偏移改用 pixelCount。
     if (nBands < 1 || width <= 0 || height <= 0) {
         std::cout << "影像波段数或尺寸无效!" << std::endl;
         GDALClose(poDataset);
@@ -365,7 +356,6 @@ std::vector<std::vector<float>> Utils::readImage(std::string infilename) {
         return std::vector<std::vector<float>>();
     }
 
-    // FIXED[中] 错误处理: GetRasterBand(1) 在判空之前就被解引用以取 GetRasterDataType（前轮补漏发现，原文件未标注）；已修复：先取出 poBand 并判空，再取数据类型，空指针时 GDALClose 数据集并返回空 vector（readImageinout1/readImageinout 同改）。
     GDALRasterBand * poBand = poDataset->GetRasterBand(1);
     if (poBand == nullptr) {
         GDALClose(poDataset);
@@ -376,8 +366,6 @@ std::vector<std::vector<float>> Utils::readImage(std::string infilename) {
 
 
     std::vector<std::vector<float>> collected(nBands);
-    // FIXED[高] Bug: 循环条件 kband < nBands 少读最后一个波段（GDAL 波段号 1..nBands），collected[nBands-1] 恒为空，单波段影像返回空数据，调用方按 width*height 索引即越界；已修复：循环上界改为 kband <= nBands，最后一个波段也被读取。
-    // FIXED[中] 错误处理: GetRasterBand(kband)/CPLMalloc 返回值未判空、RasterIO 的 CPLErr 未检查，波段为空或分配/读取失败时解引用空指针或把未初始化数据当作影像返回（前轮补漏发现，原文件未标注）；已修复：三者逐一判空并检查 CE_None，失败时释放已分配的 bandData、GDALClose 数据集并返回空 vector。
     for(int kband=1;kband <= nBands;kband++)
     {
 //        GDALRasterBand * band = poDataset->GetRasterBand(kband);
@@ -427,7 +415,6 @@ int Utils::saveImage1(std::string outfilepath, std::vector<float> &c,
 //    GDALDataType type = poBand->GetRasterDataType();
 
     GDALDriver *driver = GetGDALDriverManager()->GetDriverByName("GTiff");
-    // FIXED[中] 错误处理: driver/ods 未判空（目录不存在、无写权限、路径编码问题时 Create 返回 nullptr 直接崩溃），未校验 c.size()>=width*height（不足时 RasterIO 越界读），RasterIO 结果被忽略；已修复（saveImage 同改）：driver/ods 判空后返回 0，写入前校验尺寸为正且 c.size()>=width*height；RasterIO 的 CPLErr 与 proj/trans 地理参考仍未使用，保持 DEFERRED。
     if (driver == nullptr) {
         std::cout << "GDAL GTiff driver unavailable: " << outfilepath << std::endl;
         return 0;
@@ -556,7 +543,6 @@ float* Utils::infile2num(std::string infileName, int skip, int col, int& num)
 	infile.close();
 
 	// Rows shorter than col are counted but not written; keep them at zero.
-	// FIXED[高] 内存: 文件打不开时 num 未被赋值（保持调用方传入的值，可能是未初始化垃圾/负数），new float[num] 可能抛 bad_array_new_length 或分配巨量内存；已修复：打不开时置 num=0 并返回 nullptr，num<=0 时不再分配；返回裸 new[] 的接口改为 std::vector<float> 属 API 变更，保持 DEFERRED。
 	if (num <= 0) return nullptr;
 	float* mydata = new float[num]();
 	if (num >= 1)
@@ -605,7 +591,6 @@ std::vector <int> Utils::findnum(std::string& ch)
 {
 	std::vector <int> numVec;
 	int k = ch.size();
-	// FIXED[低] 内存: new int[k] 从未 delete[]，每次调用泄漏；连续数字串较长时 int result 有符号溢出（UB）；已修复：去掉临时数组，直接 push_back 到 numVec，不再泄漏（超长数字串的 int 溢出仍为 DEFERRED）。
 	int result;
 	int n = 0;
 	while (n < k) {

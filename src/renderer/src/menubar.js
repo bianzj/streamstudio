@@ -64,7 +64,6 @@ export function createMenubar({ root, route }) {
   window.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && active) { event.preventDefault(); event.stopImmediatePropagation(); close(true); return }
     if (!(event.ctrlKey || event.metaKey) || event.altKey) return
-    // FIXED[低] Bug: 全局捕获 Ctrl+N/Ctrl+O 并 stopImmediatePropagation，模态对话框打开或 project.json 源码编辑器聚焦时也会触发新建/打开；已修复：原生 dialog[open]、应用内 .drawer-backdrop 弹层打开或焦点在可编辑元素时直接跳过
     if (document.querySelector('dialog[open], .drawer-backdrop:not([hidden])')) return
     const focused = document.activeElement
     if (focused && (focused.isContentEditable || focused.closest?.('[contenteditable="true"]') ||

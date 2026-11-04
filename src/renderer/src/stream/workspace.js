@@ -150,7 +150,6 @@ function localToUtc(date, time, timezone) {
   const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''))
   const clock = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(String(time || ''))
   if (!day || !clock) return ''
-  // FIXED[低] Bug: 与 server/stream/config.mjs 的 localToUtc 重复实现，问题也相同：timezone 为 null/'' 时 Number() 得 0，按 UTC+0 而不是默认 +8 换算；已修复：先判空（null/undefined/空白）再取默认 +8，不再被 Number() 当成 0；两处重复实现合并成共享模块属跨文件重构，未做
   const hasTimezone = timezone !== null && timezone !== undefined && String(timezone).trim() !== ''
   const offset = hasTimezone && Number.isFinite(Number(timezone)) ? Number(timezone) : 8
   const ms = Date.UTC(Number(day[1]), Number(day[2]) - 1, Number(day[3]), Number(clock[1]), Number(clock[2]), Number(clock[3] || 0)) - offset * 3600000
@@ -349,7 +348,6 @@ function niceLength(target) {
   return [1, 2, 5, 10].map((step) => step * power).reverse().find((value) => value <= target) || power
 }
 
-// FIXED[低] 性能: 最大约 22 MB 的 base64 用 atob + 逐字节 charCodeAt 解码，再加上 JSON 解析，切换波段时主线程会卡顿；字节数不是 4 的倍数时 Float32Array 构造会抛错；已修复：按 4 字节向下取整后再构造 Float32Array，尾字节丢弃，不再抛 RangeError；改用 octet-stream + arrayBuffer() 需要改服务端接口，未做
 function decodeFloat32(base64) {
   const binary = atob(base64 || '')
   const length = binary.length - (binary.length % 4)
@@ -823,7 +821,6 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     inspectTimer = setTimeout(inspectInputs, 350)
   }
 
-  // FIXED[低] 并发: 防抖触发的 inspect 和 startRun 中 await 的 inspect 可能并发，返回顺序不保证，较早请求的结果会覆盖较新的 inspections，validate() 可能基于过期的文件状态放行或拦截；已修复：照 view.token 的做法加递增 token，响应回来时 token 不是最新就丢弃
   async function inspectInputs() {
     const token = ++inspectToken
     const paths = [...new Set(ALL_FIELDS.map((spec) => getPath(form, spec.path)).filter((field) => field.mode === 'file' && field.file.trim()).map((field) => field.file.trim()))]
@@ -954,7 +951,6 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       scheduleInspect()
       return
     }
-    // FIXED[低] 可维护性: 页面中没有 data-path="outputRoot" 输入框和 data-browse-folder 按钮（refreshStatus 里也有同样的死代码）；如果以后加了文件夹按钮而没加输入框，input 为 null 会抛 TypeError；已修复：取 input 时给 row 加可选链并判空后直接返回，不再抛 TypeError（死分支本身保留，删除属清理）
     if (button.dataset.role === 'browse' || button.hasAttribute('data-browse-folder')) {
       const folder = button.hasAttribute('data-browse-folder')
       try {
@@ -1254,8 +1250,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       setRunning(Boolean(mine) || (currentJob === 'pending' && running))
       if (mine) setRunState('running', mine.stage || '运行中', mine.progress)
       else if (Number.isInteger(currentJob)) {
-        // FIXED[中] Bug: 断线期间任务已结束、job-closed 丢失时 currentJob 不会清空，运行卡片一直停在运行中；
-        // 已修复：任务既不在运行也不在排队时，清空 currentJob 并按输出目录读取最终结果
+        // The job ended while the event stream was down (job-closed lost): clear it and load the final result.
         const outputDir = currentJobOutput
         currentJob = null
         currentJobOutput = null
@@ -1766,7 +1761,6 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (Number.isFinite(layer.originX) && layer.pixelSizeX) {
       const x = layer.originX + (sourceColumn + .5) * layer.pixelSizeX
       const y = layer.originY - (sourceRow + .5) * layer.pixelSizeY
-      // FIXED[中] Bug: layer.crs 来自 server.mjs 的 readTiff，它只解析投影 EPSG（3072），经纬度栅格得到的是 GeoAscii 引文或“经纬度坐标”，从不会是 "EPSG:4326"；isGeographic 判断失败，于是把度数当成“X / Y … m”显示，而且不显示经纬度；另外南纬、西经会显示成负的 °N/°E；已修复：改用 layer.unit === '°' 或 EPSG:4326 判定经纬度栅格（并回退到 [y, x]），经纬度按符号显示 N/S、E/W，经纬度栅格不再输出带 m 的 X/Y 行
       const geographicLayer = isGeographic(layer.crs) || layer.unit === '°'
       const geo = geographicLayer ? geographic(layer.crs, x, y) || [y, x] : geographic(layer.crs, x, y)
       if (!geographicLayer) parts.push(`<span title="${escapeHtml(crsLabel(layer.crs))}"><em>X / Y</em>${x.toLocaleString('en-US', { maximumFractionDigits: 1 })}, ${y.toLocaleString('en-US', { maximumFractionDigits: 1 })} m</span>`)
@@ -1816,7 +1810,6 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
   }
 
   // ---------- events ----------
-  // FIXED[低] 资源泄漏: document/window 上的 fullscreenchange、keydown、beforeunload 监听器和 ResizeObserver 都没有保存引用，也不会解除；目前 bind 只调用一次，问题不大，但工作台如果被重建或销毁（root.innerHTML 重写时 rendered 复位）就会重复绑定，F5 会触发多次 startRun；已修复：这三处全局监听器用 globalBound 守卫，只在首次 bind 注册；元素级监听器仍每次 bind 都注册（重建后新 DOM 不会丢监听）；工作台没有销毁路径，AbortController + dispose() 的全量解绑未加
   function bind() {
     root.addEventListener('click', (event) => {
       const action = event.target.closest('[data-action]')?.dataset.action
@@ -1856,7 +1849,6 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     })
     for (const id of ['#swMin', '#swMax']) {
       $(id).addEventListener('change', () => {
-        // FIXED[低] Bug: Number('') 为 0，清空某个输入框会被当作 0（°C 模式下是 273.15 K）而不是报错；已修复：先判断 trim() === '' 得到 NaN，交给下面已有的“拉伸范围无效”提示拦截，不再退回成 0
         const minText = $('#swMin').value.trim(), maxText = $('#swMax').value.trim()
         const low = minText === '' ? NaN : fromDisplay(Number(minText)), high = maxText === '' ? NaN : fromDisplay(Number(maxText))
         if (!Number.isFinite(low) || !Number.isFinite(high) || high <= low) { toast('拉伸范围无效', '上限须大于下限', 'error'); drawHistogram(); return }
@@ -1880,7 +1872,6 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       for (const item of $('#swInterp').children) item.classList.toggle('active', item === button)
       draw()
     })
-    // FIXED[低] 资源泄漏: document/window 上的 fullscreenchange、keydown、beforeunload 监听器和 ResizeObserver 都没有保存引用，也不会解除…；已修复：这三处全局监听器改为仅首次 bind 注册（globalBound 守卫，详见 bind() 开头说明），重建工作台不会重复绑定，F5 不会再触发多次 startRun
     if (!globalBound) document.addEventListener('fullscreenchange', () => {
       if (rendered) setTimeout(() => fit(), 80)
     })
@@ -1932,7 +1923,6 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (!rendered) render()
     root.hidden = false
     document.body.classList.add('scene-workspace-open')
-    // FIXED[中] 错误处理: EventSource 断线自动重连后，服务端只补发一条 status 事件，handleEvent 直接忽略了它；断线期间的 job-closed 丢失时，界面会永远停在“运行中”（停止按钮也无效）；已修复：handleEvent 收到 status 事件时调用 refreshStatus，按服务端 running/queue 重新同步 currentJob 与运行/停止按钮状态
     if (!unsubscribe) unsubscribe = api.onEvent(handleEvent)
     void refreshStatus()
     void refreshPacks()
@@ -1998,7 +1988,6 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
   // ---------- engine events (/api/stream/events) ----------
   function handleEvent(event) {
     if (!rendered) return
-    // FIXED[中] 错误处理(对应 show() 中 EventSource 重连的 REVIEW)：status 事件原本被直接 return 丢弃；已修复：已知过一次状态后再收到 status（断线重连时服务端补发的那条）就调用 refreshStatus 重新同步，避免界面永远停在“运行中”
     if (event.type === 'status') { if (status) void refreshStatus(); return }
     const job = event.job
     if (!job) return

@@ -30,7 +30,6 @@ std::vector<glm::ivec3> VoxelDesigner::createEllipsoid(float height, float width
     std::vector<glm::ivec3> discreteCoord;
     std::vector<Aabb> aabbs;
 
-    // FIXED[中] 数值: 未校验 stepSize>0 与尺寸有限，stepSize=0 时 ceil(inf) 转 int 属未定义行为（本文件所有 createXxx 同理）；下方椭球判定用体元角点 i 而非中心 i+0.5 与 size/2 比较（注释中的推导不成立），整个椭球向负方向偏移半格、形状不对称；已修复：入口校验 stepSize/height/width 有限且 >0，非法时清空 m_voxelModel 并返回空结果；角点判定未改（DEFERRED，改变形状）。
     if (!(stepSize > 0.0f) || !(height > 0.0f) || !(width > 0.0f) ||
         !std::isfinite(stepSize) || !std::isfinite(height) || !std::isfinite(width)) {
         m_voxelModel.centerPoints.clear();
@@ -87,7 +86,6 @@ std::vector<glm::ivec3> VoxelDesigner::createCube(float length, float width, flo
     std::vector<glm::ivec3> discreteCoord;
     std::vector<Aabb> aabbs;
 
-    // FIXED[中] 数值: 未校验 stepSize>0 与尺寸有限，stepSize=0 时 ceil(inf) 转 int 属未定义行为（与 createEllipsoid 同源）；已修复：入口校验 stepSize/length/width/height 有限且 >0，非法时清空 m_voxelModel 并返回空结果。
     if (!(stepSize > 0.0f) || !(length > 0.0f) || !(width > 0.0f) || !(height > 0.0f) ||
         !std::isfinite(stepSize) || !std::isfinite(length) || !std::isfinite(width) || !std::isfinite(height)) {
         m_voxelModel.centerPoints.clear();
@@ -186,7 +184,6 @@ PrimMesh VoxelDesigner::createTriCube(Shape shape, float stepSize)
     voxelTriModel.nIndices = 0;
     voxelTriModel.meshId = 0;
 
-    // FIXED[中] 数值: 未校验 stepSize>0 与尺寸有限，stepSize=0 时 height/stepSize 为 inf，循环上界转 int 属未定义行为（createTriCube_wall/_roof 同源）；已修复：入口校验 stepSize 与 shape 三维有限且 >0，非法时返回空 mesh。
     if (!(stepSize > 0.0f) || !(shape.width > 0.0f) || !(shape.height > 0.0f) || !(shape.length > 0.0f) ||
         !std::isfinite(stepSize) || !std::isfinite(shape.width) || !std::isfinite(shape.height) || !std::isfinite(shape.length)) {
         return voxelTriModel;
@@ -439,7 +436,6 @@ PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
     voxelTriModel.nIndices = 0;
     voxelTriModel.meshId = 0;
 
-    // FIXED[中] 数值: 未校验 stepSize>0 与尺寸有限，stepSize=0 时 height/stepSize-1 为 inf，循环上界转 int 属未定义行为（与 createTriCube 同源）；已修复：入口校验 stepSize 与 shape 三维有限且 >0，非法时返回空 mesh。
     if (!(stepSize > 0.0f) || !(shape.width > 0.0f) || !(shape.height > 0.0f) || !(shape.length > 0.0f) ||
         !std::isfinite(stepSize) || !std::isfinite(shape.width) || !std::isfinite(shape.height) || !std::isfinite(shape.length)) {
         return voxelTriModel;
@@ -658,7 +654,6 @@ PrimMesh VoxelDesigner::createTriCube_roof(Shape shape, float stepSize)
     voxelTriModel.nIndices = 0;
     voxelTriModel.meshId = 0;
 
-    // FIXED[中] 数值: 未校验 stepSize>0 与尺寸有限，stepSize=0 时 height/stepSize-1 为 inf，转 int 属未定义行为（与 createTriCube 同源）；已修复：入口校验 stepSize 与 shape 三维有限且 >0，非法时返回空 mesh。
     if (!(stepSize > 0.0f) || !(shape.width > 0.0f) || !(shape.height > 0.0f) || !(shape.length > 0.0f) ||
         !std::isfinite(stepSize) || !std::isfinite(shape.width) || !std::isfinite(shape.height) || !std::isfinite(shape.length)) {
         return voxelTriModel;
@@ -714,7 +709,6 @@ PrimMesh VoxelDesigner::createTriCube_roof(Shape shape, float stepSize)
 
 bool VoxelDesigner::outputPrimMesh(std::string path, PrimMesh mesh)
 {
-    // FIXED[低] 物理: 输出时交换 y/z（Z-up→Y-up）是镜像变换，三角形绕序被反转，导出 OBJ 中法向朝内；窄字符路径打开中文目录失败；PrimMesh 按值传参整体复制；indices.size() 不是 3 的倍数时 kk+1/kk+2 越界；建议：交换坐标时同时交换每个面的两个索引，const 引用传参，循环条件用 kk+2<size；已修复：循环条件改为 kk+2<size 并使用 std::size_t 步进，尾部不足 3 个的索引不再被读出；其余三项未改（DEFERRED）。
     std::ofstream outfile(path);
     if (outfile.is_open())
     {
@@ -989,7 +983,6 @@ PrimMesh VoxelDesigner::createTriEllipsoid(Shape shape, float stepSize)
 
 bool VoxelDesigner::isInPloy(nvmath::vec2i testPoint, std::vector<nvmath::vec2f> ploys)
 {
-    // FIXED[中] 数值: 浮点叉积被隐式截断为 int，|值|<1 的结果变为 0，导致靠近边的点被判为"不在多边形内"（严格 >0/<0），且大坐标时 float→int 溢出为 UB；ploys 未检查至少 4 个点即越界读；建议：叉积用 float/double 保存，必要时用 >=0 包含边界，并校验 ploys.size()>=4；已修复：入口校验 ploys.size()>=4，不足 4 点直接返回 false，不再越界读；叉积仍为 int（DEFERRED，边界判定语义需确认）。
     if (ploys.size() < 4) return false;
     nvmath::vec2f A = ploys[0];
     nvmath::vec2f B = ploys[1];
@@ -1053,7 +1046,6 @@ PrimMesh VoxelDesigner::createTriBackground(float sceneLength, float sceneWidth,
     mesh.nVertices = 0;
     mesh.nIndices = 0;
     float bgZ = -1;
-    // FIXED[低] 数值: 循环上界 i < sceneLength/stepSize 等价于 ceil，而 createBackground 用 int 截断（floor），scene.cpp 中背景格数也用截断；非整数倍时两者相差一列，背景网格与体元 ID 错位；stepSize 未校验 >0；建议：统一使用一个格数计算函数；已修复：入口校验 stepSize/sceneLength/sceneWidth 有限且 >0，非法时返回空 mesh；格数仍为循环上界与 int 截断并存（DEFERRED，改变体元数量）。
     if (!(stepSize > 0.0f) || !(sceneLength > 0.0f) || !(sceneWidth > 0.0f) ||
         !std::isfinite(stepSize) || !std::isfinite(sceneLength) || !std::isfinite(sceneWidth)) {
         return mesh;
@@ -1295,7 +1287,6 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float s
     int nImgSizeX = heightDataset->GetRasterXSize();
     int nImgSizeY = heightDataset->GetRasterYSize();
     int bandcount = heightDataset->GetRasterCount();
-    // FIXED[高] 内存: 缓冲区只分配 nImgSizeX*nImgSizeY 个 float，但 RasterIO 以 nBandCount=bandcount（panBandMap=nullptr 即读全部波段）读取，多波段 TIF（如带 alpha 的 RGB/高度图）时写入 bandcount 倍数据，堆溢出；int 乘法对 >2^31 像素溢出；RasterIO 返回值未检查；new[] 在后续抛异常时泄漏；建议：只读第 1 波段（GetRasterBand(1)->RasterIO）、用 std::vector<float>(size_t) 分配并检查 CPLErr（_roof/_wall 两个函数同理）；已修复：改从 GetRasterBand(1) 读第 1 波段，缓冲区用 std::vector<FLOAT>(size_t 像素数)，校验 bandcount/尺寸/CPLErr 并在失败时 GDALClose 后返回；minReHeightScanline 的 new[] 也改用 size_t 像素数（三处），原有 delete[] 保留；_roof/_wall 的读取错误处理未改（DEFERRED）。
     if (nImgSizeX <= 0 || nImgSizeY <= 0 || bandcount < 1) {
         GDALClose(heightDataset);
         return voxelTriModel;
@@ -1341,7 +1332,6 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float s
     {
         for (int j = 1; j < nImgSizeY - 1; j++)
         {
-            // FIXED[中] 内存: heightScanline[(j±1)*nImgSizeX+i] 等下标的乘法仍按 int 计算，超大尺寸时 j*nImgSizeX+i 超过 INT_MAX 溢出为负下标/越界（前轮补漏发现，原文件未标注）；已修复：索引乘法的每个操作数逐项 static_cast 为 std::size_t，下标值不变。
             // all the height
             float curReHeight = std::round(heightScanline[static_cast<std::size_t>(j) * static_cast<std::size_t>(nImgSizeX) + static_cast<std::size_t>(i)] / stepSize);
 
@@ -1544,7 +1534,6 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, gl
 
     std::vector<float> heightScanline0;
     int width,height, nband;
-    // FIXED[中] 错误处理: 忽略 readImageinout1 的返回值，影像打不开时 width/height 未赋值，convertVector2Mat 用未初始化的行数、高度图为空或长度不符时越界（_wall 同源）；已修复：检查返回值与 width/height 为正、heightScanline0.size()==width*height（size_t 计算），失败时记录日志并返回空 mesh；INTER_LINEAR→INTER_NEAREST 属结果变化，保持 DEFERRED。
     if (!Utils::readImageinout1(heightPath,heightScanline0,width,height,nband) ||
         width <= 0 || height <= 0 ||
         heightScanline0.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) {
@@ -1592,7 +1581,6 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, gl
     {
         for (int j = 1; j < nImgSizeY - 1; j++)
         {
-            // FIXED[中] 内存: heightScanline[(j±1)*nImgSizeX+i] 等下标的乘法仍按 int 计算，超大 targetSize 时 j*nImgSizeX+i 超过 INT_MAX 溢出为负下标/越界（前轮补漏发现，原文件未标注）；已修复：索引乘法的每个操作数逐项 static_cast 为 std::size_t，下标值不变。
             // all the height
             float curReHeight = std::round(heightScanline[static_cast<std::size_t>(j) * static_cast<std::size_t>(nImgSizeX) + static_cast<std::size_t>(i)] / stepSize);
 
@@ -1712,7 +1700,6 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_wall(std::string heightPath, gl
 
      std::vector<float> heightScanline0;
      int width,height, nband;
-     // FIXED[中] 错误处理: 忽略 readImageinout1 的返回值，影像打不开时 width/height 未赋值，convertVector2Mat 用未初始化的行数、高度图为空或长度不符时越界（与 _roof 同源）；已修复：检查返回值与 width/height 为正、heightScanline0.size()==width*height（size_t 计算），失败时记录日志并返回空 mesh；INTER_LINEAR→INTER_NEAREST 属结果变化，保持 DEFERRED。
      if (!Utils::readImageinout1(heightPath,heightScanline0,width,height,nband) ||
          width <= 0 || height <= 0 ||
          heightScanline0.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) {
@@ -1762,7 +1749,6 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_wall(std::string heightPath, gl
     {
         for (int j = 1; j < nImgSizeY - 1; j++)
         {
-            // FIXED[中] 内存: heightScanline[(j±1)*nImgSizeX+i] 等下标的乘法仍按 int 计算，超大 targetSize 时 j*nImgSizeX+i 超过 INT_MAX 溢出为负下标/越界（前轮补漏发现，原文件未标注）；已修复：索引乘法的每个操作数逐项 static_cast 为 std::size_t，下标值不变。
             // all the height
             float curReHeight = std::round(heightScanline[static_cast<std::size_t>(j) * static_cast<std::size_t>(nImgSizeX) + static_cast<std::size_t>(i)] / stepSize);
 

@@ -42,7 +42,6 @@ export function meshSpecularFromRow(row) {
 }
 
 export function specularParametersFromValues(values, previous = {}) {
-  // FIXED[低] Bug: 输入框清空时值为 ''，?? 不会回退到 previous，finite('') 再回退到 0.5/0.25 默认值，用户原有参数被重置；已修复：空字符串时改用 previous 的对应值，仅真正无输入时才回退默认值
   const fraction = values.specularFraction == null || String(values.specularFraction).trim() === '' ? previous.fraction : values.specularFraction
   const roughness = values.specularRoughness == null || String(values.specularRoughness).trim() === '' ? previous.roughness : values.specularRoughness
   return normalizeSpecular({ ...previous, fraction, roughness })

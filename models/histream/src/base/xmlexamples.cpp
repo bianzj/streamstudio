@@ -173,7 +173,6 @@ void XmlExamples::createVoxelebxml(){
 
     PropertyXml propertyXml1,propertyXml2,propertyXml3;
     propertyXml1 = {"soilset",Type::SOIL};
-    // FIXED[中] Bug: 按位置初始化时 Tsoil 与 smc 互换（Tsoil=0.25、smc=25）；已修复：改为按成员名赋值，Tsoil=25、smc=0.25。
     propertyXml1.soilset = SoilSet{};
     propertyXml1.soilset.method = 1;
     propertyXml1.soilset.rss = 2000;

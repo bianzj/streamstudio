@@ -93,7 +93,6 @@ public:
         PropertyXml soilProperty{};
         soilProperty.name = "soil";
         soilProperty.type = Type::SOIL;
-        // FIXED[高] Bug: 按位置初始化时 Tsoil 与 smc 互换（Tsoil=0.25、smc=25 超过饱和含水量）；已修复：改为按成员名赋值。
         soilProperty.soilset = SoilSet{};
         soilProperty.soilset.method = 1;
         soilProperty.soilset.rss = 2000.0f;

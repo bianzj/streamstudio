@@ -96,7 +96,6 @@ std::filesystem::path ProjectJson::resolve(const std::string& value) const {
     const std::filesystem::path path = std::filesystem::u8path(value);
     if (path.is_absolute()) return path.lexically_normal();
     const std::filesystem::path local = (projectDirectory() / path).lexically_normal();
-    // FIXED[低] 错误处理: std::filesystem::exists 的无 error_code 重载在权限不足/网络盘断开时抛 filesystem_error，会导致整个项目加载失败；已修复：两处均改用 exists(p, ec) 重载，查询失败（ec 置位）按“不存在”处理并继续回退查找，不再抛异常。
     std::error_code existsError;
     if (std::filesystem::exists(local, existsError) || path.begin() == path.end() || *path.begin() != "assets")
         return local;
@@ -156,7 +155,6 @@ std::vector<std::string> ProjectJson::names(const Json& value) {
     if (!value.is_string()) return result;
     std::istringstream input(value.get<std::string>());
     std::string token;
-    // FIXED[低] Bug: 逗号分隔的名字未去除首尾空白，"leaf, bark" 得到 " bark"，后续按名字查找光谱/网格失败（numbers() 却把空格当分隔符）；已修复：每个逗号分隔的 token 先 trim 空白字符，空 token 仍被跳过。
     const auto addTrimmed = [&result](std::string part) {
         const auto first = part.find_first_not_of(" \t\r\n");
         if (first == std::string::npos) return;
@@ -187,7 +185,6 @@ float ProjectJson::number(const Json& object, const char* key, float fallback) {
 }
 
 int ProjectJson::integer(const Json& object, const char* key, int fallback) {
-    // FIXED[低] 数值: 整数经 float 中转，>2^24（16,777,216）的值（如随机种子、大计数）会丢失精度，超出 long 范围时 lround 结果未指定（Windows 上 long 为 32 位）；已修复：JSON 整数直接取 64 位整型并按 int 范围钳制，仅非整数数值/字符串仍走原 float 路径。
     if (!object.is_object()) return fallback;
     const auto found = object.find(key);
     if (found == object.end()) return fallback;

@@ -1,6 +1,5 @@
 // HTTP client and event channel of the STREAM image workspace (/api/stream/*).
 async function request(path, options) {
-  // FIXED[低] 错误处理: fetch 没有超时/AbortSignal，后端卡住（如 pick 对话框或同步读取大 TIFF）时调用方会一直等待，界面无法取消；网络错误时抛出原始 TypeError “Failed to fetch”，不是中文提示；已修复：fetch 包 try/catch，网络失败转换为可读中文错误（调用方传入的 options.signal 原本就会透传给 fetch，可用于取消）；未加默认超时，避免引入新的超时数值常量
   let response
   try {
     response = await fetch(path, options)

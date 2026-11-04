@@ -10,7 +10,6 @@ namespace {
 template <typename ModelIO>
 bool readbackBuffer(ModelIO& modelio, const nvvk::Buffer& bufferIn, VkDeviceSize size, const nvvk::Buffer& bufferOut)
 {
-    // FIXED[低] 越界/性能: 此前未校验 size 不超过 bufferIn/bufferOut 的实际大小，超出时 vkCmdCopyBuffer 越界（命令池复用需重构，本轮未改）；已修复：复制前用 vkGetBufferMemoryRequirements 取两缓冲容量，size 超出时返回 false，不再提交越界复制。
     VkMemoryRequirements sourceRequirements{};
     VkMemoryRequirements destinationRequirements{};
     vkGetBufferMemoryRequirements(modelio->m_device, bufferIn.buffer, &sourceRequirements);

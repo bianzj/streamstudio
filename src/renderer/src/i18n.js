@@ -986,7 +986,6 @@ function updateToggle(button) {
 
 export function startLocalization({ onChange } = {}) {
   const button = document.querySelector('#languageToggle')
-  // FIXED[低] 内存泄漏: click 与 languagechange 监听器每次调用都会重复注册（observer 有防重入守卫，监听器没有），重复调用后单击会切换两次语言而看似无效；已修复：与 observer 一样加 listenersBound 一次性守卫，重复调用只重新本地化
   if (!listenersBound) {
     listenersBound = true
     button?.addEventListener('click', () => setLanguage(language === DEFAULT_LANGUAGE ? 'en-US' : DEFAULT_LANGUAGE))

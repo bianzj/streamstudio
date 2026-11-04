@@ -1174,7 +1174,6 @@ function updateSceneSkybox(config) {
   }
 }
 
-// FIXED[中|内存泄漏]: 只释放 material.map，normalMap/alphaMap/emissiveMap/roughnessMap 等其它贴图及 uniforms 中的纹理不会 dispose，反复重建场景会累积 GPU 纹理；已修复：遍历材质自身的全部属性与 uniforms，凡 isTexture 的统一 dispose（同一纹理多次 dispose 是幂等的，未做引用计数）
 function disposeObject(object) {
   object.traverse((child) => {
     child.geometry?.dispose?.()
@@ -2746,7 +2745,6 @@ function loadXml(result) {
       .catch((error) => toast('无法打开影像模拟工程', error?.message || String(error), 'error'))
     return
   }
-  // FIXED[中|错误处理]: 本函数和 chooseXml 都不检查 state.running，运行中切换工程会改写 outputDir/inputPath，运行结束事件落到新工程上；已修复：运行中拒绝切换工程（沿用“打开示例”的同一提示）
   if (state.running) { toast('无法打开工程', '模拟运行中，不能更换工程', 'error'); return }
   streamWorkspace.close()
   if (projectTextSyncTimer) { clearTimeout(projectTextSyncTimer); projectTextSyncTimer = null }
@@ -2767,7 +2765,6 @@ function loadXml(result) {
     selectMode(projectMode)
     $('#xmlEditor').value = result.content; $('#xmlEditor').hidden = false; $('#emptyEditor').hidden = true; $('#applyXmlBtn').disabled = false; $('#xmlStatus').textContent = result.path
     $('#projectName').textContent = project?.name || fileName(result.path); $('#unsavedMark').hidden = true
-    // FIXED[中|错误处理]: loadActualScene(config) 未 await 也无 catch（saveXml 的 replaced 分支、applyXmlBtn 处理器同样），OBJ 读取/解析失败成为未处理 rejection，场景对象静默缺失；已修复：改用自带 catch 的 restoreActualScene()（saveXml 的 replaced 分支与 applyXmlBtn 处理器同样替换）；运行中拒绝切换工程已在上方 loadXml 入口加入
     refreshFromState(); restoreActualScene(); renderInspector(); addLog(`已加载配置：${result.path}`, 'success'); toast('配置已加载', fileName(result.path))
     void reportUsdOpen(result)
   } catch (error) { toast('无法读取配置', error.message, 'error'); addLog(error.message, 'error') }
@@ -2857,7 +2854,6 @@ async function importMeteo(file) {
   if (!file) return
   try {
     if (state.running) throw new Error('模拟运行中，不能更换气象驱动文件')
-    // FIXED[中|并发]: 与 importDem 同类问题——上传期间若切换了工程，下面会把气象文件写进新工程的 state.config 并立即 saveXml，而文件实际导入在旧工程目录；已修复：await 前缓存 state.inputPath，返回后不一致则中止并提示
     const projectPath = state.inputPath
     const imported = await api.importMeteo({ name: file.name, content: await file.text() })
     if (state.inputPath !== projectPath) throw new Error('导入期间已切换工程，本次气象文件未写入')
@@ -2895,7 +2891,6 @@ async function importDem(file) {
     if (file.size > 64 * 1024 * 1024) throw new Error('DEM 文件超过 64MB，请先裁剪或降采样')
     const projectPath = state.inputPath
     const imported = await api.importDem({ name: file.name, contentBase64: await readFileBase64(file), projectPath: state.inputPath })
-    // FIXED[中|并发]: 读取 64MB 文件并上传期间若切换了工程，下面会把 DEM 写进新工程的 state.config 并立即 saveXml，而文件实际导入在旧工程目录（importMeteo 同样问题）；已修复：await 前缓存 state.inputPath，返回后不一致则中止并提示
     if (state.inputPath !== projectPath) throw new Error('导入期间已切换工程，本次 DEM 未写入')
     const project = ensureProjectState()
     state.config.scene.demFile = imported.relativePath || imported.path
@@ -3442,7 +3437,6 @@ async function renderClassTextureRows(root, currentSpectrumName) {
   const existing = [...root.querySelectorAll('[name="classColor"]')].map((input, index) => ({
     color: input.value, spectralName: root.querySelectorAll('[name="classSpectral"]')[index]?.value || ''
   }))
-  // FIXED[低|错误处理]: JSON.parse 位于 try 之外，data-classes 损坏时整个函数 reject，容器停留在旧内容且调用方多为未 await 的 fire-and-forget，异常无人处理；已修复：本地 try/catch 解析，损坏时回退为 []
   let saved = existing
   if (!saved.length) {
     try { saved = JSON.parse(container.dataset.classes || '[]') } catch { saved = [] }
@@ -4181,7 +4175,6 @@ async function generateGeometryObject(event) {
 
 async function importObj() {
   if (!state.inputPath) { toast('无法导入 OBJ', '请先新建或打开工程', 'error'); return }
-  // FIXED[中|错误处理]: api.chooseObj() 在 try 之外，读取/选择失败会变成未处理的 Promise rejection，用户无任何提示；另外若已有 pendingObject 未释放就被 preparePendingObject 覆盖，旧 Object3D 的几何/材质泄漏；已修复：把 await 放进 try/catch 并 toast 提示，覆盖前先 disposeObject(state.pendingObject.object)
   let result
   try { result = await api.chooseObj() }
   catch (error) { toast('无法导入 OBJ', error.message, 'error'); addLog(`无法导入 OBJ：${error.message}`, 'error'); return }
@@ -4200,7 +4193,6 @@ function upsertByName(list, value) {
   else list.push(value)
 }
 
-// FIXED[中|Bug]: 各物化参数直接 Number(values.xxx)：空输入框得到 0（如 Vcmax、cs、rhos、lambdas 变 0），非数字得到 NaN；Wood 分支 Math.max(1, NaN) 仍为 NaN，会原样写进 project.json 并交给引擎；已修复：返回前过滤掉 params 中非有限的数字项（缺失/非法即跳过，不引入新的默认值），NaN 不再写进工程；空串被当成 0 的字段（未包 Math.max 的 Vcmax/SMC 等）行为未改，见下方说明
 function physicalFromForm(values, type) {
   let params
   if (type === 'Photovoltaic') {
@@ -4539,7 +4531,6 @@ async function saveImportedObject(event) {
     const physicalSelections = $$('.mesh-physical'), canopySelections = $$('.mesh-canopy')
     const physicalType = physicalTypeForObject(values.objectType)
     const physical = state.config.materials.find((item) => item.name === values.materialPreset) || physicalFromForm(values, physicalType)
-    // FIXED[低|错误处理]: 新建的光谱/温度/物化预设在此直接 upsert 进 state.config，后续校验或保存失败时 catch 只回滚 objects.items，预设库残留半成品条目（同名时还会覆盖已有预设）；已修复：upsert 前对三个预设数组做浅快照（upsert 是替换/追加元素，不原地改元素），catch 中一并恢复
     presetSnapshot = { spectra: [...state.config.spectra], thermals: [...state.config.thermals], materials: [...state.config.materials] }
     if (spectralSelections.some((select) => select.value === '__new__')) upsertByName(state.config.spectra, spectrum)
     if (thermalSelections.some((select) => select.value === '__new__')) upsertByName(state.config.thermals, thermal)
@@ -4842,7 +4833,6 @@ async function saveSceneObject(event) {
     const distribution = distributionFromForm(form, { requireValidDensity: true })
     const instances = generateDistribution(distribution)
     const saved = await api.saveDistribution({ path: item.positionFile, name: nextName, instances })
-    // FIXED[低|错误处理]: 先原地修改 item（name/distribution/movement/instanceCount）再 saveXml，保存失败时 catch 不回滚，界面与磁盘上的 project.json 不一致；另外传给 saveDistribution 的是未 trim 的名称，与 item.name=nextName 不一致；已修复：进函数时留存 item 快照，catch 中删除新增键并还原字段；saveDistribution 统一用 nextName
     item.name = nextName
     item.positionFile = saved.path
     item.distribution = distribution
@@ -5287,7 +5277,6 @@ async function drawEnviPreview(result, file, format = 'ENVI') {
   disposeResultViewer()
   const settings = normalizedResultDisplay(result, file)
   const selectedBands = settings.mode === 'color' ? settings.channels : [settings.gray]
-  // FIXED[中|错误处理]: 切换波段/彩色模式时由事件监听直接调用本函数且不 await、不 catch；任一 api.readResult 失败都会成为未处理 rejection，此时 3D 视图已被 dispose，预览区停留在旧画面而无错误提示；已修复：Promise.all 包 try/catch，失败时（且 previewRequest 仍为最新）先 disposeResultViewer，再用 emptyResultPreview + toast + addLog 提示
   let bandResults
   try {
     bandResults = await Promise.all(selectedBands.map((band) => band === result.band ? result : api.readResult(file.path, band)))
@@ -5434,7 +5423,6 @@ function rasterFromImage(image) {
 }
 
 async function drawImagePreview(result, file) {
-  // FIXED[低|并发]: 本函数不递增 state.resultPreviewRequest，只比较文件路径；同一文件的 drawEnviPreview 尚在等待 readResult 时切到图像预览，旧请求返回后会覆盖当前画面；已修复：开头同样 ++state.resultPreviewRequest，await 后比对 request 与路径
   const previewRequest = ++state.resultPreviewRequest
   disposeResultViewer()
   state.resultRaster = null
@@ -5558,7 +5546,6 @@ function showResult3D(raster, file, sourceResult = null) {
   resizeResultViewer()
   controls3d.update()
   $('#result3dBtn').classList.add('active')
-  // FIXED[低|错误处理]: 返回 2D 时 drawImagePreview/drawTiffPreview 返回的 Promise 没有 catch，解码失败成为未处理 rejection 且预览区停留在空 <img>；sourceResult 为 null 时 drawImagePreview(null) 会因 result.mimeType 抛 TypeError；已修复：sourceResult 与 rasterResult 都为空时直接返回，绘制用 async 处理器 await 并 try/catch，失败时先 disposeResultViewer 再用 emptyResultPreview + addLog 提示
   $('#result2dBtn').addEventListener('click', async () => {
     if (!rasterResult && !sourceResult) return
     try {
@@ -5730,7 +5717,6 @@ function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
   let valueMinimum = Infinity, valueMaximum = -Infinity
   let minimum = [Infinity, Infinity, Infinity], maximum = [-Infinity, -Infinity, -Infinity]
   for (let voxel = 0; voxel < result.voxelCount; voxel += 1) {
-    // FIXED[中|Bug]: 与 showSoilProfile3D 的做法对齐——JSON 中的 NaN/NoData 序列化为 null，Number(null) === 0 会被当成有效值参与 min/max；已修复：非数字（含 null）不再被 Number() 强转为 0，按无效值处理（下方着色循环同样处理；showFacet3D 未改）
     const raw = selected.values[voxel]
     const value = typeof raw === 'number' ? raw : NaN
     if (Number.isFinite(value)) { valueMinimum = Math.min(valueMinimum, value); valueMaximum = Math.max(valueMaximum, value) }
@@ -5835,7 +5821,6 @@ function soilProfileDepthLabel(depth, unit) {
 
 function showSoilProfile3D(result, file, selectedLayers = null) {
   const profile = result.soilProfile
-  // FIXED[中|内存泄漏]: 此处在 disposeResultViewer() 之前就用 emptyResultPreview 覆盖 innerHTML，旧 resultViewer 的 WebGL 上下文/几何/ResizeObserver 未释放，且 animate 中 renderResultViewer 仍对已脱离 DOM 的画布持续渲染；已修复：把 disposeResultViewer() 提到校验之前，空结果直接释放旧视图
   disposeResultViewer()
   if (!profile || !Array.isArray(profile.values) || !profile.layerCount ||
       !Array.isArray(result.voxelPositions) || !result.voxelCount) {
@@ -7059,7 +7044,6 @@ window.addEventListener('keydown', (event) => {
     else setObjectEditEnabled(false)
   }
 })
-// FIXED[低|错误处理]: 本行中停止按钮 () => api.stop() 的 Promise 没有 catch，停止失败（网络/进程已退出）时无提示且为未处理 rejection；已修复：补 .catch 并 toast + addLog 提示
 $('#fitBtn').addEventListener('click', fitCamera); $('#openXmlBtn').addEventListener('click', chooseXml); $('#drawerOpenBtn').addEventListener('click', chooseXml); $('#saveXmlBtn').addEventListener('click', saveXml); $('#saveAsBtn').addEventListener('click', showSaveAsDialog); $('#runBtn').addEventListener('click', runSimulation); $('#stopBtn').addEventListener('click', () => { api.stop().catch((error) => { toast('无法停止模拟', error.message, 'error'); addLog(`停止失败：${error.message}`, 'error') }) }); $('#resetBtn').addEventListener('click', resetSimulation)
 $('#openExampleBtn').addEventListener('click', showExampleDialog)
 $('#exampleForm').addEventListener('submit', openExampleFromDialog)
