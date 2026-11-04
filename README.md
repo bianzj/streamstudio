@@ -14,9 +14,9 @@ Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两�
 
 | 内容 | 入口 |
 | --- | --- |
-| 用户安装包、两本手册、四个核验案例 | D:/发布/streamstudio/2.0.1 |
+| 用户安装包、两本手册、九个随附案例（四个已核验影像案例 + 五个三维培训案例） | D:/发布/streamstudio/2.0.1；见 [案例目录](docs/example-library.md) |
 | 五个原有内置精选案例 | 安装后从案例库打开；源码索引 [assets/examples/catalog.json](assets/examples/catalog.json) |
-| 九个培训候选与研究导航 | 原 D:/examples 保留；见 [案例目录](docs/example-library.md) |
+| 研究案例与导航 | D:/cases/StreamStudio；原 D:/examples 已于 2026-11-04 并入发布目录 |
 | 测试脚本和验收摘要 | tools/check-user-release-cases.mjs、[本次验收范围](docs/testing/user-release-cases-20261101.md) |
 
 随附四例为 MODIS-ERA5、Landsat-ERA5、MODIS-LSCT、Landsat-LSCT；默认 4×4 区域已通过影像引擎检查。请先将案例文件夹复制到全英文可写路径，再在软件中打开 project.json；当前 ERA5 读取不能保证支持中文路径。LSCT 条目读取已有组分温度用于正向模拟，不做温度反演。
