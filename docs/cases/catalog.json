@@ -1,0 +1,63 @@
+{
+  "updated": "2026-11-07",
+  "cases": [
+    {
+      "id": "001",
+      "title": "玉米光热转换",
+      "page": "001-maize/README.md",
+      "figures": 5,
+      "limitations": "理想化玉米场景，包含四个生长阶段和Vcmax 20/40/60对照；尚非连续全季模拟，未完成独立观测验证。",
+      "model_rerun": false,
+      "projects": [
+        "examples/research-cases/001-maize/project-stage-01.json",
+        "examples/research-cases/001-maize/project-stage-02.json",
+        "examples/research-cases/001-maize/project-stage-03.json",
+        "examples/research-cases/001-maize/project-stage-04.json",
+        "examples/research-cases/001-maize/project-vcmax-020.json",
+        "examples/research-cases/001-maize/project-vcmax-040.json",
+        "examples/research-cases/001-maize/project-vcmax-060.json",
+        "examples/research-cases/001-maize/project.json"
+      ]
+    },
+    {
+      "id": "002",
+      "title": "雨林分层光热",
+      "page": "002-rainforest/README.md",
+      "figures": 4,
+      "limitations": "理想化森林与合成气象；5m混合体元按关联材料分组，棕榈样本仅9个体元；未完成独立观测验证。",
+      "model_rerun": false,
+      "projects": [
+        "examples/research-cases/002-rainforest/project.json",
+        "examples/research-cases/002-rainforest/project-multiband.json",
+        "examples/research-cases/002-rainforest/project-canopy-baseline.json",
+        "examples/research-cases/002-rainforest/project-canopy-diurnal.json"
+      ]
+    },
+    {
+      "id": "003",
+      "title": "城市街区热环境",
+      "page": "003-urban/README.md",
+      "figures": 5,
+      "limitations": "采用2026-11-05 v2修订：屋面反射率0.20→0.35，发射率0.92；共同通过时刻用于主要效果统计。绿化方案部分时刻残差未通过，空气温度绝对值偏高，未完成独立观测验证。",
+      "model_rerun": false,
+      "projects": [
+        "examples/research-cases/003-urban/baseline.json",
+        "examples/research-cases/003-urban/light-roof.json",
+        "examples/research-cases/003-urban/greening.json"
+      ]
+    },
+    {
+      "id": "004",
+      "title": "延庆山地光热与风场",
+      "page": "004-yanqing/README.md",
+      "figures": 5,
+      "limitations": "真实地形演示。风速上限30m/s，图3仅显示中心2×2km、离阶梯地面25m的原生流体结果；裁切不代表收敛。图5为2019-08-17 FFP足迹情景，与其他图日期不同，未完成独立观测验证。",
+      "model_rerun": false,
+      "projects": [
+        "examples/research-cases/004-yanqing/project.json",
+        "examples/research-cases/004-yanqing/fluid.json",
+        "examples/research-cases/004-yanqing/display.json"
+      ]
+    }
+  ]
+}

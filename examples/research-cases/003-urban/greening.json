@@ -1,0 +1,1351 @@
+{
+  "schemaVersion": 6,
+  "format": "histream-project",
+  "name": "城市街区热环境 · 增加绿化",
+  "mode": "eVoxelEB",
+  "createdAt": "2026-10-24T01:43:38.102Z",
+  "updatedAt": "2026-10-24T01:43:38.102Z",
+  "folders": {
+    "models": "models",
+    "positions": "positions",
+    "spectral": "spectral",
+    "meteorology": "meteorology",
+    "terrain": "terrain",
+    "output": "output"
+  },
+  "configuration": {
+    "outDir": "output",
+    "scene": {
+      "x": 300,
+      "y": 300,
+      "height": 100,
+      "offsetX": 0,
+      "offsetY": 0,
+      "offsetZ": 0,
+      "voxel": 2,
+      "voxelFillThreshold": 0.05,
+      "terrain": false,
+      "demFile": "",
+      "demInfo": null,
+      "background": {
+        "spectralName": "asphalt",
+        "thermalName": "soil_temperature",
+        "materialType": "Soil",
+        "materialName": "pavement",
+        "heterogeneityEnabled": false,
+        "angularEffectStrength": 0.5
+      }
+    },
+    "light": {
+      "zenith": 30,
+      "azimuth": 135,
+      "direct": 0.8,
+      "diffuse": 0.19999999999999996,
+      "skyTemperature": 250
+    },
+    "sensor": {
+      "x": 512,
+      "y": 512,
+      "bands": "660,860,10500",
+      "projection": "parallel",
+      "vza": 0,
+      "vaa": 0,
+      "continuousBands": false,
+      "bandStart": 400,
+      "bandEnd": 2500,
+      "bandStep": 10,
+      "principalPlane": false,
+      "hemisphere": false,
+      "positionX": 5000,
+      "positionY": 5000,
+      "height": 500,
+      "fov": 45,
+      "cruiseEnabled": false,
+      "cruiseHeading": 90,
+      "cruiseRoute": "line",
+      "cruiseTargetX": 400,
+      "cruiseTargetY": 400,
+      "cruiseTargetZ": 500,
+      "cruiseRectangleWidth": 500,
+      "cruiseRectangleHeight": 500,
+      "cruiseRandomSeed": 1,
+      "cruiseStep": 100,
+      "cruiseCount": 5,
+      "image": true,
+      "process": false,
+      "radiationProcess": true,
+      "energyProcess": true,
+      "temperature": true,
+      "albedo": false
+    },
+    "control": {
+      "depth": 4,
+      "samples": 32,
+      "gpu": 0,
+      "facetBackend": "gpu",
+      "heterogeneousVoxel": false,
+      "periodicTraversalCount": 20,
+      "skyboxEnabled": false,
+      "radiationSolver": "traditional",
+      "spectralAccelerationWidth": 100,
+      "shortwaveScatteringOrders": 2,
+      "voxelCollisionOrders": 2,
+      "radiationMaxSteps": 64,
+      "couplingIterations": 20,
+      "temperatureTolerance": 0.05,
+      "temperatureRelaxation": 0.5,
+      "stabilityCorrection": false,
+      "soilTemperatureMethod": 2,
+      "vegetationTemperatureMethod": 0
+    },
+    "fluid": {
+      "enabled": true,
+      "voxelSize": 5,
+      "timeStep": 5,
+      "pressureIterations": 20,
+      "windDirection": 110.7,
+      "buoyancy": 0.033,
+      "dragCoefficient": 0.3,
+      "thermalCoupling": 1,
+      "diffusivity": 10,
+      "smokeEmission": 0,
+      "maxVelocity": 10,
+      "outputWind": true,
+      "outputAirTemperature": true,
+      "outputHeight": 2.5
+    },
+    "objects": {
+      "count": 2,
+      "names": [
+        "urban_buildings",
+        "street_trees"
+      ],
+      "items": [
+        {
+          "name": "urban_buildings",
+          "type": "Building",
+          "materialName": "building_envelope",
+          "canopyName": "rigid_body",
+          "fileName": "../inputs/12b764acdbe19257/urban_block_buildings.obj",
+          "positionFile": "../inputs/2858d40d2f707470/urban_block_buildings_position.txt",
+          "shape": "cube",
+          "dimensions": [
+            5820.37744140625,
+            195,
+            5471.185791015625
+          ],
+          "meshes": [
+            {
+              "name": "wall",
+              "spectralName": "red_brick",
+              "thermalName": "building_temperature",
+              "materialName": "building_envelope",
+              "canopyName": "rigid_body"
+            },
+            {
+              "name": "roof",
+              "spectralName": "roof_conventional",
+              "thermalName": "building_temperature",
+              "materialName": "building_envelope",
+              "canopyName": "rigid_body"
+            }
+          ],
+          "distribution": {
+            "mode": "single",
+            "basis": "count",
+            "count": 1,
+            "density": 0.01,
+            "densityUnit": "hectare",
+            "rows": 4,
+            "columns": 6,
+            "minX": 150,
+            "maxX": 150,
+            "minY": 150,
+            "maxY": 150,
+            "seed": 1,
+            "scaleMin": 1,
+            "scaleMax": 1,
+            "z": 0,
+            "offsetX": 0,
+            "offsetY": 0,
+            "offsetZ": 0,
+            "points": ""
+          },
+          "instanceCount": 1
+        },
+        {
+          "name": "street_trees",
+          "type": "Vegetation",
+          "materialName": "leaf_c3",
+          "canopyName": "canopy_default",
+          "fileName": "../inputs/fc624428519e77e7/PRIM_geometry_2.obj",
+          "positionFile": "../inputs/0e8c4a713892b0c6/street_trees_greening.txt",
+          "shape": "ellipsoid",
+          "dimensions": [
+            5,
+            5,
+            5
+          ],
+          "meshes": [
+            {
+              "name": "geometry_2",
+              "spectralName": "green_leaf",
+              "thermalName": "vegetation_temperature",
+              "materialName": "leaf_c3",
+              "canopyName": "canopy_default"
+            }
+          ],
+          "distribution": {
+            "mode": "manual",
+            "basis": "count",
+            "count": 345,
+            "density": 0.04,
+            "densityUnit": "hectare",
+            "rows": 4,
+            "columns": 6,
+            "minX": 0,
+            "maxX": 500,
+            "minY": 0,
+            "maxY": 500,
+            "seed": 1,
+            "scaleMin": 1,
+            "scaleMax": 1,
+            "z": 0,
+            "offsetX": 0,
+            "offsetY": 0,
+            "offsetZ": 0,
+            "points": ""
+          },
+          "instanceCount": 345,
+          "sourceKind": "prim",
+          "generation": {
+            "type": "几何体",
+            "shape": "ellipsoid",
+            "parameters": {
+              "name": "geometry_2",
+              "shape": "ellipsoid",
+              "mode": "surface",
+              "sizeX": 5,
+              "sizeY": 5,
+              "sizeZ": 5,
+              "detail": 2,
+              "basis": "lai",
+              "amount": 3,
+              "facetArea": 0.01,
+              "orientation": "spherical",
+              "seed": 2026,
+              "positionX": 30,
+              "positionY": 30,
+              "positionZ": 0,
+              "extinction": 1.2,
+              "scatteringAlbedo": 0.72,
+              "asymmetry": 0.55,
+              "temperature": 1100,
+              "emissionScale": 1,
+              "waterPositionX": 30,
+              "waterPositionY": 30,
+              "waterPositionZ": 0.01,
+              "waterOffsetX": 0,
+              "waterOffsetY": 0,
+              "waterOffsetZ": 0
+            }
+          }
+        }
+      ]
+    },
+    "spectra": [
+      {
+        "name": "soil",
+        "label": "典型土壤",
+        "model": "BSM",
+        "reflectance": "0.20",
+        "transmittance": "0.0",
+        "refTir": 0.05,
+        "tauTir": 0,
+        "params": {
+          "SMC": 25,
+          "BSMBrightness": 0.5,
+          "BSMlat": 25,
+          "BSMlon": 45,
+          "Cab": null,
+          "Cw": null,
+          "Cdm": null,
+          "Cs": null,
+          "N": null
+        },
+        "fileName": "",
+        "physicalTexture": {
+          "enabled": true,
+          "fileName": "../inputs/8ceb9186d990b31f/concrete_variance.jpg",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "green_leaf",
+        "label": "健康绿叶",
+        "model": "Prospect",
+        "reflectance": "0.08",
+        "transmittance": "0.04",
+        "refTir": 0.03,
+        "tauTir": 0,
+        "params": {
+          "Cab": 40,
+          "Cw": 0.01,
+          "Cdm": 0.01,
+          "Cs": 0,
+          "N": 1.5
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "dry_leaf",
+        "label": "干燥叶片",
+        "model": "Prospect",
+        "reflectance": "0.16",
+        "transmittance": "0.08",
+        "refTir": 0.05,
+        "tauTir": 0,
+        "params": {
+          "Cab": 15,
+          "Cw": 0.003,
+          "Cdm": 0.02,
+          "Cs": 0,
+          "N": 1.8
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "maize_leaf",
+        "label": "玉米健康叶片",
+        "model": "Prospect",
+        "reflectance": "0.07",
+        "transmittance": "0.04",
+        "refTir": 0.025,
+        "tauTir": 0,
+        "params": {
+          "Cab": 48,
+          "Cw": 0.015,
+          "Cdm": 0.009,
+          "Cs": 0,
+          "N": 1.45
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "wheat_leaf",
+        "label": "小麦健康叶片",
+        "model": "Prospect",
+        "reflectance": "0.08",
+        "transmittance": "0.045",
+        "refTir": 0.03,
+        "tauTir": 0,
+        "params": {
+          "Cab": 42,
+          "Cw": 0.012,
+          "Cdm": 0.01,
+          "Cs": 0,
+          "N": 1.5
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "rice_leaf",
+        "label": "水稻健康叶片",
+        "model": "Prospect",
+        "reflectance": "0.075",
+        "transmittance": "0.045",
+        "refTir": 0.025,
+        "tauTir": 0,
+        "params": {
+          "Cab": 45,
+          "Cw": 0.014,
+          "Cdm": 0.009,
+          "Cs": 0,
+          "N": 1.5
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "senescent_crop_leaf",
+        "label": "衰老作物叶片",
+        "model": "Prospect",
+        "reflectance": "0.18",
+        "transmittance": "0.09",
+        "refTir": 0.045,
+        "tauTir": 0,
+        "params": {
+          "Cab": 8,
+          "Cw": 0.004,
+          "Cdm": 0.02,
+          "Cs": 0.2,
+          "N": 1.8
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "broadleaf_tree_leaf",
+        "label": "阔叶树叶片",
+        "model": "Prospect",
+        "reflectance": "0.07",
+        "transmittance": "0.04",
+        "refTir": 0.025,
+        "tauTir": 0,
+        "params": {
+          "Cab": 52,
+          "Cw": 0.016,
+          "Cdm": 0.012,
+          "Cs": 0,
+          "N": 1.55
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "conifer_needle",
+        "label": "针叶树针叶",
+        "model": "Prospect",
+        "reflectance": "0.09",
+        "transmittance": "0.025",
+        "refTir": 0.035,
+        "tauTir": 0,
+        "params": {
+          "Cab": 38,
+          "Cw": 0.011,
+          "Cdm": 0.016,
+          "Cs": 0,
+          "N": 1.75
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "tree_wood",
+        "label": "树干与树枝木质部",
+        "model": "custom",
+        "reflectance": "0.18",
+        "transmittance": "0.0",
+        "refTir": 0.06,
+        "tauTir": 0,
+        "params": {},
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "soil_dry_spectral",
+        "label": "干燥壤土光谱",
+        "model": "BSM",
+        "reflectance": "0.28",
+        "transmittance": "0.0",
+        "refTir": 0.07,
+        "tauTir": 0,
+        "params": {
+          "SMC": 8,
+          "BSMBrightness": 0.68,
+          "BSMlat": 25,
+          "BSMlon": 45
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "soil_wet_spectral",
+        "label": "湿润壤土光谱",
+        "model": "BSM",
+        "reflectance": "0.12",
+        "transmittance": "0.0",
+        "refTir": 0.035,
+        "tauTir": 0,
+        "params": {
+          "SMC": 38,
+          "BSMBrightness": 0.35,
+          "BSMlat": 25,
+          "BSMlon": 45
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "concrete",
+        "label": "混凝土",
+        "model": "custom",
+        "reflectance": "0.35",
+        "transmittance": "0.0",
+        "refTir": 0.08,
+        "tauTir": 0,
+        "previewTexture": {
+          "enabled": true,
+          "preset": "concrete",
+          "repeatSize": 2
+        },
+        "physicalTexture": {
+          "enabled": true,
+          "fileName": "../inputs/8ceb9186d990b31f/concrete_variance.jpg",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "params": {
+          "Cab": null,
+          "Cw": null,
+          "Cdm": null,
+          "Cs": null,
+          "N": null,
+          "SMC": null,
+          "BSMBrightness": null,
+          "BSMlat": null,
+          "BSMlon": null
+        },
+        "fileName": ""
+      },
+      {
+        "name": "asphalt",
+        "label": "沥青路面",
+        "model": "custom",
+        "reflectance": "0.12",
+        "transmittance": "0.0",
+        "refTir": 0.05,
+        "tauTir": 0,
+        "previewTexture": {
+          "enabled": true,
+          "preset": "gravel",
+          "repeatSize": 3
+        },
+        "physicalTexture": {
+          "enabled": true,
+          "fileName": "../inputs/8ceb9186d990b31f/concrete_variance.jpg",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "params": {
+          "Cab": null,
+          "Cw": null,
+          "Cdm": null,
+          "Cs": null,
+          "N": null,
+          "SMC": null,
+          "BSMBrightness": null,
+          "BSMlat": null,
+          "BSMlon": null
+        },
+        "fileName": ""
+      },
+      {
+        "name": "red_brick",
+        "label": "红砖墙面",
+        "model": "custom",
+        "reflectance": "0.28",
+        "transmittance": "0.0",
+        "refTir": 0.07,
+        "tauTir": 0,
+        "previewTexture": {
+          "enabled": true,
+          "preset": "red-brick",
+          "repeatSize": 1.2
+        },
+        "physicalTexture": {
+          "enabled": true,
+          "fileName": "../inputs/8ceb9186d990b31f/concrete_variance.jpg",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "params": {
+          "Cab": null,
+          "Cw": null,
+          "Cdm": null,
+          "Cs": null,
+          "N": null,
+          "SMC": null,
+          "BSMBrightness": null,
+          "BSMlat": null,
+          "BSMlon": null
+        },
+        "fileName": ""
+      },
+      {
+        "name": "human_surface",
+        "label": "人员典型光谱",
+        "model": "custom",
+        "reflectance": "0.30",
+        "transmittance": "0.0",
+        "refTir": 0.02,
+        "tauTir": 0,
+        "params": {},
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "vehicle_surface",
+        "label": "载具典型光谱",
+        "model": "custom",
+        "reflectance": "0.20",
+        "transmittance": "0.0",
+        "refTir": 0.08,
+        "tauTir": 0,
+        "previewTexture": {
+          "enabled": true,
+          "preset": "metal",
+          "repeatSize": 1.5
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "params": {}
+      },
+      {
+        "name": "ship_surface",
+        "label": "船舶典型光谱",
+        "model": "custom",
+        "reflectance": "0.22",
+        "transmittance": "0.0",
+        "refTir": 0.06,
+        "tauTir": 0,
+        "params": {},
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "water_surface",
+        "label": "水体光谱",
+        "model": "custom",
+        "reflectance": "0.04",
+        "transmittance": "0.0",
+        "refTir": 0.02,
+        "tauTir": 0,
+        "params": {},
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "fire_medium",
+        "label": "火焰介质",
+        "model": "custom",
+        "reflectance": "0.0",
+        "transmittance": "0.0",
+        "refTir": 0,
+        "tauTir": 0,
+        "params": {},
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "fog_medium",
+        "label": "雾介质",
+        "model": "custom",
+        "reflectance": "0.0",
+        "transmittance": "0.0",
+        "refTir": 0,
+        "tauTir": 0,
+        "params": {},
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "fog_3_fog_spectrum",
+        "label": "fog_3 · 雾介质",
+        "model": "custom",
+        "reflectance": "0",
+        "transmittance": "0",
+        "refTir": 0,
+        "tauTir": 0,
+        "params": {},
+        "previewTexture": {
+          "enabled": false,
+          "preset": "concrete",
+          "repeatSize": 2
+        },
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "roof_conventional",
+        "label": "普通屋面（灰色）",
+        "model": "custom",
+        "reflectance": "0.20",
+        "transmittance": "0.0",
+        "refTir": 0.08,
+        "tauTir": 0,
+        "params": {},
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": true,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      },
+      {
+        "name": "roof_cool",
+        "label": "冷屋面（白色反射涂层）",
+        "model": "custom",
+        "reflectance": "0.80",
+        "transmittance": "0.0",
+        "refTir": 0.1,
+        "tauTir": 0,
+        "params": {},
+        "physicalTexture": {
+          "enabled": false,
+          "fileName": "",
+          "strength": 0.2,
+          "repeatSize": 2
+        },
+        "previewTexture": {
+          "enabled": true,
+          "preset": "concrete",
+          "repeatSize": 2
+        }
+      }
+    ],
+    "canopies": [
+      {
+        "name": "canopy_default",
+        "label": "混沌介质（多孔透射）",
+        "structureType": "canopy",
+        "lai": 3,
+        "density": 1,
+        "hc": 2,
+        "G": 0.5,
+        "LIDFa": -0.35,
+        "LIDFb": -0.15,
+        "hspot": 0.2,
+        "leafwidth": 0.1,
+        "extinction": 0,
+        "scatteringAlbedo": 0,
+        "asymmetry": 0,
+        "emissionScale": 0,
+        "fixedTemperature": 0,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "tree_leaf_canopy",
+        "label": "树叶（多孔透射）",
+        "structureType": "canopy",
+        "lai": 3,
+        "density": 1,
+        "hc": 2,
+        "G": 0.5,
+        "LIDFa": -0.35,
+        "LIDFb": -0.15,
+        "hspot": 0.2,
+        "leafwidth": 0.08,
+        "extinction": 0,
+        "scatteringAlbedo": 0,
+        "asymmetry": 0,
+        "emissionScale": 0,
+        "fixedTemperature": 0,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "tree_branch_rigid",
+        "label": "树枝（刚性木质）",
+        "structureType": "rigid",
+        "lai": 0,
+        "density": 1,
+        "hc": 2,
+        "G": 0.5,
+        "LIDFa": 0,
+        "LIDFb": 0,
+        "hspot": 0,
+        "leafwidth": 0,
+        "extinction": 0,
+        "scatteringAlbedo": 0,
+        "asymmetry": 0,
+        "emissionScale": 0,
+        "fixedTemperature": 0,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "tree_trunk_rigid",
+        "label": "树干（刚性木质）",
+        "structureType": "rigid",
+        "lai": 0,
+        "density": 1,
+        "hc": 2,
+        "G": 0.5,
+        "LIDFa": 0,
+        "LIDFb": 0,
+        "hspot": 0,
+        "leafwidth": 0,
+        "extinction": 0,
+        "scatteringAlbedo": 0,
+        "asymmetry": 0,
+        "emissionScale": 0,
+        "fixedTemperature": 0,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "rigid_body",
+        "label": "刚体（仅轮廓不透光）",
+        "structureType": "rigid",
+        "lai": 0,
+        "density": 0,
+        "hc": 2,
+        "G": 0.5,
+        "LIDFa": -0.35,
+        "LIDFb": -0.15,
+        "hspot": 0,
+        "leafwidth": 0.1,
+        "extinction": 0,
+        "scatteringAlbedo": 0,
+        "asymmetry": 0,
+        "emissionScale": 0,
+        "fixedTemperature": 0,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "fire_medium",
+        "label": "火焰（参与介质）",
+        "structureType": "fire",
+        "lai": 0,
+        "density": 0,
+        "hc": 3,
+        "G": 0,
+        "LIDFa": 0,
+        "LIDFb": 0,
+        "hspot": 0,
+        "leafwidth": 0,
+        "extinction": 1.2,
+        "scatteringAlbedo": 0.72,
+        "asymmetry": 0.55,
+        "emissionScale": 1,
+        "fixedTemperature": 1100,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "fog_medium",
+        "label": "雾（参与介质）",
+        "structureType": "fog",
+        "lai": 0,
+        "density": 0,
+        "hc": 10,
+        "G": 0,
+        "LIDFa": 0,
+        "LIDFb": 0,
+        "hspot": 0,
+        "leafwidth": 0,
+        "extinction": 0.08,
+        "scatteringAlbedo": 0.95,
+        "asymmetry": 0.85,
+        "emissionScale": 1,
+        "fixedTemperature": 288
+      },
+      {
+        "name": "fog_3_fog_medium",
+        "label": "fog_3 · 雾",
+        "structureType": "fog",
+        "lai": 0,
+        "density": 0,
+        "hc": 100,
+        "G": 0,
+        "LIDFa": 0,
+        "LIDFb": 0,
+        "hspot": 0,
+        "leafwidth": 0,
+        "extinction": 0.08,
+        "scatteringAlbedo": 0.95,
+        "asymmetry": 0.85,
+        "emissionScale": 1,
+        "fixedTemperature": 288
+      }
+    ],
+    "thermals": [
+      {
+        "name": "soil_temperature",
+        "label": "土壤温度",
+        "sunlitTemperature": 305,
+        "shadedTemperature": 295,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "vegetation_temperature",
+        "label": "植被温度",
+        "sunlitTemperature": 300,
+        "shadedTemperature": 296,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "tree_wood_temperature",
+        "label": "树干与树枝温度",
+        "sunlitTemperature": 303,
+        "shadedTemperature": 297,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "building_temperature",
+        "label": "建筑表面温度",
+        "sunlitTemperature": 310,
+        "shadedTemperature": 300,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "human_temperature",
+        "label": "人员表面温度",
+        "sunlitTemperature": 310,
+        "shadedTemperature": 307,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "vehicle_temperature",
+        "label": "载具表面温度",
+        "sunlitTemperature": 315,
+        "shadedTemperature": 305,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "ship_temperature",
+        "label": "船舶表面温度",
+        "sunlitTemperature": 313,
+        "shadedTemperature": 303,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "water_temperature",
+        "label": "水体初始温度",
+        "sunlitTemperature": 295,
+        "shadedTemperature": 295,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "fire_temperature",
+        "label": "火焰固定温度",
+        "sunlitTemperature": 1100,
+        "shadedTemperature": 1100,
+        "params": {},
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "fog_temperature",
+        "label": "雾介质温度",
+        "sunlitTemperature": 288,
+        "shadedTemperature": 288
+      },
+      {
+        "name": "fog_3_fog_temperature",
+        "label": "fog_3 · 固定温度",
+        "sunlitTemperature": 288,
+        "shadedTemperature": 288
+      }
+    ],
+    "materials": [
+      {
+        "name": "leaf_c3",
+        "label": "C3 植被",
+        "type": "Vegetation",
+        "params": {
+          "Vcmax": 80,
+          "m": 9,
+          "BallBerry": 0.01,
+          "Type": 3,
+          "kV": 0.6396,
+          "Rdparam": 0.015,
+          "Tparam": "0.2,0.3,288,313,328",
+          "Tyear": 25,
+          "beta": 0.507,
+          "kNPQs": 0,
+          "qLs": 1,
+          "stressfactor": 1,
+          "Tcor": 0
+        },
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "leaf_c4",
+        "label": "C4 植被",
+        "type": "Vegetation",
+        "params": {
+          "Vcmax": 60,
+          "m": 4,
+          "BallBerry": 0.01,
+          "Type": 4,
+          "kV": 0.7,
+          "Rdparam": 0.012,
+          "Tparam": "0.2,0.3,288,313,328",
+          "Tyear": 25,
+          "beta": 0.507,
+          "kNPQs": 0,
+          "qLs": 1,
+          "stressfactor": 1,
+          "Tcor": 0
+        },
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "tree_branch_wood",
+        "label": "树枝木质部",
+        "type": "Vegetation",
+        "energyModel": "wood",
+        "params": {
+          "method": 1,
+          "rss": 1000000000,
+          "cs": 1700,
+          "rhos": 550,
+          "lambdas": 0.14,
+          "Tsoil": 25,
+          "SMC": 0,
+          "Satwater": 0,
+          "convectiveScale": 1.5
+        },
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "tree_trunk_wood",
+        "label": "树干木质部",
+        "type": "Vegetation",
+        "energyModel": "wood",
+        "params": {
+          "method": 1,
+          "rss": 1000000000,
+          "cs": 1700,
+          "rhos": 650,
+          "lambdas": 0.16,
+          "Tsoil": 25,
+          "SMC": 0,
+          "Satwater": 0,
+          "convectiveScale": 1.2
+        },
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "soilset",
+        "label": "典型壤土",
+        "type": "Soil",
+        "params": {
+          "method": 2,
+          "rss": 2000,
+          "cs": 1180,
+          "rhos": 1800,
+          "lambdas": 1.55,
+          "Tsoil": 25,
+          "SMC": 25,
+          "Satwater": 0.45
+        },
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "soil_dry",
+        "label": "干燥土壤",
+        "type": "Soil",
+        "params": {
+          "method": 2,
+          "rss": 4000,
+          "cs": 1000,
+          "rhos": 1600,
+          "lambdas": 0.8,
+          "Tsoil": 30,
+          "SMC": 10,
+          "Satwater": 0.38
+        },
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "soil_wet",
+        "label": "湿润土壤",
+        "type": "Soil",
+        "params": {
+          "method": 2,
+          "rss": 800,
+          "cs": 1400,
+          "rhos": 1900,
+          "lambdas": 2,
+          "Tsoil": 22,
+          "SMC": 35,
+          "Satwater": 0.5
+        },
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "ship_material",
+        "label": "船舶表面物化",
+        "type": "Ship",
+        "params": {
+          "method": 1,
+          "rss": 4000,
+          "cs": 900,
+          "rhos": 2700,
+          "lambdas": 10,
+          "Tsoil": 30,
+          "SMC": 0,
+          "Satwater": 0
+        },
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "water_set",
+        "label": "水体物化参数",
+        "type": "Water",
+        "params": {
+          "rss": 0,
+          "heatCapacity": 4186000,
+          "mixingDepth": 0.5,
+          "evaporationCoefficient": 1,
+          "brdfModel": 1,
+          "refractiveIndex": 1.333,
+          "slopeVariance": 0,
+          "diffuseFraction": 0.02
+        },
+        "physicalTexture": {},
+        "previewTexture": {}
+      },
+      {
+        "name": "building_envelope",
+        "label": "建筑围护结构（混凝土）",
+        "type": "Building",
+        "params": {
+          "method": 2,
+          "rss": 1000000000.0,
+          "cs": 880,
+          "rhos": 2300,
+          "lambdas": 1.4,
+          "Tsoil": 26,
+          "SMC": 0,
+          "Satwater": 0
+        }
+      },
+      {
+        "name": "pavement",
+        "label": "沥青硬化地面",
+        "type": "Soil",
+        "params": {
+          "method": 2,
+          "rss": 1000000000.0,
+          "cs": 920,
+          "rhos": 2100,
+          "lambdas": 0.75,
+          "Tsoil": 26,
+          "SMC": 1,
+          "Satwater": 0.3
+        }
+      }
+    ],
+    "meteo": {
+      "path": "../inputs/28d1ca9194da89d1/era5_beijing_20190815_local.txt",
+      "start": 0,
+      "end": 49,
+      "z": 15,
+      "Tsold": 299.15,
+      "SatWater": 0.45,
+      "dTime": 3600,
+      "Ca": 410,
+      "latitude": 39.99,
+      "longitude": 116.38,
+      "year": 2019,
+      "timezone": 8
+    },
+    "atmosphere": {
+      "enabled": false,
+      "model": "midlatitude-summer",
+      "waterVapor": 2,
+      "aerosol": "rural",
+      "visibility": 23,
+      "lutFile": "../inputs/104299b5b4472e2a/simple_modtran_lut.csv"
+    }
+  },
+  "voxelization": {
+    "sourceMode": "eRaytracing",
+    "targetMode": "eVoxelRT",
+    "voxelSize": 10,
+    "updatedAt": "2026-09-08T15:22:29.791Z"
+  }
+}
