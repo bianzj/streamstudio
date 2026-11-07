@@ -3503,8 +3503,8 @@
       "sha256": "3d470d07519eadcf715776b00503daf0b703363805e591a53a63c96f64d2bd34"
     },
     "docs/cases/005-photovoltaic/promotion-manifest.json": {
-      "bytes": 12616,
-      "sha256": "3c11dfd9a4c1cc503962a87524a49aecd4efae410bdc3952bcf7eab83bdc07e1"
+      "bytes": 12617,
+      "sha256": "7df8f614b3183a7fa6bbfb8165b16afe0996f6d46a42614d1fc38bb34c244c75"
     },
     "docs/cases/005-photovoltaic/README.md": {
       "bytes": 732,
@@ -3515,8 +3515,8 @@
       "sha256": "21817bb3346d0e4be0da4d73bb963610d45b5c22a822cf32a34f031244c19bd9"
     },
     "docs/cases/005-photovoltaic/report.pdf": {
-      "bytes": 968582,
-      "sha256": "4808709cf9cb93afe485b4ccad087483c15807bf5e9733d065f73a9ab097d9c0"
+      "bytes": 1150237,
+      "sha256": "3ab943dc59267d92839ecc8c1e0a7e1adfc21de53cc5c616ede4664858e8fa31"
     },
     "docs/cases/005-photovoltaic/assets/case005.css": {
       "bytes": 11419,
@@ -3787,8 +3787,8 @@
       "sha256": "21876edc077dc1f91e28e15a92e235a1e7fa6a2282d616c10f73d9c93516a8d8"
     },
     "docs/cases/005-photovoltaic/promotion/page-1.png": {
-      "bytes": 371013,
-      "sha256": "454ca5c36048ac19edd75fcb64e435a313274e4f3ce1e854a83d77520904390c"
+      "bytes": 320882,
+      "sha256": "c21e6005068291f4917d92b67af97b7e79c2430c35103f431eb9cc0ce3321dcc"
     },
     "docs/cases/005-photovoltaic/promotion/page-2.png": {
       "bytes": 186833,
