@@ -1,16 +1,14 @@
 # 案例005：光伏草场热环境
 
-用4张图介绍：草场对照、板温日变化、热辐射方向性及StreamStudio展示。
+用3张图介绍：StreamStudio光伏草场宣传封面、草场温度对照与热辐射方向性。
 
-[4页PDF](report.pdf) · [小红书文案](小红书文案.md) · [知乎文章](知乎文章.md) · [参考文献](references-and-downloads.md)
+[3页PDF](report.pdf) · [小红书文案](小红书文案.md) · [知乎文章](知乎文章.md) · [参考文献](references-and-downloads.md)
 
 ![场景与主要结果](promotion/page-1.png)
 
 ![空间与日变化](promotion/page-2.png)
 
 ![热辐射方向性](promotion/page-3.png)
-
-![软件展示与参考文献](promotion/page-4.png)
 
 基础温度与方向性采用1 m草叶网格；空间图独立补算0.25 m网格，二者分别标明。理想化数值教学案例，未完成独立实测验证；草叶温差不代表气温或区域热岛变化。
 

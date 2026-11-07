@@ -8,7 +8,7 @@
 | 002 | [雨林分层光热](002-rainforest/README.md) | 4 |
 | 003 | [城市街区热环境](003-urban/README.md) | 5 |
 | 004 | [延庆山地光热与风场](004-yanqing/README.md) | 5 |
-| 005 | [光伏草场热环境](005-photovoltaic/README.md) | 4张融合推广图 |
+| 005 | [光伏草场热环境](005-photovoltaic/README.md) | 3张融合推广图 |
 
 [工程与输入目录](../../examples/research-cases) · [程序下载](https://github.com/bianzj/streamstudio/releases/tag/v2.0.1)
 

@@ -104,11 +104,11 @@
     },
     "docs/cases/catalog.json": {
       "bytes": 3515,
-      "sha256": "be3981814f17cc47afa1c41224e55b6cff111b57a59f27270894196bf5e313c2"
+      "sha256": "9c758ae9b8e69360bbd74f7d3d168551c23e9afe0f71da8bfc983a3f095b877c"
     },
     "docs/cases/README.md": {
       "bytes": 1018,
-      "sha256": "635ab7db4c28bd7776cd53ee4d3aae9fad19034a15307f2e81a7d435d55444e2"
+      "sha256": "0acbbf010df9988ce22f5c35e7b63f8146c3758787f0d468a6581ba9de6d68c1"
     },
     "docs/cases/001-maize/README.md": {
       "bytes": 1630,
@@ -3499,24 +3499,24 @@
       "sha256": "ff84e75e1e7ee898498035888acd2327133853ca15d08c7991cc0fd69d9c70b1"
     },
     "docs/cases/005-photovoltaic/index.html": {
-      "bytes": 2698,
-      "sha256": "6d87442db4937601d5443baffd46ccf74450ddce93c16e5928100cd822ae4702"
+      "bytes": 2334,
+      "sha256": "95cc9d28293db9986d9b1554b5684e18ee0152753172b94946bdef6aaad19980"
     },
     "docs/cases/005-photovoltaic/promotion-manifest.json": {
-      "bytes": 12780,
-      "sha256": "de000bd3dec295be2ae3b519d312889bf1ee2184bbf73c1a65044a351e487534"
+      "bytes": 12617,
+      "sha256": "d7327b89f5f93a0beecbeb720a7423b3a46ebb771ee18e6a9a96204f542aa501"
     },
     "docs/cases/005-photovoltaic/README.md": {
-      "bytes": 1035,
-      "sha256": "8608c93cf68f9cdbe3ed3012c6159aa0e9a8f5e855259fd64c6d9f9dc41c0709"
+      "bytes": 985,
+      "sha256": "2afa1407abb56344d6bc7c149439b7b84aaf479a2858cab68928cbc9fad0caeb"
     },
     "docs/cases/005-photovoltaic/references-and-downloads.md": {
       "bytes": 2477,
       "sha256": "21817bb3346d0e4be0da4d73bb963610d45b5c22a822cf32a34f031244c19bd9"
     },
     "docs/cases/005-photovoltaic/report.pdf": {
-      "bytes": 998464,
-      "sha256": "cad7cd6b3c04ab374a6c52e8874eb225d0e9e27fa9278409cceabf8ceaedab13"
+      "bytes": 970396,
+      "sha256": "46c3139442524a989e2ce51af7130fb1b61ea2614f446b37814bac1f4fd96696"
     },
     "docs/cases/005-photovoltaic/assets/case005.css": {
       "bytes": 11419,
@@ -3780,27 +3780,23 @@
     },
     "docs/cases/005-photovoltaic/小红书文案.md": {
       "bytes": 1232,
-      "sha256": "6117b196e4bae66d8f473ef2e6dc701f93005b7bb1c6790b264eaa8ba1343e4a"
+      "sha256": "4d6fd079dc4829bf9f0d5ba5096e58964996078aadae37a91600779e18bfa3cc"
     },
     "docs/cases/005-photovoltaic/知乎文章.md": {
-      "bytes": 4110,
-      "sha256": "593d881eb512d0776a39050f27820bf1d067d802b0a75f73b6386db6a418ef46"
+      "bytes": 4054,
+      "sha256": "9149db9a191c5647179db1711fdbac9896a7c48fdcc554eeac25286fc9edb111"
     },
     "docs/cases/005-photovoltaic/promotion/page-1.png": {
-      "bytes": 375578,
-      "sha256": "a5e125204f29ccc1b959ea8ccd3cf1a9088005c5c28d4e1b6eab6652adb2c1bd"
+      "bytes": 393157,
+      "sha256": "4531b6f7217ed3bdbb849f2c919c86a4bbed693b90649637efc308ea111efb72"
     },
     "docs/cases/005-photovoltaic/promotion/page-2.png": {
-      "bytes": 208852,
-      "sha256": "4c9259aad7f200a34c1a51451be07a030900729661840749f7a236deba3874be"
+      "bytes": 208922,
+      "sha256": "3811ff7ed90bbd0a0b73b2052ade0766a7e14646ec596478399457076e34c089"
     },
     "docs/cases/005-photovoltaic/promotion/page-3.png": {
-      "bytes": 211525,
-      "sha256": "8f8c5dcd0ce7808b6bc0408f496d212a7579c418f02b215cdde65474abc9e0cd"
-    },
-    "docs/cases/005-photovoltaic/promotion/page-4.png": {
-      "bytes": 349132,
-      "sha256": "545b0939d78d8fee9f56fe32deb183992d2eec1aad03d1005270dc58e6d63ad0"
+      "bytes": 237645,
+      "sha256": "65b973bc49df8807e909f40651f0e481522799238ca8ed3156af3c22625df602"
     }
   }
 }
