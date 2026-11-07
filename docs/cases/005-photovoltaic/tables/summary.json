@@ -1,0 +1,17 @@
+{
+  "noon": {
+    "hour": 12,
+    "grass_open_C": 37.59796142578125,
+    "grass_pv_C": 35.22509765625,
+    "grass_under_footprint_C": 29.935821533203125,
+    "grass_interrow_C": 37.452178955078125,
+    "panel_C": 46.207493017317404,
+    "grass_difference_K": -2.37286376953125
+  },
+  "peak_panel_C": 46.207493017317404,
+  "peak_panel_hour": 12,
+  "noon_directional_range_K": 5.649131213696876,
+  "max_daytime_grass_cooling_K": 2.37286376953125,
+  "second_day_dc_energy_kWh": 117.06199999999998,
+  "independent_field_validation": false
+}

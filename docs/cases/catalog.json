@@ -58,6 +58,24 @@
         "examples/research-cases/004-yanqing/fluid.json",
         "examples/research-cases/004-yanqing/display.json"
       ]
+    },
+    {
+      "id": "005",
+      "title": "光伏草场热环境",
+      "page": "005-photovoltaic/README.md",
+      "figures": 4,
+      "report": "005-photovoltaic/report.pdf",
+      "interactive_page": "005-photovoltaic/index.html",
+      "scope": "promotional_materials_only",
+      "limitations": "理想化草场配对模拟。基础温度与方向性使用1 m网格，空间图独立补算0.25 m网格；没有气温响应或产草量求解，未进行独立实测验证。",
+      "model_rerun": false,
+      "projects": [],
+      "report_pages": 4,
+      "promotion_platforms": [
+        "xiaohongshu",
+        "zhihu",
+        "github"
+      ]
     }
   ]
 }
