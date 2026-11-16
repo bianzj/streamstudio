@@ -1,0 +1,46 @@
+{
+  "status": "passed",
+  "checkedAtUtc": "2026-11-09T10:07:57.344493+00:00",
+  "scope": "design artifacts and source preservation only",
+  "existingSourceReferencesChecked": 23,
+  "markdownLinksChecked": 3,
+  "protectedSourceHashesUnchanged": 6,
+  "proposedPaths": 10,
+  "capabilityGroups": 7,
+  "errors": [],
+  "preexistingGitStatusPreserved": true,
+  "addedGitStatus": [
+    "?? docs/superpowers/plans/2026-11-09-simulation-code-consolidation.md",
+    "?? docs/superpowers/specs/"
+  ],
+  "runtimeModulesImplemented": false,
+  "builds": "not run",
+  "modelTests": "not run",
+  "simulations": "not run",
+  "protectedSources": [
+    {
+      "Path": "C:\\work\\streamstudio\\models\\histream\\src\\animation\\scene_animation.cpp",
+      "Hash": "9E28BD918088FDE053F9223921EB0754123BEB1B800D0C7951174A76436D8FE8"
+    },
+    {
+      "Path": "C:\\work\\streamstudio\\models\\histream\\src\\animation\\render\\mesh_sequence.cpp",
+      "Hash": "EF78112D315F5DC7B6CA60C14517A1C003A133B3FFBC5ED3225FE7D768D68496"
+    },
+    {
+      "Path": "C:\\work\\streamstudio\\models\\histream\\src\\animation\\observation\\camera_observation.cpp",
+      "Hash": "68DE801AAD3CC394E2775AF4E8D467B989F5215174570E4BAFC48545CA9BF7D3"
+    },
+    {
+      "Path": "C:\\work\\streamstudio\\models\\histream\\cmake\\scene-animation.cmake",
+      "Hash": "CB73C992E8C4A3F4A635F6C16BD72B8E8AF534AFF887AC51FC266CC17A2829D8"
+    },
+    {
+      "Path": "C:\\cases\\StreamStudio\\game_thermal_original_scene_v4_20261109\\generic_thermal.py",
+      "Hash": "9D555D4BD188F5DEBB4BCAF0DA42A59129C3587B065BCE393C16F8A88A434A34"
+    },
+    {
+      "Path": "C:\\cases\\StreamStudio\\game_thermal_original_scene_v4_20261109\\apply_to_original.py",
+      "Hash": "D291C570B1FC640A58BA5FDCB646C1A2CE2196F73021DC0A596375E45D773DD5"
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "kind": "native-faceteb-input-receipt",
+  "schemaVersion": 1,
+  "status": "completed",
+  "startedUtc": "2026-11-08T03:18:17.445729+00:00",
+  "engine": "C:\\work\\streamstudio\\build\\histream-core\\runtime\\Release\\histream.exe",
+  "engineSha256": "92c4ffca190a2f2f24a4f881684f1989f2dcb35c066140244e5a8e180012f3a3",
+  "inputs": {
+    "project": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\project.json",
+      "sha256": "bdfaa81fbfdf35aa84427222f8d1535ece1e4b540aa5eca9c38c0182214ff5b1"
+    },
+    "forcing": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\meteorology.txt",
+      "sha256": "10063dff026bfc5e0cfa2e19e6e06bf5c9e98ee1275df40ad614ef0040d0813d"
+    },
+    "history": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\forcing-and-history.json",
+      "sha256": "155051fe89156674dfc02f1cfd3f4b4afd46ace93ce80ca821e3014c6bb2e596"
+    },
+    "mapping": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\mesh-mapping.json",
+      "sha256": "fdbbf9404e4b63574485a4b38fc4bfd64483d083fb5a4f2f69ea618eed40282d"
+    },
+    "mappingData": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\mesh-mapping.bin",
+      "sha256": "6116d8407ddc980ae5a8c78ff799694982da8cf8394902d98e0a355e55bd1470"
+    },
+    "model": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\models\\world.obj",
+      "sha256": "54c03f8a7a53bb2b588a3bd6c9218a5aff7c95d193fc055a03ace689e987c1f7"
+    },
+    "placements": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\positions\\origin.txt",
+      "sha256": "941154d2cda32aab85e4892f9036c91cacf82bf9b6cc8be110e5e891a0ecebd6"
+    },
+    "sourceScene": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\mesh_scene_20261108\\assets-final\\street-block.json",
+      "sha256": "0f87e2bdd2d1f9fe4188ccdfaaa019bbcd163b8dcac38e87fb396e9029e5db63"
+    },
+    "asset_office": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\mesh_scene_20261108\\assets-final\\office.obj",
+      "sha256": "e2c3f66f4896ea630aa104af86aee131d804d3671da0617d39a34060b87b39bc"
+    },
+    "asset_neighbor": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\mesh_scene_20261108\\assets-final\\neighbor.obj",
+      "sha256": "adfed68dc5f3ace383ac15887c4852dfd8f27993bb6d4d833e985e49a89355c5"
+    },
+    "asset_ground": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\mesh_scene_20261108\\assets-final\\ground.obj",
+      "sha256": "3bdb2e9d7bfdb168d236127ee2421c226630b21aa706f11ea655ba0138f86189"
+    },
+    "preparation": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\preparation-receipt.json",
+      "sha256": "56d67a7e18aa45286b1a6ced202993e093c1a0aa7d410bad99a43619784f9311"
+    }
+  },
+  "environment": {
+    "HISTREAM_FACET_RASTER_LAYERS": "256"
+  },
+  "returncode": 0,
+  "finishedUtc": "2026-11-08T03:20:08.047822+00:00",
+  "inputsUnchanged": true
+}

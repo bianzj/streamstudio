@@ -2,6 +2,7 @@
 #include "../base/projectjson.h"
 #include "facetrt_vulkan.h"
 #include "leafbiochemistry.h"
+#include "lumpedthermal.h"
 #include "energyphysics.h"
 #include "../base/compo.h"
 #include "../base/soil_tir_emissivity.h"
@@ -141,6 +142,10 @@ struct SurfaceParameters {
     float thermalConductivity{1.55f};
     float soilMoisture{0.25f};
     float heatCapacityPerArea{60000.0f};
+    std::string lumpedGroup;
+    facetphysics::LumpedThermalParameters lumped;
+    double lumpedWeight{1};
+    double lumpedMaxSurfaceK{500};
     int soilTemperatureMethod{1};
     std::vector<float> energyReflectance;
     std::vector<float> energyTransmittance;
@@ -2513,11 +2518,49 @@ std::string facetInputView(const std::string& path)
                 << "<kNPQs>" << ProjectJson::number(p,"kNPQs",0) << "</kNPQs>"
                 << "<Tparam>" << xmlEscaped(tparam) << "</Tparam>";
         }
+        if (p.contains("lumpedThermal")) {
+            const auto& h=p.at("lumpedThermal");
+            facetphysics::LumpedThermalParameters checked{
+                h.at("capacityJPerK").get<double>(),h.at("conductanceWPerK").get<double>(),
+                h.value("airConductanceWPerK",0.),h.value("powerW",0.),
+                h.value("startSeconds",0.),h.at("stopSeconds").get<double>(),h.value("initialK",298.15)};
+            checked.validate();
+            const auto group=h.at("group").get<std::string>();
+            const double weight=h.value("weight",1.);
+            const double maxSurfaceK=h.value("maxSurfaceK",500.);
+            if(group.empty() || !std::isfinite(weight) || weight<0 || weight>1)
+                throw std::runtime_error("Invalid lumped thermal group/weight");
+            if(!std::isfinite(maxSurfaceK) || maxSurfaceK<checked.initialK || maxSurfaceK>1500)
+                throw std::runtime_error("Invalid lumped thermal surface-temperature range");
+            xml << "<lumpedThermalGroup>" << xmlEscaped(group) << "</lumpedThermalGroup>"
+                << "<lumpedCapacity>" << checked.capacityJPerK << "</lumpedCapacity>"
+                << "<lumpedConductance>" << checked.conductanceWPerK << "</lumpedConductance>"
+                << "<lumpedAirConductance>" << checked.airConductanceWPerK << "</lumpedAirConductance>"
+                << "<lumpedPower>" << checked.powerW << "</lumpedPower>"
+                << "<lumpedStart>" << checked.startSeconds << "</lumpedStart>"
+                << "<lumpedStop>" << checked.stopSeconds << "</lumpedStop>"
+                << "<lumpedInitialK>" << checked.initialK << "</lumpedInitialK>"
+                << "<lumpedWeight>" << weight << "</lumpedWeight>";
+            xml << "<lumpedMaxSurfaceK>" << maxSurfaceK << "</lumpedMaxSurfaceK>";
+        }
         xml << "</surfaceEnergy>";
     }
     for (const auto& item : project.canopies())
         xml << "<canopyAero name=\"" << xmlEscaped(ProjectJson::string(item, "name")) << "\"><leafwidth>"
             << ProjectJson::number(item, "leafwidth", 0.1f) << "</leafwidth></canopyAero>";
+    if(meteo.contains("timeStepSeconds")) {
+        const auto& widths=meteo.at("timeStepSeconds");
+        if(!widths.is_array() || widths.size()!=size_t(ProjectJson::integer(meteo,"end",1)))
+            throw std::runtime_error("timeStepSeconds must contain every requested node");
+        xml << "<nodeTimeStepsSeconds>";
+        for(const auto& v:widths) {
+            double step=v.get<double>();
+            if(!std::isfinite(step) || step<1 || step>86400)
+                throw std::runtime_error("Invalid timeStepSeconds value");
+            xml << step << ' ';
+        }
+        xml << "</nodeTimeStepsSeconds>";
+    }
     xml << "</Biochemistry></Attribute><Meteorology>"
         << "<filePath>" << xmlEscaped(project.meteorologyPath().string()) << "</filePath>"
         << "<referenceHeight>" << ProjectJson::number(meteo, "z", 10) << "</referenceHeight>"
@@ -3484,6 +3527,19 @@ Scene loadProjectScene(const std::string& inputFile)
                 material.pvBifaciality=xmlFloat(physical,"bifaciality",0);
                 material.heatCapacityPerArea=xmlFloat(physical,"heatCapacityPerArea",60000);
                 material.convectiveScale=xmlFloat(physical,"convectiveScale",1);
+                material.lumpedGroup=trim(firstXmlTag(physical,"lumpedThermalGroup"));
+                if(!material.lumpedGroup.empty()) {
+                    material.lumped={xmlFloat(physical,"lumpedCapacity",0),xmlFloat(physical,"lumpedConductance",0),
+                        xmlFloat(physical,"lumpedAirConductance",0),xmlFloat(physical,"lumpedPower",0),
+                        xmlFloat(physical,"lumpedStart",0),xmlFloat(physical,"lumpedStop",0),xmlFloat(physical,"lumpedInitialK",298.15f)};
+                    material.lumped.validate();
+                    material.lumpedWeight=xmlFloat(physical,"lumpedWeight",1);
+                    material.lumpedMaxSurfaceK=xmlFloat(physical,"lumpedMaxSurfaceK",500);
+                    if(material.vegetation || material.photovoltaic || !std::isfinite(material.lumpedWeight) ||
+                       material.lumpedWeight<0 || material.lumpedWeight>1 || !std::isfinite(material.lumpedMaxSurfaceK) ||
+                       material.lumpedMaxSurfaceK<material.lumped.initialK || material.lumpedMaxSurfaceK>1500)
+                        throw std::runtime_error("Lumped thermal group requires finite solid-material weights");
+                }
                 if(material.vegetation) {
                     LeafBiochemistry& leaf=material.leaf;
                     leaf.vcmax25=std::max(0.0f,xmlFloat(physical,"Vcmax",leaf.vcmax25));
@@ -3754,6 +3810,16 @@ try {
     const int endNode = std::max(startNode + 1, static_cast<int>(
         std::lround(xmlFloat(xml, "endTimeNode", static_cast<float>(startNode + 1)))));
     const float dTime = std::max(1.0f, xmlFloat(xml, "dTime", 1800.0f));
+    std::vector<float> nodeTimeSteps;
+    const auto variableSteps=firstXmlTag(xml,"nodeTimeStepsSeconds");
+    if(!variableSteps.empty()) {
+        std::istringstream values(variableSteps);double step;
+        while(values>>step) {
+            if(!std::isfinite(step) || step<1 || step>86400)throw std::runtime_error("Invalid native node time step");
+            nodeTimeSteps.push_back(float(step));
+        }
+        if(!values.eof() || nodeTimeSteps.size()!=size_t(endNode))throw std::runtime_error("Native node time-step count mismatch");
+    }
     bool saveRadiationProcess = trim(firstXmlTag(xml, "isRadiationProcess")) == "1";
     bool saveEnergyProcess = trim(firstXmlTag(xml, "isEnergyProcess")) == "1";
     if (!saveRadiationProcess && !saveEnergyProcess &&
@@ -3977,7 +4043,10 @@ try {
     };
 
     const char* energyBackend = std::getenv("HISTREAM_FACET_ENERGY_BACKEND");
-    const bool cpuEnergyRequested = energyBackend && std::string(energyBackend) == "cpu";
+    const bool hasLumpedThermal=std::any_of(scene.materials.begin(),scene.materials.end(),
+        [](const SurfaceParameters& s){return !s.lumpedGroup.empty();});
+    if(hasLumpedThermal && startNode!=0)throw std::runtime_error("Lumped thermal runs must restore history from node zero");
+    const bool cpuEnergyRequested = (energyBackend && std::string(energyBackend) == "cpu") || hasLumpedThermal;
     const bool gpuEnergy = !useCpuBackend && !cpuEnergyRequested && model.supportsGpuEnergy();
     const char* verifyEnergy = std::getenv("HISTREAM_FACET_VALIDATE_ENERGY");
     const bool shadowEnergy = gpuEnergy && verifyEnergy && std::string(verifyEnergy) == "1";
@@ -4063,6 +4132,43 @@ try {
     std::vector<double> columnInverseL(columns.size(), 0.0);
     std::vector<double> facetAreas(scene.facetCount());
     for (uint32_t f = 0; f < scene.facetCount(); ++f) facetAreas[f] = facetArea(scene, f);
+    struct LumpedBody {
+        std::string id;facetphysics::LumpedThermalParameters p;
+        double weightedArea{},temperatureK{};facetphysics::LumpedThermalStep step;
+    };
+    std::vector<LumpedBody> lumpedBodies;
+    std::unordered_map<std::string,size_t> lumpedIds;
+    std::vector<int> lumpedFacet(scene.facetCount(),-1);
+    std::vector<double> lumpedConductanceDensity(scene.facetCount(),0);
+    for(uint32_t f=0;f<scene.facetCount();++f) {
+        const auto& s=surfaceForFacet(scene,f);
+        if(s.lumpedGroup.empty())continue;
+        if(f>=scene.leafFacetCount)throw std::runtime_error("Lumped thermal surface must be an explicit solid instance");
+        auto found=lumpedIds.find(s.lumpedGroup);
+        if(found==lumpedIds.end()) {
+            found=lumpedIds.emplace(s.lumpedGroup,lumpedBodies.size()).first;
+            lumpedBodies.push_back({s.lumpedGroup,s.lumped,0,s.lumped.initialK,{}});
+        }
+        const size_t index=found->second;auto& body=lumpedBodies[index];
+        const auto& a=body.p;const auto& b=s.lumped;
+        if(a.capacityJPerK!=b.capacityJPerK || a.conductanceWPerK!=b.conductanceWPerK ||
+           a.airConductanceWPerK!=b.airConductanceWPerK || a.powerW!=b.powerW ||
+           a.startSeconds!=b.startSeconds || a.stopSeconds!=b.stopSeconds || a.initialK!=b.initialK)
+            throw std::runtime_error("Inconsistent parameters in lumped group: "+body.id);
+        lumpedFacet[f]=int(index);body.weightedArea+=facetAreas[f]*s.lumpedWeight;
+    }
+    runIndex.value["lumpedThermalBodies"]=ProjectJson::Json::array();
+    for(const auto& b:lumpedBodies) {
+        if(!(b.weightedArea>0))throw std::runtime_error("Lumped group has no conductive area: "+b.id);
+        runIndex.value["lumpedThermalBodies"].push_back({{"id",b.id},{"capacity_J_K",b.p.capacityJPerK},
+            {"conductance_W_K",b.p.conductanceWPerK},{"weightedArea_m2",b.weightedArea}});
+    }
+    for(uint32_t f=0;f<scene.facetCount();++f)if(lumpedFacet[f]>=0) {
+        const auto& b=lumpedBodies[size_t(lumpedFacet[f])];
+        lumpedConductanceDensity[f]=b.p.conductanceWPerK*surfaceForFacet(scene,f).lumpedWeight/b.weightedArea;
+    }
+    if(hasLumpedThermal)runIndex.value["execution"]["lumpedThermal"]="CPU implicit internal nodes + surface EB; GPU coupled radiation";
+    runIndex.write();
     const size_t firstGroundSide = static_cast<size_t>(scene.leafFacetCount) * 2U;
     const size_t groundSides = surfaceCount - firstGroundSide;
     std::array<std::vector<facetphysics::SoilProfile>, 2> soilProfiles{
@@ -4140,7 +4246,13 @@ try {
         if (!geometry) throw std::runtime_error("FacetEB cannot write shared geometry");
     }
     const auto totalBegin = Clock::now();
+    double lumpedElapsedSeconds=0;
     for (int node = startNode; node < endNode; ++node) {
+        const float dTime=nodeTimeSteps.empty()?std::max(1.0f,xmlFloat(xml,"dTime",1800.0f)):nodeTimeSteps[size_t(node)];
+        const double lumpedPreviousSeconds=lumpedElapsedSeconds;
+        lumpedElapsedSeconds+=dTime;
+        std::vector<double> previousLumpedK;
+        for(const auto& b:lumpedBodies)previousLumpedK.push_back(b.temperatureK);
         const MeteoStep& meteo = meteorology[static_cast<size_t>(node)];
         updateSolarPosition(meteo);
         const std::string token = timeToken(meteo.julianTime);
@@ -4346,18 +4458,19 @@ try {
 
         struct StateFluxes {
             std::vector<float> net, sensible, sensibleSlope, latent, latentSlope,
-                storage, storageSlope, photovoltaic, photovoltaicSlope, temperatureStep, stomatalMismatch;
+                storage, storageSlope, photovoltaic, photovoltaicSlope, temperatureStep, stomatalMismatch,internal,internalSlope;
         };
         const auto makeStateFluxes = [&]() {
             const std::vector<float> zero(surfaceCount, 0.0f);
-            return StateFluxes{zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero};
+            return StateFluxes{zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,zero,zero};
         };
         std::array<StateFluxes, 2> stateFlux{makeStateFluxes(), makeStateFluxes()};
         float maximumStabilityChange = 0.0f;
         float maximumStomatalMismatch = 0.0f, maximumLeafEnergyResidual = 0.0f;
         uint32_t failingEnergyFacets = 0;
+        double lumpedSurfaceResidual=0;
         const auto energyConverged = [&]() {
-            return facetphysics::facetEnergyConverged(failingEnergyFacets, scene.facetCount());
+            return facetphysics::facetEnergyConverged(failingEnergyFacets, scene.facetCount()) && lumpedSurfaceResidual<2;
         };
         // The maximum over states/sides prevents cancellation and double counting.
         const auto countFailingEnergyFacets = [&]() {
@@ -4369,7 +4482,7 @@ try {
                     const auto& flux = stateFlux[state];
                     const size_t first = size_t(facet) * 2U;
                     for (size_t side = first; side < first + (object ? 1U : 2U); ++side) {
-                        const float residual = flux.net[side] - flux.sensible[side] - flux.latent[side] -
+                        const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] -
                             flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
                         failing = failing || facetphysics::facetEnergyViolation(residual);
                     }
@@ -4397,6 +4510,20 @@ try {
         const auto evaluateEnergyFluxes =
             [&](const std::vector<facetvk::SurfaceOptics>& longwaveOptics,
                 const std::vector<float>& longwaveIncident) {
+                if(!lumpedBodies.empty()) {
+                    std::vector<double> weighted(lumpedBodies.size(),0);
+                    for(uint32_t f=0;f<scene.facetCount();++f)if(lumpedFacet[f]>=0) {
+                        const size_t side=size_t(f)*2;const double sun=sunlitPart[side];
+                        const double skin=sun*stateTemperature[0][side]+(1-sun)*stateTemperature[1][side];
+                        weighted[size_t(lumpedFacet[f])]+=facetAreas[f]*surfaceForFacet(scene,f).lumpedWeight*skin;
+                    }
+                    for(size_t i=0;i<lumpedBodies.size();++i) {
+                        auto& b=lumpedBodies[i];
+                        b.step=facetphysics::solveLumpedCore(b.p,previousLumpedK[i],weighted[i]/b.weightedArea,
+                            airTemperature,dTime,lumpedPreviousSeconds);
+                        b.temperatureK=b.step.temperatureK;
+                    }
+                }
                 std::vector<float> radiativeNet(surfaceCount);
                 for (int state = 0; state < 2; ++state) {
                     const std::vector<float>& T = stateTemperature[state];
@@ -4520,6 +4647,11 @@ try {
                                 flux.latentSlope[side] = facetLatentHeatSlope;
                                 flux.storage[side] = facetStorageHeat;
                                 flux.storageSlope[side] = facetStorageSlope;
+                                if(lumpedFacet[facet]>=0) {
+                                    const auto& b=lumpedBodies[size_t(lumpedFacet[facet])];
+                                    flux.internal[side]=float(lumpedConductanceDensity[facet]*(b.temperatureK-T[side]));
+                                    flux.internalSlope[side]=float(lumpedConductanceDensity[facet]);
+                                }
                             }
                         } else {
                             // Ground under vegetation is sheltered by its column's
@@ -4620,6 +4752,7 @@ try {
         // Maxima and temperature-equivalent residuals are diagnostics only.
         const auto measureEnergyResidual = [&](const std::vector<facetvk::SurfaceOptics>& optics) {
             maximumEnergyResidual = 0.0f;
+            lumpedSurfaceResidual=0;
             maximumEnergyResidualEquivalent = 0.0f;
             maximumStomatalMismatch = maximumLeafEnergyResidual = 0.0f;
             for (int state = 0; state < 2; ++state) {
@@ -4630,16 +4763,17 @@ try {
                     const size_t first = static_cast<size_t>(facet) * 2U;
                     for (size_t side = first; side < first + (object ? 1U : 2U); ++side) {
                         const float emissivity = std::clamp(1.0f - optics[side].reflectance - optics[side].transmittance, 0.0f, 1.0f);
-                        const float residual = flux.net[side] - flux.sensible[side] - flux.latent[side] - flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
+                        const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] - flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
                         if (object && surfaceForFacet(scene, facet).vegetation) {
                             maximumStomatalMismatch = std::max(maximumStomatalMismatch, flux.stomatalMismatch[side]);
                             maximumLeafEnergyResidual = std::max(maximumLeafEnergyResidual, std::abs(residual));
                         }
                         const float response = (object ? 8.0f : 4.0f) * emissivity * kStefanBoltzmann * std::pow(T[side], 3.0f) +
                             flux.sensibleSlope[side] +
-                            flux.latentSlope[side] + flux.storageSlope[side] + (object ? flux.photovoltaicSlope[side] : 0.0f);
+                            flux.latentSlope[side] + flux.storageSlope[side] + flux.internalSlope[side] + (object ? flux.photovoltaicSlope[side] : 0.0f);
                         if (!std::isfinite(residual) || !std::isfinite(response)) throw std::runtime_error("FacetEB energy residual is not finite");
                         maximumEnergyResidual = std::max(maximumEnergyResidual, std::abs(residual));
+                        if(lumpedFacet[facet]>=0)lumpedSurfaceResidual=std::max(lumpedSurfaceResidual,double(std::abs(residual)));
                         maximumEnergyResidualEquivalent = std::max(maximumEnergyResidualEquivalent, std::abs(residual) / std::max(1.0f, response));
                     }
                 }
@@ -4823,9 +4957,9 @@ try {
                             }
                             const float t = stateTemperature[state][side];
                             const float e = std::clamp(1.0f - audit.optics[side].reflectance - audit.optics[side].transmittance, 0.0f, 1.0f);
-                            const float residual = flux.net[side] - flux.sensible[side] - flux.latent[side] - flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
+                            const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] - flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
                             const float response = (object ? 8.0f : 4.0f) * e * kStefanBoltzmann * std::pow(t, 3.0f) +
-                                flux.sensibleSlope[side] + flux.latentSlope[side] + flux.storageSlope[side] + (object ? flux.photovoltaicSlope[side] : 0.0f);
+                                flux.sensibleSlope[side] + flux.latentSlope[side] + flux.storageSlope[side] + flux.internalSlope[side] + (object ? flux.photovoltaicSlope[side] : 0.0f);
                             const float candidate = std::clamp(t + std::clamp(residual / std::max(1.0f, response), -5.0f, 5.0f), 220.0f, 360.0f);
                             shadowNextTemperature[index] = t + (object && surface.vegetation ? flux.temperatureStep[side] : temperatureRelaxation * (candidate - t));
                             if (object) shadowNextTemperature[index + 1] = shadowNextTemperature[index];
@@ -4923,15 +5057,17 @@ try {
                             const float emissivity =
                                 std::clamp(1.0f - longwaveOptics[side].reflectance - longwaveOptics[side].transmittance,
                                            0.0f, 1.0f);
-                            const float residual = flux.net[side] - flux.sensible[side] - flux.latent[side] -
+                            const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] -
                                                    flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
                             const float derivative =
                                 (object ? 8.0f : 4.0f) * emissivity * kStefanBoltzmann * std::pow(T[side], 3.0f) +
-                                flux.sensibleSlope[side] + flux.latentSlope[side] + flux.storageSlope[side] +
+                                flux.sensibleSlope[side] + flux.latentSlope[side] + flux.storageSlope[side] + flux.internalSlope[side] +
                                 (object ? flux.photovoltaicSlope[side] : 0.0f);
+                            const float maximumSurfaceK=lumpedFacet[facet]>=0
+                                ? float(surfaceForFacet(scene,facet).lumpedMaxSurfaceK) : 360.0f;
                             const float candidate =
                                 std::clamp(T[side] + std::clamp(residual / std::max(1.0f, derivative), -5.0f, 5.0f),
-                                           220.0f, 360.0f);
+                                           220.0f, maximumSurfaceK);
                             const float updated = T[side] + (object && surfaceForFacet(scene, facet).vegetation
                                                                  ? flux.temperatureStep[side]
                                                                  : stepRelaxation * (candidate - T[side]));
@@ -4991,6 +5127,26 @@ try {
             }
         }
         diagnostic["maximumSoilClosure_W_m2"] = maxSoilClosure;
+        diagnostic["timeStepSeconds"]=dTime;
+        diagnostic["elapsedSeconds"]=lumpedElapsedSeconds;
+        diagnostic["lumpedThermal"]=ProjectJson::Json::array();
+        double maxCoreResidual=0,maxExchangeMismatch=0;
+        std::vector<double> exchanged(lumpedBodies.size(),0);
+        for(uint32_t f=0;f<scene.facetCount();++f)if(lumpedFacet[f]>=0) {
+            const size_t side=size_t(f)*2;const double sun=sunlitPart[side];
+            exchanged[size_t(lumpedFacet[f])]+=facetAreas[f]*(sun*stateFlux[0].internal[side]+(1-sun)*stateFlux[1].internal[side]);
+        }
+        for(size_t i=0;i<lumpedBodies.size();++i) {
+            const auto& b=lumpedBodies[i];const auto& s=b.step;
+            maxCoreResidual=std::max(maxCoreResidual,std::abs(s.residualW));
+            maxExchangeMismatch=std::max(maxExchangeMismatch,std::abs(s.conductedW-exchanged[i]));
+            diagnostic["lumpedThermal"].push_back({{"id",b.id},{"coreTemperature_K",s.temperatureK},
+                {"inputPower_W",s.powerW},{"conductedToSkin_W",s.conductedW},{"surfaceReceived_W",exchanged[i]},
+                {"airLoss_W",s.airLossW},{"storage_W",s.storageW},{"coreResidual_W",s.residualW}});
+        }
+        diagnostic["lumpedThermalMaxCoreResidual_W"]=maxCoreResidual;
+        diagnostic["lumpedThermalMaxSurfaceResidual_W_m2"]=lumpedSurfaceResidual;
+        diagnostic["lumpedThermalMaxExchangeMismatch_W"]=maxExchangeMismatch;
         std::filesystem::create_directories(outputDirectory / "diagnostics");
         std::ofstream(outputDirectory / "diagnostics" / ("facet_physics_node=" + std::to_string(node) + ".json")) << diagnostic.dump(2);
 

@@ -1,8 +1,9 @@
 #pragma once
 // Run mode "同化": MAP Gauss-Newton analysis of one pixel at a time with the built-in differentiable operator.
 //
-// Observation operator h(x): the same thermal / optical forward model as the imaging (thermal_view.h,
-// canopyReflectanceT), evaluated on Dual numbers so H = dh/dx is exact (no finite differences).
+// Observation operator h(x): shared with imaging and differentiated with Dual numbers.
+// Tabulated moisture optical slopes are local approximations; EB derivatives are
+// conditional on the overpass history/stability, not the full trajectory derivative.
 //   RT background: x = four component temperatures (+ LAI when reflectances are given).
 //   EB background: x = soil moisture + Vcmax (+ LAI). The component temperatures follow from the energy balance;
 //                  dT/dx comes from implicit differentiation of the four component balances at the converged
@@ -25,6 +26,7 @@ namespace stream {
 
 struct EbControls { double moisture = 0, vcmax = 0, lai = 0; };
 struct EbOutcome {
+    bool gradientValid = false;  // false means the analysis must reject the linearization
     std::array<double, 4> temperatures{};                  // Tss, Tsh, Tcs, Tch at the overpass
     std::array<std::array<double, 3>, 4> gradient{};       // dT_k / d[soil moisture, Vcmax, LAI]
     std::array<double, 4> fluxes{};                        // Rn, H, LE, G at the overpass

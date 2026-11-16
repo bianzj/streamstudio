@@ -43,8 +43,7 @@ struct InversionConfig {
     double tolerance = 1e-3;       // K
     bool enabled() const { return target != InversionTarget::None; }
 };
-// Run mode "同化": the user supplies observations and picks what they are; every other setting (observation
-// errors, background errors, iteration) is a built-in default of app/assimilation.cpp.
+// Run mode "同化": optional observation errors/QA override compatible defaults.
 //   brightness: brightness temperatures, one band per thermal band (scene view; optional extra views)
 //   lst       : one radiometric LST band (10.5 um, fixed class emissivity convention)
 //   components: four component temperatures Tss/Tsh/Tcs/Tch
@@ -54,12 +53,19 @@ enum class AssimilationObservation { None, Brightness, Lst, Components };
 struct AssimilationView {
     std::string data;  // one band per thermal band
     Field vza, vaa;
+    std::string uncertainty, qa;  // optional 1-sigma / QA rasters
 };
 struct AssimilationConfig {
     AssimilationObservation observation = AssimilationObservation::None;
     std::string data;
     std::vector<AssimilationView> views;  // brightness only
     std::string optical;                  // optional: one band per optical band
+    std::string uncertainty, covariance, qa, opticalUncertainty, opticalQa;
+    double sigmaBrightnessK = 0.5, sigmaLstK = 1.0, sigmaComponentK = 2.0, sigmaReflectance = 0.02;
+    double lstWavelengthUm = 10.5;
+    unsigned rejectQaBits = 895;  // invalid/ill-conditioned/low-support/not-converged; bits 0-6,8-9 except bit 7
+    std::string observationLevel;  // canopy (brightness), surface (LST/components); no TOA operator
+    std::vector<std::string> sourceIds, priorSourceIds;
     bool enabled() const { return observation != AssimilationObservation::None; }
 };
 

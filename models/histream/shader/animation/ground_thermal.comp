@@ -1,0 +1,59 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x=8,local_size_y=8)in;
+layout(binding=0)uniform accelerationStructureEXT baseAS;
+layout(binding=2)uniform accelerationStructureEXT backgroundAS;
+struct GTriangle{vec4 a,b,c,na,nb,nc;uvec4 ids;vec4 thermal;};
+layout(std430,binding=1)readonly buffer BaseTriangles{GTriangle baseTriangles[];};
+layout(std430,binding=3)readonly buffer BackgroundTriangles{GTriangle backgroundTriangles[];};
+#define GROUND_PARAMS_BINDING 4
+#define GROUND_FIELD_BINDING 5
+#include "ground_layout.glsl"
+layout(push_constant)uniform Step{vec4 sun,weather,time;}pc; // airK,wind,GHI,LW; dt,phase,0,0
+const float GSIGMA=5.670374419e-8;
+bool traceGround(vec3 ro,vec3 rd,bool omitCanopy,out GTriangle tri,out float distance){
+    rayQueryEXT a;rayQueryInitializeEXT(a,baseAS,gl_RayFlagsOpaqueEXT,255,ro,.003,rd,10000.);while(rayQueryProceedEXT(a)){}
+    bool hit=rayQueryGetIntersectionTypeEXT(a,true)==gl_RayQueryCommittedIntersectionTriangleEXT;
+    distance=hit?rayQueryGetIntersectionTEXT(a,true):10000.;if(hit)tri=baseTriangles[rayQueryGetIntersectionPrimitiveIndexEXT(a,true)];
+    rayQueryEXT b;rayQueryInitializeEXT(b,backgroundAS,omitCanopy?gl_RayFlagsNoOpaqueEXT:gl_RayFlagsOpaqueEXT,255,ro,.003,rd,distance);
+    while(rayQueryProceedEXT(b))if(omitCanopy&&rayQueryGetIntersectionTypeEXT(b,false)==gl_RayQueryCandidateIntersectionTriangleEXT){uint j=rayQueryGetIntersectionPrimitiveIndexEXT(b,false);uint m=backgroundTriangles[j].ids.x;if(groundMaterials[m].flags.x<.5)rayQueryConfirmIntersectionEXT(b);}
+    if(rayQueryGetIntersectionTypeEXT(b,true)==gl_RayQueryCommittedIntersectionTriangleEXT){distance=rayQueryGetIntersectionTEXT(b,true);tri=backgroundTriangles[rayQueryGetIntersectionPrimitiveIndexEXT(b,true)];hit=true;}return hit;
+}
+vec2 incoming(vec3 p,vec3 d,bool omit){GTriangle t;float z;if(!traceGround(p,d,omit,t,z))return vec2(1,0);
+    float temp=(dot(cross(t.b.xyz-t.a.xyz,t.c.xyz-t.a.xyz),d)<0.?t.thermal.x:t.thermal.y)+t.thermal.z;
+    float eps=groundMaterials[t.ids.x].energy.y;return vec2(1.-eps,eps*GSIGMA*pow(temp,4.));
+}
+float surfaceStep(float previous,vec4 mat,float sw,float lw){
+    float h=(5.8+4.1*sqrt(max(.1,pc.weather.y))),dt=pc.time.x,T=previous;
+    for(int i=0;i<6;i++){float e=GSIGMA*mat.y*T*T*T*T;float residual=(1.-mat.x)*sw+mat.y*lw-e-h*(T-pc.weather.x)-mat.w*(T-groundSettings.z)-mat.z*(T-previous)/dt;
+        T+=residual/(4.*GSIGMA*mat.y*T*T*T+h+mat.w+mat.z/dt);}
+    return T;
+}
+void main(){ivec2 c=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(c,groundSize.xy)))return;int id=c.y*groundSize.x+c.x;
+    if(pc.time.y<.5){
+        vec3 ro=vec3(groundDomain.xy+(vec2(c)+.5)*groundDomain.z,groundDomain.w);GTriangle t;float distance;GroundCell f;f.point=vec4(0,0,0,-1);f.sky=f.emission=f.solar=vec4(0);f.state=vec4(groundSettings.y,groundSettings.y,0,0);
+        if(traceGround(ro,vec3(0,0,-1),true,t,distance)){
+            vec3 p=ro-vec3(0,0,distance),n=normalize(cross(t.b.xyz-t.a.xyz,t.c.xyz-t.a.xyz));
+            if(p.z<=groundSettings.x&&n.z>.95&&groundMaterials[t.ids.x].flags.y>.5){
+                f.point=vec4(p,float(t.ids.x));f.emission.z=t.thermal.x+t.thermal.z;int count=int(groundControl.y);
+                for(int k=0;k<count;k++){float u=(float(k)+.5)/float(count),phi=6.2831853*fract(float(k)*.61803398875);vec3 d=vec3(sqrt(u)*cos(phi),sqrt(u)*sin(phi),sqrt(1.-u));
+                    GTriangle h;float z;bool hb=traceGround(p+vec3(0,0,.006),d,true,h,z);float sv0=hb?0.:1.;bool ht=traceGround(p+vec3(0,0,.006),d,false,h,z);float sv1=ht?0.:1.;
+                    vec2 l0=incoming(p+vec3(0,0,.006),d,true),l1=incoming(p+vec3(0,0,.006),d,false);
+                    f.sky+=vec4(sv0,sv1,l0.x,l1.x)/float(count);f.emission.xy+=vec2(l0.y,l1.y)/float(count);
+                }
+            }
+        }groundCells[id]=f;return;
+    }
+    GroundCell f=groundCells[id];if(f.point.w<0.)return;
+    if(pc.time.y<1.5){
+        vec2 visibility=vec2(0);if(pc.sun.z>0.&&pc.weather.z>0.)for(int k=0;k<4;k++){
+            vec3 p=f.point.xyz+vec3((vec2(k%2,k/2)-.5)*groundDomain.z*.5,.006);GTriangle t;float z;
+            visibility.x+=traceGround(p,pc.sun.xyz,true,t,z)?0.:.25;visibility.y+=traceGround(p,pc.sun.xyz,false,t,z)?0.:.25;
+        }f.solar=vec4(visibility,0,0);groundCells[id]=f;return;
+    }
+    vec4 mat=groundMaterials[int(f.point.w)].energy;vec2 sw=pc.weather.z*(groundControl.x*f.solar.xy+(1.-groundControl.x)*f.sky.xy);
+    vec2 lw=pc.weather.w*f.sky.zw+f.emission.xy;float t0=surfaceStep(f.state.x,mat,sw.x,lw.x),t1=surfaceStep(f.state.y,mat,sw.y,lw.y);
+    float h=5.8+4.1*sqrt(max(.1,pc.weather.y));float residual=(1.-mat.x)*sw.y+mat.y*lw.y-mat.y*GSIGMA*t1*t1*t1*t1-h*(t1-pc.weather.x)-mat.w*(t1-groundSettings.z)-mat.z*(t1-f.state.y)/pc.time.x;
+    f.state=vec4(t0,t1,t1-t0,residual);groundCells[id]=f;
+}

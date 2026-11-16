@@ -34,5 +34,3 @@ models/bin_x64/
 # Run outputs: raw logs and results belong in .test/ or D:/cases, not the repo.
 /results/
 review/examples-run/
-tools/tirt/cases/
-tools/tirt/inputs/

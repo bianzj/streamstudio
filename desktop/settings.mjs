@@ -4,7 +4,8 @@ import { join } from 'node:path'
 const KEYS = new Set([
   'streamStudioLanguage', 'histreamStudioLanguage', 'streamsimLanguage',
   'histreamExampleDirectory', 'histreamProjectDirectory', 'histreamExecutable',
-  'streamStudioImage', 'streamStudioScene', 'histreamStreamScene', 'streamStudioImageProject'
+  'streamStudioImage', 'streamStudioScene', 'histreamStreamScene', 'streamStudioImageProject',
+  'sceneAnimationInput', 'sceneAnimationOutputRoot', 'sceneAnimationLastResult'
 ])
 
 // A dedicated file survives changes to the loopback server's port. It contains

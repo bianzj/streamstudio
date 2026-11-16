@@ -50,7 +50,10 @@ void main()
         const FragmentRecord fragment = records[pixel * pc.raster.z + i];
         if ((fragment.cameraSide & REPLICA_BIT) == 0u)
             atomicAdd(totalCounts[fragment.cameraSide], 1u);
-        if (fragment.depthBits < nearestDepth) {
+        // Match FacetRT's deterministic depth/side ordering; fragment arrival
+        // order is not a stable ownership rule for coplanar surfaces.
+        if (fragment.depthBits < nearestDepth ||
+            (fragment.depthBits == nearestDepth && fragment.cameraSide < nearestSide)) {
             nearestDepth = fragment.depthBits;
             nearestSide = fragment.cameraSide;
         }

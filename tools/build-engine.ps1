@@ -27,6 +27,13 @@ if (-not $CmakeCommand) {
 
 $ConfigureArguments = @('-S', $SourceDirectory, '-B', $BuildDirectory)
 if ($Configuration -eq 'Release') { $ConfigureArguments += '-DHISTREAM_REQUIRE_USD=ON' }
+# Scene animation (eSceneAnimation research module: mesh sequences, rigid-v1/impact-v1) is part of the product
+# engine (development build under test, not yet released). Bullet 3.25 is taken from the verified local source when present (no download).
+$ConfigureArguments += '-DHISTREAM_ENABLE_SCENE_ANIMATION=ON', '-DHISTREAM_ENABLE_ANIMATION_COLLISION=ON'
+$BulletSource = Join-Path $ProjectRoot 'build\dependencies\bullet3-3.25'
+if (Test-Path -LiteralPath (Join-Path $BulletSource 'src\btBulletDynamicsCommon.h')) {
+    $ConfigureArguments += "-DFETCHCONTENT_SOURCE_DIR_HISTREAM_BULLET=$($BulletSource -replace '\\', '/')"
+}
 if ($VcpkgRoot) {
     $ToolchainFile = Join-Path $VcpkgRoot 'scripts\buildsystems\vcpkg.cmake'
     if (-not (Test-Path -LiteralPath $ToolchainFile)) { throw "vcpkg toolchain was not found: $ToolchainFile" }

@@ -28,7 +28,9 @@ D:/releases/streamstudio/2.0.1 将安装器、用户手册和随附案例放在�
 
 ## 项目内部
 
-assets/examples 提供五个精选内置案例：玉米、森林、城市、MODIS 能量平衡、Landsat 能量平衡。唯一内置索引为 assets/examples/catalog.json；玉米曲面光伏技术演示已撤下。
+assets/examples 提供五个精选内置案例：玉米、森林、城市、MODIS 能量平衡、Landsat 能量平衡；另有一个场景动画研究示例 `impact_v1_building`。唯一内置索引为 assets/examples/catalog.json；玉米曲面光伏技术演示已撤下。
+
+catalog.json 也可登记场景动画（研究功能，HiStream `eSceneAnimation`）示例：条目写 `"mode": "eSceneAnimation"`，用 `input` 代替 `project`，指向场景动画输入 JSON。`input` 与 `project` 一样相对资源根目录书写（如 `assets/examples/<文件夹>/scene.json`），也接受相对 assets/examples 的写法；id、label、category、categoryLabel、tier、focus、note 与普通条目相同，`recommendedMode` 可省略。输入 JSON 放在示例文件夹根目录，引用的 OBJ、背景场等文件放在同一文件夹内，因为“打开示例”只复制该文件夹（跳过 output/）。复制后场景动画面板自动填入副本中的输入，运行输出写入副本的 output/。输入不存在或不在 assets/examples 的子文件夹内的条目不会列出。当前内置目录含一个场景动画示例 `impact_v1_building`（建筑撞击，impact-v1，通用示例参数，经验模型估算，未经独立验证），但场景动画界面入口当前隐藏（`SCENE_ANIMATION_UI_ENABLED=false`），该条目不会出现在“打开示例”列表中，可用命令行运行；输入格式见 [histream-scene-animation.md](histream-scene-animation.md)，示例只能使用通用参数。
 
 ## 研究与维护
 

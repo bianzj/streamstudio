@@ -1,0 +1,431 @@
+{
+  "format": "histream-project",
+  "schemaVersion": 1,
+  "name": "Mesh background thermal field",
+  "mode": "eFacetEB",
+  "configuration": {
+    "outDir": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\output",
+    "scene": {
+      "x": 192,
+      "y": 172,
+      "height": 31,
+      "voxel": 193,
+      "terrain": false,
+      "background": {
+        "spectralName": "asphalt",
+        "thermalName": "asphalt",
+        "materialName": "soil_boundary",
+        "materialType": "Soil",
+        "heterogeneityEnabled": false
+      }
+    },
+    "sensor": {
+      "x": 32,
+      "y": 32,
+      "bands": "10000",
+      "image": false,
+      "temperature": true,
+      "process": true,
+      "energyProcess": true,
+      "radiationProcess": false,
+      "principalPlane": false,
+      "hemisphere": false
+    },
+    "control": {
+      "samples": 8,
+      "depth": 4,
+      "facetBackend": "gpu",
+      "couplingIterations": 100,
+      "temperatureTolerance": 0.05,
+      "temperatureRelaxation": 0.5,
+      "radiationSolver": "traditional",
+      "spectralAccelerationWidth": 500,
+      "soilTemperatureMethod": 0,
+      "stabilityCorrection": false
+    },
+    "meteo": {
+      "path": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\meteorology.txt",
+      "start": 0,
+      "end": 25,
+      "dTime": 7200,
+      "Tsold": 298.15,
+      "z": 35,
+      "latitude": 40,
+      "longitude": 120,
+      "timezone": 8,
+      "year": 2019
+    },
+    "light": {
+      "zenith": 30,
+      "azimuth": 180,
+      "direct": 0.8,
+      "diffuse": 0.2,
+      "skyTemperature": 280
+    },
+    "atmosphere": {
+      "enabled": false
+    },
+    "fluid": {
+      "enabled": false
+    },
+    "spectra": [
+      {
+        "name": "concrete",
+        "model": "custom",
+        "reflectance": "0.35",
+        "transmittance": "0",
+        "refTir": 0.06000000000000005,
+        "tauTir": 0
+      },
+      {
+        "name": "brick",
+        "model": "custom",
+        "reflectance": "0.25",
+        "transmittance": "0",
+        "refTir": 0.06000000000000005,
+        "tauTir": 0
+      },
+      {
+        "name": "interior",
+        "model": "custom",
+        "reflectance": "0.4",
+        "transmittance": "0",
+        "refTir": 0.06000000000000005,
+        "tauTir": 0
+      },
+      {
+        "name": "glass",
+        "model": "custom",
+        "reflectance": "0.18",
+        "transmittance": "0",
+        "refTir": 0.16000000000000003,
+        "tauTir": 0
+      },
+      {
+        "name": "glass_warm",
+        "model": "custom",
+        "reflectance": "0.18",
+        "transmittance": "0",
+        "refTir": 0.16000000000000003,
+        "tauTir": 0
+      },
+      {
+        "name": "metal",
+        "model": "custom",
+        "reflectance": "0.3",
+        "transmittance": "0",
+        "refTir": 0.35,
+        "tauTir": 0
+      },
+      {
+        "name": "roof",
+        "model": "custom",
+        "reflectance": "0.3",
+        "transmittance": "0",
+        "refTir": 0.06999999999999995,
+        "tauTir": 0
+      },
+      {
+        "name": "plant",
+        "model": "custom",
+        "reflectance": "0.28",
+        "transmittance": "0",
+        "refTir": 0.12,
+        "tauTir": 0
+      },
+      {
+        "name": "asphalt",
+        "model": "custom",
+        "reflectance": "0.12",
+        "transmittance": "0",
+        "refTir": 0.040000000000000036,
+        "tauTir": 0
+      },
+      {
+        "name": "pavement",
+        "model": "custom",
+        "reflectance": "0.35",
+        "transmittance": "0",
+        "refTir": 0.06000000000000005,
+        "tauTir": 0
+      },
+      {
+        "name": "marking",
+        "model": "custom",
+        "reflectance": "0.7",
+        "transmittance": "0",
+        "refTir": 0.06000000000000005,
+        "tauTir": 0
+      }
+    ],
+    "materials": [
+      {
+        "name": "concrete",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 80000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "brick",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 100000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "interior",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 120000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "glass",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 15000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "glass_warm",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 15000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "metal",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 20000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "roof",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 90000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "plant",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 60000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "asphalt",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 120000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "pavement",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 100000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "marking",
+        "type": "Building",
+        "energyModel": "solid",
+        "params": {
+          "heatCapacityPerArea": 120000,
+          "convectiveScale": 1
+        }
+      },
+      {
+        "name": "soil_boundary",
+        "type": "Soil",
+        "params": {
+          "rss": 1000000000.0,
+          "cs": 1800,
+          "rhos": 1600,
+          "lambdas": 1,
+          "SMC": 0.1
+        }
+      }
+    ],
+    "thermals": [
+      {
+        "name": "concrete",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "brick",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "interior",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "glass",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "glass_warm",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "metal",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "roof",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "plant",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "asphalt",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "pavement",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      },
+      {
+        "name": "marking",
+        "sunlitTemperature": 298.15,
+        "shadedTemperature": 298.15
+      }
+    ],
+    "canopies": [
+      {
+        "name": "solid",
+        "structureType": "solid",
+        "leafwidth": 2
+      }
+    ],
+    "objects": {
+      "count": 1,
+      "names": [
+        "world"
+      ],
+      "items": [
+        {
+          "name": "world",
+          "type": "Building",
+          "fileName": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\models\\world.obj",
+          "positionFile": "D:\\cases\\StreamStudio\\supplemental\\impact_gpu_20261107\\thermal_field_20261108\\native_v5\\positions\\origin.txt",
+          "meshes": [
+            {
+              "name": "concrete",
+              "spectralName": "concrete",
+              "thermalName": "concrete",
+              "materialName": "concrete",
+              "canopyName": "solid"
+            },
+            {
+              "name": "brick",
+              "spectralName": "brick",
+              "thermalName": "brick",
+              "materialName": "brick",
+              "canopyName": "solid"
+            },
+            {
+              "name": "interior",
+              "spectralName": "interior",
+              "thermalName": "interior",
+              "materialName": "interior",
+              "canopyName": "solid"
+            },
+            {
+              "name": "glass",
+              "spectralName": "glass",
+              "thermalName": "glass",
+              "materialName": "glass",
+              "canopyName": "solid"
+            },
+            {
+              "name": "glass_warm",
+              "spectralName": "glass_warm",
+              "thermalName": "glass_warm",
+              "materialName": "glass_warm",
+              "canopyName": "solid"
+            },
+            {
+              "name": "metal",
+              "spectralName": "metal",
+              "thermalName": "metal",
+              "materialName": "metal",
+              "canopyName": "solid"
+            },
+            {
+              "name": "roof",
+              "spectralName": "roof",
+              "thermalName": "roof",
+              "materialName": "roof",
+              "canopyName": "solid"
+            },
+            {
+              "name": "plant",
+              "spectralName": "plant",
+              "thermalName": "plant",
+              "materialName": "plant",
+              "canopyName": "solid"
+            },
+            {
+              "name": "asphalt",
+              "spectralName": "asphalt",
+              "thermalName": "asphalt",
+              "materialName": "asphalt",
+              "canopyName": "solid"
+            },
+            {
+              "name": "pavement",
+              "spectralName": "pavement",
+              "thermalName": "pavement",
+              "materialName": "pavement",
+              "canopyName": "solid"
+            },
+            {
+              "name": "marking",
+              "spectralName": "marking",
+              "thermalName": "marking",
+              "materialName": "marking",
+              "canopyName": "solid"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

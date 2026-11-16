@@ -10,6 +10,7 @@ set(PROJNAME ${PROJNAME})
 project(${PROJNAME} LANGUAGES C CXX)
 message(STATUS "-------------------------------")
 
+option(HISTREAM_ENABLE_SCENE_ANIMATION "Build the isolated scene animation module" OFF)
 option(HISTREAM_ENABLE_FACET "Build integrated FacetRT and FacetEB backends" ON)
 if (HISTREAM_ENABLE_FACET)
     find_package(Vulkan REQUIRED)
@@ -167,6 +168,7 @@ find_program(HISTREAM_GLSLC
 file(GLOB_RECURSE HISTREAM_SHARED_SHADER_DEPENDENCIES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/shader/*.glsl"
         "${CMAKE_CURRENT_SOURCE_DIR}/shader/*.h")
+list(FILTER HISTREAM_SHARED_SHADER_DEPENDENCIES EXCLUDE REGEX "/shader/animation/")
 
 set(HISTREAM_RAYTRACING_SHADER_FILES
         offline.rgen
@@ -303,7 +305,6 @@ add_custom_target(histream_voxelrt_shaders ALL
         DEPENDS ${HISTREAM_VOXELRT_SHADER_OUTPUTS})
 add_dependencies(${PROJNAME} histream_voxelrt_shaders)
 
-
 #-------------------------------------------------------------------------------------------------
 # Sub-folders in Visual Studio
 #
@@ -381,6 +382,8 @@ endforeach (RELEASELIB)
 #
 
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/scene-animation.cmake")
+
 # Deploy runtime resources next to histream.exe so XML-driven projects use the same
 # shader and predefined-data layout as the built-in configurations.
 set(HISTREAM_OBSOLETE_FLUID_CLEANUP)
@@ -404,9 +407,10 @@ if (HISTREAM_ENABLE_FACET)
 endif()
 add_custom_target(histream_runtime_resources ALL
     ${HISTREAM_OBSOLETE_FLUID_CLEANUP}
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/shader"
-            "$<TARGET_FILE_DIR:${PROJNAME}>/shader"
+    COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/shader"
+            "-DDESTINATION=$<TARGET_FILE_DIR:${PROJNAME}>/shader"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy-core-shaders.cmake"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/defined"
             "$<TARGET_FILE_DIR:${PROJNAME}>/defined"
@@ -420,6 +424,7 @@ add_custom_target(histream_runtime_resources ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_BINARY_DIR}/shader/raytracing"
             "$<TARGET_FILE_DIR:${PROJNAME}>/shader/raytracing"
+    ${HISTREAM_ANIMATION_RUNTIME_COPY}
     COMMAND ${CMAKE_COMMAND}
             "-DSOURCE_DIR=$<IF:$<CONFIG:Debug>,${VCPKG_INSTALLED_DIR}/x64-windows/debug/bin,${VCPKG_INSTALLED_DIR}/x64-windows/bin>"
             "-DDESTINATION_DIR=$<TARGET_FILE_DIR:${PROJNAME}>"
@@ -433,3 +438,8 @@ add_custom_target(histream_runtime_resources ALL
 )
 
 _finalize_target(${PROJNAME})
+
+# Header-only physical check; no GPU or scene simulation is launched by builds.
+add_executable(histream_lumped_thermal_tests EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/scene-animation/tests/lumped_thermal_fixture.cpp")
+target_include_directories(histream_lumped_thermal_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

@@ -1,0 +1,522 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "geometry.glsl"
+// HiStream GPU procedural illustration. No blast, combustion or damage solver.
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,std430) buffer Pixels { uint rgba[]; };
+struct TransportCell {vec4 flow;vec4 matter;};
+layout(set=0,binding=1,std430) readonly buffer TransportField {TransportCell field[];};
+layout(set=0,binding=2,std430) writeonly buffer LinearRadiance {float rawRadiance[];};
+layout(push_constant) uniform Parameters {
+    ivec4 image; // width, height, zero-based frame, timeline frames
+    vec4 time;  // presentation time, impact time, exposure, samples
+    vec4 camera;
+    vec4 target;
+    ivec4 tile;
+    vec4 thermal; // wavelength [um], display bounds [K], logarithmic gain
+    vec4 fieldOrigin;
+    ivec4 fieldGrid;
+} pc;
+const vec3 contact=vec3(0,-8.15,12);
+const vec3 start=vec3(-46,-38,31);
+const vec3 sun=vec3(-.45,-.65,.61);
+float age() { return pc.time.x-pc.time.y; }
+bool thermalMode() { return pc.tile.y==1; }
+bool transportMode() { return pc.tile.z==1; }
+bool detailedMode() { return (pc.fieldGrid.w&2)!=0; }
+bool sensorMode() { return (pc.fieldGrid.w&4)!=0; }
+vec2 transportSample(vec3 p,bool solid) {
+    vec3 q=(p-pc.fieldOrigin.xyz)/pc.fieldOrigin.w-.5;
+    ivec3 base=ivec3(floor(q));vec3 f=fract(q);vec2 sum=vec2(0);float weights=0;
+    for(int z=0;z<2;z++)for(int y=0;y<2;y++)for(int x=0;x<2;x++) {
+        ivec3 offset=ivec3(x,y,z),i=base+offset;
+        if(any(lessThan(i,ivec3(0)))||any(greaterThanEqual(i,pc.fieldGrid.xyz)))continue;
+        TransportCell c=field[(i.z*pc.fieldGrid.y+i.y)*pc.fieldGrid.x+i.x];
+        if((c.matter.y>.5)!=solid)continue;
+        vec3 w=mix(1-f,f,vec3(offset));float weight=w.x*w.y*w.z;
+        sum+=vec2(c.flow.w-300,c.matter.x)*weight;weights+=weight;
+    }
+    return weights>1e-6?vec2(300+sum.x/weights,sum.y/weights):vec2(300,0);
+}
+// Spectral Planck radiance in W m^-2 sr^-1 um^-1. Temperatures below are
+// prescribed illustration fields, not computed by the RT/EB or blast solvers.
+float spectralPlanck(float w,float temperature) {
+    return 1.191043934e8/(pow(w,5)*(exp(14388.29104/(w*temperature))-1));
+}
+float planck(float temperature) {
+    if(pc.tile.w==0)return spectralPlanck(pc.thermal.x,temperature);
+    // Uniform generic LWIR response: integrated W m^-2 sr^-1, not a camera SRF.
+    float total=0;
+    for(int i=0;i<8;i++)total+=spectralPlanck(8+float(i)*6/7,temperature)*(i==0||i==7?.5:1);
+    return total*6/7;
+}
+float hash(vec3 p) { p=fract(p*.1031);p+=dot(p,p.yzx+33.33);return fract((p.x+p.y)*p.z); }
+float noise(vec3 p) {
+    vec3 i=floor(p),f=fract(p); f=f*f*(3-2*f);
+    return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x),
+                   mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+               mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),
+                   mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z);
+}
+float fbm(vec3 p) { return .57*noise(p)+.28*noise(p*2.07+7.1)+.15*noise(p*4.13+13.6); }
+float box(vec3 p,vec3 b) { vec3 q=abs(p)-b;return length(max(q,0))+min(max(q.x,max(q.y,q.z)),0); }
+float capsule(vec3 p,vec3 a,vec3 b,float r) { vec3 d=b-a;return length(p-a-d*clamp(dot(p-a,d)/dot(d,d),0,1))-r; }
+vec2 nearest(vec2 a,vec2 b) { return a.x<b.x?a:b; }
+vec3 projectile() { return mix(start,contact,clamp(pc.time.x/max(pc.time.y,.001),0,1)); }
+
+float building(vec3 p) {
+    return geometryBuilding(p,age(),detailedMode());
+}
+vec2 streetAccessories(vec3 p) {
+    vec2 result=vec2(1e5,6);
+    if(p.z<3 && p.y< -16 && p.y> -39) {
+        const vec2 cars[5]=vec2[5](vec2(-22,-18.5),vec2(17,-18.5),vec2(37,-18.5),vec2(-42,-37),vec2(60,-37));
+        for(int i=0;i<5;i++) {
+            vec3 q=p-vec3(cars[i],0);
+            float body=min(box(q-vec3(0,0,.65),vec3(2.05,.90,.50)),box(q-vec3(-.25,0,1.25),vec3(1.05,.78,.43)));
+            for(int x=-1;x<=1;x+=2)for(int y=-1;y<=1;y+=2)
+                body=min(body,length((q-vec3(float(x)*1.35,float(y)*.88,.35))/vec3(1,.55,1))*.55-.19);
+            result=nearest(result,vec2(body,6));
+        }
+        for(int i=0;i<8;i++) {
+            vec3 q=p-vec3(-28+float(i)*8,-20.1,.6);
+            result=nearest(result,vec2(max(length(q.xy)-.09,abs(q.z)-.6),8));
+        }
+    }
+    if(p.z<.5) {
+        result=nearest(result,vec2(box(p-vec3(0,-20.4,.1),vec3(125,.16,.1)),8));
+        result=nearest(result,vec2(box(p-vec3(0,-35.6,.1),vec3(125,.16,.1)),8));
+    }
+    return result;
+}
+float exposedSteel(vec3 p) {
+    if(age()<.16 || p.y< -9 || p.y> -6.5 || abs(p.x)>5 || p.z<8 || p.z>16)return 1e5;
+    float distance=1e5;
+    for(int i=0;i<10;i++) {
+        float side=i%2==0?-1:1;
+        vec3 centre=vec3(side*(3.1+.15*sin(float(i)*2.1)),-7.9,9+float(i/2)*1.25);
+        vec3 q=p-centre;
+        q.xz=mat2(.94,-.342,.342,.94)*q.xz;
+        distance=min(distance,box(q,vec3(.65,.025,.025)));
+    }
+    return distance;
+}
+vec2 staticScene(vec3 p) {
+    vec2 d=vec2(building(p),2);
+    d=nearest(d,vec2(p.z,1));
+    d=nearest(d,vec2(geometryCity(p,detailedMode()),4));
+    if(detailedMode()) {
+        d=nearest(d,streetAccessories(p));
+        d=nearest(d,vec2(exposedSteel(p),7));
+    }
+    return d;
+}
+vec2 scene(vec3 p) {
+    vec2 d=staticScene(p);
+    vec3 dir=normalize(contact-start);
+    if(age()<0) {
+        vec3 q=p-projectile();
+        float along=dot(q,dir);
+        vec3 side=q-dir*along;
+        float body=capsule(q,-dir*1.8,dir*1.2,.24);
+        float nose=max(length(side)-(.30*(2.3-along)/1.1),max(1.2-along,along-2.3));
+        body=min(body,nose);
+        vec3 right=normalize(cross(dir,vec3(0,0,1)));
+        vec3 up=cross(right,dir);
+        vec3 local=vec3(dot(q,right),dot(q,up),along+1.2);
+        body=min(body,box(local,vec3(.8,.055,.45)));
+        body=min(body,box(local,vec3(.055,.8,.45)));
+        d=nearest(d,vec2(body,3));
+    }
+    return d;
+}
+vec3 normalAt(vec3 p) {
+    const vec2 e=vec2(.015,0);
+    return normalize(vec3(scene(p+e.xyy).x-scene(p-e.xyy).x,
+                          scene(p+e.yxy).x-scene(p-e.yxy).x,
+                          scene(p+e.yyx).x-scene(p-e.yyx).x));
+}
+float shadow(vec3 p) {
+    float t=.08,visibility=1;
+    for(int i=0;i<28;i++) {
+        float h=staticScene(p+sun*t).x;
+        visibility=min(visibility,12*h/t);
+        t+=clamp(h,.12,3);
+        if(h<.015 || t>55) break;
+    }
+    return clamp(visibility,.16,1);
+}
+vec3 sky(vec3 rd) { return mix(vec3(.56,.65,.70),vec3(.18,.35,.53),clamp(rd.z*.8+.2,0,1)); }
+float materialSeed(vec3 p,int id) {
+    if(id!=4)return 0;
+    float best=1e6,seed=1;
+    for(int i=0;i<CITY_COUNT;i++) {
+        float distance=abs(geometryBox(p-CITY_CENTRE[i],CITY_HALF[i]));
+        if(distance<best){best=distance;seed=float(i+1);}
+    }
+    return seed;
+}
+vec2 facadeTile(vec3 p,vec3 n,float seed) {
+    float u=abs(n.x)>.65?p.y:p.x;
+    return fract(vec2(u+seed*.73,p.z-.5)/vec2(3.0+fract(seed*.37)*1.6,seed==0?4.3:3.2+mod(seed,3)*.35));
+}
+bool windowAt(vec2 tile){return tile.x>.14 && tile.x<.84 && tile.y>.26 && tile.y<.79;}
+bool detailedWindow(vec2 tile,float seed) {
+    int kind=int(mod(seed,4));
+    if(seed==0)return windowAt(tile);
+    if(kind==1)return tile.x>.07 && tile.x<.93 && tile.y>.12 && tile.y<.87;
+    if(kind==2)return tile.x>.23 && tile.x<.71 && tile.y>.27 && tile.y<.73;
+    if(kind==3)return tile.x>.10 && tile.x<.90 && tile.y>.43 && tile.y<.77;
+    return windowAt(tile);
+}
+bool interior(vec3 p,int id){return id==2 && abs(p.x)<11.22 && abs(p.y)<7.22 && p.z>.78 && p.z<25.22;}
+bool fracture(vec3 p,int id){return id==2 && age()>=0 && abs(geometryBreach(p,age(),true))<.07;}
+float detailedThermal(vec3 p,vec3 n,int id) {
+    float seed=materialSeed(p,id),temperature=300,emissivity=.94;
+    if(id==1 || id==8) {
+        temperature=302+3*fbm(p*.16)+.5*noise(p*2);
+        if(p.y< -21 && p.y> -35)temperature=308+4*fbm(p*.12);
+        if(abs(p.x+8)<1.8 && p.y< -21 && p.y> -35 && fract((p.y+35)/1.8)<.52)temperature=299;
+        if(abs(p.x)<31 && p.y> -19 && p.y<19) {
+            temperature=304+1.3*noise(floor(p.xy.xyx/3));
+            if(max(abs(fract(p.x/3)-.5),abs(fract(p.y/3)-.5))>.48)temperature-=1.2;
+        }
+        temperature-=3*(1-shadow(p+n*.06));
+        if(id==8)temperature=297;
+    }
+    if(id==2 || id==4) {
+        vec2 tile=facadeTile(p,n,seed);
+        float variation=fbm(p*.24+seed)*2+noise(p*3)*.35;
+        temperature=297+mod(seed,4)*1.3+6*max(dot(n,sun),0)+variation;
+        if(n.z>.6)temperature=309+mod(seed,3)*2+variation;
+        else if(detailedWindow(tile,seed)) {
+            float room=noise(vec3(floor(p.x/3),floor(p.z/4),seed));
+            temperature=292+5*room+(room>.74?6:0);emissivity=.88+.06*room;
+        }
+        if(interior(p,id))temperature=295+variation;
+        if(fracture(p,id)){temperature=300+variation;emissivity=.96;}
+        if(id==2 && transportMode())temperature+=transportSample(p-n*.6,true).x-300;
+        else if(id==2 && age()>=0)temperature+=180*(1-exp(-age()*5))*exp(-age()*.12)*exp(-dot(p-contact,p-contact)/28);
+        if(n.z>.6 && noise(floor(p*.4)+7.3)>.75)temperature+=3;
+    }
+    if(id==3){temperature=335;emissivity=.72;}
+    if(id==5){temperature=305+160*exp(-max(age(),0)*.23);emissivity=.92;}
+    if(id==6){temperature=300+4*noise(floor(p*.7));emissivity=.88;if(p.z>1.1)temperature-=5;}
+    if(id==7){temperature=300+30*exp(-max(age(),0)*.1);emissivity=.7;}
+    return emissivity*planck(temperature)+(1-emissivity)*planck(255);
+}
+vec3 detailedAlbedo(vec3 p,vec3 n,int id,out float gloss) {
+    gloss=0;float seed=materialSeed(p,id);
+    vec3 c=vec3(.44,.43,.40);
+    if(id==1) {
+        c=vec3(.28,.30,.28);
+        if(p.y< -21 && p.y> -35) {
+            c=vec3(.09,.10,.105)*(1+.14*fbm(p*.3));
+            if((abs(p.y+28)<.10 && fract((p.x+2)/8)<.5)||abs(p.y+21.3)<.06||abs(p.y+34.7)<.06)c=vec3(.65,.65,.57);
+            if(abs(p.x+8)<1.8 && fract((p.y+35)/1.8)<.52)c=vec3(.67,.67,.61);
+        } else if(abs(p.x)<31 && p.y> -19 && p.y<19) {
+            c=vec3(.43,.42,.37)*(1+.08*noise(floor(p/3)));
+            if(max(abs(fract(p.x/3)-.5),abs(fract(p.y/3)-.5))>.48)c*=.72;
+        }
+    }
+    if(id==2 || id==4) {
+        vec2 tile=facadeTile(p,n,seed);
+        int kind=int(mod(seed,4));
+        c=kind==0?vec3(.52,.47,.38):kind==1?vec3(.24,.28,.30):kind==2?vec3(.33,.16,.09):vec3(.35,.36,.33);
+        if(seed==0)c=vec3(.52,.47,.39);
+        c*=.91+.15*fbm(p*2.7+seed);
+        if(kind==2 && seed!=0) {
+            float u=abs(n.x)>.65?p.y:p.x;
+            vec2 brick=fract(vec2(u+mod(floor(p.z/.22),2)*.27,p.z)/vec2(.54,.22));
+            if(brick.x<.035||brick.y<.08)c=mix(c,vec3(.44,.40,.33),.65);
+        }
+        if(n.z>.6)c=vec3(.29,.30,.29)*(1+.1*noise(p*3));
+        else if(detailedWindow(tile,seed)) {
+            c=mix(vec3(.055,.105,.13),vec3(.16,.21,.22),noise(vec3(floor(p.x/3),floor(p.z/4),seed)));
+            gloss=.35;
+            if(abs(tile.x-.49)<.009)c=vec3(.30,.31,.29);
+        }
+        if(tile.y<.04 || tile.y>.96)c*=.7;
+        if(interior(p,id)){c=vec3(.20,.19,.17);gloss=0;}
+        if(fracture(p,id)){c=vec3(.43,.41,.36)*(.8+.3*noise(p*5));gloss=0;}
+        if(id==2 && age()>=0 && p.y< -6.5) {
+            float rim=max(geometryBreach(p,age(),true),0);
+            c=mix(c,vec3(.06,.05,.035),.75*(1-smoothstep(.2,1.3,rim)));
+        }
+    }
+    if(id==3){c=vec3(.45,.49,.5);gloss=.6;}
+    if(id==5)c=vec3(.39,.36,.30)*(.8+.3*noise(p*6));
+    if(id==6){c=mix(vec3(.12,.15,.16),vec3(.43,.39,.32),noise(floor(p*.3)));gloss=.25;if(p.z>1.05)c*=.35;}
+    if(id==7){c=vec3(.13,.11,.08);gloss=.25;}
+    if(id==8)c=vec3(.39,.38,.34);
+    return c;
+}
+float thermalSurface(vec3 p,vec3 n,int id) {
+    if(detailedMode())return detailedThermal(p,n,id);
+    float temperature=300,emissivity=.94;
+    if(id==1) {
+        temperature=303;
+        if(p.y<-21 && p.y>-35) temperature=312;
+        if(abs(p.x)<31 && p.y>-19 && p.y<19) temperature=307;
+        temperature+=noise(p*.35)*1.5;
+    }
+    if(id==2 || id==4) {
+        temperature=299+5*max(dot(n,sun),0);
+        if(n.z>.6) temperature=313;
+        else if(p.z>1) {
+            float u=abs(n.x)>.65?p.y:p.x;
+            vec2 tile=fract(vec2(u+1.95,p.z-.5)/vec2(3.9,4.3));
+            if(tile.x>.10 && tile.x<.90 && tile.y>.19 && tile.y<.83) {
+                temperature=292;emissivity=.90;
+            }
+            if(tile.y<.025 || tile.y>.975) temperature=296;
+        }
+        if(id==2 && transportMode()) {
+            temperature+=transportSample(p-n*.6,true).x-300;
+        } else if(id==2 && age()>=0) {
+            float r=length(p-contact);
+            temperature+=180*(1-exp(-age()*5))*exp(-age()*.12)*exp(-r*r/28);
+        }
+    }
+    if(id==3) {temperature=335;emissivity=.72;}
+    if(id==5) temperature=305+160*exp(-max(age(),0)*.23);
+    return emissivity*planck(temperature)+(1-emissivity)*planck(255);
+}
+vec3 surface(vec3 p,vec3 n,int id,vec3 rd) {
+    vec3 albedo=vec3(.55,.51,.44);
+    float gloss=0;
+    if(id==1) {
+        albedo=vec3(.25,.29,.27);
+        if(abs(p.x)<31 && p.y>-19 && p.y<19) {
+            albedo=vec3(.38,.40,.39);
+            vec2 seam=abs(fract((p.xy+1)/4)-.5);
+            if(max(seam.x,seam.y)>.491) albedo*=.65;
+        }
+        if(p.y<-21 && p.y>-35) {
+            albedo=vec3(.105,.12,.135);
+            if(abs(p.y+28)<.09 && fract((p.x+2)/8)<.5) albedo=vec3(.82,.80,.65);
+            if(abs(p.y+21.3)<.07 || abs(p.y+34.7)<.07) albedo=vec3(.72,.72,.63);
+        }
+    }
+    if(id==2 || id==4) {
+        if(n.z<.6 && p.z>1) {
+            float u=abs(n.x)>.65?p.y:p.x;
+            vec2 tile=fract(vec2(u+1.95,p.z-.5)/vec2(3.9,4.3));
+            bool window=tile.x>.10 && tile.x<.90 && tile.y>.19 && tile.y<.83;
+            if(window) {
+                albedo=mix(vec3(.045,.105,.13),vec3(.12,.24,.30),.5+.5*noise(vec3(floor(u/3.9),floor(p.z/4.3),2)));
+                float reflected=pow(max(dot(reflect(rd,n),sun),0),32);
+                albedo+=vec3(.9,.80,.6)*reflected;
+                gloss=.25;
+                if(abs(tile.x-.5)<.009) albedo=vec3(.22,.24,.24);
+            }
+            if(tile.y<.025 || tile.y>.975) albedo*=.65;
+        } else albedo=vec3(.64,.61,.54);
+        if(id==2 && age()>=0) {
+            float scorch=length((p-contact)/vec3(1,1.4,1.2));
+            albedo=mix(vec3(.035,.028,.022),albedo,smoothstep(3.8,6.2,scorch));
+        }
+    }
+    if(id==3) { albedo=vec3(.62,.65,.67);gloss=.5; }
+    if(id==5) albedo=vec3(.46,.42,.36);
+    if(detailedMode())albedo=detailedAlbedo(p,n,id,gloss);
+    float light=max(dot(n,sun),0);
+    float ao=clamp(staticScene(p+n*.65).x/.65,.35,1);
+    vec3 c=albedo*(vec3(.30,.37,.43)*ao+vec3(1.1,1.0,.84)*light*shadow(p+n*.05));
+    c+=gloss*pow(max(dot(reflect(rd,n),sun),0),48)*vec3(1,.88,.66);
+    if(age()>=0) {
+        float flash=exp(-age()*5)*12+.6*exp(-age()*.25);
+        vec3 toLight=contact+vec3(0,-3,1)-p;
+        c+=albedo*vec3(1,.25,.035)*flash*60/(16+dot(toLight,toLight))*max(dot(n,normalize(toLight)),0);
+    }
+    return c;
+}
+vec2 rayBox(vec3 ro,vec3 rd,vec3 centre,vec3 halfSize) {
+    vec3 inverseDirection=mix(vec3(-1),vec3(1),greaterThanEqual(rd,vec3(0)))/max(abs(rd),vec3(1e-7));
+    vec3 a=(centre-halfSize-ro)*inverseDirection,b=(centre+halfSize-ro)*inverseDirection;
+    vec3 lo=min(a,b),hi=max(a,b);
+    return vec2(max(lo.x,max(lo.y,lo.z)),min(hi.x,min(hi.y,hi.z)));
+}
+
+// Exact tiny-box intersections avoid repeating 22 fragment tests at every
+// sphere-tracing step. Motion remains a prescribed visual arc.
+void fragments(vec3 ro,vec3 rd,inout float distance,inout vec3 normal,inout bool found) {
+    if(age()<0) return;
+    for(int i=0;i<(detailedMode()?44:22);i++) {
+        vec3 v=vec3(hash(vec3(i,1,5))*14-7,-2-hash(vec3(i,2,5))*10,hash(vec3(i,3,5))*7);
+        vec3 initial=contact;
+        if(detailedMode())initial+=vec3((hash(vec3(i,14,2))-.5)*5,0,(hash(vec3(i,15,2))-.5)*4);
+        float land=(v.z+sqrt(v.z*v.z+14*(initial.z-.2)))/7;
+        float t=min(age(),land);
+        vec3 c=initial+v*t+vec3(0,0,-3.5*t*t);
+        float angle=t*(1+float(i)*.11);
+        mat2 rotation=mat2(cos(angle),-sin(angle),sin(angle),cos(angle));
+        vec3 localRo=ro-c,localRd=rd;
+        localRo.xy=rotation*localRo.xy;
+        localRd.xy=rotation*localRd.xy;
+        float halfSize=.14+hash(vec3(i,4,5))*.20;
+        vec3 extent=detailedMode()?vec3(halfSize,.06+.1*hash(vec3(i,7,3)),.15+.35*hash(vec3(i,8,3))):vec3(halfSize);
+        vec2 interval=rayBox(localRo,localRd,vec3(0),extent);
+        if(interval.x>0 && interval.y>=interval.x && interval.x<distance) {
+            distance=interval.x;
+            vec3 q=localRo+distance*localRd;
+            vec3 aq=abs(q)/extent;
+            normal=aq.x>aq.y && aq.x>aq.z?vec3(sign(q.x),0,0):aq.y>aq.z?vec3(0,sign(q.y),0):vec3(0,0,sign(q.z));
+            normal.xy=transpose(rotation)*normal.xy;
+            found=true;
+        }
+    }
+}
+
+// Local extinction and display emission; arbitrary RGB artistic coefficients.
+void medium(vec3 p,out float density,out vec3 color,out vec3 emission,out float thermalSource) {
+    density=0; color=vec3(.20); emission=vec3(0);
+    thermalSource=0;
+    if((pc.fieldGrid.w&1)==0)return;
+    float a=age();
+    if(a<0) {
+        vec3 d=normalize(contact-start),q=p-projectile();
+        float axial=-dot(q,d),radial=length(q+d*axial);
+        float trail=exp(-radial*radial/(.12+.020*axial*axial))*smoothstep(1.5,3,axial)*(1-smoothstep(26,38,axial));
+        if(axial>0) {
+            density=trail*.35;
+            color=vec3(.64,.67,.68);
+            float exhaust=exp(-radial*radial/.15)*exp(-abs(axial-2.4)*2);
+            emission=vec3(7,2.2,.22)*exhaust;
+            if(thermalMode()) {
+                float gas=exhaust*.6;
+                thermalSource=density*planck(315)+gas*planck(1100);
+                density+=gas;
+            }
+        }
+        return;
+    }
+    if(transportMode()) {
+        vec2 local=transportSample(p,false);
+        density=.25*max(local.y,0);
+        thermalSource=density*planck(max(local.x,300));
+        return;
+    }
+    // Moving noise produces rolling billows without a CPU particle system.
+    float top=3+a*1.65;
+    vec3 drift=vec3(a*.65,-2-a*.22,top);
+    vec3 q=p-contact-drift;
+    float radius=2.1+a*.48;
+    float shape=length(q/vec3(radius*1.2,radius,radius*1.05));
+    vec3 stem=p-contact-vec3(a*.35,-2-a*.12,top*.43);
+    float stemShape=length(stem/vec3(1.7+a*.28,1.8+a*.23,2+top*.65));
+    float fireRadius=6.8*(1-exp(-a*9))*exp(-max(a-.75,0)*.82);
+    vec3 fq=p-contact-vec3(0,-2.3,1.2+a*.8);
+    vec3 residual=p-contact-vec3(.4*sin(a*3),-1.5,-.4);
+    float residualShape=length(residual/vec3(2,1.7,3.3));
+    vec3 dq=p-vec3(a*.25,-10,1.1);
+    float dustR=1+10*(1-exp(-a*.75));
+    float dustShape=length(dq/vec3(dustR,dustR*.85,1.2+min(a,3)*.6));
+    if(min(shape,stemShape)>1.55 && length(fq)>fireRadius*1.5 && residualShape>1.4 && dustShape>1.4) return;
+    float n=fbm(p*.63+vec3(a*.08,0,-a*.25));
+    float smoke=max(0,1.05-min(shape,stemShape)+(n-.5)*.9)*smoothstep(0,.5,a)*1.8;
+    if(smoke>0) {
+        density=smoke;
+        color=mix(vec3(.08,.085,.09),vec3(.29,.31,.33),clamp(.4+q.z/(radius*3)+(n-.5)*.7,0,1));
+        color+=vec3(.18,.055,.008)*exp(-a*.6)*exp(-length(p-contact)*.12);
+        if(thermalMode()) thermalSource+=smoke*planck(315+145*exp(-a*.22)*exp(-max(p.z-contact.z,0)*.04));
+    }
+    float fireN=fbm(p*1.05+vec3(a*.5,0,-a*2.5));
+    float flame=0;
+    if(a<3.5 && fireRadius>.02) flame=max(0,1-length(fq)/fireRadius+(fireN-.5)*.85);
+    float burning=max(0,1-residualShape+(fireN-.5)*.65)*smoothstep(.3,.9,a)*exp(-max(a-4,0)*.14);
+    flame=max(flame,burning*.55);
+    if(flame>0) {
+        float hot=clamp(flame*1.3+(fireN-.5)*.6,0,1);
+        vec3 fireColor=mix(vec3(1,.045,.002),vec3(1,.52,.035),smoothstep(.08,.52,hot));
+        fireColor=mix(fireColor,vec3(1,.9,.50),smoothstep(.58,.94,hot));
+        emission+=fireColor*flame*4.5;
+        color=mix(color,vec3(.42,.08,.008),clamp(flame,0,1));
+        density+=flame*.9;
+        if(thermalMode()) thermalSource+=flame*.9*planck(700+650*hot);
+    }
+    // Broad, low dust cloud rather than a claimed physical shock front.
+    float dust=max(0,1-dustShape+(n-.5)*.6)*smoothstep(0,.45,a)*.7;
+    if(dust>0) {
+        color=(color*density+vec3(.42,.36,.28)*dust)/(density+dust);
+        density+=dust;
+        if(thermalMode()) thermalSource+=dust*planck(305);
+    }
+}
+vec3 render(vec2 pixel,out float linear) {
+    linear=0;
+    vec2 uv=(pixel-.5*vec2(pc.image.xy))/float(pc.image.y);
+    uv.y=-uv.y;
+    vec3 ro=pc.camera.xyz,forward=normalize(pc.target.xyz-ro);
+    vec3 right=normalize(cross(forward,vec3(0,0,1))),up=cross(right,forward);
+    vec3 rd=normalize(forward*pc.camera.w+right*uv.x+up*uv.y);
+    float t=0;
+    float limit=detailedMode()?900:280;
+    vec2 hit=vec2(1e4,0);
+    for(int i=0;i<200;i++) {
+        hit=scene(ro+rd*t);
+        if(hit.x<.012 || t>limit) break;
+        t+=max(hit.x*.85,.008);
+    }
+    vec3 c=thermalMode()?vec3(planck(mix(260,245,clamp(rd.z+.3,0,1)))):sky(rd);
+    vec3 fragmentNormal=vec3(0);
+    bool fragmentHit=false;
+    if(!(t<limit && hit.x<.035)) {
+        float ground=rd.z<-.0001?-ro.z/rd.z:1e6;
+        if(detailedMode() && ground<2000){t=ground;hit=vec2(0,1);}
+        else {t=limit;hit=vec2(1e4,0);}
+    }
+    fragments(ro,rd,t,fragmentNormal,fragmentHit);
+    if((hit.x<.035 || fragmentHit)) {
+        vec3 p=ro+rd*t,n=fragmentHit?fragmentNormal:normalAt(p);
+        if(fragmentHit) hit.y=5;
+        if(thermalMode()) c=vec3(thermalSurface(p,n,int(hit.y+.5)));
+        else {
+            c=surface(p,n,int(hit.y+.5),rd);
+            c=mix(c,sky(rd),1-exp(-t*.0014));
+        }
+    } else t=limit;
+    vec2 interval=rayBox(ro,rd,vec3(-4,-18,27),vec3(52,36,30));
+    float entry=max(interval.x,0),exit=min(interval.y,t);
+    vec3 accum=vec3(0);float trans=1;
+    const float stepSize=.45;
+    // Pixel-stable spatial dither, independent of frame number (no time flicker).
+    float jitter=hash(vec3(floor(pixel),5));
+    float march=entry+stepSize*jitter;
+    for(int i=0;i<300;i++) {
+        if(march>=exit || trans<.008) break;
+        vec3 p=ro+rd*march;
+        float density,thermalSource;vec3 localColor,emission;
+        medium(p,density,localColor,emission,thermalSource);
+        float alpha=1-exp(-density*stepSize);
+        if(thermalMode()) accum+=vec3(trans*alpha*thermalSource/max(density,1e-8));
+        else accum+=trans*(alpha*localColor+emission*stepSize);
+        trans*=1-alpha;
+        march+=stepSize;
+    }
+    c=accum+trans*c;
+    if(thermalMode()) {
+        linear=c.x;
+        if(sensorMode())return vec3(0);
+        float low=planck(pc.thermal.y),high=planck(pc.thermal.z);
+        float normalized=clamp((c.x-low)/max(high-low,1e-8),0,1);
+        return vec3(log(1+pc.thermal.w*normalized)/log(1+pc.thermal.w));
+    }
+    // Display transform only; these pixels are not radiometrically calibrated.
+    c*=pc.time.z;
+    c=clamp((c*(2.51*c+.03))/(c*(2.43*c+.59)+.14),0,1);
+    return pow(c,vec3(1/2.2));
+}
+void main() {
+    ivec2 xy=ivec2(gl_GlobalInvocationID.xy)+ivec2(0,pc.tile.x);
+    if(any(greaterThanEqual(xy,pc.image.xy))) return;
+    int samples=int(pc.time.w);
+    vec3 color=vec3(0);
+    float linear=0;
+    for(int sampleIndex=0;sampleIndex<samples;sampleIndex++) {
+        vec2 offset=samples==1?vec2(.5):vec2(.25+.5*float(sampleIndex%2),.25+.5*float(sampleIndex/2));
+        float value; color+=render(vec2(xy)+offset,value)/samples;linear+=value/samples;
+    }
+    if(sensorMode())rawRadiance[xy.y*pc.image.x+xy.x]=linear;
+    rgba[xy.y*pc.image.x+xy.x]=packUnorm4x8(vec4(color,1));
+}

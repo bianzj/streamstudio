@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "pipeline": "airfield-day",
+  "engine": "../../../build/histream-animation/runtime/Release/histream.exe",
+  "townCase": "D:/cases/StreamStudio/supplemental/impact_gpu_20261107/mwir_town_coupled_v5_20261109",
+  "actors": "runway-day.actors.json",
+  "ffmpeg": "C:/Users/jiank/AppData/Local/kzip_sogou/ffmpeg.exe",
+  "spinupDays": 12,
+  "parallel": 4,
+  "videoViews": ["overview", "vehicle_view"],
+  "videoEncoder": "auto",
+  "deck": true,
+  "output": "C:/cases/StreamStudio/airfield_day_example_new"
+}

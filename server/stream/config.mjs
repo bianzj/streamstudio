@@ -58,9 +58,11 @@ export function mapStreamScenePaths(scene, convert) {
   if (era5 && String(era5.pack || '').trim()) era5.pack = convert(era5.pack)
   const assimilation = scene.assimilation
   if (assimilation && typeof assimilation === 'object') {
-    for (const key of ['data', 'optical']) if (String(assimilation[key] || '').trim()) assimilation[key] = convert(assimilation[key])
+    for (const key of ['data', 'optical', 'uncertainty', 'covariance', 'qa', 'opticalUncertainty', 'opticalQa'])
+      if (String(assimilation[key] || '').trim()) assimilation[key] = convert(assimilation[key])
     for (const view of Array.isArray(assimilation.views) ? assimilation.views : [])
-      if (view && String(view.data || '').trim()) view.data = convert(view.data)
+      for (const key of ['data', 'uncertainty', 'qa'])
+        if (view && String(view[key] || '').trim()) view[key] = convert(view[key])
   }
   if (String(scene.outputRoot || '').trim()) scene.outputRoot = convert(scene.outputRoot, 'output')
   return scene
@@ -207,7 +209,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
   }
 
   // Run mode: 直接模拟 or 同化. Only the data and the observation kind are user choices; observation and background
-  // errors, iteration and controls are engine defaults (models/stream/app/assimilation.cpp).
+  // Explicit observation errors/QA override engine defaults; controls remain engine-managed.
   function assimilationKind(scene) {
     const source = scene.assimilation
     if (!source || typeof source !== 'object' || source.mode !== 'assimilate') return 'none'
@@ -217,6 +219,34 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
   function buildAssimilation(source, observation, { thermalEnabled, opticalEnabled }) {
     const label = observation === 'brightness' ? '亮温观测文件' : observation === 'lst' ? '地表温度观测文件' : '组分温度观测文件'
     const block = { observation, data: existingFile(source.data, label) }
+    for (const key of ['uncertainty', 'covariance', 'qa', 'opticalUncertainty', 'opticalQa'])
+      if (String(source[key] || '').trim()) block[key] = existingFile(source[key], `同化 ${key}`)
+    if (block.uncertainty && block.covariance) throw new Error('uncertainty 与 covariance 只能选一个')
+    for (const key of ['sigmaBrightnessK', 'sigmaLstK', 'sigmaComponentK', 'sigmaReflectance', 'lstWavelengthUm']) {
+      if (source[key] === undefined) continue
+      const value = source[key]
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)
+        throw new Error(`assimilation.${key} 须为正数`)
+      if (key === 'lstWavelengthUm' && (value < 3 || value > 25)) throw new Error('LST 波长须在 3–25 μm')
+      block[key] = value
+    }
+    if (source.rejectQaBits !== undefined) {
+      if (!Number.isInteger(source.rejectQaBits) || source.rejectQaBits < 0 || source.rejectQaBits > 65535)
+        throw new Error('rejectQaBits 须为 uint16 位掩码')
+      block.rejectQaBits = source.rejectQaBits
+    }
+    const expectedLevel = observation === 'brightness' ? 'canopy' : 'surface'
+    if (source.observationLevel !== undefined && source.observationLevel !== expectedLevel)
+      throw new Error(`observationLevel 须为 ${expectedLevel}；尚无 TOA 大气算子`)
+    block.observationLevel = expectedLevel
+    for (const key of ['sourceIds', 'priorSourceIds']) {
+      if (source[key] === undefined) continue
+      if (!Array.isArray(source[key]) || source[key].some(id => typeof id !== 'string' || !id.trim()))
+        throw new Error(`${key} 须为非空来源 ID 数组`)
+      block[key] = source[key]
+    }
+    if ((block.sourceIds || []).some(id => (block.priorSourceIds || []).includes(id)))
+      throw new Error('观测与先验 source IDs 重叠，不能假设误差独立')
     if (observation === 'brightness' && !thermalEnabled) throw new Error('同化亮温需要启用热红外波段（观测文件每个波段对应一个热红外波段）')
     if (String(source.optical || '').trim()) {
       if (!opticalEnabled) throw new Error('光学反射率观测需要启用光学波段（文件每个波段对应一个光学波段）')
@@ -227,9 +257,14 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     const used = views.filter((item) => String(item?.data || '').trim())
     if (used.length) block.views = used.map((item, index) => ({
       data: existingFile(item.data, `附加视角 ${index + 1} 亮温文件`),
+      ...Object.fromEntries(['uncertainty', 'qa'].filter(key => String(item[key] || '').trim())
+        .map(key => [key, existingFile(item[key], `附加视角 ${index + 1} ${key}`)])),
       vza: inputField(item.vza, `附加视角 ${index + 1} 天顶角 VZA`, { required: true }),
       vaa: inputField(item.vaa, `附加视角 ${index + 1} 方位角 VAA`, { required: true })
     }))
+    const observationFiles = [block.data, ...(block.views || []).map(view => view.data)]
+    if (new Set(observationFiles.map(path => path.toLowerCase())).size !== observationFiles.length)
+      throw new Error('同一个亮温文件不能作为多个独立视角重复使用')
     return block
   }
 

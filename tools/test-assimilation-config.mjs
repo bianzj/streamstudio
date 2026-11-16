@@ -1,0 +1,41 @@
+import assert from 'node:assert/strict'
+import { test, after } from 'node:test'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createProjectStore, mapStreamScenePaths } from '../server/stream/config.mjs'
+
+const dir = mkdtempSync(join(tmpdir(), 'stream-assimilation-contract-'))
+after(() => rmSync(dir, { recursive: true }))
+const file = join(dir, 'input.tif')
+writeFileSync(file, '') // Config validation only; native tests exercise real rasters.
+const store = createProjectStore({ normalizeHostPath: p => p, windowsPath: p => p })
+const scene = extra => ({ overpass: '2019-07-15T04:00:00Z', locationSource: 'input',
+  surface: { type: { file }, lai: { value: 2 }, latitude: { value: 40 }, longitude: { value: 116 } },
+  view: { vza: { value: 0 }, vaa: { value: 0 } }, optical: { enabled: false }, thermal: { enabled: false },
+  temperature: { mode: 'rt', components: Object.fromEntries(['soilSunlit','soilShaded','leafSunlit','leafShaded'].map(k => [k, { value: 300 }])) },
+  assimilation: { mode: 'assimilate', observation: 'components', data: file, ...extra } })
+const compile = extra => store.buildEngineConfig(scene(extra), { outputDir: dir, dataDir: dir })
+
+test('forward explicit errors, QA, wavelength and provenance', () => {
+  const as = compile({ uncertainty: file, qa: file, sigmaComponentK: 3, rejectQaBits: 256,
+    lstWavelengthUm: 12, observationLevel: 'surface', sourceIds: ['scene'], priorSourceIds: ['forecast'] }).assimilation
+  assert.equal(as.uncertainty, file)
+  assert.equal(as.qa, file)
+  assert.equal(as.sigmaComponentK, 3)
+  assert.equal(as.lstWavelengthUm, 12)
+  assert.deepEqual(as.sourceIds, ['scene'])
+})
+test('reject invalid or dependent errors', () => {
+  for (const extra of [{ sigmaComponentK: 0 }, { rejectQaBits: 1.2 }, { lstWavelengthUm: 0 },
+    { observationLevel: 'toa' }, { sourceIds: ['scene'], priorSourceIds: ['scene'] }])
+    assert.throws(() => compile(extra))
+})
+test('rewrite every assimilation file path', () => {
+  const input = { assimilation: { data: 'a', uncertainty: 'b', qa: 'c', optical: 'd',
+    opticalUncertainty: 'e', opticalQa: 'f', views: [{ data: 'g', uncertainty: 'h', qa: 'i' }] } }
+  mapStreamScenePaths(input, p => `mapped/${p}`)
+  assert.equal(input.assimilation.uncertainty, 'mapped/b')
+  assert.equal(input.assimilation.opticalQa, 'mapped/f')
+  assert.equal(input.assimilation.views[0].uncertainty, 'mapped/h')
+})

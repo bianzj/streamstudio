@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "pipeline": "native-scene",
+  "engine": "../../../build/histream-animation/runtime/Release/histream.exe",
+  "scene": "minimal-scene.json",
+  "output": "C:/cases/StreamStudio/scene_animation_example_new"
+}

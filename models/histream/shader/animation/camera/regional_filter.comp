@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x=8,local_size_y=8)in;
+layout(std430,binding=0)readonly buffer Source{vec4 source[];};
+layout(std430,binding=1)writeonly buffer Filtered{vec4 filtered[];};
+layout(push_constant)uniform P{ivec4 image;vec4 region;vec4 sigma;vec4 activation;}pc;
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,pc.image.xy)))return;
+    vec2 uv=(vec2(p)+.5)/vec2(pc.image.xy),q=(uv-pc.region.xy)/pc.region.zw;
+    float centre=exp(-.5*dot(q,q))*pc.activation.x,edge=smoothstep(.25,1.,length(uv*2.-1.)*.70710678);
+    vec2 sigma=sqrt(pow(pc.sigma.xy*centre,vec2(2))+pow(pc.sigma.zw*edge,vec2(2)));vec4 sum=vec4(0),weights=vec4(0);
+    int a=int(ceil(3.*sigma.x)),b=int(ceil(3.*sigma.y));
+    for(int k=-12;k<=12;k++){
+        vec4 w=vec4(0);if(abs(k)<=a)w.x=sigma.x<.01?(k==0?1.:0.):exp(-float(k*k)/(2.*sigma.x*sigma.x));
+        if(abs(k)<=b)w.yzw=vec3(sigma.y<.01?(k==0?1.:0.):exp(-float(k*k)/(2.*sigma.y*sigma.y)));
+        if(all(equal(w,vec4(0))))continue;ivec2 r=clamp(p+(pc.image.z==0?ivec2(k,0):ivec2(0,k)),ivec2(0),pc.image.xy-1);sum+=w*source[r.y*pc.image.x+r.x];weights+=w;
+    }filtered[p.y*pc.image.x+p.x]=sum/max(weights,vec4(1e-9));
+}

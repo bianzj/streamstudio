@@ -1,0 +1,14 @@
+{
+  "backend": "mesh",
+  "schemaVersion": 1,
+  "coordinates": {"units": "m", "upAxis": "Z", "handedness": "right"},
+  "width": 64, "height": 48, "samples": 1,
+  "materials": [
+    {"id": "ground", "color": [0.35, 0.4, 0.3], "emissivity": 0.95, "temperatureK": 295},
+    {"id": "prop", "color": [0.8, 0.18, 0.07], "emissivity": 0.9, "temperatureK": 330}
+  ],
+  "assets": [{"id": "sample", "path": "minimal.obj", "sha256": "6f91cdb2c6890d9af7d0085b2553af55e8696f31b1d557e710eaddab4a7431a1", "upAxis": "Z", "units": "m"}],
+  "instances": [{"id": "sample", "asset": "sample", "transform": [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]}],
+  "cameras": [{"id": "view", "position": [0,-6,4], "target": [0,0,0.3], "up": [0,0,1], "fovYDegrees": 45}],
+  "thermal": {"wavelengthMicrometers": 10, "displayMinK": 280, "displayMaxK": 350, "skyK": 280}
+}

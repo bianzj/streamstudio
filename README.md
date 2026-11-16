@@ -2,7 +2,7 @@
 
 Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两个相互独立的引擎：STREAM 影像级引擎（`stream.exe`）和 STREAM 的高分辨率三维扩展 HiStream（`histream.exe`）。源码、编译结果和运行文件均集中在本项目目录。
 
-当前版本 **2.0.1**，发布内容与验证范围见 [2.0.1 发布说明](docs/release-2.0.1.md)。
+当前版本 **2.0.1**，发布内容与验证范围见 [2.0.1 发布说明](docs/release-2.0.1.md)。开发版正在测试场景动画 GUI 集成与 impact-v1，尚未发布，变更草稿见 [下一版本更新说明（草稿）](docs/release-next-draft.md)。
 
 下载：[Windows 安装程序、手册与案例包](https://github.com/bianzj/streamstudio/releases/tag/v2.0.1)。
 
@@ -15,14 +15,15 @@ Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两�
 | 内容 | 入口 |
 | --- | --- |
 | 用户安装包、两本手册、九个随附案例（四个已核验影像案例 + 五个三维培训案例） | D:/releases/streamstudio/2.0.1；见 [案例目录](docs/example-library.md) |
-| 五个原有内置精选案例 | 安装后从案例库打开；源码索引 [assets/examples/catalog.json](assets/examples/catalog.json) |
+| 五个原有内置精选案例；开发版另含场景动画示例 `impact_v1_building`（测试中） | 安装后从案例库打开；源码索引 [assets/examples/catalog.json](assets/examples/catalog.json) |
 | 研究案例与导航 | D:/cases/StreamStudio；原 D:/examples 已于 2026-11-04 并入发布目录 |
 | 新增研究案例：玉米、雨林、城市街区、延庆山地、光伏草场 | [在线图文案例库](docs/cases/README.md)；含图文报告；001–004附工程输入，005为宣传材料 |
 | 测试脚本和验收摘要 | tools/check-user-release-cases.mjs、[本次验收范围](docs/testing/user-release-cases-20261101.md) |
+| 场景动画（**研究功能**；开发版已接入 GUI，测试中，不在 2.0.1 安装包内）与机场日变化 | GUI“解决方案 → 研究功能 → 场景动画”、用户手册第 18 章；源码与命令行见 [tools/scene-animation](tools/scene-animation/CURRENT_FEATURES.md)。`authored`/`rigid-v1` 为作者设定演示，`impact-v1` 为经验模型估算，均未经独立验证 |
 
 随附四例为 MODIS-ERA5、Landsat-ERA5、MODIS-LSCT、Landsat-LSCT；默认 4×4 区域已通过影像引擎检查。请先将案例文件夹复制到全英文可写路径，再在软件中打开 project.json；当前 ERA5 读取不能保证支持中文路径。LSCT 条目读取已有组分温度用于正向模拟，不做温度反演。
 
-本次不改安装器和版本号。干净环境安装、全部三维模式及科学精度等尚未完成的验收仍保留原范围，见 [2.0.1 发布说明](docs/release-2.0.1.md)。
+干净环境安装、全部三维模式及科学精度等尚未完成的验收仍保留原范围，见 [2.0.1 发布说明](docs/release-2.0.1.md)。
 
 ## 命名约定
 

@@ -50,7 +50,10 @@ void main()
         const FragmentRecord fragment = records[pixel * pc.raster.z + i];
         if ((fragment.cameraSide & REPLICA_BIT) == 0u)
             atomicAdd(totalCounts[fragment.cameraSide], 1u);
-        if (fragment.depthBits < nearestDepth) {
+        // A-buffer slot order is a GPU scheduling detail. Equal depths must
+        // use the same stable side-ID tie break as visibility_resolve.
+        if (fragment.depthBits < nearestDepth ||
+            (fragment.depthBits == nearestDepth && fragment.cameraSide < nearestSide)) {
             nearestDepth = fragment.depthBits;
             nearestSide = fragment.cameraSide;
         }

@@ -1,0 +1,651 @@
+{
+  "assets": [
+    {
+      "id": "office",
+      "path": "asset_0.obj",
+      "sha256": "e2c3f66f4896ea630aa104af86aee131d804d3671da0617d39a34060b87b39bc",
+      "units": "m",
+      "upAxis": "Z"
+    },
+    {
+      "id": "neighbor",
+      "path": "asset_1.obj",
+      "sha256": "adfed68dc5f3ace383ac15887c4852dfd8f27993bb6d4d833e985e49a89355c5",
+      "units": "m",
+      "upAxis": "Z"
+    },
+    {
+      "id": "ground",
+      "path": "asset_2.obj",
+      "sha256": "3bdb2e9d7bfdb168d236127ee2421c226630b21aa706f11ea655ba0138f86189",
+      "units": "m",
+      "upAxis": "Z"
+    }
+  ],
+  "backend": "meshSequence",
+  "backgroundField": {
+    "expectedTimestamp": "2019-06-29T12:00:00+08:00",
+    "path": "background/field.json",
+    "sha256": "f993cc6d17feaa1d028927ac8cddd280b2da6be43ff92e8797111859ce793291"
+  },
+  "cameras": [
+    {
+      "fovYDegrees": 43,
+      "id": "street",
+      "position": [
+        43,
+        -54,
+        19
+      ],
+      "target": [
+        10,
+        7,
+        11
+      ],
+      "up": [
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "fovYDegrees": 44,
+      "id": "roof",
+      "position": [
+        42,
+        -40,
+        48
+      ],
+      "target": [
+        9,
+        7,
+        12
+      ],
+      "up": [
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "fovYDegrees": 48,
+      "id": "rear",
+      "position": [
+        -31,
+        27,
+        22
+      ],
+      "target": [
+        10,
+        7,
+        11
+      ],
+      "up": [
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "fovYDegrees": 55,
+      "id": "flight_side",
+      "position": [
+        -20,
+        -38,
+        22
+      ],
+      "target": [
+        13,
+        4,
+        12
+      ],
+      "up": [
+        0,
+        0,
+        1
+      ]
+    }
+  ],
+  "coordinates": {
+    "handedness": "right",
+    "units": "m",
+    "upAxis": "Z"
+  },
+  "height": 720,
+  "instances": [
+    {
+      "asset": "office",
+      "id": "target",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        0,
+        0.0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "ground",
+      "id": "ground",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        0,
+        0.0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_0",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        -39,
+        0.0,
+        1.0,
+        0,
+        3,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_1",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        39,
+        0.0,
+        1.0,
+        0,
+        3,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_2",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        -39,
+        0.0,
+        1.0,
+        0,
+        32,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_3",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        0,
+        0.0,
+        1.0,
+        0,
+        34,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_4",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        38,
+        0.0,
+        1.0,
+        0,
+        34,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_5",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        -38,
+        0.0,
+        1.0,
+        0,
+        -48,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_6",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        0,
+        0.0,
+        1.0,
+        0,
+        -49,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_7",
+      "transform": [
+        1.0,
+        -0.0,
+        0,
+        39,
+        0.0,
+        1.0,
+        0,
+        -48,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_8",
+      "transform": [
+        0.9800665778412416,
+        -0.19866933079506122,
+        0,
+        -70,
+        0.19866933079506122,
+        0.9800665778412416,
+        0,
+        10,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "asset": "neighbor",
+      "id": "neighbor_9",
+      "transform": [
+        0.9887710779360422,
+        0.14943813247359922,
+        0,
+        68,
+        -0.14943813247359922,
+        0.9887710779360422,
+        0,
+        8,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "color": [
+        0.55,
+        0.53,
+        0.49
+      ],
+      "emissivity": 0.94,
+      "id": "concrete",
+      "temperatureK": 303
+    },
+    {
+      "color": [
+        0.42,
+        0.25,
+        0.18
+      ],
+      "emissivity": 0.94,
+      "id": "brick",
+      "temperatureK": 307
+    },
+    {
+      "color": [
+        0.48,
+        0.46,
+        0.41
+      ],
+      "emissivity": 0.94,
+      "id": "interior",
+      "temperatureK": 298
+    },
+    {
+      "color": [
+        0.1,
+        0.18,
+        0.22
+      ],
+      "emissivity": 0.84,
+      "id": "glass",
+      "temperatureK": 294
+    },
+    {
+      "color": [
+        0.16,
+        0.22,
+        0.25
+      ],
+      "emissivity": 0.84,
+      "id": "glass_warm",
+      "temperatureK": 298
+    },
+    {
+      "color": [
+        0.12,
+        0.14,
+        0.15
+      ],
+      "emissivity": 0.65,
+      "id": "metal",
+      "temperatureK": 302
+    },
+    {
+      "color": [
+        0.48,
+        0.49,
+        0.47
+      ],
+      "emissivity": 0.93,
+      "id": "roof",
+      "temperatureK": 309
+    },
+    {
+      "color": [
+        0.29,
+        0.32,
+        0.32
+      ],
+      "emissivity": 0.88,
+      "id": "plant",
+      "temperatureK": 306
+    },
+    {
+      "color": [
+        0.12,
+        0.13,
+        0.14
+      ],
+      "emissivity": 0.96,
+      "id": "asphalt",
+      "temperatureK": 310
+    },
+    {
+      "color": [
+        0.45,
+        0.45,
+        0.43
+      ],
+      "emissivity": 0.94,
+      "id": "pavement",
+      "temperatureK": 305
+    },
+    {
+      "color": [
+        0.78,
+        0.77,
+        0.66
+      ],
+      "emissivity": 0.94,
+      "id": "marking",
+      "temperatureK": 310
+    }
+  ],
+  "provenance": {
+    "assetOrigin": "Original synthetic architectural reference generated by make_mesh_case.py",
+    "license": "CC0-1.0",
+    "temperatureSource": "prescribed per-material values, not energy balance",
+    "sampleCase": "impact-v1 sample 2026-11-12",
+    "parameters": "generic example values"
+  },
+  "samples": 1,
+  "schemaVersion": 1,
+  "sequence": {
+    "camera": "flight_side",
+    "chunks": {
+      "path": "sequence_chunks.json",
+      "sha256": "739bc612a11ed1c25cab81de61b1356bd7c37b4196436b1d1145c0721b4d19d6"
+    },
+    "exportFrames": [
+      1,
+      30,
+      34,
+      40,
+      72,
+      144,
+      288
+    ],
+    "fixedDisplayMaxK": 480,
+    "fixedDisplayMinK": 280,
+    "flowOrigin": [
+      -22,
+      -28,
+      0
+    ],
+    "fps": 24,
+    "fractureMaterial": {
+      "color": [
+        0.58,
+        0.55,
+        0.49
+      ],
+      "emissivity": 0.94,
+      "id": "fracture",
+      "temperatureK": 300
+    },
+    "fragmentLinks": {
+      "path": "sequence_fragmentLinks.json",
+      "sha256": "b27c85cb166cf8e5dc141d4358a32fadd824babc986e83b1687e06864b35e962"
+    },
+    "fragments": {
+      "path": "sequence_fragments.obj",
+      "sha256": "de3dc2ae3e62594fad81c20170fc1ce3f96e65a01d16fe8236724f87617c6de2"
+    },
+    "frameCount": 288,
+    "landingArea": {
+      "lower": [
+        -5,
+        -24
+      ],
+      "upper": [
+        27,
+        -6.7
+      ]
+    },
+    "media": true,
+    "motionBackend": "impact-v1",
+    "projectileAppearance": "separated-v2",
+    "projectileStart": [
+      27,
+      -24,
+      23
+    ],
+    "remainder": {
+      "path": "sequence_remainder.obj",
+      "sha256": "53fb754913241e09fe5d72897fe0b4c95f7da335ff4c0b54c188a2cc739d308f"
+    },
+    "remainderLinks": {
+      "path": "sequence_remainderLinks.json",
+      "sha256": "cd2df85dbba663e50d66c315cf4c33a0a0f8953bd72d21c947455bcacd38f605"
+    },
+    "scope": "impact-v1 empirical event estimate with generic example parameters: Young penetration, Kingery-Bulmash blast load, impulse failure of preset blocks, rigid fragments, energy-budget fireball/heat/dust; not independently validated",
+    "sensor": true,
+    "sensorOptions": {
+      "agcMinimumSpanKelvin": 60,
+      "binning": 1,
+      "blurSigma": 0.35,
+      "fixedPatternKelvin": 0.03,
+      "logarithmicDisplay": true,
+      "noiseKelvin": 0.05
+    },
+    "sourcePoint": [
+      10.2,
+      -0.35,
+      12
+    ],
+    "targetInstance": "target",
+    "wind": [
+      0.8,
+      0.15
+    ],
+    "firstFrame": 1,
+    "lastFrame": 288,
+    "optical": true,
+    "impactPhysics": {
+      "projectile": {
+        "massKg": 250,
+        "diameterM": 0.34,
+        "lengthM": 3.0,
+        "speedMetersPerSecond": 340,
+        "trajectory": "straight",
+        "noseCoefficientN": 0.85
+      },
+      "charge": {
+        "massKg": 100,
+        "tntEquivalence": 1.0
+      },
+      "fuze": {
+        "mode": "delay",
+        "delaySeconds": 0.005
+      },
+      "targetMaterial": {
+        "wall": {
+          "type": "concrete",
+          "thicknessM": 0.3,
+          "youngS": 0.9,
+          "criticalImpulsePaS": 2000,
+          "densityKgPerM3": 2300
+        }
+      },
+      "fragments": {
+        "minimumMassKg": 2,
+        "minimumThicknessM": 0.05
+      },
+      "energySplit": {
+        "blast": 0.6,
+        "heat": 0.3
+      },
+      "dust": {
+        "massFraction": 0.01,
+        "massExtinctionM2PerKg": 200
+      },
+      "fireball": {
+        "peakTemperatureK": 2000
+      },
+      "ambientTemperatureK": 288,
+      "presentationTimeScale": 0.2
+    },
+    "additionalCameras": [
+      {
+        "id": "street",
+        "camera": "street"
+      }
+    ]
+  },
+  "thermal": {
+    "displayMaxK": 330,
+    "displayMinK": 280,
+    "skyK": 275,
+    "wavelengthMicrometers": 10
+  },
+  "width": 1280
+}

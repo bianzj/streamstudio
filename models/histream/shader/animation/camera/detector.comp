@@ -1,0 +1,25 @@
+#version 450
+layout(local_size_x=8,local_size_y=8)in;
+layout(std430,binding=0)readonly buffer Exposure{vec4 exposed[];};
+layout(std430,binding=1)readonly buffer Previous{vec4 previous[];};
+layout(std430,binding=2)writeonly buffer Response{vec4 response[];};
+layout(std430,binding=3)writeonly buffer Quantized{vec4 quantized[];};
+layout(std430,binding=4)writeonly buffer Codes{uvec4 codes[];};
+layout(push_constant)uniform P{ivec4 image;vec4 conversion;vec4 noise;ivec4 flags;}pc;
+uint hash(uint x){x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;return x;}
+float u(uint seed){return (float(hash(seed)&0xffffffu)+.5)/16777216.;}
+float gaussian(uint seed){return sqrt(-2.*log(u(seed)))*cos(6.28318530718*u(seed+137u));}
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,pc.image.xy)))return;int j=p.y*pc.image.x+p.x;
+    vec3 analog=pc.image.w!=0?exposed[j].xyz:mix(previous[j].xyz,exposed[j].xyz,pc.conversion.x);
+    response[j]=vec4(analog,0);vec3 signal=analog;uint base=uint(p.x)*1973u+uint(p.y)*9277u+uint(pc.flags.y)*26699u;
+    for(int c=0;c<3;c++){
+        uint seed=base+(pc.flags.x==0?0u:uint(c)*45893u);
+        float fixedGain=1.+pc.noise.y*gaussian(seed+31u),offset=pc.noise.z*gaussian(seed+73u);
+        float read=pc.noise.x*gaussian(seed+uint(pc.image.z)*104729u+79u);
+        float row=pc.noise.w*gaussian(uint(p.y)*17077u+uint(pc.image.z)*1009u+uint(pc.flags.y));
+        signal[c]=analog[c]*max(.1,fixedGain)+offset+read+row;
+    }
+    vec3 code=round(clamp((signal-pc.conversion.y)/max(pc.conversion.z-pc.conversion.y,1e-8),0.,1.)*pc.conversion.w);
+    codes[j]=uvec4(uvec3(code),0);quantized[j]=vec4(code/pc.conversion.w*(pc.conversion.z-pc.conversion.y)+pc.conversion.y,0);
+}

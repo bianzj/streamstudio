@@ -104,7 +104,9 @@ void main()
     for (uint i = 1u; i < count; ++i) {
         const FragmentRecord value = localRecords[i];
         uint j = i;
-        while (j > 0u && localRecords[j - 1u].depthBits > value.depthBits) {
+        while (j > 0u && (localRecords[j - 1u].depthBits > value.depthBits ||
+               (localRecords[j - 1u].depthBits == value.depthBits &&
+                localRecords[j - 1u].cameraSide > value.cameraSide))) {
             localRecords[j] = localRecords[j - 1u];
             --j;
         }

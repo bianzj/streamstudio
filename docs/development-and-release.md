@@ -8,6 +8,6 @@
 - 开发文档在 C 盘维护；供用户阅读的手册可以随发布包提供副本。测试脚本、验收摘要在 C 盘项目；原始测试日志和输出在项目忽略目录 .test/，不随用户包分发。
 - 可行案例必须具备完整输入、相对路径、操作说明和明确的运行核验范围。文件齐全或哈希相同只能证明文件完整性，不能替代运行检查或科学精度验证。
 
-Stream Studio 开发入口：C:/work/streamstudio。用户交付入口：D:/releases/streamstudio/2.0.1。本次只优化现有 2.0.1 的本机交付资料，保留原安装器，不创建新软件版本、不改动已发布 GitHub Release。
+Stream Studio 开发入口：C:/work/streamstudio。用户交付入口：D:/releases/streamstudio/2.0.1。2026-11-12 起开发版加入场景动画 GUI 集成与 impact-v1，仍在测试阶段：版本号保持 2.0.1，不构建正式安装包、不创建新的交付目录；变更草稿见 [下一版本更新说明（草稿）](release-next-draft.md)。将来发布时可用 `tools/prepare_user_release.py` 生成交付目录（尚未实际使用）。
 
 详见 [案例验收记录](testing/user-release-cases-20261101.md)。

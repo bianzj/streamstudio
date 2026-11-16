@@ -1,0 +1,20 @@
+#version 450
+layout(local_size_x=8,local_size_y=8)in;
+layout(std430,binding=0)readonly buffer Signal{vec4 signal[];};
+layout(std430,binding=1)writeonly buffer Display{uint rgba[];};
+layout(push_constant)uniform P{ivec4 image;vec4 stretch;vec4 options;}pc;
+vec3 pixel(ivec2 p){
+    p=clamp(p,ivec2(0),pc.image.xy-1);vec3 v=signal[p.y*pc.image.x+p.x].xyz;
+    if(pc.stretch.w<.5){
+        if(pc.options.x>.5)v=vec3(clamp((v.x-pc.stretch.x)/max(pc.stretch.y-pc.stretch.x,1e-8),0.,1.));
+        else {float knee=max(pc.stretch.z,1e-6);float q=clamp(log(1.+max(0.,v.x-pc.stretch.x)/knee)/log(1.+max(pc.stretch.y-pc.stretch.x,1e-8)/knee),0.,1.);v=vec3(pow(q,.92));}
+    }
+    else {v=max(v*pc.options.w,vec3(0));v=pow(v/(1.+v),vec3(1./2.2));}
+    return round(clamp(v,0.,1.)*pc.options.z)/pc.options.z;
+}
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,pc.image.zw)))return;
+    vec2 q=(vec2(p)+.5)*vec2(pc.image.xy)/vec2(pc.image.zw)-.5;ivec2 a=ivec2(floor(q));vec2 f=fract(q);
+    vec3 rgb=mix(mix(pixel(a),pixel(a+ivec2(1,0)),f.x),mix(pixel(a+ivec2(0,1)),pixel(a+ivec2(1,1)),f.x),f.y);
+    rgba[p.y*pc.image.z+p.x]=packUnorm4x8(vec4(rgb,1));
+}

@@ -1,0 +1,39 @@
+#version 450
+// Optical/pixel filtering is applied to linear radiance, before display AGC.
+layout(local_size_x=8,local_size_y=8)in;
+layout(set=0,binding=0,std430)readonly buffer Input{float radiance[];};
+layout(set=0,binding=1,std430)writeonly buffer Output{uint rgba[];};
+layout(push_constant)uniform Parameters{ivec4 image;vec4 exposure;vec4 calibration;vec4 optics;}pc;
+uint hash(uint x){x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;return x;}
+float uniformRandom(uint x){return (float(hash(x)&0x00ffffffu)+.5)/16777216.;}
+float gaussian(uint seed){return sqrt(-2*log(uniformRandom(seed)))*cos(6.28318530718*uniformRandom(seed+137u));}
+float binned(ivec2 pixel) {
+    int bin=pc.image.w;ivec2 count=(pc.image.xy+bin-1)/bin;pixel=clamp(pixel,ivec2(0),count-1);
+    float sum=0,weight=0;
+    for(int y=0;y<bin;y++)for(int x=0;x<bin;x++) {
+        ivec2 source=pixel*bin+ivec2(x,y);if(any(greaterThanEqual(source,pc.image.xy)))continue;
+        sum+=radiance[source.y*pc.image.x+source.x];weight++;
+    }
+    return sum/max(weight,1);
+}
+float detector(ivec2 pixel) {
+    ivec2 dimensions=(pc.image.xy+pc.image.w-1)/pc.image.w;pixel=clamp(pixel,ivec2(0),dimensions-1);
+    float sigma=pc.exposure.z,sum=0,weight=0;
+    if(sigma<.01){sum=binned(pixel);weight=1;}
+    else for(int y=-2;y<=2;y++)for(int x=-2;x<=2;x++) {
+        float w=exp(-float(x*x+y*y)/(2*sigma*sigma));sum+=binned(pixel+ivec2(x,y))*w;weight+=w;
+    }
+    uint seed=uint(pixel.x)*1973u+uint(pixel.y)*9277u+uint(pc.calibration.w)*26699u;
+    float value=sum/weight+gaussian(seed)*pc.calibration.x+gaussian(seed+uint(pc.image.z)*104729u+79u)*pc.exposure.w;
+    float normalized=clamp((value-pc.exposure.x)/max(pc.exposure.y-pc.exposure.x,1e-8),0,1);
+    if(pc.optics.x>.5){float knee=max(pc.optics.y,1e-6);normalized=clamp(log(1.+max(0.,value-pc.exposure.x)/knee)/log(1.+max(pc.exposure.y-pc.exposure.x,1e-8)/knee),0.,1.);}
+    normalized=round(normalized*pc.calibration.z)/pc.calibration.z;
+    return pow(normalized,pc.calibration.y);
+}
+void main() {
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(pixel,pc.image.xy)))return;
+    vec2 q=(vec2(pixel)+.5)/float(pc.image.w)-.5;ivec2 base=ivec2(floor(q));vec2 f=fract(q);
+    float value=mix(mix(detector(base),detector(base+ivec2(1,0)),f.x),
+                    mix(detector(base+ivec2(0,1)),detector(base+ivec2(1,1)),f.x),f.y);
+    rgba[pixel.y*pc.image.x+pixel.x]=packUnorm4x8(vec4(vec3(value),1));
+}

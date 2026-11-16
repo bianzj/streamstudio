@@ -3,6 +3,7 @@
 #include "../physics/canopy.h"
 #include "../physics/dual.h"
 #include "../physics/shortwave.h"
+#include "../physics/observation_errors.h"
 
 #include <algorithm>
 #include <atomic>
@@ -20,10 +21,6 @@ namespace stream {
 namespace {
 
 // ---- built-in defaults (not exposed in the workbench) ----
-constexpr double kSigmaBrightness = 0.5;    // K
-constexpr double kSigmaLst = 1.0;           // K
-constexpr double kSigmaComponent = 2.0;     // K
-constexpr double kSigmaReflectance = 0.02;  // absolute reflectance
 constexpr double kTemperatureSd = 5.0;      // K, background error of each component
 constexpr double kTemperatureCorrelation = 0.5;
 constexpr double kMoistureSd = 0.10, kMoistureLow = 0.02, kMoistureHigh = 0.60;  // m3 m-3
@@ -31,7 +28,6 @@ constexpr double kVcmaxRelativeSd = 0.3, kVcmaxMinSd = 10.0, kVcmaxLow = 5.0, kV
 constexpr double kLaiRelativeSd = 0.3, kLaiMinSd = 0.5, kLaiHigh = 10.0;
 constexpr double kTemperatureLow = 150.0, kTemperatureHigh = 400.0;  // search domain, K
 constexpr double kValidLow = 200.0, kValidHigh = 380.0;              // plausible analysis, K
-constexpr double kLstWavelength = 10.5;                              // um
 constexpr int kMaxIterationsRt = 20, kMaxIterationsEb = 10;
 constexpr double kStepTolerance = 1e-3;  // converged when every step < 1e-3 of its background sd (5e-3 K for temperatures)
 constexpr double kLowSupportDfs = 0.2;
@@ -107,6 +103,31 @@ std::vector<std::vector<float>> readBands(const std::string& file, int count, co
     return bands;
 }
 
+// One band may be shared by all observations; otherwise the band counts must match.
+std::vector<std::vector<float>> optionalBands(const std::string& file, int count, const Grid& grid, const std::string& label)
+{
+    if (file.empty()) return {};
+    auto dataset = openRaster(file, label);
+    const int bands = dataset->GetRasterCount();
+    if (bands != 1 && bands != count) throw std::runtime_error(label + " must have 1 or " + std::to_string(count) + " bands");
+    std::vector<std::vector<float>> result(count);
+    for (int b = 0; b < count; ++b) result[b] = readBand(*dataset, bands == 1 ? 1 : b + 1, grid, label);
+    return result;
+}
+
+bool acceptedQa(const std::vector<std::vector<float>>& qa, int band, size_t pixel, unsigned reject)
+{
+    if (qa.empty()) return true;
+    const double value = qa[band][pixel];
+    return std::isfinite(value) && value >= 0 && value <= 65535 && std::floor(value) == value &&
+           (static_cast<unsigned>(value) & reject) == 0;
+}
+
+double sigmaAt(const std::vector<std::vector<float>>& raster, int band, size_t pixel, double fallback)
+{
+    return raster.empty() ? fallback : raster[band][pixel];  // invalid supplied errors never use the default
+}
+
 }  // namespace
 
 AssimilationResult runAssimilation(const AssimilationInputs& in, const std::array<std::vector<float>, 4>& background)
@@ -126,18 +147,34 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
     const std::string dataLabel = kind == AssimilationObservation::Brightness ? "亮温观测"
                                 : kind == AssimilationObservation::Lst ? "地表温度观测" : "组分温度观测";
     const auto data = readBands(as.data, dataBands, grid, dataLabel);
+    const auto errors = optionalBands(as.uncertainty, dataBands, grid, "observation uncertainty");
+    std::vector<std::vector<float>> covarianceRaster;
+    if (!as.covariance.empty()) {
+        auto dataset = openRaster(as.covariance, "observation covariance");
+        if (dataset->GetRasterCount() != dataBands * dataBands)
+            throw std::runtime_error("observation covariance needs N*N row-major bands (K^2)");
+        covarianceRaster = readBands(as.covariance, dataBands * dataBands, grid, "observation covariance");
+    }
+    const auto qa = optionalBands(as.qa, dataBands, grid, "observation QA");
+    const double defaultSigma = kind == AssimilationObservation::Brightness ? as.sigmaBrightnessK
+                              : kind == AssimilationObservation::Lst ? as.sigmaLstK : as.sigmaComponentK;
     std::vector<std::vector<std::vector<float>>> viewData;
+    std::vector<std::vector<std::vector<float>>> viewErrors, viewQa;
     std::vector<std::vector<float>> viewVza, viewVaa;
     for (size_t v = 0; v < as.views.size(); ++v) {
         const std::string label = "附加视角 " + std::to_string(v + 1) + " 亮温";
         viewData.push_back(readBands(as.views[v].data, dataBands, grid, label));
+        viewErrors.push_back(optionalBands(as.views[v].uncertainty, dataBands, grid, label + " uncertainty"));
+        viewQa.push_back(optionalBands(as.views[v].qa, dataBands, grid, label + " QA"));
         viewVza.push_back(fieldRaster(as.views[v].vza, grid, label + " VZA", 0, true));
         viewVaa.push_back(fieldRaster(as.views[v].vaa, grid, label + " VAA", 0, true));
     }
     const bool withOptical = !as.optical.empty();
     std::vector<std::vector<float>> reflectance;
     if (withOptical) reflectance = readBands(as.optical, static_cast<int>(config.opticalBands.size()), grid, "光学反射率观测");
-    const std::vector<double> lstWavelength{kLstWavelength};
+    const auto opticalErrors = optionalBands(as.opticalUncertainty, static_cast<int>(config.opticalBands.size()), grid, "reflectance uncertainty");
+    const auto opticalQa = optionalBands(as.opticalQa, static_cast<int>(config.opticalBands.size()), grid, "reflectance QA");
+    const std::vector<double> lstWavelength{as.lstWavelengthUm};
     const int maxIterations = eb ? kMaxIterationsEb : kMaxIterationsRt;
 
     AssimilationResult result;
@@ -192,28 +229,38 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
             }
             std::vector<Observation> obs;
             const auto temperatureValid = [](float y) { return std::isfinite(y) && y >= kTemperatureLow && y <= kTemperatureHigh; };
+            const auto addThermal = [&](Source source, int band, int view, double value,
+                                        const auto& errorRaster, const auto& qaRaster) {
+                const double sigma = sigmaAt(errorRaster, band, pixel, defaultSigma);
+                if (temperatureValid(static_cast<float>(value)) && std::isfinite(sigma) && sigma > 0 &&
+                    acceptedQa(qaRaster, band, pixel, as.rejectQaBits))
+                    obs.push_back({source, band, view, value, sigma, true});
+            };
             if (kind == AssimilationObservation::Brightness) {
                 if (sceneOk)
                     for (int b = 0; b < dataBands; ++b)
-                        if (temperatureValid(data[b][pixel])) obs.push_back({Source::SceneBrightness, b, -1, data[b][pixel], kSigmaBrightness, true});
+                        addThermal(Source::SceneBrightness, b, -1, data[b][pixel], errors, qa);
                 for (size_t v = 0; v < as.views.size(); ++v) {
                     if (!viewOk[v]) continue;
                     for (int b = 0; b < dataBands; ++b)
-                        if (temperatureValid(viewData[v][b][pixel]))
-                            obs.push_back({Source::ViewBrightness, b, static_cast<int>(v), viewData[v][b][pixel], kSigmaBrightness, true});
+                        addThermal(Source::ViewBrightness, b, static_cast<int>(v), viewData[v][b][pixel], viewErrors[v], viewQa[v]);
                 }
             } else if (kind == AssimilationObservation::Lst) {
-                if (sceneOk && temperatureValid(data[0][pixel])) obs.push_back({Source::Lst, 0, -1, data[0][pixel], kSigmaLst, true});
+                if (sceneOk) addThermal(Source::Lst, 0, -1, data[0][pixel], errors, qa);
             } else {
                 for (int k = 0; k < 4; ++k)
-                    if (temperatureValid(data[k][pixel])) obs.push_back({Source::Component, k, -1, data[k][pixel], kSigmaComponent, true});
+                    addThermal(Source::Component, k, -1, data[k][pixel], errors, qa);
             }
-            const bool opticalPixel = withOptical && sun.zenith < 90.0 && in.leafBandReflectance.count(code) > 0;
-            if (opticalPixel)
+            bool opticalPixel = false;
+            if (withOptical && sun.zenith < 90.0 && in.leafBandReflectance.count(code) > 0)
                 for (size_t b = 0; b < config.opticalBands.size(); ++b) {
                     const float y = reflectance[b][pixel];
-                    if (std::isfinite(y) && y >= 0.0f && y <= 1.0f)
-                        obs.push_back({Source::Reflectance, static_cast<int>(b), -1, y, kSigmaReflectance, false});
+                    const double sigma = sigmaAt(opticalErrors, static_cast<int>(b), pixel, as.sigmaReflectance);
+                    if (std::isfinite(y) && y >= 0.0f && y <= 1.0f && std::isfinite(sigma) && sigma > 0 &&
+                        acceptedQa(opticalQa, static_cast<int>(b), pixel, as.rejectQaBits)) {
+                        obs.push_back({Source::Reflectance, static_cast<int>(b), -1, y, sigma, false});
+                        opticalPixel = true;
+                    }
                 }
 
             // ---- controls and background covariance ----
@@ -245,6 +292,32 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
             backgroundControls[2][pixel] = leafArea;
             if (obs.empty() || n == 0) { ++noObservation; finish(kQaInputInvalid); qaBands[5][pixel] = 0; continue; }
 
+            // Covariance covers the primary thermal observation. Additional views
+            // and optical observations remain independent blocks with their own sigma.
+            std::vector<size_t> correlated;
+            std::vector<double> precision;
+            if (!covarianceRaster.empty()) {
+                for (size_t i = 0; i < obs.size(); ++i)
+                    if (obs[i].thermal && obs[i].source != Source::ViewBrightness) correlated.push_back(i);
+                const int nc = static_cast<int>(correlated.size());
+                std::vector<double> covariance(nc * nc);
+                for (int i = 0; i < nc; ++i) for (int j = 0; j < nc; ++j)
+                    covariance[i * nc + j] = covarianceRaster[obs[correlated[i]].band * dataBands + obs[correlated[j]].band][pixel];
+                if (!observationPrecision(covariance, nc, precision)) {
+                    ++failed; finish(kQaInputInvalid | kQaIllConditioned); continue;
+                }
+            }
+            const auto applyPrecision = [&](const std::vector<double>& values) {
+                std::vector<double> weighted(values.size());
+                for (size_t i = 0; i < values.size(); ++i) weighted[i] = values[i] / (obs[i].sigma * obs[i].sigma);
+                const size_t nc = correlated.size();
+                for (size_t i = 0; i < nc; ++i) {
+                    weighted[correlated[i]] = 0.0;
+                    for (size_t j = 0; j < nc; ++j) weighted[correlated[i]] += precision[i * nc + j] * values[correlated[j]];
+                }
+                return weighted;
+            };
+
             Matrix backgroundInverse{};
             for (int i = 0; i < n; ++i)
                 for (int j = 0; j < n; ++j) {
@@ -270,6 +343,7 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
                 } else {
                     const EbControls controls{moistureAd.v, index[kVcmax] >= 0 ? x[index[kVcmax]] : vcmaxB, laiAd.v};
                     if (!in.ebSolver || !in.ebSolver(pixel, controls, outcome)) return false;
+                    if (!outcome.gradientValid) { flags |= kQaIllConditioned; return false; }
                     for (int k = 0; k < 4; ++k) {
                         Ad t(outcome.temperatures[k]);
                         for (int c = 0; c < n; ++c)
@@ -357,13 +431,19 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
                 }
                 Matrix a = backgroundInverse;
                 std::array<double, kMaxControls> g{};
+                std::vector<double> innovation(m);
                 for (size_t i = 0; i < m; ++i) {
-                    const double w = 1.0 / (obs[i].sigma * obs[i].sigma);
-                    double innovation = obs[i].y - h[i].v;
-                    for (int c = 0; c < n; ++c) innovation += h[i].d[c] * (x[c] - xb[c]);
-                    for (int c = 0; c < n; ++c) {
-                        g[c] += h[i].d[c] * w * innovation;
-                        for (int d = 0; d < n; ++d) a[c][d] += h[i].d[c] * w * h[i].d[d];
+                    innovation[i] = obs[i].y - h[i].v;
+                    for (int c = 0; c < n; ++c) innovation[i] += h[i].d[c] * (x[c] - xb[c]);
+                }
+                const auto weightedInnovation = applyPrecision(innovation);
+                for (int c = 0; c < n; ++c) {
+                    std::vector<double> column(m);
+                    for (size_t i = 0; i < m; ++i) column[i] = h[i].d[c];
+                    const auto weightedColumn = applyPrecision(column);
+                    for (size_t i = 0; i < m; ++i) {
+                        g[c] += h[i].d[c] * weightedInnovation[i];
+                        for (int d = 0; d < n; ++d) a[d][c] += h[i].d[d] * weightedColumn[i];
                     }
                 }
                 if (!invert(a, n)) { conditioned = false; break; }
@@ -379,7 +459,7 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
                 ++iterations;
                 if (step < kStepTolerance) { converged = true; break; }
             }
-            if (!ok || hGood.empty()) { ++failed; finish(kQaRetrievalFailed); continue; }
+            if (!ok || hGood.empty()) { ++failed; finish(flags | kQaRetrievalFailed); continue; }
             if (!conditioned) flags |= kQaIllConditioned;
             // Analysis state: evaluate at the last iterate; fall back to the last evaluated state.
             if (conditioned && evaluate(x)) { hGood = h; outcomeGood = outcome; xGood = x; }
@@ -391,10 +471,12 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
 
             // Posterior covariance and DFS at the analysis.
             Matrix a = backgroundInverse;
-            for (size_t i = 0; i < m; ++i) {
-                const double w = 1.0 / (obs[i].sigma * obs[i].sigma);
-                for (int c = 0; c < n; ++c)
-                    for (int d = 0; d < n; ++d) a[c][d] += h[i].d[c] * w * h[i].d[d];
+            for (int c = 0; c < n; ++c) {
+                std::vector<double> column(m);
+                for (size_t i = 0; i < m; ++i) column[i] = h[i].d[c];
+                const auto weighted = applyPrecision(column);
+                for (size_t i = 0; i < m; ++i)
+                    for (int d = 0; d < n; ++d) a[d][c] += h[i].d[d] * weighted[i];
             }
             double dfs = std::numeric_limits<double>::quiet_NaN();
             if (invert(a, n)) {
@@ -505,24 +587,34 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
     CPLJSONObject summary;
     summary.Add("observation", kind == AssimilationObservation::Brightness ? "brightness" : kind == AssimilationObservation::Lst ? "lst" : "components");
     summary.Add("background", eb ? "eb" : "rt");
-    summary.Add("method", "MAP Gauss-Newton per pixel; exact Jacobian by forward-mode dual numbers" +
-                std::string(eb ? "; EB temperatures by implicit differentiation of the overpass energy balance" : ""));
+    summary.Add("method", "MAP Gauss-Newton per pixel; Dual-number observation Jacobian; tabulated optical moisture slopes are local approximations" +
+                std::string(eb ? "; implicit overpass EB derivative conditional on history and stability (not a full trajectory derivative)" : ""));
+    summary.Add("observationLevel", as.observationLevel);
+    summary.Add("uncertaintyRaster", as.uncertainty);
+    summary.Add("covarianceRaster", as.covariance);
+    summary.Add("qaRaster", as.qa);
+    summary.Add("rejectQaBits", static_cast<int>(as.rejectQaBits));
+    CPLJSONArray sourceIds, priorIds;
+    for (const auto& id : as.sourceIds) sourceIds.Add(id);
+    for (const auto& id : as.priorSourceIds) priorIds.Add(id);
+    summary.Add("sourceIds", sourceIds);
+    summary.Add("priorSourceIds", priorIds);
     CPLJSONArray controlList;
     if (eb) { controlList.Add(kControlNames[kMoisture]); controlList.Add(kControlNames[kVcmax]); }
     else for (int k = 0; k < 4; ++k) controlList.Add(kControlNames[k]);
     if (withOptical) controlList.Add(kControlNames[kLai]);
     summary.Add("controls", controlList);
     CPLJSONObject defaults;
-    defaults.Add("sigmaBrightnessK", kSigmaBrightness);
-    defaults.Add("sigmaLstK", kSigmaLst);
-    defaults.Add("sigmaComponentK", kSigmaComponent);
-    defaults.Add("sigmaReflectance", kSigmaReflectance);
+    defaults.Add("sigmaBrightnessK", as.sigmaBrightnessK);
+    defaults.Add("sigmaLstK", as.sigmaLstK);
+    defaults.Add("sigmaComponentK", as.sigmaComponentK);
+    defaults.Add("sigmaReflectance", as.sigmaReflectance);
     defaults.Add("backgroundTemperatureSdK", kTemperatureSd);
     defaults.Add("backgroundCorrelation", kTemperatureCorrelation);
     defaults.Add("backgroundMoistureSd", kMoistureSd);
     defaults.Add("backgroundVcmaxRelativeSd", kVcmaxRelativeSd);
     defaults.Add("backgroundLaiRelativeSd", kLaiRelativeSd);
-    defaults.Add("lstWavelengthUm", kLstWavelength);
+    defaults.Add("lstWavelengthUm", as.lstWavelengthUm);
     defaults.Add("maxIterations", maxIterations);
     summary.Add("defaults", defaults);
     summary.Add("views", static_cast<int>(as.views.size()) + 1);

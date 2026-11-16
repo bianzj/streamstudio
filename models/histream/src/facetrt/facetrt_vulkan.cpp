@@ -1058,8 +1058,7 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
 
         VkMemoryBarrier resolveToNext{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         resolveToNext.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        // DEFERRED[低] GPU同步: dstAccessMask 只有 TRANSFER_WRITE，缺 TRANSFER_READ；循环结束后 downloadBuffer 用 vkCmdCopyBuffer 读取 m_edgeKeys/m_edgeCounts/m_denominator 时，resolve 计算写入对 transfer 读不保证可见；建议：dstAccessMask 加 VK_ACCESS_TRANSFER_READ_BIT。
-        resolveToNext.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
+        resolveToNext.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
                                       VK_ACCESS_SHADER_READ_BIT |
                                       VK_ACCESS_SHADER_WRITE_BIT;
         vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1121,6 +1120,10 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     std::partial_sum(m_rowOffsetsCpu.begin(), m_rowOffsetsCpu.end(),
                      m_rowOffsetsCpu.begin());
     m_edgesCpu.assign(m_rowOffsetsCpu.back(), {});
+    // Hash-slot placement depends on concurrent insertion; canonical edge order
+    // makes CSR floating-point accumulation reproducible between paired runs.
+    std::sort(undirectedEdges.begin(),undirectedEdges.end(),
+        [](const auto& a,const auto& b){return a.first<b.first;});
     std::vector<uint32_t> cursor = m_rowOffsetsCpu;
     for (const auto& entry : undirectedEdges) {
         const uint32_t sideA = static_cast<uint32_t>(entry.first >> 32U);
@@ -1251,7 +1254,11 @@ std::vector<float> FacetrtVulkan::computeSunlitFraction(const Direction& sunDire
                            kVisibilityPushStages, 0, sizeof(push), &push);
         vkCmdDispatch(commandBuffer, static_cast<uint32_t>((pixels + 63ULL) / 64ULL), 1, 1);
     }
-    // DEFERRED[中] GPU同步: 最后一次 direct_resolve 计算写入 m_directTotal/m_directVisible 后没有任何 COMPUTE→TRANSFER_READ 屏障，随后 downloadBuffer 的 vkCmdCopyBuffer 读取属于跨提交但无内存依赖（fence 只保证 host 侧可见，不保证后续 transfer 读可见）；建议：endCommands 前补一个 computeBarrier(commandBuffer) 或 srcAccess=SHADER_WRITE/dstAccess=TRANSFER_READ 的屏障。
+    VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    readback.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+    readback.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,1,&readback,0,nullptr,0,nullptr);
     endCommands(commandBuffer);
 
     std::vector<uint32_t> total(surfaceCount());

@@ -1,5 +1,6 @@
 
 *.cmake
+!cmake/*.cmake
 cmake-build-debug-visual-studio/*.*
 *.ninja
 *.txt

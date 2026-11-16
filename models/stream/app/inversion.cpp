@@ -299,8 +299,9 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         }
         std::vector<float> qa(grid.size(), kNaN), residual(grid.size(), kNaN), dfs(grid.size(), kNaN), used(grid.size(), kNaN),
             iterations(grid.size(), kNaN);
-        std::array<std::vector<float>, 4> shares;
+        std::array<std::vector<float>, 4> shares, radianceShares;
         for (auto& band : shares) band.assign(grid.size(), kNaN);
+        for (auto& band : radianceShares) band.assign(grid.size(), kNaN);
         const int half = inv.window / 2;
         #pragma omp parallel for schedule(dynamic, 2) reduction(+:retrieved, failed, notConverged, lowSupport, outOfRange, illConditioned, dfsSum, residualSum)
         for (int row = in.startRow; row < in.endRow; ++row) {
@@ -400,13 +401,22 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                     posterior[index[a]][pixel] = static_cast<float>(x[index[a]]);
                     sd[index[a]][pixel] = static_cast<float>(std::sqrt(std::max(hessian[a][a], 0.0)));
                 }
-                // Radiance share of each component in the first valid observation of the centre pixel.
+                // Keep the legacy normalized-weight product; actual radiance
+                // contributions also depend on the retrieved component temperatures.
                 for (size_t j = 0; j < observations; ++j) {
                     const Sample& sample = samples[local * observations + j];
                     if (!sample.valid()) continue;
                     double total = 0.0;
                     for (int k = 0; k < kComponents; ++k) total += sample.weights[k];
                     if (total > 0.0) for (int k = 0; k < kComponents; ++k) shares[k][pixel] = static_cast<float>(sample.weights[k] / total);
+                    double contribution[kComponents]{}, radiance = 0.0;
+                    for (int k = 0; k < kComponents; ++k) {
+                        if (sample.weights[k] > 0.0f && std::isfinite(x[k]))
+                            contribution[k] = sample.weights[k] * planck(x[k], sample.wavelength);
+                        radiance += contribution[k];
+                    }
+                    if (radiance > 0.0) for (int k = 0; k < kComponents; ++k)
+                        radianceShares[k][pixel] = static_cast<float>(contribution[k] / radiance);
                     break;
                 }
                 residual[pixel] = static_cast<float>(std::sqrt(squares / set.size()));
@@ -431,8 +441,11 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         writeTiff(dir / "lsct_qa.tif", grid, {qa, residual, dfs, used, iterations},
                   {"quality flags", "residual RMS (K)", "degrees of freedom for signal", "observations used", "iterations"});
         writeTiff(dir / "lsct_fractions.tif", grid, {shares.begin(), shares.end()},
-                  {"Tss radiance share", "Tsh radiance share", "Tcs radiance share", "Tch radiance share"});
-        result.products = {"lsct.tif", "lsct_uncertainty.tif", "lsct_qa.tif", "lsct_fractions.tif"};
+                  {"Tss normalized effective weight", "Tsh normalized effective weight", "Tcs normalized effective weight", "Tch normalized effective weight"});
+        writeTiff(dir / "lsct_radiance_fractions.tif", grid, {radianceShares.begin(), radianceShares.end()},
+                  {"Tss radiance contribution fraction", "Tsh radiance contribution fraction", "Tcs radiance contribution fraction", "Tch radiance contribution fraction"});
+        result.products = {"lsct.tif", "lsct_uncertainty.tif", "lsct_qa.tif", "lsct_fractions.tif", "lsct_radiance_fractions.tif"};
+        result.summary.Add("fractionReference", "first valid center-pixel observation; normalized effective weights are not geometric area fractions");
         CPLJSONArray stats;
         for (int k = 0; k < kComponents; ++k) stats.Add(bandStatistics(names[k], posterior[k]));
         stats.Add(bandStatistics("degrees of freedom for signal", dfs));

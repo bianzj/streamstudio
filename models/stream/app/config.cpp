@@ -4,7 +4,9 @@
 #include <cpl_json.h>
 
 #include <cmath>
+#include <algorithm>
 #include <stdexcept>
+#include <set>
 
 namespace stream {
 namespace {
@@ -180,7 +182,58 @@ ImageConfig readImageConfig(const std::string& path)
             as.data = assimilation.GetString("data", "");
             if (as.data.empty()) throw std::runtime_error("同化需要观测数据文件");
             as.optical = assimilation.GetString("optical", "");
+            as.uncertainty = assimilation.GetString("uncertainty", "");
+            as.covariance = assimilation.GetString("covariance", "");
+            if (!as.uncertainty.empty() && !as.covariance.empty())
+                throw std::runtime_error("supply assimilation uncertainty or covariance, not both");
+            as.qa = assimilation.GetString("qa", "");
+            as.opticalUncertainty = assimilation.GetString("opticalUncertainty", "");
+            as.opticalQa = assimilation.GetString("opticalQa", "");
+            const auto positive = [&](const char* key, double fallback) {
+                const auto field = assimilation.GetObj(key);
+                if (field.IsValid() && field.GetType() != CPLJSONObject::Type::Integer &&
+                    field.GetType() != CPLJSONObject::Type::Long && field.GetType() != CPLJSONObject::Type::Double)
+                    throw std::runtime_error(std::string(key) + " must be numeric");
+                const double value = assimilation.GetDouble(key, fallback);
+                if (!std::isfinite(value) || value <= 0)
+                    throw std::runtime_error(std::string("assimilation.") + key + " must be finite and positive");
+                return value;
+            };
+            as.sigmaBrightnessK = positive("sigmaBrightnessK", as.sigmaBrightnessK);
+            as.sigmaLstK = positive("sigmaLstK", as.sigmaLstK);
+            as.sigmaComponentK = positive("sigmaComponentK", as.sigmaComponentK);
+            as.sigmaReflectance = positive("sigmaReflectance", as.sigmaReflectance);
+            as.lstWavelengthUm = positive("lstWavelengthUm", as.lstWavelengthUm);
+            if (as.lstWavelengthUm < 3.0 || as.lstWavelengthUm > 25.0)
+                throw std::runtime_error("assimilation.lstWavelengthUm must be in [3, 25] um");
+            const double rejectBits = assimilation.GetDouble("rejectQaBits", as.rejectQaBits);
+            if (!std::isfinite(rejectBits) || rejectBits < 0 || rejectBits > 65535 || std::floor(rejectBits) != rejectBits)
+                throw std::runtime_error("assimilation.rejectQaBits must be a uint16 bit mask");
+            as.rejectQaBits = static_cast<unsigned>(rejectBits);
+            const std::string expectedLevel = as.observation == AssimilationObservation::Brightness ? "canopy" : "surface";
+            as.observationLevel = assimilation.GetString("observationLevel", expectedLevel);
+            if (as.observationLevel != expectedLevel)
+                throw std::runtime_error("assimilation.observationLevel must be " + expectedLevel + "; TOA is unsupported");
+            const auto sources = [&](const char* key) {
+                std::vector<std::string> result;
+                const auto field = assimilation.GetObj(key);
+                if (field.IsValid() && field.GetType() != CPLJSONObject::Type::Array)
+                    throw std::runtime_error(std::string(key) + " must be an array of source IDs");
+                const auto array = assimilation.GetArray(key);
+                for (int i = 0; i < array.Size(); ++i) {
+                    if (array[i].GetType() != CPLJSONObject::Type::String || array[i].ToString().empty())
+                        throw std::runtime_error(std::string(key) + " must contain nonempty source IDs");
+                    result.push_back(array[i].ToString());
+                }
+                return result;
+            };
+            as.sourceIds = sources("sourceIds");
+            as.priorSourceIds = sources("priorSourceIds");
+            for (const auto& id : as.sourceIds)
+                if (std::find(as.priorSourceIds.begin(), as.priorSourceIds.end(), id) != as.priorSourceIds.end())
+                    throw std::runtime_error("assimilation source IDs overlap the prior source IDs");
             const auto views = assimilation.GetArray("views");
+            std::vector<std::filesystem::path> observationFiles{std::filesystem::absolute(pathFromUtf8(as.data)).lexically_normal()};
             if (views.IsValid()) {
                 if (views.Size() > 16) throw std::runtime_error("同化的附加观测视角不能超过 16 个");
                 if (views.Size() > 0 && as.observation != AssimilationObservation::Brightness)
@@ -189,6 +242,17 @@ ImageConfig readImageConfig(const std::string& path)
                     const auto item = views[index];
                     AssimilationView view;
                     view.data = item.GetString("data", "");
+                    if (!view.data.empty()) {
+                        const auto path = std::filesystem::absolute(pathFromUtf8(view.data)).lexically_normal();
+                        for (const auto& previous : observationFiles) {
+                            std::error_code error;
+                            if (path == previous || std::filesystem::equivalent(path, previous, error))
+                                throw std::runtime_error("a brightness file cannot be counted in multiple views");
+                        }
+                        observationFiles.push_back(path);
+                    }
+                    view.uncertainty = item.GetString("uncertainty", "");
+                    view.qa = item.GetString("qa", "");
                     view.vza = readField(item, "vza");
                     view.vaa = readField(item, "vaa");
                     if (view.data.empty() || !view.vza.present() || !view.vaa.present())

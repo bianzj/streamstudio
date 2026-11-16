@@ -614,6 +614,7 @@ int runImage(const std::string& configPath)
     // BSM soil albedo of the absorbed shortwave; Vcmax: stomatal resistance; LAI: hom3 radiation and fractions).
     // The soil heat history before the overpass node is held fixed (derivative of the last node only).
     EbSolver ebSolver = [&](size_t pixel, const EbControls& controls, EbOutcome& outcome) -> bool {
+        outcome.gradientValid = false;
         const auto* entry = classes.find(type[pixel]);
         if (!entry || entry->surface != SurfaceKind::Vegetation || !validLocation(pixel)) return false;
         const double leafArea = std::clamp(controls.lai, 0.0, 100.0);
@@ -689,7 +690,7 @@ int runImage(const std::string& configPath)
             int pivot = column;
             for (int row = column + 1; row < size; ++row)
                 if (std::abs(a[row][column]) > std::abs(a[pivot][column])) pivot = row;
-            if (!(std::abs(a[pivot][column]) > 1e-9) || !std::isfinite(a[pivot][column])) return true;  // no usable derivative
+            if (!(std::abs(a[pivot][column]) > 1e-9) || !std::isfinite(a[pivot][column])) return true;  // temperatures valid, derivative rejected
             if (pivot != column) {
                 for (int k = 0; k < size; ++k) std::swap(a[column][k], a[pivot][k]);
                 for (int k = 0; k < 3; ++k) std::swap(b[column][k], b[pivot][k]);
@@ -704,8 +705,10 @@ int runImage(const std::string& configPath)
         for (int i = 0; i < size; ++i)
             for (int c = 0; c < 3; ++c) {
                 const double value = b[i][c] / a[i][i];
-                outcome.gradient[i][c] = std::isfinite(value) ? value : 0.0;
+                if (!std::isfinite(value)) return true;
+                outcome.gradient[i][c] = value;
             }
+        outcome.gradientValid = true;
         return true;
     };
 

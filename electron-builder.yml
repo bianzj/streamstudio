@@ -46,6 +46,8 @@ extraResources:
       - "!**/*.xlsx"
       - "!usd/usd/resources/codegenTemplates{,/**/*}"
       - "!shader/*副本*"
+      # Scene-animation fixture executables (histream_*_tests.exe) are developer tests, not product tools.
+      - "!histream_*_tests.exe"
   - from: docs
     to: docs
     filter:

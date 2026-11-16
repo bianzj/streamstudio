@@ -13,7 +13,7 @@ const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const args = process.argv.slice(2)
 const withVehicles = args.includes('--vehicles')
 const outputArg = args.find((arg) => !arg.startsWith('--'))
-const exampleRoot = resolve(outputArg ?? (withVehicles ? 'C:/cases/vehicle-tarp/forest' : join(projectRoot, 'assets', 'examples', 'forest')))
+const exampleRoot = resolve(outputArg ?? (withVehicles ? 'D:/cases/vehicle-tarp/forest' : join(projectRoot, 'assets', 'examples', 'forest')))
 for (const folder of ['positions', 'meteorology']) mkdirSync(join(exampleRoot, folder), { recursive: true })
 
 const SCENE = 100
