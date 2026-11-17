@@ -10,7 +10,7 @@
 | 004 | [延庆山地光热与风场](004-yanqing/README.md) | 5 |
 | 005 | [光伏草场热环境](005-photovoltaic/README.md) | 3张融合推广图 |
 
-[工程与输入目录](../../examples/research-cases) · [程序下载](https://github.com/bianzj/streamstudio/releases/tag/v2.0.1)
+[工程与输入目录](../../tests/research-cases) · [程序下载](https://github.com/bianzj/streamstudio/releases/tag/v2.0.1)
 
 百度网盘：https://pan.baidu.com/s/1iYGVT5aC67xQ9T5A00A_YA?pwd=uvx2 ，提取码：uvx2。
 

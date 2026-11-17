@@ -1,8 +1,8 @@
 # Stream Studio 模型使用手册
 
-软件版本：2.0.1（本手册含开发版测试中的场景动画功能，第 18 章）
+软件版本：2.0.1
 工程格式：三维 `schemaVersion = 6`；遥感影像 `schemaVersion = 2`
-更新日期：2026-11-12（开发版：第 18 章“场景动画（研究功能）”、impact-v1 经验撞击模型与场景动画内置示例；测试中，未发布）
+更新日期：2026-11-16（场景动画研究功能已移至 STREAM IMAGING，本手册不再包含）
 
 ## 0. 新用户从这里开始
 
@@ -29,9 +29,8 @@
 | 城市与建筑 | `urban_block` | 三维 VoxelRT；建筑、树木和辐射成像 |
 | 区域遥感影像 | `modis_beijing_eb` | STREAM EB；北京 1 km 输入与 ERA5 驱动 |
 | 区域遥感影像 | `landsat_beijing_eb` | STREAM EB；北京 300 m 输入与 ERA5 驱动 |
-| 场景动画（研究功能，开发版） | `impact_v1_building` | HiStream eSceneAnimation；建筑撞击 impact-v1 经验模型，通用示例参数（见 18.7） |
 
-前五个目录的入口是 `project.json`，场景动画示例的入口是 `sequence.json`；先阅读各自的 README。300 m 是本案例的建模网格，不能等同于 Landsat 原始像元尺度。城市 RT 案例使用给定温度，不能把成像结果解释为独立能量平衡温度预测。玉米案例旧碳通量参考的限制见该例说明。
+各目录的入口是 `project.json`；先阅读各自的 README。300 m 是本案例的建模网格，不能等同于 Landsat 原始像元尺度。城市 RT 案例使用给定温度，不能把成像结果解释为独立能量平衡温度预测。玉米案例旧碳通量参考的限制见该例说明。
 
 ### 0.3 外部培训案例与研究案例
 
@@ -183,7 +182,7 @@ project-name/
 - 坐标：`upAxis = "Y"`，单位米（`metersPerUnit = 1`），X 为北、Z 为东，与编辑器预览一致；Blender 导入时会自动转为 Z 轴向上。
 - 几何：每个 OBJ 转换为 `usd/<OBJ 名>-<校验码>.usda` 原型资产，只在 OBJ 变化时重建，因此日常保存只需改写较小的 `project.usd`；原型按 OBJ 分组（`o`/`g`）拆成网格并以最低点落地。每个位置记录写为引用原型的 instanceable Xform（平移、绕 Y 旋转、缩放）。PRIM 盒体/椭球与火焰、雾介质写为 Cube/Sphere。地面为平面或按 DEM 采样（每边最多 256 格）的地形网格。
 - 太阳：`/World/Sun`（DistantLight），方向由太阳天顶角和方位角确定。
-- 材质：每条光谱记录生成一个 UsdPreviewSurface 预览材质（颜色仅用于显示）；光谱、热学、物化、冠层等 Stream Studio 参数以 `histream:*` 自定义属性写在网格和实例上，完整 `project.json` 保存在图层元数据 `customLayerData.histream.project` 中（旧版导出的 `streamsim:*` 属性仍可读取）。
+- 材质：每条光谱记录生成一个 UsdPreviewSurface 预览材质（颜色仅用于显示）；光谱、热学、物化、冠层等 Stream Studio 参数以 `histream:*` 自定义属性写在网格和实例上，完整 `project.json` 保存在图层元数据 `customLayerData.histream.project` 中。
 - `usd/sync.json` 记录 Stream Studio 最后写出或载入的 USD 校验码。若 `project.usd` 已在其他软件中被修改，打开工程时会询问是否载入这些修改；不载入而直接保存时，旧文件会先备份为 `project.external-<时间>.usd` 再覆盖。
 - 同步失败（例如 OBJ 缺失）不影响 `project.json` 的保存，原因写入运行日志。
 
@@ -208,7 +207,7 @@ project-name/
 
 ## 4. 界面布局
 
-窗口最上方是菜单栏：“项目”菜单含新建工程、打开工程、打开示例、保存和另存为；“结果”菜单含二维水平和三维立体；“分析”菜单含时间、角度、波段分析和变化分析；“解决方案”菜单含三维解决方案（面元/体元辐射传输与能量平衡、简单光线追踪）、解析解决方案（像元辐射传输、像元能量平衡，打开 STREAM 影像模拟工作台，见 5.2 节）和研究功能“场景动画（研究功能）”（见第 18 章）；“帮助”菜单含理论与参考、使用手册、理论手册、快捷键和版本信息。菜单栏下方的工具栏保留语言切换、运行模拟、停止和重置。影像模拟工作台打开时，“项目”菜单中的新建、打开、保存和另存为作用于影像模拟工程。“重置”会结束当前 HiStream 三维进程、清理本次运行状态并恢复可再次启动的界面，不影响影像模拟任务；它不会删除工程输入和已经落盘的结果。
+窗口最上方是菜单栏：“项目”菜单含新建工程、打开工程、打开示例、保存和另存为；“结果”菜单含二维水平和三维立体；“分析”菜单含时间、角度、波段分析和变化分析；“解决方案”菜单含三维解决方案（面元/体元辐射传输与能量平衡、简单光线追踪）、解析解决方案（像元辐射传输、像元能量平衡，打开 STREAM 影像模拟工作台，见 5.2 节）；“帮助”菜单含理论与参考、使用手册、理论手册、快捷键和版本信息。菜单栏下方的工具栏保留语言切换、运行模拟、停止和重置。影像模拟工作台打开时，“项目”菜单中的新建、打开、保存和另存为作用于影像模拟工程。“重置”会结束当前 HiStream 三维进程、清理本次运行状态并恢复可再次启动的界面，不影响影像模拟任务；它不会删除工程输入和已经落盘的结果。
 
 顶栏 `EN / 中文` 按钮可在程序内即时切换界面语言，默认语言为中文，并通过浏览器本地存储自动记忆上次选择。语言切换覆盖静态界面、动态属性检查器、计算模式和主要对话框；工程名、文件路径、`project.json` 原始字段及引擎日志不强制翻译。中英文名称只影响显示，不改变模式枚举、工程配置或结果数值。
 
@@ -729,7 +728,7 @@ FacetEB 的方法 2 使用 12 层有限体积隐式传导，层边界为 0、0.0
 - 0：Ball–Berry 经验耦合；
 - 1：Farquhar 机制耦合。
 
-面元机制法使用 C3 Farquhar / C4 von Caemmerer 光合方程，将光合速率经气孔阻力耦合到潜热和叶温。修改目标叶片所绑定物化属性中的 `Vcmax` 后重新运行即可产生响应；还会读取 `m`、`BallBerry`、`Type`、`kV`、`Rdparam`、`stressfactor`、`Tyear`、`beta`、`qLs` 和 `kNPQs`。`Vcmax` 以 25 °C 为基准，单位为 µmol CO₂ m⁻² s⁻¹。机制法始终使用其自身温度响应；`Tcor` 和 `Tparam` 只控制方法 0 的温度修正。夜间、弱光或强胁迫时，Vcmax 对温度的影响可能很小；木质及其他非叶片材料不执行叶片光合计算。SCOPE 对比资料位于项目外的 D:\cases\StreamStudio\模型对比\SCOPE，仅在用户明确要求时使用。
+面元机制法使用 C3 Farquhar / C4 von Caemmerer 光合方程，将光合速率经气孔阻力耦合到潜热和叶温。修改目标叶片所绑定物化属性中的 `Vcmax` 后重新运行即可产生响应；还会读取 `m`、`BallBerry`、`Type`、`kV`、`Rdparam`、`stressfactor`、`Tyear`、`beta`、`qLs` 和 `kNPQs`。`Vcmax` 以 25 °C 为基准，单位为 µmol CO₂ m⁻² s⁻¹。机制法始终使用其自身温度响应；`Tcor` 和 `Tparam` 只控制方法 0 的温度修正。夜间、弱光或强胁迫时，Vcmax 对温度的影响可能很小；木质及其他非叶片材料不执行叶片光合计算。SCOPE 对比资料位于项目外的 D:\cases\streamstudio\模型对比\SCOPE，仅在用户明确要求时使用。
 
 土壤热红外发射率随含水量变化：对 BSM 光谱材质，热红外反射率在“TIR 反射率”（干端，`SMC ≤ 0.05 m³/m³`）与“湿端 TIR 反射率”之间按含水量插值，权重与 BSM 反射率共用同一几何 `1 - exp(-(SMC - 0.05)/0.25)`，`SMC` 即光谱材料中的土壤含水量。湿端留空时取干端发射率 +0.03（上限 0.995）；含水量只降低热红外反射率，因此发射率随含水量单调不减。发射率仍按 1 - TIR 反射率 - TIR 透射率 计算，FacetEB/VoxelEB 的发射、长波交换与成像亮温同步变化；叶片、混凝土和导入波谱等非 BSM 材质不受含水量影响。物化属性里的“土壤含水量 SMC”是水热参数（蒸发干湿判据），不改变发射率。
 
@@ -865,110 +864,3 @@ FacetEB 显示“未收敛”时结果仍会保留，但该节点未满足配置
 - 变化分析只比较相同物理量和单位；
 - 植被 GPP 白天应随有效光照增强、夜间接近 0；NPP 可因暗呼吸为负，当前数值是叶片尺度近似，不能直接当作扣除根、茎等全部自养呼吸后的生态系统 NPP；
 - 关键实验同时保存 `project.json`、统计 CSV 和运行日志。
-
-## 18. 场景动画（研究功能）
-
-> **界面入口暂时隐藏（2026-11-12 决定）**：本版界面不提供场景动画入口，菜单“解决方案”下不显示“研究功能”分组，示例列表中也不出现场景动画示例，界面不能调度或运行场景动画。原因是还没有参数编辑界面，场景参数只能写在 JSON 里。引擎命令行 `histream.exe eSceneAnimation 输入.json 新输出目录` 和本地 `/api/scene-animation/*` 接口保持可用，供开发与调试。恢复界面入口的方法是：把 `src/renderer/src/project-schema.js` 中的 `SCENE_ANIMATION_UI_ENABLED` 设为 `true` 后重新构建界面。本章其余内容描述该面板恢复后的用法。
-
-场景动画调用 HiStream 引擎的研究模式 `eSceneAnimation`：读取一份已有的场景动画输入 JSON（OBJ 资产、实例、材质、相机和 `sequence` 时间轴），在 GPU 上逐帧渲染红外图像，可选输出可见光和相机观测图像，用于撞击、火光、烟尘和碎片过程的可视化与方法研究。它不读取三维工程 `project.json`，也不是 RT/EB 计算模式，因此不会出现在“计算模型”列表和工程编辑器中。
-
-**研究功能：撞击效果为作者设定或经验模型估算，不是经过验证的物理预测。** 面板顶部始终显示这句提示，以及本次结果的 `impactModel.kind` 和说明文字。运行清单中的 `physicsValidated` 当前始终为 `false`。
-
-### 18.1 打开面板与运行（入口隐藏期间改用命令行）
-
-当前界面入口隐藏，请用命令行运行（输出目录必须不存在，每次用新目录）。以下面板步骤在 `SCENE_ANIMATION_UI_ENABLED` 设为 `true` 后适用。
-
-1. 选择菜单“解决方案 → 研究功能 → 场景动画（研究功能）…”。
-2. 在“场景动画输入 JSON”中点击“浏览…”选择文件，或粘贴绝对路径后按回车。面板读取文件并显示场景后端、分辨率、帧率、帧范围和运动后端。
-3. “输出目录”可留空，默认为用户文档下的 `Stream Studio/scene-animation`。每次运行都在其中新建 `输入文件名_日期-时间_随机码` 子目录；引擎拒绝写入已存在的目录，因此旧结果不会被覆盖。
-4. 点击“运行”（面板打开时也可按 F5）。进度条按引擎每帧输出的 `FRAME 帧号/总帧数 t=秒` 更新，显示当前帧、演示时间和耗时；日志窗口显示引擎输出，`WARNING:` 行以黄色标出。最后一帧写出后引擎还要写完 PNG 和运行清单，进度在运行完成时才显示 100%。
-5. 点击“停止”会结束引擎进程。输出目录保留已写出的部分帧，运行记录标为“已停止”，这类结果不应作为完整序列使用。
-
-面板只读取输入，不修改输入文件。运行前会拦截明显错误：选中的是 `project.json` 或 `run_case.py` 任务文件、`backend` 未知、含网格或 `sequence` 却没有写 `backend`（引擎会忽略它们而改跑程序化参考场景）、引用的 OBJ 或背景场文件不存在。其余参数（取值范围、SHA256 校验、相机和材质等）由引擎完整校验，失败时日志显示 `HiStream GPU scene animation failed:` 后的原因。
-
-HiStream 同一时间只运行一个任务：场景动画运行期间不能启动三维模拟，三维模拟运行期间也不能启动场景动画；STREAM 遥感影像任务不受影响。场景动画使用与三维模拟相同的 HiStream 引擎，需要硬件 GPU，不支持 CPU（lavapipe）模式。引擎须包含场景动画模块（引擎目录下的 `shader/animation`），网格后端还需要 `shader/animation/mesh`；不满足时面板给出中文提示并且不启动。开发调试时可用环境变量 `STREAM_STUDIO_SCENE_ANIMATION_ENGINE` 指向另一个 `histream.exe`，普通用户无需设置。
-
-### 18.2 输入 JSON
-
-| 字段 | 说明 |
-|---|---|
-| `backend` | `procedural`：内置程序化参考街区（可省略）；`mesh`：静态网格多视图检查；`meshSequence`：连续撞击、火球、碎片和烟羽序列 |
-| `assets` | OBJ 资产，路径相对输入 JSON 所在目录（也可为绝对路径），每项附 `sha256` |
-| `instances`、`materials`、`cameras` | 实例变换、材质温度/发射率/颜色、一个或多个相机 |
-| `backgroundField` | 可选；绑定 FacetEB 背景温度场，同样带 SHA256 |
-| `sequence` | 时间轴：`fps`、`frameCount`、`firstFrame`/`lastFrame`、`impactTime`、`exportFrames`、`motionBackend`、`optical`、`cameraObservation` 等 |
-
-帧号从 `firstFrame` 到 `lastFrame`，演示时间为 t =（帧号 − 1）/ fps，因此只渲染其中一段时帧号和时间保持不变。尺寸、帧率和帧数的允许范围以引擎为准（例如图像边长 32–4096 像素）。首次使用建议先用小分辨率和少量帧试运行，确认画面和警告后再提高分辨率。
-
-### 18.3 运动后端与撞击模型
-
-| `sequence.motionBackend` | 含义 | 结果标注 |
-|---|---|---|
-| `authored`（默认） | 作者设定的飞行轨迹、破口、碎片发射和热源，用于效果演示 | `impactModel.kind = authored`：作者设定的效果演示，不是物理预测 |
-| `rigid-v1` | 在作者设定的破口和初速基础上，用刚体动力学计算碎片的接触、摩擦、反弹和重力 | 破口位置和碎片初速仍是设定值 |
-| `impact-v1` | 经验撞击模型：由弹体、装药和墙体参数估算撞击过程 | 经验模型估算，未经独立实验验证 |
-
-`impact-v1` 根据弹体（质量、直径、速度）、装药（质量、TNT 当量）和墙体（材料、厚度）参数，按真实速度计算撞击过程：穿深采用公开的 Young 经验穿深公式，冲击波超压、冲量和到达时间采用公开的 Kingery–Bulmash 经验关系，破口、碎片初速和火球由这些估算值驱动。物理过程始终按真实速度计算；需要慢放时由 `presentationTimeScale` 记录呈现比例（例如 0.04 表示 25 倍慢放），视频中会标注该比例，不能把慢放画面当作真实时间。结果标注为“经验模型估算，未经独立实验验证”。该后端需要支持 `impact-v1` 的引擎版本，旧引擎会拒绝此输入并在日志中说明原因；示例中的参数均为通用值，不对应任何具体型号。
-
-`impact-v1` 的参数写在 `sequence.impactPhysics` 中（未写的项取下表默认值；与 `impactTime`、`flightSpeedMetersPerSecond`、`fragmentRelease`、`fragmentExit` 互斥，需要 `projectileAppearance: "separated-v2"` 和预设碎块资产）：
-
-| 参数 | 默认（通用示例值） | 作用 |
-|---|---|---|
-| `projectile.massKg` / `diameterM` / `lengthM` / `speedMetersPerSecond` / `noseCoefficientN` | 250 kg / 0.34 m / 3 m / 250 m/s / 0.85 | 飞行时间、Young 穿深、弹体表面恢复温度 |
-| `charge.massKg`、`charge.tntEquivalence` | 100 kg、1.0 | 装药能量（按 4.184 MJ/kg TNT）和冲击波荷载 |
-| `fuze.mode`、`fuze.delaySeconds` | `delay`、0.005 s | 起爆点：接触后按墙内减速运动延时起爆；穿透时在墙后 |
-| `targetMaterial.wall`：`thicknessM`、`youngS`、`criticalImpulsePaS`、`densityKgPerM3` | 0.25 m、0.9、2000 Pa·s、2300 kg/m³ | 墙体穿深指数、预设碎块的临界冲量和质量 |
-| `fragments.minimumMassKg` / `minimumThicknessM` | 2 kg / 0.05 m | 更小的失效块记为粉碎（只计入烟尘） |
-| `energySplit.blast` / `heat` | 0.6 / 0.3 | 装药能量中冲击波和进入空气的热量份额 |
-| `dust.massFraction`、`fireball.peakTemperatureK`、`ambientTemperatureK` | 0.01、2000 K、288 K | 烟尘量、火球峰值温度、环境温度 |
-| `presentationTimeScale` | 1 | 每秒视频对应的物理秒数（0.2 即 5 倍慢放） |
-
-每次运行写出 `event.json`：穿深与起爆点、每个预设块的距离、比例距离、反射冲量、是否失效及原因、碎片速度、能量与冲量核算、火球直径与持续时间、热量与烟尘源。运行清单的 `warnings` 会提示比例距离超出拟合范围（已截断）、碎片动能超过冲击波份额、没有块失效、弹体超出 Young 公式适用范围（质量小于 5 kg、速度大于 1219 m/s 或穿深小于 3 倍弹径）等情况；`impactHeatClosure` 给出注入热量在输运网格中的闭合比例。
-
-启用 `cameraObservation.jitterOnImpact` 时，`impact-v1` 的相机抖动从冲击波到达相机的时刻开始（Kingery–Bulmash 到达时间），幅度按该处超压缩放；`authored`/`rigid-v1` 可用 `blastArrival: "acoustic"` 按声速估计起点。
-
-面板不预设撞击模型的种类：运行清单 `impactModel` 中的类型、说明、是否可作预测（`predictive`）以及 `presentation`（慢放倍数、参考速度等）按原样逐项显示。
-
-### 18.4 查看结果
-
-运行完成后面板自动载入结果。“打开已有结果…”可选择以前结果目录中的 `run-manifest.json` 再次查看；只接受由 `eSceneAnimation` 写出的目录，图像只从该目录内读取。
-
-- 警告：列出运行清单 `warnings` 中的各项（例如静态碰撞体退化为薄壳、计算的接触点不在设定破口内、轨迹缓存写入失败），以及引擎日志中的 `WARNING:` 行。出现警告时应先阅读，再决定是否使用图像。
-- 运行清单：状态、场景后端、运动后端、分辨率、帧率、帧范围、时间轴帧数、撞击时刻、是否输出可见光和相机观测、物理验证（`physicsValidated`）、计算设备和引擎用时。
-- 帧查看器：选择帧类型后拖动滑块，或点击“播放”按运行帧率播放（可选 0.25×–2×）。低分辨率帧放大显示时保留像素边界，不做平滑。`impact-v1` 结果的帧说明显示物理时间和慢放倍数（物理 t =（帧号 − 1）/ fps × `presentationTimeScale`）。
-- 附加相机：输入中 `sequence.additionalCameras` 定义的相机写在 `cameras/<id>/` 下，帧类型列表中显示为“相机 <id> · 红外显示帧”等。
-- “打开输出文件夹”在资源管理器中打开本次结果目录。
-
-| 帧类型 | 目录 | 说明 |
-|---|---|---|
-| 红外显示帧 | `frames/` | 始终输出；启用传感器时为自动增益显示 |
-| 固定标尺红外帧 | `fixed_frames/` | 固定温度显示范围，便于帧间比较 |
-| 可见光 RGB 帧 | `optical_frames/` | `sequence.optical` 为 true 时输出 |
-| 相机观测红外 / 可见光 | `observed_ir/`、`observed_optical/` | 启用 `cameraObservation` 时输出，含曝光、点扩散、噪声和抖动 |
-| 几何预览（导出帧） | `geometry/` | 仅 `exportFrames` 指定的帧 |
-| 静态视图 | 结果目录根 | `mesh` 后端的 `*_visible.png`、`*_thermal.png` 等 |
-
-结果目录中的其他文件：`run-manifest.json`（运行清单，开始时写入，完成时改写为 `status: complete`）、`timeline.json`、`frames.csv`、`transport.csv`、`sensor.csv`、可选的 `rigid.csv` 和 `observation.csv`、`detector_ir/`（16 位探测器码值，不在查看器中显示）、`radiance/`（`*.f32` 浮点辐亮度和温度）、`provenance/`（输入、OBJ、着色器和引擎快照，用于复现）。Stream Studio 另写 `scene-animation-job.json`（输入路径、引擎路径与 SHA256、状态、退出码和命令）和 `scene-animation-engine.log`（引擎完整输出）。
-
-### 18.5 适用范围与限制
-
-- 没有结构有限元：不计算应力、裂纹扩展、构件失效或倒塌；
-- 没有 CFD 爆轰或可压缩冲击波传播计算，`impact-v1` 的冲击波量来自经验关系；`impact-v1` 只判定预设碎块是否失效，不生成新的裂纹形状，也不计算壳体破片、地冲击、弹坑或钢筋；
-- 没有燃烧化学：火焰和烟尘源强为设定值或经验估算，烟热输运是低速近似；
-- 红外为单波长灰体或简化波段近似，相机链使用通用、未标定的参数，不等同于具体仪器；
-- 示例只使用通用参数，不代表任何具体弹药、目标或实测事件；
-- 图像适合可视化和方法研究，不能作为毁伤评估、武器效应或安全评价的依据。
-
-### 18.6 提速选项
-
-| `sequence` 字段 | 作用 |
-|---|---|
-| `instancedGeometry` | 每个刚体部件（目标、弹体、每个碎片）建一次加速结构，之后每帧只更新位姿；`impact-v1` 默认开启，其他后端默认关闭。图像与默认路径在浮点舍入范围内一致 |
-| `additionalCameras` | 最多 7 个附加相机，与主相机共享同一次烟热输运和碎片计算，结果写在 `cameras/<id>/`；主相机结果与单相机运行逐字节一致 |
-| `checkpoints` | `{"directory": "...", "everyFrames": 24}`：保存输运场、传感器自动增益和探测器历史；同一场景以后只渲染后段帧（`firstFrame` 大于 1）时，从最近的检查点继续，不必从第 1 帧重新预热，结果与完整运行逐字节一致。不支持 `groundThermal` |
-
-### 18.7 场景动画示例
-
-开发版内置的场景动画示例位于 `assets/examples/impact_v1_building`（界面入口隐藏期间不会出现在“项目 → 打开示例…”列表中，可用命令行运行其中的 `sequence.json`）：一座办公楼外墙被通用示例参数的弹体（250 kg、0.34 m、340 m/s）撞击，100 kg TNT 当量装药延时 5 ms 起爆。按真实速度计算后以 5 倍慢放呈现（`presentationTimeScale` 0.2），1280×720、288 帧（12 秒视频，对应 2.4 秒物理时间），输出红外、可见光两路图像，并带一个街道视角的附加相机。在 RTX PRO 6000 上约 2 分钟完成，较弱的显卡可能需要十几分钟；可先把 `lastFrame` 改小试运行。
-
-打开时示例被复制到所选目录，面板自动填入副本中的输入 JSON，输出写入副本的 `output` 文件夹，不修改内置示例。也可用“浏览…”选择自己的输入 JSON。

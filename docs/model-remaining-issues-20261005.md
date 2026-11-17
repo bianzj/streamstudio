@@ -56,7 +56,7 @@
 ## 部署状态
 
 - 当前工作区 Release 引擎：`C:\work\streamstudio\models\bin_x64\Release\histream.exe`，SHA256 `f87ebc7b8027d77d58d6e6bf76d7d7e2c067382c00681ae9c3620de4cc08eb7e`。
-- `D:\streamsim\resources\engine\histream.exe` 仍为 `9b852d9e02e40048be230dd707387bfc33552f881cb61a651e48ed9a0c4126e3`，未同步本次三阶改动。
-- 源码默认阶数仍为 1，默认走旧路径；2/3 或 `STREAMSIM_NEW_SCATTERING=1` 才启用新短波路径。
+- 旧部署目录中的 `resources\engine\histream.exe` 仍为 `9b852d9e02e40048be230dd707387bfc33552f881cb61a651e48ed9a0c4126e3`，未同步本次三阶改动。
+- 源码默认阶数仍为 1，默认走旧路径；设为 2/3 才启用新短波路径。
 
 预算未闭合按要求保留为诊断并继续步进。后续模型工作仍包括固体几何投影、普通冠层边界及介质长波散射；太阳截断诊断、夜间优化及光学成像的高阶接入另行处理。既有三阶测试证据见 2026-10-04 测试记录（已移出工作区，见 git 历史 `docs/scattering-order-validation-20261004.md`）。

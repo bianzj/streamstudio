@@ -80,23 +80,6 @@
       ],
       "note": "参考综合收敛率98.82%；异常像元已标记",
       "categoryLabel": "区域遥感影像"
-    },
-    {
-      "id": "impact_v1_building",
-      "label": "建筑撞击 · impact-v1（研究功能）",
-      "mode": "eSceneAnimation",
-      "input": "assets/examples/impact_v1_building/sequence.json",
-      "category": "research",
-      "tier": "featured",
-      "focus": [
-        "经验撞击模型",
-        "冲击波失效",
-        "刚体碎片",
-        "火球与烟尘",
-        "5倍慢放"
-      ],
-      "note": "经验模型估算，未经独立验证；通用示例参数；1280×720×288 帧，约 2 分钟（RTX PRO 6000）",
-      "categoryLabel": "场景动画（研究功能）"
     }
   ],
   "categories": [
@@ -127,10 +110,6 @@
     {
       "id": "reference",
       "label": "对比与历史资料"
-    },
-    {
-      "id": "research",
-      "label": "场景动画（研究功能）"
     }
   ],
   "library": "builtin"

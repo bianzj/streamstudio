@@ -2,10 +2,9 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'node:path'
 
 const KEYS = new Set([
-  'streamStudioLanguage', 'histreamStudioLanguage', 'streamsimLanguage',
+  'streamStudioLanguage', 'histreamStudioLanguage',
   'histreamExampleDirectory', 'histreamProjectDirectory', 'histreamExecutable',
-  'streamStudioImage', 'streamStudioScene', 'histreamStreamScene', 'streamStudioImageProject',
-  'sceneAnimationInput', 'sceneAnimationOutputRoot', 'sceneAnimationLastResult'
+  'streamStudioImage', 'streamStudioScene', 'histreamStreamScene', 'streamStudioImageProject'
 ])
 
 // A dedicated file survives changes to the loopback server's port. It contains

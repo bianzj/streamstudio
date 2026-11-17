@@ -2,7 +2,7 @@
 
 ## 在线研究案例
 
-[四例图文案例库](cases/README.md)提供玉米光热、雨林分层光热、城市街区降温和延庆山地风场案例，含报告、图件和相对路径工程输入。工程位于[examples/research-cases](../examples/research-cases/README.md)，需整体下载以保留输入依赖。
+[四例图文案例库](cases/README.md)提供玉米光热、雨林分层光热、城市街区降温和延庆山地风场案例，含报告、图件和相对路径工程输入。工程位于[tests/research-cases](../tests/research-cases/README.md)，需整体下载以保留输入依赖。
 
 城市案例以2026-11-05 v2修订版PDF与图表为准；延庆案例采用五图版、30m/s上限和中心2×2km流体展示窗口。本次仅整理和核对文件，未重新运行模型，未完成独立观测验证；完整研究历史与原生输出保留在本地案例库。
 
@@ -24,18 +24,16 @@ D:/releases/streamstudio/2.0.1 将安装器、用户手册和随附案例放在�
 
 影像案例默认 4×4 像元、2 线程；运行前复制到全英文可写路径。详见 [验收记录](testing/user-release-cases-20261101.md)。LSCT 条目读取既有组分温度，不执行温度反演。MODIS-ERA5 和 Landsat-ERA5 的 reference 为历史全图结果，综合收敛率 98.82% 和 99.95%，分别保留 204 和 82 个异常像元标记；数值收敛不等于观测精度。
 
-合并前的 D:/examples 原样备份在 D:/cases/StreamStudio/项目清理归档/20261104-examples-merge。完整研究历史与维护资料不进入用户发布；此前误归集的大包保存在 D:/cases/StreamStudio/发布整理归档/20261101-开发与研究资料。
+合并前的 D:/examples 原样备份在 D:/cases/streamstudio/项目清理归档/20261104-examples-merge。完整研究历史与维护资料不进入用户发布；此前误归集的大包保存在 D:/cases/streamstudio/发布整理归档/20261101-开发与研究资料。
 
 ## 项目内部
 
-assets/examples 提供五个精选内置案例：玉米、森林、城市、MODIS 能量平衡、Landsat 能量平衡；另有一个场景动画研究示例 `impact_v1_building`。唯一内置索引为 assets/examples/catalog.json；玉米曲面光伏技术演示已撤下。
-
-catalog.json 也可登记场景动画（研究功能，HiStream `eSceneAnimation`）示例：条目写 `"mode": "eSceneAnimation"`，用 `input` 代替 `project`，指向场景动画输入 JSON。`input` 与 `project` 一样相对资源根目录书写（如 `assets/examples/<文件夹>/scene.json`），也接受相对 assets/examples 的写法；id、label、category、categoryLabel、tier、focus、note 与普通条目相同，`recommendedMode` 可省略。输入 JSON 放在示例文件夹根目录，引用的 OBJ、背景场等文件放在同一文件夹内，因为“打开示例”只复制该文件夹（跳过 output/）。复制后场景动画面板自动填入副本中的输入，运行输出写入副本的 output/。输入不存在或不在 assets/examples 的子文件夹内的条目不会列出。当前内置目录含一个场景动画示例 `impact_v1_building`（建筑撞击，impact-v1，通用示例参数，经验模型估算，未经独立验证），但场景动画界面入口当前隐藏（`SCENE_ANIMATION_UI_ENABLED=false`），该条目不会出现在“打开示例”列表中，可用命令行运行；输入格式见 [histream-scene-animation.md](histream-scene-animation.md)，示例只能使用通用参数。
+assets/examples 提供五个精选内置案例：玉米、森林、城市、MODIS 能量平衡、Landsat 能量平衡。唯一内置索引为 assets/examples/catalog.json，条目都以 `project` 指向工程文件；玉米曲面光伏技术演示已撤下。原场景动画研究示例 `impact_v1_building` 已随场景动画于 2026-11-16 移到 STREAM IMAGING（`C:/work/streamimaging/animation/examples`），catalog.json 不再支持 `eSceneAnimation` 条目。
 
 ## 研究与维护
 
-阿柔站、真实山地、虚拟山地保存在 D:/cases/真实地形 和 D:/cases/虚拟地形，入口见 D:/cases/StreamStudio地形案例.json；完整旧运行放在 D:/cases/StreamStudio/历史运行。
+阿柔站、真实山地、虚拟山地保存在 D:/cases/streamstudio/真实地形 和 D:/cases/streamstudio/虚拟地形，入口见 D:/cases/streamstudio/StreamStudio地形案例.json；完整旧运行放在 D:/cases/streamstudio/历史运行。
 
-唯一 SCOPE 对比库位于 D:/cases/StreamStudio/模型对比/SCOPE；只有明确要求时运行。
+唯一 SCOPE 对比库位于 D:/cases/streamstudio/模型对比/SCOPE；只有明确要求时运行。
 
-培训案例机器索引为 D:/cases/StreamStudio/培训案例目录.json（已指向发布目录）。整理记录和待删除资料在 D:/cases/StreamStudio 下，不进入发布目录。上述开发机路径不是内置工程的运行依赖。
+培训案例机器索引为 D:/cases/streamstudio/培训案例目录.json（已指向发布目录）。整理记录和待删除资料在 D:/cases/streamstudio 下，不进入发布目录。上述开发机路径不是内置工程的运行依赖。

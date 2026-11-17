@@ -69,7 +69,6 @@ std::string jsonNumber(double value)
 }
 
 // histream:* attributes in any namespace (Blender re-exports them as userProperties:histream:*).
-// USD files exported before the rename carry streamsim:* and are still read.
 using Attributes = std::map<std::string, std::string>;
 
 Attributes histreamAttributes(const UsdPrim& prim)
@@ -77,15 +76,9 @@ Attributes histreamAttributes(const UsdPrim& prim)
     Attributes result;
     for (const UsdAttribute& attribute : prim.GetAttributes()) {
         const std::string name = attribute.GetName().GetString();
-        size_t position = name.find("histream:");
-        size_t prefixLength = 9;
-        if (position == std::string::npos) {
-            position = name.find("streamsim:");
-            prefixLength = 10;
-        }
+        const size_t position = name.find("histream:");
         if (position == std::string::npos) continue;
-        const std::string key = name.substr(position + prefixLength);
-        if (prefixLength == 10 && result.count(key)) continue;
+        const std::string key = name.substr(position + 9);
         VtValue value;
         if (!attribute.Get(&value, kTime)) continue;
         if (value.IsHolding<std::string>()) result[key] = jsonString(value.UncheckedGet<std::string>());
@@ -400,7 +393,6 @@ int read(const std::string& input, const std::filesystem::path& outputDirectory)
     std::string projectJson, layerFormat;
     const VtDictionary layerData = stage->GetRootLayer()->GetCustomLayerData();
     const VtValue* entry = layerData.GetValueAtPath("histream");
-    if (!entry) entry = layerData.GetValueAtPath("streamsim");
     if (entry && entry->IsHolding<VtDictionary>()) {
         const VtDictionary& data = entry->UncheckedGet<VtDictionary>();
         if (const auto found = data.find("project"); found != data.end() && found->second.IsHolding<std::string>())

@@ -23,9 +23,7 @@ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 
 #include "src/base/engine.h"
-#ifdef HISTREAM_ENABLE_SCENE_ANIMATION
-#include "animation/scene_animation.h"
-#endif
+#include "base/extension.h"
 #include <filesystem>
 #include <vector>
 
@@ -60,33 +58,16 @@ int main(int argc, char **argv) {
     // std::string filePath;
 
     std::string mode = argc > 1 ? argv[1] : "eVoxelEB";
-    if (mode == "eSceneAnimation") {
-#ifndef HISTREAM_ENABLE_SCENE_ANIMATION
-        std::cerr << "HiStream scene animation module is not enabled; build with HISTREAM_ENABLE_SCENE_ANIMATION=ON\n";
-        return 2;
-#else
-        if (argc != 4) {
-            std::cerr << "Usage: histream eSceneAnimation animation.json new-output-directory\n";
-            return 2;
-        }
+    // Out-of-tree extension modes (none in the core build; see src/base/extension.h).
+    histream::ExtensionRegistry extensions;
+    histream::registerExtensions(extensions);
+    if (const auto* extension = extensions.find(mode)) {
         try {
-            std::filesystem::path executable;
-#ifdef _WIN32
-            std::vector<wchar_t> name(32768,L'\0');
-            const auto length=GetModuleFileNameW(nullptr,name.data(),static_cast<DWORD>(name.size()));
-            if(!length || length>=name.size()) throw std::runtime_error("Cannot resolve HiStream executable path");
-            executable=std::wstring(name.data(),length);
-#else
-            std::error_code ec;
-            executable=std::filesystem::read_symlink("/proc/self/exe",ec);
-            if(ec) executable=std::filesystem::absolute(argv[0]);
-#endif
-            return runSceneAnimation(argv[2], argv[3], executable.parent_path() / "shader/animation/scene.comp.spv", executable);
+            return extension->run(argc, argv, histream::executablePath(argv[0]));
         } catch (const std::exception& error) {
-            std::cerr << "HiStream GPU scene animation failed: " << error.what() << '\n';
+            std::cerr << "HiStream " << mode << " failed: " << error.what() << '\n';
             return 1;
         }
-#endif
     }
     if (mode == "--list-devices") {
         try {
@@ -103,8 +84,9 @@ int main(int argc, char **argv) {
     if (mode != "eVoxelEB" && mode != "eFacetEB" && mode != "eFacetRT"
         && mode != "eVoxelRT" && mode != "eRaytracing") {
         std::cerr << "Usage: histream [eVoxelEB|eFacetEB|eFacetRT|eVoxelRT|eRaytracing] [project.json] [output.json]\n"
-                     "       histream --list-devices\n"
-                     "       histream eSceneAnimation animation.json new-output-directory\n";
+                     "       histream --list-devices\n";
+        for (const auto& extension : extensions.modes())
+            std::cerr << "       " << extension.usage << '\n';
         return 2;
     }
 

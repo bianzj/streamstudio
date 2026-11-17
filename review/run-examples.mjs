@@ -181,7 +181,8 @@ async function runExample(entry) {
         record.exitCode = manifest?.exitCode ?? null
         record.error = manifest?.error || null
         record.outputDir = manifest?.outputDir || (path ? dirname(path) : null)
-        step('运行结束', record.status === 'finished', `status=${record.status} exitCode=${record.exitCode}${record.error ? ' error=' + record.error : ''}`)
+        const passed = record.exitCode === 0 || ['completed', 'finished', 'done'].includes(record.status)
+        step('运行结束', passed, `status=${record.status} exitCode=${record.exitCode}${record.error ? ' error=' + record.error : ''}`)
       }
     }
   } catch (error) {

@@ -10,7 +10,6 @@ set(PROJNAME ${PROJNAME})
 project(${PROJNAME} LANGUAGES C CXX)
 message(STATUS "-------------------------------")
 
-option(HISTREAM_ENABLE_SCENE_ANIMATION "Build the isolated scene animation module" OFF)
 option(HISTREAM_ENABLE_FACET "Build integrated FacetRT and FacetEB backends" ON)
 if (HISTREAM_ENABLE_FACET)
     find_package(Vulkan REQUIRED)
@@ -168,7 +167,6 @@ find_program(HISTREAM_GLSLC
 file(GLOB_RECURSE HISTREAM_SHARED_SHADER_DEPENDENCIES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/shader/*.glsl"
         "${CMAKE_CURRENT_SOURCE_DIR}/shader/*.h")
-list(FILTER HISTREAM_SHARED_SHADER_DEPENDENCIES EXCLUDE REGEX "/shader/animation/")
 
 set(HISTREAM_RAYTRACING_SHADER_FILES
         offline.rgen
@@ -382,7 +380,39 @@ endforeach (RELEASELIB)
 #
 
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/scene-animation.cmake")
+#####################################################################################
+# Optional out-of-tree extensions (see src/base/extension.h). The core build has none.
+# Each directory in HISTREAM_EXTENSION_DIRS provides histream-extension.cmake, which may
+# add targets, link them to ${PROJNAME}, append registrar function names to
+# HISTREAM_EXTENSION_REGISTRARS and runtime deployment commands to
+# HISTREAM_EXTENSION_RUNTIME_COPY. Inside it, CMAKE_CURRENT_LIST_DIR is the extension
+# directory and HISTREAM_CORE_SOURCE_DIR is this directory.
+set(HISTREAM_EXTENSION_DIRS "" CACHE STRING "Semicolon-separated out-of-tree HiStream extension directories")
+set(HISTREAM_CORE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+set(HISTREAM_EXTENSION_REGISTRARS)
+set(HISTREAM_EXTENSION_RUNTIME_COPY)
+foreach(HISTREAM_EXTENSION_ENTRY IN LISTS HISTREAM_EXTENSION_DIRS)
+    get_filename_component(HISTREAM_EXTENSION_ENTRY "${HISTREAM_EXTENSION_ENTRY}" ABSOLUTE)
+    if(NOT EXISTS "${HISTREAM_EXTENSION_ENTRY}/histream-extension.cmake")
+        message(FATAL_ERROR "HiStream extension directory has no histream-extension.cmake: ${HISTREAM_EXTENSION_ENTRY}")
+    endif()
+    message(STATUS "HiStream extension: ${HISTREAM_EXTENSION_ENTRY}")
+    include("${HISTREAM_EXTENSION_ENTRY}/histream-extension.cmake")
+endforeach()
+set(HISTREAM_EXTENSION_DECLARATIONS "")
+set(HISTREAM_EXTENSION_CALLS "")
+foreach(HISTREAM_EXTENSION_REGISTRAR IN LISTS HISTREAM_EXTENSION_REGISTRARS)
+    string(APPEND HISTREAM_EXTENSION_DECLARATIONS "void ${HISTREAM_EXTENSION_REGISTRAR}(histream::ExtensionRegistry&);\n")
+    string(APPEND HISTREAM_EXTENSION_CALLS "    ${HISTREAM_EXTENSION_REGISTRAR}(registry);\n")
+endforeach()
+if(HISTREAM_EXTENSION_REGISTRARS)
+    string(REPLACE ";" ", " HISTREAM_EXTENSION_SUMMARY "${HISTREAM_EXTENSION_REGISTRARS}")
+else()
+    set(HISTREAM_EXTENSION_SUMMARY "none")
+endif()
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/extensions.cpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/histream_extensions.cpp" @ONLY)
+target_sources(${PROJNAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/histream_extensions.cpp")
 
 # Deploy runtime resources next to histream.exe so XML-driven projects use the same
 # shader and predefined-data layout as the built-in configurations.
@@ -424,7 +454,7 @@ add_custom_target(histream_runtime_resources ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_BINARY_DIR}/shader/raytracing"
             "$<TARGET_FILE_DIR:${PROJNAME}>/shader/raytracing"
-    ${HISTREAM_ANIMATION_RUNTIME_COPY}
+    ${HISTREAM_EXTENSION_RUNTIME_COPY}
     COMMAND ${CMAKE_COMMAND}
             "-DSOURCE_DIR=$<IF:$<CONFIG:Debug>,${VCPKG_INSTALLED_DIR}/x64-windows/debug/bin,${VCPKG_INSTALLED_DIR}/x64-windows/bin>"
             "-DDESTINATION_DIR=$<TARGET_FILE_DIR:${PROJNAME}>"
@@ -441,5 +471,5 @@ _finalize_target(${PROJNAME})
 
 # Header-only physical check; no GPU or scene simulation is launched by builds.
 add_executable(histream_lumped_thermal_tests EXCLUDE_FROM_ALL
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/scene-animation/tests/lumped_thermal_fixture.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/test-facet-lumped-thermal.cpp")
 target_include_directories(histream_lumped_thermal_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

@@ -1,5 +1,5 @@
-# Stream Studio uses a new application identity. Uninstall HiStream Studio (or
-# the earlier StreamSim 1.x) before installing; user data is migrated on first launch.
+# Stream Studio uses a new application identity. Uninstall HiStream Studio
+# before installing; user data is migrated on first launch.
 appId: cn.stream.studio
 productName: Stream Studio
 asar: true
@@ -46,7 +46,7 @@ extraResources:
       - "!**/*.xlsx"
       - "!usd/usd/resources/codegenTemplates{,/**/*}"
       - "!shader/*副本*"
-      # Scene-animation fixture executables (histream_*_tests.exe) are developer tests, not product tools.
+      # Engine fixture executables (histream_*_tests.exe) are developer tests, not product tools.
       - "!histream_*_tests.exe"
   - from: docs
     to: docs

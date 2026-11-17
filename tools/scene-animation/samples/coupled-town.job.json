@@ -1,9 +1,0 @@
-{
-  "schemaVersion": 1,
-  "pipeline": "coupled-town",
-  "engine": "../../../build/histream-animation/runtime/Release/histream.exe",
-  "sourceCase": "D:/cases/StreamStudio/supplemental/impact_gpu_20261107/mwir_runway_road_generic_20261109",
-  "actors": "D:/cases/StreamStudio/supplemental/impact_gpu_20261107/mwir_town_coupled_v5_20261109/actors.json",
-  "ffmpeg": "D:/cases/StreamStudio/补充案例/impact_visual_20261107/_tools/imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v9.0.2.exe",
-  "output": "C:/cases/StreamStudio/town_coupled_example_new"
-}

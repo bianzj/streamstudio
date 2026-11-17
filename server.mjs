@@ -8,7 +8,7 @@ import { inflateSync } from 'node:zlib'
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { createDefaultProject, DEFAULT_SCENE_MODEL, normalizeProject, PROJECT_MODES, SCENE_ANIMATION_MODE, SCENE_ANIMATION_UI_ENABLED, sensorBandValues, sensorViewAngles, stringifyProject, validateProject } from './src/renderer/src/project-schema.js'
+import { createDefaultProject, DEFAULT_SCENE_MODEL, normalizeProject, PROJECT_MODES, sensorBandValues, sensorViewAngles, stringifyProject, validateProject } from './src/renderer/src/project-schema.js'
 import { applyHistreamToUnified, histreamProjectToUnified, isUnifiedProject, normalizeUnified, stringifyUnifiedProject, unifiedToHistreamProject } from './src/renderer/src/project-unified.js'
 import { prepareRuntimeSceneProject } from './tools/runtime-scene.mjs'
 import { generateTarpCover } from './tools/tarp-cover.mjs'
@@ -16,7 +16,6 @@ import { exportProjectUsd } from './tools/usd-export.mjs'
 import { buildProjectFromUsd } from './tools/usd-import.mjs'
 import { createStreamService } from './server/stream/index.mjs'
 import { mapStreamScenePaths } from './server/stream/config.mjs'
-import { createSceneAnimationService } from './server/scene-animation.mjs'
 
 const PROJECT_ROOT = dirname(fileURLToPath(import.meta.url))
 const APP_VERSION = (() => { try { return JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')).version || '' } catch { return '' } })()
@@ -60,17 +59,6 @@ let projectFileChooser = null
 const clients = new Set()
 // STREAM remote-sensing image simulation: an independent module with its own API, queue and events.
 const streamService = createStreamService({ resourceRoot: RESOURCE_ROOT, modelRoot: MODEL_ROOT, json, body, readTiff, normalizeHostPath, windowsPath })
-// HiStream eSceneAnimation research runs share the single HiStream engine slot (`child`) with /api/run.
-const sceneAnimation = createSceneAnimationService({
-  json, body, emit, normalizeHostPath, windowsPath, pathWithin, realPathWithin, appVersion: APP_VERSION,
-  defaultEngine: executable, runtimePath: histreamRuntimePath,
-  engineSlot: {
-    busyReason: () => resettingProcesses ? '模拟环境正在重置，请稍后再运行'
-      : !child ? '' : child.sceneAnimationRun ? '场景动画正在运行，请等待完成或先停止' : '已有 HiStream 模拟任务正在运行，请等待完成或先停止',
-    claim: (process, engine) => { child = process; childExecutable = engine },
-    release: (process) => { if (child === process) { child = null; childExecutable = '' } }
-  }
-})
 
 function executable() {
   return histreamCandidates.find(existsSync) || histreamCandidates[0]
@@ -2383,24 +2371,7 @@ function saveProjectAs(data) {
 
 const EXAMPLES_ROOT = join(RESOURCE_ROOT, 'assets', 'examples')
 
-// Scene-animation catalog entries ("mode": "eSceneAnimation") name an input JSON instead of a
-// project. Like "project", "input" is relative to the resource root (assets/examples/<folder>/x.json);
-// a path relative to the catalog folder is accepted too. The input must sit in its own example folder.
-function sceneAnimationExampleInput(entry) {
-  const value = typeof entry?.input === 'string' ? normalizeHostPath(entry.input.trim()) : ''
-  if (!value || isAbsolute(value)) return ''
-  for (const base of [RESOURCE_ROOT, EXAMPLES_ROOT]) {
-    const path = resolve(base, value)
-    const folder = relative(EXAMPLES_ROOT, dirname(path))
-    if (!folder || folder === '..' || folder.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(folder)) continue
-    try { if (extname(path).toLowerCase() === '.json' && statSync(path).isFile()) return path } catch {}
-  }
-  return ''
-}
-
 function exampleSourceFile(entry) {
-  // Scene-animation entries stay in catalog.json but are not offered while the UI is hidden.
-  if (entry?.mode === SCENE_ANIMATION_MODE) return SCENE_ANIMATION_UI_ENABLED ? sceneAnimationExampleInput(entry) : ''
   return entry?.project && existsSync(resolve(RESOURCE_ROOT, entry.project)) ? resolve(RESOURCE_ROOT, entry.project) : ''
 }
 
@@ -2410,9 +2381,8 @@ function listExamples() {
   const catalog = JSON.parse(readFileSync(catalogPath, 'utf8').replace(/^\uFEFF/, ''))
   return (catalog.examples || [])
     .filter((entry) => exampleSourceFile(entry))
-    .map(({ id, label, recommendedMode, mode, focus, category, categoryLabel, tier, note }) => ({
-      id, label, recommendedMode: recommendedMode || (mode === SCENE_ANIMATION_MODE ? SCENE_ANIMATION_MODE : ''),
-      ...(mode === SCENE_ANIMATION_MODE ? { mode } : {}), focus: focus || [], category: category || 'other',
+    .map(({ id, label, recommendedMode, focus, category, categoryLabel, tier, note }) => ({
+      id, label, recommendedMode: recommendedMode || '', focus: focus || [], category: category || 'other',
       categoryLabel: categoryLabel || '其他案例', tier: tier || 'featured', note: note || ''
     }))
 }
@@ -2423,12 +2393,9 @@ function defaultExampleDirectory() {
 
 function openExample(data) {
   const entry = JSON.parse(readFileSync(join(EXAMPLES_ROOT, 'catalog.json'), 'utf8').replace(/^\uFEFF/, ''))
-    .examples?.find((item) => item.id === data.id && (item.project || item.mode === SCENE_ANIMATION_MODE))
+    .examples?.find((item) => item.id === data.id && item.project)
   if (!entry) throw new Error(`示例不存在：${data.id}`)
-  if (entry.mode === SCENE_ANIMATION_MODE && !SCENE_ANIMATION_UI_ENABLED) throw new Error('场景动画（研究功能）界面入口当前已隐藏，示例不在界面中提供')
-  const sceneAnimationInput = entry.mode === SCENE_ANIMATION_MODE ? sceneAnimationExampleInput(entry) : ''
-  if (entry.mode === SCENE_ANIMATION_MODE && !sceneAnimationInput) throw new Error(`场景动画示例的输入文件不存在：${entry.input || data.id}`)
-  const sourceFile = sceneAnimationInput || resolve(RESOURCE_ROOT, entry.project)
+  const sourceFile = resolve(RESOURCE_ROOT, entry.project)
   const sourceDirectory = dirname(sourceFile)
   if (relative(EXAMPLES_ROOT, sourceDirectory).startsWith('..')) throw new Error('示例路径无效')
   const directory = normalizeHostPath(data.directory || defaultExampleDirectory()).replace(/^"|"$/g, '')
@@ -2440,8 +2407,6 @@ function openExample(data) {
   cpSync(sourceDirectory, target, { recursive: true, filter: (path) => relative(sourceDirectory, path).split(/[\\/]/)[0] !== 'output' })
   mkdirSync(join(target, 'output'), { recursive: true })
   const copiedProject = join(target, basename(sourceFile))
-  // The scene-animation panel opens the copied input (runs go to the copy's output/); it is not a 3D or STREAM project.
-  if (sceneAnimationInput) return { sceneAnimation: { id: entry.id, label: entry.label || entry.id, input: windowsPath(copiedProject), outputRoot: windowsPath(join(target, 'output')), directory: windowsPath(target) } }
   const streamProject = streamService.openProjectFile(copiedProject)
   return streamProject ? { path: streamProject.path, streamProject } : openProject(copiedProject)
 }
@@ -3687,8 +3652,6 @@ function readEnvi(path, requestedBand = 0) {
 async function api(request, response, url) {
   const streamHandled = await streamService.handle(request, response, url)
   if (streamHandled !== false) return streamHandled
-  const sceneAnimationHandled = await sceneAnimation.handle(request, response, url)
-  if (sceneAnimationHandled !== false) return sceneAnimationHandled
   if (request.method === 'GET' && url.pathname === '/api/histream-proxy/info') {
     return json(response, 200, histreamProxyHealth(true))
   }
@@ -3814,10 +3777,7 @@ async function api(request, response, url) {
     response.write(': connected\n\n')
     // EventSource reconnects silently; this lets the GUI resync a run whose
     // started/closed events it missed while disconnected or reloading.
-    // A scene animation occupies the same engine slot but reports through its own events.
-    const histreamChild = child && !child.sceneAnimationRun ? child : null
-    response.write(`data: ${JSON.stringify({ type: 'status', running: Boolean(histreamChild), pid: histreamChild?.pid ?? null, ...(histreamChild?.histreamRun || {}) })}\n\n`)
-    response.write(`data: ${JSON.stringify(sceneAnimation.statusEvent())}\n\n`)
+    response.write(`data: ${JSON.stringify({ type: 'status', running: Boolean(child), pid: child?.pid ?? null, ...(child?.histreamRun || {}) })}\n\n`)
     clients.add(response)
     request.on('close', () => clients.delete(response))
     return
@@ -4116,7 +4076,7 @@ async function api(request, response, url) {
     try {
       const data = await body(request)
       if (resettingProcesses) throw new Error('模拟环境正在重置，请稍后再运行')
-      if (child) throw new Error(child.sceneAnimationRun ? '场景动画正在运行，请等待完成或先停止' : '已有模拟任务正在运行')
+      if (child) throw new Error('已有模拟任务正在运行')
       if (!modes.has(data.mode)) throw new Error('不支持的计算模式')
       const input = resolveProjectFile(data.inputPath || projectFile)
       projectFile = input
@@ -4458,7 +4418,6 @@ else if (workerData?.kind === 'facet-step') {
 export { server, stopEngines }
 
 function stopEngines() {
-  sceneAnimation.shutdown()
   if (child?.facetWorker) void child.facetWorker.terminate()
   if (child) {
     child.histreamStopped = true

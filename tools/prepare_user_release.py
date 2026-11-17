@@ -55,7 +55,7 @@ def main():
     shutil.copy2(a.start_text, a.out / '开始使用.txt')
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     catalog = dict(version=a.version, checkedAt=now, requiredRunLocation=previous.get('requiredRunLocation'),
-                   scope=previous.get('scope', '') + ' Scene-animation example: run check with the packaged engine, see its acceptance field.',
+                   scope=previous.get('scope', ''),
                    carriedOverFrom=str(a.previous).replace('\\', '/'), cases=cases)
     (a.out / '案例目录.json').write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding='utf-8')
     files = sorted(f for f in a.out.rglob('*') if f.is_file())

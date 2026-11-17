@@ -2,11 +2,11 @@
 
 Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两个相互独立的引擎：STREAM 影像级引擎（`stream.exe`）和 STREAM 的高分辨率三维扩展 HiStream（`histream.exe`）。源码、编译结果和运行文件均集中在本项目目录。
 
-当前版本 **2.0.1**，发布内容与验证范围见 [2.0.1 发布说明](docs/release-2.0.1.md)。开发版正在测试场景动画 GUI 集成与 impact-v1，尚未发布，变更草稿见 [下一版本更新说明（草稿）](docs/release-next-draft.md)。
+当前版本 **2.0.1**，发布内容与验证范围见 [2.0.1 发布说明](docs/release-2.0.1.md)。开发版尚未发布的变更（含 2026-11-16 场景动画剥离到 STREAM IMAGING、HiStream 通用扩展接口）见 [下一版本更新说明（草稿）](docs/release-next-draft.md)。
 
 下载：[Windows 安装程序、手册与案例包](https://github.com/bianzj/streamstudio/releases/tag/v2.0.1)。
 
-产品已从 HiStream Studio 更名为 Stream Studio，并集成 STREAM 影像级引擎。应用标识改为 `cn.stream.studio`，桌面程序为 `StreamStudio.exe`，安装包为 `Stream-Studio-Setup-<version>-x64-slim.exe`。由于应用标识改变，安装前请先卸载旧版；用户数据首次启动时从旧版目录迁移到 `%APPDATA%\Stream Studio`，桌面数据目录改为 `%LOCALAPPDATA%\StreamStudio`，默认输出与示例目录改为 `文档\Stream Studio`，环境变量前缀为 `STREAM_STUDIO_*`。命名迁移历史见 [2.0 历史发布说明](docs/release-2.0.0.md)；1.1.4 的功能变更见 [1.1.4 发布说明](docs/release-1.1.4.md)，基础修复见 [1.1.3 修复说明](docs/release-1.1.3.md)。
+产品已从 HiStream Studio 更名为 Stream Studio，并集成 STREAM 影像级引擎。应用标识改为 `cn.stream.studio`，桌面程序为 `StreamStudio.exe`，安装包为 `Stream-Studio-Setup-<version>-x64-slim.exe`。由于应用标识改变，安装前请先卸载旧版；用户数据首次启动时从旧版目录迁移到 `%APPDATA%\Stream Studio`，桌面数据目录改为 `%LOCALAPPDATA%\StreamStudio`，默认输出与示例目录改为 `文档\Stream Studio`，环境变量前缀为 `STREAM_STUDIO_*`。旧版本发布说明与迁移记录不再随仓库保留。
 
 ## 安装与案例入口
 
@@ -15,11 +15,11 @@ Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两�
 | 内容 | 入口 |
 | --- | --- |
 | 用户安装包、两本手册、九个随附案例（四个已核验影像案例 + 五个三维培训案例） | D:/releases/streamstudio/2.0.1；见 [案例目录](docs/example-library.md) |
-| 五个原有内置精选案例；开发版另含场景动画示例 `impact_v1_building`（测试中） | 安装后从案例库打开；源码索引 [assets/examples/catalog.json](assets/examples/catalog.json) |
-| 研究案例与导航 | D:/cases/StreamStudio；原 D:/examples 已于 2026-11-04 并入发布目录 |
+| 五个内置精选案例 | 安装后从案例库打开；源码索引 [assets/examples/catalog.json](assets/examples/catalog.json) |
+| 研究案例与导航 | D:/cases/streamstudio；原 D:/examples 已于 2026-11-04 并入发布目录 |
 | 新增研究案例：玉米、雨林、城市街区、延庆山地、光伏草场 | [在线图文案例库](docs/cases/README.md)；含图文报告；001–004附工程输入，005为宣传材料 |
 | 测试脚本和验收摘要 | tools/check-user-release-cases.mjs、[本次验收范围](docs/testing/user-release-cases-20261101.md) |
-| 场景动画（**研究功能**；开发版已接入 GUI，测试中，不在 2.0.1 安装包内）与机场日变化 | GUI“解决方案 → 研究功能 → 场景动画”、用户手册第 18 章；源码与命令行见 [tools/scene-animation](tools/scene-animation/CURRENT_FEATURES.md)。`authored`/`rigid-v1` 为作者设定演示，`impact-v1` 为经验模型估算，均未经独立验证 |
+| 场景动画（撞击、火球、机场全天等研究功能） | 2026-11-16 已剥离到 STREAM IMAGING（`C:/work/streamimaging`：工具链 `animation/`、引擎扩展 `engine/scene-animation`）；本仓库只保留 HiStream 通用扩展接口（`models/histream/src/base/extension.h`、CMake `HISTREAM_EXTENSION_DIRS`），产品引擎不含该模式 |
 
 随附四例为 MODIS-ERA5、Landsat-ERA5、MODIS-LSCT、Landsat-LSCT；默认 4×4 区域已通过影像引擎检查。请先将案例文件夹复制到全英文可写路径，再在软件中打开 project.json；当前 ERA5 读取不能保证支持中文路径。LSCT 条目读取已有组分温度用于正向模拟，不做温度反演。
 
@@ -34,7 +34,7 @@ Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两�
 | 影像级引擎 | STREAM | `stream.exe`、`models/stream/`、`/api/stream/*`、`stream-*` 格式标识 |
 | 高分辨率三维扩展 | HiStream | `histream.exe`、`histream-usd.exe`、`models/histream/`、`HISTREAM_*` 引擎变量、`histream-*` 格式标识 |
 
-旧产品名 StreamSim、HiStream Studio 只用于读取旧数据：`streamsim-project` 工程、USD 中的 `streamsim:*` 属性与 `customLayerData.streamsim`、`%APPDATA%\StreamSim` 与 `%APPDATA%\HiStream Studio` 用户数据，以及 `HISTREAM_STUDIO_*` 应用环境变量别名。新写出的文件一律使用上表中的名称。
+旧产品名 HiStream Studio 只用于读取旧数据：`%APPDATA%\HiStream Studio` 用户数据，以及 `HISTREAM_STUDIO_*` 应用环境变量别名。新写出的文件一律使用上表中的名称。更早的产品名、工程格式与 USD 属性前缀不再读取，旧工程需先在受支持的版本中另存为当前格式。
 
 ## 结果展示
 
@@ -101,6 +101,7 @@ streamstudio/
 ├─ server.mjs                   Node 后端（HiStream 部分与桌面外壳）
 ├─ server/stream/               STREAM 服务端模块（/api/stream/*、任务队列、事件）
 ├─ assets/                      内置 OBJ、DEM、光谱和大气数据
+├─ tests/                       研究案例工程与输入（原 examples/，案例 001–004）
 ├─ build/histream/              HiStream CMake 中间文件
 ├─ build/stream/                STREAM CMake 中间文件
 ├─ models/
@@ -152,7 +153,7 @@ CMake 编译仍需要本机 Vulkan SDK、Visual Studio 和 vcpkg 依赖。`eFace
 
 ## SCOPE 对比资料
 
-唯一保留的一组对比资料位于本机外部目录 `D:\cases\StreamStudio\模型对比\SCOPE`，不随项目源码或安装包分发。只有用户明确要求与 SCOPE 对比时才执行；日常开发仅做当前任务相关测试，不自动运行 SCOPE 对比或扩大为正式发布。历史对比说明与结果保存在该目录。
+唯一保留的一组对比资料位于本机外部目录 `D:\cases\streamstudio\模型对比\SCOPE`，不随项目源码或安装包分发。只有用户明确要求与 SCOPE 对比时才执行；日常开发仅做当前任务相关测试，不自动运行 SCOPE 对比或扩大为正式发布。历史对比说明与结果保存在该目录。
 
 ## 主要参考文献
 

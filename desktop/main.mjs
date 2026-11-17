@@ -23,11 +23,11 @@ const MIGRATION_SKIPPED = new Set([
   'GrShaderCache', 'ShaderCache', 'Crashpad', 'lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket'
 ])
 
-// Preserve the Chromium profile across product renames (StreamSim 1.x, HiStream Studio 2.0). Copying into
+// Preserve the Chromium profile across product renames (HiStream Studio 2.0). Copying into
 // a staging folder first keeps a locked or partially readable old profile from leaving a broken one.
 function migrateLegacyUserData() {
   if (!userData || existsSync(join(userData, 'Local State'))) return
-  const legacyUserData = ['HiStream Studio', 'StreamSim']
+  const legacyUserData = ['HiStream Studio']
     .map((name) => join(appDataRoot, name))
     .find((path) => existsSync(join(path, 'Local State')))
   if (!legacyUserData) return

@@ -2,9 +2,8 @@ import { webApi } from './web-api.js'
 import { appStorage } from './storage.js'
 import { getLocale, startLocalization, t } from './i18n.js'
 import { invalidateImageTextures, loadXmlScene, updateSceneDynamics } from './scene-loader.js'
-import { createDefaultProject, createMaterialPresets, DEFAULT_CPU_THREADS, groundedPlacementHeight, MAX_SENSOR_BANDS, normalizeCpuThreads, normalizeTerrainEnvironment, normalizeProject, parseProjectJson, SCENE_ANIMATION_UI_ENABLED, sensorBandValues, sensorCruisePositions, sensorViewAngles, simplifySolarSpectra, stringifyProject } from './project-schema.js'
+import { createDefaultProject, createMaterialPresets, DEFAULT_CPU_THREADS, groundedPlacementHeight, MAX_SENSOR_BANDS, normalizeCpuThreads, normalizeTerrainEnvironment, normalizeProject, parseProjectJson, sensorBandValues, sensorCruisePositions, sensorViewAngles, simplifySolarSpectra, stringifyProject } from './project-schema.js'
 import { createStreamWorkspace } from './stream/workspace.js'
-import { createSceneAnimationPanel } from './scene-animation.js'
 import { createMenubar } from './menubar.js'
 import * as THREE from 'three'
 import { specularParametersFromValues, specularParameterFields, normalizeSpecular, meshSpecular, meshSpecularFields, meshSpecularFromRow, meshSpecularRunError } from './material-specular.js'
@@ -2811,7 +2810,7 @@ function hideExampleDialog() { $('#exampleDialog').hidden = true }
 
 function renderExampleSummary() {
   const example = state.examples?.find((item) => item.id === $('#exampleSelect').value)
-  const mode = example?.mode === 'eSceneAnimation' ? t('场景动画（研究功能）') : example?.recommendedMode
+  const mode = example?.recommendedMode
   $('#exampleSummary').textContent = example ? `${t('推荐模式')}：${mode} · ${example.focus.map((item) => t(item)).join('、')}${example.note ? ` · ${t(example.note)}` : ''}` : ''
 }
 
@@ -2843,18 +2842,6 @@ async function openExampleFromDialog(event) {
     const directory = $('#exampleDirectory').value.trim().replace(/^"(.*)"$/, '$1')
     const result = await api.openExample($('#exampleSelect').value, directory)
     appStorage.setItem('histreamExampleDirectory', directory)
-    // Scene-animation catalog entries ("mode": "eSceneAnimation") open in their own panel, not as a project.
-    if (result.sceneAnimation) {
-      hideExampleDialog()
-      if (!SCENE_ANIMATION_UI_ENABLED) {
-        addLog('场景动画（研究功能）界面入口当前已隐藏，示例已复制但不会在界面中运行', 'warning')
-        toast('场景动画（研究功能）界面入口当前已隐藏')
-        return
-      }
-      addLog(`场景动画示例已复制：${result.sceneAnimation.input}`, 'success')
-      sceneAnimationPanel.open({ input: result.sceneAnimation.input, outputRoot: result.sceneAnimation.outputRoot, label: result.sceneAnimation.label })
-      return
-    }
     loadXml(result)
     hideExampleDialog()
     addLog(`示例已复制并打开：${result.path}`, 'success')
@@ -5053,8 +5040,6 @@ function normalizedEngineLog(text) {
 }
 
 function handleSimulationEvent(event) {
-  // eSceneAnimation research runs share the event stream but never touch the 3D run state.
-  if (String(event.type || '').startsWith('scene-animation-')) { sceneAnimationPanel.handleEvent(event); return }
   if (event.type === 'status') {
     if (event.running && !state.running) {
       if (event.outputDir) state.outputDir = event.outputDir
@@ -7088,11 +7073,6 @@ createMenubar({
   }
 })
 const streamWorkspace = createStreamWorkspace({ toast })
-const sceneAnimationPanel = createSceneAnimationPanel({ api, toast, addLog })
-// Hidden while SCENE_ANIMATION_UI_ENABLED is false: the menu entry and its group do not appear and no click is
-// bound, so the interface cannot dispatch or run a scene animation (see project-schema.js).
-for (const id of ['#researchMenuSeparator', '#researchMenuLabel', '#openSceneAnimationBtn']) $(id).hidden = !SCENE_ANIMATION_UI_ENABLED
-if (SCENE_ANIMATION_UI_ENABLED) $('#openSceneAnimationBtn').addEventListener('click', () => sceneAnimationPanel.open())
 for (const item of document.querySelectorAll('[data-stream-command]')) {
   item.addEventListener('click', () => {
     if (item.dataset.streamCommand === 'show') streamWorkspace.open()
@@ -7264,7 +7244,7 @@ $('#xmlBtn').addEventListener('click', () => { $('#xmlDrawer').hidden = false })
 $('#xmlDrawer').addEventListener('click', (event) => { if (event.target === $('#xmlDrawer')) $('#xmlDrawer').hidden = true })
 $('#xmlEditor').addEventListener('input', () => { state.xmlText = $('#xmlEditor').value; markXmlDirty(); state.xmlManualEdit = true; $('#unsavedMark').hidden = false; $('#xmlStatus').textContent = '有未保存的修改' })
 $('#applyXmlBtn').addEventListener('click', async () => { try { const project = parseProjectJson(state.xmlText); const mode = project.mode; state.project = project; state.config = ensureMaterialPresets(project.configuration); state.xmlManualEdit = false; selectMode(mode); if (await saveXml()) { refreshFromState(); restoreActualScene(); renderInspector(); $('#xmlDrawer').hidden = true } } catch (error) { toast('JSON 格式错误', error.message, 'error') } })
-window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); if (event.shiftKey) showSaveAsDialog(); else saveXml() } if (event.key === 'F5') { event.preventDefault(); if (sceneAnimationPanel.isOpen()) sceneAnimationPanel.run(); else runSimulation() } if (event.key === 'F7') { event.preventDefault(); streamWorkspace.open() } if (event.key === 'Escape') { if (!$('#histreamProxyDialog').hidden) hideHistreamProxyDialog(); else if (!$('#referenceImageDialog').hidden) hideReferenceImage(); else if (!$('#referenceDialog').hidden) hideReferenceDialog(); else if (!$('#resultDialog').hidden) hideResults(); else if (!$('#objectAttributeDialog').hidden) hideObjectAttributeDialog(); else if (!$('#objectDialog').hidden) hideObjectDialog(); else if (!$('#materialDialog').hidden) hideMaterialDialog(true); else if (!$('#geometryDialog').hidden) hideGeometryDialog(); else if (!$('#presetDialog').hidden) hidePresetDialog(); else if (!$('#projectDialog').hidden) hideProjectDialog(); else if (!$('#xmlDrawer').hidden) $('#xmlDrawer').hidden = true } })
+window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); if (event.shiftKey) showSaveAsDialog(); else saveXml() } if (event.key === 'F5') { event.preventDefault(); runSimulation() } if (event.key === 'F7') { event.preventDefault(); streamWorkspace.open() } if (event.key === 'Escape') { if (!$('#histreamProxyDialog').hidden) hideHistreamProxyDialog(); else if (!$('#referenceImageDialog').hidden) hideReferenceImage(); else if (!$('#referenceDialog').hidden) hideReferenceDialog(); else if (!$('#resultDialog').hidden) hideResults(); else if (!$('#objectAttributeDialog').hidden) hideObjectAttributeDialog(); else if (!$('#objectDialog').hidden) hideObjectDialog(); else if (!$('#materialDialog').hidden) hideMaterialDialog(true); else if (!$('#geometryDialog').hidden) hideGeometryDialog(); else if (!$('#presetDialog').hidden) hidePresetDialog(); else if (!$('#projectDialog').hidden) hideProjectDialog(); else if (!$('#xmlDrawer').hidden) $('#xmlDrawer').hidden = true } })
 setInterval(() => { if (state.running) renderRunProgress() }, 250)
 
 const ENGINE_PROMPT = 'HiStream 可执行文件路径（留空恢复内置引擎）。自定义路径须先由管理员加入服务端环境变量 STREAM_STUDIO_ENGINE_ALLOWLIST（多个路径用系统路径分隔符分隔，Windows 为分号 ;），并重启 Stream Studio，否则运行会被拒绝。'

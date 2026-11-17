@@ -6,7 +6,7 @@
 
 统一入口为 D:/发布/streamstudio/2.0.1，包含 Windows x64 安装器、用户使用手册、模型理论与方法手册、LICENSE、开始使用说明、清单与 examples。四个随附影像案例已按默认 4×4 区域通过打包引擎检查，详见 [案例验收记录](testing/user-release-cases-20261101.md)。请先把案例复制到全英文可写路径再运行；当前 ERA5 读取在无短文件名的中文路径下会失败。
 
-五个原有内置案例仍在安装器中。原 D:/examples 九个培训候选保持原位，旧独立九例 ZIP 和此前混入发布目录的研究资料保存在 D:/cases/StreamStudio/发布整理归档/20261101-开发与研究资料。
+五个原有内置案例仍在安装器中。原 D:/examples 九个培训候选保持原位，旧独立九例 ZIP 和此前混入发布目录的研究资料保存在 D:/cases/streamstudio/发布整理归档/20261101-开发与研究资料。
 
 ## 验证范围
 
@@ -22,4 +22,4 @@
 
 代码、测试和开发文档以 C:/work/streamstudio 为入口，通过 GitHub 做小更新，不自动变成正式发布。规则见 [开发更新与用户发布](development-and-release.md)。
 
-已有构建清单标记 dirty=true，315 个源码指纹用于定位原构建内容；单独 Git HEAD 不能重建该发布工作树。[原 GitHub v2.0.1 发布页](https://github.com/bianzj/streamstudio/releases/tag/v2.0.1) 的既有资产保持不变，源码 ZIP 含当时本地修改的 nvpro_core。原构建和源文件快照保存在 D:/cases/StreamStudio/发布整理归档/20261101-开发与研究资料。本次本机案例默认配置和目录整理尚未同步到原 GitHub 发布资产。
+已有构建清单标记 dirty=true，315 个源码指纹用于定位原构建内容；单独 Git HEAD 不能重建该发布工作树。[原 GitHub v2.0.1 发布页](https://github.com/bianzj/streamstudio/releases/tag/v2.0.1) 的既有资产保持不变，源码 ZIP 含当时本地修改的 nvpro_core。原构建和源文件快照保存在 D:/cases/streamstudio/发布整理归档/20261101-开发与研究资料。本次本机案例默认配置和目录整理尚未同步到原 GitHub 发布资产。

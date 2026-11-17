@@ -65,7 +65,7 @@ ProjectJson ProjectJson::load(const std::string& path) {
     }
     if (!result.m_root.is_object()) throw std::runtime_error("project.json root must be an object");
     const std::string format = string(result.m_root, "format", "histream-project");
-    if (format != "histream-project" && format != "streamsim-project")
+    if (format != "histream-project")
         throw std::runtime_error("Unsupported project format: " + format);
     const int version = integer(result.m_root, "schemaVersion", 1);
     if (version < 1 || version > kLatestProjectSchemaVersion)

@@ -1,4 +1,4 @@
-// Builds examples on the realistic 100 m forest (20 jacaranda trees + 200 searsia
+﻿// Builds examples on the realistic 100 m forest (20 jacaranda trees + 200 searsia
 // shrubs, layout in assets/obj-library/large_scene/realistic_forest_100m/).
 //   node tools/generate-forest-example.mjs [output directory]             VoxelEB: temperature, GPP, NPP
 //   node tools/generate-forest-example.mjs --vehicles [output directory]  RayTracing: vehicle lineup in forest openings
@@ -13,7 +13,7 @@ const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const args = process.argv.slice(2)
 const withVehicles = args.includes('--vehicles')
 const outputArg = args.find((arg) => !arg.startsWith('--'))
-const exampleRoot = resolve(outputArg ?? (withVehicles ? 'D:/cases/vehicle-tarp/forest' : join(projectRoot, 'assets', 'examples', 'forest')))
+const exampleRoot = resolve(outputArg ?? (withVehicles ? 'D:/cases/streamstudio/vehicle-tarp/forest' : join(projectRoot, 'assets', 'examples', 'forest')))
 for (const folder of ['positions', 'meteorology']) mkdirSync(join(exampleRoot, folder), { recursive: true })
 
 const SCENE = 100
