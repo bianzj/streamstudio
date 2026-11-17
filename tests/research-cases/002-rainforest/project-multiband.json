@@ -2,7 +2,7 @@
   "schemaVersion": 6,
   "format": "histream-project",
   "name": "热带雨林标准案例 · multiband",
-  "mode": "eFacetRT",
+  "mode": "eVoxelRT",
   "createdAt": "2026-11-03T00:00:00+08:00",
   "updatedAt": "2026-11-03T00:00:00+08:00",
   "folders": {

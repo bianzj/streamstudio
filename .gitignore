@@ -26,6 +26,7 @@ validation/**/log_nvprosample.txt
 /screenshot/
 **/__pycache__/
 assets/examples/**/output/
+tests/**/output/
 **/log_nvprosample.txt
 # Engine build output (exe/dll/shaders) is produced by npm run build:engine, not versioned.
 models/bin_x64/

@@ -288,7 +288,7 @@
     },
     "tests/research-cases/002-rainforest/project-multiband.json": {
       "bytes": 81108,
-      "sha256": "cdf4507bbf89a21859495c1d360fb559df07497301dda85e5be59fc678aca4be"
+      "sha256": "051d0828fa7b8ceae6bb5078fd26e592703c0ff93b588d151ec925b77d43fb3b"
     },
     "tests/research-cases/002-rainforest/project.json": {
       "bytes": 98587,

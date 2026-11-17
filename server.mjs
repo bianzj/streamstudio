@@ -38,7 +38,13 @@ const MODEL_ROOT = join(PROJECT_ROOT, 'models')
 const DEFAULT_HISTREAM_PROXY_MANIFEST = ''
 const DEFAULT_HISTREAM_PROXY_RUNNER = ''
 const DEFAULT_HISTREAM_PROXY_PYTHON = ''
-const MAX_FACET_TRIANGLES = 1_000_000
+const MAX_FACET_TRIANGLES = 5_000_000
+// 单次三维运行的硬上限：超时即终止整棵进程树；结果体积超过上限则跳过读取与结果处理。
+const RUN_TIMEOUT_MS = Number(process.env.STREAM_STUDIO_RUN_TIMEOUT_MS) || 15 * 60 * 1000
+const MAX_RESULT_BYTES = Number(process.env.STREAM_STUDIO_MAX_RESULT_BYTES) || 8 * 1024 * 1024 * 1024
+const runTimeoutLabel = () => (RUN_TIMEOUT_MS >= 60000
+  ? `${Math.round(RUN_TIMEOUT_MS / 60000)} 分钟`
+  : `${Math.max(1, Math.round(RUN_TIMEOUT_MS / 1000))} 秒`)
 const defaultSceneAsset = join(RESOURCE_ROOT, 'assets', 'obj-library', 'building', 'house_a.obj')
 const histreamCandidates = [
   join(RESOURCE_ROOT, 'engine', 'histream.exe'),
@@ -925,6 +931,31 @@ function outputTiffName(mode, values = {}) {
     '_VZA=' + vza + '_VAA=' + vaa + suffix + '.tif'
 }
 
+// readFileSync 对超过 2 GiB 的文件会抛 ERR_FS_FILE_TOO_LARGE（与 Buffer 上限无关）。
+// 面元结果和三维过程数据可能达到数 GB，因此分块读入自行分配的 Buffer。
+function readLargeFileSync(path) {
+  const { size } = statSync(path)
+  if (!(size > 0)) return Buffer.alloc(0)
+  if (size > MAX_RESULT_BYTES) {
+    const label = (bytes) => (bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB`
+      : bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(0)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`)
+    throw new Error(`结果文件 ${label(size)} 超过上限 ${label(MAX_RESULT_BYTES)}，请减少面元数量或简化 OBJ`)
+  }
+  const buffer = Buffer.allocUnsafe(size)
+  const descriptor = openSync(path, 'r')
+  let offset = 0
+  try {
+    while (offset < size) {
+      const read = readSync(descriptor, buffer, offset, Math.min(size - offset, 1 << 30), offset)
+      if (read <= 0) break
+      offset += read
+    }
+  } finally {
+    closeSync(descriptor)
+  }
+  return offset === size ? buffer : buffer.subarray(0, offset)
+}
+
 function readRadiosityResult(jsonPath, geometryOnly = false) {
   if (!existsSync(jsonPath)) throw new Error(`找不到面元结果：${jsonPath}`)
   // 大场景/多波段面元结果 JSON 会超过 512 MB。若用 readFileSync(..., 'utf8') + JSON.parse，
@@ -932,8 +963,9 @@ function readRadiosityResult(jsonPath, geometryOnly = false) {
   //   Cannot create a string longer than 0x1fffffe8 characters
   // 这里改为直接基于 Buffer 逐数字解析（与 sampleRadiosityResult 同一思路），
   // 不把整个文件转换成 JS 字符串，因此不再受该上限限制。
-  // DEFERRED[中] Bug: readFileSync 读取超过 2 GiB 的文件会抛 ERR_FS_FILE_TOO_LARGE，所以上面说的“避开字符串上限”只能把可读规模推到 2 GiB，更大的面元结果依然会失败；整份读入也占用等量内存，并在主线程（非流式模式时）同步执行；sampleRadiosityResult 同样如此；建议：改用 openSync + readSync 分块流式解析，或让引擎直接输出二进制格式。
-  const source = readFileSync(jsonPath)
+  // readFileSync 对超过 2 GiB 的文件会抛 ERR_FS_FILE_TOO_LARGE，而面元结果可达数 GB
+  // （约 750 万面元 ≈ 3.3 GB），因此统一用 readLargeFileSync 分块读入自行分配的 Buffer。
+  const source = readLargeFileSync(jsonPath)
   const header = source.subarray(0, Math.min(source.length, 1 << 16)).toString('utf8')
   const facetCount = Number(header.match(/"facetCount"\s*:\s*(\d+)/)?.[1])
   if (!Number.isInteger(facetCount) || facetCount < 1) throw new Error('面元结果缺少有效的 facetCount')
@@ -1056,7 +1088,7 @@ const THREE_DIMENSIONAL_FACET_SAMPLE_LIMIT = 1000000
 
 function sampleRadiosityResult(jsonPath, maximumFacets = THREE_DIMENSIONAL_FACET_SAMPLE_LIMIT, geometryOnly = false) {
   if (!existsSync(jsonPath)) throw new Error('找不到面元结果：' + jsonPath)
-  const source = readFileSync(jsonPath)
+  const source = readLargeFileSync(jsonPath)
   const header = source.subarray(0, Math.min(source.length, 65536)).toString('utf8')
   const sourceFacetCount = Number(header.match(/"facetCount"\s*:\s*(\d+)/)?.[1])
   if (!Number.isInteger(sourceFacetCount) || sourceFacetCount < 1) throw new Error('面元结果缺少有效的 facetCount')
@@ -1181,7 +1213,7 @@ function readProcessResult(metadataPath, maximumElements = THREE_DIMENSIONAL_FAC
   if (!metadata) throw new Error('无效的三维过程结果')
   const dataPath = resolve(dirname(metadataPath), String(metadata.dataFile || ''))
   if (!existsSync(dataPath)) throw new Error('找不到过程二进制数据：' + dataPath)
-  const data = readFileSync(dataPath)
+  const data = readLargeFileSync(dataPath)
   const recordFloats = Number(metadata.recordFloats)
   const fields = Array.isArray(metadata.fields)
     ? metadata.fields.filter((field) => field && typeof field === 'object' && Number.isInteger(Number(field.offset)))
@@ -4161,6 +4193,15 @@ async function api(request, response, url) {
       const running = child
       running.histreamRun = { runId: run.runId, outputDir: windowsPath(run.outputDir), startedAt, mode: data.mode }
       writeRunManifest(run, { status: 'running', pid: running.pid, command: [engine, ...args] })
+      // 单次运行硬超时：到点终止整棵进程树，并按超时结束（结果不完整）。
+      const runTimer = setTimeout(() => {
+        if (running.histreamTimedOut) return
+        running.histreamTimedOut = true
+        emit({ type: 'error', text: `运行超过 ${runTimeoutLabel()}，已终止` })
+        try { spawn('taskkill', ['/pid', String(running.pid), '/T', '/F'], { windowsHide: true }).on('error', () => running.kill('SIGKILL')) }
+        catch { try { running.kill('SIGKILL') } catch {} }
+      }, RUN_TIMEOUT_MS)
+      if (typeof runTimer.unref === 'function') runTimer.unref()
       emit({ type: 'started', pid: running.pid, runId: run.runId, outputDir: windowsPath(run.outputDir), command: `"${windowsPath(engine)}" ${args.map((item) => `"${windowsPath(item)}"`).join(' ')}` })
       running.stdout.setEncoding('utf8')
       running.stderr.setEncoding('utf8')
@@ -4213,6 +4254,7 @@ async function api(request, response, url) {
         if (!running.pid && child === running) { child = null; childExecutable = '' }
       })
       const completeHistreamRun = (code, signal) => {
+        clearTimeout(runTimer)
         if (running.facetWorker) void running.facetWorker.terminate()
         if (running.histreamReset) {
           writeRunManifest(run, { status: 'stopped', finishedAt: new Date().toISOString(), completed: { ...run.manifest.completed, products: runProductPaths(run.outputDir) } })
@@ -4222,6 +4264,7 @@ async function api(request, response, url) {
           return
         }
         let finalCode = stepOutputError ? 1 : code
+        if (running.histreamTimedOut && (finalCode === null || finalCode === undefined)) finalCode = 1
         if ([0, 2].includes(code) && radiosityJsonPath && !streamedSteps && !stepOutputError) {
           try {
             verifyFrozenRunInputs(run.manifest, runInput)
@@ -4233,6 +4276,8 @@ async function api(request, response, url) {
             if (tif.processPaths.length) emit({ type: 'stdout', text: '已保存 ' + tif.processPaths.length + ' 个时间节点索引' })
           } catch (error) {
             finalCode = 1
+            // 结果处理失败也要写进清单，否则运行只显示 failed 而没有原因。
+            stepOutputError = error
             emit({ type: 'error', text: `结果影像生成失败：${error.message}` })
           } finally {
             if (!keepThreeDimensionalResults && existsSync(radiosityJsonPath)) unlinkSync(radiosityJsonPath)
@@ -4249,8 +4294,9 @@ async function api(request, response, url) {
         if (nativeRun.completed) run.manifest.computedNodes = nativeRun.completed
         if (!nativeRun.completed && finalCode === 0 && !streamFacetSteps) run.manifest.completed.nodes = run.manifest.requested.nodes.map(node => ({ node, completionSource: 'engine-exit' }))
         run.manifest.completed.nodeCount = run.manifest.completed.nodes.length || (finalCode === 0 && !isEnergyBalanceMode(data.mode) ? 1 : 0)
-        const status = running.histreamStopped ? 'stopped' : finalCode === 2 ? 'non_converged' : finalCode === 0 ? 'completed' : 'failed'
+        const status = running.histreamTimedOut ? 'timeout' : running.histreamStopped ? 'stopped' : finalCode === 2 ? 'non_converged' : finalCode === 0 ? 'completed' : 'failed'
         writeRunManifest(run, { status, finishedAt: new Date().toISOString(), exitCode: finalCode, signal,
+          ...(running.histreamTimedOut ? { error: `运行超过 ${runTimeoutLabel()}，已终止` } : {}),
           ...(stepOutputError ? { error: stepOutputError.message } : {}), completed: { ...run.manifest.completed, products: runProductPaths(run.outputDir) } })
         emit({ type: 'closed', code: finalCode, signal, status, runId: run.runId, outputDir: windowsPath(run.outputDir), elapsed: Date.now() - startedAt })
         runtimeScene?.cleanup()
