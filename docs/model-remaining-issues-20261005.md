@@ -23,6 +23,7 @@
 - RayTracing/VoxelRT 中波太阳项的绝对量可设（2026-11-22 夜）：新增光照设置 `light.shortwaveIrradiance`（地表水平短波总辐照 W/m²，0 = 晴空 Haurwitz 公式，界面“光照”面板在 RayTracing/VoxelRT/FacetRT 下显示），经 `LightSet.Rin` 传入着色器；直射/天空份额照旧跟随直射比例，阴天设置（如 200 W/m²、直射 0.2）时 3.8 µm 太阳增量严格按总量线性降低；未设置时与之前逐字节相同。静态 RT 模式无时刻，不从气象文件取 Rin。
 - VoxelEB Monin–Obukhov 稳定度迭代（2026-11-22 晚，`control.stabilityCorrection`，新建 VoxelEB 工程默认开启）：按场景显热与地面柱 u* 松弛更新场景 1/L（−5 ≤ z/L ≤ 1，FacetEB 相似函数），1/L 变化时重算气动阻抗，开启时自由对流与 MOST 取大；关闭时着色器与旧版逐字节相同、结果逐位不变。示例正午 z/L ≈ −4.9、叶温 −2.7~−6.2 K，夜间 z/L = +1、显热绝对值降约 3 倍，迭代 ≤ 27 次无振荡。尚存限制：整个场景只有一个 L（异质场景近似）；低风速正午常在 ζ = −5 限幅附近；土壤 G/Rn 不随之降低（forest 0.77–0.84），剩余偏高主要来自示例土壤热惯量；localExchange 模式不适用。
 - 晴/阴两态热历史面积守恒（2026-11-22 晚，FacetEB 全部表面与 FacetEB 土壤方法 1/2，VoxelEB 土壤方法 1 的土壤与建筑）：受光比例 p 变化时改变状态的面积带着自己的热历史（表面温度、方法 1 的 8 节点序列、方法 2 土柱）按面积加权并入另一状态，Σ p·C·T 不变；p 不变逐位不变。实测原误差（城市示例 08:50–13:20 共 10 节点）：阴影到达的 FacetEB 地面当节点偏冷平均 7.1 K（方法 2）/ 7.8 K（方法 1）、最大 18–20 K，后 1、2 节点仍偏冷约 5 K、2.7 K，G 多算 70–77 W m⁻²；建筑面元 1.4 K（最大 4–6 K）；VoxelEB 方法 1 土壤 6.6 K（最大 14 K）、建筑 1.7 K（最大 9.7 K）；FacetEB 热含量闭合残差土壤 5–42 W m⁻²（面积平均）、结构 1–7 W m⁻²，修正后为 0。与单一混合历史参考差 0.003 K（阴影到达面元均值）。尚存限制：转移只按 p 的净变化计，同一节点内一部分进入阴影、另一部分离开阴影的面元只交换净面积；VoxelEB 没有对应的热含量闭合诊断（守恒按构造保证）；VoxelEB 方法 2 的单一混合土柱仍会抹平长期部分遮挡体元的晴阴土柱差异（既有设计）。
+- 太阳遮挡截断（#4 已修正，2026-11-23，VoxelEB 与 VoxelRT）：太阳射线与 `radiationMaxSteps` 解耦，按体元网格自动设定几何步数预算（2·(nx+ny+nz)+16，开周期按爬升到网格顶穿越的副本数，不低于原上限），追踪到射出场景、被固体遮挡或透射率 ≤ 10⁻⁴（原 0.001）为止；阈值保留的透射率即单体元可见性误差上界（直射误差 ≤ 10⁻⁴·E_b）。VoxelEB 太阳可见性纳入诊断：`scattering_node=*.json` 的 `solarVisibility`（`solarTruncations`、被截断射线剩余透射率总和/最大值及 W m⁻² 上界、阈值结束统计、超过 `radiationMaxSteps` 的射线数与旧截断多给的透射率），`SHORTWAVE_SCATTERING`/`ENERGY_BALANCE` 日志与界面运行质量摘要显示。冻结算例最多需 5–31 步，23 个 VoxelEB/VoxelRT 算例逐字节不变；森林强制 `radiationMaxSteps = 8` 时旧截断使 7.0% 的太阳射线平均多给透射率 0.18（最大 1.0），修正后冠层净辐射 −2.9%、叶温 −0.31 K。尚存：几何预算是估计值，若被触及只计数不再续追；VoxelRT 无诊断输出。
 
 仍未处理（按建议优先级）：
 - 开周期边界的 VoxelEB 比不开周期慢约 45%（森林周期 8：14.0 s 对 9.6 s，短波散射 4.0 对 2.5 s/节点）；其中约 1 s 是第二遍盒内浊介质积分使驱动代码生成变差（该遍计算本身约 0.14 s），合并循环、`[[dont_unroll]]`、特化常量分支都没有改善。VoxelRT 开周期慢约 20%（7.4 对 6.2 s）。
@@ -54,7 +55,7 @@
 - VoxelEB 夜间不再空跑短波（#6 已修正，2026-11-20 深夜）：太阳天顶角 ≥ 90° 且实测短波 ≤ 0.001 W m⁻² 时，清零方向可见性（VoxelDir）、净辐射、PAR 与方向辐射场，跳过 gap、直射与全部散射阶数；散射诊断照旧写出（`elapsedMs`≈0），标准输出打印 `SHORTWAVE_SKIPPED`。forest 示例全天 329 s → 254 s（16 个夜间节点，短波追踪总耗 222 s → 146 s），474 个输出文件除散射诊断的耗时字段外逐字节不变。晨昏（sza<90° 但短波很小）仍照常追踪。
 
 仍未处理：
-- 太阳遮挡截断（#4）。
+- ~~太阳遮挡截断（#4）~~ 已修正（2026-11-23，见 2026-11-22 更新）。
 - 光学图像只含单次散射（#5）。
 - VoxelEB 不读 LIDF；旋转实例加速结构仍是旋转立方体。
 - FacetRT 向下逃逸按天空计；A-buffer 已达 256 层或超出显存预算时仍报错（需要清理重叠面或改用体元模式）。
@@ -106,7 +107,7 @@
 
 ## 数值近似、功能边界和性能
 
-4. **太阳遮挡的截断缺少诊断和误差约束。** [voxelrad_solar.comp:57](C:/work/streamstudio/models/histream/shader/voxeleb/voxelrad_solar.comp:57) 达到最大步数后仍返回剩余透射率，没有检查更后方的遮挡；0.001 阈值仍在。新短波漫射的 0.01 阈值和最大步数有计数，但 [command.cpp:125](C:/work/streamstudio/models/histream/src/voxeleb/command.cpp:125) 明确排除了太阳可见性。路径数及无量纲剩余 throughput 不能作为遗漏能量误差界。
+4. **已修正（2026-11-23）：太阳遮挡的截断缺少诊断和误差约束。** 原 [voxelrad_solar.comp:57](C:/work/streamstudio/models/histream/shader/voxeleb/voxelrad_solar.comp:57) 达到最大步数后仍返回剩余透射率，没有检查更后方的遮挡；0.001 阈值仍在。新短波漫射的 0.01 阈值和最大步数有计数，但 [command.cpp:125](C:/work/streamstudio/models/histream/src/voxeleb/command.cpp:125) 明确排除了太阳可见性。路径数及无量纲剩余 throughput 不能作为遗漏能量误差界。现在太阳射线追踪到出场景（几何步数预算），阈值 10⁻⁴ 保留的透射率即该体元直射误差上界（× 法向直射 E_b），截断计数与剩余透射率总和/最大值写入 `solarVisibility` 诊断（见 2026-11-22 更新“已修正”）。
 
 5. **三阶尚未进入光学传感器图像。** 改动作用于 VoxelEB 短波能量/PAR 场；热红外传播、VoxelRT/FacetEB 和光学观察 shader 是独立路径。光学图像仍在 [voxelrad_image.comp:463](C:/work/streamstudio/models/histream/shader/voxeleb/voxelrad_image.comp:463) 从直射、天空和材质构造辐亮度，没有读取新逐阶方向场。温度变化能影响热红外结果，但不能据此称光学图像已支持完整三阶散射。
 

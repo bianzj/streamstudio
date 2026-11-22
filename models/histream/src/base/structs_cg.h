@@ -140,6 +140,27 @@ struct ScatteringOrderStats {
 };
 static_assert(sizeof(ScatteringOrderStats) == 32);
 
+// Solar-visibility diagnostics of the VoxelEB gap stage, stored right after
+// the four ScatteringOrderStats; matches SolarVisibilityStatsRecord in
+// scatter_stats.glsl. *Max fields are float bit patterns.
+struct SolarVisibilityStats {
+    uint32_t tracedRays{0};
+    uint32_t truncations{0};
+    uint32_t thresholdStops{0};
+    uint32_t legacyTruncations{0};
+    float truncatedResidual{0};
+    uint32_t truncatedResidualMax{0};
+    float thresholdResidual{0};
+    uint32_t thresholdResidualMax{0};
+    float legacyExcess{0};
+    uint32_t legacyExcessMax{0};
+    uint32_t maxStepsUsed{0};
+    uint32_t stepLimit{0};
+    uint32_t reserved[4]{};
+};
+static_assert(sizeof(SolarVisibilityStats) == 64);
+constexpr uint64_t kSolarVisibilityStatsOffset = 4 * sizeof(ScatteringOrderStats);
+
 // DEFERRED[低] 可维护性: VoxelRTSetting 同样作为推送常量与 GLSL 共享布局，却没有像 VoxelLstSetting 那样的 offsetof/sizeof static_assert，字段增删时 C++/GLSL 布局会悄然错位；建议：补充同样的布局断言。
 struct alignas(32)  VoxelRTSetting
 {

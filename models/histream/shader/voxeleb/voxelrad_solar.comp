@@ -34,6 +34,9 @@ PtPayload        prd;
 ShadowHitPayload shadow_payload;
 
 #include "../traceray_comp.glsl"
+#include "../solar_steps.glsl"
+#define SOLAR_VISIBILITY_STATS
+#include "scatter_stats.glsl"
 
 layout(local_size_x = GROUP_SIZEX) in;
 
@@ -43,6 +46,20 @@ layout(local_size_x = GROUP_SIZEX) in;
 float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 
+// Records the ray outcome for the solar diagnostics and returns its visibility.
+float FinishSolarRay(int reason, float transmittance, float legacyTransmittance,
+                     int steps, int stepLimit)
+{
+    recordSolarRay(reason, transmittance, legacyTransmittance, steps, stepLimit);
+    return transmittance;
+}
+
+// Sun visibility (transmittance to the sun) from origin. The ray is followed
+// until it leaves the scene (SolarStepLimit), not cut at radiationMaxSteps:
+// the earlier cut returned the transmittance accumulated so far and so
+// counted every occluder beyond it as transparent. It still stops once the
+// transmittance is <= SOLAR_TRANSMITTANCE_CUTOFF (1e-4) and keeps that value,
+// so the direct irradiance of the voxel is too high by at most 1e-4 * E_beam.
 float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
                                 NanoVDBLink nanoVDBLink, vec3 semiRange)
 {
@@ -53,13 +70,19 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
     float alphaToSolar = 1.0;
     ivec3 voxelRes = ivec3(setting.voxelSize);
     Ray ray = Ray(origin, lightDirection);
+    int stepLimit = SolarStepLimit(lightDirection, setting.maxStep);
+    // Transmittance the former radiationMaxSteps cut would have returned.
+    float legacyTransmittance = -1.0;
 
-    for(int step = 0; step < setting.maxStep; ++step)
+    for(int step = 0; step < stepLimit; ++step)
     {
+        if(step == setting.maxStep) legacyTransmittance = alphaToSolar;
         float alphaVoxel = 1.0;
         ClosestHit(ray, 0.01);
         if(prd.hitT == INFINITY)
-            return alphaToSolar * TurbidEscapeTransmittance(ray.origin, ray.direction);
+            return FinishSolarRay(SOLAR_RAY_ESCAPED,
+                alphaToSolar * TurbidEscapeTransmittance(ray.origin, ray.direction),
+                legacyTransmittance, step, stepLimit);
 
         ShadeState sstate = GetShadeState(prd);
         ivec3 alignVoxelId;
@@ -93,17 +116,23 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
             uint meshId = instanceLinks[instanceId].meshId;
             uint typeId = meshLinks[meshId].type;
             if(typeId == TYPE_SOIL || typeId == TYPE_BUILDING || typeId == TYPE_WATER)
-                return 0.0;
+                return FinishSolarRay(SOLAR_RAY_BLOCKED, 0.0,
+                    legacyTransmittance, step + 1, stepLimit);
         }
 
         alphaToSolar *= alphaVoxel;
-        if(alphaToSolar <= 0.001) return alphaToSolar;
+        if(alphaToSolar <= SOLAR_TRANSMITTANCE_CUTOFF)
+            return FinishSolarRay(SOLAR_RAY_THRESHOLD, alphaToSolar,
+                legacyTransmittance, step + 1, stepLimit);
         vec3 ffnormal = sstate.normal;
         ray.origin = OffsetRay(
             sstate.position,
             dot(ray.direction, ffnormal) > 0.0 ? ffnormal : -ffnormal);
     }
-    return alphaToSolar;
+    // Geometric budget exhausted (not expected): keep the transmittance as
+    // before but count the ray; its value bounds the error of this voxel.
+    return FinishSolarRay(SOLAR_RAY_TRUNCATED, alphaToSolar,
+        legacyTransmittance, stepLimit, stepLimit);
 }
 
 // Building OBJ voxels carry one physical/energy state.  Their illumination is
@@ -166,7 +195,7 @@ bool TraversalDirection(vec3 lightDirection)
     }
 
     voxelDirs[bufferId0].solar = visibility;
-    return visibility <= 0.001;
+    return visibility <= SOLAR_TRANSMITTANCE_CUTOFF;
 }
 
 void main()

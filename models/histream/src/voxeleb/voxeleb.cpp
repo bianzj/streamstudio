@@ -978,6 +978,19 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
                 << ",\"lastZOverLChange\":" << modelio->stabilityChange
                 << ",\"basis\":\"scene 1/L from domain-mean H (per ground area) and ground-column mean u*; Paulson/linear MOST, -5<=z/L<=1\"}";
         }
+        {
+            // Direct-sun visibility rays (gap stage); details in scattering_node=*.json.
+            const auto& solar = modelio->solarStats;
+            float residualMax = 0.0f;
+            std::memcpy(&residualMax, &solar.truncatedResidualMax, sizeof(residualMax));
+            balanceDiagnostic << ",\"solarVisibility\":{\"tracedRays\":" << solar.tracedRays
+                << ",\"solarTruncations\":" << solar.truncations
+                << ",\"truncatedResidualSum\":" << solar.truncatedResidual
+                << ",\"truncatedResidualMax\":" << residualMax
+                << ",\"truncationErrorBoundMaxWm2\":" << residualMax * modelio->solarBeamIrradiance
+                << ",\"thresholdStops\":" << solar.thresholdStops
+                << ",\"thresholdErrorBoundWm2\":" << 1.0e-4 * modelio->solarBeamIrradiance << '}';
+        }
         balanceDiagnostic
             << ",\"budgetResidualWithinTolerance\":"
             << (modelio->energyFinalized && modelio->energyFinalUnconvergedStateCount == 0 ? "true" : "false")
@@ -1007,7 +1020,8 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
         std::cout << "ENERGY_BALANCE\tnode=" << modelio->k_node
             << "\titerations=" << modelio->energyIterations
             << "\tfinalStateRefreshed=" << modelio->energyFinalized
-            << "\tstatesOutsideTolerance=" << modelio->energyFinalUnconvergedStateCount;
+            << "\tstatesOutsideTolerance=" << modelio->energyFinalUnconvergedStateCount
+            << "\tsolarTruncations=" << modelio->solarStats.truncations;
         if (modelio->stabilityCorrection) {
             std::cout << "\tstability=" << (modelio->stabilityAvailable ? "most" : "unavailable")
                 << "\tinverseObukhov=" << modelio->inverseObukhov

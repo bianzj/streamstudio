@@ -33,6 +33,7 @@ PtPayload        prd;
 ShadowHitPayload shadow_payload;
 
 #include "../traceray_comp.glsl"
+#include "../solar_steps.glsl"
 
 layout(local_size_x = GROUP_SIZEX) in;
 // #define DIFFUSE_ANGLE_NUM 32
@@ -42,6 +43,9 @@ layout(local_size_x = GROUP_SIZEX) in;
 float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 
+// As VoxelEB: the straight solar ray is followed until it leaves the scene
+// (SolarStepLimit, at least setting.maxStep = clamp(128*depth, 128, 2048));
+// it stops at transmittance <= SOLAR_TRANSMITTANCE_CUTOFF (1e-4) and keeps that value.
 float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
                                 NanoVDBLink nanoVDBLink, vec3 semiRange)
 {
@@ -52,8 +56,9 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
     float alphaToSolar = 1.0;
     ivec3 voxelRes = ivec3(setting.voxelSize);
     Ray ray = Ray(origin, lightDirection);
+    int stepLimit = SolarStepLimit(lightDirection, setting.maxStep);
 
-    for(int step = 0; step < setting.maxStep; ++step)
+    for(int step = 0; step < stepLimit; ++step)
     {
         float alphaVoxel = 1.0;
         ClosestHit(ray, 0.01);
@@ -96,7 +101,7 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
         }
 
         alphaToSolar *= alphaVoxel;
-        if(alphaToSolar <= 0.001) return alphaToSolar;
+        if(alphaToSolar <= SOLAR_TRANSMITTANCE_CUTOFF) return alphaToSolar;
         vec3 ffnormal = sstate.normal;
         ray.origin = OffsetRay(
             sstate.position,
@@ -163,7 +168,7 @@ bool TraversalDirection(vec3 lightDirection)
     }
 
     voxelDirs[bufferId0].solar = visibility;
-    return visibility <= 0.001;
+    return visibility <= SOLAR_TRANSMITTANCE_CUTOFF;
 }
 
 void main()

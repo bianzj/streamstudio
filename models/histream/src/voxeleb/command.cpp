@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 
@@ -167,6 +168,97 @@ std::array<ScatteringOrderStats, 4> readScatteringStats(
     return stats;
 }
 
+void resetSolarStats(const std::shared_ptr<VoxelebIO>& modelio)
+{
+    nvvk::CommandPool pool(modelio->m_device, modelio->m_queueIndex);
+    VkCommandBuffer command = pool.createCommandBuffer();
+    vkCmdFillBuffer(command, modelio->m_pScatteringStats->buffer,
+                    kSolarVisibilityStatsOffset, sizeof(SolarVisibilityStats), 0);
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    pool.submitAndWait(command);
+}
+
+SolarVisibilityStats readSolarStats(const std::shared_ptr<VoxelebIO>& modelio)
+{
+    SolarVisibilityStats stats{};
+    const VkDeviceSize bytes = sizeof(stats);
+    nvvk::Buffer staging = modelio->m_pAlloc->createBuffer(bytes,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    nvvk::CommandPool pool(modelio->m_device, modelio->m_queueIndex);
+    VkCommandBuffer command = pool.createCommandBuffer();
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    VkBufferCopy copy{};
+    copy.srcOffset = kSolarVisibilityStatsOffset;
+    copy.size = bytes;
+    vkCmdCopyBuffer(command, modelio->m_pScatteringStats->buffer, staging.buffer, 1, &copy);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    pool.submitAndWait(command);
+    const void* mapped = modelio->m_pAlloc->map(staging);
+    std::memcpy(&stats, mapped, static_cast<size_t>(bytes));
+    modelio->m_pAlloc->unmap(staging);
+    modelio->m_pAlloc->destroy(staging);
+    return stats;
+}
+
+float floatFromBits(uint32_t bits)
+{
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+// Beam irradiance on a plane normal to the sun, W/m2: Rin x direct fraction
+// / cos(theta_s), zero when the solar pass is skipped (cos <= 0.01).
+double solarBeamNormalIrradiance(const std::shared_ptr<VoxelebIO>& modelio)
+{
+    if (modelio->angles.empty()) return 0.0;
+    const double cosine = std::cos(modelio->angles.front().sza * 3.14159265358979323846 / 180.0);
+    if (!(cosine > 0.01)) return 0.0;
+    return std::max(0.0, double(modelio->meteo.Rin)) *
+        std::clamp(double(modelio->light.direct), 0.0, 1.0) / cosine;
+}
+
+// JSON object and log fields of the per-node solar-visibility diagnostics.
+std::string solarStatsJson(const std::shared_ptr<VoxelebIO>& modelio,
+                           const std::function<std::string(double)>& jsonNumber)
+{
+    const auto& s = modelio->solarStats;
+    const double beam = modelio->solarBeamIrradiance;
+    std::ostringstream out;
+    out << std::setprecision(10)
+        << "{\"tracedRays\": " << s.tracedRays
+        << ", \"stepLimit\": " << s.stepLimit
+        << ", \"maxStepsUsed\": " << s.maxStepsUsed
+        << ", \"solarTruncations\": " << s.truncations
+        << ", \"truncatedResidualSum\": " << jsonNumber(s.truncatedResidual)
+        << ", \"truncatedResidualMax\": " << jsonNumber(floatFromBits(s.truncatedResidualMax))
+        << ", \"thresholdStops\": " << s.thresholdStops
+        << ", \"transmittanceCutoff\": 0.0001"
+        << ", \"thresholdResidualSum\": " << jsonNumber(s.thresholdResidual)
+        << ", \"thresholdResidualMax\": " << jsonNumber(floatFromBits(s.thresholdResidualMax))
+        << ", \"beyondRadiationMaxSteps\": " << s.legacyTruncations
+        << ", \"legacyCutExcessSum\": " << jsonNumber(s.legacyExcess)
+        << ", \"legacyCutExcessMax\": " << jsonNumber(floatFromBits(s.legacyExcessMax))
+        << ", \"beamNormalIrradiance\": " << jsonNumber(beam)
+        << ", \"truncationErrorBoundMaxWm2\": "
+        << jsonNumber(beam * floatFromBits(s.truncatedResidualMax))
+        << ", \"thresholdErrorBoundMaxWm2\": "
+        << jsonNumber(beam * floatFromBits(s.thresholdResidualMax)) << "}";
+    return out.str();
+}
+
 void writeScatteringStats(const std::shared_ptr<VoxelebIO>& modelio,
     const std::array<ScatteringAggregate, 4>& stats, double milliseconds,
     const std::array<double, 3>& orderMilliseconds)
@@ -196,10 +288,14 @@ void writeScatteringStats(const std::shared_ptr<VoxelebIO>& modelio,
         << "  \"transmittanceCutoff\": 0.01,\n"
         << "  \"elapsedMs\": " << milliseconds << ",\n"
         << "  \"statsAvailable\": true,\n"
-        << "  \"statsScope\": \"diffuse shortwave paths only; solar visibility is not counted\",\n"
+        << "  \"statsScope\": \"perOrder: diffuse shortwave paths; solarVisibility: direct-sun visibility rays\",\n"
         << "  \"counterAggregation\": \"GPU counters reset per spectral group; CPU uint64 totals\",\n"
         << "  \"residualAggregation\": \"sum of dimensionless ray throughputs at cutoff; not omitted energy\",\n"
         << "  \"fluxAggregation\": \"sum of per-voxel flux densities; not total domain power\",\n"
+        << "  \"solarVisibilityDefinition\": \"rays followed until they leave the scene (stepLimit); "
+           "per-voxel direct irradiance error <= residual * beamNormalIrradiance; "
+           "beyondRadiationMaxSteps/legacyCutExcess describe the former radiationMaxSteps cut\",\n"
+        << "  \"solarVisibility\": " << solarStatsJson(modelio, jsonNumber) << ",\n"
         << "  \"perOrder\": [\n";
     bool valid = true;
     for (int index = 0; index < 4; ++index) {
@@ -223,10 +319,16 @@ void writeScatteringStats(const std::shared_ptr<VoxelebIO>& modelio,
     output.close();
     uint64_t truncations = 0;
     for (const auto& value : stats) truncations += value.maxStepTruncations;
+    const auto& solar = modelio->solarStats;
     std::cout << "SHORTWAVE_SCATTERING\tnode=" << modelio->k_node
         << "\trequested=" << modelio->shortwaveScatteringOrders
         << "\telapsedMs=" << milliseconds
         << "\ttruncations=" << truncations
+        << "\tsolarTruncations=" << solar.truncations
+        << "\tsolarResidualSum=" << solar.truncatedResidual
+        << "\tsolarResidualMax=" << floatFromBits(solar.truncatedResidualMax)
+        << "\tsolarBeyondMaxSteps=" << solar.legacyTruncations
+        << "\tsolarMaxSteps=" << solar.maxStepsUsed
         << "\tdiagnostics=" << file.string() << std::endl;
     if (!valid) throw std::runtime_error("Invalid shortwave scattering state: " + file.string());
 }
@@ -289,6 +391,8 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
 
     std::array<double, 3> orderMilliseconds{};
     std::array<ScatteringAggregate, 4> scatteringStats{};
+    modelio->solarStats = SolarVisibilityStats{};
+    modelio->solarBeamIrradiance = 0.0;
     if (noShortwaveNode) {
         const auto skipBegin = std::chrono::steady_clock::now();
         clearShortwaveFields(modelio);
@@ -299,8 +403,11 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
                   << "\trin=" << modelio->meteo.Rin
                   << "\tsza=" << solarZenith << std::endl;
     } else {
+    resetSolarStats(modelio);
     submit(modelio, VoxelEBStage::gap, voxelSize1D, std::nullopt, std::nullopt);
     waitFence(modelio);
+    modelio->solarStats = readSolarStats(modelio);
+    modelio->solarBeamIrradiance = solarBeamNormalIrradiance(modelio);
 
     submit(modelio, VoxelEBStage::directVNIR, voxelSize1D, std::nullopt, std::nullopt);
     waitFence(modelio);

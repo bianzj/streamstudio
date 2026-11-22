@@ -5428,8 +5428,12 @@ function recordRunQualityLine(line) {
   }
   match = line.match(/^SHORTWAVE_SCATTERING\s+node=(\d+).*?elapsedMs=([\d.]+)(?:.*?truncations=(\d+))?/)
   if (match) {
-    quality.scattering.push({ node: Number(match[1]), milliseconds: Number(match[2]), truncations: Number(match[3] || 0) })
-    return `短波散射 · 节点 ${Number(match[1]) + 1} · ${(Number(match[2]) / 1000).toFixed(2)} s${Number(match[3]) ? ` · 步数截断 ${match[3]} 条射线` : ''}`
+    // VoxelEB 太阳可见性射线（2026-11-23 起出场景为止追踪；达到几何步数预算的射线计数并给出剩余透射率上界）。
+    const solar = line.match(/\ssolarTruncations=(\d+)\s+solarResidualSum=(\S+)\s+solarResidualMax=(\S+)/)
+    const item = { node: Number(match[1]), milliseconds: Number(match[2]), truncations: Number(match[3] || 0),
+      solarTruncations: solar ? Number(solar[1]) : 0, solarResidualSum: solar ? Number(solar[2]) || 0 : 0, solarResidualMax: solar ? Number(solar[3]) || 0 : 0 }
+    quality.scattering.push(item)
+    return `短波散射 · 节点 ${item.node + 1} · ${(item.milliseconds / 1000).toFixed(2)} s${item.truncations ? ` · 步数截断 ${item.truncations} 条射线` : ''}${item.solarTruncations ? ` · 太阳射线截断 ${item.solarTruncations} 条（剩余透射率最大 ${item.solarResidualMax.toPrecision(3)}）` : ''}`
   }
   return null
 }
@@ -5456,6 +5460,13 @@ function runQualitySummary(quality) {
   }
   const truncations = quality.scattering.reduce((total, item) => total + item.truncations, 0)
   if (truncations > 0) lines.push({ kind: 'warning', text: `运行质量 · 短波散射共有 ${truncations} 条射线达到步数上限，建议增大“体元射线步数上限”。` })
+  const solarTruncations = quality.scattering.reduce((total, item) => total + (item.solarTruncations || 0), 0)
+  if (solarTruncations > 0) {
+    const residualMax = Math.max(...quality.scattering.map((item) => item.solarResidualMax || 0))
+    lines.push({ kind: 'warning', text: `运行质量 · 太阳可见性共有 ${solarTruncations} 条射线达到几何步数预算（剩余透射率最大 ${residualMax.toPrecision(3)}，对应体元直射最多偏高该比例的法向直射辐照），详见 diagnostics/scattering_node=*.json。` })
+  } else if (quality.scattering.length) {
+    lines.push({ kind: 'success', text: '运行质量 · 太阳可见性射线全部追踪到出场景或被遮挡（透射率 ≤ 10⁻⁴ 时提前结束，体元直射误差 ≤ 0.01% 法向直射）。' })
+  }
   return lines
 }
 

@@ -588,7 +588,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
               << "\taddress=" << voxellstio->setting.radianceAddress << std::endl;
 
     {
-        constexpr VkDeviceSize statsBytes = 4 * sizeof(ScatteringOrderStats);
+        constexpr VkDeviceSize statsBytes =
+            kSolarVisibilityStatsOffset + sizeof(SolarVisibilityStats);
         voxellstio->m_pScatteringStats = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(
             statsBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |

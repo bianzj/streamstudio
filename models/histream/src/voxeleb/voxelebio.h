@@ -140,6 +140,11 @@ VoxelebIO(){
     int stabilityAeroUpdates{0};
     double stabilityChange{0.0};
     std::shared_ptr<nvvk::Buffer> m_pScatteringStats;
+    // Solar-visibility diagnostics of the current node (zero on skipped
+    // night nodes) and the beam-normal irradiance that turns its
+    // dimensionless transmittance residuals into W/m2 bounds.
+    SolarVisibilityStats solarStats{};
+    double solarBeamIrradiance{0.0};
     FluidXml fluid;
     glm::ivec3 fluidGridSize{1, 1, 1};
     uint64_t fluidCellCount{1};
