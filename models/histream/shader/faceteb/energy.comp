@@ -22,6 +22,8 @@ void main() {
     if(f>=pc.facets) return;
     uint s0=2u*f,p=f*32u,surfaces=2u*pc.facets;
     bool object=f<pc.objects,leaf=object&&P[p]>0.5;
+    // Faces whose emission enters the balance: both of a thin facet, the outdoor face of a wall slab.
+    float faces=object?(P[p+28u]>1.5?4.0:8.0):4.0;
     if(pc.phase==2u) {
         for(uint s=s0;s<s0+2u;++s) {
             uint b=s*12u; float e=clamp(1.0-I[b+9u]-I[b+10u],0.0,1.0),w=I[b+11u];
@@ -36,7 +38,7 @@ void main() {
             for(uint side=0u;side<(object?1u:2u);++side) {
                 uint k=index+side,j=k*12u; float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
                 float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0);
-                float response=(object?8.0:4.0)*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
+                float response=faces*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
                 float candidate=clamp(temp+clamp(residual/max(1.0,response),-5.0,5.0),220.0,360.0);
                 float next=temp+(leaf?F[j+9u]:pc.relax*(candidate-temp));
                 maximum(4u,abs(next-temp)); T[k]=next; if(object) T[k+1u]=next;
@@ -56,13 +58,22 @@ void main() {
         float temp=T[index];
         if(object) {
             float rn=net[0]+net[1],rb=I[b+4u],depth=I[b+6u],previous=I[b];
-            float conductance=leaf?pc.rho*1005.0*P[p+3u]/rb:2.0*(5.8+4.1*sqrt(max(.1,pc.reserved)))*P[p+3u];
-            float h=conductance*(temp-pc.air),ss=max(0.0,P[p+2u])/pc.dt,storage=ss*(temp-previous);
+            // P[28]: 0 thin shell, 1 water mixed layer (one face exchanges with the
+            // air), 2 wall slab (outdoor face P[29] only, conduction I[7], I[8]).
+            bool water=!leaf&&P[p+28u]>0.5&&P[p+28u]<1.5,wall=!leaf&&P[p+28u]>1.5;
+            if(wall) rn=net[uint(P[p+29u]+0.5)];
+            float conductance=leaf?pc.rho*1005.0*P[p+3u]/rb:(water||wall?1.0:2.0)*(5.8+4.1*sqrt(max(.1,pc.reserved)))*P[p+3u];
+            float h=conductance*(temp-pc.air),ss=wall?I[b+7u]:max(0.0,P[p+2u])/pc.dt;
+            float storage=wall?ss*(temp-previous)+I[b+8u]:ss*(temp-previous);
             float inc=I[b+3u]+P[p+6u]*I[b+15u],available=I[b+1u]+I[b+13u];
             float raw=P[p+4u]*(1.0+P[p+5u]*(temp-298.15))*inc;
             float power=P[p+1u]>.5?clamp(raw,0.0,max(0.0,available)):0.0;
             float ps=P[p+1u]>.5&&raw>0.0&&raw<available?P[p+4u]*P[p+5u]*inc:0.0;
             float le=0.0,ls=0.0,step=0.0,mismatch=0.0;
+            if(water) {
+                float ra=pc.rho*1005.0/max(1.0e-6,conductance);
+                le=P[p+29u]*latent(temp,ra,P[p+7u]); ls=P[p+29u]*latentSlope(temp,ra,P[p+7u]);
+            }
             if(leaf) {
                 float par=max(0.0,I[b+2u]+I[b+14u]);
                 double eps=double(clamp(1.0-I[b+9u]-I[b+10u],0.0,1.0)+clamp(1.0-I[b+21u]-I[b+22u],0.0,1.0));
@@ -106,7 +117,7 @@ void main() {
         for(uint side=0u;side<(object?1u:2u);++side) {
             uint k=index+side,j=k*12u;float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
             float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0);
-            float response=(object?8.0:4.0)*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
+            float response=faces*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
             maximum(0u,abs(residual));maximum(1u,abs(residual)/max(1.0,response));
             energyViolation=energyViolation||abs(residual)>=2.0;
             if(leaf) {maximum(2u,F[j+10u]);maximum(3u,abs(residual));}

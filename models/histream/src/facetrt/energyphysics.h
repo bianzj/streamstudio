@@ -106,6 +106,87 @@ inline SoilResponse soilResponse(const SoilProfile& previous, double bottomTempe
     return response;
 }
 
+// Building wall/roof slab (FacetEB material wallMode "wall"): one homogeneous
+// layer of the given thickness in cell-centred finite volumes refined towards
+// both faces. The outer face carries the solved surface temperature; the inner
+// face exchanges with the indoor air (combined convection + radiation h_in)
+// through the half-cell conduction: q_in = (T_last - T_in) / (w/2k + 1/h_in).
+inline constexpr std::array<double, 11> wallEdgeFractions{0, .025, .07, .15, .3, .5, .7, .85, .93, .975, 1};
+inline constexpr size_t wallLayers = wallEdgeFractions.size() - 1;
+using WallProfile = std::array<double, wallLayers>;
+struct WallSlab {
+    double thickness{.2}, conductivity{1.4}, volumetricCapacity{2.024e6}, indoorK{295.15}, indoorCoefficient{8};
+    void validate() const {
+        if (!(thickness > 0 && thickness <= 5 && conductivity > 0 && volumetricCapacity > 0 &&
+              indoorCoefficient > 0 && indoorK > 200 && indoorK < 400) ||
+            !std::isfinite(thickness + conductivity + volumetricCapacity + indoorK + indoorCoefficient))
+            throw std::runtime_error("Invalid FacetEB wall parameters (thickness, lambdas, rhos, cs, indoor)");
+    }
+    double width(size_t i) const { return thickness * (wallEdgeFractions[i + 1] - wallEdgeFractions[i]); }
+    double indoorConductance() const {
+        return 1.0 / (.5 * width(wallLayers - 1) / conductivity + 1.0 / indoorCoefficient);
+    }
+    double indoorFlux(const WallProfile& p) const { return indoorConductance() * (p.back() - indoorK); }
+    double innerSurfaceK(const WallProfile& p) const { return indoorK + indoorFlux(p) / indoorCoefficient; }
+    double heat(const WallProfile& p) const {
+        double sum = 0;
+        for (size_t i = 0; i < wallLayers; ++i) sum += volumetricCapacity * width(i) * p[i];
+        return sum;
+    }
+    // Steady conduction between the surface and the indoor air.
+    WallProfile steadyProfile(double surfaceK) const {
+        const double total = thickness / conductivity + 1.0 / indoorCoefficient;
+        WallProfile p{};
+        for (size_t i = 0; i < wallLayers; ++i) {
+            const double depth = thickness * .5 * (wallEdgeFractions[i] + wallEdgeFractions[i + 1]);
+            p[i] = surfaceK + (indoorK - surfaceK) * (depth / conductivity) / total;
+        }
+        return p;
+    }
+};
+struct WallResponse {
+    WallProfile offset{}, slope{}; // T_i(new) = offset_i + slope_i * T_surface(new)
+    double conductance{};
+    double fluxSlope() const { return conductance * (1 - slope[0]); }
+    double flux(double surface) const { return conductance * ((1 - slope[0]) * surface - offset[0]); }
+    WallProfile profile(double surface) const {
+        WallProfile result{};
+        for (size_t i = 0; i < wallLayers; ++i) result[i] = offset[i] + slope[i] * surface;
+        return result;
+    }
+};
+// Backward Euler, as soilResponse, with the indoor Robin boundary.
+inline WallResponse wallResponse(const WallProfile& previous, const WallSlab& slab, double dt) {
+    slab.validate();
+    if (!(dt > 0)) throw std::runtime_error("Invalid FacetEB wall time step");
+    WallProfile upper{}, diagonal{}, rhs{}, boundary{};
+    for (size_t i = 0; i < wallLayers; ++i) {
+        if (!std::isfinite(previous[i])) throw std::runtime_error("Nonfinite wall profile");
+        const double width = slab.width(i);
+        const double up = slab.conductivity / (i ? .5 * (width + slab.width(i - 1)) : .5 * width);
+        const double down = i + 1 < wallLayers ? slab.conductivity / (.5 * (width + slab.width(i + 1)))
+                                               : slab.indoorConductance();
+        const double storage = slab.volumetricCapacity * width / dt;
+        diagonal[i] = storage + up + down;
+        upper[i] = i + 1 < wallLayers ? -down : 0;
+        rhs[i] = storage * previous[i] + (i + 1 == wallLayers ? down * slab.indoorK : 0);
+        boundary[i] = i == 0 ? up : 0;
+        if (i) {
+            const double factor = -up / diagonal[i - 1];
+            diagonal[i] -= factor * upper[i - 1];
+            rhs[i] -= factor * rhs[i - 1];
+            boundary[i] -= factor * boundary[i - 1];
+        }
+    }
+    WallResponse response;
+    response.conductance = slab.conductivity / (.5 * slab.width(0));
+    for (size_t i = wallLayers; i-- > 0;) {
+        response.offset[i] = (rhs[i] - (i + 1 < wallLayers ? upper[i] * response.offset[i + 1] : 0)) / diagonal[i];
+        response.slope[i] = (boundary[i] - (i + 1 < wallLayers ? upper[i] * response.slope[i + 1] : 0)) / diagonal[i];
+    }
+    return response;
+}
+
 // Paulson unstable / linear stable MOST functions, with explicit applicability
 // bounds -5 <= z/L <= 1. These are similarity parameterizations, not CFD.
 inline double psiM(double zeta) {

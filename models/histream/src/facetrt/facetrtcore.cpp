@@ -190,6 +190,13 @@ struct SurfaceParameters {
     bool vegetation{true};
     float pvEta25{0.22f}, pvGamma{-0.0035f}, pvBifaciality{0.0f};
     float convectiveScale{1.0f};
+    // Water mixed layer (componentType Water): heatCapacityPerArea holds
+    // rho_w c_w h_mix, one face exchanges with the air, LE uses surfaceResistance.
+    bool water{false};
+    float evaporationCoefficient{1.0f};
+    // Building wall/roof slab (wallMode "wall"); false keeps the thin shell.
+    bool wall{false};
+    facetphysics::WallSlab wallSlab;
     float leafWidth{0.1f};
     LeafBiochemistry leaf;
     uint8_t outputComponent{0}; // 0 unknown, 1 soil/background, 2 vegetation, 3 building, 4 PV, 5 water
@@ -2881,8 +2888,12 @@ std::string facetInputView(const std::string& path)
         const auto p=item.contains("params")?item["params"]:ProjectJson::Json::object();
         const bool pv=ProjectJson::string(item,"energyModel")=="photovoltaic";
         const bool leaf=ProjectJson::string(item,"type")=="Vegetation" && ProjectJson::string(item,"energyModel")!="wood";
+        const bool water=!pv && ProjectJson::string(item,"type")=="Water";
         // A thin leaf stores about 0.2 kg m-2 of water: ~1000 J m-2 K-1.
-        const float defaultHeatCapacity = pv ? 12000.0f : leaf ? 1000.0f : 60000.0f;
+        // A water facet stores its mixed layer: heatCapacity (J m-3 K-1) x mixingDepth.
+        const float waterCapacity = water
+            ? ProjectJson::number(p,"heatCapacity",4186000.0f)*std::max(0.01f,ProjectJson::number(p,"mixingDepth",.5f)) : 0.0f;
+        const float defaultHeatCapacity = pv ? 12000.0f : leaf ? 1000.0f : water ? waterCapacity : 60000.0f;
         xml << "<surfaceEnergy name=\"" << xmlEscaped(ProjectJson::string(item,"name")) << "\">"
             << "<photovoltaic>" << (pv?1:0) << "</photovoltaic>"
             << "<vegetation>" << (leaf?1:0) << "</vegetation>"
@@ -2891,6 +2902,19 @@ std::string facetInputView(const std::string& path)
             << "<bifaciality>" << ProjectJson::number(p,"bifaciality",0) << "</bifaciality>"
             << "<heatCapacityPerArea>" << ProjectJson::number(p,"heatCapacityPerArea",defaultHeatCapacity) << "</heatCapacityPerArea>"
             << "<convectiveScale>" << ProjectJson::number(p,"convectiveScale",1) << "</convectiveScale>";
+        if (water)
+            xml << "<water>1</water><waterRss>" << std::max(0.0f,ProjectJson::number(p,"rss",0)) << "</waterRss>"
+                << "<evaporationCoefficient>" << std::clamp(ProjectJson::number(p,"evaporationCoefficient",1),0.0f,1.0f)
+                << "</evaporationCoefficient>";
+        // Building wall/roof slab: only written for wallMode "wall" (shell = old thin facet).
+        if (!pv && !leaf && !water && ProjectJson::string(item,"energyModel")!="membrane" &&
+            ProjectJson::string(p,"wallMode","shell")=="wall")
+            xml << "<wallMode>wall</wallMode><thickness>" << ProjectJson::number(p,"thickness",.2f) << "</thickness>"
+                << "<lambdas>" << ProjectJson::number(p,"lambdas",1.4f) << "</lambdas>"
+                << "<rhos>" << ProjectJson::number(p,"rhos",2300) << "</rhos><cs>" << ProjectJson::number(p,"cs",880) << "</cs>"
+                << "<indoorTemperature>" << ProjectJson::number(p,"indoorTemperature",22) << "</indoorTemperature>"
+                << "<indoorHeatTransferCoefficient>" << ProjectJson::number(p,"indoorHeatTransferCoefficient",8)
+                << "</indoorHeatTransferCoefficient>";
         if (leaf) {
             std::string tparam = p.contains("Tparam") && p["Tparam"].is_string()
                 ? p["Tparam"].get<std::string>() : std::string("0.2,0.3,288,313,328");
@@ -4011,6 +4035,15 @@ Scene loadProjectScene(const std::string& inputFile)
                           !namedXmlBlock(xml, "waterSet", physicalName).empty()))
                     material.vegetation = false;
                 else material.vegetation = !woody;
+                // Direct XML: a Water object reads its mixed layer from waterSet.
+                const auto waterBlock = physicalName.empty() ? std::string{} : namedXmlBlock(xml, "waterSet", physicalName);
+                if (!material.vegetation && (componentType == "Water" || (componentType.empty() && !waterBlock.empty()))) {
+                    material.water = true;
+                    material.heatCapacityPerArea = xmlFloat(waterBlock, "heatCapacity", 4186000.0f) *
+                        std::max(0.01f, xmlFloat(waterBlock, "mixingDepth", 0.5f));
+                    material.surfaceResistance = std::max(0.0f, xmlFloat(waterBlock, "rss", 0.0f));
+                    material.evaporationCoefficient = std::clamp(xmlFloat(waterBlock, "evaporationCoefficient", 1.0f), 0.0f, 1.0f);
+                }
             }
             if(!physical.empty()) {
                 material.photovoltaic=xmlFloat(physical,"photovoltaic",0)>0.5f;
@@ -4020,6 +4053,11 @@ Scene loadProjectScene(const std::string& inputFile)
                 material.pvBifaciality=xmlFloat(physical,"bifaciality",0);
                 material.heatCapacityPerArea=xmlFloat(physical,"heatCapacityPerArea",60000);
                 material.convectiveScale=xmlFloat(physical,"convectiveScale",1);
+                material.water=xmlFloat(physical,"water",0)>0.5f && !material.vegetation && !material.photovoltaic;
+                if(material.water) {
+                    material.surfaceResistance=std::max(0.0f,xmlFloat(physical,"waterRss",0));
+                    material.evaporationCoefficient=std::clamp(xmlFloat(physical,"evaporationCoefficient",1),0.0f,1.0f);
+                }
                 material.lumpedGroup=trim(firstXmlTag(physical,"lumpedThermalGroup"));
                 if(!material.lumpedGroup.empty()) {
                     material.lumped={xmlFloat(physical,"lumpedCapacity",0),xmlFloat(physical,"lumpedConductance",0),
@@ -4058,6 +4096,24 @@ Scene loadProjectScene(const std::string& inputFile)
                 if(material.photovoltaic && (material.tirTransmittance>1e-6f ||
                     std::any_of(material.energyTransmittance.begin(),material.energyTransmittance.end(),[](float t){return t>1e-6f;})))
                     throw std::runtime_error("Photovoltaic surface must be opaque: "+physicalName);
+            }
+            {
+                // Wall/roof slab: surfaceEnergy (project JSON) or soilSet (direct XML).
+                const std::string wallBlock = !physical.empty() ? physical
+                    : physicalName.empty() ? std::string{} : namedXmlBlock(xml, "soilSet", physicalName);
+                const std::string wallMode = trim(firstXmlTag(wallBlock, "wallMode"));
+                if ((wallMode == "wall" || wallMode == "1") && !material.vegetation && !material.photovoltaic && !material.water) {
+                    if (!material.lumpedGroup.empty())
+                        throw std::runtime_error("wallMode wall cannot be combined with lumpedThermal: " + physicalName);
+                    auto& slab = material.wallSlab;
+                    slab.thickness = xmlFloat(wallBlock, "thickness", .2f);
+                    slab.conductivity = xmlFloat(wallBlock, "lambdas", 1.4f);
+                    slab.volumetricCapacity = double(xmlFloat(wallBlock, "rhos", 2300)) * xmlFloat(wallBlock, "cs", 880);
+                    slab.indoorK = double(xmlFloat(wallBlock, "indoorTemperature", 22)) + 273.15;
+                    slab.indoorCoefficient = xmlFloat(wallBlock, "indoorHeatTransferCoefficient", 8);
+                    slab.validate();
+                    material.wall = true;
+                }
             }
             const uint32_t materialIndex =
                 static_cast<uint32_t>(scene.materials.size());
@@ -4753,6 +4809,40 @@ try {
     if (thermalHistoryMode != "remap" && thermalHistoryMode != "legacy" && thermalHistoryMode != "mixed")
         throw std::runtime_error("HISTREAM_THERMAL_HISTORY must be remap, legacy or mixed");
     runIndex.value["thermalHistory"] = thermalHistoryMode;
+    // Building wall/roof slabs (material wallMode "wall"). The indoor side of a
+    // facet is the one that sees no sky: per-side sky view factors from one
+    // black-scene solve (sky radiosity 1, every side black and non-emitting),
+    // independent of the OBJ winding. A side with view >= kIndoorSkyView is
+    // outdoors; a facet whose both sides see the sky (open structure) keeps the
+    // thin shell. Ties (both enclosed) take the geometric-normal side as outer.
+    constexpr float kIndoorSkyView = 0.02f;
+    std::vector<int32_t> wallIndex(scene.leafFacetCount, -1);
+    std::vector<uint32_t> wallFacets;
+    std::vector<uint8_t> wallOuter;
+    {
+        bool anyWall = false;
+        for (uint32_t f = 0; f < scene.leafFacetCount && !anyWall; ++f) anyWall = surfaceForFacet(scene, f).wall;
+        if (anyWall) {
+            const std::vector<facetvk::SurfaceOptics> black(surfaceCount);
+            const auto skyView = incidentRadiation(solveRadiation(black, 1.0f, 1U, 1.0f), black, 1.0f);
+            uint32_t shellFallback = 0;
+            float maximumIndoorView = 0.0f;
+            double wallArea = 0;
+            for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
+                if (!surfaceForFacet(scene, f).wall) continue;
+                const float front = skyView[size_t(f) * 2U], back = skyView[size_t(f) * 2U + 1U];
+                if (std::min(front, back) >= kIndoorSkyView) { ++shellFallback; continue; }
+                wallIndex[f] = static_cast<int32_t>(wallFacets.size());
+                wallFacets.push_back(f);
+                wallOuter.push_back(back > front ? 1U : 0U);
+                maximumIndoorView = std::max(maximumIndoorView, std::min(front, back));
+                wallArea += facetAreas[f];
+            }
+            runIndex.value["buildingWalls"] = {{"facets", wallFacets.size()}, {"area_m2", wallArea},
+                {"shellFallbackFacets", shellFallback}, {"indoorSkyViewThreshold", kIndoorSkyView},
+                {"maximumIndoorSideSkyView", maximumIndoorView}, {"layers", facetphysics::wallLayers}};
+        }
+    }
     runIndex.write();
     const size_t firstGroundSide = static_cast<size_t>(scene.leafFacetCount) * 2U;
     const size_t groundSides = surfaceCount - firstGroundSide;
@@ -4765,6 +4855,10 @@ try {
     std::array<std::vector<facetphysics::SoilProfile>, 2> soilProfiles{
         std::vector<facetphysics::SoilProfile>(groundSides), std::vector<facetphysics::SoilProfile>(groundSides)};
     std::vector<double> soilBottomTemperature(groundSides);
+    // Sunlit/shaded slab profiles of the wall facets (index wallIndex[facet]).
+    std::array<std::vector<facetphysics::WallProfile>, 2> wallProfiles{
+        std::vector<facetphysics::WallProfile>(wallFacets.size()), std::vector<facetphysics::WallProfile>(wallFacets.size())};
+    std::vector<double> previousWallHeat(wallFacets.size(), 0.0);
 
     // Surface temperatures of the preceding nodes, newest first, for the
     // thermal-inertia soil heat flux (SCOPE/VoxelEB soil method 1).
@@ -4928,13 +5022,18 @@ try {
                 if (groundSide && side % 2U == groundDownSide(facet)) continue;
                 const auto& surface = surfaceForFacet(scene, facet);
                 const bool profileSide = groundSide && surface.soilTemperatureMethod == 2;
+                // A wall facet stores its slab profile once (side 0).
+                const int32_t wallSide = !groundSide && side % 2U == 0U ? wallIndex[facet] : -1;
                 if (transfer.target >= 0) {
                     ++historyChangedSides;
                     historyMaximumGap = std::max(historyMaximumGap,
                         std::abs(static_cast<double>(stateTemperature[0][side]) - stateTemperature[1][side]));
                     // Object facets store one heat content per facet (side 0).
                     double gap = 0, area = facetAreas[facet];
-                    if (!groundSide && side % 2U == 0U)
+                    if (wallSide >= 0)
+                        gap = surface.wallSlab.heat(wallProfiles[0][size_t(wallSide)]) -
+                            surface.wallSlab.heat(wallProfiles[1][size_t(wallSide)]);
+                    else if (!groundSide && side % 2U == 0U)
                         gap = std::max(0.0f, surface.heatCapacityPerArea) *
                             (static_cast<double>(stateTemperature[0][side]) - stateTemperature[1][side]);
                     else if (profileSide)
@@ -4964,6 +5063,9 @@ try {
                     for (size_t layer = 0; layer < facetphysics::soilLayers; ++layer)
                         move(soilProfiles[0][g][layer], soilProfiles[1][g][layer]);
                 }
+                if (wallSide >= 0)
+                    for (size_t layer = 0; layer < facetphysics::wallLayers; ++layer)
+                        move(wallProfiles[0][size_t(wallSide)][layer], wallProfiles[1][size_t(wallSide)][layer]);
             }
         }
         const std::array<std::vector<float>, 2> previousStateTemperature = stateTemperature;
@@ -4990,6 +5092,21 @@ try {
                 if (node == startNode) soilProfiles[state][g].fill(previousStateTemperature[state][side]);
                 soilResponses[state][g] = facetphysics::soilResponse(soilProfiles[state][g], soilBottomTemperature[g],
                     soil.thermalConductivity, soil.specificHeat * soil.density, dTime);
+            }
+        }
+        // Wall slabs: start from steady conduction between the seed surface
+        // temperature and the indoor air; eliminate the interior once per node.
+        std::array<std::vector<facetphysics::WallResponse>, 2> wallResponses{
+            std::vector<facetphysics::WallResponse>(wallFacets.size()), std::vector<facetphysics::WallResponse>(wallFacets.size())};
+        for (size_t w = 0; w < wallFacets.size(); ++w) {
+            const auto& slab = surfaceForFacet(scene, wallFacets[w]).wallSlab;
+            const size_t side0 = size_t(wallFacets[w]) * 2U;
+            for (int state = 0; state < 2; ++state) {
+                if (node == startNode) {
+                    wallProfiles[state][w] = slab.steadyProfile(previousStateTemperature[state][side0]);
+                    if (state == 0) previousWallHeat[w] = slab.heat(wallProfiles[0][w]);
+                }
+                wallResponses[state][w] = facetphysics::wallResponse(wallProfiles[state][w], slab, dTime);
             }
         }
 
@@ -5187,6 +5304,11 @@ try {
                 lumpedSurfaceResidual<2;
         };
         // The maximum over states/sides prevents cancellation and double counting.
+        // Faces whose emission enters the facet balance, x4 sigma T^3 each: both
+        // faces of a thin object facet, the outdoor face of a wall slab.
+        const auto radiatingFaces = [&](uint32_t facet) {
+            return facet < scene.leafFacetCount ? (wallIndex[facet] >= 0 ? 4.0f : 8.0f) : 4.0f;
+        };
         const auto countFailingEnergyFacets = [&]() {
             uint32_t count = 0;
             for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
@@ -5265,19 +5387,26 @@ try {
                         const SurfaceParameters& surface =
                             surfaceForFacet(scene, facet);
                         if (facet < scene.leafFacetCount) {
-                            const float facetNetRadiation =
-                                radiativeNet[side0] +
+                            // Wall slab: only the outdoor face is in the outdoor energy
+                            // balance; the indoor face conducts through the slab to the room.
+                            const int32_t wall = wallIndex[facet];
+                            const float facetNetRadiation = wall >= 0
+                                ? radiativeNet[side0 + wallOuter[size_t(wall)]]
+                                : radiativeNet[side0] +
                                 radiativeNet[side0 + 1U];
                             // Leaves exchange whole-leaf fluxes through the SCOPE canopy
                             // resistance of their ground column; other objects keep the
                             // two-face forced-convection coefficient.
                             const bool leafExchange = surface.vegetation;
+                            // A water surface exchanges heat and vapour through its upper
+                            // face only; its lower face lies on the water body.
+                            const bool waterSurface = surface.water && !leafExchange;
                             const CanopyAerodynamics& aerodynamics =
                                 columnAerodynamics[facetColumn[facet]];
                             const float facetSensibleConductance = leafExchange
                                 ? airDensity * 1005.0f * surface.convectiveScale /
                                     aerodynamics.leafResistance
-                                : 2.0f * aerodynamicConductance * surface.convectiveScale;
+                                : (waterSurface || wall >= 0 ? 1.0f : 2.0f) * aerodynamicConductance * surface.convectiveScale;
                             const float facetSensibleHeat = facetSensibleConductance *
                                 (T[side0] - airTemperature);
                             const CanopyColumn& column = columns[facetColumn[facet]];
@@ -5286,11 +5415,16 @@ try {
                             const float statePar = std::max(0.0f,
                                 stateValue(absorbedParPhotons, absorbedParDirect, state, side0) +
                                 stateValue(absorbedParPhotons, absorbedParDirect, state, side0 + 1U));
-                            const float facetStorageSlope =
-                                std::max(0.0f, surface.heatCapacityPerArea) /
+                            // Wall: conduction into the slab, linear in the surface
+                            // temperature about the preceding state (energy.comp: I[7], I[8]).
+                            const float facetStorageSlope = wall >= 0
+                                ? static_cast<float>(wallResponses[state][size_t(wall)].fluxSlope())
+                                : std::max(0.0f, surface.heatCapacityPerArea) /
                                 dTime;
-                            const float facetStorageHeat =
-                                facetStorageSlope *
+                            const float facetStorageHeat = wall >= 0
+                                ? facetStorageSlope * (T[side0] - previousT[side0]) +
+                                    static_cast<float>(wallResponses[state][size_t(wall)].flux(previousT[side0]))
+                                : facetStorageSlope *
                                 (T[side0] - previousT[side0]);
                             const float effectiveIncident =
                                 stateValue(incidentShortwave, incidentDirect, state, side0) +
@@ -5305,6 +5439,17 @@ try {
                             const float pvSlope=surface.photovoltaic && rawPower>0 && rawPower<available ?
                                 surface.pvEta25*surface.pvGamma*effectiveIncident:0.0f;
                             float facetLatentHeat = 0, facetLatentHeatSlope = 0;
+                            if (waterSurface) {
+                                // Open-water evaporation (VoxelEB water): saturated vapour at the
+                                // mixed-layer temperature, aerodynamic resistance of the upper
+                                // face rho cp / h, surface resistance rss, times the coefficient.
+                                const float waterResistance = airDensity * 1005.0f /
+                                    std::max(1.0e-6f, facetSensibleConductance);
+                                facetLatentHeat = surface.evaporationCoefficient * latentHeatFlux(T[side0], airDensity,
+                                    airPressure, meteo.vaporPressure, waterResistance, surface.surfaceResistance);
+                                facetLatentHeatSlope = surface.evaporationCoefficient * latentHeatFluxDerivative(T[side0],
+                                    airDensity, airPressure, meteo.vaporPressure, waterResistance, surface.surfaceResistance);
+                            }
                             if (leafExchange) {
                                 const double emissivitySum = std::clamp(1.0f - longwaveOptics[side0].reflectance - longwaveOptics[side0].transmittance, 0.0f, 1.0f) +
                                     std::clamp(1.0f - longwaveOptics[side0 + 1].reflectance - longwaveOptics[side0 + 1].transmittance, 0.0f, 1.0f);
@@ -5490,7 +5635,7 @@ try {
                             maximumStomatalMismatch = std::max(maximumStomatalMismatch, flux.stomatalMismatch[side]);
                             maximumLeafEnergyResidual = std::max(maximumLeafEnergyResidual, std::abs(residual));
                         }
-                        const float response = (object ? 8.0f : 4.0f) * emissivity * kStefanBoltzmann * std::pow(T[side], 3.0f) +
+                        const float response = radiatingFaces(facet) * emissivity * kStefanBoltzmann * std::pow(T[side], 3.0f) +
                             flux.sensibleSlope[side] +
                             flux.latentSlope[side] + flux.storageSlope[side] + flux.internalSlope[side] + (object ? flux.photovoltaicSlope[side] : 0.0f);
                         if (!std::isfinite(residual) || !std::isfinite(response)) throw std::runtime_error("FacetEB energy residual is not finite");
@@ -5552,6 +5697,14 @@ try {
                 data[26] = leaf.sustainedNPQ;
                 // energy.comp: 1 + local index of the soil-facing ground side.
                 data[27] = facet >= scene.leafFacetCount ? 1.0f + float(groundDownSide(facet)) : 0.0f;
+                // energy.comp P[28]: 0 thin shell, 1 water mixed layer (one exchanging
+                // face, open-water LE; P[29] evaporation coefficient), 2 wall slab
+                // (outdoor face only; P[29] its local side, conduction from I[7], I[8]).
+                const bool waterFacet = facet < scene.leafFacetCount && mat.water && !mat.vegetation;
+                const bool wallFacet = facet < scene.leafFacetCount && wallIndex[facet] >= 0;
+                data[28] = wallFacet ? 2.0f : waterFacet ? 1.0f : 0.0f;
+                data[29] = wallFacet ? float(wallOuter[size_t(wallIndex[facet])])
+                    : waterFacet ? mat.evaporationCoefficient : 0.0f;
             }
             for (int state = 0; state < 2; ++state)
                 for (size_t side = 0; side < surfaceCount; ++side)
@@ -5581,6 +5734,13 @@ try {
                         const auto &soil = soilResponses[state][side - firstGroundSide];
                         data[7] = static_cast<float>(soil.fluxSlope());
                         data[8] = static_cast<float>(soil.flux(0));
+                    }
+                    else if (facet < scene.leafFacetCount && wallIndex[facet] >= 0)
+                    {
+                        const auto &wall = wallResponses[state][size_t(wallIndex[facet])];
+                        const size_t side0 = size_t(facet) * 2U;
+                        data[7] = static_cast<float>(wall.fluxSlope());
+                        data[8] = static_cast<float>(wall.flux(previousStateTemperature[state][side0]));
                     }
                     data[9] = initialOptics[side].reflectance;
                     data[10] = initialOptics[side].transmittance;
@@ -5682,7 +5842,7 @@ try {
                             const float t = stateTemperature[state][side];
                             const float e = std::clamp(1.0f - audit.optics[side].reflectance - audit.optics[side].transmittance, 0.0f, 1.0f);
                             const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] - flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
-                            const float response = (object ? 8.0f : 4.0f) * e * kStefanBoltzmann * std::pow(t, 3.0f) +
+                            const float response = radiatingFaces(facet) * e * kStefanBoltzmann * std::pow(t, 3.0f) +
                                 flux.sensibleSlope[side] + flux.latentSlope[side] + flux.storageSlope[side] + flux.internalSlope[side] + (object ? flux.photovoltaicSlope[side] : 0.0f);
                             const float candidate = std::clamp(t + std::clamp(residual / std::max(1.0f, response), -5.0f, 5.0f), 220.0f, 360.0f);
                             shadowNextTemperature[index] = t + (object && surface.vegetation ? flux.temperatureStep[side] : temperatureRelaxation * (candidate - t));
@@ -5788,7 +5948,7 @@ try {
                             const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] -
                                                    flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
                             const float derivative =
-                                (object ? 8.0f : 4.0f) * emissivity * kStefanBoltzmann * std::pow(T[side], 3.0f) +
+                                radiatingFaces(facet) * emissivity * kStefanBoltzmann * std::pow(T[side], 3.0f) +
                                 flux.sensibleSlope[side] + flux.latentSlope[side] + flux.storageSlope[side] + flux.internalSlope[side] +
                                 (object ? flux.photovoltaicSlope[side] : 0.0f);
                             const float maximumSurfaceK=lumpedFacet[facet]>=0
@@ -5884,6 +6044,7 @@ try {
         }
         diagnostic["maximumSoilClosure_W_m2"] = maxSoilClosure;
         for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet) {
+            if (wallIndex[facet] >= 0) continue; // slab heat: buildingWalls closure below
             const size_t side = static_cast<size_t>(facet) * 2U;
             const double capacity = std::max(0.0f, surfaceForFacet(scene, facet).heatCapacityPerArea);
             const double heat = capacity * (sunlitPart[side] * static_cast<double>(stateTemperature[0][side]) +
@@ -5895,6 +6056,42 @@ try {
                 objectClosureMax = std::max(objectClosureMax, std::abs(residual));
             }
             previousObjectHeat[facet] = heat;
+        }
+        if (!wallFacets.empty()) {
+            // Advance the slabs to the solved surface temperatures. Closure per
+            // facet: change of the area-weighted slab heat since the end of the
+            // preceding node minus (surface conduction - indoor flux).
+            double area = 0, indoorSum = 0, outerSum = 0, innerSum = 0, closureSum = 0, closureMax = 0;
+            for (size_t w = 0; w < wallFacets.size(); ++w) {
+                const uint32_t facet = wallFacets[w];
+                const auto& slab = surfaceForFacet(scene, facet).wallSlab;
+                const size_t side = size_t(facet) * 2U;
+                double heat = 0, conducted = 0, indoor = 0, inner = 0, outer = 0;
+                for (int state = 0; state < 2; ++state) {
+                    const double weight = state == 0 ? sunlitPart[side] : 1.0 - sunlitPart[side];
+                    const double surface = stateTemperature[state][side];
+                    const auto next = wallResponses[state][w].profile(surface);
+                    conducted += weight * wallResponses[state][w].flux(surface);
+                    indoor += weight * slab.indoorFlux(next);
+                    inner += weight * slab.innerSurfaceK(next);
+                    outer += weight * surface;
+                    heat += weight * slab.heat(next);
+                    wallProfiles[state][w] = next;
+                }
+                const double residual = (heat - previousWallHeat[w]) / dTime - (conducted - indoor);
+                previousWallHeat[w] = heat;
+                area += facetAreas[facet];
+                indoorSum += facetAreas[facet] * indoor;
+                outerSum += facetAreas[facet] * outer;
+                innerSum += facetAreas[facet] * inner;
+                closureSum += facetAreas[facet] * residual;
+                closureMax = std::max(closureMax, std::abs(residual));
+            }
+            diagnostic["buildingWalls"] = {{"facets", wallFacets.size()}, {"area_m2", area},
+                {"meanOuterSurfaceTemperature_K", outerSum / area}, {"meanInnerSurfaceTemperature_K", innerSum / area},
+                {"meanIndoorFlux_W_m2", indoorSum / area},
+                {"heatClosureMean_W_m2", closureAvailable ? closureSum / area : 0.0},
+                {"heatClosureMaxAbs_W_m2", closureAvailable ? closureMax : 0.0}};
         }
         {
             const auto perArea = [](double value, double area) { return area > 0 ? value / area : 0.0; };

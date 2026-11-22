@@ -35,6 +35,11 @@ for (const name of names) {
   // Optional replacement position files (rows: x y z scale rotation).
   for (const [file, rows] of Object.entries(spec.positions || {}))
     writeFileSync(join(projectCopy, file), rows.map((row) => row.join(' ')).join('\n') + '\n', 'utf8')
+  // Optional extra text files (e.g. an added OBJ) relative to the project.
+  for (const [file, text] of Object.entries(spec.files || {})) {
+    mkdirSync(dirname(join(projectCopy, file)), { recursive: true })
+    writeFileSync(join(projectCopy, file), text, 'utf8')
+  }
   const source = join(projectCopy, 'project.json')
   const doc = JSON.parse(readFileSync(source, 'utf8').replace(/^\uFEFF/, ''))
   const project = unified.isUnifiedProject(doc)
@@ -45,6 +50,12 @@ for (const name of names) {
   c.outDir = join(caseDir, 'out-placeholder')
   if (spec.meteo) { c.meteo.start = spec.meteo[0]; c.meteo.end = spec.meteo[1] }
   for (const [path, value] of Object.entries(spec.set || {})) setPath(project, path, value)
+  // Optional scene objects appended after normalization (e.g. a water surface).
+  for (const item of spec.addObjects || []) {
+    c.objects.items.push(structuredClone(item))
+    if (Array.isArray(c.objects.names)) c.objects.names.push(item.name)
+    if ('count' in c.objects) c.objects.count = c.objects.items.length
+  }
   const assetPath = (value) => {
     const text = String(value || '').trim()
     if (!text) return ''

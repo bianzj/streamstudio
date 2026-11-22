@@ -18,6 +18,32 @@ const MWIR_BANDS = { 'configuration.sensor.bands': '3800,10500', 'configuration.
   'configuration.sensor.temperature': true }
 // Every soil set on soil method 1 (the control value overrides the material).
 const SOIL_METHOD_1 = { 'configuration.control.soilTemperatureMethod': 1 }
+// A flat size x size water sheet (n x n cells, upward normal) as the bundled
+// water generator writes it (main.js waterSurfaceObj), 1 cm above the ground.
+const waterSheetObj = (name, size, n) => {
+  const lines = [`o ${name}`, `g ${name}`, 's off']
+  const h = size / 2, d = size / n
+  for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) lines.push(`v ${-h + i * d} 0 ${-h + j * d}`)
+  const v = (i, j) => j * (n + 1) + i + 1
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++)
+    lines.push(`f ${v(i, j)} ${v(i, j + 1)} ${v(i + 1, j)}`, `f ${v(i + 1, j)} ${v(i, j + 1)} ${v(i + 1, j + 1)}`)
+  return lines.join('\n') + '\n'
+}
+// 30 m x 30 m pond in the open south-east corner of urban_block (no
+// buildings or street trees within 5 m), centre (280, 65).
+const URBAN_WATER = {
+  files: {
+    'models/regression_water.obj': waterSheetObj('regression_water', 30, 6),
+    'positions/regression_water_position.txt': '280 65 0.01 1 0\n'
+  },
+  addObjects: [{
+    name: 'regression_water', type: 'Water', materialName: 'water_set', canopyName: 'rigid_body',
+    fileName: 'models/regression_water.obj', positionFile: 'positions/regression_water_position.txt',
+    shape: 'cube', dimensions: [30, 0.01, 30], instanceCount: 1,
+    meshes: [{ name: 'regression_water', spectralName: 'water_surface', thermalName: 'water_temperature',
+      materialName: 'water_set', canopyName: 'rigid_body' }]
+  }]
+}
 
 export const CASES = {
   vrt_urban: { example: 'urban_block', mode: 'eVoxelRT' },
@@ -89,6 +115,13 @@ export const CASES = {
   feb_urban_shadow: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27] },
   feb_urban_shadow_m1: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], set: SOIL_METHOD_1 },
   veb_urban_shadow_m1: { example: 'urban_block', mode: 'eVoxelEB', meteo: [17, 27], set: SOIL_METHOD_1 },
+  // FacetEB open water (mixed layer + evaporation) over the same 10 nodes:
+  // noon LE of a few hundred W m-2, small water-temperature range.
+  feb_urban_water: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], ...URBAN_WATER },
+  // The urban buildings (material soil_dry, index 5) as 0.2 m wall/roof slabs
+  // with a 22 C interior (wallMode "wall"); feb_urban_shadow is the thin shell.
+  feb_urban_shadow_wall: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], set: {
+    'configuration.materials.5.params.wallMode': 'wall', 'configuration.materials.5.params.thickness': 0.2 } },
   // Mid-wave infrared in FacetRT/FacetEB (facetRtThermalSolar and the FacetEB
   // state spectra): 3.8 um warms by about rho*E*cos/pi by day, 10.5 um and
   // night nodes stay unchanged.
