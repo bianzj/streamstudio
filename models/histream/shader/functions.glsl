@@ -4,6 +4,7 @@
 #include "global.glsl"
 #include "parameters.h"
 #include "lidf_common.h"
+#include "periodic_walk.glsl"
 
 // Leaf projection function G(Omega) of a turbid canopy (Ross): from the SAIL
 // leaf inclination classes when the host derived them from LIDFa/LIDFb,
@@ -890,7 +891,7 @@ struct TurbidPeriodicWalk
 
 int TurbidPeriodicLimit()
 {
-    return clamp(setting.periodicNeighborCount, 0, 20);
+    return periodicCrossingLimit(setting.periodicNeighborCount);
 }
 
 ivec2 TurbidPeriodicTile(ivec3 cell, ivec2 period)
@@ -982,18 +983,30 @@ float TurbidPeriodicOpticalDepth(vec3 start, vec3 direction)
 // the copy the flight started from (its origin cell's exit part) are
 // integrated; copies crossed in between had no plane hit and are skipped,
 // so the cost stays two box DDAs however many copies the flight crossed.
+// One call site of the box DDA (a pass loop that folds to a single pass when
+// the PERIODIC_BOUNDARY_ENABLED specialization constant is false): a second
+// call, even in a branch that is never taken, made the VoxelEB scattering
+// pass ~30% slower without periodic boundaries. With periodic boundaries the
+// live second pass still costs the scattering pass about that much (driver
+// code generation; the extra DDA work itself is ~4%).
 float TurbidSegmentOpticalDepth(vec3 start, vec3 end)
 {
-    float tau = TurbidBoxSegmentOpticalDepth(start, end);
+    vec3 shift = vec3(0.0);
+    int passes = 1;
     if (TurbidPeriodicLimit() > 0) {
         vec2 semi = vec2(floor(setting.voxelSize.x * 0.5 + 0.5),
                          floor(setting.voxelSize.z * 0.5 + 0.5));
         vec2 period = max(vec2(setting.voxelSize.x, setting.voxelSize.z), vec2(1.0));
         ivec2 tile = ivec2(floor((vec2(start.x, start.z) + semi) / period));
         if (tile != ivec2(0)) {
-            vec3 shift = vec3(float(tile.x) * period.x, 0.0, float(tile.y) * period.y);
-            tau += TurbidBoxSegmentOpticalDepth(start - shift, end - shift);
+            shift = vec3(float(tile.x) * period.x, 0.0, float(tile.y) * period.y);
+            passes = 2;
         }
+    }
+    float tau = 0.0;
+    for (int pass = 0; pass < passes; ++pass) {
+        vec3 offset = pass == 0 ? vec3(0.0) : shift;
+        tau += TurbidBoxSegmentOpticalDepth(start - offset, end - offset);
     }
     return tau;
 }

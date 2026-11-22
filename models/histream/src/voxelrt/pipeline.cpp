@@ -49,6 +49,12 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelrtIO> &modelio)
         LOGI(error.c_str());
     }
 
+    // Specialization constant 0 (PERIODIC_BOUNDARY_ENABLED, periodic_walk.glsl):
+    // without periodic boundaries the driver drops every periodic branch.
+    const VkBool32 periodicBoundary = modelio->periodicNeighborCount > 0 ? VK_TRUE : VK_FALSE;
+    const VkSpecializationMapEntry periodicEntry{0, 0, sizeof(VkBool32)};
+    const VkSpecializationInfo periodicSpecialization{1, &periodicEntry, sizeof(VkBool32), &periodicBoundary};
+
     for (const auto &stage : magic_enum::enum_values<VoxelRTStage>())
     {
         //int stageInt = (int)stage;
@@ -56,6 +62,7 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelrtIO> &modelio)
         computePipelineCreateInfo.layout = m_pipelineLayout;
         computePipelineCreateInfo.stage =
                 nvvk::createShaderStageInfo(m_device, nvh::loadFile(VoxelrtPaths[stage], true), VK_SHADER_STAGE_COMPUTE_BIT);
+        computePipelineCreateInfo.stage.pSpecializationInfo = &periodicSpecialization;
 
         const VkResult result = vkCreateComputePipelines(
             m_device, {}, 1, &computePipelineCreateInfo, nullptr, &m_pipelines[stage]);

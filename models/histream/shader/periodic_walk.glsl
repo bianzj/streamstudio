@@ -15,6 +15,21 @@
 
 const float PERIODIC_WALK_HUGE = 1.0e30;
 
+// Specialization constant 0: false when the run has no periodic boundaries
+// (periodicTraversalCount = 0). The VoxelRT/VoxelEB hosts set it per run, so
+// the driver removes every periodic branch and the non-periodic pipelines
+// compile to the original single-query / single-box code (a runtime-uniform
+// branch alone left the scattering pass about 30% slower). Pipelines that do
+// not specialize it keep the default true and decide from
+// setting.periodicNeighborCount at run time.
+layout(constant_id = 0) const bool PERIODIC_BOUNDARY_ENABLED = true;
+
+// Crossings allowed per query: 0 disables periodic traversal.
+int periodicCrossingLimit(int requested)
+{
+  return PERIODIC_BOUNDARY_ENABLED ? clamp(requested, 0, 20) : 0;
+}
+
 struct PeriodicWalk
 {
   vec2 low;            // world x/z of the domain minimum corner

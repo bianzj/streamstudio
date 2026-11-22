@@ -54,6 +54,7 @@
 - VoxelRT：太阳方向不变时多视角/航点只重跑成像（61 视角 14 s → 4.5 s）。
 - RayTracing：批次按实测 GPU 耗时自适应切分（约 120 ms/批），消除开周期边界时的低占用和整图一次提交的 TDR 风险。
 - 服务端：FacetEB 逐节点出图改为每次运行一个常驻出图线程（超过 300 万面元时仍逐节点开线程，阈值 `STREAM_STUDIO_FACET_STEP_RESIDENT_FACETS`）。
+- **未开周期边界的 VoxelEB/VoxelRT 恢复周期一致化之前的耗时**：周期边界一致化后，`TurbidSegmentOpticalDepth` 里第二处盒内 DDA 调用（即使该分支从不执行）使驱动为短波散射着色器生成的代码慢约 1/3，周期遍历的其余分支又使其他传输 pass 变慢。现在盒内 DDA 只有一个调用点（按需 1–2 遍的循环），并新增特化常量 `PERIODIC_BOUNDARY_ENABLED`（`shader/periodic_walk.glsl`，constant_id 0）：VoxelRT/VoxelEB 建管线时按 `periodicTraversalCount > 0` 设置，未开周期时驱动去掉全部周期分支（RayTracing 不设置，按默认值照旧运行时判断）。耗时（同机、各跑 2 次取快）：veb_forest 12.15 → 9.63 s（一致化之前 9.59 s；短波散射每节点 3.43 → 2.52 s，之前 2.53 s），vrt_forest 6.42 → 6.19 s（之前 6.22 s），rt_forest 1.27 → 1.26 s；开周期 veb_forest_periodic 14.08 → 13.98 s、vrt_forest_periodic 7.62 → 7.41 s、rt_forest_periodic 1.26 → 1.25 s。33 个冻结算例的全部输出逐字节不变。开周期的 VoxelEB 仍比不开周期慢约 45%（短波散射 2.5 → 4.0 s/节点），其中约 1 s 来自第二遍盒内积分使驱动代码生成变差（该遍本身的计算约 0.14 s），尚未找到不改变结果又能消除它的写法（试过的合并循环、`[[dont_unroll]]`、特化常量分支均无效）。
 
 ### 新工程默认值（2026-11-22）
 
@@ -96,7 +97,7 @@
 - `voxelrt.json` 过程字段：2.5–5 µm 波段由 `illumination_<波长>` 改名为 `spectral_radiance_<波长>`（与 > 5 µm 波段一致，按 Planck 辐亮度计），读取这些字段的脚本需改名；`radiosity_<波长>` 别名不变。2.5–6 µm 波段的 `spectral_radiance_<波长>`（环境场）自 MWIR 太阳反射修正起含太阳直射与天空散射的贡献（白天变大，夜间与 > 6 µm 不变），字段名不变。
 - 中波红外（2.5–6 µm）白天亮温随 MWIR 太阳反射修正升高（叶片约 3 K，受光土壤/建筑 5–10 K）；依赖旧 MWIR 数值的对比或反演需重跑。RayTracing/VoxelRT 的太阳绝对量由晴空模型给定，与工程里设置的组分温度无关，阴天场景的 MWIR 太阳项会偏大。
 - 2026-11-22 精度修正后，旧工程重新运行会有以下数值变化：VoxelEB 地面显热升高；RayTracing 近红外升高；反射率可大于 1；天空背景下物体边缘变亮；开周期边界的 Facet 工程更准但更慢。FacetEB 判据更严，已保存的低迭代上限（如 12 次）可能被报告为未收敛（退出码 2，结果保留）。VoxelRT/VoxelEB 的混沌介质改用 `LIDFa/LIDFb` 决定 G(Ω)：默认参数下变化 < 0.3%，非球形 LIDF 或 G ≠ 0.5 的工程变化可达 10% 量级；想保持旧的常数 G 行为可把 `LIDFa`、`LIDFb` 都设为 0（G = 0.5 时与旧结果相同，G ≠ 0.5 时单次散射按 G/0.5 修正）。`Canopy` GPU 结构体新增 `lidfValid/lidf[13]/diffuseG[32]`（244 字节），C++ 与着色器需同时更新。
-- 周期边界传输一致化后，开周期的工程边界条带变暗/变冷到与内部一致，整体均值随之变化（森林周期 8 约 −4%，城市斜视可达 +17%）。耗时（同机、预热后）：VoxelRT 周期 8 森林 6.4 → 7.6 s，VoxelEB 周期 8 森林 10.0 → 14.2 s、周期 20 城市 2.9 → 3.5 s；RayTracing 不变或略快（1.3 s）。未开周期的 VoxelEB 短波散射 pass 也慢了约 1/3（森林 9.9 → 12.0 s，结果逐位不变），原因未查明。`RayRTSetting` 新增 `sceneTop`（占用原对齐填充，仍为 80 字节），C++ 与 `settings.h` 需同时更新。
+- 周期边界传输一致化后，开周期的工程边界条带变暗/变冷到与内部一致，整体均值随之变化（森林周期 8 约 −4%，城市斜视可达 +17%）。耗时（同机、预热后）：VoxelRT 周期 8 森林 6.4 → 7.6 s，VoxelEB 周期 8 森林 10.0 → 14.2 s、周期 20 城市 2.9 → 3.5 s；RayTracing 不变或略快（1.3 s）。未开周期时一度变慢的 VoxelEB 短波散射 pass（森林 9.9 → 12.0 s）已恢复（9.6 s，见“性能”），开周期森林现为 VoxelRT 7.4 s、VoxelEB 14.0 s。VoxelRT/VoxelEB 计算管线新增特化常量 0（`PERIODIC_BOUNDARY_ENABLED`），自行加载这些 SPIR-V 的程序不设置时按默认值 true 运行，结果相同但不享受未开周期的提速。`RayRTSetting` 新增 `sceneTop`（占用原对齐填充，仍为 80 字节），C++ 与 `settings.h` 需同时更新。
 - 工程新增 `control.raytracingDepth`（RayTracing 散射次数），旧工程缺省按 16 处理；`control.depth` 只对 VoxelRT 有意义（步数预算 ×128）。
 - 工程新增 `control.qualityPreset`（`fast`/`standard`/`high`/`custom`）与 `control.runTimeoutMinutes`。旧工程缺少这两项时按 `custom` 与 0（服务端默认上限）处理，已有参数不变；缺少 `voxelCollisionOrders`/`shortwaveScatteringOrders`/`radiationMaxSteps` 的旧工程仍按 2/1/64 运行，只有新工程才按标准档取 3/2/自动。旧版本打开新工程会忽略这两个字段。
 - VoxelEB 稳定度迭代：GPU `EBState` 由 4 字节扩为 1544 字节（地面柱计数与 3×128 个定点累加槽，`structs_cg.h` 与 `parameters.h` 的 `VOXELEB_MOST` 分支同步），`FluidParameters.localExchange` 的保留分量 y/z 用于稳定度开关与场景 1/L；新增 3 个 `*_most.comp.spv`（构建清单已登记）。旧 XML 工程中 `<Aerodynamics><L>` 在中性管线中照旧使用；开启稳定度修正时由迭代得到的场景 L 取代。
@@ -118,6 +119,7 @@
 - 未验证：桌面（Electron）模式下的运行质量档位与上限流程。
 - 中波红外太阳反射：新增 6 个 MWIR 算例对比修正前引擎（`bin_periodic`），逐像元按 ΔL = B(T新) − B(T旧) 反推等效反射率与材质 TIR 反射率一致（数字见上）；10.5 µm 波段与夜间算例逐字节相同；22 个旧算例 86 个 TIFF 与 `periodic_final` 逐字节相同。未与 MODTRAN/DART 等外部模型对比。
 - VoxelEB 稳定度迭代：中性管线的 `aeresist/budget/evapo.comp.spv` 与修正前引擎（`bin_mwir`）逐字节相同；9 个 VoxelEB 算例（含新增 2 个夜间算例）关闭稳定度时 TIFF/诊断二进制与 `mwir_final` 逐字节相同；开启时逐算例对比能量项与迭代（数字见上），`veb_urban`、`veb_forest_night` 重复运行逐字节相同；`project-schema.js` 检查新建 VoxelEB 为 true、FacetEB/VoxelRT 为 false、旧工程缺字段为 false、XML 写出一致。未在界面中实测下拉框；未做 SCOPE 对比。
+- 周期提速：33 个冻结算例对比上一版引擎逐文件逐字节比较，除 Facet 时间戳/耗时字段外全部相同（含全部开周期算例与体元/面元过程文件）。耗时用 veb/vrt/rt_forest(_periodic) 与周期一致化前后的引擎各跑 2 次取快。
 
 ## 已做的检查（2026-11-16）
 

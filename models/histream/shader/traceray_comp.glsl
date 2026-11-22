@@ -71,7 +71,7 @@ bool QueryClosestPeriodic(Ray r, float minLength, uint rayFlags,
   result = prd;
   result.hitT = INFINITY;
   int count = periodicMode != PERIODIC_QUERY_CENTRAL
-    ? clamp(setting.periodicNeighborCount, 0, 20) : 0;
+    ? periodicCrossingLimit(setting.periodicNeighborCount) : 0;
   bool walking = count > 0;
 
   // Every ray, from a voxel or from the camera, visits the domain copies in
