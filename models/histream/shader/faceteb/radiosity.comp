@@ -38,6 +38,17 @@ layout(std430, set = 0, binding = 6) buffer RadiosityB {
 layout(std430, set = 0, binding = 7) buffer Residual {
     uint maxDeltaBits;
 };
+// Downward escapes per side; INACTIVE_SIDE marks the soil-facing back side of
+// a ground facet, which is not a receiving surface (no sky, no exchange).
+layout(std430, set = 0, binding = 9) readonly buffer GroundCounts {
+    uint groundCounts[];
+};
+// Equivalent-ground radiosity of the current iterate (ground_mean.comp).
+layout(std430, set = 0, binding = 12) readonly buffer GroundMean {
+    float groundMean[];
+};
+
+const uint INACTIVE_SIDE = 0xffffffffu;
 
 layout(push_constant) uniform SolvePush {
     uint facetCount;
@@ -62,12 +73,19 @@ void writeRadiosity(uint side, float value)
 
 float incoming(uint side)
 {
+    const uint ground = groundCounts[side];
+    if (ground == INACTIVE_SIDE) {
+        return 0.0;
+    }
     const uint denominator = denominators[side];
     if (denominator == 0u) {
         return pc.skyRadiosity;
     }
 
     float value = float(skyCounts[side]) * pc.skyRadiosity;
+    if (ground != 0u) {
+        value += float(ground) * groundMean[0];
+    }
     for (uint edgeIndex = rowOffsets[side]; edgeIndex < rowOffsets[side + 1u]; ++edgeIndex) {
         const CsrEdge edge = edges[edgeIndex];
         value += float(edge.count) * readRadiosity(edge.neighbor);

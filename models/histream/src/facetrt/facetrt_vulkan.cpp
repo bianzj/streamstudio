@@ -140,6 +140,82 @@ std::vector<DeviceCandidate> rankDevices(VkInstance instance)
     return candidates;
 }
 
+GroundBoundary applyGroundBoundary(const std::vector<Vertex>& vertices, uint32_t firstGroundFacet,
+                                   std::vector<uint32_t>& denominators, std::vector<uint32_t>& skyCounts,
+                                   std::vector<uint32_t>& groundCounts, GraphDiagnostics& diagnostics)
+{
+    const uint32_t facets = static_cast<uint32_t>(vertices.size() / 3U);
+    if (denominators.size() != size_t(facets) * 2U || skyCounts.size() != denominators.size() ||
+        groundCounts.size() != denominators.size())
+        throw std::invalid_argument("Ground boundary requires one count per oriented side");
+    const uint32_t first = std::min(firstGroundFacet, facets);
+    const auto area = [&](uint32_t facet) {
+        const auto& a = vertices[size_t(facet) * 3U].position;
+        const auto& b = vertices[size_t(facet) * 3U + 1U].position;
+        const auto& c = vertices[size_t(facet) * 3U + 2U].position;
+        const std::array<float, 3> n = cross3({b[0] - a[0], b[1] - a[1], b[2] - a[2]},
+                                              {c[0] - a[0], c[1] - a[1], c[2] - a[2]});
+        return 0.5 * std::sqrt(double(n[0]) * n[0] + double(n[1]) * n[1] + double(n[2]) * n[2]);
+    };
+    GroundBoundary ground;
+    double total = 0.0;
+    std::vector<double> weights;
+    for (uint32_t facet = first; facet < facets; ++facet) {
+        // The side whose normal points down faces the soil: it receives
+        // neither sky nor ground and exchanges with nothing.
+        const uint32_t down = facet * 2U + (vertices[size_t(facet) * 3U].normal[1] >= 0.0f ? 1U : 0U);
+        denominators[down] = 0U;
+        skyCounts[down] = 0U;
+        groundCounts[down] = kInactiveSide;
+        const double weight = area(facet);
+        if (weight > 0.0) {
+            ground.sides.push_back(down ^ 1U);
+            weights.push_back(weight);
+            total += weight;
+        }
+    }
+    for (double weight : weights) ground.weights.push_back(static_cast<float>(weight / total));
+    diagnostics.groundFacets = facets - first;
+    diagnostics.inactiveGroundSides = facets - first;
+    double denominator = 0.0, escaped = 0.0, sky = 0.0, areaSum = 0.0, areaEscape = 0.0;
+    uint32_t escapeSides = 0U;
+    float maximum = 0.0f;
+    for (uint32_t side = 0; side < first * 2U; ++side) {
+        if (denominators[side] == 0U) continue;
+        const double fraction = double(groundCounts[side]) / denominators[side];
+        denominator += denominators[side];
+        escaped += groundCounts[side];
+        sky += skyCounts[side];
+        escapeSides += groundCounts[side] != 0U ? 1U : 0U;
+        maximum = std::max(maximum, static_cast<float>(fraction));
+        const double weight = area(side / 2U);
+        areaSum += weight;
+        areaEscape += weight * fraction;
+    }
+    double groundDenominator = 0.0, groundEscaped = 0.0;
+    for (uint32_t side : ground.sides) {
+        groundDenominator += denominators[side];
+        groundEscaped += groundCounts[side];
+    }
+    diagnostics.groundEscapeSides = escapeSides;
+    diagnostics.groundEscapeFraction = denominator > 0.0 ? float(escaped / denominator) : 0.0f;
+    diagnostics.groundEscapeAreaFraction = areaSum > 0.0 ? float(areaEscape / areaSum) : 0.0f;
+    diagnostics.groundEscapeMaxFraction = maximum;
+    diagnostics.groundEscapeGroundFraction =
+        groundDenominator > 0.0 ? float(groundEscaped / groundDenominator) : 0.0f;
+    diagnostics.skyFraction = denominator > 0.0 ? float(sky / denominator) : 0.0f;
+    return ground;
+}
+
+float groundBoundaryRadiosity(const GroundBoundary& ground, const std::vector<float>& radiosity, float skyRadiosity)
+{
+    if (ground.sides.empty()) return skyRadiosity;
+    double value = 0.0;
+    for (size_t i = 0; i < ground.sides.size(); ++i)
+        value += double(ground.weights[i]) * radiosity.at(ground.sides[i]);
+    return static_cast<float>(value);
+}
+
 FacetrtVulkan::~FacetrtVulkan()
 {
     destroy();
@@ -698,6 +774,8 @@ void FacetrtVulkan::createVisibilityResources()
                                  deviceStorage, deviceLocal);
     m_skyCounts = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(uint32_t),
                                deviceStorage, deviceLocal);
+    m_groundCounts = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(uint32_t),
+                                  deviceStorage, deviceLocal);
     m_visibilityStats = createBuffer(4U * sizeof(uint32_t), deviceStorage, deviceLocal);
     m_directTotal = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(uint32_t),
                                  deviceStorage, deviceLocal);
@@ -707,7 +785,7 @@ void FacetrtVulkan::createVisibilityResources()
 
 void FacetrtVulkan::createVisibilityDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
     for (uint32_t index = 0; index < bindings.size(); ++index) {
         bindings[index].binding = index;
         bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -744,11 +822,11 @@ void FacetrtVulkan::createVisibilityDescriptors()
     m_visibilityDescriptorSet = sets[0];
     m_directDescriptorSet = sets[1];
 
-    const std::array<Buffer*, 7> buffers{&m_fragments, &m_pixelCounts, &m_edgeKeys,
+    const std::array<Buffer*, 8> buffers{&m_fragments, &m_pixelCounts, &m_edgeKeys,
                                          &m_edgeCounts, &m_denominator, &m_skyCounts,
-                                         &m_visibilityStats};
-    std::array<VkDescriptorBufferInfo, 7> bufferInfos{};
-    std::array<VkWriteDescriptorSet, 7> writes{};
+                                         &m_visibilityStats, &m_groundCounts};
+    std::array<VkDescriptorBufferInfo, 8> bufferInfos{};
+    std::array<VkWriteDescriptorSet, 8> writes{};
     for (uint32_t index = 0; index < buffers.size(); ++index) {
         bufferInfos[index] = {buffers[index]->buffer, 0, buffers[index]->size};
         writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -761,11 +839,12 @@ void FacetrtVulkan::createVisibilityDescriptors()
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(),
                            0, nullptr);
 
-    const std::array<Buffer*, 7> directBuffers{&m_fragments, &m_pixelCounts, &m_edgeKeys,
+    const std::array<Buffer*, 8> directBuffers{&m_fragments, &m_pixelCounts, &m_edgeKeys,
                                                &m_edgeCounts, &m_directTotal,
-                                               &m_directVisible, &m_visibilityStats};
-    std::array<VkDescriptorBufferInfo, 7> directInfos{};
-    std::array<VkWriteDescriptorSet, 7> directWrites{};
+                                               &m_directVisible, &m_visibilityStats,
+                                               &m_groundCounts};
+    std::array<VkDescriptorBufferInfo, 8> directInfos{};
+    std::array<VkWriteDescriptorSet, 8> directWrites{};
     for (uint32_t index = 0; index < directBuffers.size(); ++index) {
         directInfos[index] = {directBuffers[index]->buffer, 0, directBuffers[index]->size};
         directWrites[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -918,6 +997,16 @@ void FacetrtVulkan::createSolveResources(uint32_t directedEdgeCount)
     m_radiosityB = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(float), usage, memory);
     m_residual = createBuffer(sizeof(uint32_t), usage, memory);
     m_incident = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(float), usage, memory);
+    const size_t groundSides = m_ground.sides.size();
+    m_groundSides = createBuffer(VkDeviceSize(std::max<size_t>(groundSides, 1U)) * sizeof(uint32_t), usage, memory);
+    m_groundWeights = createBuffer(VkDeviceSize(std::max<size_t>(groundSides, 1U)) * sizeof(float), usage, memory);
+    m_groundMean = createBuffer(4U * sizeof(float), usage, memory);
+    if (groundSides != 0U) {
+        uploadBuffer(m_groundSides, m_ground.sides.data(), groundSides * sizeof(uint32_t));
+        uploadBuffer(m_groundWeights, m_ground.weights.data(), groundSides * sizeof(float));
+    }
+    const std::array<float, 4> noGround{};
+    uploadBuffer(m_groundMean, noGround.data(), sizeof(noGround));
 
     uploadBuffer(m_rowOffsets, m_rowOffsetsCpu.data(),
                  m_rowOffsetsCpu.size() * sizeof(uint32_t));
@@ -931,7 +1020,7 @@ void FacetrtVulkan::createSolveResources(uint32_t directedEdgeCount)
 
 void FacetrtVulkan::createSolveDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 9> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 13> bindings{};
     for (uint32_t index = 0; index < bindings.size(); ++index) {
         bindings[index].binding = index;
         bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -960,11 +1049,13 @@ void FacetrtVulkan::createSolveDescriptors()
     require(vkAllocateDescriptorSets(m_device, &allocation, &m_solveDescriptorSet),
             "vkAllocateDescriptorSets(solve)");
 
-    const std::array<Buffer*, 9> buffers{&m_rowOffsets, &m_edges, &m_denominator,
-                                         &m_skyCounts, &m_optics, &m_radiosityA,
-                                         &m_radiosityB, &m_residual, &m_incident};
-    std::array<VkDescriptorBufferInfo, 9> infos{};
-    std::array<VkWriteDescriptorSet, 9> writes{};
+    const std::array<Buffer*, 13> buffers{&m_rowOffsets, &m_edges, &m_denominator,
+                                          &m_skyCounts, &m_optics, &m_radiosityA,
+                                          &m_radiosityB, &m_residual, &m_incident,
+                                          &m_groundCounts, &m_groundSides, &m_groundWeights,
+                                          &m_groundMean};
+    std::array<VkDescriptorBufferInfo, 13> infos{};
+    std::array<VkWriteDescriptorSet, 13> writes{};
     for (uint32_t index = 0; index < buffers.size(); ++index) {
         infos[index] = {buffers[index]->buffer, 0, buffers[index]->size};
         writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1001,6 +1092,19 @@ void FacetrtVulkan::createSolvePipeline()
         require(vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &info, nullptr,
                                          &m_solvePipeline),
                 "vkCreateComputePipelines(radiosity)");
+    }
+    {
+        const VkShaderModule groundModule = loadShader("ground_mean.comp.spv");
+        const ShaderModuleGuard guard{m_device, groundModule};
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        info.stage.module = groundModule;
+        info.stage.pName = "main";
+        info.layout = m_solvePipelineLayout;
+        require(vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &info, nullptr,
+                                         &m_groundPipeline),
+                "vkCreateComputePipelines(ground_mean)");
     }
     if (m_shaderFloat64) {
         {
@@ -1067,6 +1171,7 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     vkCmdFillBuffer(commandBuffer, m_edgeCounts.buffer, 0, m_edgeCounts.size, 0U);
     vkCmdFillBuffer(commandBuffer, m_denominator.buffer, 0, m_denominator.size, 0U);
     vkCmdFillBuffer(commandBuffer, m_skyCounts.buffer, 0, m_skyCounts.size, 0U);
+    vkCmdFillBuffer(commandBuffer, m_groundCounts.buffer, 0, m_groundCounts.size, 0U);
     vkCmdFillBuffer(commandBuffer, m_visibilityStats.buffer, 0, m_visibilityStats.size, 0U);
 
     VkMemoryBarrier transferToShader{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1168,6 +1273,9 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
                    m_denominatorCpu.size() * sizeof(uint32_t));
     downloadBuffer(m_skyCounts, m_skyCountsCpu.data(),
                    m_skyCountsCpu.size() * sizeof(uint32_t));
+    m_groundCountsCpu.resize(surfaceCount());
+    downloadBuffer(m_groundCounts, m_groundCountsCpu.data(),
+                   m_groundCountsCpu.size() * sizeof(uint32_t));
     downloadBuffer(m_visibilityStats, statistics.data(), sizeof(statistics));
 
     GraphDiagnostics diagnostics{};
@@ -1222,10 +1330,23 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     diagnostics.directedEdgeCount = static_cast<uint32_t>(m_edgesCpu.size());
     if (std::none_of(m_denominatorCpu.begin(), m_denominatorCpu.end(), [](uint32_t n){return n>0;}))
         throw std::runtime_error("Visibility raster has no surface samples; radiation results are invalid");
+    // Lower boundary: downward escapes see the equivalent ground and the
+    // soil-facing ground sides leave the solve. The adjusted counts replace
+    // the device copies the solve descriptors read.
+    m_ground = applyGroundBoundary(m_geometry, m_firstGroundFacet, m_denominatorCpu,
+                                   m_skyCountsCpu, m_groundCountsCpu, diagnostics);
+    // Without any downward escape the per-sweep reduction is skipped: the
+    // sweeps are then exactly those of a scene without a lower boundary.
+    m_groundUsed = std::any_of(m_groundCountsCpu.begin(), m_groundCountsCpu.end(),
+                               [](uint32_t n) { return n != 0U && n != kInactiveSide; });
+    uploadBuffer(m_denominator, m_denominatorCpu.data(), m_denominatorCpu.size() * sizeof(uint32_t));
+    uploadBuffer(m_skyCounts, m_skyCountsCpu.data(), m_skyCountsCpu.size() * sizeof(uint32_t));
+    uploadBuffer(m_groundCounts, m_groundCountsCpu.data(), m_groundCountsCpu.size() * sizeof(uint32_t));
 
     float maxClosureError = 0.0f;
     for (uint32_t side = 0; side < surfaceCount(); ++side) {
-        uint64_t visibleCount = m_skyCountsCpu[side];
+        if (m_groundCountsCpu[side] == kInactiveSide) continue;
+        uint64_t visibleCount = uint64_t(m_skyCountsCpu[side]) + m_groundCountsCpu[side];
         for (uint32_t index = m_rowOffsetsCpu[side];
              index < m_rowOffsetsCpu[side + 1U]; ++index) {
             visibleCount += m_edgesCpu[index].count;
@@ -1440,6 +1561,8 @@ uint32_t FacetrtVulkan::recordIterations(VkCommandBuffer commandBuffer, uint32_t
         vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
                              &residualClear, 0, nullptr, 0, nullptr);
 
+        // The equivalent ground follows the iterate (Jacobi-consistent).
+        if (m_groundUsed) recordGroundMean(commandBuffer, ping, skyRadiosity);
         const SolvePush push{m_facetCount, ping, skyRadiosity, relaxation};
         vkCmdPushConstants(commandBuffer, m_solvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         if (indirect) vkCmdDispatchIndirect(commandBuffer, m_spectralDispatch.buffer, 0);
@@ -1470,8 +1593,37 @@ void FacetrtVulkan::computeBarrier(VkCommandBuffer commandBuffer) const
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+void FacetrtVulkan::recordGroundMean(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity)
+{
+    SolvePush push{m_facetCount, ping, skyRadiosity, 1.0f};
+    push.groundSideCount = static_cast<uint32_t>(m_ground.sides.size());
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_groundPipeline);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_solvePipelineLayout, 0, 1,
+                            &m_solveDescriptorSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, m_solvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(commandBuffer, 1, 1, 1);
+    VkMemoryBarrier meanBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    meanBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    meanBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                         &meanBarrier, 0, nullptr, 0, nullptr);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_solvePipeline);
+}
+
+float FacetrtVulkan::groundRadiosity() const
+{
+    if (m_groundMean.buffer == VK_NULL_HANDLE) return 0.0f;
+    float value = 0.0f;
+    downloadBuffer(m_groundMean, &value, sizeof(value));
+    return value;
+}
+
 void FacetrtVulkan::recordIncident(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity)
 {
+    // Final equivalent ground of this solve (incident pass and diagnostics).
+    computeBarrier(commandBuffer);
+    recordGroundMean(commandBuffer, ping, skyRadiosity);
     if (m_incidentPipeline == VK_NULL_HANDLE)
         return;
     computeBarrier(commandBuffer);
@@ -1685,6 +1837,7 @@ EnergySnapshot FacetrtVulkan::readEnergyState(bool includeRadiation)
         downloadBuffer(m_residual, &delta, sizeof(delta));
         std::memcpy(&result.radiation.maxDelta, &delta, sizeof(delta));
         result.radiation.iterations = m_energyIterations;
+        result.radiation.groundRadiosity = groundRadiosity();
     }
     return result;
 }
@@ -1722,6 +1875,7 @@ SolveResult FacetrtVulkan::solve(const std::vector<SurfaceOptics> &optics, float
         result.incident.resize(surfaceCount());
         downloadBuffer(m_incident, result.incident.data(), result.incident.size() * sizeof(float));
     }
+    result.groundRadiosity = groundRadiosity();
     return result;
 }
 
@@ -1783,42 +1937,7 @@ SolveResult FacetrtVulkan::solveAccelerated(
         const uint32_t count = std::min(
             batchIterations, maximumIterations - result.iterations);
         VkCommandBuffer commandBuffer = beginCommands();
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          m_solvePipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                m_solvePipelineLayout, 0, 1,
-                                &m_solveDescriptorSet, 0, nullptr);
-        for (uint32_t iteration = 0; iteration < count; ++iteration) {
-            vkCmdFillBuffer(commandBuffer, m_residual.buffer, 0,
-                            sizeof(uint32_t), 0U);
-            VkMemoryBarrier residualClear{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            residualClear.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            residualClear.dstAccessMask =
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                                 1, &residualClear, 0, nullptr, 0, nullptr);
-
-            const SolvePush push{
-                m_facetCount, ping, skyRadiosity, relaxation};
-            vkCmdPushConstants(commandBuffer, m_solvePipelineLayout,
-                               VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                               sizeof(push), &push);
-            vkCmdDispatch(commandBuffer, (m_facetCount + 63U) / 64U, 1, 1);
-
-            VkMemoryBarrier iterationBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            iterationBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            iterationBarrier.dstAccessMask =
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
-                VK_ACCESS_TRANSFER_READ_BIT;
-            vkCmdPipelineBarrier(commandBuffer,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 1, &iterationBarrier,
-                                 0, nullptr, 0, nullptr);
-            ping ^= 1U;
-        }
+        ping = recordIterations(commandBuffer, ping, skyRadiosity, count, relaxation);
         endCommands(commandBuffer);
         result.iterations += count;
 
@@ -1841,6 +1960,7 @@ SolveResult FacetrtVulkan::solveAccelerated(
         result.incident.resize(surfaceCount());
         downloadBuffer(m_incident, result.incident.data(), m_incident.size);
     }
+    result.groundRadiosity = groundRadiosity();
     return result;
 }
 
@@ -1864,12 +1984,18 @@ std::vector<float> FacetrtVulkan::incidentIrradiance(
 
     if (solution.incident.size() == surfaceCount()) return solution.incident;
     std::vector<float> irradiance(surfaceCount(), 0.0f);
+    const double groundValue = groundBoundaryRadiosity(m_ground, solution.radiosity, skyRadiosity);
     for (uint32_t side = 0; side < surfaceCount(); ++side) {
+        if (m_groundCountsCpu[side] == kInactiveSide) {
+            irradiance[side] = std::max(0.0f, optics[side].directIrradiance);
+            continue;
+        }
         double diffuse = skyRadiosity;
         const uint32_t denominator = m_denominatorCpu[side];
         if (denominator != 0U) {
             diffuse = static_cast<double>(m_skyCountsCpu[side]) *
-                      static_cast<double>(skyRadiosity);
+                      static_cast<double>(skyRadiosity) +
+                      static_cast<double>(m_groundCountsCpu[side]) * groundValue;
             for (uint32_t edgeIndex = m_rowOffsetsCpu[side];
                  edgeIndex < m_rowOffsetsCpu[side + 1U]; ++edgeIndex) {
                 const CsrEdge& edge = m_edgesCpu[edgeIndex];
@@ -2020,6 +2146,7 @@ SolveResult FacetrtVulkan::solveSpectralBand(uint32_t band, bool thermal, float 
     if (accelerated) std::memcpy(&result.iterations, mapped, sizeof(uint32_t));
     std::memcpy(&result.maxDelta, static_cast<const char*>(mapped) + sizeof(uint32_t), sizeof(float));
     vkUnmapMemory(m_device, m_spectralConvergence.memory);
+    result.groundRadiosity = groundRadiosity();
     return result;
 }
 
@@ -2074,6 +2201,11 @@ void FacetrtVulkan::destroySolveResources()
     if (m_incidentPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_incidentPipeline, nullptr);
     m_incidentPipeline = VK_NULL_HANDLE;
     destroyBuffer(m_incident);
+    if (m_groundPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_groundPipeline, nullptr);
+    m_groundPipeline = VK_NULL_HANDLE;
+    destroyBuffer(m_groundSides);
+    destroyBuffer(m_groundWeights);
+    destroyBuffer(m_groundMean);
     if (m_solvePipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(m_device, m_solvePipeline, nullptr);
     }
@@ -2147,11 +2279,13 @@ void FacetrtVulkan::destroyVisibilityResources()
     destroyBuffer(m_edgeCounts);
     destroyBuffer(m_denominator);
     destroyBuffer(m_skyCounts);
+    destroyBuffer(m_groundCounts);
     destroyBuffer(m_visibilityStats);
     destroyBuffer(m_directTotal);
     destroyBuffer(m_directVisible);
     m_denominatorCpu.clear();
     m_skyCountsCpu.clear();
+    m_groundCountsCpu.clear();
 }
 
 void FacetrtVulkan::destroy()

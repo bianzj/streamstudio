@@ -33,6 +33,12 @@ layout(std430, set = 0, binding = 5) buffer SkyCounts {
 layout(std430, set = 0, binding = 6) buffer Statistics {
     uint statistics[];
 };
+// Downward escapes: the line leaves the scene below the last fragment, so its
+// back side looks into the lower hemisphere. Those directions see the lower
+// boundary (the equivalent ground), not the sky.
+layout(std430, set = 0, binding = 7) buffer GroundCounts {
+    uint groundCounts[];
+};
 
 layout(push_constant) uniform VisibilityPush {
     mat4 viewProjection;
@@ -128,7 +134,7 @@ void main()
     if (centralWeight(localRecords[0]) != 0u)
         atomicAdd(skyCounts[sideOf(localRecords[0])], 2u);
     if (centralWeight(localRecords[count - 1u]) != 0u)
-        atomicAdd(skyCounts[sideOf(localRecords[count - 1u]) ^ 1u], 2u);
+        atomicAdd(groundCounts[sideOf(localRecords[count - 1u]) ^ 1u], 2u);
 
     for (uint i = 0u; i + 1u < count; ++i) {
         const uint nearBackSide = sideOf(localRecords[i]) ^ 1u;

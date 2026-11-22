@@ -1,0 +1,41 @@
+#version 460
+// Equivalent-ground radiosity for downward escapes: the area-weighted mean
+// radiosity of the upward ground sides of the current Jacobi iterate. One
+// workgroup; weights are normalized on the host (sum = 1). Fixed reduction
+// order, so repeated runs are bitwise identical.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(std430, set = 0, binding = 5) readonly buffer RadiosityA { float radiosityA[]; };
+layout(std430, set = 0, binding = 6) readonly buffer RadiosityB { float radiosityB[]; };
+layout(std430, set = 0, binding = 10) readonly buffer GroundSides { uint groundSides[]; };
+layout(std430, set = 0, binding = 11) readonly buffer GroundWeights { float groundWeights[]; };
+layout(std430, set = 0, binding = 12) writeonly buffer GroundMean { float groundMean[]; };
+layout(push_constant) uniform SolvePush {
+    uint facetCount;
+    uint ping;
+    float skyRadiosity;
+    float relaxation;
+    uint groundSideCount;
+} pc;
+
+shared float partial[256];
+
+void main()
+{
+    const uint thread = gl_LocalInvocationID.x;
+    float sum = 0.0;
+    for (uint i = thread; i < pc.groundSideCount; i += 256u) {
+        const uint side = groundSides[i];
+        sum += groundWeights[i] * (pc.ping == 0u ? radiosityA[side] : radiosityB[side]);
+    }
+    partial[thread] = sum;
+    memoryBarrierShared();
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (thread < stride) partial[thread] += partial[thread + stride];
+        memoryBarrierShared();
+        barrier();
+    }
+    // Without ground facets (not produced by the scene loaders) the lower
+    // boundary falls back to the sky value, the historical behaviour.
+    if (thread == 0u) groundMean[0] = pc.groundSideCount == 0u ? pc.skyRadiosity : partial[0];
+}

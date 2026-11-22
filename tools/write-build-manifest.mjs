@@ -42,7 +42,7 @@ const sources = [...new Set(sourceFiles)]
 // separately as staleShaderBinaries so "manifest matches" means "built from
 // the current sources" and nothing else.
 const shaderSourceRoot = path.join(root, 'models/histream/shader')
-const facetShaders = ['visibility.vert', 'visibility.frag', 'visibility_resolve.comp', 'direct_resolve.comp', 'radiosity.comp', 'incident.comp']
+const facetShaders = ['visibility.vert', 'visibility.frag', 'visibility_resolve.comp', 'direct_resolve.comp', 'radiosity.comp', 'ground_mean.comp', 'incident.comp']
 const builtShaderModules = new Set([
   ...['offline.rgen', 'closestHit.rchit', 'rmiss.rmiss', 'shadow.rmiss'].map(file => `raytracing/${file}.spv`),
   ...[...facetShaders, 'spectral.comp'].map(file => `facetrt/${file}.spv`),

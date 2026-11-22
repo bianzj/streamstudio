@@ -81,7 +81,41 @@ struct GraphDiagnostics
     uint32_t fragmentOverflow{};
     uint32_t hashOverflow{};
     float maxClosureError{};
+    // Lower boundary (applyGroundBoundary). Fractions are visibility samples
+    // (facet x direction) of receiving object sides; the soil-facing back sides
+    // of ground facets are excluded from every denominator.
+    uint32_t groundFacets{};
+    uint32_t inactiveGroundSides{};
+    uint32_t groundEscapeSides{};       // object sides with any downward escape
+    float groundEscapeFraction{};       // sum(ground) / sum(denominator), object sides
+    float groundEscapeAreaFraction{};   // area-weighted mean per-side fraction
+    float groundEscapeMaxFraction{};    // largest per-side fraction
+    float groundEscapeGroundFraction{}; // same for the upward ground sides
+    float skyFraction{};                // sum(sky) / sum(denominator), object sides
 };
+
+// Marks a side that is not a receiving surface (the soil-facing back side of a
+// ground facet) in the ground-count array: no sky, no ground, no exchange.
+constexpr uint32_t kInactiveSide = 0xffffffffU;
+
+// Lower boundary of the visibility graph. Downward lines that leave the scene
+// without a hit see the "equivalent ground": the area-weighted mean radiosity of
+// the upward ground sides (weights sum to 1).
+struct GroundBoundary
+{
+    std::vector<uint32_t> sides;
+    std::vector<float> weights;
+};
+
+// Applies the lower boundary to a freshly resolved graph: facets from
+// firstGroundFacet on are ground; their side facing down (by the facet normal)
+// becomes inactive, the other side contributes to the equivalent ground.
+// Fills the ground-escape diagnostics.
+GroundBoundary applyGroundBoundary(const std::vector<Vertex> &vertices, uint32_t firstGroundFacet,
+                                   std::vector<uint32_t> &denominators, std::vector<uint32_t> &skyCounts,
+                                   std::vector<uint32_t> &groundCounts, GraphDiagnostics &diagnostics);
+// Equivalent-ground radiosity of a solution (sky value without ground sides).
+float groundBoundaryRadiosity(const GroundBoundary &ground, const std::vector<float> &radiosity, float skyRadiosity);
 
 struct SolveResult
 {
@@ -90,6 +124,8 @@ struct SolveResult
     float maxDelta{};
     // Irradiance computed from the same optics/state, without a CPU CSR walk.
     std::vector<float> incident;
+    // Equivalent-ground radiosity seen by downward escapes in the final state.
+    float groundRadiosity{};
 };
 
 struct EnergyPush
@@ -150,6 +186,14 @@ class FacetrtVulkan
 
     void initialize(const Config &config, const std::string &shaderDirectory);
     void setGeometry(const std::vector<Vertex> &vertices);
+    // Facets from firstGroundFacet on are the scene ground (lower boundary);
+    // call before buildVisibilityGraph. Default: no ground facets.
+    void setGroundFacets(uint32_t firstGroundFacet)
+    {
+        m_firstGroundFacet = firstGroundFacet;
+    }
+    // Equivalent-ground radiosity of the last recorded solve or incident pass.
+    [[nodiscard]] float groundRadiosity() const;
     // Grows the edge hash table and rebuilds when it overflows.
     GraphDiagnostics buildVisibilityGraph(const std::vector<Direction> &directions);
 
@@ -234,6 +278,8 @@ class FacetrtVulkan
         uint32_t ping{};
         float skyRadiosity{};
         float relaxation{1.0f};
+        uint32_t groundSideCount{};
+        uint32_t reserved[3]{};
     };
 
     void createContext();
@@ -250,6 +296,9 @@ class FacetrtVulkan
     uint32_t recordIterations(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity,
                               uint32_t iterations, float relaxation, bool indirect = false);
     void recordIncident(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity);
+    // Equivalent-ground reduction of the iterate in buffer `ping`; leaves the
+    // radiosity pipeline bound.
+    void recordGroundMean(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity);
     void recordEnergy(VkCommandBuffer commandBuffer, uint32_t phase);
     void computeBarrier(VkCommandBuffer commandBuffer) const;
     void recordSpectral(VkCommandBuffer commandBuffer, const SpectralPush &push);
@@ -314,6 +363,7 @@ class FacetrtVulkan
     Buffer m_edgeCounts;
     Buffer m_denominator;
     Buffer m_skyCounts;
+    Buffer m_groundCounts;
     Buffer m_visibilityStats;
 
     VkDescriptorSetLayout m_visibilitySetLayout{VK_NULL_HANDLE};
@@ -333,6 +383,10 @@ class FacetrtVulkan
     VkPipeline m_directResolvePipeline{VK_NULL_HANDLE};
     std::vector<uint32_t> m_denominatorCpu;
     std::vector<uint32_t> m_skyCountsCpu;
+    std::vector<uint32_t> m_groundCountsCpu;
+    GroundBoundary m_ground;
+    uint32_t m_firstGroundFacet{0xffffffffU};
+    bool m_groundUsed{false};
 
     Buffer m_rowOffsets;
     Buffer m_edges;
@@ -340,6 +394,10 @@ class FacetrtVulkan
     Buffer m_radiosityA;
     Buffer m_radiosityB;
     Buffer m_residual;
+    Buffer m_groundSides;
+    Buffer m_groundWeights;
+    Buffer m_groundMean;
+    VkPipeline m_groundPipeline{VK_NULL_HANDLE};
 
     VkDescriptorSetLayout m_solveSetLayout{VK_NULL_HANDLE};
     VkDescriptorPool m_solveDescriptorPool{VK_NULL_HANDLE};

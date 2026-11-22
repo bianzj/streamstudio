@@ -11,12 +11,18 @@ layout(std430,binding=4) readonly buffer Optical { SurfaceOptics optics[]; };
 layout(std430,binding=5) readonly buffer RadiosityA { float A[]; };
 layout(std430,binding=6) readonly buffer RadiosityB { float B[]; };
 layout(std430,binding=8) writeonly buffer Incident { float H[]; };
+layout(std430,binding=9) readonly buffer GroundCounts { uint groundCounts[]; };
+layout(std430,binding=12) readonly buffer GroundMean { float groundMean[]; };
 layout(push_constant) uniform Push { uint facets,ping;float skyRadiosity,relaxation; } pc;
+const uint INACTIVE_SIDE=0xffffffffu;
 void main() {
     uint s=gl_GlobalInvocationID.x; if(s>=2u*pc.facets) return;
+    // Soil-facing back side of a ground facet: not a receiving surface.
+    if(groundCounts[s]==INACTIVE_SIDE) { H[s]=max(0.0,optics[s].directIrradiance); return; }
     double v=double(pc.skyRadiosity);
     if(denom[s]!=0u) {
         v=double(sky[s])*double(pc.skyRadiosity);
+        if(groundCounts[s]!=0u) v+=double(groundCounts[s])*double(groundMean[0]);
         for(uint k=rows[s];k<rows[s+1u];++k) v+=double(edges[k].count)*double(pc.ping==0u?A[edges[k].neighbor]:B[edges[k].neighbor]);
         v/=double(denom[s]);
     }

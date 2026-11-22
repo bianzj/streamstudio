@@ -219,6 +219,7 @@ if (HISTREAM_ENABLE_FACET)
             visibility_resolve.comp
             direct_resolve.comp
             radiosity.comp
+            ground_mean.comp
             incident.comp)
     foreach (FACET_KIND IN ITEMS facetrt faceteb)
         set(FACET_KIND_SHADER_FILES ${HISTREAM_FACET_SHADER_FILES})

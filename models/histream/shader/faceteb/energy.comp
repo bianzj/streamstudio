@@ -41,6 +41,9 @@ void main() {
                 float next=temp+(leaf?F[j+9u]:pc.relax*(candidate-temp));
                 maximum(4u,abs(next-temp)); T[k]=next; if(object) T[k+1u]=next;
             }
+            // The soil-facing back side of a ground facet is not an energy
+            // balance surface: it carries the temperature of the upper side.
+            if(!object&&P[p+27u]>0.5) { uint down=uint(P[p+27u]+0.5)-1u; T[index+down]=T[index+(down^1u)]; }
             continue;
         }
         float net[2];
@@ -91,6 +94,8 @@ void main() {
             }
         } else {
             for(uint side=0u;side<2u;++side) {
+                // Back side of a ground facet: no fluxes (zeroed above).
+                if(P[p+27u]>0.5&&side==uint(P[p+27u]+0.5)-1u) continue;
                 uint k=index+side,j=k*12u;float temp=T[k],rb=I[j+5u],conductance=pc.rho*1005.0/rb;
                 F[j]=net[side]; F[j+1u]=conductance*(temp-pc.air); F[j+2u]=conductance;
                 F[j+3u]=P[p+8u]>.5?0.0:latent(temp,rb,P[p+7u]);

@@ -28,6 +28,9 @@ export const CASES = {
   feb_crop: { example: 'crop_gpp_npp', mode: 'eFacetEB', meteo: [23, 25] },
   frt_crop: { example: 'crop_gpp_npp', mode: 'eFacetRT' },
   frt_crop_periodic: { example: 'crop_gpp_npp', mode: 'eFacetRT', set: { 'configuration.control.periodicTraversalCount': 8 } },
+  // FacetEB without boundary effects: the reference for the outer plants of
+  // feb_crop (lower boundary / downward escapes, edge-versus-centre leaves).
+  feb_crop_periodic: { example: 'crop_gpp_npp', mode: 'eFacetEB', meteo: [23, 25], set: PERIODIC_8 },
   rt_urban: { example: 'urban_block', mode: 'eRaytracing' },
   rt_forest: { example: 'forest', mode: 'eRaytracing' },
   rt_crop: { example: 'crop_gpp_npp', mode: 'eRaytracing' },

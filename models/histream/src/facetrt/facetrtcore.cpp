@@ -303,11 +303,36 @@ bool growCpuRasterLayers(Scene& scene)
     return true;
 }
 
+// Lower-boundary (downward escape) diagnostics of a visibility graph.
+ProjectJson::Json groundEscapeJson(const facetvk::GraphDiagnostics& graph)
+{
+    return {{"groundFacets", graph.groundFacets},
+            {"inactiveGroundSides", graph.inactiveGroundSides},
+            {"groundEscapeSides", graph.groundEscapeSides},
+            {"groundEscapeFraction", graph.groundEscapeFraction},
+            {"groundEscapeAreaFraction", graph.groundEscapeAreaFraction},
+            {"groundEscapeMaxFraction", graph.groundEscapeMaxFraction},
+            {"groundEscapeGroundFraction", graph.groundEscapeGroundFraction},
+            {"objectSkyFraction", graph.skyFraction}};
+}
+
+std::string groundEscapeLog(const facetvk::GraphDiagnostics& graph)
+{
+    std::ostringstream text;
+    text << std::setprecision(4) << "下边界：物体侧向下逃逸 " << 100.0 * graph.groundEscapeFraction
+         << "%（面积加权 " << 100.0 * graph.groundEscapeAreaFraction << "%，单侧最大 "
+         << 100.0 * graph.groundEscapeMaxFraction << "%，" << graph.groundEscapeSides
+         << " 侧），按等效地面计；地面背面 " << graph.inactiveGroundSides << " 侧不参与求解";
+    return text.str();
+}
+
 struct CpuGraph {
     std::vector<uint32_t> rowOffsets;
     std::vector<Edge> edges;
     std::vector<uint32_t> denominators;
     std::vector<uint32_t> skyCounts;
+    std::vector<uint32_t> groundCounts;
+    facetvk::GroundBoundary ground;
     facetvk::GraphDiagnostics diagnostics;
 };
 
@@ -1880,6 +1905,7 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
     CpuGraph graph;
     std::unique_ptr<std::atomic<uint32_t>[]> denominators(new std::atomic<uint32_t>[surfaceCount]());
     std::unique_ptr<std::atomic<uint32_t>[]> skyCounts(new std::atomic<uint32_t>[surfaceCount]());
+    std::unique_ptr<std::atomic<uint32_t>[]> groundCounts(new std::atomic<uint32_t>[surfaceCount]());
     using EdgeMap = std::unordered_map<uint64_t, uint32_t>;
     // Thread maps hold one direction only and are folded into key-sharded totals after
     // each direction, so peak memory does not grow with the thread count.
@@ -1919,8 +1945,9 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
             }
             if (local.front().central)
                 skyCounts[local.front().cameraSide].fetch_add(2U, std::memory_order_relaxed);
+            // Downward escape: the lower boundary, not the sky.
             if (local.back().central)
-                skyCounts[local.back().cameraSide ^ 1U].fetch_add(2U, std::memory_order_relaxed);
+                groundCounts[local.back().cameraSide ^ 1U].fetch_add(2U, std::memory_order_relaxed);
             for (uint32_t i = 0; i + 1U < count; ++i) {
                 const uint32_t sideA = local[i].cameraSide ^ 1U;
                 const uint32_t sideB = local[i + 1U].cameraSide;
@@ -1955,10 +1982,14 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
 
     graph.denominators.resize(surfaceCount);
     graph.skyCounts.resize(surfaceCount);
+    graph.groundCounts.resize(surfaceCount);
     for (uint32_t side = 0; side < surfaceCount; ++side) {
         graph.denominators[side] = denominators[side].load();
         graph.skyCounts[side] = skyCounts[side].load();
+        graph.groundCounts[side] = groundCounts[side].load();
     }
+    graph.ground = facetvk::applyGroundBoundary(scene.vertices, scene.leafFacetCount, graph.denominators,
+                                                graph.skyCounts, graph.groundCounts, graph.diagnostics);
     size_t edgeTotal = 0;
     for (const EdgeMap& shard : mergedShards) edgeTotal += shard.size();
     std::vector<std::pair<uint64_t, uint32_t>> edgeCounts;
@@ -1987,7 +2018,8 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
 
     float closureError = 0.0f;
     for (uint32_t side = 0; side < surfaceCount; ++side) {
-        uint64_t visible = graph.skyCounts[side];
+        if (graph.groundCounts[side] == facetvk::kInactiveSide) continue;
+        uint64_t visible = uint64_t(graph.skyCounts[side]) + graph.groundCounts[side];
         for (uint32_t edgeIndex = graph.rowOffsets[side];
              edgeIndex < graph.rowOffsets[side + 1U]; ++edgeIndex) {
             visible += graph.edges[edgeIndex].count;
@@ -2148,7 +2180,10 @@ facetvk::SolveResult solveCpu(const CpuGraph& graph,
     maximumIterations = std::max(1U, maximumIterations);
     relaxation = std::clamp(relaxation, 0.01f, 1.0f);
 
+    float groundValue = skyRadiosity;
     auto incoming = [&](uint32_t side) {
+        const uint32_t ground = graph.groundCounts[side];
+        if (ground == facetvk::kInactiveSide) return 0.0f;
         const uint32_t denominator = graph.denominators[side];
         // DEFERRED[中] 物理: 没有任何栅格样本的面（亚像素小面元，冠层中很常见）被当作完全开阔、只接收天空辐射，冠层内部会系统性高估入射与吸收（长波同理）；建议：统计并报告此类面数量，用邻近面/空间单元的平均可见性估计，类似 fillUnsampledSunlit。
         if (denominator == 0U) {
@@ -2156,6 +2191,7 @@ facetvk::SolveResult solveCpu(const CpuGraph& graph,
         }
         double value = static_cast<double>(graph.skyCounts[side]) *
                        skyRadiosity;
+        if (ground != 0U) value += static_cast<double>(ground) * groundValue;
         for (uint32_t edgeIndex = graph.rowOffsets[side];
              edgeIndex < graph.rowOffsets[side + 1U]; ++edgeIndex) {
             const Edge& edge = graph.edges[edgeIndex];
@@ -2168,6 +2204,8 @@ facetvk::SolveResult solveCpu(const CpuGraph& graph,
     const size_t facetCount = surfaceCount / 2U;
     std::vector<float> chunkDelta((facetCount + kFacetGrain - 1U) / kFacetGrain, 0.0f);
     for (uint32_t iteration = 0; iteration < maximumIterations; ++iteration) {
+        // Equivalent ground of the current iterate, as ground_mean.comp.
+        groundValue = facetvk::groundBoundaryRadiosity(graph.ground, current, skyRadiosity);
         parallelRanges(facetCount, kFacetGrain, [&](size_t begin, size_t end) {
         float delta = 0.0f;
         for (uint32_t facet = static_cast<uint32_t>(begin); facet < end; ++facet) {
@@ -2195,7 +2233,9 @@ facetvk::SolveResult solveCpu(const CpuGraph& graph,
                          std::to_string(maximumIterations));
         }
     }
-    return {std::move(current), maximumIterations, maxDelta};
+    facetvk::SolveResult result{std::move(current), maximumIterations, maxDelta};
+    result.groundRadiosity = facetvk::groundBoundaryRadiosity(graph.ground, result.radiosity, skyRadiosity);
+    return result;
 }
 
 std::vector<float> incidentIrradianceCpu(
@@ -2209,12 +2249,18 @@ std::vector<float> incidentIrradianceCpu(
         throw std::invalid_argument("CPU incident irradiance input size mismatch");
     }
     std::vector<float> irradiance(surfaceCount, 0.0f);
+    const double groundValue = facetvk::groundBoundaryRadiosity(graph.ground, solution.radiosity, skyRadiosity);
     parallelRanges(surfaceCount, 4096U, [&](size_t begin, size_t end) {
     for (uint32_t side = static_cast<uint32_t>(begin); side < end; ++side) {
+        if (graph.groundCounts[side] == facetvk::kInactiveSide) {
+            irradiance[side] = std::max(0.0f, optics[side].directIrradiance);
+            continue;
+        }
         double diffuse = skyRadiosity;
         const uint32_t denominator = graph.denominators[side];
         if (denominator != 0U) {
-            diffuse = static_cast<double>(graph.skyCounts[side]) * skyRadiosity;
+            diffuse = static_cast<double>(graph.skyCounts[side]) * skyRadiosity +
+                static_cast<double>(graph.groundCounts[side]) * groundValue;
             for (uint32_t edgeIndex = graph.rowOffsets[side];
                  edgeIndex < graph.rowOffsets[side + 1U]; ++edgeIndex) {
                 const Edge& edge = graph.edges[edgeIndex];
@@ -2406,6 +2452,7 @@ RunResult runGpu(const Scene& scene,
     facetvk::FacetrtVulkan model;
     model.initialize(config, shaderDirectory);
     model.setGeometry(scene.vertices);
+    model.setGroundFacets(scene.leafFacetCount);
 
     progress(10, "GPU visibility graph: 40 directions at " +
                      std::to_string(scene.visibilityRasterSize) + " x " +
@@ -2413,6 +2460,7 @@ RunResult runGpu(const Scene& scene,
     const auto visibilityBegin = Clock::now();
     result.graph = model.buildVisibilityGraph(makeHemisphereDirections());
     const auto visibilityEnd = Clock::now();
+    progress(70, groundEscapeLog(result.graph));
     result.visibilityMs = milliseconds(visibilityBegin, visibilityEnd);
 
     progress(72, "GPU sunlight visibility raster");
@@ -2602,7 +2650,8 @@ void writeWebResult(const std::string& fileName,
            << "\"directedEdges\":" << result.graph.directedEdgeCount << ","
            << "\"closureError\":" << result.graph.maxClosureError << ","
            << "\"fragmentOverflow\":" << result.graph.fragmentOverflow << ","
-           << "\"hashOverflow\":" << result.graph.hashOverflow << "},\n"
+           << "\"hashOverflow\":" << result.graph.hashOverflow << ","
+           << "\"lowerBoundary\":" << groundEscapeJson(result.graph).dump() << "},\n"
            << "  \"timing\": {"
            << "\"totalMs\":" << result.totalMs << ","
            << "\"visibilityMs\":" << result.visibilityMs << ","
@@ -4496,6 +4545,7 @@ try {
         try {
             model.initialize(config, shaderDirectory);
             model.setGeometry(scene.vertices);
+            model.setGroundFacets(scene.leafFacetCount);
             std::cout << "PROGRESS\t10\t构建共享面元可见性图" << std::endl;
             graph = model.buildVisibilityGraph(makeHemisphereDirections());
         } catch (const std::exception& gpuError) {
@@ -4505,6 +4555,7 @@ try {
             buildCpuBackend();
         }
     }
+    std::cout << "PROGRESS\t10\t" << groundEscapeLog(graph) << std::endl;
     const auto solveRadiation = [&](const std::vector<facetvk::SurfaceOptics>& optics,
                                     float skyRadiosity,
                                     uint32_t iterations,
@@ -4705,6 +4756,12 @@ try {
     runIndex.write();
     const size_t firstGroundSide = static_cast<size_t>(scene.leafFacetCount) * 2U;
     const size_t groundSides = surfaceCount - firstGroundSide;
+    // The soil-facing side of a ground facet (normal pointing down, as in
+    // facetvk::applyGroundBoundary) is not an energy-balance surface: it has
+    // no fluxes and carries the temperature of the upper side.
+    const auto groundDownSide = [&](uint32_t facet) -> uint32_t {
+        return scene.vertices[size_t(facet) * 3U].normal[1] >= 0.0f ? 1U : 0U;
+    };
     std::array<std::vector<facetphysics::SoilProfile>, 2> soilProfiles{
         std::vector<facetphysics::SoilProfile>(groundSides), std::vector<facetphysics::SoilProfile>(groundSides)};
     std::vector<double> soilBottomTemperature(groundSides);
@@ -4843,6 +4900,10 @@ try {
             } else {
                 sunlitPart[side0] = std::clamp(sunlit[side0], 0.0f, 1.0f);
                 sunlitPart[side0 + 1U] = std::clamp(sunlit[side0 + 1U], 0.0f, 1.0f);
+                // The soil-facing side mirrors the upper side's states, so it
+                // also takes its sunlit part (same mean temperature on output).
+                const size_t down = side0 + groundDownSide(facet);
+                sunlitPart[down] = sunlitPart[down ^ 1U];
             }
         }
         // Conservative sunlit/shaded transfer before the stored states become
@@ -4864,6 +4925,7 @@ try {
                 if (transfer.target < 0 && !mixed) continue;
                 const uint32_t facet = static_cast<uint32_t>(side / 2U);
                 const bool groundSide = side >= firstGroundSide;
+                if (groundSide && side % 2U == groundDownSide(facet)) continue;
                 const auto& surface = surfaceForFacet(scene, facet);
                 const bool profileSide = groundSide && surface.soilTemperatureMethod == 2;
                 if (transfer.target >= 0) {
@@ -5314,6 +5376,14 @@ try {
                             for (uint32_t localSide = 0;
                                  localSide < 2U; ++localSide) {
                                 const size_t side = side0 + localSide;
+                                if (localSide == groundDownSide(facet)) {
+                                    for (auto field : {&StateFluxes::net, &StateFluxes::sensible,
+                                                       &StateFluxes::sensibleSlope, &StateFluxes::latent,
+                                                       &StateFluxes::latentSlope, &StateFluxes::storage,
+                                                       &StateFluxes::storageSlope})
+                                        (flux.*field)[side] = 0.0f;
+                                    continue;
+                                }
                                 flux.net[side] = radiativeNet[side];
                                 flux.sensible[side] =
                                     groundConductance * (T[side] - airTemperature);
@@ -5480,6 +5550,8 @@ try {
                 data[24] = leaf.beta;
                 data[25] = leaf.qLs;
                 data[26] = leaf.sustainedNPQ;
+                // energy.comp: 1 + local index of the soil-facing ground side.
+                data[27] = facet >= scene.leafFacetCount ? 1.0f + float(groundDownSide(facet)) : 0.0f;
             }
             for (int state = 0; state < 2; ++state)
                 for (size_t side = 0; side < surfaceCount; ++side)
@@ -5616,6 +5688,10 @@ try {
                             shadowNextTemperature[index] = t + (object && surface.vegetation ? flux.temperatureStep[side] : temperatureRelaxation * (candidate - t));
                             if (object) shadowNextTemperature[index + 1] = shadowNextTemperature[index];
                         }
+                        if (!object) {
+                            const size_t down = size_t(state) * surfaceCount + first + groundDownSide(facet);
+                            shadowNextTemperature[down] = shadowNextTemperature[down ^ 1U];
+                        }
                     }
                 if (shadowIncidentMaximum > 0.0001f)
                     throw std::runtime_error("CPU/GPU incident irradiance shadow mismatch");
@@ -5728,6 +5804,10 @@ try {
                             if (object)
                                 T[side0 + 1U] = updated;
                         }
+                        if (!object) {
+                            const size_t down = side0 + groundDownSide(facet);
+                            T[down] = T[down ^ 1U];
+                        }
                     }
                 }
                 updateMeanTemperature();
@@ -5754,6 +5834,9 @@ try {
             {"maximumStomatalLogMismatch", maximumStomatalMismatch}, {"maximumLeafEnergyResidual_W_m2", maximumLeafEnergyResidual},
             {"soilLayerEdges_m", facetphysics::soilEdges}, {"soilBottomBoundary", "fixed initial temperature at 3 m"},
             {"columns", ProjectJson::Json::array()}, {"soilProfiles", ProjectJson::Json::array()}};
+        diagnostic["lowerBoundary"] = groundEscapeJson(graph);
+        diagnostic["lowerBoundary"]["longwaveGroundRadiosity_W_m2"] = finalLongwaveSolution.groundRadiosity;
+        diagnostic["lowerBoundary"]["skyLongwave_W_m2"] = skyLongwave;
         for (size_t i = 0; i < columns.size(); ++i)
             if (saveEnergyProcess) diagnostic["columns"].push_back({{"index", i}, {"inverseObukhovLength_m-1", columnInverseL[i]},
                 {"leafResistance_s_m", columnAerodynamics[i].leafResistance}, {"soilResistance_s_m", columnAerodynamics[i].soilResistance}});
@@ -5770,6 +5853,7 @@ try {
             const size_t side = firstGroundSide + g;
             const auto& soil = surfaceForFacet(scene, static_cast<uint32_t>(side / 2));
             if (soil.soilTemperatureMethod != 2) continue;
+            if (side % 2U == groundDownSide(static_cast<uint32_t>(side / 2))) continue;
             double conducted = 0, heat = 0;
             for (int state = 0; state < 2; ++state) {
                 const double weight = state == 0 ? sunlitPart[side] : 1.0 - sunlitPart[side];
@@ -6207,7 +6291,8 @@ try {
            << latest.graph.directedEdgeCount
            << ",\"closureError\":" << latest.graph.maxClosureError
            << ",\"fragmentOverflow\":" << latest.graph.fragmentOverflow
-           << ",\"hashOverflow\":" << latest.graph.hashOverflow << "},\n"
+           << ",\"hashOverflow\":" << latest.graph.hashOverflow
+           << ",\"lowerBoundary\":" << groundEscapeJson(latest.graph).dump() << "},\n"
            << "  \"iterations\": " << latest.solution.iterations << ",\n"
            << "  \"maxDelta\": " << latest.solution.maxDelta << ",\n"
            << "  \"couplingIterations\": " << latestCouplingIterations << ",\n"
