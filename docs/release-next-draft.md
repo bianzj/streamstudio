@@ -57,6 +57,13 @@
 - VoxelRT 辐射求解方法默认“光谱批处理加速”（与传统方法均值相同，快 1.1–1.6×）。
 - FacetEB 温度松弛系数默认 0.8（原 0.5；作物/城市收敛所需迭代 16–19 → 9–12）。
 - 已有工程中显式保存的 `radiationSolver=traditional`、`temperatureRelaxation=0.5` 保持不变。
+- **新工程按“标准”运行质量档**（`control.qualityPreset = 'standard'`），与此前 schema 默认值不同的三项以标准档为准：VoxelRT 真实碰撞次数 2 → 3；VoxelEB 短波散射阶数 1 → 2；VoxelEB 体元射线步数上限 64 → 按场景对角线体元数 × 1.5 自动取值（16 的倍数，64–4096；默认 60×60×15 m / 1 m 场景为 144）。采样数 32、RayTracing 散射次数 16、FacetEB 耦合迭代 60 与原默认相同。标定见用户手册 13.2.1：VoxelEB 2 阶比 1 阶植被吸收误差 4% → 1%、耗时约 +50%。
+
+### 运行质量档位与单次运行上限（2026-11-22）
+
+- **运行质量三档**：仿真控制面板顶部新增“运行质量”（快速预览 / 标准 / 高精度 / 自定义），选择后只把当前模式实际读取的参数批量写入工程：RayTracing `samples`+`raytracingDepth`；VoxelRT `samples`+`voxelCollisionOrders`；VoxelEB `samples`+`shortwaveScatteringOrders`+`radiationMaxSteps`；FacetEB `couplingIterations`；FacetRT 无受管参数。手动修改受管参数后自动记为“自定义”；切换计算模式时按工程记录的档位写入新模式参数；VoxelEB 标准/高精度档的步数上限随场景尺寸、体元大小重算。各档数值由 `tools/regression` 冻结算例（`vrt_urban`、`veb_forest`、`feb_crop`、`rt_forest`，补充 `feb_urban`）以高精度为参考标定，标定表写入用户手册 13.2.1。
+- **单次运行上限可在工程内设置**：新增 `control.runTimeoutMinutes`（1–1440 分钟；0/空 = 服务端默认 15 分钟，仍可用 `STREAM_STUDIO_RUN_TIMEOUT_MS` 修改），仿真控制面板顶部可填写。`/api/run` 与 `/api/run/preflight` 使用工程值；预检返回 `timeoutSource`（`project`/`server`）、`serverTimeoutSeconds`，预计超时时返回 `suggestedTimeoutMinutes`（预计 × 1.5 向上取整到分钟），界面弹窗提供“把上限调到建议值并运行 / 按当前上限运行 / 取消”。`/api/defaults` 新增 `runTimeoutSeconds`。
+- 修正预检警告中预计耗时只显示单位、不显示数值的问题（服务端 `durationLabel`）。
 
 ### 界面（2026-11-22）
 
@@ -69,6 +76,13 @@
 - **FacetEB 自动后端**：设备不支持 shaderFloat64（或缺少 `energy.comp.spv`）时，“自动”不再报错，改为辐射仍用 GPU、能量平衡走 CPU 路径，并在日志中提示；显式选择 GPU 时仍报错并提示改选 CPU 或自动。
 - **冠层投影系数 G**：混沌介质的叶倾角参数有效时，“投影系数 G”字段只读并说明 G 由 LIDF 推导；刚体/介质、`LIDFa = LIDFb = 0` 或参数超出定义域时可编辑并照常使用。资源库摘要中 G 显示为 `LIDF (a, b)` 或 `0.5（球形）`。工程中保存的 G 值不变。
 
+### 运行管线（2026-11-22，不改数值）
+
+- **桌面版服务端移出主进程**：`desktop/main.mjs` 用 Electron `utilityProcess.fork` 启动 `desktop/server-process.mjs`，HTTP 服务（含 FacetEB 出图线程）在独立进程中运行，主进程只负责窗口、文件对话框（经进程消息转发）和桌面设置 IPC。运行准备、出图、ENVI 转换、读结果不再冻结窗口。退出时先通知服务进程停止引擎再退出，5 s 未退出则结束整棵进程树；服务进程意外退出时清理它遗留的引擎进程，自动重启并重新载入页面，1 分钟内第 3 次退出则报错关闭。网页模式不变。
+- **结果读取缓存**：`/api/results/read` 按 (路径, mtime, size) 缓存原始数据、已解码 TIFF 分块和已编码响应，按字节计的 LRU，默认 512 MB（`STREAM_STUDIO_RESULT_CACHE_MB`，0 为关闭）；响应头 `X-Cache: hit|miss`。彩色合成三个波段共用一次读盘/解码；变化分析和 STREAM 栅格读取也共用该缓存。文件被覆盖即失效，“删除所有结果”清空缓存。
+- **三维结果二进制传输**：请求头 `Accept: application/vnd.stream-studio.result-v1` 时，面元/体元结果的几何坐标和逐面元/体元指标以 Float32（不能无损表示时用 Float64）二进制块回传，其余字段仍为 JSON；界面已适配。不带该请求头时仍返回原 JSON。2 万面元测试结果 3.66 MB → 1.92 MB，逐值一致。
+- **运行准备不阻塞事件循环**：引擎 exe、工程与气象文件的 SHA-256 改为流式计算并按 (路径, mtime, size) 缓存；运行输入目录（含裁切后的 OBJ）与气象快照改为异步复制；准备期间拒绝第二个运行请求。
+
 ## 兼容性
 
 - `tools/build-engine.ps1` 构建的产品引擎只含核心（显式清空 `HISTREAM_EXTENSION_DIRS`），不再含场景动画与 Bullet 碰撞模块，也不再需要本地 Bullet 源码；三维 RT/EB 与 STREAM 遥感工作流的代码路径不变。
@@ -79,7 +93,8 @@
 - 2026-11-22 精度修正后，旧工程重新运行会有以下数值变化：VoxelEB 地面显热升高；RayTracing 近红外升高；反射率可大于 1；天空背景下物体边缘变亮；开周期边界的 Facet 工程更准但更慢。FacetEB 判据更严，已保存的低迭代上限（如 12 次）可能被报告为未收敛（退出码 2，结果保留）。VoxelRT/VoxelEB 的混沌介质改用 `LIDFa/LIDFb` 决定 G(Ω)：默认参数下变化 < 0.3%，非球形 LIDF 或 G ≠ 0.5 的工程变化可达 10% 量级；想保持旧的常数 G 行为可把 `LIDFa`、`LIDFb` 都设为 0（G = 0.5 时与旧结果相同，G ≠ 0.5 时单次散射按 G/0.5 修正）。`Canopy` GPU 结构体新增 `lidfValid/lidf[13]/diffuseG[32]`（244 字节），C++ 与着色器需同时更新。
 - 周期边界传输一致化后，开周期的工程边界条带变暗/变冷到与内部一致，整体均值随之变化（森林周期 8 约 −4%，城市斜视可达 +17%）。耗时（同机、预热后）：VoxelRT 周期 8 森林 6.4 → 7.6 s，VoxelEB 周期 8 森林 10.0 → 14.2 s、周期 20 城市 2.9 → 3.5 s；RayTracing 不变或略快（1.3 s）。未开周期的 VoxelEB 短波散射 pass 也慢了约 1/3（森林 9.9 → 12.0 s，结果逐位不变），原因未查明。`RayRTSetting` 新增 `sceneTop`（占用原对齐填充，仍为 80 字节），C++ 与 `settings.h` 需同时更新。
 - 工程新增 `control.raytracingDepth`（RayTracing 散射次数），旧工程缺省按 16 处理；`control.depth` 只对 VoxelRT 有意义（步数预算 ×128）。
-- 新增环境变量：`HISTREAM_FACET_RASTER_SIZE`（Facet 可见性栅格边长，用于生成高分辨率参考解）、`STREAM_STUDIO_FACET_STEP_RESIDENT_FACETS`（常驻出图线程的面元数阈值，默认 3,000,000）。
+- 工程新增 `control.qualityPreset`（`fast`/`standard`/`high`/`custom`）与 `control.runTimeoutMinutes`。旧工程缺少这两项时按 `custom` 与 0（服务端默认上限）处理，已有参数不变；缺少 `voxelCollisionOrders`/`shortwaveScatteringOrders`/`radiationMaxSteps` 的旧工程仍按 2/1/64 运行，只有新工程才按标准档取 3/2/自动。旧版本打开新工程会忽略这两个字段。
+- 新增环境变量：`HISTREAM_FACET_RASTER_SIZE`（Facet 可见性栅格边长，用于生成高分辨率参考解）、`STREAM_STUDIO_FACET_STEP_RESIDENT_FACETS`（常驻出图线程的面元数阈值，默认 3,000,000）、`STREAM_STUDIO_RESULT_CACHE_MB`（结果读取缓存上限，默认 512）、`STREAM_STUDIO_RESULT_CACHE_DEBUG=1`（服务端打印缓存命中日志）。
 - 回归测试工具 `tools/regression/`：从内置示例生成 13 个冻结算例，用两版引擎运行并对比；`compare.py --tolerance` 可作为“纯性能改动不得改变结果”的门禁。
 
 ## 已做的检查（2026-11-22）
@@ -90,6 +105,9 @@
 - 未做 SCOPE 对比；VoxelEB 自由对流与 RayTracing 深度会改变既有 SCOPE 指标，发布前如需对比应单独运行。
 - 叶倾角/G/Γ 自洽：`tools/test-lidf-gamma.cpp`（cl 单文件编译）全部通过——G 与暴力方位积分及独立 PROSAIL 双精度转写差 < 2e-7（平面、直立、倾斜、极端、均匀、默认与精确球形），⟨G⟩ = 1/2，(1/π)∫Γ_R,T = G 相对差 < 2e-5，连续球形极限与 Ross 闭式差 < 2e-7。16 个冻结算例（含新增 `vrt_forest`、`vrt_forest_planophile`、`vrt_forest_g03`）对比修正前引擎：Facet/RayTracing 输出逐字节相同（仅耗时/时间戳字段不同）；`LIDFa = 2` 的森林 VoxelRT/VoxelEB 与修正前相对差 ≤ 5e-7；新引擎重复运行结果相同，耗时与修正前持平。
 - 周期边界传输一致化：`tools/regression/prepare.mjs` 支持用 `positions` 替换示例的位置文件，新增 `rt/vrt/veb_forest_periodic` 与 25 m 规则格网的 `rt/vrt/veb_lattice_periodic` 共 6 个算例（总 22 个）。对比 LIDF 修正后的引擎：未开周期的 VoxelRT/VoxelEB/Facet 算例逐字节相同，RayTracing 仅舍入级路径分叉；格网算例按 16 个格子统计边缘/中心差（数字见上）。
+- 运行管线（服务端独立进程、结果缓存、二进制传输）：网页模式接口检查（示例列表、打开示例、RayTracing 运行、同一 TIFF 第二次读取 `X-Cache: hit`、touch 后失效）；二进制与 JSON 逐值一致；桌面模式 CDP 端到端（打开 urban_block → RayTracing → 结果自动打开），进程树确认服务在 utility 进程且 histream 为其子进程；运行中强杀服务进程后自动重启、页面重新载入、无遗留 histream；运行中关闭窗口后无遗留进程；asar 内 utilityProcess + Worker 可用。
+- 运行质量档位与单次运行上限：`tools/regression` 用基线引擎 `bin_v0` 对 `vrt_urban`、`veb_forest`、`feb_crop`、`rt_forest`（补充 `feb_urban`）各跑三档并以高精度为参考对比（标定表见用户手册 13.2.1）；网页模式（`STREAM_STUDIO_PORT=4199`，无头 Edge + CDP）实测：旧工程显示“自定义”且参数不变，三档切换后 `project.json` 写入对应参数，手动改采样数切为“自定义”，切换 FacetEB/RayTracing/VoxelRT 按档位写入新模式参数，修改体元大小时 VoxelEB 步数随之重算；工程上限设 1 分钟时预检返回 60 s（`timeoutSource=project`）与建议 10 分钟，选择“按当前上限运行”的 `veb_forest` 全天运行在 61 s 时被终止（`status=timeout`，“运行超过 1 分钟，已终止”），选择“调到建议值并运行”后工程写入 10 分钟并在 3 分 43 秒内完成。
+- 未验证：桌面（Electron）模式下的运行质量档位与上限流程。
 
 ## 已做的检查（2026-11-16）
 
