@@ -4463,13 +4463,22 @@ try {
         [](const SurfaceParameters& s){return !s.lumpedGroup.empty();});
     if(hasLumpedThermal && startNode!=0)throw std::runtime_error("Lumped thermal runs must restore history from node zero");
     const bool cpuEnergyRequested = (energyBackend && std::string(energyBackend) == "cpu") || hasLumpedThermal;
-    const bool gpuEnergy = !useCpuBackend && !cpuEnergyRequested && model.supportsGpuEnergy();
+    // "auto" must not fail on a device without shaderFloat64 (or without
+    // energy.comp.spv): keep GPU radiation and run the CPU energy path, which
+    // HISTREAM_FACET_ENERGY_BACKEND=cpu already uses with GPU radiation.
+    const bool autoCpuEnergy = requestedBackend == "auto" && !useCpuBackend &&
+        !cpuEnergyRequested && !model.supportsGpuEnergy();
+    if (autoCpuEnergy)
+        std::cerr << "faceteb: GPU energy kernel unavailable (requires shaderFloat64 and energy.comp.spv); "
+                     "auto backend keeps GPU radiation and uses the CPU energy balance\n";
+    const bool cpuEnergy = cpuEnergyRequested || autoCpuEnergy;
+    const bool gpuEnergy = !useCpuBackend && !cpuEnergy && model.supportsGpuEnergy();
     const char* verifyEnergy = std::getenv("HISTREAM_FACET_VALIDATE_ENERGY");
     const bool shadowEnergy = gpuEnergy && verifyEnergy && std::string(verifyEnergy) == "1";
     float shadowFluxMaximum = 0.0f, shadowIncidentMaximum = 0.0f, shadowUpdateMaximum = 0.0f;
     uint64_t shadowEvaluations = 0, shadowUpdates = 0;
-    if (!useCpuBackend && !cpuEnergyRequested && !gpuEnergy)
-        throw std::runtime_error("GPU FacetEB energy requires shaderFloat64 and energy.comp.spv; CPU reference can be selected explicitly");
+    if (!useCpuBackend && !cpuEnergy && !gpuEnergy)
+        throw std::runtime_error("GPU FacetEB energy requires shaderFloat64 and energy.comp.spv; select the CPU or auto backend");
     runIndex.value["execution"] = {{"radiation", useCpuBackend ? "cpu" : "gpu"},
         {"incidentIrradiance", !useCpuBackend && model.supportsGpuIncident() ? "gpu" : "cpu"},
         {"leafPhysiology", gpuEnergy ? "gpu" : "cpu"},

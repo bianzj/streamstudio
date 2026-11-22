@@ -2158,8 +2158,20 @@ function resize() {
 }
 new ResizeObserver(resize).observe(viewport)
 let frameCount = 0, lastFps = performance.now(), lastAnimationTime = performance.now()
+// While the engine runs, the 60 fps viewport (with its 2048² shadow map)
+// competes with it for the GPU. Throttle to ~10 fps unless the user is
+// interacting with the viewport.
+const RUNNING_FRAME_INTERVAL_MS = 100
+const VIEWPORT_INTERACTION_GRACE_MS = 1500
+let lastRenderTime = 0, lastViewportInput = 0
+for (const type of ['pointerdown', 'pointermove', 'wheel', 'keydown']) {
+  renderer.domElement.addEventListener(type, () => { lastViewportInput = performance.now() }, { passive: true })
+}
 function animate(now) {
   requestAnimationFrame(animate)
+  if (state.running && now - lastViewportInput > VIEWPORT_INTERACTION_GRACE_MS &&
+      now - lastRenderTime < RUNNING_FRAME_INTERVAL_MS) return
+  lastRenderTime = now
   const deltaSeconds = Math.min(.1, Math.max(0, (now - lastAnimationTime) / 1000))
   lastAnimationTime = now
   controls.update(); updateSceneDynamics(world, deltaSeconds, state.config); updateCruiseAnimation(now); updateObjectSelectionBox(); renderer.render(scene, camera); renderResultViewer(); frameCount++
@@ -2476,7 +2488,7 @@ function renderInspector() {
     )))
     const effectivePeriodicCount = configuredPeriodicCount
     const periodicScopeNotice = isFacetMode()
-      ? '面元模式按实例复制邻块（向上取整为 4/8/12/20 块）；邻块越多，可见性栅格对中心块的有效分辨率越低。'
+      ? '面元模式按实例复制邻块（向上取整为 4/8/12/20 块）；可见性栅格的水平窗口只覆盖中心块，邻块只参与遮挡，邻块越多可见性边数越多、运行越慢。'
       : state.mode === 'eRaytracing'
         ? '不会复制邻域场景。1–20 表示主视线离开一侧边界后从对侧继续查询的最大次数；阴影和散射射线不跨边界，靠近边界的条带会缺少邻域阴影。'
         : '不会复制邻域场景。1–20 表示成像射线离开一侧边界后从对侧继续查询的最大次数；体元太阳与漫射传输不跨边界。'
