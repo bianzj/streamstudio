@@ -31,6 +31,7 @@
 #include "../mwir_solar.glsl"
 #include "../shade_state_voxel.glsl"
 #include "../random.glsl"
+#include "image_environment.glsl"
 
 PtPayload        prd;
 ShadowHitPayload shadow_payload;
@@ -120,6 +121,24 @@ float thermalSolarDiffuse(float wavelength)
     float share = (1.0 - directFraction) * MWIR_SKY_SOLAR_RATIO
         + (solarBeamActive() ? 0.0 : directFraction);
     return max(ubom.meteo.Rin, 0.0) * share * mwirSolarShape(wavelength);
+}
+
+// Multiple scattering: the collided (scattered at least once) incident
+// shortwave stored by the scattering pass for this sensor band's spectral
+// group (image_environment.glsl), rescaled to the band by its illumination
+// and - foliage - by w/(1 - p w) of its own leaf albedo (spectral
+// invariants). Same convention as skyDiffuse: two-face total for foliage and
+// media (a face re-emits half), irradiance for solid facets. `illumination`
+// is referenceIrradiance (optical, per nm) or the 2.5-6 um solar spectral
+// irradiance (W m-2 um-1). The uncollided sky and the beam are the separate
+// single-scattering terms, so nothing is counted twice. 0 at night.
+float collidedEnvironment(int bufferId, int kwave, float illumination,
+                          bool leaf, float albedo, float recollision)
+{
+    if(setting.imageEnvironment == 0 || bufferId < 0 || !(illumination > 0.0)) return 0.0;
+    float k = loadImageEnvironment(uint(bufferId), uint(kwave));
+    if(isnan(k) || isinf(k) || !(k > 0.0)) return 0.0;
+    return k * illumination * (leaf ? leafSpectralInvariant(albedo, recollision) : 1.0);
 }
 
 // diffuseTrad stores the *absorbed* incident longwave (incident * (1-r-t) of
@@ -326,6 +345,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 								* voxelDirs[bufferId].skyDiffuse * 0.5;
 							Radiance[kwave] += alpha_toSensor * scatteringFraction
 								* (directSource + diffuseSource);
+							Radiance[kwave] += alpha_toSensor * scatteringFraction * 0.5
+								* collidedEnvironment(bufferId, kwave,
+									referenceIrradiance(wavelength), false, 0.0, 0.0);
 						}
 						else
 						{
@@ -335,10 +357,14 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 								* Planck(wavelength, envTemp);
 							float solarDirect = thermalSolarDirect(wavelength);
 							float solarDiffuse = thermalSolarDiffuse(wavelength);
-							if(solarDirect > 0.0 || solarDiffuse > 0.0)
+							if(solarDirect > 0.0 || solarDiffuse > 0.0) {
 								Radiance[kwave] += alpha_toSensor * scatteringFraction
 									* (solarDirect * beamNormalScale() * alpha_toSolar * scatteringPhase
 									+ solarDiffuse * voxelDirs[bufferId].skyDiffuse * 0.5 / PI);
+								Radiance[kwave] += alpha_toSensor * scatteringFraction * 0.5
+									* collidedEnvironment(bufferId, kwave,
+										solarDirect + solarDiffuse, false, 0.0, 0.0) / PI;
+							}
 						}
 					}
 				}
@@ -408,6 +434,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                     gamma = CanopyPhase(canopy, solarDirection, -viewDirection);
                     gammaCanopyId = canopyId;
                 }
+                // Recollision probability of the spectral-invariant scaling,
+                // as in the scattering pass's tail.
+                float recollision = calReCor(canopy.lai);
                 for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
                     float wavelength = wave[kwave];
                     float refl = clamp(specMaterials[spectralBase + kwave].reflectance, 0.0, 1.0);
@@ -426,6 +455,10 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                         // A leaf face sees on average half of the two-face total.
                         Radiance[kwave] += alpha_toSensor * (1.0 - alpha_voxel) * s
                             * diffuseIrradiance * 0.5;
+                        // Multiple scattering: collided environment of this band.
+                        Radiance[kwave] += alpha_toSensor * (1.0 - alpha_voxel) * s * 0.5
+                            * collidedEnvironment(bufferId, kwave,
+                                referenceIrradiance(wavelength), true, w, recollision);
                         // Single scattering of the direct beam (Ross/Kuusk): leaf phase
                         // function with this leaf's rho/tau, view interception
                         // (1 - alpha_voxel)/G(view), and the joint sun/view gap probability
@@ -450,6 +483,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                                 * solarDiffuse * voxelDirs[bufferId].skyDiffuse * 0.5
                                 + solarDirect * beamNormalScale() * leafGamma / safeG
                                 * (1.0 - alpha_voxel) * hotspot) / PI;
+                            Radiance[kwave] += alpha_toSensor * (1.0 - alpha_voxel) * s * 0.5
+                                * collidedEnvironment(bufferId, kwave,
+                                    solarDirect + solarDiffuse, true, w, recollision) / PI;
                         }
                     }
                 }
@@ -584,6 +620,12 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                             angularStrength);
                         Radiance[kwave] += alpha_toSensor
                             * diffuseWeight * diffuseIrradiance;
+                        // Multiple scattering: collided irradiance of this band
+                        // (spectrally neutral within the group: its source
+                        // material is unknown at a solid receiver).
+                        Radiance[kwave] += alpha_toSensor * diffuseWeight
+                            * collidedEnvironment(alignBufferId, kwave,
+                                referenceIrradiance(wavelength), false, 0.0, 0.0);
                         // Sunlit and visible: Kuusk joint gap probability (hot spot).
                         Radiance[kwave] += directWeight * directIrradiance
                             * cosIncidence * hotspot;
@@ -617,6 +659,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                                 * solarDiffuse * voxelDirs[alignBufferId].skyDiffuse
                                 + directWeight * solarDirect * beamNormalScale()
                                 * cosIncidence * hotspot) / PI;
+                            Radiance[kwave] += alpha_toSensor * diffuseWeight
+                                * collidedEnvironment(alignBufferId, kwave,
+                                    solarDirect + solarDiffuse, false, 0.0, 0.0) / PI;
                         }
                     }
                 }

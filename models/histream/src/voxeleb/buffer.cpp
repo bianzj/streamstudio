@@ -569,9 +569,20 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     // Radiance field (N x DIFFUSENUM VoxelRad) followed by the per-direction
     // sky gap transmittance (N x DIFFUSENUM floats) that lets later spectral
     // groups reuse the first group's uncollided-sky trace
-    // (voxelrad_scattering_VNIR.comp stage 4).
+    // (voxelrad_scattering_VNIR.comp stage 4), then the optical image's
+    // multiple-scattering environment (N x n_wave floats,
+    // shader/voxeleb/image_environment.glsl). The shaders index the buffer
+    // with 32-bit VoxelRad entries; the environment is left out (image keeps
+    // single scattering) if its entries would not fit.
+    const VkDeviceSize fieldEntries = static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * 3 / 2;
+    const VkDeviceSize environmentFloats =
+        static_cast<VkDeviceSize>(n_voxel) * static_cast<VkDeviceSize>(std::max(voxellstio->n_wave, 0));
+    const bool imageEnvironment = environmentFloats > 0
+        && fieldEntries + (environmentFloats + 1) / 2 <= VkDeviceSize(UINT32_MAX);
+    voxellstio->setting.imageEnvironment = imageEnvironment ? 1 : 0;
     const VkDeviceSize radianceBytes = static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(VoxelRad)
-        + static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(float);
+        + static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(float)
+        + (imageEnvironment ? (environmentFloats + 1) / 2 * sizeof(VoxelRad) : 0);
     auto& radianceAllocator = voxellstio->m_radianceAllocator;
     radianceAllocator = std::make_unique<nvvk::ResourceAllocatorDedicated>(
         m_device, voxellstio->m_physicalDevice);
@@ -585,6 +596,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
         nvvk::getBufferDeviceAddress(m_device, voxelio->m_pRadsBuffer->buffer);
     if (!voxellstio->setting.radianceAddress) throw std::runtime_error("Voxel radiance device address is null");
     std::cout << "RADIANCE_BUFFER\tbytes=" << radianceBytes
+              << "\timageEnvironment=" << voxellstio->setting.imageEnvironment
               << "\taddress=" << voxellstio->setting.radianceAddress << std::endl;
 
     {

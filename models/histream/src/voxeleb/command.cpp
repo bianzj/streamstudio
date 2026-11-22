@@ -46,6 +46,16 @@ void clearShortwaveFields(const std::shared_ptr<VoxelebIO>& modelio)
             vkCmdFillBuffer(command, buffer->buffer, 0, bytes, 0U);
         }
     }
+    // The optical image's multiple-scattering environment follows the field
+    // and the sky gap transmittances (buffer.cpp): no shortwave, no environment.
+    if (modelio->setting.imageEnvironment != 0 && modelio->m_voxelio->m_pRadsBuffer
+        && modelio->m_voxelio->m_pRadsBuffer->buffer) {
+        const VkDeviceSize environmentOffset = voxelCount * DIFFUSENUM * 3 / 2 * sizeof(VoxelRad);
+        const VkDeviceSize environmentFloats =
+            voxelCount * static_cast<VkDeviceSize>(std::max(modelio->n_wave, 0));
+        vkCmdFillBuffer(command, modelio->m_voxelio->m_pRadsBuffer->buffer, environmentOffset,
+                        (environmentFloats + 1) / 2 * sizeof(VoxelRad), 0U);
+    }
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;

@@ -15,6 +15,7 @@
 #include "../surface_brdf.glsl"
 #include "../shade_state_voxel.glsl"
 #include "scatter_stats.glsl"
+#include "image_environment.glsl"
 
 PtPayload prd;
 ShadowHitPayload shadow_payload;
@@ -396,6 +397,31 @@ float traceIncoming(uint voxel0, uint angle, vec3 origin, NanoVDBLink nano,
     return checkedScatteringRadiance(incoming);
 }
 
+// Collided incident shortwave of this order (radiation of accumulateAbsorption
+// before the absorptance, i.e. the skyDiffuse convention; the last order
+// carries the spectral-invariant tail) for the optical image, normalized so
+// voxelrad_image.comp can rescale it to each sensor band of this group
+// (image_environment.glsl). Order 1 overwrites the previous node.
+void accumulateImageEnvironment(uint voxel, uint mesh, bool vegetation,
+                                float collided, vec2 optics) {
+    float normalization = groupIllumination(true) + groupIllumination(false);
+    if(vegetation) {
+        Canopy canopy = canopies[meshLinks[mesh].canopyId];
+        if(!isParticipatingMedium(canopy))
+            normalization *= leafSpectralInvariant(optics.x + optics.y, calReCor(canopy.lai));
+    }
+    float value = normalization > 1.0e-9 ? collided / normalization : 0.0;
+    if(isnan(value) || isinf(value) || value < 0.0) value = 0.0;
+    for(int band = 0; band < setting.n_wave; ++band) {
+        int shortwave = imageEnvironmentBand(wave[band]);
+        if(shortwave < setting.scatteringBandStart || shortwave >= setting.scatteringBandEnd)
+            continue;
+        float previous = setting.scatteringOrder <= 1 ? 0.0
+            : loadImageEnvironment(voxel, uint(band));
+        storeImageEnvironment(voxel, uint(band), previous + value);
+    }
+}
+
 void accumulateAbsorption(uint voxel, uint mesh) {
     bool vegetation = meshLinks[mesh].type == TYPE_VEGETATION;
     float radiation = 0.0;
@@ -435,6 +461,7 @@ void accumulateAbsorption(uint voxel, uint mesh) {
     }
     vec3 optics = groupOptics(mesh);
     float absorption = 1.0 - optics.x - optics.y;
+    float tailGain = 1.0;
     if(vegetation) {
         Canopy canopy = canopies[meshLinks[mesh].canopyId];
         if(isParticipatingMedium(canopy))
@@ -446,8 +473,11 @@ void accumulateAbsorption(uint voxel, uint mesh) {
             // as the VoxelRT last-order tail), absorbing a geometric series.
             float q = min(calReCor(canopy.lai) * (optics.x + optics.y), 0.9);
             absorption /= (1.0 - q);
+            tailGain = 1.0 / (1.0 - q);
         }
     }
+    if(setting.scatteringStage == 3 && setting.imageEnvironment != 0)
+        accumulateImageEnvironment(voxel, mesh, vegetation, radiation * tailGain, optics.xy);
     radiation *= max(absorption, 0.0);
     float wavelength = optics.z;
     float par = setting.scatteringBandEnd <= 301

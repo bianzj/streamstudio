@@ -116,6 +116,10 @@ struct alignas(32)  VoxelLstSetting
     int scatteringOrders{1};
     // Energy-balance iteration within the current time node, 0-based.
     int energyIteration{0};
+    // 1 when the radiance buffer also holds the per-voxel, per-sensor-band
+    // multiple-scattering environment of the optical image
+    // (shader/voxeleb/image_environment.glsl).
+    int imageEnvironment{0};
 };
 
 static_assert(offsetof(VoxelLstSetting, radianceAddress) == 80,
@@ -125,6 +129,7 @@ static_assert(offsetof(VoxelLstSetting, scatteringStatsAddress) == 104);
 static_assert(offsetof(VoxelLstSetting, energyFinalize) == 112);
 static_assert(offsetof(VoxelLstSetting, scatteringOrders) == 116);
 static_assert(offsetof(VoxelLstSetting, energyIteration) == 120);
+static_assert(offsetof(VoxelLstSetting, imageEnvironment) == 124);
 static_assert(sizeof(VoxelLstSetting) == 128);
 
 // Three scattering orders plus the unscattered sky; matches scatter_stats.glsl.

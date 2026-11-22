@@ -60,6 +60,9 @@ struct VoxellstSetting
 	int energyFinalize;
 	int scatteringOrders;
 	int energyIteration;
+	// 1 when the radiance buffer carries the image multiple-scattering
+	// environment (voxeleb/image_environment.glsl).
+	int imageEnvironment;
 #endif
 };
 
