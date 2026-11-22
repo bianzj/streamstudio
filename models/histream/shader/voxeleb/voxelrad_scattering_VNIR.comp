@@ -109,6 +109,16 @@ void buildSource(uint voxel, uint mesh) {
     vec2 optics = groupOptics(mesh).xy;
     float incident[DIFFUSE_ANGLE_NUM];
     float phaseNormalization[DIFFUSE_ANGLE_NUM];
+    // LIDF foliage: a beam from Omega' is intercepted in proportion to
+    // G(Omega') and the scattered field leaves the cell along Omega with the
+    // interception G(Omega) of the gathering ray, so the per-unit-interception
+    // source carries G(Omega')/G(Omega). The diffuse kernel keeps the
+    // spherical-leaf angular shape; the beam uses the exact LIDF Gamma.
+    bool leafLidf = !medium && canopy.lidfValid != 0;
+    float projection[DIFFUSE_ANGLE_NUM];
+    for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
+        projection[angle] = leafLidf
+            ? max(CanopyDiffuseG(canopy, angle), 1.0e-6) : 1.0;
     for(uint incoming = 0; incoming < DIFFUSE_ANGLE_NUM; ++incoming) {
         incident[incoming] = checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + incoming].cumulated);
         if(medium) {
@@ -125,7 +135,30 @@ void buildSource(uint voxel, uint mesh) {
         ? groupIllumination(true) * clamp(voxelDirs[voxel].solar, 0.0, 1.0)
             / max(abs(solar.y), 0.001) : 0.0;
     float sunNormalization = 0.0;
-    if(primary > 0.0) {
+    float sunGammaR[DIFFUSE_ANGLE_NUM];
+    float sunGammaT[DIFFUSE_ANGLE_NUM];
+    float sunSumR = 0.0;
+    float sunSumT = 0.0;
+    float solarProjection = leafLidf ? CanopyProjection(canopy, solar) : 1.0;
+    if(primary > 0.0 && leafLidf) {
+        // Outgoing index = propagation direction of the scattered light.
+        // Directions 2k+1 = -(2k): reflection towards -o is transmission
+        // towards o for two-sided leaves, so one evaluation serves the pair.
+        for(uint pair = 0; pair < DIFFUSE_ANGLE_NUM; pair += 2) {
+            vec3 o = DIFFUSE_DIRECTIONS[pair];
+            float gammaR = 0.0;
+            float gammaT = 0.0;
+            lidfGamma(canopy.lidf, solar.x, solar.y, solar.z, o.x, o.y, o.z, gammaR, gammaT);
+            sunGammaR[pair] = gammaR;
+            sunGammaT[pair] = gammaT;
+            sunGammaR[pair + 1] = gammaT;
+            sunGammaT[pair + 1] = gammaR;
+            sunSumR += gammaR + gammaT;
+        }
+        sunSumT = sunSumR;
+        sunSumR = max(sunSumR, 1.0e-12);
+        sunSumT = max(sunSumT, 1.0e-12);
+    } else if(primary > 0.0) {
         for(uint outgoing = 0; outgoing < DIFFUSE_ANGLE_NUM; ++outgoing)
             sunNormalization += medium
                 ? mediumPhaseHG(canopy, dot(-solar, DIFFUSE_DIRECTIONS[outgoing]))
@@ -145,16 +178,22 @@ void buildSource(uint voxel, uint mesh) {
                     / phaseNormalization[incoming];
             } else {
                 // Exact antipodal pairs let transmission reuse reflection.
-                kernel = optics.x * leafReflectionKernel[outgoing*DIFFUSE_ANGLE_NUM + incoming]
-                    + optics.y * leafReflectionKernel[outgoing*DIFFUSE_ANGLE_NUM + (incoming ^ 1u)];
+                kernel = (optics.x * leafReflectionKernel[outgoing*DIFFUSE_ANGLE_NUM + incoming]
+                    + optics.y * leafReflectionKernel[outgoing*DIFFUSE_ANGLE_NUM + (incoming ^ 1u)])
+                    * (projection[incoming] / projection[outgoing]);
             }
             compensatedAdd(source, correction, incident[incoming] * kernel);
         }
         if(primary > 0.0) {
             float cosine = dot(solar, DIFFUSE_DIRECTIONS[outgoing]);
+            // LIDF: each face part is normalized to the discrete quadrature,
+            // so the beam scatters exactly (rho + tau) G(sun) per leaf area.
             float kernel = medium
                 ? clamp(canopy.scatteringAlbedo, 0.0, 1.0)
                     * mediumPhaseHG(canopy, -cosine) / sunNormalization
+                : leafLidf
+                ? (optics.x*sunGammaR[outgoing]/sunSumR + optics.y*sunGammaT[outgoing]/sunSumT)
+                    * (solarProjection / projection[outgoing])
                 : (optics.x*sphericalLeafReflection(cosine)
                     + optics.y*sphericalLeafReflection(-cosine)) / sunNormalization;
             // Fields are pi*L; DeltaOmega=4*pi/N, so pi*p = (N/4)*probability.
@@ -290,10 +329,11 @@ float traceIncoming(uint voxel0, uint angle, vec3 origin, NanoVDBLink nano,
                 uint canopyId = meshLinks[mesh].canopyId;
                 Canopy canopy = canopies[canopyId];
                 float density = ResolveTurbidDensity(voxel, canopyId, id, setting.voxelSize);
+                float leafG = CanopyG(canopyId, direction);
                 float transmittance = isParticipatingMedium(canopy)
-                    ? canopyVoxelTransmittance(canopy, density, canopy.G,
+                    ? canopyVoxelTransmittance(canopy, density, leafG,
                         length(state.position - state.lastPosition), setting.scale)
-                    : ResolveSpatialInteraction(voxel, density, canopy.G,
+                    : ResolveSpatialInteraction(voxel, density, leafG,
                         state.lastPosition, state.position, setting.scale).x;
                 transmittance = clamp(transmittance, 0.0, 1.0);
                 if(!skyZero) {
@@ -341,10 +381,19 @@ void accumulateAbsorption(uint voxel, uint mesh) {
     float correction = 0.0;
     if(vegetation) {
         // Randomly oriented two-faced foliage: (1/2) of the full-sphere integral.
+        // A LIDF canopy intercepts each direction in proportion to G(Omega);
+        // weights 2 G_i / sum G keep the isotropic total of 2/N.
+        Canopy receiverCanopy = canopies[meshLinks[mesh].canopyId];
+        bool leafWeighted = receiverCanopy.lidfValid != 0 && !isParticipatingMedium(receiverCanopy);
+        float projectionSum = 0.0;
+        if(leafWeighted)
+            for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
+                projectionSum += CanopyDiffuseG(receiverCanopy, angle);
         for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
             compensatedAdd(radiation, correction,
-                checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + angle].cumulated));
-        radiation *= DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+                checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + angle].cumulated)
+                * (leafWeighted ? 2.0 * CanopyDiffuseG(receiverCanopy, angle)
+                    / max(projectionSum, 1.0e-6) : DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT));
     } else {
         // A solid facet receives cosine-weighted irradiance over its own hemisphere.
         vec3 normal = solidSurfaceNormal(int(voxel));

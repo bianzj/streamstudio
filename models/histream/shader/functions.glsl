@@ -3,6 +3,26 @@
 
 #include "global.glsl"
 #include "parameters.h"
+#include "lidf_common.h"
+
+// Leaf projection function G(Omega) of a turbid canopy (Ross): from the SAIL
+// leaf inclination classes when the host derived them from LIDFa/LIDFb,
+// otherwise the constant user G. direction need not be normalized.
+float CanopyProjection(Canopy canopy, vec3 direction)
+{
+    if (canopy.lidfValid == 0) return canopy.G;
+    float length2 = dot(direction, direction);
+    float mu = length2 > 1.0e-24 ? abs(direction.y) * inversesqrt(length2) : 1.0;
+    return lidfProjection(canopy.lidf, mu);
+}
+
+// G of the diffuse quadrature direction DIFFUSE_DIRECTIONS[angle], also after
+// an azimuthal rotation (which keeps y): |y| = (2*(angle>>1)+1)/64, tabulated
+// by the host in canopy.diffuseG.
+float CanopyDiffuseG(Canopy canopy, uint angle)
+{
+    return canopy.lidfValid == 0 ? canopy.G : canopy.diffuseG[angle >> 1];
+}
 //--------------------------------------------------------------------------------------------
 // Common functions
 //--------------------------------------------------------------------------------------------
@@ -543,6 +563,26 @@ int SurfFlatten(ivec3 voxelId, ivec3 voxelRes)
 };
 
 #if defined(VOXELRT) || defined(VOXELLST)
+// G(Omega) of canopy canopyId for a ray direction. Rays query the same canopy
+// and direction cell after cell (as the ray direction and as the normalized
+// segment direction), so the last value is cached per invocation, keyed by
+// |cos zenith| (G depends on nothing else; 1e-6 changes G by < 1e-5).
+uint canopyProjectionCacheId = 0xffffffffu;
+float canopyProjectionCacheMu = -1.0;
+float canopyProjectionCacheValue = 0.5;
+float CanopyG(uint canopyId, vec3 direction)
+{
+    float length2 = dot(direction, direction);
+    float mu = length2 > 1.0e-24 ? abs(direction.y) * inversesqrt(length2) : 1.0;
+    if (canopyId != canopyProjectionCacheId || abs(mu - canopyProjectionCacheMu) > 1.0e-6) {
+        canopyProjectionCacheId = canopyId;
+        canopyProjectionCacheMu = mu;
+        canopyProjectionCacheValue = canopies[canopyId].lidfValid == 0
+            ? canopies[canopyId].G : lidfProjection(canopies[canopyId].lidf, mu);
+    }
+    return canopyProjectionCacheValue;
+}
+
 // OBJ cells have one state (faceId=0). Legacy generated buildings have five
 // contiguous states (faceId=1..5). Never offset a one-state cell into its neighbour.
 int ResolveVoxelSurfaceState(int base, vec3 normal)
@@ -825,7 +865,7 @@ float TurbidCellExtinction(int bufferId, ivec3 cell, vec3 direction)
             voxelHexs[mediumId].ay, voxelHexs[mediumId].az)), 0.0) * setting.scale;
     }
     float density = ResolveTurbidDensity(bufferId, canopyId, cell, ivec3(setting.voxelSize));
-    return density * max(canopies[canopyId].G, 0.0)
+    return density * max(CanopyG(canopyId, direction), 0.0)
         * ResolveClumpingIndex(bufferId, direction) * setting.scale;
 }
 
@@ -1197,14 +1237,39 @@ vec2 scattering_phase_function_direct_XZY_paper(vec3 directioni,vec3 directionj)
     return Gamma;
 }
 
+// Area scattering phase function of a canopy with the arguments of
+// scattering_phase_function_direct_XZY_paper: towardSource points to the
+// source, rayDirection from the observer into the scene (the scattered light
+// propagates along -rayDirection). Returns x = GammaR, y = GammaT - GammaR, so
+// Gamma = x (rho + tau) + y tau, normalized as (1/pi) int Gamma = (rho+tau) G.
+// With a LIDF the SAIL classes are integrated exactly (lidf_common.h);
+// otherwise the spherical shape is scaled to the constant G (G/0.5), so that
+// Gamma/G stays energy conserving for any G.
+vec2 CanopyPhase(Canopy canopy, vec3 towardSource, vec3 rayDirection)
+{
+    if (canopy.lidfValid == 0)
+        return scattering_phase_function_direct_XZY_paper(towardSource, rayDirection)
+            * (max(canopy.G, 0.0) / 0.5);
+    vec3 s = normalize(towardSource);
+    vec3 o = -normalize(rayDirection);
+    float gammaR = 0.0;
+    float gammaT = 0.0;
+    lidfGamma(canopy.lidf, s.x, s.y, s.z, o.x, o.y, o.z, gammaR, gammaT);
+    return vec2(gammaR, gammaT - gammaR);
+}
+
 
 // Kuusk (1991, 1995) bidirectional gap probability of the sun and view paths
 // from a scattering point, both directions pointing away from the scene:
-//   P = exp(-G rho (ls + lv) + G rho sqrt(ls lv) (1 - exp(-a)) / a)
+//   P = exp(-rho (Gs ls + Gv lv) + rho sqrt(Gs Gv ls lv) (1 - exp(-a)) / a)
 // with a = z * dso / hs, z the vertical depth, hs the leaf size in metres and
 //   dso = sqrt(tan^2 ts + tan^2 tv - 2 tan ts tan tv cos(phi_s - phi_v)),
 // so a vanishes in the exact backscatter direction (full correlation).
-float Hotspot_Kuusk(vec3 directioni,vec3 directionj, float pl_from, float pl_to, float density, float hs)
+// gFrom/gTo are the leaf projections G of the sun and view directions, the
+// same ones used for the extinction that defined pl_from/pl_to (SAIL uses
+// sqrt(ks ko) for the correlated term); without correlation P = Ts * Tv.
+float Hotspot_Kuusk(vec3 directioni,vec3 directionj, float pl_from, float pl_to, float density, float hs,
+                    float gFrom, float gTo)
 {
     float mus = max(directioni.y, 1.0e-3);
     float muv = max(directionj.y, 1.0e-3);
@@ -1219,7 +1284,10 @@ float Hotspot_Kuusk(vec3 directioni,vec3 directionj, float pl_from, float pl_to,
     float ks = dso * depth / max(hs, 1.0e-6);
     float xtemp = ks <= 0.1 ? 1.0 - ks * 0.5 : (1.0 - exp(-ks)) / ks;
     float chs = sqrt(max(pl_from * pl_to, 0.0)) * xtemp;
-    float xx = (chs - pl_from - pl_to) * GLEAF;
+    float gs = max(gFrom, 0.0);
+    float gv = max(gTo, 0.0);
+    float xx = gs == gv ? (chs - pl_from - pl_to) * gs // constant G: the former expression
+        : sqrt(gs * gv) * chs - gs * pl_from - gv * pl_to;
     float hotspot = exp(xx * density);
     return hotspot;
 }

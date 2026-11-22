@@ -14,9 +14,9 @@
 - VoxelEB 温度阻尼随迭代递减，迭代 29–35 → 16–20 次，结果差 ≤ 0.05 K。
 - FacetEB `auto` 后端在不支持 FP64 的设备上改为 GPU 辐射 + CPU 能量平衡，不再直接报错（2026-11-22 晚，未在无 FP64 设备上实测）。
 - 运行期间三维视口降到约 10 fps（交互时恢复），减少与引擎争用 GPU。
+- VoxelRT/VoxelEB 中 G、Γ 与 LIDF 自洽（2026-11-22 晚）：主机由 LIDFa/LIDFb 求 SAIL 13 区间频率传入 GPU，消光、太阳可见性、视线截获、直射投影与 Kuusk 热点都用方向相关 G(Ω)（`GLEAF` 常数已删除），Γ 按 SAIL volscatt 精确积分并满足 (1/π)∫Γ = (ρ+τ)G；刚体/介质、LIDFa = LIDFb = 0、超出定义域时回退常数 G 且 Γ 按 G/0.5 归一，LIDFa > 1 为精确球形（与旧结果相对差 ≤ 5e-7）。下文 2026-11-20、2026-10-12 中“VoxelEB 不读 LIDF”同时不再成立。尚存近似：VoxelEB 漫射→漫射多次散射核仍用球形角形状（乘 G(Ω′)/G(Ω) 保持能量守恒），未做 SCOPE/DART 对比。
 
 仍未处理（按建议优先级）：
-- VoxelRT 中 G、Γ 与 LIDF 不自洽：Γ 用球形叶公式却除以用户 G，`Hotspot_Kuusk` 写死 GLEAF=0.5，LIDFa/b 不被任何 shader 使用；G≠0.5 时散射能量不守恒。
 - RayTracing 阴影、天空、散射射线不跨周期边界；VoxelRT/VoxelEB 传输 pass 不走周期边界。
 - 2.5–5 µm 中波红外不计太阳反射（RayTracing、VoxelRT、VoxelEB），白天 MWIR 亮温估计偏低数 K。
 - VoxelEB 无 MOST 稳定度迭代（自由对流只是下限修补），G/Rn 仍偏高。
@@ -25,7 +25,7 @@
 - 桌面版服务端仍在 Electron 主进程同步执行准备、出图和格式转换；结果读取无缓存。
 - 其余见 2026-11-20 更新“仍未处理”。
 
-部署状态（取代 2026-11-20 的哈希）：`models\bin_x64\Release\histream.exe` 于 2026-11-22 15:42 重建（含 FacetEB auto 回退），SHA256 `a78b58bbee5e4d6740821233ad14db06d44585002123b7f25f6b7ff528068b1b`；`build-manifest.json` 随后由 `tools/write-build-manifest.mjs` 重写。
+部署状态（取代 2026-11-20 的哈希）：`models\bin_x64\Release\histream.exe` 于 2026-11-22 16:34 重建（含 LIDF/G/Γ 自洽；着色器 16:39 更新），SHA256 `da5a647a6d9d72de047145fc8c1a626721c90ac09f4d353d218605106d2c77b6`；`build-manifest.json` 随后由 `tools/write-build-manifest.mjs` 重写。
 
 ## 2026-11-20 更新
 

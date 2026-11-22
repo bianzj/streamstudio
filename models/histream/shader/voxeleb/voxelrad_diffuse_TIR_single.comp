@@ -210,7 +210,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
 
           if(typeId == TYPE_VEGETATION)
           {
-              G = canopies[canopyId].G;
+              G = CanopyG(canopyId, directioni);
             density = ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
             float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
             alpha_voxel = isParticipatingMedium(canopies[canopyId])
@@ -221,7 +221,8 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
 
           // get the phase function for solar direction to induced direction;
           // scattered light propagates back along -directioni to the receiver.
-          gammart = scattering_phase_function_direct_XZY_paper(directions, directioni);
+          // (Only the shortwave beam term uses it; Esun is 0 in this longwave pass.)
+          gammart = Esun > 0.0 ? CanopyPhase(canopies[canopyId], directions, directioni) : vec2(0.0);
           sunlitTemperature = voxelTempes[bufferId].sunlit;
           shadedTemperature = voxelTempes[bufferId].shaded;
           /////////////////////////////////////////////////////
@@ -480,11 +481,21 @@ void main()
         {
             // A randomly oriented leaf absorbs (1/2) * integral of L over the
             // full sphere with its two faces; in the stored pi*L field this is
-            // the sum over all directions times 2/N, as for diffuseVrad.
+            // the sum over all directions times 2/N, as for diffuseVrad. A
+            // LIDF canopy intercepts each direction in proportion to G(Omega):
+            // weights 2 G_i / sum G keep the isotropic total.
+            Canopy receiverCanopy = canopies[meshLinks[meshId0].canopyId];
+            bool leafWeighted = receiverCanopy.lidfValid != 0
+                && !isParticipatingMedium(receiverCanopy);
+            float projectionSum = 0.0;
+            if(leafWeighted)
+                for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
+                    projectionSum += CanopyDiffuseG(receiverCanopy, iangle);
             for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
                 compensatedAdd(rads, radsCorrection, finiteNonnegative(
-                    voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].cumulated));
-            rads *= DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+                    voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].cumulated)
+                    * (leafWeighted ? 2.0 * CanopyDiffuseG(receiverCanopy, iangle)
+                        / max(projectionSum, 1.0e-6) : DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT));
         }
         else
         {

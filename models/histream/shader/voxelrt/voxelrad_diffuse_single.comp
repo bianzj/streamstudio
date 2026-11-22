@@ -44,9 +44,8 @@ layout(local_size_x = GROUP_SIZEX) in;
 
 float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
-// from solar direction to selected direction;
-float GammaSR[DIFFUSE_ANGLE_NUM];
-float GammaST[DIFFUSE_ANGLE_NUM];
+// The solar -> diffuse-direction leaf phase function depends on the LIDF of
+// the canopy hit; it is evaluated per ray and canopy (CanopyPhase).
 
 // Opaque cells end a diffuse ray; turbid vegetation planes do not (a plane's
 // front cell is its own vegetation voxel).
@@ -112,12 +111,33 @@ float solidHemisphereCosineSum(vec3 normal, float azimuthOffset)
     return max(sum, 1.0e-6);
 }
 
-float receiverQuadratureWeight(bool surfaceReceiver, vec3 normal,
-                               float cosineSum, vec3 direction)
+// Vegetation receivers intercept the incident field in proportion to the
+// leaf projection G(Omega_i) of their LIDF: weights 2 G_i / sum_j G_j keep the
+// isotropic-field total of the fixed 2/N weights (constant G gives 2/N).
+// Returns 0 when the receiver needs no LIDF weighting.
+float leafReceiverProjectionSum(uint bufferId, float azimuthOffset)
 {
-    return surfaceReceiver
-        ? max(dot(normal, normalize(direction)), 0.0) / cosineSum
-        : DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+    uint meshId = instanceLinks[voxelLinks[bufferId].instanceId].meshId;
+    if(meshLinks[meshId].type != TYPE_VEGETATION) return 0.0;
+    Canopy canopy = canopies[meshLinks[meshId].canopyId];
+    if(canopy.lidfValid == 0 || isParticipatingMedium(canopy)) return 0.0;
+    float sum = 0.0;
+    for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
+        sum += CanopyDiffuseG(canopy, angle); // rotation keeps |y|
+    return max(sum, 1.0e-6);
+}
+
+float receiverQuadratureWeight(bool surfaceReceiver, vec3 normal,
+                               float cosineSum, vec3 direction,
+                               uint bufferId, float leafProjectionSum)
+{
+    if(surfaceReceiver)
+        return max(dot(normal, normalize(direction)), 0.0) / cosineSum;
+    if(leafProjectionSum <= 0.0) return DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+    uint canopyId = meshLinks[instanceLinks[voxelLinks[bufferId].instanceId].meshId].canopyId;
+    // Quadrature directions have |y| = (k + 0.5)/32 (see CanopyDiffuseG).
+    uint k = uint(clamp(floor(abs(normalize(direction).y) * 32.0), 0.0, 31.0));
+    return 2.0 * canopies[canopyId].diffuseG[k] / leafProjectionSum;
 }
 
 // A solid receiver's own cell is where its field is sampled, not an external
@@ -175,22 +195,6 @@ float diffuseAzimuthOffset(ivec3 voxelId)
     return fract(sin(hashValue) * 43758.5453) * M_TWO_PI;
 }
 
-// calculate the scattering phase function from solar angle to N angles.
-void Scattering_phase_function_solar_diffuse(float azimuthOffset)
-{
-    vec3 directioni = normalize(lightSet.direction);
-    for(int jangle = 0; jangle < DIFFUSE_ANGLE_NUM; jangle++)
-    {
-        vec3 directionj = normalize(rotateDiffuseAzimuth(
-            DIFFUSE_DIRECTIONS[jangle], azimuthOffset));
-        // Scattered light propagates back along -directionj towards the receiver;
-        // with directioni towards the sun the helper's angle is then exactly the
-        // incident/scattered propagation angle.
-        vec2 gamma = scattering_phase_function_direct_XZY_paper(directioni, directionj);
-        GammaSR[jangle] = gamma.x;
-        GammaST[jangle] = gamma.y;
-    }
-}
 
 // calculate the scattering phase function from N angles to N angles.
 void Scattering_phase_function_diffuse(float azimuthOffset)
@@ -263,6 +267,9 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
     ConfigureCone(voxelPos0, directioni, 0.0, 0.0);
     alpha_toSolar = 1.0;
     alpha_toVoxel = 1.0;
+    // Leaf phase function sun -> receiver for the canopy last hit. Scattered
+    // light propagates back along -directioni, i.e. directioni is the ray.
+    uint gammaCanopyId = 0xffffffffu;
 	  voxelRads[voxelRadiationIndex(bufferId0, iangle)].induced = 0.0;
 
     // A solid surface only receives radiance through the hemisphere of its
@@ -339,7 +346,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
           {
 
 
-              G = canopy.G;
+              G = CanopyG(canopyId, directioni);
               density = isParticipatingMedium(canopy) ? canopy.density
                   : ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
               float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
@@ -350,8 +357,10 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
               alpha_toSolar = voxelDirs[bufferId].solar;
 
             // get the phase function for solar direction to induced direction 
-            gammart.x = GammaSR[iangle];
-            gammart.y = GammaST[iangle];
+            if(canopyId != gammaCanopyId) {
+              gammart = CanopyPhase(canopy, directions, directioni);
+              gammaCanopyId = canopyId;
+            }
             sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
             shadedTemperature = thermalMaterials[thermalId].shadedTemperature;
             /////////////////////////////////////////////////////
@@ -546,6 +555,8 @@ void voxel_raytracing_diffuse_packet(
   bool surfaceReceiver = receiverType == TYPE_BUILDING || receiverType == TYPE_SOIL || receiverType == TYPE_WATER;
   vec3 receiverNormal = surfaceReceiver ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
   float cosineSum = surfaceReceiver ? solidHemisphereCosineSum(receiverNormal, azimuthOffset) : 1.0;
+  float leafProjectionSum = surfaceReceiver ? 0.0 : leafReceiverProjectionSum(bufferId0, azimuthOffset);
+  vec3 solarDirection = normalize(lightSet.direction);
 
   for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; ++iangle)
   {
@@ -562,10 +573,13 @@ void voxel_raytracing_diffuse_packet(
     // Surface receivers integrate their outer (normal) hemisphere only.
     if(surfaceReceiver && dot(direction, receiverNormal) <= 0.0) continue;
     float quadratureWeight = receiverQuadratureWeight(
-        surfaceReceiver, receiverNormal, cosineSum, direction);
+        surfaceReceiver, receiverNormal, cosineSum, direction,
+        bufferId0, leafProjectionSum);
     Ray ray = Ray(voxelPos0, direction);
     ConfigureCone(voxelPos0, direction, 0.0, 0.0);
     float alphaToVoxel = 1.0;
+    uint gammaCanopyId = 0xffffffffu;
+    vec2 gammaCanopy = vec2(0.0);
     int kstep = 0;
 
     for(kstep = 0; kstep <= setting.maxStep; ++kstep)
@@ -608,14 +622,19 @@ void voxel_raytracing_diffuse_packet(
               : ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
           float pathLength = Vector2Distance(
               sstate.position - sstate.lastPosition);
+          float leafG = CanopyG(canopyId, direction);
           float alphaVoxel = isParticipatingMedium(canopy)
               ? canopyVoxelTransmittance(
-                    canopy, density, canopy.G, pathLength, scale)
-              : ResolveSpatialInteraction(bufferId, density, canopy.G,
+                    canopy, density, leafG, pathLength, scale)
+              : ResolveSpatialInteraction(bufferId, density, leafG,
                     sstate.lastPosition, sstate.position, scale).x;
           float alphaToSolar = voxelDirs[bufferId].solar;
-          float gammaR = GammaSR[iangle];
-          float gammaT = GammaST[iangle];
+          if(canopyId != gammaCanopyId && !isParticipatingMedium(canopy)) {
+            gammaCanopy = CanopyPhase(canopy, solarDirection, direction);
+            gammaCanopyId = canopyId;
+          }
+          float gammaR = gammaCanopy.x;
+          float gammaT = gammaCanopy.y;
           float sunlitTemperature =
               thermalMaterials[thermalId].sunlitTemperature;
           float shadedTemperature =
@@ -662,7 +681,7 @@ void voxel_raytracing_diffuse_packet(
                 radiance += thermalRadiance * (1.0 - alphaVoxel)
                     * emis * alphaToVoxel;
               }
-              radiance += alphaToSolar * gamma / max(canopy.G, 0.000001)
+              radiance += alphaToSolar * gamma / max(leafG, 0.000001)
                   * packetEsun[bandOffset]
                   * alphaToVoxel * (1.0 - alphaVoxel);
             }
@@ -759,6 +778,7 @@ void voxel_collision_order_packet(
   bool surfaceReceiver = receiverType == TYPE_BUILDING || receiverType == TYPE_SOIL || receiverType == TYPE_WATER;
   vec3 receiverNormal = surfaceReceiver ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
   float cosineSum = surfaceReceiver ? solidHemisphereCosineSum(receiverNormal, azimuthOffset) : 1.0;
+  float leafProjectionSum = surfaceReceiver ? 0.0 : leafReceiverProjectionSum(bufferId0, azimuthOffset);
 
   for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; ++iangle)
   {
@@ -766,7 +786,8 @@ void voxel_collision_order_packet(
     vec3 direction = normalize(direction0);
     if(surfaceReceiver && dot(direction, receiverNormal) <= 0.0) continue;
     float quadratureWeight = receiverQuadratureWeight(
-        surfaceReceiver, receiverNormal, cosineSum, direction);
+        surfaceReceiver, receiverNormal, cosineSum, direction,
+        bufferId0, leafProjectionSum);
     Ray ray = Ray(voxelPos0, direction);
     ConfigureCone(voxelPos0, direction, 0.0, 0.0);
     float alphaToVoxel = 1.0;
@@ -798,9 +819,9 @@ void voxel_collision_order_packet(
           float density = medium ? canopy.density
               : ResolveTurbidDensity(bufferId, meshLink.canopyId, voxelId, voxelRes);
           float alphaVoxel = medium
-              ? canopyVoxelTransmittance(canopy, density, canopy.G,
+              ? canopyVoxelTransmittance(canopy, density, CanopyG(meshLink.canopyId, direction),
                     Vector2Distance(sstate.position - sstate.lastPosition), scale)
-              : ResolveSpatialInteraction(bufferId, density, canopy.G,
+              : ResolveSpatialInteraction(bufferId, density, CanopyG(meshLink.canopyId, direction),
                     sstate.lastPosition, sstate.position, scale).x;
           float pCanopy = medium ? 0.0 : calReCor(canopy.lai);
           for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset)
@@ -970,7 +991,6 @@ void main()
     const int diffuseSampleSets = 5;
     for(int kiter = 0; kiter < diffuseSampleSets; ++kiter) {
       float iterationOffset = azimuthOffset + float(kiter) * 2.39996323;
-      Scattering_phase_function_solar_diffuse(iterationOffset);
       float iterationRadiance[SPECTRAL_PACKET_SIZE];
       voxel_raytracing_diffuse_packet(
           voxelPos0, bufferId0, nanoVDBLink, kwave, bandCount,
@@ -1027,7 +1047,6 @@ void main()
               // increasing the existing ray count.
               float iterationOffset = azimuthOffset
                   + float(kiter) * 2.39996323;
-              Scattering_phase_function_solar_diffuse(iterationOffset);
               voxel_raytracing_diffuse(voxelPos0, bufferId0, nanoVDBLink,
                   kwave, Esun, Esky, kiter, iterationOffset);
               // This invocation exclusively owns bufferId0's directional
@@ -1037,6 +1056,8 @@ void main()
 
               float cosineSum0 = surfaceReceiver0
                   ? solidHemisphereCosineSum(receiverNormal0, iterationOffset) : 1.0;
+              float leafProjectionSum0 = surfaceReceiver0
+                  ? 0.0 : leafReceiverProjectionSum(bufferId0, iterationOffset);
               float iterationRadiance = 0.0;
               float iterationCorrection = 0.0;
               for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
@@ -1047,7 +1068,8 @@ void main()
                   // outer hemisphere (skipped directions hold zero).
                   float weight = receiverQuadratureWeight(surfaceReceiver0,
                       receiverNormal0, cosineSum0, rotateDiffuseAzimuth(
-                          DIFFUSE_DIRECTIONS[iangle], iterationOffset));
+                          DIFFUSE_DIRECTIONS[iangle], iterationOffset),
+                      bufferId0, leafProjectionSum0);
                   compensatedAdd(iterationRadiance, iterationCorrection,
                       finiteNonnegative(voxelRads[index].induced) * weight);
               }

@@ -2205,16 +2205,42 @@ function physicalValues(item) {
   return [['rss', p.rss], ['热容', p.cs], ['密度', p.rhos], ['导热率', p.lambdas], ['SMC', p.SMC], ['饱和量', p.Satwater]]
 }
 
+// Mirrors withLeafAngles in models/histream/src/base/compo.cpp: how VoxelRT /
+// VoxelEB obtain the leaf projection G of a canopy.
+//   lidf: G(Ω) and the phase function come from the SAIL LIDF (LIDFa, LIDFb)
+//   spherical: LIDFa > 1, exact spherical distribution (G = 0.5)
+//   constant: rigid/medium or LIDFa = LIDFb = 0 (unspecified) -> stored G
+//   invalid: |LIDFa| + |LIDFb| > 1 -> stored G (the engine prints a warning)
+function canopyLeafAngleMode(item = {}) {
+  if ((item.structureType || 'canopy') !== 'canopy') return 'constant'
+  const a = Number(item.LIDFa ?? -0.35)
+  const b = Number(item.LIDFb ?? -0.15)
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 'invalid'
+  if (a === 0 && b === 0) return 'constant'
+  if (a > 1) return 'spherical'
+  return Math.abs(a) + Math.abs(b) > 1 + 1e-6 ? 'invalid' : 'lidf'
+}
+
+const CANOPY_G_HINTS = Object.freeze({
+  lidf: 'G 由叶倾角分布 LIDFa/LIDFb（SAIL 13 区间）按方向推导，消光与叶片散射相函数一致；上面的 G 值仅保留，不参与计算。',
+  spherical: 'LIDFa > 1 表示精确球形叶倾角分布：G = 0.5，使用 Ross 球形闭式；上面的 G 值不参与计算。',
+  constant: '使用上面的常数 G（刚体、参与介质或 LIDFa = LIDFb = 0 未指定叶倾角时）；散射相函数为球形形状并按 G/0.5 归一，保持能量守恒。',
+  invalid: 'LIDFa/LIDFb 超出 SAIL 定义域（|a| + |b| ≤ 1），引擎回退为上面的常数 G 与球形形状相函数。'
+})
+
 function canopyValues(item) {
   const labels = { canopy: '混沌介质', rigid: '刚体', fire: '火焰', fog: '雾' }
   if (item.structureType === 'fire' || item.structureType === 'fog') return [
     ['结构', labels[item.structureType]], ['消光', `${item.extinction} m⁻¹`], ['散射率', item.scatteringAlbedo],
     ['非对称', item.asymmetry], ['温度', `${item.fixedTemperature} K`], ['发射倍率', item.emissionScale]
   ]
+  const mode = canopyLeafAngleMode(item)
+  const gLabel = mode === 'lidf' ? `LIDF (${item.LIDFa ?? -0.35}, ${item.LIDFb ?? -0.15})`
+    : mode === 'spherical' ? '0.5（球形）' : item.G
   return [
     ['结构', labels[item.structureType] || '混沌介质'],
     ['LAI', item.lai], ['LAD', item.density], ['高度', `${item.hc} m`],
-    ['G', item.G], ['热点', item.hspot]
+    ['G', gLabel], ['热点', item.hspot]
   ]
 }
 
@@ -4481,7 +4507,20 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
     const defaults = { ...createMaterialPresets().canopies[0], ...(item || {}) }
     const structureOptions = [['canopy', '混沌介质（多孔透射）'], ['rigid', '刚体（不透光轮廓）'], ['fire', '火焰（参与介质）'], ['fog', '雾（参与介质）']]
       .map(([value, label]) => `<option value="${value}" ${value === defaults.structureType ? 'selected' : ''}>${label}</option>`).join('')
-    target.innerHTML = `${presetSelect('结构类型', 'presetStructureType', 'structureType', structureOptions)}${physicalInput('叶面积指数 LAI', 'lai', defaults.lai, 0.01)}${physicalInput('叶面积密度 LAD', 'density', defaults.density, 0.01)}${physicalInput('介质高度 hc（m）', 'hc', defaults.hc, 0.01)}${physicalInput('投影系数 G', 'G', defaults.G, 0.01)}${physicalInput('叶倾角参数 LIDFa', 'LIDFa', defaults.LIDFa, 0.01)}${physicalInput('叶倾角参数 LIDFb', 'LIDFb', defaults.LIDFb, 0.01)}${physicalInput('热点参数 hspot', 'hspot', defaults.hspot, 0.01)}${physicalInput('叶宽 leafwidth（m）', 'leafwidth', defaults.leafwidth, 0.01)}${physicalInput('消光系数（m⁻¹）', 'extinction', defaults.extinction ?? 0, 0.01)}${physicalInput('单次散射反照率', 'scatteringAlbedo', defaults.scatteringAlbedo ?? 0, 0.01)}${physicalInput('散射非对称因子', 'asymmetry', defaults.asymmetry ?? 0, 0.01)}${physicalInput('发射倍率', 'emissionScale', defaults.emissionScale ?? 0, 0.01)}${physicalInput('固定温度（K）', 'fixedTemperature', defaults.fixedTemperature ?? 0, 1)}`
+    target.innerHTML = `${presetSelect('结构类型', 'presetStructureType', 'structureType', structureOptions)}${physicalInput('叶面积指数 LAI', 'lai', defaults.lai, 0.01)}${physicalInput('叶面积密度 LAD', 'density', defaults.density, 0.01)}${physicalInput('介质高度 hc（m）', 'hc', defaults.hc, 0.01)}${physicalInput('投影系数 G（仅 LIDF 无效时使用）', 'G', defaults.G, 0.01)}${physicalInput('叶倾角参数 LIDFa', 'LIDFa', defaults.LIDFa, 0.01)}${physicalInput('叶倾角参数 LIDFb', 'LIDFb', defaults.LIDFb, 0.01)}<div class="notice" id="presetCanopyGHint" style="grid-column:1 / -1"></div>${physicalInput('热点参数 hspot', 'hspot', defaults.hspot, 0.01)}${physicalInput('叶宽 leafwidth（m）', 'leafwidth', defaults.leafwidth, 0.01)}${physicalInput('消光系数（m⁻¹）', 'extinction', defaults.extinction ?? 0, 0.01)}${physicalInput('单次散射反照率', 'scatteringAlbedo', defaults.scatteringAlbedo ?? 0, 0.01)}${physicalInput('散射非对称因子', 'asymmetry', defaults.asymmetry ?? 0, 0.01)}${physicalInput('发射倍率', 'emissionScale', defaults.emissionScale ?? 0, 0.01)}${physicalInput('固定温度（K）', 'fixedTemperature', defaults.fixedTemperature ?? 0, 1)}`
+    const updateCanopyGField = () => {
+      const field = (name) => $(`#presetParameterFields [name="${name}"]`)
+      const mode = canopyLeafAngleMode({ structureType: field('structureType')?.value, LIDFa: field('LIDFa')?.value, LIDFb: field('LIDFb')?.value })
+      const gInput = field('G')
+      // The stored G is kept (old projects stay readable); it is only read-only
+      // while the engine derives G(Ω) from LIDFa/LIDFb.
+      if (gInput) gInput.readOnly = mode === 'lidf' || mode === 'spherical'
+      const hint = $('#presetCanopyGHint')
+      if (hint) hint.textContent = CANOPY_G_HINTS[mode]
+    }
+    $$('#presetParameterFields [name="structureType"], #presetParameterFields [name="LIDFa"], #presetParameterFields [name="LIDFb"]')
+      .forEach((input) => { input.addEventListener('input', updateCanopyGField); input.addEventListener('change', updateCanopyGField) })
+    updateCanopyGField()
     return
   }
   const typeOptions = [['Building', '建筑表面'], ['Photovoltaic', '光伏板热电耦合'], ['Membrane', '篷布/织物薄膜（FacetEB）'], ['Vegetation', '植被生理生化'], ['Wood', '木质固体热平衡'], ['Soil', '土壤表面物化'], ['Water', '水体物性'], ['Ship', '船舶表面物化']].map(([value, label]) => `<option value="${value}" ${value === state.presetPhysicalType ? 'selected' : ''}>${label}</option>`).join('')

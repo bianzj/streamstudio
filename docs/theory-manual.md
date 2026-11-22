@@ -390,6 +390,17 @@ $$
 - **热红外环境温度。** VoxelEB 图像中反射环境项的温度由入射长波反算：入射 = 存储吸收量 ÷ 吸收率（1 − r − t），植被再取单面一半，低发射率表面不再因只用吸收量而偏冷。
 - **夜间跳过短波。** 太阳天顶角 ≥ 90° 且实测短波 ≤ 0.001 W m⁻² 时，该时间节点没有太阳直射也没有天空短波：实现先把太阳可见性与天空漫射比例（VoxelDir）、净辐射、PAR 和方向辐射场整体清零，再跳过可见性、直射与全部散射阶数，直接进入热红外传播与能量平衡。结果与逐条追踪完全一致（各源项在零辐照下恒为 0），散射诊断仍按节点写出（耗时为清零时间、各阶计数为 0），标准输出打印 `SHORTWAVE_SKIPPED`。晨昏时太阳仍在地平线上（天顶角 < 90°）即使短波很小也照常追踪。
 
+**叶倾角分布、G 与 Γ 的自洽（2026-11-22 修正）。** 此前 VoxelRT/VoxelEB 的消光只用常数 $G$，叶片散射相函数 $\Gamma$ 固定为球形叶倾角的 Ross 闭式（隐含 $G=0.5$），Kuusk 热点式又写死 $G_{leaf}=0.5$；`LIDFa/LIDFb` 不参与计算。$G\neq0.5$ 时单次散射项 $\Gamma/G$ 被放大或缩小 $0.5/G$ 倍，能量不守恒。现在三者由同一叶倾角分布导出（共享代码 `models/histream/shader/lidf_common.h`，主机与 GPU 同源）：
+
+- **叶倾角频率。** 主机端按 Verhoef 双参数 LIDF（SCOPE `leafangles`/PROSAIL `dladgen`）对 SAIL 13 个区间（中心 5°,15°,…,75°,81°,83°,85°,87°,89°）积分得频率 $f_i$（和为 1），连同漫射 64 方向上的 $G$ 表随冠层参数传入 GPU。
+- **方向相关的 G。** $G(\boldsymbol\Omega)=\sum_i f_i\,\psi(\theta_{L,i},\mu)$，$\psi$ 为单一倾角类方位平均投影的闭式（$\cot\theta_L\cot\theta\ge1$ 时为 $\cos\theta_L\mu$，否则 $\tfrac{2}{\pi}[(\beta-\tfrac{\pi}{2})\cos\theta_L\mu+\sin\beta\sin\theta_L\sin\theta]$，$\cos\beta=-\cot\theta_L\cot\theta$），即 SAIL 的 $k_s\cos\theta_s$。任意 LIDF 在全球面上 $\langle G\rangle=1/2$。沿线消光 $\tau_k(\boldsymbol\omega)$ 中的 $G$、太阳可见性、视线截获 $(1-\tau)/G$、VoxelEB 直射投影 $G(\Omega_s)/\cos\theta_s$ 都用对应方向的 $G$。
+- **Γ 与 G 同归一。** $\Gamma(\Omega'\!\to\!\Omega)=\rho\Gamma_R+\tau\Gamma_T$，$\Gamma_{R/T}$ 按倾角类用 SAIL `volscatt` 解析方位积分再按 $f_i$ 求和，满足 $\frac{1}{\pi}\int_{4\pi}\Gamma\,d\Omega=(\rho+\tau)G(\Omega')$，因此单次散射 $\Gamma/G$ 对任意 LIDF 能量守恒。球形分布的连续极限与 Ross 闭式 $\Gamma=\frac{\rho+\tau}{3\pi}(\sin\alpha-\alpha\cos\alpha)+\frac{\tau}{3}\cos\alpha$ 一致（误差 < 2×10⁻⁷）。
+- **热点。** Kuusk 联合间隙率改为 $P=\exp[-\rho_L(G_s l_s+G_v l_v)+\rho_L\sqrt{G_sG_v l_s l_v}\,(1-e^{-a})/a]$，$G_s,G_v$ 与定义 $l_s,l_v$ 的消光同源；无相关时严格等于 $T_sT_v$。
+- **漫射与多次散射。** 植被接收体对 64 个方向的入射权重由固定 $2/N$ 改为 $2G_i/\sum_j G_j$（各向同性场总量不变）；VoxelEB 多次散射核保留球形角形状，乘 $G(\Omega')/G(\Omega)$ 以保持对截获量的能量守恒（这是近似：漫射→漫射核未用精确 LIDF 形状），一次散射太阳源用精确 LIDF $\Gamma$ 并在离散方向上归一。
+- **回退与球形极限。** 刚体、火焰/雾介质、`LIDFa = LIDFb = 0`（旧工程/预设表示未指定）以及超出 SAIL 定义域（$|a|+|b|>1$，引擎打印警告）时使用用户常数 $G$，$\Gamma$ 取球形形状并乘 $G/0.5$，保证 $\Gamma/G$ 守恒；`LIDFa > 1` 按 SCOPE 约定表示精确球形分布，$G=0.5$ 且使用原 Ross 闭式，结果与修正前一致（回归检验相对差 ≤ 5×10⁻⁷，仅浮点舍入）。默认 SAIL "球形" 参数 (−0.35, −0.15) 的 $G$ 在 0.490–0.505 之间随天顶角变化，因而默认工程有小幅数值变化。
+
+数值检验见 `tools/test-lidf-gamma.cpp`：13 区间频率、闭式 $G$ 与暴力方位积分及独立 PROSAIL 双精度转写的对比（平面型 a=1,b=0、直立型 a=−1,b=0 等，误差 < 2×10⁻⁷）、$\langle G\rangle=1/2$、$\Gamma$ 归一（相对误差 < 2×10⁻⁵）、$\Gamma$ 与暴力积分及球形极限。
+
 高光谱加速模式一次最多打包 4 个相邻波段，共享相同几何遍历；每个波段仍使用自己的光谱参数并产生独立结果，因此不引入波长插值误差。
 
 ### 5.3 均质体元与尺度意义

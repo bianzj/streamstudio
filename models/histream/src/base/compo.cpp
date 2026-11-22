@@ -5,6 +5,7 @@
 #include "compo.h"
 
 #include "soil_tir_emissivity.h"
+#include "../../shader/lidf_common.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,6 +19,38 @@
 #include <utility>
 
 namespace {
+// Derive the SAIL leaf inclination class frequencies of a turbid canopy.
+// They define G(Omega) and the area scattering phase function on the GPU.
+// lidfValid stays 0 (constant G, spherical-shaped Gamma scaled by G/0.5) for
+//   * rigid bodies and participating media (structureType != 0),
+//   * LIDFa = LIDFb = 0, the "not specified" placeholder of older projects
+//     and presets: the user G is used as before,
+//   * LIDFa > 1, the SCOPE convention for the exact spherical distribution:
+//     G = 0.5 and the Ross closed form, i.e. exactly the former model,
+//   * parameters outside the SAIL domain |a| + |b| <= 1 (warning).
+Canopy withLeafAngles(Canopy canopy, const std::string& name)
+{
+    canopy.lidfValid = 0;
+    for (float& value : canopy.lidf) value = 0.0f;
+    if (canopy.structureType == 0 && std::isfinite(canopy.LIDFa) && canopy.LIDFa > 1.0f)
+        canopy.G = 0.5f;
+    for (float& value : canopy.diffuseG) value = canopy.G;
+    if (canopy.structureType != 0) return canopy;
+    if (canopy.LIDFa == 0.0f && canopy.LIDFb == 0.0f) return canopy;
+    if (std::isfinite(canopy.LIDFa) && canopy.LIDFa > 1.0f) return canopy;
+    if (lidf::sailLeafAngleFrequencies(canopy.LIDFa, canopy.LIDFb, canopy.lidf)) {
+        canopy.lidfValid = 1;
+        for (int k = 0; k < 32; ++k)
+            canopy.diffuseG[k] = lidf::lidfProjection(canopy.lidf, (2.0f * k + 1.0f) / 64.0f);
+    } else {
+        std::cerr << "Warning: canopy '" << name << "' LIDFa=" << canopy.LIDFa
+                  << " LIDFb=" << canopy.LIDFb
+                  << " is outside the SAIL domain (|a|+|b|<=1); using constant G="
+                  << canopy.G << " with a spherical phase function." << std::endl;
+    }
+    return canopy;
+}
+
 float bounded(float value, float fallback)
 {
     return std::clamp(std::isfinite(value) ? value : fallback, 0.0f, 1.0f);
@@ -162,7 +195,7 @@ bool Compo::createCompOptical(std::shared_ptr<FileIO> &fileio, std::shared_ptr<V
     meshio->canopyNames.clear();
     int canopyId = 0;
     for (const auto &canopyxml : fileio->m_pVoxelrtXml->canopyxmls) {
-        meshio->canopies.push_back(canopyxml.canopy);
+        meshio->canopies.push_back(withLeafAngles(canopyxml.canopy, canopyxml.canopyName));
         meshio->canopyNames[canopyxml.canopyName] = canopyId++;
     }
     return true;
@@ -419,7 +452,7 @@ bool Compo::createCompProperty(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
     // DEFERRED[低] Bug: canopies/leafbios/soilsets/watersets 及其 Names 映射在追加前未 clear（thermals/spectrals 却清了），重复调用会产生重复条目且 map.insert 不覆盖旧 ID；理由：属 createCompProperty 生命周期/初始化重构，不属本轮允许的缺陷类别，未改。
     id = 0;
     for(auto &canopyxml: fileio->m_pVoxelebXml->canopyxmls){
-        meshio->canopies.push_back(canopyxml.canopy);
+        meshio->canopies.push_back(withLeafAngles(canopyxml.canopy, canopyxml.canopyName));
         meshio->canopyNames.insert({canopyxml.canopyName,id});
         id++;
     }

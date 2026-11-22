@@ -188,9 +188,9 @@ struct Canopy
     float density; // gap property
     float height;  // this is used for the aerodynamic resistance inside a system
     float width;  // ???
-    float G;      // gap property
-    float LIDFa;  // For dynamic G
-    float LIDFb;  // For dynamic G
+    float G;      // user projection coefficient; transport uses it only when lidfValid == 0
+    float LIDFa;  // Verhoef/SAIL leaf inclination parameter a
+    float LIDFb;  // Verhoef/SAIL leaf inclination parameter b
     float hspot;      // for the hotspot
     float leafwidth; // for the aerodynamic resistance
     int structureType{0}; // 0: canopy, 1: rigid, 2: fire/smoke, 3: fog
@@ -199,6 +199,16 @@ struct Canopy
     float asymmetry{0.0f};
     float emissionScale{0.0f};
     float fixedTemperature{0.0f};
+    // Host-derived from LIDFa/LIDFb (shader/lidf_common.h): 1 when lidf holds
+    // the 13 SAIL class frequencies, which then define G(Omega) and Gamma.
+    // 0 (rigid, media, LIDFa = LIDFb = 0, LIDFa > 1 = exact spherical with
+    // G = 0.5, invalid LIDF): constant G with a spherical-shaped Gamma scaled
+    // by G/0.5. Keep in sync with Canopy in shader/parameters.h.
+    int lidfValid{0};
+    float lidf[13]{};
+    // G at the |cos zenith| (2k+1)/64 of the 64-direction diffuse quadrature
+    // (DIFFUSE_DIRECTIONS[i] has |y| = (2*(i>>1)+1)/64); G when lidfValid == 0.
+    float diffuseG[32]{};
 };
 
 

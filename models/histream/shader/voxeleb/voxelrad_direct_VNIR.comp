@@ -83,12 +83,12 @@ void main()
     if(solarDirection.y <= 0.01) return;
 
     // Rin*direct is horizontal irradiance. Convert it to the irradiance on the
-    // absorbing element: G/cos(sza) per one-sided leaf area for foliage,
+    // absorbing element: G(sun)/cos(sza) per one-sided leaf area for foliage,
     // cos(incidence)/cos(sza) for a solid facet.
     float projection = 1.0;
     bool medium = isParticipatingMedium(canopy);
     if(typeId == TYPE_VEGETATION && !medium) {
-        projection = max(canopy.G, 0.0) / max(cosSolar, 0.05);
+        projection = max(CanopyProjection(canopy, solarDirection), 0.0) / max(cosSolar, 0.05);
     } else if(medium) {
         projection = alpha_toSolar / max(cosSolar, 0.05);
     } else {

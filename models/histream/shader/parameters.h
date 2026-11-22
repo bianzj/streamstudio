@@ -59,6 +59,13 @@ struct Canopy
 	float asymmetry;
 	float emissionScale;
 	float fixedTemperature;
+	// 1: lidf holds the 13 SAIL leaf inclination class frequencies (host
+	// derived from LIDFa/LIDFb), which define G(Omega) and Gamma; 0: constant
+	// G (see lidf_common.h). Keep in sync with Canopy in src/base/structs_cg.h.
+	int lidfValid;
+	float lidf[13];
+	// G at |cos zenith| (2k+1)/64, i.e. at DIFFUSE_DIRECTIONS[2k] and [2k+1].
+	float diffuseG[32];
 };
 
 bool isParticipatingMedium(Canopy canopy)

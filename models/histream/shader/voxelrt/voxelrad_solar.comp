@@ -74,7 +74,7 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
             uint canopyId = meshLinks[meshId].canopyId;
             if(typeId == TYPE_VEGETATION)
             {
-                G = canopies[canopyId].G;
+                G = CanopyG(canopyId, lightDirection);
                 density = ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
                 float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
                 alphaVoxel = isParticipatingMedium(canopies[canopyId])

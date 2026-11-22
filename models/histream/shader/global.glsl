@@ -41,7 +41,8 @@ const float InvPI = 0.318309886183790671538;
 #define EPSION_3 0.001
 
 #define EPSION 0.00000001
-#define GLEAF 0.5
+// Hotspot_Kuusk takes the leaf projections G of the sun/view directions used
+// for extinction (CanopyG); there is no fixed leaf G constant any more.
 #define HSPOT 0.5
 
 #define GROUP_SIZEXY 8
@@ -59,6 +60,8 @@ const float InvPI = 0.318309886183790671538;
 // bias. For hemisphere-integrated quantities every direction keeps a fixed
 // weight; occluded zero-radiance directions therefore remain part of the
 // quadrature instead of being removed from the denominator.
+// Directions 2k and 2k+1 are antipodal with |y| = (2k+1)/64; Canopy.diffuseG
+// (leaf projection per LIDF) and the scattering pass rely on this layout.
 const float DIFFUSE_SPHERE_AVERAGE_WEIGHT = 0.015625; // 1 / 64
 const float DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT = 0.03125; // 2 / 64
 

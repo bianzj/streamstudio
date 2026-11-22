@@ -141,13 +141,15 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
     // uses the corresponding radiance propagation direction.
     vec3 solarDirection = normalize(lightSet.direction);
     vec3 viewDirection = normalize(-ray.direction);
-    vec2 gamma = scattering_phase_function_direct_XZY_paper(
-        solarDirection, -viewDirection);
+    // Leaf phase function of the canopy last hit (it depends on its LIDF).
+    vec2 gamma = vec2(0.0);
+    uint gammaCanopyId = 0xffffffffu;
     ivec3 voxelRes = ivec3(setting.voxelSize);
     // Canopy parameters of the last turbid voxel on this ray, reused for the
     // Kuusk joint gap probability of surfaces seen through the canopy.
     float hotspotDensity = DENSITY;
-    float hotspotG = LEAFG;
+    float hotspotGs = LEAFG;
+    float hotspotGv = LEAFG;
     float hotspotLeafSize = HSPOT;
 
     float canopyTSum = 0.0;
@@ -246,7 +248,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 // LST = voxelDirs[bufferId].solar;
                 // return true;
 
-                G = canopies[canopyId].G;
+                // Leaf projection along the view ray (extinction) and to the sun.
+                G = CanopyG(canopyId, ray.direction);
+                float solarG = CanopyProjection(canopy, solarDirection);
                 density = isParticipatingMedium(canopy) ? canopy.density
                     : ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
 				float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);// * 0.2; //!!!!需要改回去！！！
@@ -313,19 +317,21 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 				else
 				{
 				// this is used for the hotspot effect
-                float solarDensity = max(HexHotspotDensity(bufferId, solarDirection, density, G), 0.000001);
+                float solarDensity = max(HexHotspotDensity(bufferId, solarDirection, density, solarG), 0.000001);
                 float viewDensity = max(HexHotspotDensity(bufferId, viewDirection, density, G), 0.000001);
                 float safeG = max(G, 0.000001);
+                float safeSolarG = max(solarG, 0.000001);
 				if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
-				else pl_toSolar = -log(clamp(alpha_toSolar, 0.000001, 1.0)) / safeG / solarDensity;
+				else pl_toSolar = -log(clamp(alpha_toSolar, 0.000001, 1.0)) / safeSolarG / solarDensity;
 				if(alpha_toSensor < 0.0001) pl_toSensor = 10000.0;
 				else pl_toSensor = -log(clamp(alpha_toSensor, 0.000001, 1.0)) / safeG / viewDensity;
                 // SAIL hspot is leaf size / canopy height; Kuusk needs metres.
                 float hspot = max(canopy.hspot * canopy.height, 0.0001);
                 hotspotDensity = sqrt(solarDensity * viewDensity);
-                hotspotG = safeG;
+                hotspotGs = safeSolarG;
+                hotspotGv = safeG;
                 hotspotLeafSize = hspot;
-				float hotspot = Hotspot_Kuusk(solarDirection, viewDirection, pl_toSolar, pl_toSensor, sqrt(solarDensity * viewDensity), hspot);
+				float hotspot = Hotspot_Kuusk(solarDirection, viewDirection, pl_toSolar, pl_toSensor, sqrt(solarDensity * viewDensity), hspot, safeSolarG, safeG);
                 if (!isnan(hotspot) && !isinf(hotspot)) {
                     hotspot = clamp(hotspot, 0.0, 1.0);
                 }
@@ -370,6 +376,10 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                     }
                 }
 
+                if (canopyId != gammaCanopyId) {
+                    gamma = CanopyPhase(canopy, solarDirection, -viewDirection);
+                    gammaCanopyId = canopyId;
+                }
                 for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
                     float wavelength = wave[kwave];
                     float refl = clamp(specMaterials[spectralBase + kwave].reflectance, 0.0, 1.0);
@@ -390,7 +400,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                             * diffuseIrradiance * 0.5;
                         // Single scattering of the direct beam (Ross/Kuusk): leaf phase
                         // function with this leaf's rho/tau, view interception
-                        // (1 - alpha_voxel)/G, and the joint sun/view gap probability
+                        // (1 - alpha_voxel)/G(view), and the joint sun/view gap probability
                         // (Kuusk hot spot) instead of independent transmittances.
                         float leafGamma = max(gamma.x * (refl + trans) + gamma.y * trans, 0.0);
                         Radiance[kwave] += directIrradiance * leafGamma / safeG
@@ -472,11 +482,11 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 
 				// this is used for the hotspot effect
 				if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
-				else pl_toSolar = -log(alpha_toSolar) / hotspotG / hotspotDensity;
+				else pl_toSolar = -log(alpha_toSolar) / hotspotGs / hotspotDensity;
 				if(alpha_toSensor < 0.0001) pl_toSensor = 10000.0;
-				else pl_toSensor = -log(alpha_toSensor) / hotspotG / hotspotDensity;
+				else pl_toSensor = -log(alpha_toSensor) / hotspotGv / hotspotDensity;
 
-				float hotspot =  Hotspot_Kuusk(solarDirection, viewDirection, pl_toSolar, pl_toSensor, hotspotDensity, hotspotLeafSize);
+				float hotspot =  Hotspot_Kuusk(solarDirection, viewDirection, pl_toSolar, pl_toSensor, hotspotDensity, hotspotLeafSize, hotspotGs, hotspotGv);
                 hotspot = min(hotspot, min(alpha_toSolar, alpha_toSensor));
                 if (checkSameDirection(solarDirection, viewDirection) && abs(alpha_toSolar - alpha_toSensor) < EPSION_2)
                 {

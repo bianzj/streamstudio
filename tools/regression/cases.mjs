@@ -24,6 +24,16 @@ export const CASES = {
     'configuration.sensor.positionX': 150, 'configuration.sensor.positionY': 5, 'configuration.sensor.height': 25,
     'configuration.sensor.vza': 78, 'configuration.sensor.vaa': 0, 'configuration.sensor.fov': 60,
     'configuration.control.periodicTraversalCount': 0 } },
+  // Leaf angle / projection consistency (canopies[1] = tree_leaf_canopy).
+  // vrt_forest is the reference; _planophile uses the SAIL planophile LIDF
+  // (a=1, b=0); _g03 forces the constant-G fallback with G=0.3 through an
+  // out-of-domain LIDF (|a|+|b|>1), where the old engine amplified leaf
+  // single scattering by 0.5/G.
+  vrt_forest: { example: 'forest', mode: 'eVoxelRT' },
+  vrt_forest_planophile: { example: 'forest', mode: 'eVoxelRT', set: {
+    'configuration.canopies.1.LIDFa': 1, 'configuration.canopies.1.LIDFb': 0 } },
+  vrt_forest_g03: { example: 'forest', mode: 'eVoxelRT', set: {
+    'configuration.canopies.1.G': 0.3, 'configuration.canopies.1.LIDFa': 0.8, 'configuration.canopies.1.LIDFb': 0.8 } },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.
