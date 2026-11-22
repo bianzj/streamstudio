@@ -1,7 +1,35 @@
 import { appStorage } from './storage.js'
 
+// 结果读取接口的二进制格式（见 server/result-cache.mjs）：
+// 'SSR1' | uint32 头长度 | 头 JSON { value, buffers } | 8 字节对齐的 Float32/Float64 数据块。
+// 头 JSON 里的 { $ssBuffer: i } 换成对应的类型化数组；其余字段与 JSON 响应完全相同。
+const BINARY_RESULT_TYPE = 'application/vnd.stream-studio.result-v1'
+
+function decodeBinaryResult(buffer) {
+  const bytes = new Uint8Array(buffer)
+  if (String.fromCharCode(...bytes.subarray(0, 4)) !== 'SSR1') throw new Error('二进制结果格式无效')
+  const headerLength = new DataView(buffer).getUint32(4, true)
+  const header = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + headerLength)))
+  const dataStart = Math.ceil((8 + headerLength) / 8) * 8
+  const arrays = header.buffers.map(({ type, offset, length }) => type === 'f64'
+    ? new Float64Array(buffer, dataStart + offset, length)
+    : new Float32Array(buffer, dataStart + offset, length))
+  const revive = (value) => {
+    if (Array.isArray(value)) return value.map(revive)
+    if (value && typeof value === 'object') {
+      if (Number.isInteger(value.$ssBuffer) && Object.keys(value).length === 1) return arrays[value.$ssBuffer]
+      for (const key of Object.keys(value)) value[key] = revive(value[key])
+    }
+    return value
+  }
+  return revive(header.value)
+}
+
 async function request(path, options) {
   const response = await fetch(path, options)
+  if (response.ok && (response.headers.get('Content-Type') || '').startsWith(BINARY_RESULT_TYPE)) {
+    return decodeBinaryResult(await response.arrayBuffer())
+  }
   const text = await response.text()
   let result
   try { result = JSON.parse(text) } catch {
@@ -74,7 +102,11 @@ export const webApi = {
   openHelpDocument: (document) => post('/api/help/open', { document }),
   listResults: (path) => post('/api/results/list', { path }),
   deleteResults: (path, kind = 'image') => post('/api/results/delete-all', { path, kind }),
-  readResult: (path, band = 0) => post('/api/results/read', { path, band }),
+  readResult: (path, band = 0) => request('/api/results/read', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: `${BINARY_RESULT_TYPE}, application/json` },
+    body: JSON.stringify({ path, band })
+  }),
   compareResults: (firstPath, secondPath, band = 0, maxScatterPoints = 4000) => post('/api/results/change', { firstPath, secondPath, band, maxScatterPoints }),
   histreamProxyInfo: () => request('/api/histream-proxy/info'),
   runHistreamProxy: (data) => post('/api/histream-proxy/run', data),

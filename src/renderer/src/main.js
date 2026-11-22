@@ -5838,6 +5838,9 @@ function facetControls(result, metric, side) {
   return `<div class="facet-controls"><div><span>显示指标</span>${metricButtons}</div><div><span>面方向</span><button class="button ghost facet-side ${side === 'both' ? 'active' : ''}" type="button" data-side="both">正反两面</button><button class="button ghost facet-side ${side === 'front' ? 'active' : ''}" type="button" data-side="front">正面</button><button class="button ghost facet-side ${side === 'back' ? 'active' : ''}" type="button" data-side="back">背面</button></div></div>`
 }
 
+// 结果读取接口可能以二进制块回传大数组（Float32Array/Float64Array），与普通数组同等对待。
+const isNumberArray = (value) => Array.isArray(value) || ArrayBuffer.isView(value)
+
 function facetIndices(result, side) {
   const total = result.facetCount * 2
   if (side === 'front') return Array.from({ length: result.facetCount }, (_, index) => index * 2)
@@ -5883,7 +5886,7 @@ function showFacet3D(result, file, metric = 'radiosity', side = 'both') {
   const samplingLabel = sourceFacetCount > result.facetCount
     ? '面元过多：原始 ' + sourceFacetCount.toLocaleString('zh-CN') + ' 个，当前显示 ' + result.facetCount.toLocaleString('zh-CN') + ' 个'
     : '完整显示 ' + result.facetCount.toLocaleString('zh-CN') + ' 个面'
-  const rawPositions = Array.isArray(result.vertexPositions) ? result.vertexPositions : []
+  const rawPositions = isNumberArray(result.vertexPositions) ? result.vertexPositions : []
   const hasGeometry = rawPositions.length >= result.facetCount * 9
   const sideDescription = side === 'both' ? '三维表面取正反面较大值' : side === 'front' ? '显示正面值' : '显示背面值'
   $('#resultPreview').innerHTML = `<div class="result-preview-card result-3d-card"><div class="result-3d-viewport" id="result3dViewport"></div>${resultColorbar(selected.label, stats.minimum, stats.maximum)}${facetControls(result, selected.id, side)}${facetViewActions()}<div class="result-meta"><span>${escapeHtml(samplingLabel)} · ${valueCount.toLocaleString('zh-CN')} 个面值</span><span>颜色：${escapeHtml(selected.label)}</span><span>${sideDescription}</span><span>MIN ${Number(stats.minimum).toPrecision(6)} · MAX ${Number(stats.maximum).toPrecision(6)}</span>${hasGeometry ? '<span>真实 OBJ 面元空间位置</span>' : '<span>旧结果无几何坐标，使用面元序号排列</span>'}</div></div>`
@@ -5981,7 +5984,7 @@ function showFacet3D(result, file, metric = 'radiosity', side = 'both') {
 function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
   disposeResultViewer()
   const selected = result.metrics.find((item) => item.id === metric) || result.metrics[0]
-  if (!selected || !Array.isArray(result.voxelPositions) || !result.voxelCount) {
+  if (!selected || !isNumberArray(result.voxelPositions) || !result.voxelCount) {
     emptyResultPreview('体元过程结果为空', '没有可显示的体元位置或过程变量。')
     return
   }
@@ -6094,7 +6097,7 @@ function showSoilProfile3D(result, file, selectedLayers = null) {
   const profile = result.soilProfile
   disposeResultViewer()
   if (!profile || !Array.isArray(profile.values) || !profile.layerCount ||
-      !Array.isArray(result.voxelPositions) || !result.voxelCount) {
+      !isNumberArray(result.voxelPositions) || !result.voxelCount) {
     emptyResultPreview('土壤温度剖面为空', '当前结果没有多层土壤温度数据。')
     return
   }
@@ -6108,7 +6111,7 @@ function showSoilProfile3D(result, file, selectedLayers = null) {
   let minimumX = Infinity, maximumX = -Infinity, minimumZ = Infinity, maximumZ = -Infinity
   const validIndices = Array.from({ length: profile.layerCount }, () => [])
   for (let layer = 0; layer < profile.layerCount; layer += 1) {
-    const values = Array.isArray(profile.values[layer]) ? profile.values[layer] : []
+    const values = isNumberArray(profile.values[layer]) ? profile.values[layer] : []
     for (let voxel = 0; voxel < Math.min(result.voxelCount, values.length); voxel += 1) {
       // JSON serializes binary NaN/NoData as null.  Number(null) is 0, which
       // previously drew every vegetation/building voxel as a false cold spot
@@ -6794,8 +6797,8 @@ async function openResultFile(file, band = 0) {
     let result = await api.readResult(file.path, band)
     if (stale()) return
     if (!result.kind && Number.isInteger(Number(result.facetCount)) &&
-        Array.isArray(result.radiosity) && Array.isArray(result.lightEnhancement) &&
-        Array.isArray(result.sunlit)) {
+        isNumberArray(result.radiosity) && isNumberArray(result.lightEnhancement) &&
+        isNumberArray(result.sunlit)) {
       const metrics = [
         { id: 'radiosity', label: 'Radiosity', values: result.radiosity },
         { id: 'lightEnhancement', label: 'Light enhancement', values: result.lightEnhancement },

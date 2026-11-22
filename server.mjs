@@ -3,6 +3,7 @@ import { execFile, spawn, spawnSync } from 'node:child_process'
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads'
 import { createInterface } from 'node:readline'
 import { closeSync, copyFileSync, cpSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { copyFile as copyFileAsync, cp as cpAsync } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { inflateSync } from 'node:zlib'
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -16,6 +17,7 @@ import { exportProjectUsd } from './tools/usd-export.mjs'
 import { buildProjectFromUsd } from './tools/usd-import.mjs'
 import { createStreamService } from './server/stream/index.mjs'
 import { mapStreamScenePaths } from './server/stream/config.mjs'
+import { BINARY_RESULT_TYPE, ByteLru, encodeBinaryResult, fileStamp, resultCacheLimitBytes } from './server/result-cache.mjs'
 
 const PROJECT_ROOT = dirname(fileURLToPath(import.meta.url))
 const APP_VERSION = (() => { try { return JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')).version || '' } catch { return '' } })()
@@ -62,6 +64,7 @@ const histreamCandidates = [
 const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp', '.wasm': 'application/wasm', '.json': 'application/json; charset=utf-8', '.ico': 'image/x-icon', '.woff2': 'font/woff2' }
 const resultImageMime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp' }
 let child = null
+let runPreparing = false
 let childExecutable = ''
 let resettingProcesses = false
 let histreamProxyRequestInFlight = false
@@ -69,6 +72,9 @@ let projectFile = ''
 let projectDir = ''
 let projectFileChooser = null
 const clients = new Set()
+// 结果读取缓存（原始 TIFF/ENVI 数据 + 已解码分块 + 已编码的接口响应），总字节上限默认 512 MB，
+// STREAM_STUDIO_RESULT_CACHE_MB 调整，设为 0 关闭。键含 (路径, mtime, size)，文件被覆盖即失效。
+const resultCache = new ByteLru(resultCacheLimitBytes())
 // STREAM remote-sensing image simulation: an independent module with its own API, queue and events.
 const streamService = createStreamService({ resourceRoot: RESOURCE_ROOT, modelRoot: MODEL_ROOT, json, body, readTiff, normalizeHostPath, windowsPath })
 
@@ -113,9 +119,20 @@ function listComputeDevices(engine, refresh = false) {
   return pending
 }
 
+// SHA-256 按 (路径, mtime, size) 缓存：引擎 exe、气象文件等在每次运行准备时都要记录哈希，
+// 内容未变时不再整文件重读。文件在哈希期间被改动（前后身份不一致）则不缓存。
+const fileHashCache = new Map()
+const rememberFileHash = (before, sha256) => {
+  const after = fileStamp(before.path)
+  if (after?.key === before.key) fileHashCache.set(before.path, { key: before.key, sha256 })
+}
+
 function fileIdentity(path) {
   const resolved = resolve(normalizeHostPath(path))
-  if (!existsSync(resolved) || !statSync(resolved).isFile()) return null
+  const stamp = fileStamp(resolved)
+  if (!stamp) return null
+  const cached = fileHashCache.get(stamp.path)
+  if (cached?.key === stamp.key) return { path: resolved, bytes: stamp.size, sha256: cached.sha256 }
   const hash = createHash('sha256')
   const descriptor = openSync(resolved, 'r')
   const buffer = Buffer.allocUnsafe(1024 * 1024)
@@ -123,7 +140,28 @@ function fileIdentity(path) {
     let count
     while ((count = readSync(descriptor, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, count))
   } finally { closeSync(descriptor) }
-  return { path: resolved, bytes: statSync(resolved).size, sha256: hash.digest('hex') }
+  const sha256 = hash.digest('hex')
+  rememberFileHash(stamp, sha256)
+  return { path: resolved, bytes: statSync(resolved).size, sha256 }
+}
+
+// 运行准备阶段用的流式版本：大文件（引擎、气象、工程）分块读入，不阻塞事件循环。
+async function fileIdentityAsync(path) {
+  const resolved = resolve(normalizeHostPath(path))
+  const stamp = fileStamp(resolved)
+  if (!stamp) return null
+  const cached = fileHashCache.get(stamp.path)
+  if (cached?.key === stamp.key) return { path: resolved, bytes: stamp.size, sha256: cached.sha256 }
+  const hash = createHash('sha256')
+  await new Promise((resolveHash, reject) => {
+    createReadStream(resolved, { highWaterMark: 1024 * 1024 })
+      .on('data', (chunk) => hash.update(chunk))
+      .on('error', reject)
+      .on('end', resolveHash)
+  })
+  const sha256 = hash.digest('hex')
+  rememberFileHash(stamp, sha256)
+  return { path: resolved, bytes: statSync(resolved).size, sha256 }
 }
 
 function writeRunManifest(run, patch = {}) {
@@ -161,7 +199,7 @@ function runProductPaths(directory) {
   return files.map(path => relative(directory, path).replaceAll('\\', '/')).sort()
 }
 
-function createIsolatedRun(input, project, mode, engine) {
+async function createIsolatedRun(input, project, mode, engine) {
   const baseDir = dirname(input)
   const root = resolve(baseDir, normalizeHostPath(project.configuration.outDir || 'output'))
   const runId = new Date().toISOString().replace(/[:.]/g, '-') + '-' + randomUUID().slice(0, 8)
@@ -169,8 +207,9 @@ function createIsolatedRun(input, project, mode, engine) {
   const configuredMeteo = String(project.configuration.meteo?.path || '')
   const meteoPath = !configuredMeteo || ['defined/meteo.txt', 'HiStream 内置气象数据'].includes(configuredMeteo)
     ? join(dirname(engine), 'defined', 'meteo.txt') : projectAssetPath(configuredMeteo, baseDir)
-  const meteo = fileIdentity(meteoPath)
+  const meteo = await fileIdentityAsync(meteoPath)
   if (isEnergyBalanceMode(mode) && !meteo) throw new Error('找不到本轮气象驱动：' + meteoPath)
+  const [sourceInput, engineIdentity] = await Promise.all([fileIdentityAsync(input), fileIdentityAsync(engine)])
   const sensor = project.configuration.sensor
   const perspective = ['perspective', 'central', 'center'].includes(String(sensor.projection))
   // Requested nodes follow the engine rule (fileio_json.cpp / facetrtcore.cpp):
@@ -182,7 +221,7 @@ function createIsolatedRun(input, project, mode, engine) {
   const run = { runId, outputDir, manifest: {
     kind: 'histream-run', schemaVersion: 1, runId, mode, status: 'preparing', startedAt: new Date().toISOString(),
     outputDir: windowsPath(outputDir),
-    sourceInput: fileIdentity(input), engine: fileIdentity(engine), meteorology: meteo,
+    sourceInput, engine: engineIdentity, meteorology: meteo,
     requested: { nodes, nodeCount: isEnergyBalanceMode(mode) ? nodes.length : 1,
       viewAngles: perspective ? [[sensor.vza, sensor.vaa]] : sensorViewAngles(sensor, project.configuration.light.azimuth),
       observation: {
@@ -202,7 +241,7 @@ function createIsolatedRun(input, project, mode, engine) {
     } catch { run.manifest.build = { ...fileIdentity(buildManifestPath), unreadable: true } }
   }
   mkdirSync(outputDir, { recursive: true })
-  copyFileSync(input, join(outputDir, 'source-project.json'))
+  await copyFileAsync(input, join(outputDir, 'source-project.json'))
   writeRunManifest(run)
   return { ...run, meteoPath }
 }
@@ -257,6 +296,41 @@ const FRAME_HEADERS = { 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "f
 function json(response, status, value) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...FRAME_HEADERS })
   response.end(JSON.stringify(value))
+}
+
+// 结果读取接口：已编码的响应按依赖文件的 (路径, mtime, size) + 变体缓存，X-Cache 标明命中与否。
+// 请求头 Accept 含 BINARY_RESULT_TYPE 时，大数值数组（几何、逐面元/体元指标）以二进制块回传；
+// 否则保持原来的 JSON。
+function sendCachedResult(request, response, dependencies, variant, produce) {
+  const binary = String(request.headers.accept || '').includes(BINARY_RESULT_TYPE)
+  const stamps = dependencies.map((path) => fileStamp(path))
+  const key = stamps.every(Boolean) ? `result:${variant}|${binary ? 'binary' : 'json'}|${stamps.map((stamp) => stamp.key).join('|')}` : ''
+  let cached = key ? resultCache.get(key) : undefined
+  const hit = Boolean(cached)
+  if (!cached) {
+    const result = produce()
+    const encoded = binary ? encodeBinaryResult(result) : null
+    cached = encoded
+      ? { payload: encoded, contentType: BINARY_RESULT_TYPE }
+      : { payload: Buffer.from(JSON.stringify(result), 'utf8'), contentType: 'application/json; charset=utf-8' }
+    // 读取期间文件被改写（引擎仍在写出）时不缓存，下次重新读取。
+    if (key && dependencies.every((path, index) => fileStamp(path)?.key === stamps[index].key)) resultCache.set(key, cached, cached.payload.length, stamps)
+  }
+  const { payload, contentType } = cached
+  if (process.env.STREAM_STUDIO_RESULT_CACHE_DEBUG === '1') {
+    console.log(`STREAM STUDIO: 结果缓存 ${hit ? 'hit' : 'miss'} ${variant} ${(payload.length / 1048576).toFixed(2)} MB，占用 ${(resultCache.bytes / 1048576).toFixed(1)}/${(resultCache.limit / 1048576).toFixed(0)} MB，${windowsPath(dependencies[0])}`)
+  }
+  response.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': payload.length, 'Cache-Control': 'no-store', 'X-Cache': hit ? 'hit' : 'miss', ...FRAME_HEADERS
+  })
+  response.end(payload)
+}
+
+function processResultDependencies(metadataPath, metadata) {
+  const dependencies = [metadataPath, resolve(dirname(metadataPath), String(metadata.dataFile || ''))]
+  if (metadata.geometry === 'facet') dependencies.push(resolve(dirname(metadataPath), String(metadata.geometryFile || '../faceteb.json')))
+  return dependencies
 }
 
 function pathWithin(root, candidate) {
@@ -3328,8 +3402,21 @@ function stretchedByte(value, minimum, maximum, inverted = false) {
   return Math.max(0, Math.min(255, Math.round(displayed * 255)))
 }
 
+// 同一结果文件的多个波段（彩色合成连读三次）、变化分析与重复打开共用一次读盘和分块解码。
+function cachedResultSource(path) {
+  const before = fileStamp(path)
+  const key = before ? 'source:' + before.key : ''
+  const cached = key ? resultCache.get(key) : undefined
+  if (cached) return cached
+  const source = { key, data: readFileSync(path), chunks: new Map(), decodedBytes: 0 }
+  const after = fileStamp(path)
+  if (!before || after?.key !== before.key || !resultCache.set(key, source, source.data.length, [before])) source.key = ''
+  return source
+}
+
 function readTiff(path, requestedBand = 0, includeValues = false) {
-  const data = readFileSync(path)
+  const cachedSource = cachedResultSource(path)
+  const data = cachedSource.data
   if (data.length < 8) throw new Error('TIFF 文件头不完整')
   const littleEndian = data.toString('ascii', 0, 2) === 'II'
   const bigEndian = data.toString('ascii', 0, 2) === 'MM'
@@ -3414,7 +3501,7 @@ function readTiff(path, requestedBand = 0, includeValues = false) {
   const chunksPerPlane = chunksPerRow * chunksPerColumn
   const bytesPerSample = Math.max(1, Math.ceil(Math.max(...bitsPerSample) / 8))
   const maxChunkBytes = Math.trunc(tileWidth * tileHeight * samples * bytesPerSample)
-  const decodedChunks = new Map()
+  const decodedChunks = cachedSource.chunks
   const getChunk = (index) => {
     if (decodedChunks.has(index)) return decodedChunks.get(index)
     if (!Number.isInteger(offsets[index]) || !Number.isInteger(byteCounts[index]) || offsets[index] < 0 || byteCounts[index] < 0 || offsets[index] + byteCounts[index] > data.length) throw new Error('TIFF 图像数据分块越界')
@@ -3444,6 +3531,10 @@ function readTiff(path, requestedBand = 0, includeValues = false) {
       })
     }
     decodedChunks.set(index, decoded)
+    if (decoded !== source && cachedSource.key) {
+      cachedSource.decodedBytes += decoded.length
+      resultCache.resize(cachedSource.key, data.length + cachedSource.decodedBytes)
+    }
     return decoded
   }
   const readSample = (chunk, bitOffset, bits, format) => {
@@ -3838,7 +3929,7 @@ function readEnvi(path, requestedBand = 0) {
   if (!typeSize) throw new Error(`暂不支持 ENVI data type ${dataType}`)
   const imagePath = path.slice(0, -extname(path).length) + '.img'
   if (!existsSync(imagePath)) throw new Error(`找不到 ENVI 影像数据：${imagePath}`)
-  const data = readFileSync(imagePath)
+  const data = cachedResultSource(imagePath).data
   const expectedSize = headerOffset + width * height * bands * typeSize
   if (data.length < expectedSize) throw new Error(`ENVI 数据不完整：需要 ${expectedSize} 字节，实际 ${data.length} 字节`)
 
@@ -4313,10 +4404,14 @@ async function api(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/run') {
     let runtimeScene = null
     let run = null
+    let ownsPreparation = false
     try {
       const data = await body(request)
       if (resettingProcesses) throw new Error('模拟环境正在重置，请稍后再运行')
       if (child) throw new Error('已有模拟任务正在运行')
+      // 准备阶段含异步哈希/复制，期间第二个 /api/run 不能穿过上面的 child 检查。
+      if (runPreparing) throw new Error('已有模拟任务正在准备')
+      runPreparing = ownsPreparation = true
       if (!modes.has(data.mode)) throw new Error('不支持的计算模式')
       const input = resolveProjectFile(data.inputPath || projectFile)
       projectFile = input
@@ -4328,7 +4423,7 @@ async function api(request, response, url) {
       if (!project) throw new Error('无法读取工程配置')
       const engine = allowedEngine(data.executable)
       if (!existsSync(engine)) throw new Error(`找不到 HiStream：${windowsPath(engine)}`)
-      run = createIsolatedRun(input, project, data.mode, engine)
+      run = await createIsolatedRun(input, project, data.mode, engine)
       const runProject = structuredClone(project)
       runProject.configuration.outDir = run.outputDir
       if (run.manifest.meteorology) runProject.configuration.meteo.path = run.meteoPath
@@ -4343,20 +4438,21 @@ async function api(request, response, url) {
       if (!basename(stagingDirectory).startsWith('.histream-runtime-') || pathWithin(stagingDirectory, inputDirectory)) {
         throw new Error('运行输入暂存目录无效或复制目标位于暂存目录内')
       }
-      cpSync(stagingDirectory, inputDirectory, { recursive: true })
+      // 裁切后的 OBJ 与纹理可能很大：异步复制，避免长时间阻塞事件循环（SSE 进度、其他请求）。
+      await cpAsync(stagingDirectory, inputDirectory, { recursive: true })
       const runInput = join(inputDirectory, 'project.json')
       if (run.manifest.meteorology) {
         const frozenMeteo = join(inputDirectory, 'meteo.txt')
-        copyFileSync(run.meteoPath, frozenMeteo)
+        await copyFileAsync(run.meteoPath, frozenMeteo)
         const frozenProject = JSON.parse(readFileSync(runInput, 'utf8'))
         frozenProject.configuration.meteo.path = frozenMeteo
         writeFileSync(runInput, stringifyProject(frozenProject), 'utf8')
-        run.manifest.meteorology.snapshot = fileIdentity(frozenMeteo)
+        run.manifest.meteorology.snapshot = await fileIdentityAsync(frozenMeteo)
         if (run.manifest.meteorology.snapshot?.sha256 !== run.manifest.meteorology.sha256) {
           throw new Error(`气象文件在准备运行期间被修改，本轮已取消：${windowsPath(run.meteoPath)}`)
         }
       }
-      writeRunManifest(run, { runtimeInput: fileIdentity(runInput), inputDirectory })
+      writeRunManifest(run, { runtimeInput: await fileIdentityAsync(runInput), inputDirectory })
       emit({
         type: 'stdout',
         text: `实例边界筛选：原始 ${runtimeScene.total.toLocaleString('zh-CN')} 个，保留 ${runtimeScene.kept.toLocaleString('zh-CN')} 个，完整包围盒在域外跳过 ${runtimeScene.excluded.toLocaleString('zh-CN')} 个；跨界对象仅计算域内部分${runtimeScene.clippedObjects ? `；预裁切 ${runtimeScene.clippedObjects} 个单实例 OBJ，三角面 ${runtimeScene.sourceTriangles.toLocaleString('zh-CN')} → ${runtimeScene.retainedTriangles.toLocaleString('zh-CN')}` : ''}${runtimeScene.invalid ? `，忽略无效记录 ${runtimeScene.invalid.toLocaleString('zh-CN')} 条` : ''}${runtimeScene.grounded ? `；${runtimeScene.grounded} 个车辆实例已落地` : ''}`
@@ -4572,6 +4668,8 @@ async function api(request, response, url) {
       }
       if (run) try { writeRunManifest(run, { status: 'failed', finishedAt: new Date().toISOString(), error: error.message }) } catch {}
       return json(response, 400, { error: error.message })
+    } finally {
+      if (ownsPreparation) runPreparing = false
     }
   }
   if (request.method === 'POST' && url.pathname === '/api/stop') {
@@ -4596,6 +4694,7 @@ async function api(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/results/delete-all') {
     try {
       if (child) throw new Error('模拟运行中，不能删除结果')
+      resultCache.clear()
       const data = await body(request)
       return json(response, 200, data.kind === "3d" ? deleteThreeDimensionalResults(data.path) : deleteTiffResults(data.path))
     } catch (error) {
@@ -4618,20 +4717,26 @@ async function api(request, response, url) {
       const path = resolveAsset(data.path)
       if (!existsSync(path) || !statSync(path).isFile()) throw new Error(`找不到模拟结果：${path}`)
       const extension = extname(path).toLowerCase()
-      if (extension === '.hdr') return json(response, 200, readEnvi(path, data.band))
+      const band = Math.max(0, Math.floor(Number(data.band) || 0))
+      if (extension === '.hdr') {
+        return sendCachedResult(request, response, [path, path.slice(0, -extension.length) + '.img'], `envi:${band}`, () => readEnvi(path, band))
+      }
       if (extension === '.tif' || extension === '.tiff') {
-        const result = /^fluid_wind_/i.test(basename(path))
-          ? readWindTiff(path)
-          : readTiff(path, data.band)
-        return json(response, 200, result)
+        const wind = /^fluid_wind_/i.test(basename(path))
+        return sendCachedResult(request, response, [path], wind ? 'wind' : `tiff:${band}`, () => wind ? readWindTiff(path) : readTiff(path, band))
       }
       if (extension === '.json' && isRadiosityResultFile(path)) {
-        const result = sampleRadiosityResult(path)
-        return json(response, 200, { ...result, path: windowsPath(result.path) })
+        return sendCachedResult(request, response, [path], 'facet', () => {
+          const result = sampleRadiosityResult(path)
+          return { ...result, path: windowsPath(result.path) }
+        })
       }
-      if (extension === '.json' && processResultMetadata(path)) {
-        const result = readProcessResult(path)
-        return json(response, 200, { ...result, path: windowsPath(result.path) })
+      const processMetadata = extension === '.json' ? processResultMetadata(path) : null
+      if (processMetadata) {
+        return sendCachedResult(request, response, processResultDependencies(path, processMetadata), 'process', () => {
+          const result = readProcessResult(path)
+          return { ...result, path: windowsPath(result.path) }
+        })
       }
       if (resultImageMime[extension]) {
         if (statSync(path).size > 32 * 1024 * 1024) throw new Error('图像结果超过 32MB，请在资源管理器中打开')

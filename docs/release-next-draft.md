@@ -66,6 +66,13 @@
 - **运行期间视口降帧**：引擎运行时三维视口约 10 fps 渲染，减少与引擎争用 GPU；在视口内拖动、缩放或按键后 1.5 s 内恢复全帧率。
 - **FacetEB 自动后端**：设备不支持 shaderFloat64（或缺少 `energy.comp.spv`）时，“自动”不再报错，改为辐射仍用 GPU、能量平衡走 CPU 路径，并在日志中提示；显式选择 GPU 时仍报错并提示改选 CPU 或自动。
 
+### 运行管线（2026-11-22，不改数值）
+
+- **桌面版服务端移出主进程**：`desktop/main.mjs` 用 Electron `utilityProcess.fork` 启动 `desktop/server-process.mjs`，HTTP 服务（含 FacetEB 出图线程）在独立进程中运行，主进程只负责窗口、文件对话框（经进程消息转发）和桌面设置 IPC。运行准备、出图、ENVI 转换、读结果不再冻结窗口。退出时先通知服务进程停止引擎再退出，5 s 未退出则结束整棵进程树；服务进程意外退出时清理它遗留的引擎进程，自动重启并重新载入页面，1 分钟内第 3 次退出则报错关闭。网页模式不变。
+- **结果读取缓存**：`/api/results/read` 按 (路径, mtime, size) 缓存原始数据、已解码 TIFF 分块和已编码响应，按字节计的 LRU，默认 512 MB（`STREAM_STUDIO_RESULT_CACHE_MB`，0 为关闭）；响应头 `X-Cache: hit|miss`。彩色合成三个波段共用一次读盘/解码；变化分析和 STREAM 栅格读取也共用该缓存。文件被覆盖即失效，“删除所有结果”清空缓存。
+- **三维结果二进制传输**：请求头 `Accept: application/vnd.stream-studio.result-v1` 时，面元/体元结果的几何坐标和逐面元/体元指标以 Float32（不能无损表示时用 Float64）二进制块回传，其余字段仍为 JSON；界面已适配。不带该请求头时仍返回原 JSON。2 万面元测试结果 3.66 MB → 1.92 MB，逐值一致。
+- **运行准备不阻塞事件循环**：引擎 exe、工程与气象文件的 SHA-256 改为流式计算并按 (路径, mtime, size) 缓存；运行输入目录（含裁切后的 OBJ）与气象快照改为异步复制；准备期间拒绝第二个运行请求。
+
 ## 兼容性
 
 - `tools/build-engine.ps1` 构建的产品引擎只含核心（显式清空 `HISTREAM_EXTENSION_DIRS`），不再含场景动画与 Bullet 碰撞模块，也不再需要本地 Bullet 源码；三维 RT/EB 与 STREAM 遥感工作流的代码路径不变。
@@ -75,7 +82,7 @@
 - `voxelrt.json` 过程字段：2.5–5 µm 波段由 `illumination_<波长>` 改名为 `spectral_radiance_<波长>`（与 > 5 µm 波段一致，按 Planck 辐亮度计），读取这些字段的脚本需改名；`radiosity_<波长>` 别名不变。
 - 2026-11-22 精度修正后，旧工程重新运行会有以下数值变化：VoxelEB 地面显热升高；RayTracing 近红外升高；反射率可大于 1；天空背景下物体边缘变亮；开周期边界的 Facet 工程更准但更慢。FacetEB 判据更严，已保存的低迭代上限（如 12 次）可能被报告为未收敛（退出码 2，结果保留）。
 - 工程新增 `control.raytracingDepth`（RayTracing 散射次数），旧工程缺省按 16 处理；`control.depth` 只对 VoxelRT 有意义（步数预算 ×128）。
-- 新增环境变量：`HISTREAM_FACET_RASTER_SIZE`（Facet 可见性栅格边长，用于生成高分辨率参考解）、`STREAM_STUDIO_FACET_STEP_RESIDENT_FACETS`（常驻出图线程的面元数阈值，默认 3,000,000）。
+- 新增环境变量：`HISTREAM_FACET_RASTER_SIZE`（Facet 可见性栅格边长，用于生成高分辨率参考解）、`STREAM_STUDIO_FACET_STEP_RESIDENT_FACETS`（常驻出图线程的面元数阈值，默认 3,000,000）、`STREAM_STUDIO_RESULT_CACHE_MB`（结果读取缓存上限，默认 512）、`STREAM_STUDIO_RESULT_CACHE_DEBUG=1`（服务端打印缓存命中日志）。
 - 回归测试工具 `tools/regression/`：从内置示例生成 13 个冻结算例，用两版引擎运行并对比；`compare.py --tolerance` 可作为“纯性能改动不得改变结果”的门禁。
 
 ## 已做的检查（2026-11-22）
@@ -84,6 +91,7 @@
 - `tools/test-facet-energy-convergence.cpp` 补充 0.5 K 上限用例并通过。
 - Electron 中端到端：五种模式参数列表、体元预览、运行、自动打开结果、运行质量摘要与预检弹窗。
 - 未做 SCOPE 对比；VoxelEB 自由对流与 RayTracing 深度会改变既有 SCOPE 指标，发布前如需对比应单独运行。
+- 运行管线（服务端独立进程、结果缓存、二进制传输）：网页模式接口检查（示例列表、打开示例、RayTracing 运行、同一 TIFF 第二次读取 `X-Cache: hit`、touch 后失效）；二进制与 JSON 逐值一致；桌面模式 CDP 端到端（打开 urban_block → RayTracing → 结果自动打开），进程树确认服务在 utility 进程且 histream 为其子进程；运行中强杀服务进程后自动重启、页面重新载入、无遗留 histream；运行中关闭窗口后无遗留进程；asar 内 utilityProcess + Worker 可用。
 
 ## 已做的检查（2026-11-16）
 
