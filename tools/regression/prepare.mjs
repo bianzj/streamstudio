@@ -32,6 +32,9 @@ for (const name of names) {
   if (existsSync(caseDir)) rmSync(caseDir, { recursive: true, force: true })
   const projectCopy = join(caseDir, 'project')
   cpSync(join(STUDIO, 'assets', 'examples', spec.example), projectCopy, { recursive: true })
+  // Optional replacement position files (rows: x y z scale rotation).
+  for (const [file, rows] of Object.entries(spec.positions || {}))
+    writeFileSync(join(projectCopy, file), rows.map((row) => row.join(' ')).join('\n') + '\n', 'utf8')
   const source = join(projectCopy, 'project.json')
   const doc = JSON.parse(readFileSync(source, 'utf8').replace(/^\uFEFF/, ''))
   const project = unified.isUnifiedProject(doc)

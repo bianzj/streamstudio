@@ -75,7 +75,13 @@ struct alignas(16) RayRTSetting
     int skyboxEnabled{ 0 };
     int imageOffsetY{ 0 };
     glm::vec2 sceneSize{ 1.0f, 1.0f };
+    // Highest world y of the geometry plus a margin; periodic traversal stops
+    // for rays above it that do not descend (offline.rgen).
+    float sceneTop{ 1.0e30f };
 };
+static_assert(offsetof(RayRTSetting, sceneSize) == 64);
+static_assert(offsetof(RayRTSetting, sceneTop) == 72);
+static_assert(sizeof(RayRTSetting) == 80);
 
 
 struct alignas(32)  VoxelLstSetting

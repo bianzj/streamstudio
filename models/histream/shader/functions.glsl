@@ -27,72 +27,6 @@ float CanopyDiffuseG(Canopy canopy, uint angle)
 // Common functions
 //--------------------------------------------------------------------------------------------
 
-// Central domain is index 0. Indices 1..20 identify successive boundary
-// passages. Geometry buffers are never duplicated; ray tracers remap every
-// query into the same acceleration structure.
-ivec2 periodicTileOffset(int index)
-{
-  const ivec2 offsets[20] = ivec2[20](
-    ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1),
-    ivec2(-1, -1), ivec2(-1, 1), ivec2(1, -1), ivec2(1, 1),
-    ivec2(-2, 0), ivec2(2, 0), ivec2(0, -2), ivec2(0, 2),
-    ivec2(-2, -1), ivec2(-2, 1), ivec2(2, -1), ivec2(2, 1),
-    ivec2(-1, -2), ivec2(1, -2), ivec2(-1, 2), ivec2(1, 2));
-  return index <= 0 ? ivec2(0) : offsets[clamp(index - 1, 0, 19)];
-}
-
-// Returns the periodic tile and the ray-parameter interval over which the ray
-// is physically inside that tile. Restricting intersection tests to this
-// interval prevents a wrapped query from replacing a nearer hit that still
-// belongs to the central study area.
-ivec2 periodicRayTileSegment(vec3 origin, vec3 direction,
-                             int traversalIndex, vec2 requestedTileSize,
-                             out float segmentMinimum, out float segmentMaximum)
-{
-  const float huge = 1.0e30;
-  vec2 tileSize = max(requestedTileSize, vec2(0.01));
-  vec2 position = vec2(origin.x, origin.z) / tileSize + vec2(0.5);
-  vec2 ray = vec2(direction.x, direction.z) / tileSize;
-  ivec2 cell = ivec2(floor(position));
-  ivec2 stepDirection = ivec2(
-    ray.x > 0.0 ? 1 : (ray.x < 0.0 ? -1 : 0),
-    ray.y > 0.0 ? 1 : (ray.y < 0.0 ? -1 : 0));
-  vec2 nextBoundary = vec2(
-    stepDirection.x > 0 ? float(cell.x + 1) : float(cell.x),
-    stepDirection.y > 0 ? float(cell.y + 1) : float(cell.y));
-  vec2 nextCrossing = vec2(
-    stepDirection.x == 0 ? huge : (nextBoundary.x - position.x) / ray.x,
-    stepDirection.y == 0 ? huge : (nextBoundary.y - position.y) / ray.y);
-  vec2 crossingStep = vec2(
-    stepDirection.x == 0 ? huge : abs(1.0 / ray.x),
-    stepDirection.y == 0 ? huge : abs(1.0 / ray.y));
-
-  segmentMinimum = 0.0;
-  for(int crossing = 0; crossing < traversalIndex; ++crossing)
-  {
-    segmentMinimum = min(nextCrossing.x, nextCrossing.y);
-    float difference = abs(nextCrossing.x - nextCrossing.y);
-    float tolerance = 1.0e-5 * max(1.0, min(nextCrossing.x, nextCrossing.y));
-    if(difference <= tolerance)
-    {
-      cell += stepDirection;
-      nextCrossing += crossingStep;
-    }
-    else if(nextCrossing.x < nextCrossing.y)
-    {
-      cell.x += stepDirection.x;
-      nextCrossing.x += crossingStep.x;
-    }
-    else
-    {
-      cell.y += stepDirection.y;
-      nextCrossing.y += crossingStep.y;
-    }
-  }
-  segmentMaximum = min(nextCrossing.x, nextCrossing.y);
-  return cell;
-}
-
 // Deterministic low-frequency sky used only for sensor-image misses. It is a
 // visual background and is intentionally excluded from shadow and scattering
 // queries.
@@ -840,6 +774,7 @@ float SegmentFractionInCell(vec3 start, vec3 delta, vec3 cellMin)
 }
 
 #ifdef NANOVDB_INFO
+#define TURBID_GRID_AVAILABLE 1
 // VoxelRT: turbid cells are crossed planes, so an oblique ray can clip a cell
 // without hitting any of its planes. Integrate segments cell by cell instead.
 NanoVDBLink turbidGridLink;
@@ -849,6 +784,16 @@ void ConfigureTurbidGrid(NanoVDBLink link)
 {
     turbidGridLink = link;
     turbidGridReady = true;
+}
+
+// Top of the occupied grid in cell units (index bbox of the nanovdb root).
+// Every interaction needs a grid cell, so nothing above it affects a ray.
+float TurbidGridTop()
+{
+    if (!turbidGridReady) return 1.0e30;
+    pnanovdb_coord_t lower = pnanovdb_root_get_bbox_min(turbidGridLink.buf, turbidGridLink.root);
+    pnanovdb_coord_t upper = pnanovdb_root_get_bbox_max(turbidGridLink.buf, turbidGridLink.root);
+    return upper.y >= lower.y ? float(upper.y + 1) : 1.0e30;
 }
 
 float TurbidCellExtinction(int bufferId, ivec3 cell, vec3 direction)
@@ -869,8 +814,9 @@ float TurbidCellExtinction(int bufferId, ivec3 cell, vec3 direction)
         * ResolveClumpingIndex(bufferId, direction) * setting.scale;
 }
 
-// Optical depth of the turbid cells along start..end (scene cell units).
-float TurbidSegmentOpticalDepth(vec3 start, vec3 end)
+// Optical depth of the turbid cells along start..end inside the central grid
+// box only (scene cell units).
+float TurbidBoxSegmentOpticalDepth(vec3 start, vec3 end)
 {
     vec3 semi = vec3(floor(setting.voxelSize.x * 0.5 + 0.5), 0.0,
                      floor(setting.voxelSize.z * 0.5 + 0.5));
@@ -922,6 +868,135 @@ float TurbidSegmentOpticalDepth(vec3 start, vec3 end)
     }
     return tau;
 }
+
+// Periodic boundaries (periodicTraversalCount > 0): the grid repeats along x
+// and z with the domain period (voxelSize.x, voxelSize.z cells). This DDA
+// runs in unwrapped cell indices, looks every cell up modulo the period and
+// stops after periodicTraversalCount boundary passages, when it leaves the
+// vertical grid range, or after a bounded number of cells.
+struct TurbidPeriodicWalk
+{
+    ivec3 cell;        // unwrapped cell index
+    ivec3 stepCell;
+    vec3 tMax;
+    vec3 tDelta;
+    float t;
+    float t1;
+    ivec2 period;
+    ivec2 startTile;
+    int limit;
+    int remaining;
+};
+
+int TurbidPeriodicLimit()
+{
+    return clamp(setting.periodicNeighborCount, 0, 20);
+}
+
+ivec2 TurbidPeriodicTile(ivec3 cell, ivec2 period)
+{
+    return ivec2(floor(vec2(float(cell.x), float(cell.z)) / vec2(period)));
+}
+
+// start/direction in scene cell units (as TurbidSegmentOpticalDepth).
+bool TurbidPeriodicBegin(vec3 start, vec3 direction, out TurbidPeriodicWalk w)
+{
+    vec3 semi = vec3(floor(setting.voxelSize.x * 0.5 + 0.5), 0.0,
+                     floor(setting.voxelSize.z * 0.5 + 0.5));
+    vec3 a = start + semi;
+    vec3 dir = normalize(direction);
+    float hiY = min(float(setting.voxelSize.y), TurbidGridTop());
+    float t0 = 0.0;
+    float t1 = 1.0e30;
+    if (abs(dir.y) < 1.0e-9) {
+        if (a.y < 0.0 || a.y > hiY) return false;
+    } else {
+        float ta = -a.y / dir.y;
+        float tb = (hiY - a.y) / dir.y;
+        t0 = max(t0, min(ta, tb));
+        t1 = min(t1, max(ta, tb));
+    }
+    if (t1 <= t0) return false;
+    vec3 p = a + dir * t0;
+    w.cell = ivec3(floor(p + dir * 1.0e-5));
+    w.stepCell = ivec3(sign(dir));
+    w.tMax = vec3(1.0e30);
+    w.tDelta = vec3(1.0e30);
+    for (int axis = 0; axis < 3; ++axis) {
+        if (abs(dir[axis]) >= 1.0e-9) {
+            float boundary = float(w.cell[axis] + (dir[axis] > 0.0 ? 1 : 0));
+            w.tMax[axis] = t0 + (boundary - p[axis]) / dir[axis];
+            w.tDelta[axis] = 1.0 / abs(dir[axis]);
+        }
+    }
+    w.t = t0;
+    w.t1 = t1;
+    w.period = max(ivec2(setting.voxelSize.x, setting.voxelSize.z), ivec2(1));
+    w.startTile = TurbidPeriodicTile(w.cell, w.period);
+    w.limit = TurbidPeriodicLimit();
+    w.remaining = 1024 * (1 + w.limit);
+    return true;
+}
+
+// Next cell of the walk: its grid index (wrapped into the central domain) and
+// the path length inside it. False when the walk has ended.
+bool TurbidPeriodicNext(inout TurbidPeriodicWalk w, out ivec3 lookup, out float segmentLength)
+{
+    lookup = ivec3(0);
+    segmentLength = 0.0;
+    if (w.remaining <= 0 || w.t >= w.t1) return false;
+    ivec2 tile = TurbidPeriodicTile(w.cell, w.period);
+    if (abs(tile.x - w.startTile.x) + abs(tile.y - w.startTile.y) > w.limit) return false;
+    float segmentEnd = min(min(min(w.tMax.x, w.tMax.y), w.tMax.z), w.t1);
+    lookup = ivec3(w.cell.x - tile.x * w.period.x, w.cell.y,
+                   w.cell.z - tile.y * w.period.y);
+    segmentLength = max(segmentEnd - w.t, 0.0);
+    w.t = segmentEnd;
+    --w.remaining;
+    if (w.tMax.x <= w.tMax.y && w.tMax.x <= w.tMax.z) { w.cell.x += w.stepCell.x; w.tMax.x += w.tDelta.x; }
+    else if (w.tMax.y <= w.tMax.z) { w.cell.y += w.stepCell.y; w.tMax.y += w.tDelta.y; }
+    else { w.cell.z += w.stepCell.z; w.tMax.z += w.tDelta.z; }
+    return true;
+}
+
+float TurbidPeriodicOpticalDepth(vec3 start, vec3 direction)
+{
+    TurbidPeriodicWalk w;
+    if (!TurbidPeriodicBegin(start, direction, w)) return 0.0;
+    vec3 dir = normalize(direction);
+    float tau = 0.0;
+    ivec3 cell;
+    float segmentLength;
+    while (TurbidPeriodicNext(w, cell, segmentLength)) {
+        int bufferId = nanovdbGet(turbidGridLink, cell);
+        tau += TurbidCellExtinction(bufferId, cell, dir) * segmentLength;
+        if (tau > 50.0) break;  // transmittance below 2e-22
+    }
+    return tau;
+}
+
+// Optical depth of the turbid cells along start..end, the free flight from
+// the previous interaction (start) to the current hit (end, central grid).
+// Periodic boundaries: a hit found in a domain copy has start in that copy's
+// frame, outside the central grid. The part in the hit copy and the part in
+// the copy the flight started from (its origin cell's exit part) are
+// integrated; copies crossed in between had no plane hit and are skipped,
+// so the cost stays two box DDAs however many copies the flight crossed.
+float TurbidSegmentOpticalDepth(vec3 start, vec3 end)
+{
+    float tau = TurbidBoxSegmentOpticalDepth(start, end);
+    if (TurbidPeriodicLimit() > 0) {
+        vec2 semi = vec2(floor(setting.voxelSize.x * 0.5 + 0.5),
+                         floor(setting.voxelSize.z * 0.5 + 0.5));
+        vec2 period = max(vec2(setting.voxelSize.x, setting.voxelSize.z), vec2(1.0));
+        ivec2 tile = ivec2(floor((vec2(start.x, start.z) + semi) / period));
+        if (tile != ivec2(0)) {
+            vec3 shift = vec3(float(tile.x) * period.x, 0.0, float(tile.y) * period.y);
+            tau += TurbidBoxSegmentOpticalDepth(start - shift, end - shift);
+        }
+    }
+    return tau;
+}
 #endif
 
 // A ray that leaves the scene after its last turbid hit still crosses the rest
@@ -929,6 +1004,8 @@ float TurbidSegmentOpticalDepth(vec3 start, vec3 end)
 float TurbidEscapeTransmittance(vec3 lastPosition, vec3 direction)
 {
 #ifdef NANOVDB_INFO
+    if (turbidGridReady && TurbidPeriodicLimit() > 0)
+        return exp(-TurbidPeriodicOpticalDepth(lastPosition, direction));
     if (turbidGridReady)
         return exp(-TurbidSegmentOpticalDepth(lastPosition,
             lastPosition + normalize(direction) * 4096.0));

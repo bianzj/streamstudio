@@ -2516,8 +2516,8 @@ function renderInspector() {
     const periodicScopeNotice = isFacetMode()
       ? '面元模式按实例复制邻块（向上取整为 4/8/12/20 块）；可见性栅格的水平窗口只覆盖中心块，邻块只参与遮挡，邻块越多可见性边数越多、运行越慢。'
       : state.mode === 'eRaytracing'
-        ? '不会复制邻域场景。1–20 表示主视线离开一侧边界后从对侧继续查询的最大次数；阴影和散射射线不跨边界，靠近边界的条带会缺少邻域阴影。'
-        : '不会复制邻域场景。1–20 表示成像射线离开一侧边界后从对侧继续查询的最大次数；体元太阳与漫射传输不跨边界。'
+        ? '不会复制邻域场景。1–20 表示每条射线（主视线、散射、太阳阴影、天空）离开一侧边界后从对侧继续查询的最大次数，不占散射次数。'
+        : '不会复制邻域场景。1–20 表示射线离开一侧边界后从对侧继续查询的最大次数；成像、太阳、漫射/散射与长波传输都按周期遍历。'
     const periodicBoundaryControl = `${field('周期穿透边界次数', `<input class="input" id="periodicTraversalCount" type="number" min="0" max="20" step="1" value="${effectivePeriodicCount}">`, '0=关闭')}${switchRow('典型天空盒', 'skyboxSwitch', Boolean(c.control.skyboxEnabled))}<div class="notice">0 为关闭。${periodicScopeNotice}天空盒勾选后显示典型蓝天与云层；不勾选时保持默认 COS 天空响应。两项互相独立。</div>`
     const heterogeneousVoxelControl = (state.mode === 'eVoxelRT' || state.mode === 'eVoxelEB')
       ? `${switchRow('使用异质性体元', 'heterogeneousVoxelSwitch', Boolean(c.control.heterogeneousVoxel))}<div class="notice">开启后从 OBJ 面元计算每个体元的三轴聚集指数和体密度，并在 VoxelRT/VoxelEB 消光、散射及热辐射中使用；关闭时保持均匀体元算法。默认关闭。</div>`

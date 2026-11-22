@@ -26,6 +26,9 @@ struct RayRTSetting
 	int skyboxEnabled;
 	int imageOffsetY;
 	vec2 sceneSize;
+	// Highest world y of any geometry (+ margin): periodic traversal stops for
+	// rays above it that do not descend.
+	float sceneTop;
 };
 
 struct VoxellstSetting

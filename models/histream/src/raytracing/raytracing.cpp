@@ -155,6 +155,42 @@ std::vector<std::string> raytracingBandNames(const std::vector<float>& waves,
     }
     return names;
 }
+
+// Highest world y of all instanced geometry. Periodic traversal (offline.rgen)
+// starts descending rays at this height and stops rays above it that do not
+// descend, so wraps are never spent in empty space above the scene.
+float sceneTopHeight(const RaytracingIO& io)
+{
+    const auto& objMeshes = io.m_meshio->objMeshes;
+    std::vector<float> meshTop(objMeshes.size(), std::numeric_limits<float>::lowest());
+    std::vector<glm::vec3> meshLow(objMeshes.size()), meshHigh(objMeshes.size());
+    std::vector<char> meshValid(objMeshes.size(), 0);
+    for (size_t m = 0; m < objMeshes.size(); ++m) {
+        if (objMeshes[m].vertices.empty()) continue;
+        glm::vec3 low(std::numeric_limits<float>::max());
+        glm::vec3 high(std::numeric_limits<float>::lowest());
+        for (const auto& vertex : objMeshes[m].vertices) {
+            low = glm::min(low, vertex.pos);
+            high = glm::max(high, vertex.pos);
+        }
+        meshLow[m] = low;
+        meshHigh[m] = high;
+        meshValid[m] = 1;
+    }
+    float top = std::numeric_limits<float>::lowest();
+    for (const auto& instance : io.m_instanceio->instances) {
+        const size_t m = instance.meshId;
+        if (m >= objMeshes.size() || !meshValid[m]) continue;
+        for (int corner = 0; corner < 8; ++corner) {
+            const glm::vec3 local{(corner & 1) ? meshHigh[m].x : meshLow[m].x,
+                                  (corner & 2) ? meshHigh[m].y : meshLow[m].y,
+                                  (corner & 4) ? meshHigh[m].z : meshLow[m].z};
+            top = std::max(top, (instance.object2worldMatrix * glm::vec4(local, 1.0f)).y);
+        }
+    }
+    if (!std::isfinite(top)) return 1.0e30f;
+    return top + std::max(0.01f, 1.0e-4f * std::abs(top));
+}
 }
 
 
@@ -288,6 +324,12 @@ bool Raytracing::updateSetting(std::shared_ptr<RaytracingIO> &raytracingio){
     raytracingio->setting.sceneSize = {
         std::max(0.01f, raytracingio->sceneSize.x),
         std::max(0.01f, raytracingio->sceneSize.y)};
+    raytracingio->setting.sceneTop = sceneTopHeight(*raytracingio);
+    if (raytracingio->setting.periodicNeighborCount > 0)
+        std::cout << "raytracing: periodic boundaries, traversal count "
+                  << raytracingio->setting.periodicNeighborCount << ", domain "
+                  << raytracingio->setting.sceneSize.x << " x " << raytracingio->setting.sceneSize.y
+                  << " m, scene top " << raytracingio->setting.sceneTop << " m" << std::endl;
 
     return true;
     //raytracingio->setting.maxDepth = fileio->m_pXmlInput.

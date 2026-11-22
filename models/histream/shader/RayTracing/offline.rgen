@@ -17,6 +17,7 @@
 #extension GL_EXT_debug_printf : enable
 #extension GL_KHR_memory_scope_semantics:enable
 #extension GL_EXT_shader_atomic_float: enable
+#extension GL_EXT_ray_query : require
 
 #define RAYTRACING 1
 
@@ -28,6 +29,7 @@
 #include "../specular_brdf.glsl"
 #include "../shade_state.glsl"
 #include "../bindinglayout.h"
+#include "../periodic_walk.glsl"
 
 layout(location = 0) rayPayloadEXT PtPayload prd;
 layout(location = 1) rayPayloadEXT ShadowHitPayload shadow_payload;
@@ -73,51 +75,7 @@ float MaterialReflectance(uint index, int band, vec3 wi, vec3 wo, vec3 normal, f
   return backgroundReflectanceWeight(r, wi, wo, normal, angularStrength);
 }
 
-// Return the next X/Z domain-boundary distance for a ray whose origin is in
-// the central domain. The boundary itself is handled by PathTrace as one path
-// depth; this function never launches an additional query.
-float NextPeriodicBoundary(Ray r, out bvec2 crossedAxis)
-{
-  const float huge = 1.0e30;
-  const float directionEpsilon = 1.0e-8;
-  vec2 halfSize = max(setting.sceneSize, vec2(0.01)) * 0.5;
-  float tx = huge;
-  float tz = huge;
-  if(r.direction.x > directionEpsilon)
-    tx = (halfSize.x - r.origin.x) / r.direction.x;
-  else if(r.direction.x < -directionEpsilon)
-    tx = (-halfSize.x - r.origin.x) / r.direction.x;
-  if(r.direction.z > directionEpsilon)
-    tz = (halfSize.y - r.origin.z) / r.direction.z;
-  else if(r.direction.z < -directionEpsilon)
-    tz = (-halfSize.y - r.origin.z) / r.direction.z;
-
-  tx = tx > 0.0 ? tx : huge;
-  tz = tz > 0.0 ? tz : huge;
-  float distance = min(tx, tz);
-  float tolerance = 1.0e-5 * max(1.0, distance);
-  crossedAxis = bvec2(abs(tx - distance) <= tolerance,
-                      abs(tz - distance) <= tolerance);
-  return distance;
-}
-
-void WrapPeriodicRay(inout Ray r, float boundaryDistance, bvec2 crossedAxis)
-{
-  vec2 size = max(setting.sceneSize, vec2(0.01));
-  vec2 halfSize = size * 0.5;
-  float inset = max(max(size.x, size.y) * 1.0e-6, 1.0e-5);
-  r.origin += r.direction * boundaryDistance;
-  if(crossedAxis.x)
-    r.origin.x = r.direction.x > 0.0 ? -halfSize.x + inset
-                                     :  halfSize.x - inset;
-  if(crossedAxis.y)
-    r.origin.z = r.direction.z > 0.0 ? -halfSize.y + inset
-                                     :  halfSize.y - inset;
-}
-
-// One invocation performs exactly one TLAS query. Periodic continuation is
-// controlled by PathTrace and therefore cannot multiply queries inside a
-// single path depth.
+// One TLAS query over [Lmin, Lmax].
 void ClosestHit(Ray r, float Lmin, float Lmax)
 {
 	uint rayFlags = gl_RayFlagsOpaqueEXT;
@@ -127,10 +85,8 @@ void ClosestHit(Ray r, float Lmin, float Lmax)
 }
 
 // Visibility query: any opaque hit answers it, so stop at the first one
-// instead of searching for the closest. The origin is already offset by
-// OffsetRay; a 1 mm tmin (was 11 mm) no longer skips nearby occluders such
-// as overlapping leaves, needles and grass blades.
-bool AnyHit(Ray r, float maxDist)
+// instead of searching for the closest.
+bool AnyHitSegment(Ray r, float Lmin, float Lmax)
 {
     uint rayFlags = gl_RayFlagsOpaqueEXT
         | gl_RayFlagsTerminateOnFirstHitEXT
@@ -138,8 +94,125 @@ bool AnyHit(Ray r, float maxDist)
     shadow_payload.isHit = true;
     shadow_payload.seed = 0;
     traceRayEXT(topLevelAS, rayFlags, 0xFF, 0, 0, 1,
-                r.origin, 0.001, r.direction, maxDist, 1);
+                r.origin, Lmin, r.direction, Lmax, 1);
     return shadow_payload.isHit;
+}
+
+int PeriodicLimit()
+{
+  return clamp(setting.periodicNeighborCount, 0, 20);
+}
+
+// Periodic segments use inline ray queries. Several traceRayEXT calls inside
+// the copy walk (nested in the path loop) silently lost hits of camera rays
+// on the driver, while the same queries issued once were exact; ray queries
+// have no SBT/payload round trip. Opaque flags match ClosestHit/AnyHitSegment.
+bool QueryPeriodicSegment(vec3 origin, vec3 direction, float tMin, float tMax,
+                          bool firstHitOnly)
+{
+  uint flags = gl_RayFlagsOpaqueEXT
+    | (firstHitOnly ? gl_RayFlagsTerminateOnFirstHitEXT : 0u);
+  rayQueryEXT rayQuery;
+  rayQueryInitializeEXT(rayQuery, topLevelAS, flags, 0xFF,
+                        origin, tMin, direction, tMax);
+  while(rayQueryProceedEXT(rayQuery))
+  {
+    if(rayQueryGetIntersectionTypeEXT(rayQuery, false) ==
+       gl_RayQueryCandidateIntersectionTriangleEXT)
+      rayQueryConfirmIntersectionEXT(rayQuery);
+  }
+  if(rayQueryGetIntersectionTypeEXT(rayQuery, true) ==
+     gl_RayQueryCommittedIntersectionNoneEXT) return false;
+  if(!firstHitOnly)
+  {
+    prd.hitT = rayQueryGetIntersectionTEXT(rayQuery, true);
+    prd.primitiveID = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+    prd.instanceID = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
+    prd.instanceCustomIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+    prd.baryCoord = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+    prd.lastPosition = rayQueryGetIntersectionObjectRayOriginEXT(rayQuery, true);
+    prd.objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true);
+    prd.worldToObject = rayQueryGetIntersectionWorldToObjectEXT(rayQuery, true);
+  }
+  return true;
+}
+
+// The domain is centred on the origin: x in [-X/2, X/2], z in [-Y/2, Y/2].
+PeriodicWalk BeginPeriodicWalk(Ray r, float tStart)
+{
+  vec2 size = max(setting.sceneSize, vec2(0.01));
+  return periodicWalkBegin(r.origin, r.direction, tStart, -0.5 * size, size);
+}
+
+// Closest hit in the periodic scene. Without periodic boundaries this is the
+// single unrestricted query of the original scene. With them, every ray
+// (camera, bounce) visits the domain copies in ray order, one TLAS query per
+// copy, until it hits, rises above the scene top, or has crossed
+// periodicTraversalCount boundaries. Crossings never consume scattering
+// depth. prd.hitT stays the distance along the original ray and the hit
+// position is in central-domain coordinates.
+void ClosestHitPeriodic(Ray r, float Lmin)
+{
+  int limit = PeriodicLimit();
+  if(limit <= 0)
+  {
+    ClosestHit(r, Lmin, INFINITY);
+    return;
+  }
+  float sceneTop = setting.sceneTop;
+  if(periodicEscapedAbove(r.origin, r.direction, 0.0, sceneTop))
+  {
+    prd.hitT = INFINITY;
+    return;
+  }
+  // A ray from above the scene (camera) starts on the top plane, so no
+  // crossing is spent in the empty space above it.
+  r.origin += r.direction * periodicTopEntry(r.origin, r.direction, sceneTop);
+  PeriodicWalk walk = BeginPeriodicWalk(r, Lmin);
+  prd.hitT = INFINITY;
+  for(int crossing = 0; crossing <= limit; ++crossing)
+  {
+    float segmentEnd = periodicWalkSegmentEnd(walk);
+    if(QueryPeriodicSegment(r.origin - periodicWalkShift(walk), r.direction,
+         max(Lmin, walk.segmentStart),
+         segmentEnd >= PERIODIC_WALK_HUGE ? INFINITY : segmentEnd, false))
+      return;
+    if(segmentEnd >= PERIODIC_WALK_HUGE
+       || periodicEscapedAbove(r.origin, r.direction, segmentEnd, sceneTop))
+      return;
+    periodicWalkAdvance(walk);
+  }
+}
+
+// Shadow / sky visibility in the periodic scene: the same copy walk as
+// ClosestHitPeriodic, and every per-copy query still terminates on its first
+// hit. The origin is already offset by OffsetRay; a 1 mm tmin no longer
+// skips nearby occluders such as overlapping leaves, needles and blades.
+bool AnyHit(Ray r, float maxDist)
+{
+  const float shadowMinimum = 0.001;
+  int limit = PeriodicLimit();
+  if(limit <= 0) return AnyHitSegment(r, shadowMinimum, maxDist);
+  float sceneTop = setting.sceneTop;
+  if(periodicEscapedAbove(r.origin, r.direction, 0.0, sceneTop)) return false;
+  float entry = periodicTopEntry(r.origin, r.direction, sceneTop);
+  r.origin += r.direction * entry;
+  maxDist -= entry;
+  PeriodicWalk walk = BeginPeriodicWalk(r, shadowMinimum);
+  for(int crossing = 0; crossing <= limit; ++crossing)
+  {
+    float segmentStart = max(shadowMinimum, walk.segmentStart);
+    if(segmentStart >= maxDist) return false;
+    float segmentEnd = min(periodicWalkSegmentEnd(walk), maxDist);
+    if(QueryPeriodicSegment(r.origin - periodicWalkShift(walk), r.direction,
+                            segmentStart, segmentEnd, true))
+      return true;
+    if(segmentEnd >= maxDist
+       || periodicEscapedAbove(r.origin, r.direction, segmentEnd, sceneTop))
+      return false;
+    periodicWalkAdvance(walk);
+  }
+  return false;
 }
 
 // wi: in direction; wo: out direction; *World: direction in world coordinates.
@@ -323,12 +396,11 @@ bool InDirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth
 // Cyclic iteration of ray collisions.
 bool PathTrace(Ray r)
 {
-  int periodicTraversals = 0;
-  int periodicLimit = clamp(setting.periodicNeighborCount, 0, 20);
   bool cameraPath = true;
-  // kDepth counts scattering vertices only. Periodic wraps of the camera ray
-  // are bounded separately by periodicLimit and no longer use up the
-  // scattering budget.
+  // kDepth counts scattering vertices only. Periodic boundary crossings of
+  // every ray (camera, bounce, shadow, sky) are bounded per free flight by
+  // periodicTraversalCount inside ClosestHitPeriodic / AnyHit and never use
+  // up the scattering budget.
   for(int kDepth = 0; kDepth < setting.maxDepth; )
   {
     // Russian roulette after the first three bounces. Survival probability
@@ -352,25 +424,11 @@ bool PathTrace(Ray r)
       }
     }
 
-    // A periodic boundary is a path event. Query only the current domain
-    // segment. If the boundary is reached first, wrapping consumes this depth
-    // and the next loop iteration performs the next (single) TLAS query.
-    bvec2 crossedAxis = bvec2(false);
-    float boundaryDistance = INFINITY;
-    if(cameraPath && periodicLimit > 0)
-      boundaryDistance = NextPeriodicBoundary(r, crossedAxis);
-    ClosestHit(r, 0.0001, boundaryDistance);
+    ClosestHitPeriodic(r, 0.0001);
 
     // if hit outside the scene(PS: the started data segment is 0.)
     if(prd.hitT == INFINITY)
     {
-      bool reachedBoundary = cameraPath && periodicLimit > 0
-        && boundaryDistance < INFINITY;
-      if(reachedBoundary && periodicTraversals < periodicLimit) {
-        WrapPeriodicRay(r, boundaryDistance, crossedAxis);
-        ++periodicTraversals;
-        continue;
-      }
       if(cameraPath) {
         if(setting.skyboxEnabled == 0) return false;
         float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);

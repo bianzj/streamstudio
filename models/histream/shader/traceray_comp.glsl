@@ -3,114 +3,127 @@
 
 #include "bindingLayout.h"
 #include "functions.glsl"
+#include "periodic_walk.glsl"
 
-vec3 periodicQueryOrigin(vec3 origin, vec3 direction, int tileIndex,
-                         out float segmentMinimum, out float segmentMaximum)
+// Committed intersection of rayQuery copied into result.
+void StoreCommittedHit(rayQueryEXT rayQuery, inout PtPayload result)
 {
-  if(setting.periodicNeighborCount <= 0)
-  {
-    segmentMinimum = 0.0;
-    segmentMaximum = INFINITY;
-    return origin;
-  }
-  vec2 size = max(
-    vec2(setting.voxelSize.x, setting.voxelSize.z) * setting.scale,
-    vec2(0.01));
-  ivec2 tile = periodicRayTileSegment(
-    origin, direction, tileIndex, size, segmentMinimum, segmentMaximum);
-  return origin - vec3(float(tile.x) * size.x, 0.0,
-                       float(tile.y) * size.y);
+  result.hitT = rayQueryGetIntersectionTEXT(rayQuery, true);
+  result.primitiveID = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+  result.instanceID = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
+  result.instanceCustomIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+  result.baryCoord = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+  result.lastPosition = rayQueryGetIntersectionObjectRayOriginEXT(rayQuery, true);
+  result.objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true);
+  result.worldToObject = rayQueryGetIntersectionWorldToObjectEXT(rayQuery, true);
 }
 
+bool QueryClosestSegment(vec3 origin, vec3 direction, float tMin, float tMax,
+                         uint rayFlags, inout PtPayload result)
+{
+  rayQueryEXT rayQuery;
+  rayQueryInitializeEXT(rayQuery, topLevelAS, rayFlags, 0xFF,
+                        origin, tMin, direction, tMax);
+  while(rayQueryProceedEXT(rayQuery))
+  {
+    if(rayQueryGetIntersectionTypeEXT(rayQuery, false) ==
+       gl_RayQueryCandidateIntersectionTriangleEXT)
+      rayQueryConfirmIntersectionEXT(rayQuery);
+  }
+  if(rayQueryGetIntersectionTypeEXT(rayQuery, true) ==
+     gl_RayQueryCommittedIntersectionNoneEXT) return false;
+  StoreCommittedHit(rayQuery, result);
+  return true;
+}
+
+// Voxel scenes are traced in cell units; the domain spans
+// x in [-semi.x, voxelSize.x - semi.x] and z likewise (scene.cpp shifts every
+// instance by -semiRange), so the period is voxelSize.xz cells (not metres).
+vec2 PeriodicDomainLow()
+{
+  return -vec2(floor(setting.voxelSize.x / 2.0 + 0.5),
+               floor(setting.voxelSize.z / 2.0 + 0.5));
+}
+
+vec2 PeriodicDomainSize()
+{
+  return max(vec2(setting.voxelSize.x, setting.voxelSize.z), vec2(1.0));
+}
+
+// Top of the voxel grid (cell units, + one cell margin). Every interaction
+// needs a grid cell (nanovdbGet), so nothing above it can affect a ray.
+float PeriodicSceneTop()
+{
+#ifdef TURBID_GRID_AVAILABLE
+  if(turbidGridReady) return TurbidGridTop() + 1.0;
+#endif
+  return PERIODIC_WALK_HUGE;
+}
+
+const int PERIODIC_QUERY_CENTRAL = 0;    // original scene only
+const int PERIODIC_QUERY_TRANSPORT = 1;  // periodic copies, ray order
+const int PERIODIC_QUERY_IMAGE = 2;      // as transport, plus ground fill
+
 bool QueryClosestPeriodic(Ray r, float minLength, uint rayFlags,
-                          bool usePeriodicFill,
+                          int periodicMode,
                           out PtPayload result)
 {
   result = prd;
   result.hitT = INFINITY;
-  bool found = false;
-  int count = usePeriodicFill
+  int count = periodicMode != PERIODIC_QUERY_CENTRAL
     ? clamp(setting.periodicNeighborCount, 0, 20) : 0;
-  for(int tileIndex = 0; tileIndex <= count; ++tileIndex)
+  bool walking = count > 0;
+
+  // Every ray, from a voxel or from the camera, visits the domain copies in
+  // ray order with a fixed origin (periodic_walk.glsl): hitT, the hit shader
+  // origin (lastPosition, used for turbid path lengths) and the hit position
+  // (central-domain coordinates) are those of one straight ray. Rays above
+  // the grid start at its top; rays above it that do not descend escape.
+  // Without periodic boundaries the same loop issues the single unrestricted
+  // query (zero shift, [minLength, INFINITY]); one query site keeps the
+  // shaders as fast as before.
+  float sceneTop = walking ? PeriodicSceneTop() : PERIODIC_WALK_HUGE;
+  bool found = false;
+  if(!walking || !periodicEscapedAbove(r.origin, r.direction, 0.0, sceneTop))
   {
-    float segmentMinimum;
-    float segmentMaximum;
-    vec3 queryOrigin = r.origin;
-    // Passage zero is the original unrestricted scene. Boundary wrapping is a
-    // fallback only when that ray misses; every pass queries the same scene.
-    if(usePeriodicFill && tileIndex > 0)
-      queryOrigin = periodicQueryOrigin(
-        r.origin, r.direction, tileIndex, segmentMinimum, segmentMaximum);
-    else
+    PeriodicWalk walk = periodicWalkBegin(r.origin, r.direction,
+      walking ? max(minLength, periodicTopEntry(r.origin, r.direction, sceneTop)) : minLength,
+      PeriodicDomainLow(), PeriodicDomainSize());
+    for(int crossing = 0; ; ++crossing)
     {
-      segmentMinimum = 0.0;
-      segmentMaximum = INFINITY;
+      float segmentEnd = walking ? periodicWalkSegmentEnd(walk) : PERIODIC_WALK_HUGE;
+      float segmentStart = walking ? max(minLength, walk.segmentStart) : minLength;
+      vec3 shift = walking ? periodicWalkShift(walk) : vec3(0.0);
+      if(segmentEnd > segmentStart
+         && QueryClosestSegment(r.origin - shift, r.direction,
+              segmentStart,
+              segmentEnd >= PERIODIC_WALK_HUGE ? INFINITY : segmentEnd,
+              rayFlags, result))
+        return true;
+      if(segmentEnd >= PERIODIC_WALK_HUGE || crossing >= count
+         || periodicEscapedAbove(r.origin, r.direction, segmentEnd, sceneTop))
+        break;
+      periodicWalkAdvance(walk);
     }
-    float queryMinimum = max(minLength, segmentMinimum);
-    if(!(segmentMaximum > queryMinimum)) continue;
-    rayQueryEXT rayQuery;
-    rayQueryInitializeEXT(rayQuery, topLevelAS, rayFlags, 0xFF,
-                          queryOrigin, queryMinimum,
-                          r.direction, segmentMaximum);
-    while(rayQueryProceedEXT(rayQuery))
-    {
-      if(rayQueryGetIntersectionTypeEXT(rayQuery, false) ==
-         gl_RayQueryCandidateIntersectionTriangleEXT)
-        rayQueryConfirmIntersectionEXT(rayQuery);
-    }
-    if(rayQueryGetIntersectionTypeEXT(rayQuery, true) ==
-       gl_RayQueryCommittedIntersectionNoneEXT) continue;
-    float hitT = rayQueryGetIntersectionTEXT(rayQuery, true);
-    if(hitT >= result.hitT) continue;
-    found = true;
-    result.hitT = hitT;
-    result.primitiveID = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
-    result.instanceID = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
-    result.instanceCustomIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
-    result.baryCoord = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
-    result.lastPosition = rayQueryGetIntersectionObjectRayOriginEXT(rayQuery, true);
-    result.objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true);
-    result.worldToObject = rayQueryGetIntersectionWorldToObjectEXT(rayQuery, true);
-    if(tileIndex == 0) return true;
   }
-  if(!found && usePeriodicFill && count > 0 && r.direction.y < -1.0e-6)
+  if(walking && !found && periodicMode == PERIODIC_QUERY_IMAGE && r.direction.y < -1.0e-6)
   {
+    // Sensor images: a descending ray that used up its crossings still sees
+    // the ground of the copy it lands in instead of a hole.
     float groundT = -r.origin.y / r.direction.y;
     if(groundT > minLength)
     {
-      vec2 size = max(
-        vec2(setting.voxelSize.x, setting.voxelSize.z) * setting.scale,
-        vec2(0.01));
+      vec2 size = PeriodicDomainSize();
       vec3 groundPoint = r.origin + r.direction * groundT;
       ivec2 tile = ivec2(floor(
-        vec2(groundPoint.x, groundPoint.z) / size + vec2(0.5)));
+        (vec2(groundPoint.x, groundPoint.z) - PeriodicDomainLow()) / size));
       vec3 queryOrigin = r.origin - vec3(
         float(tile.x) * size.x, 0.0, float(tile.y) * size.y);
       float verticalMargin = max(1.0, max(size.x, size.y) * 0.02);
       float rayMargin = verticalMargin / max(-r.direction.y, 1.0e-6);
-      rayQueryEXT rayQuery;
-      rayQueryInitializeEXT(rayQuery, topLevelAS, rayFlags, 0xFF,
-                            queryOrigin, max(minLength, groundT - rayMargin),
-                            r.direction, groundT + rayMargin);
-      while(rayQueryProceedEXT(rayQuery))
-      {
-        if(rayQueryGetIntersectionTypeEXT(rayQuery, false) ==
-           gl_RayQueryCandidateIntersectionTriangleEXT)
-          rayQueryConfirmIntersectionEXT(rayQuery);
-      }
-      if(rayQueryGetIntersectionTypeEXT(rayQuery, true) !=
-         gl_RayQueryCommittedIntersectionNoneEXT)
-      {
-        found = true;
-        result.hitT = rayQueryGetIntersectionTEXT(rayQuery, true);
-        result.primitiveID = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
-        result.instanceID = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
-        result.instanceCustomIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
-        result.baryCoord = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
-        result.lastPosition = rayQueryGetIntersectionObjectRayOriginEXT(rayQuery, true);
-        result.objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true);
-        result.worldToObject = rayQueryGetIntersectionWorldToObjectEXT(rayQuery, true);
-      }
+      found = QueryClosestSegment(queryOrigin, r.direction,
+                                  max(minLength, groundT - rayMargin),
+                                  groundT + rayMargin, rayFlags, result);
     }
   }
   return found;
@@ -119,18 +132,17 @@ bool QueryClosestPeriodic(Ray r, float minLength, uint rayFlags,
 void ClosestHit(Ray r)
 {
   PtPayload result;
-  QueryClosestPeriodic(r, 0.0, gl_RayFlagsNoneEXT, false, result);
+  QueryClosestPeriodic(r, 0.0, gl_RayFlagsNoneEXT, PERIODIC_QUERY_CENTRAL, result);
   prd = result;
 }
 
-// Sensor-image rays may continue into periodic copies after leaving the
-// central study area.  Other transport passes deliberately use ClosestHit().
+// Sensor-image rays: periodic copies in ray order plus the ground fill.
 void ClosestHitPeriodic(Ray r, float minLength)
 {
   PtPayload result;
   QueryClosestPeriodic(r, minLength,
                        gl_RayFlagsNoneEXT | gl_RayFlagsOpaqueEXT,
-                       true, result);
+                       PERIODIC_QUERY_IMAGE, result);
   prd = result;
 }
 
@@ -141,7 +153,7 @@ void ClosestHitPeriodic(Ray r, float minLength)
 void ClosestHitT(Ray r)
 {
   PtPayload result;
-  QueryClosestPeriodic(r, 0.0, gl_RayFlagsNoneEXT, false, result);
+  QueryClosestPeriodic(r, 0.0, gl_RayFlagsNoneEXT, PERIODIC_QUERY_CENTRAL, result);
   prd = result;
 }
 
@@ -222,12 +234,16 @@ void ClosestHitT(Ray r)
 // }
 
 
+// Transport passes (solar gap, diffuse/scattering, TIR): with periodic
+// boundaries the ray continues through the domain copies in ray order, at
+// most periodicTraversalCount crossings per query (i.e. per free flight
+// between two consecutive cell hits); otherwise the original scene only.
 void ClosestHit(Ray r,float minLength)
 {
   PtPayload result;
   QueryClosestPeriodic(r, minLength,
                        gl_RayFlagsNoneEXT | gl_RayFlagsOpaqueEXT,
-                       false, result);
+                       PERIODIC_QUERY_TRANSPORT, result);
   prd = result;
 }
 
