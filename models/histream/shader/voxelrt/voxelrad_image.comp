@@ -560,12 +560,8 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
     return true;
 }
 
-bool SamplePixel(vec2 imageCoords,vec2 sizeImage,int smpl)
+bool SamplePixel(vec2 imageCoords,vec2 sizeImage,vec2 subpixel_jitter)
 {
-   
-    // 每次光线的随机/波动进行光滑
-    vec2 subpixel_jitter = smpl == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
-    // vec2 subpixel_jitter = vec2(0.5f, 0.5f) ;
 	// 计算样本的波动，范围 [-1 .. 1]
 	const vec2 pixelCenter = vec2(imageCoords) + subpixel_jitter;
 	const vec2 inUV        = pixelCenter / vec2(sizeImage.xy);
@@ -601,6 +597,10 @@ bool SamplePixel(vec2 imageCoords,vec2 sizeImage,int smpl)
 }
 
 
+// Stratified fallback samples (per axis) for pixels whose regular samples
+// were all uncovered.
+const int UNCOVERED_STRATA = 4;
+
 void main()
 {
     // image imageSize
@@ -623,7 +623,9 @@ void main()
 
     for(int smpl = 0; smpl< setting.n_sample; smpl++)
     {
-        if(SamplePixel(imageCoords, imageRes, smpl))
+        // 每次光线的随机/波动进行光滑
+        vec2 subpixel_jitter = smpl == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
+        if(SamplePixel(imageCoords, imageRes, subpixel_jitter))
         {
             validSampleCount++;
             coveredWeight += sampleCoverage;
@@ -635,8 +637,25 @@ void main()
 
     // Coverage-weighted mean: the scene radiance of the covered part of the
     // pixel (escaped sky fractions contribute neither radiance nor weight).
-    // Pixels with (almost) no coverage stay 0 for the host sky fill.
+    // Pixels with (almost) no coverage stay 0 for the host sky fill. A pixel
+    // on the edge of the scene footprint can lose every random sample while
+    // part of it is covered: only those pixels get a 4x4 stratified pass
+    // (see voxeleb/voxelrad_image.comp); covered pixels are unchanged.
     bool covered = coveredWeight > 1.0e-3 * float(max(validSampleCount, 1));
+    if(!covered) {
+        for(int k = 0; k < UNCOVERED_STRATA * UNCOVERED_STRATA; ++k) {
+            vec2 subpixel_jitter = (vec2(k % UNCOVERED_STRATA, k / UNCOVERED_STRATA) + 0.5)
+                / float(UNCOVERED_STRATA);
+            if(SamplePixel(imageCoords, imageRes, subpixel_jitter)) {
+                validSampleCount++;
+                coveredWeight += sampleCoverage;
+                for(int kwave = 0;kwave < setting.n_wave; kwave++){
+                    RadianceSum[kwave] = RadianceSum[kwave] + Radiance[kwave];
+                }
+            }
+        }
+        covered = coveredWeight > 1.0e-3 * float(max(validSampleCount, 1));
+    }
     for(int kwave = 0;kwave < setting.n_wave; kwave++){
         Radiance[kwave] = covered
             ? RadianceSum[kwave] / coveredWeight

@@ -510,12 +510,11 @@ bool PathTrace(Ray r)
   return true;
 }
 
-bool SamplePixel(int kSample, ivec2 imageCoords, ivec2 imageResolution)
+bool SamplePixel(vec2 subPixel_jitter, ivec2 imageCoords, ivec2 imageResolution)
 {
 
   // For each sampling of a pixel, its inital postion and direction are randomly generated.
-  // subPixel_jitter is the random disturbance variation.
-  vec2 subPixel_jitter = kSample == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
+  // subPixel_jitter is the random disturbance variation (chosen by the caller).
   const vec2 pixelCenter = vec2(imageCoords) + subPixel_jitter;
   const vec2 inUV = pixelCenter/vec2(imageResolution.xy);
   vec2 d = inUV * 2.0 - 1.0;  // this scope is limited to [-1,1]
@@ -579,13 +578,28 @@ void main()
   int coveredSamples = 0;
   for(int kSample = 0; kSample <  setting.n_sample; kSample++)
   {
-    if(!SamplePixel(kSample, imageCoords, imageRes)) continue;
+    vec2 subPixel_jitter = kSample == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
+    if(!SamplePixel(subPixel_jitter, imageCoords, imageRes)) continue;
     ++coveredSamples;
 
     for(int kBand = 0; kBand <  setting.n_wave; kBand++)
     {
       // Zero-contribution paths are valid samples, especially in shadows.
       RadianceSum[kBand] += Radiance[kBand];
+    }
+  }
+  // A pixel on the edge of the scene can lose every random sample while part
+  // of it is covered: only such pixels get a 4x4 stratified pass (see
+  // voxeleb/voxelrad_image.comp); pixels that still see nothing stay 0.
+  if(coveredSamples == 0)
+  {
+    for(int k = 0; k < 16; ++k)
+    {
+      vec2 subPixel_jitter = (vec2(k % 4, k / 4) + 0.5) / 4.0;
+      if(!SamplePixel(subPixel_jitter, imageCoords, imageRes)) continue;
+      ++coveredSamples;
+      for(int kBand = 0; kBand <  setting.n_wave; kBand++)
+        RadianceSum[kBand] += Radiance[kBand];
     }
   }
 
