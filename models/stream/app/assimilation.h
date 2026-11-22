@@ -58,6 +58,9 @@ struct AssimilationInputs {
     bool eb;
     EbSolver ebSolver;
     double progressStart, progressSpan;
+    // Downwelling longwave of the reflected-sky term (W m-2 per pixel, NaN = none), the same field the forward
+    // imaging uses, so h(x) of brightness observations includes (1 − Σw)·B(T_sky). Null disables the term.
+    const std::vector<float>* skyLongwave = nullptr;
 };
 
 struct AssimilationResult {

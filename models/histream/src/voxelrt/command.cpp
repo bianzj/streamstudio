@@ -31,7 +31,7 @@ bool Command::create(std::shared_ptr<VoxelrtIO> &modelio){
 }
 
 
-bool Command::runRT(std::shared_ptr<VoxelrtIO> &modelio){
+bool Command::runRT(std::shared_ptr<VoxelrtIO> &modelio, bool reuseTransport){
 
     modelio->m_currentSemaphore = 1;
 
@@ -41,6 +41,12 @@ bool Command::runRT(std::shared_ptr<VoxelrtIO> &modelio){
     // DEFERRED[中] GPU同步: 1D 派发组数 = n_voxel/64，超过 maxComputeWorkGroupCount[0]（规范最小值 65535，部分 AMD/Intel 驱动即为 65535）时 vkCmdDispatch 属未定义行为，即 >4.19M 体元的场景在这些 GPU 上失败；建议：查询限制并拆成 2D 派发或分批 + 偏移推送常量（runRTAccelerated 同理）。
     auto & descSet = modelio->m_descSet;
     auto & setting = modelio->setting;
+
+    if (reuseTransport) {
+        submit(modelio, VoxelRTStage::out, voxelSize2D, std::nullopt, std::nullopt);
+        waitFence(modelio);
+        return true;
+    }
 
 
     //--------------------------------------------------
@@ -76,7 +82,7 @@ bool Command::runRT(std::shared_ptr<VoxelrtIO> &modelio){
 }
 
 bool Command::runRTAccelerated(std::shared_ptr<VoxelrtIO>& modelio,
-                               int spectralBatchSize)
+                               int spectralBatchSize, bool reuseTransport)
 {
     modelio->m_currentSemaphore = 1;
     spectralBatchSize = std::clamp(spectralBatchSize, 1, 4);
@@ -87,6 +93,13 @@ bool Command::runRTAccelerated(std::shared_ptr<VoxelrtIO>& modelio,
         1);
     const glm::ivec3 voxelSize1D(
         (modelio->n_voxel + (GROUP_SIZEX - 1)) / GROUP_SIZEX, 1, 1);
+
+    if (reuseTransport) {
+        submit(modelio, VoxelRTStage::out, voxelSize2D,
+               std::nullopt, std::nullopt);
+        waitFence(modelio);
+        return true;
+    }
 
     submit(modelio, VoxelRTStage::gap, voxelSize1D,
            std::nullopt, std::nullopt);

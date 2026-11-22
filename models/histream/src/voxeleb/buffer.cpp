@@ -566,7 +566,12 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
 
     // rads
     VkCommandBuffer cmdBufRads = cmdGen.createCommandBuffer();
-    const VkDeviceSize radianceBytes = static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(VoxelRad);
+    // Radiance field (N x DIFFUSENUM VoxelRad) followed by the per-direction
+    // sky gap transmittance (N x DIFFUSENUM floats) that lets later spectral
+    // groups reuse the first group's uncollided-sky trace
+    // (voxelrad_scattering_VNIR.comp stage 4).
+    const VkDeviceSize radianceBytes = static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(VoxelRad)
+        + static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(float);
     auto& radianceAllocator = voxellstio->m_radianceAllocator;
     radianceAllocator = std::make_unique<nvvk::ResourceAllocatorDedicated>(
         m_device, voxellstio->m_physicalDevice);

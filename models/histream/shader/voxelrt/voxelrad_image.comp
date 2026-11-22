@@ -46,11 +46,26 @@ layout(local_size_x = GROUP_SIZEXY, local_size_y = GROUP_SIZEXY) in;
 // float wavelength = 10500;
 float Radiance[MAXBAND];
 float RadianceSum[MAXBAND];
+// Fraction of the current sample covered by the scene (1 - transmittance
+// that escaped to an unmodelled sky or past the step budget).
+float sampleCoverage = 1.0;
 
 uint voxelBandRadiationIndex(uint bufferId, uint band)
 {
     uint stride = uint(DIFFUSE_ANGLE_NUM) + 2u * uint(setting.n_wave);
     return bufferId * stride + uint(DIFFUSE_ANGLE_NUM) + band;
+}
+
+// Global horizontal irradiance used to normalize optical output (HDRF).
+// lightSet.direct is the beam-normal irradiance and lightSet.diffuse the
+// horizontal sky irradiance (= pi*L of the isotropic sky, the value each sky
+// ray carries in the diffuse pass), so no 0.5 belongs here (as VoxelEB).
+// The beam only exists where the solar pass computes visibility (y >= 0.01).
+float referenceIrradianceRT()
+{
+    float cosSolarZenith = normalize(lightSet.direction).y;
+    return (cosSolarZenith >= 0.01 ? lightSet.direct * cosSolarZenith : 0.0)
+        + lightSet.diffuse;
 }
 
 float filteredSurfaceEnvironmentRadiance(NanoVDBLink nanoVDBLink,
@@ -126,6 +141,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
     for(int kwave =0;kwave<setting.n_wave;kwave++){
         Radiance[kwave] = 0;
     }
+    sampleCoverage = 1.0;
     
     for(int kstep = 0;kstep<=setting.maxStep;kstep++)
     {
@@ -140,13 +156,15 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
         if(prd.hitT == INFINITY)
         {
             if(setting.skyboxEnabled == 0) {
-                // Preserve the existing COS/default sky response when the
-                // visual skybox is disabled.
-                return false;
+                // No modelled sky radiance: keep what this ray already
+                // collected in the canopy and report the escaped part as
+                // uncovered, instead of discarding the whole sample (which
+                // removed canopy edges against the sky). Fully uncovered
+                // pixels stay 0 and receive the host-side sky value.
+                sampleCoverage = 1.0 - alpha_toSensor;
+                return true;
             }
-            float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
-            float referenceIrradiance = lightSet.direct * cosSolarZenith
-                + lightSet.diffuse * 0.5;
+            float referenceIrradiance = referenceIrradianceRT();
             for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
                 float wavelength = wave[kwave];
                 bool optical = wavelength <= 2.5
@@ -234,11 +252,19 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 						float environmentRadiance = voxelRads[environmentIndex].cumulated;
 						Radiance[kwave] += Planck(wavelength, mediumTemperature)
 							* canopy.emissionScale * absorptionFraction * alpha_toSensor;
+						// The environment value is the two-face total (2/N sum
+						// over the sphere); isotropic scattering re-emits its
+						// mean, i.e. 0.5x, exactly as the leaf term below.
 						Radiance[kwave] += environmentRadiance * scatteringFraction
-							* 0.0795774715 * alpha_toSensor;
-						float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
-						Radiance[kwave] += lightSet.direct * cosSolarZenith * alpha_toSolar
-							* scatteringFraction * scatteringPhase * alpha_toSensor;
+							* 0.5 * alpha_toSensor;
+						// Optical output accumulates pi*L. lightSet.direct is
+						// already beam-normal, and HG is per steradian, so the
+						// single-scattered beam is pi * p * E (no extra mu_s).
+						bool opticalMediumBand = wavelength <= 2.5
+							|| (wavelength > 50.0 && wavelength <= 2500.0);
+						if(opticalMediumBand)
+							Radiance[kwave] += lightSet.direct * PI * alpha_toSolar
+								* scatteringFraction * scatteringPhase * alpha_toSensor;
 					}
 				}
 				else
@@ -309,7 +335,8 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                     if(isOpticalBand)
                     {
                         // Optical output is an irradiance-normalized reflectance. The
-                        // stored environment term is a hemispherical average, hence 0.5.
+                        // stored vegetation term is the two-face total (2/N sum over
+                        // the sphere); isotropic leaf scattering re-emits half of it.
                         Radiance[kwave] += environmentRadiance * 0.5 *
                             (1 - alpha_voxel) * s * alpha_toSensor;
                         // Single scattering of the direct beam (Ross/Kuusk): leaf phase
@@ -443,7 +470,10 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                             : backgroundReflectanceWeight(
                                 refl, sstate.normal, -ray.direction,
                                 sstate.normal, angularStrength);
-                        Radiance[kwave] += environmentRadiance * 0.5 *
+                        // A solid receiver stores the cosine-weighted mean of the
+                        // incident pi*L over its outer hemisphere, i.e. its
+                        // irradiance, so reflected pi*L = weight * E (no 0.5).
+                        Radiance[kwave] += environmentRadiance *
                             diffuseWeight * alpha_toSensor;
                         // Sunlit and visible: Kuusk joint gap probability (hot spot).
                         Radiance[kwave] += lightSet.direct * cosIncidence *
@@ -480,7 +510,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 
     // A very opaque canopy has already converged. Otherwise reaching
     // maxStep means the ray was truncated before its ground contribution.
-    return alpha_toSensor < 0.001;
+    // Step budget exhausted: the remaining transmittance is unresolved.
+    sampleCoverage = 1.0 - alpha_toSensor;
+    return true;
 }
 
 bool SamplePixel(vec2 imageCoords,vec2 sizeImage,int smpl)
@@ -537,7 +569,7 @@ void main()
     for(int kwave = 0;kwave < setting.n_wave; kwave++){
         RadianceSum[kwave] = 0;
     }
-    int validSampleCount = 0;
+    int validSampleCount = 0;    float coveredWeight = 0.0;
 
     // int bufferId = int((imageCoords.y * imageRes.x + imageCoords.x ));
     // LST = imageCoords.x;
@@ -549,27 +581,32 @@ void main()
         if(SamplePixel(imageCoords, imageRes, smpl))
         {
             validSampleCount++;
+            coveredWeight += sampleCoverage;
             for(int kwave = 0;kwave < setting.n_wave; kwave++){
                 RadianceSum[kwave] = RadianceSum[kwave] + Radiance[kwave];
             }
         }
     }
 
+    // Coverage-weighted mean: the scene radiance of the covered part of the
+    // pixel (escaped sky fractions contribute neither radiance nor weight).
+    // Pixels with (almost) no coverage stay 0 for the host sky fill.
+    bool covered = coveredWeight > 1.0e-3 * float(max(validSampleCount, 1));
     for(int kwave = 0;kwave < setting.n_wave; kwave++){
-        Radiance[kwave] = validSampleCount > 0
-            ? RadianceSum[kwave] / float(validSampleCount)
+        Radiance[kwave] = covered
+            ? RadianceSum[kwave] / coveredWeight
             : 0.0;
         float wavelength = wave[kwave];
         bool isOpticalBand = wavelength <= 2.5
             || (wavelength > 50.0 && wavelength <= 2500.0);
         if(isOpticalBand)
         {
-            float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
-            float referenceIrradiance = lightSet.direct * cosSolarZenith
-                + lightSet.diffuse * 0.5;
-            Radiance[kwave] = referenceIrradiance > EPSION
-                ? clamp(Radiance[kwave] / referenceIrradiance, 0.0, 1.0)
-                : 0.0;
+            float referenceIrradiance = referenceIrradianceRT();
+            // HDRF > 1 is physical (sun-facing slopes, hot spot, water glint):
+            // keep it, removing only NaN/Inf and negative noise.
+            float hdrf = referenceIrradiance > EPSION
+                ? Radiance[kwave] / referenceIrradiance : 0.0;
+            Radiance[kwave] = (isnan(hdrf) || isinf(hdrf)) ? 0.0 : max(hdrf, 0.0);
         }
         else if(setting.isTemperature == 1)
         {

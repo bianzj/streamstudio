@@ -46,7 +46,8 @@ function filePaths(scene) {
     .flatMap((item) => [item?.value, item?.vza, item?.vaa])
   const viewFields = (Array.isArray(scene.assimilation?.views) ? scene.assimilation.views : []).flatMap((item) => [item?.vza, item?.vaa])
   const fields = [...Object.values(scene.surface || {}), ...Object.values(scene.view || {}),
-    ...COMPONENT_KEYS.map((key) => scene.temperature?.components?.[key]), ...observationFields, inversion.mask, ...viewFields]
+    ...COMPONENT_KEYS.map((key) => scene.temperature?.components?.[key]), ...observationFields, inversion.mask, ...viewFields,
+    scene.skyLongwave]
   return fields.filter((field) => field && typeof field === 'object' && String(field.file || '').trim())
 }
 
@@ -330,8 +331,27 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
       if (brightness < 0.05 || brightness > 1) throw new Error('地表土壤亮度须在 0.05–1 之间')
       surface.soilBrightness = brightness
     }
-    // DEFERRED[中] 错误处理: VZA/VAA、纬度/经度常数不做范围检查（引擎 config.cpp 也不检查），VZA 输入 120 或纬度 200 会静默算出错误结果；此外无法区分角度/弧度误填；建议：常数时校验 VZA∈[0,90)、VAA∈[0,360)、纬度∈[-90,90]、经度∈[-180,360)，栅格时在引擎中按像元检查
-    const view = { vza: inputField(scene.view?.vza, '观测天顶角 VZA', { required: true }), vaa: inputField(scene.view?.vaa, '观测方位角 VAA', { required: true }) }
+    // Constant view geometry and location must be physical (the engine checks the same ranges; rasters are
+    // checked per pixel by the engine).
+    const constantInRange = (field, low, high, label, { includeHigh = true } = {}) => {
+      if (!field || field.file !== undefined || field.value === undefined) return field
+      const ok = field.value >= low && (includeHigh ? field.value <= high : field.value < high)
+      if (!ok) throw new Error(`${label}须在 ${low}–${high}${includeHigh ? '' : '（不含）'} 度之间`)
+      return field
+    }
+    if (surface.latitude) constantInRange(surface.latitude, -90, 90, '纬度')
+    if (surface.longitude) constantInRange(surface.longitude, -180, 360, '经度')
+    const view = {
+      vza: constantInRange(inputField(scene.view?.vza, '观测天顶角 VZA', { required: true }), 0, 90, '观测天顶角 VZA', { includeHigh: false }),
+      vaa: constantInRange(inputField(scene.view?.vaa, '观测方位角 VAA', { required: true }), -360, 360, '观测方位角 VAA')
+    }
+    // Thermal emission settings shared by EB and RT (the engine reads them from temperature.energy in both modes).
+    const emission = (energy = {}) => ({
+      soilEmissivityModel: energy.soilEmissivityModel === 'constant' ? 'constant' : 'hapke',
+      ...(hasNumber(energy.soilEmissivityK) ? { soilEmissivityK: Number(energy.soilEmissivityK) } : {}),
+      surfaceTemperatureNormalisation: energy.surfaceTemperatureNormalisation === 'directional' ? 'directional' : 'retrieval',
+      ...Object.fromEntries(['soilEmissivity', 'soilEmissivityWet'].filter((key) => hasNumber(energy[key])).map((key) => [key, Number(energy[key])]))
+    })
 
     let temperature
     if (mode === 'eb') {
@@ -342,7 +362,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
         energy: {
           scheme: 'tirt',
           // Preserve supported overrides; omitted fields keep the native engine's existing defaults.
-          ...Object.fromEntries(['stomatalG0', 'minWindSpeed', 'soilEmissivity', 'soilEmissivityWet', 'leafEmissivity',
+          ...Object.fromEntries(['stomatalG0', 'minWindSpeed', 'leafEmissivity',
             'soilConductivity', 'soilVolumetricCapacity', 'soilHeatFraction', 'maxStabilityIterations']
             .filter((key) => hasNumber(temperatureInput.energy?.[key]))
             .map((key) => [key, Number(temperatureInput.energy[key])])),
@@ -353,11 +373,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
           spectralBinNm: hasNumber(temperatureInput.energy?.spectralBinNm) ? Number(temperatureInput.energy.spectralBinNm) : 50,
           soilThermal: temperatureInput.energy?.soilThermal === 'moisture' ? 'moisture' : 'constant',
           // Soil directional emissivity and the aerodynamic heat-roughness of the bare-soil path.
-          soilEmissivityModel: temperatureInput.energy?.soilEmissivityModel === 'constant' ? 'constant' : 'hapke',
-          ...(hasNumber(temperatureInput.energy?.soilEmissivityK)
-            ? { soilEmissivityK: Number(temperatureInput.energy.soilEmissivityK) } : {}),
-          surfaceTemperatureNormalisation:
-            temperatureInput.energy?.surfaceTemperatureNormalisation === 'directional' ? 'directional' : 'retrieval',
+          ...emission(temperatureInput.energy),
           ...(hasNumber(temperatureInput.energy?.heatRoughnessKb)
             ? { heatRoughnessKb: Number(temperatureInput.energy.heatRoughnessKb) } : {}),
           ...(hasNumber(temperatureInput.energy?.referenceHeight)
@@ -380,7 +396,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
         if (input.source === 'package') components.file = existingFile(input.file, '组分温度文件（components.tif）')
         else for (const key of COMPONENT_KEYS) components[key] = inputField(input[key], `${COMPONENT_LABELS[key]}（K）`, { required: true })
       }
-      temperature = { mode: 'rt', components }
+      temperature = { mode: 'rt', components, energy: emission(temperatureInput.energy) }
     }
 
     const config = {
@@ -395,6 +411,17 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     }
     if (inversionTarget !== 'none') config.inversion = buildInversion(scene.inversion, inversionTarget)
     if (assimilation !== 'none') config.assimilation = buildAssimilation(scene.assimilation, assimilation, { thermalEnabled, opticalEnabled })
+    // Reflected sky of the thermal brightness: omitted = engine "auto" (EB: ERA5 strd; RT: Swinbank clear sky of the
+    // shaded component temperature); { mode: 'none' } = legacy; { value } W m-2 or { file, band } overrides.
+    const skyInput = scene.skyLongwave
+    if (skyInput && typeof skyInput === 'object') {
+      if (skyInput.mode === 'none') config.skyLongwave = { mode: 'none' }
+      else {
+        const field = inputField(skyInput, '下行长波 skyLongwave（W m⁻²）')
+        if (field?.value !== undefined && !(field.value >= 0 && field.value <= 700)) throw new Error('下行长波 skyLongwave 常数须在 0–700 W m⁻²')
+        if (field) config.skyLongwave = field
+      }
+    }
     const region = scene.region
     if (region && region.enabled) {
       const values = ['startRow', 'endRow', 'startColumn', 'endColumn'].map((key) => (String(region[key] ?? '').trim() === '' ? NaN : Number(region[key])))

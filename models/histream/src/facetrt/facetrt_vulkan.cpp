@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -15,6 +17,9 @@ namespace facetvk {
 namespace {
 
 constexpr uint64_t kEmptyEdgeKey = std::numeric_limits<uint64_t>::max();
+// Highest per-pixel fragment count the visibility shaders can resolve
+// (MAX_FRAGMENTS in visibility_resolve.comp / direct_resolve.comp).
+constexpr uint32_t kMaximumRasterLayers = 256;
 
 // Destroys a shader module on scope exit, including pipeline-creation failures.
 struct ShaderModuleGuard {
@@ -479,6 +484,63 @@ uint32_t FacetrtVulkan::chooseHashCapacity() const
     return nextPowerOfTwo(static_cast<uint32_t>(requested));
 }
 
+uint64_t FacetrtVulkan::rasterLayerBudgetBytes() const
+{
+    if (const char* requested = std::getenv("HISTREAM_FACET_RASTER_BUDGET_MB")) {
+        char* end = nullptr;
+        const double megabytes = std::strtod(requested, &end);
+        if (end != requested && megabytes > 0.0) {
+            return static_cast<uint64_t>(megabytes * 1024.0 * 1024.0);
+        }
+    }
+    // Keep the fragment buffer inside a quarter of the largest device-local
+    // heap so a denser A-buffer cannot evict the geometry and solve buffers.
+    VkPhysicalDeviceMemoryProperties memory{};
+    vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memory);
+    VkDeviceSize deviceLocal = 0;
+    for (uint32_t heap = 0; heap < memory.memoryHeapCount; ++heap) {
+        if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0U) {
+            deviceLocal = std::max(deviceLocal, memory.memoryHeaps[heap].size);
+        }
+    }
+    return deviceLocal / 4U;
+}
+
+bool FacetrtVulkan::growRasterLayers()
+{
+    const uint32_t current = std::max(1U, m_config.maxFragmentsPerPixel);
+    if (current >= kMaximumRasterLayers) {
+        return false;
+    }
+    // Jump straight to the deepest per-pixel list observed in the overflowing
+    // pass (rounded to a power of two) rather than doubling: each attempt
+    // rebuilds the whole visibility graph (~1 s per step on dense scenes).
+    uint32_t next = std::min(kMaximumRasterLayers, current * 2U);
+    if (m_requiredRasterLayers > next) {
+        next = std::min(kMaximumRasterLayers, nextPowerOfTwo(m_requiredRasterLayers));
+    }
+    const uint64_t fragments = uint64_t(m_config.rasterWidth) *
+                               uint64_t(m_config.rasterHeight) * uint64_t(next);
+    if (fragments > std::numeric_limits<uint64_t>::max() / 8ULL) {
+        return false;
+    }
+    const uint64_t bytes = fragments * 8ULL;
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
+    if (bytes > uint64_t(properties.limits.maxStorageBufferRange)) {
+        return false;
+    }
+    const uint64_t budget = rasterLayerBudgetBytes();
+    if (budget != 0ULL && bytes > budget) {
+        return false;
+    }
+    m_config.maxFragmentsPerPixel = next;
+    std::cout << "facetrt: A-buffer overflow at " << current
+              << " layers; reserving " << next << " layers per pixel ("
+              << (bytes >> 20U) << " MiB fragment buffer)" << std::endl;
+    return true;
+}
+
 void FacetrtVulkan::validateGeometry(const std::vector<Vertex>& vertices) const
 {
     if (vertices.empty() || (vertices.size() % 3U) != 0U) {
@@ -558,19 +620,37 @@ std::array<float, 16> FacetrtVulkan::makeProjection(const Direction& direction) 
         extendedMax[2] - extendedMin[2]};
     const float radius = std::max(0.5f * std::sqrt(dot3(diagonal, diagonal)) * 1.001f,
                                   1.0e-4f);
+    // Only central-block fragments are receivers, and every occluder of a
+    // central facet projects onto that facet's pixel, so the x/y window only
+    // has to cover the central block. Using the central bounding sphere (the
+    // same radius for every direction keeps the pixel area, hence the
+    // per-direction weight of the visibility counts, constant) instead of the
+    // sphere around all periodic replicas raises the effective resolution by
+    // the ratio of the two radii (3-5x linear for 4-20 neighbour tiles).
+    // Depth still spans the replicas so every occluder stays in [0, 1].
+    const std::array<float, 3> centralCenter{
+        (m_boundsMin[0] + m_boundsMax[0]) * 0.5f,
+        (m_boundsMin[1] + m_boundsMax[1]) * 0.5f,
+        (m_boundsMin[2] + m_boundsMax[2]) * 0.5f};
+    const std::array<float, 3> centralDiagonal{
+        m_boundsMax[0] - m_boundsMin[0],
+        m_boundsMax[1] - m_boundsMin[1],
+        m_boundsMax[2] - m_boundsMin[2]};
+    const float windowRadius = std::max(
+        0.5f * std::sqrt(dot3(centralDiagonal, centralDiagonal)) * 1.001f, 1.0e-4f);
 
     std::array<float, 16> matrix{};
-    matrix[0] = right[0] / radius;
-    matrix[1] = up[0] / radius;
+    matrix[0] = right[0] / windowRadius;
+    matrix[1] = up[0] / windowRadius;
     matrix[2] = -view[0] / (2.0f * radius);
-    matrix[4] = right[1] / radius;
-    matrix[5] = up[1] / radius;
+    matrix[4] = right[1] / windowRadius;
+    matrix[5] = up[1] / windowRadius;
     matrix[6] = -view[1] / (2.0f * radius);
-    matrix[8] = right[2] / radius;
-    matrix[9] = up[2] / radius;
+    matrix[8] = right[2] / windowRadius;
+    matrix[9] = up[2] / windowRadius;
     matrix[10] = -view[2] / (2.0f * radius);
-    matrix[12] = -dot3(center, right) / radius;
-    matrix[13] = -dot3(center, up) / radius;
+    matrix[12] = -dot3(centralCenter, right) / windowRadius;
+    matrix[13] = -dot3(centralCenter, up) / windowRadius;
     matrix[14] = 0.5f + dot3(center, view) / (2.0f * radius);
     matrix[15] = 1.0f;
     return matrix;
@@ -618,7 +698,7 @@ void FacetrtVulkan::createVisibilityResources()
                                  deviceStorage, deviceLocal);
     m_skyCounts = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(uint32_t),
                                deviceStorage, deviceLocal);
-    m_visibilityStats = createBuffer(2U * sizeof(uint32_t), deviceStorage, deviceLocal);
+    m_visibilityStats = createBuffer(4U * sizeof(uint32_t), deviceStorage, deviceLocal);
     m_directTotal = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(uint32_t),
                                  deviceStorage, deviceLocal);
     m_directVisible = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(uint32_t),
@@ -942,6 +1022,7 @@ void FacetrtVulkan::createSolvePipeline()
 GraphDiagnostics FacetrtVulkan::buildVisibilityGraph(
     const std::vector<Direction>& directions)
 {
+    m_visibilityDirections = directions;
     for (;;) {
         try {
             return buildVisibilityGraphOnce(directions);
@@ -949,6 +1030,12 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraph(
             // Distinct visible facet pairs exceeded the table: double it and rebuild.
             if (m_hashCapacity >= maximumHashCapacity()) throw;
             m_config.edgeHashCapacity = m_hashCapacity * 2U;
+            const std::vector<Vertex> geometry = m_geometry;
+            setGeometry(geometry);
+        } catch (const RasterLayerOverflow&) {
+            // Dense canopies overflow the per-pixel fragment list long before
+            // the hash table: reserve more layers and rebuild the resources.
+            if (!growRasterLayers()) throw;
             const std::vector<Vertex> geometry = m_geometry;
             setGeometry(geometry);
         }
@@ -1072,7 +1159,7 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     // DEFERRED[中] 内存: 整张边哈希表（容量可达 maxStorageBufferRange/8，即最多 ~512M 项 → 4 GiB 键 + 2 GiB 计数）一次性回读到主机，另外 downloadBuffer 还要分配同样大小的 host-visible staging，容易耗尽内存；建议：在 GPU 上先压缩非空槽（prefix-sum/compaction）再回读，或分块回读。
     std::vector<uint64_t> edgeKeys(m_hashCapacity);
     std::vector<uint32_t> edgeCounts(m_hashCapacity);
-    std::array<uint32_t, 2> statistics{};
+    std::array<uint32_t, 4> statistics{};
     m_denominatorCpu.resize(surfaceCount());
     m_skyCountsCpu.resize(surfaceCount());
     downloadBuffer(m_edgeKeys, edgeKeys.data(), edgeKeys.size() * sizeof(uint64_t));
@@ -1089,8 +1176,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     diagnostics.fragmentOverflow = statistics[0];
     diagnostics.hashOverflow = statistics[1];
     if (diagnostics.fragmentOverflow != 0U) {
-        throw std::runtime_error(
-            "Visibility A-buffer overflow; increase Config::maxFragmentsPerPixel");
+        m_requiredRasterLayers = std::max(m_requiredRasterLayers, statistics[2]);
+        throw RasterLayerOverflow();
     }
     if (diagnostics.hashOverflow != 0U) {
         throw EdgeHashOverflow();
@@ -1160,6 +1247,26 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
 }
 
 std::vector<float> FacetrtVulkan::computeSunlitFraction(const Direction& sunDirection)
+{
+    for (;;) {
+        try {
+            return computeSunlitFractionOnce(sunDirection);
+        } catch (const RasterLayerOverflow&) {
+            // A grazing sun stacks more fragments per pixel than the 40-direction
+            // hemisphere graph did. Reserve more layers, rebuild the graph the
+            // solve resources depend on, and retry this direction.
+            if (!growRasterLayers()) throw;
+            const std::vector<Vertex> geometry = m_geometry;
+            setGeometry(geometry);
+            if (!m_visibilityDirections.empty()) {
+                const std::vector<Direction> directions = m_visibilityDirections;
+                buildVisibilityGraph(directions);
+            }
+        }
+    }
+}
+
+std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sunDirection)
 {
     if (m_directResolvePipeline == VK_NULL_HANDLE || m_facetCount == 0U) {
         throw std::logic_error("setGeometry() must be called before computeSunlitFraction()");
@@ -1263,13 +1370,13 @@ std::vector<float> FacetrtVulkan::computeSunlitFraction(const Direction& sunDire
 
     std::vector<uint32_t> total(surfaceCount());
     std::vector<uint32_t> visible(surfaceCount());
-    std::array<uint32_t, 2> statistics{};
+    std::array<uint32_t, 4> statistics{};
     downloadBuffer(m_directTotal, total.data(), total.size() * sizeof(uint32_t));
     downloadBuffer(m_directVisible, visible.data(), visible.size() * sizeof(uint32_t));
     downloadBuffer(m_visibilityStats, statistics.data(), sizeof(statistics));
     if (statistics[0] != 0U) {
-        throw std::runtime_error(
-            "Direct-light A-buffer overflow; increase Config::maxFragmentsPerPixel");
+        m_requiredRasterLayers = std::max(m_requiredRasterLayers, statistics[2]);
+        throw RasterLayerOverflow();
     }
 
     // NaN marks a side with no sample; the caller estimates it from neighbours.
@@ -1320,6 +1427,7 @@ uint32_t FacetrtVulkan::recordSolve(VkCommandBuffer commandBuffer, float skyRadi
 uint32_t FacetrtVulkan::recordIterations(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity,
                                         uint32_t iterations, float relaxation, bool indirect)
 {
+    ++m_solveGeneration;
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_solvePipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_solvePipelineLayout, 0, 1,
                             &m_solveDescriptorSet, 0, nullptr);
@@ -1522,8 +1630,27 @@ EnergyStatistics FacetrtVulkan::evaluateEnergy(float skyRadiosity)
     VkCommandBuffer cmd = beginCommands();
     vkCmdFillBuffer(cmd, m_energyStats.buffer, 0, m_energyStats.size, 0);
     recordEnergy(cmd, 2);
-    // DEFERRED[中] 数值: 能量平衡每次评估都从零辐射度冷启动、固定 64 次 Jacobi 且不检查残差；对 r+t 接近 1 的密集冠层（近红外/长波多次散射）64 次可能未收敛，导致吸收辐射偏低且无任何告警；建议：用上一次辐射度热启动，并读取 m_residual 与容差比较，不收敛时告警或继续迭代。
-    recordSolve(cmd, skyRadiosity, 64, 1.0f);
+    // Longwave Jacobi. The first evaluation after any other solve starts cold
+    // with 64 sweeps. Later coupling iterations start from the previous
+    // longwave radiosity, which only differs through the temperature update;
+    // the Jacobi error contracts by max(r+t) (~0.02-0.1 in the thermal
+    // infrared) per sweep, so 16 warm sweeps leave a residual many orders
+    // below the 2 W/m2 energy criterion while cutting the dominant per-
+    // iteration GPU cost by 4x.
+    constexpr uint32_t coldIterations = 64;
+    constexpr uint32_t warmIterations = 16;
+    const bool warm = m_energyWarmGeneration != 0 &&
+        m_energyWarmGeneration == m_solveGeneration;
+    if (warm) {
+        m_energyRadiosityPing = recordIterations(
+            cmd, m_energyRadiosityPing, skyRadiosity, warmIterations, 1.0f);
+        recordIncident(cmd, m_energyRadiosityPing, skyRadiosity);
+        m_energyIterations = warmIterations;
+    } else {
+        m_energyRadiosityPing = recordSolve(cmd, skyRadiosity, coldIterations, 1.0f);
+        m_energyIterations = coldIterations;
+    }
+    m_energyWarmGeneration = m_solveGeneration;
     recordEnergy(cmd, 0);
     endCommands(cmd);
     return readEnergyStatistics();
@@ -1549,13 +1676,15 @@ EnergySnapshot FacetrtVulkan::readEnergyState(bool includeRadiation)
         result.radiation.radiosity.resize(surfaceCount());
         result.radiation.incident.resize(surfaceCount());
         downloadBuffer(m_optics, result.optics.data(), result.optics.size() * sizeof(SurfaceOptics));
-        // DEFERRED[低] Bug: 固定读取 m_radiosityA 并把 iterations 写死为 64，只在最后一次求解恰好是 evaluateEnergy（64 次、偶数、ping=0）时正确；若之后调用过 solveAccelerated/solveSpectralBand（ping 可能为 1），读到的是上一步的旧辐射度且 maxDelta 也来自别的求解；建议：在成员中记录最后一次求解的 ping 与迭代数，按其选择缓冲。
-        downloadBuffer(m_radiosityA, result.radiation.radiosity.data(), surfaceCount() * sizeof(float));
+        // Read the buffer that holds the final iterate of the last
+        // evaluateEnergy solve (recordSolve's returned ping: 0 = A, 1 = B).
+        downloadBuffer(m_energyRadiosityPing == 0U ? m_radiosityA : m_radiosityB,
+                       result.radiation.radiosity.data(), surfaceCount() * sizeof(float));
         downloadBuffer(m_incident, result.radiation.incident.data(), surfaceCount() * sizeof(float));
         uint32_t delta{};
         downloadBuffer(m_residual, &delta, sizeof(delta));
         std::memcpy(&result.radiation.maxDelta, &delta, sizeof(delta));
-        result.radiation.iterations = 64;
+        result.radiation.iterations = m_energyIterations;
     }
     return result;
 }
@@ -1633,6 +1762,7 @@ SolveResult FacetrtVulkan::solveAccelerated(
     }
 
     uploadBuffer(m_optics, optics.data(), optics.size() * sizeof(SurfaceOptics));
+    ++m_solveGeneration; // overwrites the ping-pong buffers below
     if (initialRadiosity != nullptr) {
         const VkDeviceSize bytes =
             initialRadiosity->size() * sizeof(float);
@@ -1840,13 +1970,15 @@ void FacetrtVulkan::recordSpectral(VkCommandBuffer commandBuffer, const Spectral
 }
 
 SolveResult FacetrtVulkan::solveSpectralBand(uint32_t band, bool thermal, float sky, float scale,
-                                           bool accelerated, bool warmStart, bool diffuse)
+                                           bool accelerated, bool warmStart, bool diffuse, float beam)
 {
     if (m_spectralPipeline == VK_NULL_HANDLE || band >= m_spectralPush.bands || !std::isfinite(sky) || sky < 0 ||
-        !std::isfinite(scale) || scale <= 0 || (diffuse && band != 0))
+        !std::isfinite(scale) || scale <= 0 || (diffuse && band != 0) || !std::isfinite(beam))
         throw std::invalid_argument("Invalid GPU spectral band solve");
     auto push = m_spectralPush;
-    push.band = band; push.thermal = thermal; push.beam = thermal ? 0.0f : m_spectralPush.beam; push.scale = scale;
+    // Per-band beam-normal irradiance (beam < 0: the value from beginSpectral).
+    const float bandBeam = beam >= 0.0f ? beam : m_spectralPush.beam;
+    push.band = band; push.thermal = thermal; push.beam = thermal ? 0.0f : bandBeam; push.scale = scale;
     push.phase = diffuse ? 4U : 0U;
     auto cmd = beginCommands();
     recordSpectral(cmd, push);

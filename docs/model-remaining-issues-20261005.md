@@ -1,5 +1,37 @@
 # Stream Studio 尚存问题核查（2026-10-05）
 
+## 2026-11-20 更新
+
+依据 2026-11-20 工作区代码修改（未提交）核对。方法细节见理论手册 4.2、5.2、7.x、9.2、11.1 节及 `models/stream/README.md`。
+
+已修正：
+- VoxelRT 光学归一：反射率 = πL / (E_dir·cosθs + E_diff)，E_diff 为水平天空辐照（不再乘 0.5）；固体表面反射环境项去掉 0.5，植被两面取单面 0.5 保留。
+- 固体接收面（VoxelRT、VoxelEB）：按存储外法线定半球并余弦加权，存储值为辐照度；VoxelRT 太阳可见性也从法线所指立方体面出发，与 VoxelEB 的固体几何投影修正一致。
+- 达到步数上限的射线不再补天空（VoxelRT 与 VoxelEB 一致）。
+- 烟/雾单次散射图像项改为 πL = ω(1−e^{−τ})·[π·p(Θ)·E_b·T_sun + ½·E_env]，p 为每球面度归一的 HG 相函数（原直射项缺 π 且 VoxelRT 混入 cosθs 因子，环境项按 1/4π 取，小 2π 倍）。
+- VoxelEB 太阳高度截断（cosθs ≤ 0.01）时，实测直射份额并入天空漫射，短波守恒。
+- VoxelRT 热红外判据统一为 > 2.5 µm（原扩散/过程输出用 5 µm），2.5–5 µm 只计 Planck 发射、不计太阳反射。
+- VoxelEB 热红外图像的环境温度由入射长波（存储吸收量 ÷ 吸收率）反算，低发射率金属屋面不再偏冷。
+- VoxelEB 对数风廓线用参考高度风速；流场风只用于 localExchange 与建筑强迫对流。rar 括号位置更正（SCOPE 原式有误；中性层结下无数值差别）。
+- FacetRT/FacetEB：Hapke 背景能量约定改为守恒形式（Lambert 底值作白空反照率，直射按 A(μ0)/A_bh 加权）；两者共用 Esun/Esky 形状与 directScatteringRatio，低太阳或 1400 W/m² 封顶丢弃的直射计入漫射；FacetEB 直散比此前被光谱文件覆盖（约 0.806），现取设置值。
+- FacetEB：无 surfaceEnergy 时按 componentType 判定叶片/固体（原一律按叶片）；Tsold 未写时取首个气象节点气温（GUI 总写数值，默认 300 K）；光合实为 SCOPE MD12（Farquhar/von Caemmerer + Ball-Berry），原记录“Farquhar 实为 Jarvis”不成立。
+- STREAM：热红外亮温补反射天空项 (1−Σw)·B(T_sky)；SZA ≥ 90°（含局地背光坡）光照组分并入阴影；地形短波先水平分直散再投影到坡面；BSM 湿土改为 SCOPE soilwat；地类 0/16 无气孔、16 的 N=1.5、水体按水面地面；rar 括号位置同上（北京 Landsat 示例收敛像元 180326→180187）。
+- 集成：HiStream 用法错误退出码改为 64，2 只表示 FacetEB 未收敛；界面、服务端与引擎的波段列表规则一致。
+- Facet 可见性 A-buffer 溢出自动扩层（2026-11-20 晚）：GPU 溢出时把片元层数加倍（64→128→256）并重建可见性/求解资源，单方向太阳可见性溢出时重建可见性图后重试；上限为着色器 256 层、`maxStorageBufferRange` 与显存最大 25%（`HISTREAM_FACET_RASTER_BUDGET_MB` 可覆盖）。crop_gpp_npp 示例此前默认配置报 `Visibility A-buffer overflow`、必须设 `HISTREAM_FACET_RASTER_LAYERS=128`，现可在默认设置下直接运行。CPU 光栅后端同样加倍重试（上限 128 层 / 2 GiB）。
+- VoxelEB 夜间不再空跑短波（#6 已修正，2026-11-20 深夜）：太阳天顶角 ≥ 90° 且实测短波 ≤ 0.001 W m⁻² 时，清零方向可见性（VoxelDir）、净辐射、PAR 与方向辐射场，跳过 gap、直射与全部散射阶数；散射诊断照旧写出（`elapsedMs`≈0），标准输出打印 `SHORTWAVE_SKIPPED`。forest 示例全天 329 s → 254 s（16 个夜间节点，短波追踪总耗 222 s → 146 s），474 个输出文件除散射诊断的耗时字段外逐字节不变。晨昏（sza<90° 但短波很小）仍照常追踪。
+
+仍未处理：
+- 太阳遮挡截断（#4）。
+- 光学图像只含单次散射（#5）。
+- VoxelEB 不读 LIDF；旋转实例加速结构仍是旋转立方体。
+- FacetRT 向下逃逸按天空计；A-buffer 已达 256 层或超出显存预算时仍报错（需要清理重叠面或改用体元模式）。
+- FacetEB 水体无蒸发、无混合层，建筑为薄壳；土壤方法 2 无深层恢复。
+- VoxelEB 短波直散比全时段固定为设置值（`fileio.cpp:1829`），不随时次变化。
+- Hapke 影像仍为天顶方向的方向反射因子/发射率，未按能量守恒归一；反射率输出截断在 [0,1]。
+- STREAM EB 从过境当天 00 UTC 起算、温度下限 240 K、冰雪不计融化。
+
+部署状态（本节取代下文“部署状态”中的哈希）：当前工作区 `C:\work\streamstudio\models\bin_x64\Release\histream.exe` 的 SHA256 为 `78416e907144fe87c08c729dd77f937340d7469dd1b97b54693dbb1437a94a22`（Get-FileHash 实测，2026-11-20 18:09 构建，含建筑法线按几何定向与 A-buffer 自动扩层，与 `build-manifest.json` 一致）。构建产出 36 个 SPV，部署目录已清理 3 个旧文件 `shader/cases/VoxelTriTracing/*.spv` 与 2 个 `- 副本.comp`，清单 `staleShaderBinaries`/`missingShaderBinaries` 均为空。
+
 ## 2026-10-12 更新
 
 依据 2026-10-11 全模型审阅完成两批修正，SCOPE 1.73 一日算例均 PASS（SCOPE 2 算例暂不作为验收依据）。
@@ -18,7 +50,7 @@
 - 旋转实体的加速结构仍是旋转立方体，与世界网格体元不完全对齐，个别射线可能穿过旋转墙体。
 - FacetRT 向下逃逸仍按天空计；需要下边界模型（地面背面目前作为独立表面求解）。试过改为自边（下边界视作与接收面相同的辐射体），非周期 16 m 算例边缘叶片变暖，SCOPE 1.73 FacetEB 全图 BT RMSE 由 1.27 升至 1.56（超 1.5），已撤回。
 - 小面元直射：太阳栅格做 4×4 亚像元抖动，零样本面按 1 m 邻域朝阳面均值估计。DOY169 正午 LAI 3、0.2 m 叶片扫描中，中心叶片最大层温差相对 16 m：≤64 m 不超过 0.05 K，96 m 0.11 K，128 m 0.23 K，160 m 0.35 K（修正前 64 m 已约 0.5 K，160 m 6 K）；抖动使太阳栅格多耗约 3 ms，约占总耗时 1%。Facet 推荐 100 m 以内，不设硬上限；建筑大面元在大场景仍可用。运行日志打印植被面元/像元面积比，≥0.5 对应约 0.1 K。漫射可见性图未做抖动，零样本面仍按全天空处理。稠密冠层开周期边界时 A-buffer（64 层）会溢出。
-- FacetEB 水体无蒸发与混合层、建筑为薄壳；“Farquhar”选项实为 Jarvis 式，土壤方法 2 无深层恢复；Tsold 默认 300 K。
+- FacetEB 水体无蒸发与混合层、建筑为薄壳；土壤方法 2 无深层恢复。（原记录的“Farquhar 选项实为 Jarvis 式”已不成立，现为 SCOPE MD12；Tsold 默认值见 2026-11-20 更新。）
 - FacetEB 与 FacetRT 一样，每个面元分光照与阴影两部分（薄面元两面共用受照比例，地面逐面），各自求能量平衡温度、气孔与土壤热历史；长波发射按面积混合，影像按观测点晴/阴（逐节点真实太阳）取值。DOY169 正午中心窗口：土壤晴/阴 36.3/20.5 °C（SCOPE 34.9/21.2），叶 31.5/24.9 °C（VoxelEB 31.5/24.6）；热点 +4.5 K（LAI 3）。SCOPE 1.73 回归 Ts/G/BT 改善，但 LE RMSE 7.2→17.9（上限 20，偏低约 11 W m⁻²，与 VoxelEB 同向），Tc 0.42→0.78，H 11.6→15.2；推测为晴/阴分开后光合对光的饱和（未单独验证）。晴叶温度与 |cos 太阳入射角| 相关 0.97，影像朝太阳侧与天底偏暖由叶片朝向造成，一维/体元模型无此效应。单节点 61 视角的算例耗时约 51→91 s（引擎约 46 s）。
 - VoxelEB 不读取 LIDF（消光与晴叶直射均用参数 G）；午后晴叶仍偏热（SCOPE 1.73 算例 LE 低约 25 W m⁻²）；生理第 25 次迭代后冻结；中性稳定度。
 - 太阳遮挡截断（#4）、夜间仍做短波追踪（#6）。
@@ -45,7 +77,7 @@
 
 5. **三阶尚未进入光学传感器图像。** 改动作用于 VoxelEB 短波能量/PAR 场；热红外传播、VoxelRT/FacetEB 和光学观察 shader 是独立路径。光学图像仍在 [voxelrad_image.comp:463](C:/work/streamstudio/models/histream/shader/voxeleb/voxelrad_image.comp:463) 从直射、天空和材质构造辐亮度，没有读取新逐阶方向场。温度变化能影响热红外结果，但不能据此称光学图像已支持完整三阶散射。
 
-6. **夜间仍有可避免的计算。** [command.cpp:213](C:/work/streamstudio/models/histream/src/voxeleb/command.cpp:213) 没有在零短波节点跳过短波谱组和全部请求阶数。夜间数值为零已经验证，但仍在做射线追踪。应先清零短波状态，再安全跳过零光源计算，保留完整诊断，避免上一节点辐射残留。
+6. **已修正（2026-11-20）：夜间空跑短波。** 原 [command.cpp](C:/work/streamstudio/models/histream/src/voxeleb/command.cpp) 在零短波节点仍跑太阳可见性、直射和全部散射阶数。现在只有在“太阳天顶角 ≥ 90° 且实测短波 ≤ 0.001 W m⁻²”时，先清零短波状态（VoxelDir 的太阳可见性与天空漫射比例、净辐射、PAR、方向辐射场），再跳过 gap、直射与散射阶数；散射诊断照旧写出（`elapsedMs`≈0, 各阶计数为 0），日志打印 `SHORTWAVE_SKIPPED`。forest 示例全天 329 s → 254 s，输出逐字节不变。
 
 此外，三阶后的收敛误差、64 方向积分、水面窄镜面峰、全域能量闭合、实测精度和北京完整 5 km 场景成本尚未验证。北京已有测试仅为 300 m ROI。
 
@@ -55,8 +87,8 @@
 
 ## 部署状态
 
-- 当前工作区 Release 引擎：`C:\work\streamstudio\models\bin_x64\Release\histream.exe`，SHA256 `f87ebc7b8027d77d58d6e6bf76d7d7e2c067382c00681ae9c3620de4cc08eb7e`。
-- 旧部署目录中的 `resources\engine\histream.exe` 仍为 `9b852d9e02e40048be230dd707387bfc33552f881cb61a651e48ed9a0c4126e3`，未同步本次三阶改动。
+- 当前工作区 Release 引擎：`C:\work\streamstudio\models\bin_x64\Release\histream.exe`，2026-10-05 记录的 SHA256 `f87ebc7b8027d77d58d6e6bf76d7d7e2c067382c00681ae9c3620de4cc08eb7e` 已过期，当前值见顶部 2026-11-20 更新。
+- 旧部署目录（2026-10-05 记录，未复核）中的 `resources\engine\histream.exe` 仍为 `9b852d9e02e40048be230dd707387bfc33552f881cb61a651e48ed9a0c4126e3`，未同步本次三阶改动。
 - 源码默认阶数仍为 1，默认走旧路径；设为 2/3 才启用新短波路径。
 
 预算未闭合按要求保留为诊断并继续步进。后续模型工作仍包括固体几何投影、普通冠层边界及介质长波散射；太阳截断诊断、夜间优化及光学成像的高阶接入另行处理。既有三阶测试证据见 2026-10-04 测试记录（已移出工作区，见 git 历史 `docs/scattering-order-validation-20261004.md`）。

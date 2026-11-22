@@ -6,7 +6,9 @@
 namespace stream {
 namespace {
 
-// TiRT/TIRTEB integrate 48 h of surface temperature; STREAM only needs the last 7 h (project decision).
+// FIX(2026-11-21 B9): TiRT/TIRTEB keep the same 7 h window (heat_conduction.py HISTORY_SECONDS; TIRTEB theory §G
+// "保存实际经过的 7 小时时间窗"), so this is not a STREAM-only shortening. (Former, wrong comment: "TiRT/TIRTEB
+// integrate 48 h of surface temperature; STREAM only needs the last 7 h (project decision).")
 constexpr double kHistorySeconds = 7.0 * 3600.0;
 constexpr double kColumnDepth = 2.0;      // m
 constexpr double kColumnTopLayer = 0.01;  // m

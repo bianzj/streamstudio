@@ -151,9 +151,21 @@ int runImage(const std::string& configPath)
         classes.soilOptics.brightness = static_cast<float>(config.soilBrightness);
         log("BSM 土壤亮度按本场景设置：" + format(config.soilBrightness, 3));
     }
+    // One soil emissivity for the EB balance and the imaging / retrieval (2026-11-20): an explicit
+    // energy.soilEmissivity replaces the class value of every soil-ground class; otherwise both use classes.json.
+    if (config.soilEmissivitySet) {
+        for (auto& entry : classes.classes)
+            if (entry.surface != SurfaceKind::Missing && entry.surface != SurfaceKind::Fill && entry.groundKind == GroundKind::Soil)
+                entry.ground.emissivity = static_cast<float>(config.soilEmissivity);
+        log("土壤（干端）发射率按配置 " + format(config.soilEmissivity, 3) + "，能量平衡与成像共用");
+    }
     const double overpass = config.overpass;
+    // FIX(2026-11-21 B10): resolved by temperature.spinupHours (default 24 h, see config.h); the march now starts at
+    // marchStart (below) instead of dayStart. Original note kept for reference:
     // DEFERRED[中] 物理: EB 起算点固定为过境当天 00 UTC，不考虑经度。对东亚/澳洲（UTC+8..+10）约 02:30 UTC 的过境，只积分当地上午 0.5–2.5 h，热历史默认 00 UTC 之前等温（无日变化记忆），G 与 Tss 偏差大；过境恰为 00:00 UTC 时只有 1 个时次，完全没有起转；建议：起转改为过境前固定时长（如 ≥24 h），或从按经度换算的当地午夜开始，并相应扩大 ERA5 读取时段
     const double dayStart = std::floor(overpass / 86400.0) * 86400.0;
+    double marchStart = dayStart;        // FIX(2026-11-21 B10): first EB node (set from spinupHours and the pack coverage)
+    double spinupUsedHours = 0.0;        // FIX(2026-11-21 B10): overpass - marchStart, hours
     log("过境时刻 " + formatUtc(overpass) + "，温度来源：" + (eb ? "EB（ERA5 驱动能量平衡）" : "RT（给定组分温度）"));
 
     progress(1, "读取地表输入");
@@ -229,13 +241,29 @@ int runImage(const std::string& configPath)
         if (elevationCorrection) variables.push_back("z");
         else if (config.elevationCorrection && config.dem.present())
             log("警告：已要求按 DEM 订正气温与气压，但 ERA5 数据包没有地表位势 z，本次不做高程订正");
-        // Hours the solver reads: 00 UTC of the overpass day through the hour after the overpass (flux interpolation);
-        // ERA5-Land de-accumulation also needs the hour before 00 UTC.
-        const int64_t firstHour = static_cast<int64_t>(dayStart / 3600.0) - (pack.landProduct() ? 1 : 0);
+        // Hours the solver reads: the march start through the hour after the overpass (flux interpolation);
+        // ERA5-Land de-accumulation also needs the hour before the start.
         int64_t lastHour = static_cast<int64_t>(std::ceil(overpass / 3600.0)) + 1;
+        // FIX(2026-11-21 B10): start spinupHours before the overpass (whole hour); fall back to the earliest hour the
+        // pack covers continuously up to lastHour, with a warning. (Was: always 00 UTC of the overpass day.)
+        const int64_t overpassHour = static_cast<int64_t>(std::floor(overpass / 3600.0));
+        const int64_t desiredStartHour = static_cast<int64_t>(std::floor((overpass - config.spinupHours * 3600.0) / 3600.0));
+        int64_t startHour = std::min(desiredStartHour, overpassHour);
+        {
+            std::string coverageGap;
+            while (startHour < overpassHour && !pack.covers(variables, startHour, lastHour, coverageGap)) ++startHour;
+            if (startHour > desiredStartHour)
+                log("警告：ERA5 数据包不覆盖要求的起转起点 " + formatUtc(static_cast<double>(desiredStartHour) * 3600.0) +
+                    "（temperature.spinupHours = " + format(config.spinupHours, 1) + " h），能量平衡改从数据包可用的最早时次 " +
+                    formatUtc(static_cast<double>(startHour) * 3600.0) + " 起转，实际起转 " +
+                    format((overpass - static_cast<double>(startHour) * 3600.0) / 3600.0, 2) + " h；结果的土壤热历史偏短，请补充更早的逐小时数据");
+        }
+        marchStart = static_cast<double>(startHour) * 3600.0;
+        spinupUsedHours = (overpass - marchStart) / 3600.0;
+        const int64_t firstHour = startHour - (pack.landProduct() ? 1 : 0);
         // TIRTEB initialises with the mean air temperature of the whole first simulated day.
-        const int64_t dayLastHour = static_cast<int64_t>(std::llround(dayStart / 3600.0)) + 23;
-        const int64_t dayStartHour = static_cast<int64_t>(std::llround(dayStart / 3600.0));
+        const int64_t dayLastHour = startHour + 23;   // FIX(2026-11-21 B10): first simulated day = 24 h from the march start
+        const int64_t dayStartHour = startHour;
         std::string gap;
         if (pack.covers(variables, dayStartHour, dayLastHour, gap)) lastHour = std::max(lastHour, dayLastHour);
         // A whole-year pack keeps the year-edge rule: hours just outside the year reuse the nearest one.
@@ -244,10 +272,11 @@ int runImage(const std::string& configPath)
                                      "（" + gap + "）。请补充该时段的逐小时数据后重新登记");
         pack.load(variables, latMin, latMax, lonMin, lonMax, firstHour, lastHour);
         for (const auto& note : pack.notes()) log("ERA5：" + note);
-        const double elapsed = overpass - dayStart;
-        for (int hour = 0; hour * 3600.0 < elapsed - 300; ++hour) nodes.push_back(dayStart + hour * 3600.0);
+        const double elapsed = overpass - marchStart;  // FIX(2026-11-21 B10)
+        for (int hour = 0; hour * 3600.0 < elapsed - 300; ++hour) nodes.push_back(marchStart + hour * 3600.0);
         nodes.push_back(overpass);
-        log("ERA5 " + pack.product() + (pack.fullYear() ? " " + std::to_string(pack.year()) + " 整年" : " 时段数据") + "：能量平衡从 " + formatUtc(dayStart) + " 推进到过境时刻，共 " +
+        log("ERA5 " + pack.product() + (pack.fullYear() ? " " + std::to_string(pack.year()) + " 整年" : " 时段数据") + "：能量平衡从 " + formatUtc(marchStart) + " 推进到过境时刻（起转 " +
+            format(spinupUsedHours, 2) + " h），共 " +
             std::to_string(nodes.size()) + " 个时次" + (pack.available("stl2") ? "，深层土壤温度取 stl2" : "，深层土壤温度取 stl1") +
             (elevationCorrection ? "，按 DEM 与 ERA5 地形高度差订正气温与气压" : ""));
     }
@@ -286,6 +315,19 @@ int runImage(const std::string& configPath)
             const float value = type[static_cast<size_t>(row) * grid.width + column];
             if (classes.find(value)) typeUsed[static_cast<size_t>(std::lround(value))] = 1;
         }
+    // FIX(2026-11-21 C9): crown / row structure parameters are not simulated; say so instead of ignoring them silently.
+    std::vector<std::pair<int, std::string>> ignoredStructureClasses;
+    for (int code = 0; code < 256; ++code)
+        if (typeUsed[code] && !classes.classes[code].ignoredStructure.empty()) {
+            ignoredStructureClasses.push_back({code, classes.classes[code].ignoredStructure});
+            log("警告：地类 " + std::to_string(code) + "（" + classes.classes[code].name + "）配置了树冠/垄行结构参数 " +
+                classes.classes[code].ignoredStructure + "，本版本未接入（physics/effective_lai.cpp 未调用），按均质冠层处理");
+        }
+    if (!config.ignoredStructureKeys.empty()) {
+        std::string keys;
+        for (const auto& key : config.ignoredStructureKeys) keys += (keys.empty() ? "" : "、") + key;
+        log("警告：配置中的冠层结构参数 " + keys + " 本版本未接入，按均质冠层处理");
+    }
     const bool needSpectra = config.opticalEnabled || eb;
     std::map<int, std::vector<float>> leafReflectance, leafTransmittance, leafRhoBins, leafTauBins, flatGroundBins;
     std::map<int, std::vector<double>> leafBandReflectance, leafBandTransmittance;
@@ -387,7 +429,9 @@ int runImage(const std::string& configPath)
             }
             coneDensity[p] = std::clamp(coneDensity[p], 0.0f, 1.0f);
         }
-        log("地形辐射：山包复合坡（12 方位面元 + 密度），坡度/密度来自栅格" + (invalid ? "，无效像元 " + std::to_string(invalid) : ""));
+        // FIX(2026-11-21 B-S4): the shortwave forcing integrates max(0, cos i) analytically over the cone azimuths
+        // (pixel_forcing.cpp); only the thermal view composite uses 12 azimuth facets (thermal_view.cpp).
+        log("地形辐射：山包复合坡（短波按锥面方位解析积分 + 密度，热红外按 12 方位面元合成），坡度/密度来自栅格" + (invalid ? "，无效像元 " + std::to_string(invalid) : ""));
     } else if (config.terrainRadiation == TerrainRadiation::Ridge) {
         ridgeSlope = fieldRaster(config.terrainSlopeField, grid, "山脊坡度", 0, false);
         ridgeAspect = fieldRaster(config.terrainAspectField, grid, "山脊走向", 0, false);
@@ -471,7 +515,7 @@ int runImage(const std::string& configPath)
     }
     // ---- EB pixel machinery: one implementation for the forward solve and the assimilation re-solve ----
     const std::vector<float> noSpectrum;
-    const int64_t ebDayStartHour = static_cast<int64_t>(std::llround(dayStart / 3600.0));
+    const int64_t ebDayStartHour = static_cast<int64_t>(std::llround(marchStart / 3600.0));  // FIX(2026-11-21 B10)
     const int64_t ebDayLastHour = std::min<int64_t>(ebDayStartHour + 23, pack.lastHour());
     const auto validForcing = [](const Forcing& f) {
         return std::isfinite(f.ta) && std::isfinite(f.ea) && std::isfinite(f.p) && std::isfinite(f.wind) &&
@@ -506,12 +550,13 @@ int runImage(const std::string& configPath)
         surface.ground = entry.ground;
         if (entry.groundKind == GroundKind::Soil) {
             // Wet soil emits more: the broadband emissivity follows the
-            // pixel water content between the dry value and saturation.
-            surface.ground.emissivity = soilEmissivityAtMoisture(config.soilEmissivity, config.soilEmissivityWet, surface.soilMoisture);
+            // pixel water content between the dry value and saturation. The dry value is the class
+            // ground.emissivity (shared with the imaging; overridden by energy.soilEmissivity when given).
+            surface.ground.emissivity = soilEmissivityAtMoisture(entry.ground.emissivity, config.soilEmissivityWet, surface.soilMoisture);
             surface.ground.conductivity = config.soilConductivity;
             surface.ground.volumetricCapacity = config.soilVolumetricCapacity;
             surface.ground.moistureResistance = config.soilResistanceFromMoisture;
-            surface.ground.fixedResistance = config.soilResistance;
+            surface.ground.fixedResistance = config.soilResistance;  // FIX(2026-11-21 B-S1): range-checked in config.cpp (0, 1e5]
             if (config.soilThermalFromMoisture)
                 johansenSoilThermal<double>(surface.ground.saturatedMoisture, surface.soilMoisture,
                                             surface.ground.conductivity, surface.ground.volumetricCapacity);
@@ -552,14 +597,15 @@ int runImage(const std::string& configPath)
             const double value = forcing.temperature("t2m", static_cast<double>(hour) * 3600.0);
             if (std::isfinite(value)) { initialSum += value; ++initialCount; }
         }
-        const double initial = initialCount > 0 ? initialSum / initialCount : forcing.temperature("t2m", dayStart);
-        // Soil starts from the ERA5 skin temperature at 00 UTC (the pack already carries skt, stl1 and stl2,
+        const double initial = initialCount > 0 ? initialSum / initialCount : forcing.temperature("t2m", marchStart);
+        // Soil starts from the ERA5 skin temperature at the march start (the pack already carries skt, stl1 and stl2,
         // which the run log promises); the 2 m column is anchored to the ERA5 soil levels. Leaves hold no heat
         // and converge in one step, so they keep the day-mean air temperature. With the day-mean air start the
         // soil was up to 6 K too warm at 06-08 local time and the first step had G = 0 (empty history).
-        const double skin = forcing.temperature("skt", dayStart);
-        const double level1 = forcing.temperature("stl1", dayStart);
-        const double level2 = pack.available("stl2") ? forcing.temperature("stl2", dayStart) : level1;
+        // FIX(2026-11-21 B10): march start = overpass - spinupHours (was 00 UTC of the overpass day).
+        const double skin = forcing.temperature("skt", marchStart);
+        const double level1 = forcing.temperature("stl1", marchStart);
+        const double level2 = pack.available("stl2") ? forcing.temperature("stl2", marchStart) : level1;
         const bool soilFromEra5 = std::isfinite(skin) && skin > 180.0 && skin < 340.0;
         const double soilInitial = soilFromEra5 ? skin : initial;
         EnergyState state;
@@ -580,7 +626,8 @@ int runImage(const std::string& configPath)
         EnergyState before;  // state entering the overpass node (soil heat history of the implicit derivative)
         Forcing meteo;
         ShortwaveAbsorption shortwave;
-        double sza = 0.0, dt = 3600.0;
+        double sza = 0.0, dt = 3600.0;  // sza: beam incidence angle of the receiving surface (= SZA when flat)
+        bool lit = false;
     };
     const auto marchNodes = [&](size_t pixel, const EnergySurface& surface, const OpticalSpectra& spectra, double leafArea,
                                 const PixelForcing& forcing, EnergyState& state, EbRun& run) {
@@ -588,23 +635,47 @@ int runImage(const std::string& configPath)
             const double time = nodes[node];
             const Sun sun = solarPosition(time, latitude[pixel], longitude[pixel], dem[pixel]);
             if (!sun.ok) return false;
-            const Forcing meteo = forcing.at(time);
+            Forcing meteo = forcing.at(time);
             if (!validForcing(meteo)) return false;
-            // DEFERRED[低] 物理: meteo.shortwave 由 NOAA 近似 cos(SZA) 决定是否大于 0，而这里的 sunlit 用的是 SPA 天顶角。日出日落附近可能出现 SPA SZA≥90 而短波>0 的情况；enforceSolarLimit=true 时直射上限为 0，会全部转成漫射，没有问题；但 enforceSolarLimit=false 时 absorbShortwave 在 !lit 下令 esun=0，直射部分 (1−fd)·SW 被直接丢掉，能量不守恒；建议：两处用同一套太阳位置，或者 !lit 时把直射全部计入漫射
-            const ShortwaveAbsorption shortwave = absorbShortwave(
-                solarBins, spectra, leafArea, meteo.shortwave, sun.zenith, dayOfYear, config.diffuseFraction,
-                config.enforceSolarLimit, sun.zenith < 90.0);
+            // Receiving-surface shortwave (2026-11-20). Terrain: split the horizontal flux (DNI limit at the true
+            // SZA), tilt direct by cos i and diffuse by the sky view, then solve with that fixed share and the local
+            // beam incidence angle (canopy extinction, sunlit fractions, longwave split). Flat: unchanged.
+            const SurfaceShortwave surfaceFlux = forcing.surfaceShortwave(time, sun.zenith, dayOfYear, config.enforceSolarLimit, sun.azimuth);
+            // FIX(2026-11-21 C10): the horizontal flux of the node uses the same SPA sun as the beam geometry below
+            // (Forcing::shortwave decided "sun up" with the NOAA approximation).
+            meteo.shortwave = surfaceFlux.horizontal;
+            double beamZenith = sun.zenith;
+            bool beamLit = sun.zenith < 90.0;
+            ShortwaveAbsorption shortwave;
+            if (surfaceFlux.tilted) {
+                meteo.shortwave = surfaceFlux.global;
+                beamLit = beamLit && surfaceFlux.cosIncidence > 1e-6;
+                beamZenith = beamLit ? std::acos(std::clamp(surfaceFlux.cosIncidence, 0.0, 1.0)) * 180.0 / kPi : sun.zenith;
+                shortwave = absorbShortwave(solarBins, spectra, leafArea, meteo.shortwave, beamZenith, dayOfYear,
+                                            std::clamp(surfaceFlux.diffuseShare, 0.0, 1.0), false, beamLit);
+                shortwave.partitionLimited = surfaceFlux.limited;
+                run.diffuse = surfaceFlux.horizontalDiffuseFraction;  // horizontal partition for the optical image
+            } else {
+                // FIX(2026-11-21 C10): resolved. meteo.shortwave now follows the SPA sun (above) and absorbShortwave /
+                // shortwaveComponents put the whole flux into the diffuse term when the surface is not sunlit, so the
+                // direct part is no longer dropped. (Original note kept for reference:)
+                // DEFERRED[低] 物理: meteo.shortwave 由 NOAA 近似 cos(SZA) 决定是否大于 0，而这里的 sunlit 用的是 SPA 天顶角。日出日落附近可能出现 SPA SZA≥90 而短波>0 的情况；enforceSolarLimit=true 时直射上限为 0，会全部转成漫射，没有问题；但 enforceSolarLimit=false 时 absorbShortwave 在 !lit 下令 esun=0，直射部分 (1−fd)·SW 被直接丢掉，能量不守恒；建议：两处用同一套太阳位置，或者 !lit 时把直射全部计入漫射
+                shortwave = absorbShortwave(
+                    solarBins, spectra, leafArea, meteo.shortwave, sun.zenith, dayOfYear, config.diffuseFraction,
+                    config.enforceSolarLimit, sun.zenith < 90.0);
+                run.diffuse = shortwave.diffuseFraction;
+            }
             run.partitionLimited = shortwave.partitionLimited ? 1.0 : 0.0;
-            run.diffuse = shortwave.diffuseFraction;
             const double dt = node ? time - nodes[node - 1] : 3600.0;
             if (node + 1 == nodes.size()) {
                 run.before = state;
                 run.meteo = meteo;
                 run.shortwave = shortwave;
-                run.sza = sun.zenith;
+                run.sza = beamZenith;
+                run.lit = beamLit;
                 run.dt = dt;
             }
-            run.result = solveEnergyNode(surface, meteo, shortwave, sun.zenith, sun.zenith < 90.0, dt, state);
+            run.result = solveEnergyNode(surface, meteo, shortwave, beamZenith, beamLit, dt, state);
         }
         return true;
     };
@@ -648,7 +719,7 @@ int runImage(const std::string& configPath)
         x.vcmax = Ad::seed(base.vcmax, 5);
         x.lai = Ad::seed(leafArea, 6);
         const bool soil = entry->groundKind == GroundKind::Soil;
-        x.soilEmissivity = soil ? soilEmissivityAtMoistureT<Ad>(config.soilEmissivity, config.soilEmissivityWet, x.soilMoisture)
+        x.soilEmissivity = soil ? soilEmissivityAtMoistureT<Ad>(entry->ground.emissivity, config.soilEmissivityWet, x.soilMoisture)
                                 : Ad(surface.ground.emissivity);
         if (soil && config.soilThermalFromMoisture) {
             Ad conductivity, capacity;
@@ -666,7 +737,7 @@ int runImage(const std::string& configPath)
                 soilSpectrum[bin] = Ad(ground[bin]) + gradient * (x.soilMoisture - moisture);
             }
             const auto sw = shortwaveComponents<Ad, std::vector<Ad>>(solarBins, *rho, *tau, soilSpectrum, x.lai, run.meteo.shortwave,
-                                                                     run.shortwave.diffuseFraction, run.sza, run.sza < 90.0);
+                                                                     run.shortwave.diffuseFraction, run.sza, run.lit);
             x.soilDirect = sw.soilDirect;
             x.soilDiffuseSun = sw.soilDiffuseSun;
             x.soilDiffuseShade = sw.soilDiffuseShade;
@@ -678,7 +749,7 @@ int runImage(const std::string& configPath)
             x.soilSunlitFraction = sw.soilSunlitFraction;
             x.laiSunlit = sw.laiSunlit;
         }
-        const auto residual = energyResiduals<Ad>(surface, x, run.meteo, run.sza, run.sza < 90.0, run.dt, run.before,
+        const auto residual = energyResiduals<Ad>(surface, x, run.meteo, run.sza, run.lit, run.dt, run.before,
                                                   state.inverseObukhov, state.sceneSensible);
         const int size = leaves ? 4 : 2;
         double a[4][4]{}, b[4][3]{};
@@ -731,7 +802,12 @@ int runImage(const std::string& configPath)
                 const PixelForcing forcing = pixelForcing(pixel);
                 const Forcing atOverpass = forcing.at(overpass);
                 if (!validForcing(atOverpass)) { ++ebNoForcing; continue; }
-                const double values[7] = {atOverpass.ta, atOverpass.ea, atOverpass.p, atOverpass.wind, atOverpass.shortwave, atOverpass.longwave, soilMoisture[pixel]};
+                // FIX(2026-11-21 C10): the reported horizontal shortwave at the overpass uses the SPA sun, as the solve.
+                double overpassShortwave = atOverpass.shortwave;
+                if (const Sun overpassSun = solarPosition(overpass, latitude[pixel], longitude[pixel], dem[pixel]); overpassSun.ok)
+                    overpassShortwave = forcing.surfaceShortwave(overpass, overpassSun.zenith, dayOfYear, config.enforceSolarLimit,
+                                                                 overpassSun.azimuth).horizontal;
+                const double values[7] = {atOverpass.ta, atOverpass.ea, atOverpass.p, atOverpass.wind, overpassShortwave, atOverpass.longwave, soilMoisture[pixel]};
                 for (int k = 0; k < 7; ++k) forcingOut[k][pixel] = static_cast<float>(values[k]);
                 if (entry->surface == SurfaceKind::Water) {
                     const float skin = static_cast<float>(forcing.temperature("skt", overpass));
@@ -798,6 +874,43 @@ int runImage(const std::string& configPath)
             // DEFERRED[低] 错误处理: RT 模式下若组分温度误给成 °C（如 25），会在这里静默变成 NaN，最后只体现为 thermalFailed 计数，没有任何单位提示；建议：统计被剔除的像元，大多数值落在 −50..60 时报错或警告"组分温度须为 K"
             for (auto& value : band) if (!(value >= 100 && value <= 400)) value = kNaN;
 
+    // ---------------- reflected sky ----------------
+    // Downwelling longwave of the reflected-sky term of the thermal brightness (2026-11-20). One per-pixel field
+    // shared by imaging, inversion and assimilation; it is fixed from the background state (not re-derived from
+    // a posterior), so the retrieval and the image of its result use the same operator.
+    std::vector<float> skyLongwave;
+    bool skyFromObservations = false;
+    std::string skySource = "none";
+    if ((config.thermalEnabled || config.inversion.enabled() || assimilate) && config.skySource != ImageConfig::SkySource::None) {
+        if (config.skySource == ImageConfig::SkySource::Field) {
+            skyLongwave = fieldRaster(config.skyLongwave, grid, "下行长波 skyLongwave", 0, true);
+            skySource = "configured";
+        } else if (eb) {
+            skyLongwave = forcingOut[5];
+            skySource = "era5-strd";
+        } else {
+            // RT: Swinbank clear-sky L↓ with the shaded leaf (else shaded / sunlit soil) temperature as air proxy.
+            skyLongwave.assign(pixels, kNaN);
+            const auto at = [&](int k, size_t p) { return components[k].size() == pixels ? components[k][p] : kNaN; };
+            for (size_t p = 0; p < pixels; ++p) {
+                float proxy = at(3, p);
+                if (!std::isfinite(proxy)) proxy = at(1, p);
+                if (!std::isfinite(proxy)) proxy = at(0, p);
+                skyLongwave[p] = static_cast<float>(swinbankLongwave(proxy));
+            }
+            skyFromObservations = true;  // plain LST retrieval without components: proxy = observed brightness
+            skySource = "swinbank-shaded-component";
+        }
+        double sum = 0.0;
+        long long count = 0;
+        for (auto& value : skyLongwave) {
+            if (!(std::isfinite(value) && value > 0.0f)) { value = kNaN; continue; }
+            sum += value;
+            ++count;
+        }
+        log("热红外反射天空项：下行长波来源 " + skySource + (count ? "，均值 " + format(sum / count, 1) + " W m⁻²" : "，无有效值"));
+    }
+
     // ---------------- imaging ----------------
     std::vector<std::vector<float>> optical(config.opticalBands.size(), std::vector<float>(config.opticalEnabled ? pixels : 0, kNaN));
     std::vector<std::vector<float>> brightness(config.thermalBands.size(), std::vector<float>(config.thermalEnabled ? pixels : 0, kNaN));
@@ -834,10 +947,24 @@ int runImage(const std::string& configPath)
     const double inversionStart = eb ? 70 : 20, inversionSpan = config.inversion.enabled() ? (eb ? 10 : 35) : 0;
     InversionResult inversionResult;
     std::array<std::vector<float>, 4> ebComponents;  // EB solution kept for components.tif when LSCT replaces it
+    // Terrain of the thermal observation operator, shared by the imaging loop, the inversion and the assimilation.
+    // FIX(2026-11-21 S-1): built before the inversion (was after it) so the retrieval uses the same terrain operator.
+    TerrainFields terrainFields;
+    terrainFields.mode = config.terrainRadiation;
+    terrainFields.slope = &terrainSlope;
+    terrainFields.aspect = &terrainAspect;
+    terrainFields.coneSlope = &coneSlope;
+    terrainFields.coneDensity = &coneDensity;
+    terrainFields.ridgeSlope = &ridgeSlope;
+    terrainFields.ridgeAspect = &ridgeAspect;
+    terrainFields.ridgeDensity = &ridgeDensity;
+    terrainFields.endFraction = config.terrainEndFraction;
     if (config.inversion.enabled()) {
         const InversionInputs inputs{config, classes, grid, type, lai, vza, vaa, latitude, longitude, dem, soilMoisture,
                                      soilEmissivityTables, startRow, endRow, startColumn, endColumn, overpass,
-                                     inversionStart, inversionSpan};
+                                     inversionStart, inversionSpan, skyLongwave.empty() ? nullptr : &skyLongwave,
+                                     skyFromObservations && config.skySource == ImageConfig::SkySource::Auto,
+                                     &terrainFields};  // FIX(2026-11-21 S-1)
         inversionResult = runInversion(inputs, components);
         if (lsctInversion) {
             if (eb) ebComponents = components;
@@ -851,17 +978,7 @@ int runImage(const std::string& configPath)
     const double assimilationStart = eb ? 70 : 20, assimilationSpan = assimilate ? (eb ? 15 : 35) : 0;
     AssimilationResult assimilationResult;
     std::vector<float> imagingLai = lai;
-    // Terrain of the thermal observation operator, shared by the imaging loop and the assimilation.
-    TerrainFields terrainFields;
-    terrainFields.mode = config.terrainRadiation;
-    terrainFields.slope = &terrainSlope;
-    terrainFields.aspect = &terrainAspect;
-    terrainFields.coneSlope = &coneSlope;
-    terrainFields.coneDensity = &coneDensity;
-    terrainFields.ridgeSlope = &ridgeSlope;
-    terrainFields.ridgeAspect = &ridgeAspect;
-    terrainFields.ridgeDensity = &ridgeDensity;
-    terrainFields.endFraction = config.terrainEndFraction;
+    // (Terrain fields of the thermal operator: built above, before the inversion — FIX(2026-11-21 S-1).)
     std::vector<double> thermalWavelengths;
     for (const auto& band : config.thermalBands) thermalWavelengths.push_back(band.center);
     if (assimilate) {
@@ -869,7 +986,8 @@ int runImage(const std::string& configPath)
                                         eb ? &diffuseFractionOut : nullptr, eb && !forcingOut.empty() ? &forcingOut[4] : nullptr,
                                         soilEmissivityTables, terrainFields, leafBandReflectance, leafBandTransmittance,
                                         soilBandReflectance, startRow, endRow, startColumn, endColumn, overpass, eb,
-                                        eb ? ebSolver : EbSolver{}, assimilationStart, assimilationSpan};
+                                        eb ? ebSolver : EbSolver{}, assimilationStart, assimilationSpan,
+                                        skyLongwave.empty() ? nullptr : &skyLongwave};
         assimilationResult = runAssimilation(inputs, components);
         if (eb) ebComponents = components;
         components = assimilationResult.components;
@@ -903,27 +1021,10 @@ int runImage(const std::string& configPath)
             solar[0][pixel] = static_cast<float>(sza);
             solar[1][pixel] = static_cast<float>(saa);
             const double view = std::min<double>(viewZenith, 89.9);
-            // Thermal view/sun relative to the local terrain normal (composite terrain). The optical
-            // reflectance keeps the horizontal geometry; the directional LST must see the slope.
-            double thermalView = view;
-            double thermalSza = sza;
-            bool backface = false;
-            if (config.terrainRadiation == TerrainRadiation::Facet && !terrainSlope.empty()) {
-                const double beta = terrainSlope[pixel] * kPi / 180.0;
-                const double aspect = terrainAspect[pixel] * kPi / 180.0;
-                const double vzaRad = viewZenith * kPi / 180.0;
-                const double vaaRad = viewAzimuth * kPi / 180.0;
-                const double cosView = std::cos(beta) * std::cos(vzaRad) +
-                                       std::sin(beta) * std::sin(vzaRad) * std::cos(vaaRad - aspect);
-                backface = cosView <= 0.0;
-                if (!backface) thermalView = std::acos(std::clamp(cosView, -1.0, 1.0)) * 180.0 / kPi;
-                const double szaRad = sza * kPi / 180.0;
-                const double saaRad = saa * kPi / 180.0;
-                const double cosSun = std::cos(beta) * std::cos(szaRad) +
-                                      std::sin(beta) * std::sin(szaRad) * std::cos(saaRad - aspect);
-                thermalSza = std::acos(std::clamp(cosSun, -1.0, 1.0)) * 180.0 / kPi;
-            }
-            // DEFERRED[低] 可维护性: 热点判据 VAA==SAA 隐含 VAA 是"像元指向传感器"的方位角（北起顺时针，与 SPA 太阳方位同一约定）。若输入用"传感器看向像元"的约定（相差 180°），热点会落到前向散射方向，且配置和 README 都没有说明；建议：在配置/README 中写明约定，或提供 viewAzimuthConvention 选项
+            // Terrain-relative thermal geometry is handled by thermalSceneAt (thermal_view.cpp); the optical
+            // reflectance keeps the horizontal geometry. (The former duplicate facet block here was unused.)
+            // VAA convention (README): azimuth of the direction from the pixel to the sensor, degrees clockwise
+            // from north, the same convention as the SPA solar azimuth; VAA = SAA is the hotspot.
             const double relative = std::fmod(viewAzimuth - saa, 360.0);
             const int code = static_cast<int>(std::lround(type[pixel]));
             const bool waterOrFill = entry->surface != SurfaceKind::Vegetation;
@@ -944,7 +1045,7 @@ int runImage(const std::string& configPath)
                             if (!(diffuse >= 0.0 && diffuse <= 1.0))
                                 diffuse = requestedDiffuseFraction(
                                     eb && !forcingOut.empty() && std::isfinite(forcingOut[4][pixel]) ? forcingOut[4][pixel] : 0.0,
-                                    sza, config.diffuseFraction);
+                                    sza, config.diffuseFraction, dayOfYear);  // FIX(2026-11-21 C7): E0 of the overpass day
                             optical[band][pixel] = static_cast<float>(canopyReflectance(
                                 leafArea, entry->canopy.hotspot, sza, saa, view, viewAzimuth, lr, lt, ground,
                                 diffuse, sza < 90.0));
@@ -961,6 +1062,8 @@ int runImage(const std::string& configPath)
                 ThermalScene scene;
                 if (!thermalSceneAt(terrainFields, pixel, sza, saa, viewZenith, viewAzimuth, scene)) { ++thermalFailed; continue; }
                 setThermalMaterial(scene, config, *entry, soilEmissivityTables, code);
+                scene.skyTemperature = skyLongwave.empty() ? std::numeric_limits<double>::quiet_NaN()
+                                                           : skyTemperatureFromLongwave(skyLongwave[pixel]);
                 // Physical value: wetter soil emits more, so the radiance synthesis uses the water-content value.
                 const double pixelMoisture = std::isfinite(soilMoisture[pixel])
                     ? static_cast<double>(soilMoisture[pixel])
@@ -994,6 +1097,8 @@ int runImage(const std::string& configPath)
     summary.Add("model", "STREAM image simulation: PROSPECT + BSM; TiRT standard four-component closure (hom3 node radiosity, hotspot); TIRTEB energy balance; NREL SPA");
     summary.Add("closure", "tirt-standard");
     summary.Add("atmosphere", "none (top-of-canopy)");
+    // Reflected sky term of the thermal brightness temperature: source of L↓ ("none" = not applied).
+    summary.Add("reflectedSky", skySource);
     summary.Add("overpass", formatUtc(overpass));
     CPLJSONObject gridInfo;
     gridInfo.Add("width", grid.width); gridInfo.Add("height", grid.height);
@@ -1067,10 +1172,17 @@ int runImage(const std::string& configPath)
         writeTiff(outputDir / "components.tif", grid, componentBands, componentNames);
         products.Add("components.tif");
         CPLJSONArray componentStats;
-        for (size_t index = 0; index < 4; ++index) componentStats.Add(bandStatistics(componentNames[index], components[index]));
+        // Statistics describe exactly what components.tif holds (the EB solution); a posterior that replaced it
+        // for imaging (LSCT / assimilation) is summarised separately (2026-11-20: the two used to be mixed).
+        for (size_t index = 0; index < 4; ++index) componentStats.Add(bandStatistics(componentNames[index], solved[index]));
         summary.Add("components", componentStats);
+        if (!ebComponents[0].empty()) {
+            CPLJSONArray posteriorStats;
+            for (size_t index = 0; index < 4; ++index) posteriorStats.Add(bandStatistics(componentNames[index], components[index]));
+            summary.Add("posteriorComponents", posteriorStats);
+        }
         const std::vector<std::string> forcingNames{"air temperature (K)", "vapour pressure (hPa)", "surface pressure (hPa)", "wind speed (m s-1)",
-                                                    "downward shortwave (W m-2)", "downward longwave (W m-2)", "soil moisture (m3 m-3)"};
+                                                    "downward shortwave, horizontal (W m-2)", "downward longwave (W m-2)", "soil moisture (m3 m-3)"};
         writeTiff(outputDir / "eb_forcing.tif", grid, forcingOut, forcingNames);
         products.Add("eb_forcing.tif");
         const std::vector<std::string> fluxNames{
@@ -1110,6 +1222,10 @@ int runImage(const std::string& configPath)
         CPLJSONArray nodeList;
         for (const double node : nodes) nodeList.Add(formatUtc(node));
         temperatureInfo.Add("nodes", nodeList);
+        // FIX(2026-11-21 B10): spin-up actually integrated before the overpass.
+        temperatureInfo.Add("spinupHoursRequested", config.spinupHours);
+        temperatureInfo.Add("spinupHoursUsed", spinupUsedHours);
+        temperatureInfo.Add("marchStart", formatUtc(marchStart));
         temperatureInfo.Add("solvedPixels", static_cast<GInt64>(ebPixels));
         temperatureInfo.Add("convergedPixels", static_cast<GInt64>(ebConverged));
         temperatureInfo.Add("stabilityConvergedPixels", static_cast<GInt64>(ebStable));
@@ -1127,6 +1243,23 @@ int runImage(const std::string& configPath)
         temperatureInfo.Add("notes", notes);
     }
     summary.Add("temperature", temperatureInfo);
+    // FIX(2026-11-21 C9): the canopy structure actually simulated, and any crown / row inputs that were not used.
+    {
+        CPLJSONObject structure;
+        structure.Add("model", "homogeneous");
+        structure.Add("note", "crown / row structure (physics/effective_lai.cpp) is not connected in this version; every canopy is a homogeneous turbid medium");
+        CPLJSONArray ignoredClasses, ignoredKeys;
+        for (const auto& [code, keys] : ignoredStructureClasses) {
+            CPLJSONObject item;
+            item.Add("code", code);
+            item.Add("keys", keys);
+            ignoredClasses.Add(item);
+        }
+        for (const auto& key : config.ignoredStructureKeys) ignoredKeys.Add(key);
+        structure.Add("ignoredClassParameters", ignoredClasses);
+        structure.Add("ignoredConfigKeys", ignoredKeys);
+        summary.Add("canopyStructure", structure);
+    }
     summary.Add("products", products);
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     summary.Add("elapsedSeconds", elapsed);

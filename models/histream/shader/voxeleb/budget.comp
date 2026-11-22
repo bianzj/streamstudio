@@ -179,6 +179,10 @@ void main()
     float s_shaded = s_fun(ei_shaded, TshadedC);
     float innovation1 = 0,innovation2 = 0;
     float raa = max(voxelRaas[bufferId].raa, 1.0);
+    // Same per-state effective resistance as evapo.comp (free convection on
+    // ground surfaces warmer than the air; vegetation unchanged).
+    float raaSunlit = groundExchangeRaa(raa, TsunlitOld, Ta, typeId);
+    float raaShaded = groundExchangeRaa(raa, TshadedOld, Ta, typeId);
     float rss_sunlit = voxelRsss[bufferId].sunlit;
     float rss_shaded = voxelRsss[bufferId].shaded;
     if(typeId == TYPE_VEGETATION)
@@ -192,12 +196,32 @@ void main()
     // float diffShadedRad = netShadedRad - (voxelHeatFlux[bufferId].LEshaded + Gshaded + voxelHeatFlux[bufferId].Hshaded);
     float lambdas_sunlit = (2.501 - 0.002361 * TsunlitC) * 1E6;
     float lambdas_shaded = (2.501 - 0.002361 * TshadedC) * 1E6;
-    float wc = 0.2;
+    // Damping of the Newton step. The ground/building/water denominators
+    // carry the full local linearisation (radiation, sensible, latent and
+    // storage slopes), so a nearly undamped step converges; the fixed 0.2
+    // used before needed 30-50 sweeps per node, each with a full 64-ray
+    // longwave trace. Foliage keeps stronger damping because its stomatal
+    // resistance (biochemical pass) responds to the leaf temperature. The
+    // damping tightens with the iteration count so the few states that
+    // limit-cycle under a large step (neighbour longwave / flow coupling)
+    // still settle within the 50-iteration budget.
+    int iteration = setting.energyIteration;
+    float wc = typeId == TYPE_VEGETATION
+        ? (iteration < 8 ? 0.5 : (iteration < 20 ? 0.3 : 0.2))
+        : (iteration < 8 ? 0.9 : (iteration < 20 ? 0.5 : 0.25));
     float sensibleDerivative = (RHOA * CP) / raa;
+    float sensibleDerivativeSunlit = (RHOA * CP) / raaSunlit;
+    float sensibleDerivativeShaded = (RHOA * CP) / raaShaded;
+    if (groundFreeConvectionApplies(typeId)) {
+        sensibleDerivativeSunlit += RHOA * CP *
+            groundFreeConductanceExtraSlope(TsunlitOld - 273.15 - Ta);
+        sensibleDerivativeShaded += RHOA * CP *
+            groundFreeConductanceExtraSlope(TshadedOld - 273.15 - Ta);
+    }
     float latentDerivativeSunlit = RHOA * lambdas_sunlit * e_to_q *
-        max(s_sunlit, 0.0) / max(raa + max(rss_sunlit, 0.0), 1.0);
+        max(s_sunlit, 0.0) / max(raaSunlit + max(rss_sunlit, 0.0), 1.0);
     float latentDerivativeShaded = RHOA * lambdas_shaded * e_to_q *
-        max(s_shaded, 0.0) / max(raa + max(rss_shaded, 0.0), 1.0);
+        max(s_shaded, 0.0) / max(raaShaded + max(rss_shaded, 0.0), 1.0);
     if(typeId == TYPE_BUILDING ||
        (typeId == TYPE_SOIL &&
         localSoilMoisture(bufferId, bioId) < 0.03))
@@ -288,7 +312,8 @@ void main()
             / max(ubom.meteo.dtime, 1.0), 1.0);
         float latentDerivativeWater = mix(
             latentDerivativeShaded, latentDerivativeSunlit, sunlitFraction);
-        float denominator = storageRate + sensibleDerivative +
+        float denominator = storageRate +
+                            mix(sensibleDerivativeShaded, sensibleDerivativeSunlit, sunlitFraction) +
                             latentDerivativeWater +
                             4.0 * emis * SIGMASB * pow(TwaterOld, 3.0);
         float Twater = TwaterOld + wc * waterResidual / denominator;
@@ -301,10 +326,10 @@ void main()
         diffSunlitRad = netSunlitRad - (voxelHeatFlux[bufferId].LEsunlit + Gsunlit + voxelHeatFlux[bufferId].Hsunlit);
         diffShadedRad = netShadedRad - (voxelHeatFlux[bufferId].LEshaded + Gshaded + voxelHeatFlux[bufferId].Hshaded);
         float denominatorSunlit = radiativeScale * 4.0 * emis * SIGMASB *
-            pow(TsunlitOld, 3.0) + sensibleDerivative +
+            pow(TsunlitOld, 3.0) + sensibleDerivativeSunlit +
             latentDerivativeSunlit + storageDerivative;
         float denominatorShaded = radiativeScale * 4.0 * emis * SIGMASB *
-            pow(TshadedOld, 3.0) + sensibleDerivative +
+            pow(TshadedOld, 3.0) + sensibleDerivativeShaded +
             latentDerivativeShaded + storageDerivative;
         Tsunlit = TsunlitOld + wc * diffSunlitRad /
             max(denominatorSunlit, 1.0);

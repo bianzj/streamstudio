@@ -137,6 +137,17 @@ if (HISTREAM_ENABLE_FACET)
             src/faceteb/*.h)
     list(APPEND SOURCE_FILES ${FACET_SOURCE_FILES})
     list(APPEND HEADER_FILES ${FACET_HEADER_FILES})
+else()
+    # base/appsetting.cpp (--list-devices) ranks devices with facetvk::rankDevices,
+    # which lives in this self-contained Vulkan helper; keep it in Facet-free builds.
+    list(APPEND SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/facetrt/facetrt_vulkan.cpp)
+    list(APPEND HEADER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/facetrt/facetrt_vulkan.h)
+endif()
+# engine.h/.cpp compile the eFacetRT/eFacetEB dispatch only when the backends are built.
+if (HISTREAM_ENABLE_FACET)
+    target_compile_definitions(${PROJNAME} PRIVATE HISTREAM_ENABLE_FACET=1)
+else()
+    target_compile_definitions(${PROJNAME} PRIVATE HISTREAM_ENABLE_FACET=0)
 endif()
 
 #--------------------------------------------------------------------------------------------------

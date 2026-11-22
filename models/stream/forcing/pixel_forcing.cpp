@@ -93,7 +93,12 @@ double PixelForcing::longwave(double unixSeconds) const
 // Interpolates the clearness F / cos(z) between hour centres so the diurnal cycle follows the sun.
 double PixelForcing::shortwave(double unixSeconds) const
 {
-    const double mu = approximateCosZenith(latitude_, longitude_, unixSeconds);
+    return shortwave(unixSeconds, approximateCosZenith(latitude_, longitude_, unixSeconds));
+}
+
+// FIX(2026-11-21 C10): the instantaneous cos(z) is a parameter so the EB march can use the SPA sun of its nodes.
+double PixelForcing::shortwave(double unixSeconds, double mu) const
+{
     if (mu <= 0.0) return 0.0;
     const double centre = unixSeconds / 3600.0 + 0.5;
     const int64_t k = static_cast<int64_t>(std::floor(centre));
@@ -107,14 +112,53 @@ double PixelForcing::shortwave(double unixSeconds) const
     else if (validA) value = fluxA / muA * mu;
     else if (validB) value = fluxB / muB * mu;
     else value = (1 - f) * fluxA + f * fluxB;
-    // The configured fraction may be -1 (Erbs); resolve it from the horizontal flux before tilting so the
-    // direct/diffuse weights below always lie in [0, 1].
-    const double diffuse = requestedDiffuseFraction(std::max(value, 0.0), std::acos(std::min(mu, 1.0)) * 180.0 / kPi, diffuse_);
-    if (coneDensity_ > 0.0 && mu > 0.0) {
+    // Horizontal global shortwave. Terrain tilting is done in surfaceShortwave() after the direct/diffuse split.
+    return std::clamp(value, 0.0, 1400.0 * mu);
+}
+
+SurfaceShortwave PixelForcing::surfaceShortwave(double unixSeconds, double szaDeg, int dayOfYear, bool enforceLimit) const
+{
+    // FIX(2026-11-21 C10): unchanged NOAA behaviour, now through the shared implementation.
+    return surfaceShortwave(unixSeconds, szaDeg, dayOfYear, enforceLimit,
+                            approximateCosZenith(latitude_, longitude_, unixSeconds),
+                            approximateSunAzimuth(latitude_, longitude_, unixSeconds));
+}
+
+SurfaceShortwave PixelForcing::surfaceShortwave(double unixSeconds, double szaDeg, int dayOfYear, bool enforceLimit,
+                                                double saaDeg) const
+{
+    // FIX(2026-11-21 C10): one solar position (the caller's SPA) for the flux, its sign and the tilt.
+    if (!std::isfinite(saaDeg) || !std::isfinite(szaDeg)) return surfaceShortwave(unixSeconds, szaDeg, dayOfYear, enforceLimit);
+    return surfaceShortwave(unixSeconds, szaDeg, dayOfYear, enforceLimit, std::cos(szaDeg * kPi / 180.0), saaDeg * kPi / 180.0);
+}
+
+SurfaceShortwave PixelForcing::surfaceShortwave(double unixSeconds, double szaDeg, int dayOfYear, bool enforceLimit,
+                                                double mu, double sunAzimuth) const
+{
+    SurfaceShortwave out;
+    out.horizontal = shortwave(unixSeconds, mu);  // FIX(2026-11-21 C10): cos(z) of the selected solar position
+    out.global = out.horizontal;
+    out.cosIncidence = std::max(std::cos(szaDeg * kPi / 180.0), 0.0);
+    if (!tilted()) return out;  // horizontal surface: absorbShortwave keeps doing the split (unchanged path)
+    out.tilted = true;
+    const double requested = requestedDiffuseFraction(out.horizontal, szaDeg, diffuse_, dayOfYear);  // FIX(2026-11-21 C7)
+    out.horizontalDiffuseFraction = admissibleDiffuseFraction(out.horizontal, szaDeg, dayOfYear, diffuse_, enforceLimit);
+    out.limited = out.horizontalDiffuseFraction > requested + 1e-12;
+    // FIX(2026-11-21 C10): mu is the parameter (NOAA in the legacy overload, SPA from the EB march).
+    if (!(out.horizontal > 0.0) || !(mu > 0.0)) {
+        out.global = 0.0;
+        out.diffuseShare = 1.0;
+        out.cosIncidence = 0.0;
+        return out;
+    }
+    // Area-mean max(0, cos i) of the receiving surface (NOAA sun, as the old tilt) and its sky-view factor.
+    double meanCos = 0.0, skyTerm = 1.0;
+    const double sinZenith = std::sqrt(std::max(0.0, 1.0 - mu * mu));
+    if (coneDensity_ > 0.0) {
         // Statistical cone: facets of slope beta uniformly distributed in azimuth; density d of the pixel
         // is covered by cones and the rest is flat. The direct term averages max(0, cosI) over the facets.
         const double a = std::cos(coneSlope_) * mu;
-        const double b = std::sin(coneSlope_) * std::sqrt(std::max(0.0, 1.0 - mu * mu));
+        const double b = std::sin(coneSlope_) * sinZenith;
         double average = std::max(0.0, a);
         if (b > 1e-12) {
             const double ratio = -a / b;
@@ -124,48 +168,41 @@ double PixelForcing::shortwave(double unixSeconds) const
                 average = (a * phi0 + b * std::sin(phi0)) / kPi;
             } else average = 0.0;
         }
-        const double direct = (coneDensity_ * average + (1.0 - coneDensity_) * mu) / mu;
-        const double skyView = 0.5 * (1.0 + std::cos(coneSlope_));
-        const double skyTerm = coneDensity_ * skyView + (1.0 - coneDensity_);
-        value *= (1.0 - diffuse) * direct + diffuse * skyTerm;
-        return std::clamp(value, 0.0, 1400.0);
-    }
-    if (ridgeDensity_ > 0.0 && mu > 0.0) {
+        meanCos = coneDensity_ * average + (1.0 - coneDensity_) * mu;
+        skyTerm = coneDensity_ * 0.5 * (1.0 + std::cos(coneSlope_)) + (1.0 - coneDensity_);
+    } else if (ridgeDensity_ > 0.0) {
         // Ridge: two flanks (slope beta, facing strike ± 90°) plus two vertical end faces (facing strike
         // and strike + 180°). endFraction e is the end-face share of the ridge surface; density d is
         // the ridge footprint coverage, the rest is flat.
-        const double azimuth = approximateSunAzimuth(latitude_, longitude_, unixSeconds);
-        const double sinZenith = std::sqrt(std::max(0.0, 1.0 - mu * mu));
+        const double azimuth = sunAzimuth;  // FIX(2026-11-21 C10): solar azimuth of the selected solar position
         const double endFraction = std::clamp(ridgeEndFraction_, 0.0, 0.5);
         double sum = 0.0;
         for (int side = 0; side < 2; ++side) {
             const double phi = ridgeStrike_ + (side == 0 ? kPi / 2.0 : -kPi / 2.0);
-            const double cosIncidence = std::cos(ridgeSlope_) * mu +
-                std::sin(ridgeSlope_) * sinZenith * std::cos(phi - azimuth);
-            sum += 0.5 * (1.0 - endFraction) * std::max(0.0, cosIncidence);
+            sum += 0.5 * (1.0 - endFraction) * std::max(0.0, std::cos(ridgeSlope_) * mu + std::sin(ridgeSlope_) * sinZenith * std::cos(phi - azimuth));
         }
         for (int end = 0; end < 2; ++end) {
             const double phi = ridgeStrike_ + (end == 0 ? 0.0 : kPi);
-            const double cosIncidence = sinZenith * std::cos(phi - azimuth);
-            sum += 0.5 * endFraction * std::max(0.0, cosIncidence);
+            sum += 0.5 * endFraction * std::max(0.0, sinZenith * std::cos(phi - azimuth));
         }
-        const double direct = (ridgeDensity_ * sum + (1.0 - ridgeDensity_) * mu) / mu;
+        meanCos = ridgeDensity_ * sum + (1.0 - ridgeDensity_) * mu;
         const double skyView = (1.0 - endFraction) * 0.5 * (1.0 + std::cos(ridgeSlope_)) + endFraction * 0.5;
-        const double skyTerm = ridgeDensity_ * skyView + (1.0 - ridgeDensity_);
-        value *= (1.0 - diffuse) * direct + diffuse * skyTerm;
-        return std::clamp(value, 0.0, 1400.0);
+        skyTerm = ridgeDensity_ * skyView + (1.0 - ridgeDensity_);
+    } else {
+        // One plane: beam by the surface normal, diffuse by the sky-view factor.
+        const double azimuth = sunAzimuth;  // FIX(2026-11-21 C10): solar azimuth of the selected solar position
+        meanCos = std::max(0.0, std::cos(slope_) * mu + std::sin(slope_) * sinZenith * std::cos(azimuth - aspect_));
+        skyTerm = 0.5 * (1.0 + std::cos(slope_));
     }
-    if (slope_ > 1e-6) {
-        // Tilt the beam by the surface normal and scale the diffuse part by the sky-view factor.
-        const double azimuth = approximateSunAzimuth(latitude_, longitude_, unixSeconds);
-        const double cosIncidence = std::cos(slope_) * mu +
-            std::sin(slope_) * std::sqrt(std::max(0.0, 1.0 - mu * mu)) * std::cos(azimuth - aspect_);
-        const double directRatio = cosIncidence > 0.0 ? cosIncidence / mu : 0.0;
-        const double skyView = 0.5 * (1.0 + std::cos(slope_));
-        value *= (1.0 - diffuse) * directRatio + diffuse * skyView;
-        return std::clamp(value, 0.0, 1400.0);
-    }
-    return std::clamp(value, 0.0, 1400.0 * mu);
+    const double fd = out.horizontalDiffuseFraction;
+    double direct = out.horizontal * (1.0 - fd) * meanCos / mu;  // beam normal flux × mean cos i
+    double diffuse = out.horizontal * fd * skyTerm;
+    const double total = direct + diffuse;
+    if (total > 1400.0) { direct *= 1400.0 / total; diffuse *= 1400.0 / total; }
+    out.global = direct + diffuse;
+    out.diffuseShare = out.global > 0.0 ? diffuse / out.global : 1.0;
+    out.cosIncidence = direct > 0.0 ? std::clamp(meanCos, 0.0, 1.0) : 0.0;
+    return out;
 }
 
 Forcing PixelForcing::at(double unixSeconds) const

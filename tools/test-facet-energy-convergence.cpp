@@ -17,7 +17,11 @@ int main() try {
     if (!facetEnergyConverged(4000000, 4294967295U) ||
         facetEnergyConverged(5000000, 4294967295U))
         throw std::runtime_error("Facet-count multiplication overflow");
-    std::cout << "PASS: signed residuals, strict boundaries, zero scene, large counts\n";
+    if (!facetEnergyConverged(0, 1000, 0.5) || facetEnergyConverged(0, 1000, 0.5001) ||
+        facetEnergyConverged(0, 1000, std::numeric_limits<double>::quiet_NaN()) ||
+        facetEnergyConverged(1, 1000, 0.1))
+        throw std::runtime_error("Temperature-equivalent residual cap must be <= 0.5 K");
+    std::cout << "PASS: signed residuals, strict boundaries, zero scene, large counts, 0.5 K cap\n";
 } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << '\n';
     return 1;

@@ -155,4 +155,46 @@ float localWindSpeed(uint sparseIndex)
     return count > 0.0 ? sum / count : ubom.meteo.u;
 }
 
+// Effective aerodynamic resistance of a ground-type surface (soil, water,
+// building) including free convection. aeresist.comp provides only the
+// neutral, wind-driven resistance (L is never updated), which collapses
+// exchange at low wind and left sunlit soil with G/Rn ~ 0.9. Under unstable
+// conditions (surface warmer than air) the windless conductance of Kondo &
+// Ishida (1997), as used in TSEB (Kustas & Norman 1999), is added in
+// parallel: g_free ~ 0.0025 (Ts - Ta)^(1/3) m/s. The form
+// 0.0025 x (x^2 + 1)^(-1/3) keeps that asymptote but has a finite slope at
+// x = 0, so the Newton update in budget.comp does not oscillate around
+// Ts = Ta. Stable or neutral cases and vegetation are unchanged.
+bool groundFreeConvectionApplies(uint typeId)
+{
+    return typeId == TYPE_SOIL || typeId == TYPE_WATER || typeId == TYPE_BUILDING;
+}
+
+float groundFreeConductance(float excess)
+{
+    float x = clamp(excess, 0.0, 60.0);
+    return 0.0025 * x * pow(x * x + 1.0, -1.0 / 3.0);
+}
+
+// d(g_free * excess)/d(excess) - g_free: the extra sensible-heat slope that
+// the free-convection term adds beyond rho*cp/raa_eff.
+float groundFreeConductanceExtraSlope(float excess)
+{
+    if (!(excess > 0.0) || excess >= 60.0) return 0.0;
+    float x = excess;
+    float s = x * x + 1.0;
+    float dg = 0.0025 * (pow(s, -1.0 / 3.0) - (2.0 / 3.0) * x * x * pow(s, -4.0 / 3.0));
+    return x * dg;
+}
+
+float groundExchangeRaa(float raa, float surfaceTemperatureK,
+                        float airTemperatureC, uint typeId)
+{
+    raa = max(raa, 1.0);
+    if (!groundFreeConvectionApplies(typeId)) return raa;
+    float excess = surfaceTemperatureK - 273.15 - airTemperatureC;
+    if (!(excess > 0.0)) return raa;
+    return 1.0 / (1.0 / raa + groundFreeConductance(excess));
+}
+
 #endif

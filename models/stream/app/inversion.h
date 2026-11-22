@@ -30,6 +30,15 @@ constexpr unsigned kQaRetrievalFailed = 1u << 3;
 constexpr unsigned kQaIllConditioned = 1u << 4;
 constexpr unsigned kQaLowSupport = 1u << 8;
 constexpr unsigned kQaNotConverged = 1u << 9;
+// FIX(2026-11-21 S-5): MAP stop reasons that are NOT failures (STREAM extensions, outside the default reject mask
+// 895 = bits 0-6, 8, 9, so downstream users keep these analyses by default):
+//   bit 10 line-search stalled: at least one Gauss-Newton step lowered the MAP cost, then no step along the GN
+//          direction (fractions 1, 1/2, 1/4) lowered it further; the analysis is the lowest-cost evaluated state.
+//   bit 11 not updated: no step lowered the cost at all; the analysis equals the background (J_a = J_b).
+// Bit 9 (not converged, rejected by default) now means: iteration limit reached while the cost was still decreasing,
+// the normal matrix was singular, or the operator failed on every trial step.
+constexpr unsigned kQaLineSearchStalled = 1u << 10;
+constexpr unsigned kQaNotUpdated = 1u << 11;
 
 struct InversionInputs {
     const ImageConfig& config;
@@ -47,6 +56,13 @@ struct InversionInputs {
     int startRow, endRow, startColumn, endColumn;
     double overpass;
     double progressStart, progressSpan;
+    // Downwelling longwave of the reflected-sky term (W m-2, NaN = none), same per-pixel field as the imaging;
+    // null disables the term. skyFromObservations: RT "auto" fallback (Swinbank from the mean observed value).
+    const std::vector<float>* skyLongwave = nullptr;
+    bool skyFromObservations = false;
+    // FIX(2026-11-21 S-1): terrain fields of the thermal observation operator (same object as the imaging and the
+    // assimilation); null = horizontal surface.
+    const TerrainFields* terrain = nullptr;
 };
 
 struct InversionResult {

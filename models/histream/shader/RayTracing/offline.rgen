@@ -126,14 +126,19 @@ void ClosestHit(Ray r, float Lmin, float Lmax)
 		r.origin, Lmin, r.direction, Lmax, 0);
 }
 
-//  used in ray tracing pipeline, similar to cloestHit().
+// Visibility query: any opaque hit answers it, so stop at the first one
+// instead of searching for the closest. The origin is already offset by
+// OffsetRay; a 1 mm tmin (was 11 mm) no longer skips nearby occluders such
+// as overlapping leaves, needles and grass blades.
 bool AnyHit(Ray r, float maxDist)
 {
-    uint rayFlags = gl_RayFlagsSkipClosestHitShaderEXT ;
+    uint rayFlags = gl_RayFlagsOpaqueEXT
+        | gl_RayFlagsTerminateOnFirstHitEXT
+        | gl_RayFlagsSkipClosestHitShaderEXT;
     shadow_payload.isHit = true;
     shadow_payload.seed = 0;
     traceRayEXT(topLevelAS, rayFlags, 0xFF, 0, 0, 1,
-                r.origin, 0.011, r.direction, maxDist, 1);
+                r.origin, 0.001, r.direction, maxDist, 1);
     return shadow_payload.isHit;
 }
 
@@ -321,10 +326,15 @@ bool PathTrace(Ray r)
   int periodicTraversals = 0;
   int periodicLimit = clamp(setting.periodicNeighborCount, 0, 20);
   bool cameraPath = true;
-  for(int kDepth = 0; kDepth < setting.maxDepth; kDepth++)
+  // kDepth counts scattering vertices only. Periodic wraps of the camera ray
+  // are bounded separately by periodicLimit and no longer use up the
+  // scattering budget.
+  for(int kDepth = 0; kDepth < setting.maxDepth; )
   {
-    // Russian roulette termination.
-    if(kDepth >= 10)
+    // Russian roulette after the first three bounces. Survival probability
+    // follows the largest band throughput (floor 0.05), so the estimator stays
+    // unbiased while low-energy deep paths stop early.
+    if(kDepth >= 3)
     {
       float maxPathThroughput = 0;
       for(int kBand = 0; kBand < setting.n_wave; kBand++)
@@ -334,13 +344,11 @@ bool PathTrace(Ray r)
           maxPathThroughput = Throughput[kBand];
         }
       }
-      float pCont = 1 - maxPathThroughput;
-      pCont = max(pCont, 0.05);
-      if(rand(prd.seed) < pCont) break; // no change
-      // set all throughput /= (1 - P)
+      float pSurvive = clamp(maxPathThroughput, 0.05, 1.0);
+      if(rand(prd.seed) >= pSurvive) break;
       for(int kBand = 0; kBand < setting.n_wave; kBand++)
       {
-        Throughput[kBand] /= (1 - pCont);
+        Throughput[kBand] /= pSurvive;
       }
     }
 
@@ -417,11 +425,12 @@ bool PathTrace(Ray r)
     vec3 ffnormal = sstate.normal;
     r.direction = wiWorld;
     r.origin = OffsetRay(sstate.position, dot(wiWorld, ffnormal) > 0 ? ffnormal : -ffnormal);
+    ++kDepth;
   }
   return true;
 }
 
-void SamplePixel(int kSample, ivec2 imageCoords, ivec2 imageResolution)
+bool SamplePixel(int kSample, ivec2 imageCoords, ivec2 imageResolution)
 {
 
   // For each sampling of a pixel, its inital postion and direction are randomly generated.
@@ -459,7 +468,7 @@ void SamplePixel(int kSample, ivec2 imageCoords, ivec2 imageResolution)
 
 
   Ray ray = Ray(origin.xyz, direction.xyz);
-  PathTrace(ray);
+  return PathTrace(ray);
 
 }
 
@@ -483,9 +492,15 @@ void main()
     Radiance[kBand] = 0.0;
     RadianceSum[kBand] = 0.0;
   }
+  // A primary ray that escapes while the sky box is off sees no modelled
+  // radiance: it is excluded from the mean instead of averaging in a zero,
+  // which darkened every object edge seen against the sky. Pixels without
+  // any scene sample stay 0 and receive the host-side sky value.
+  int coveredSamples = 0;
   for(int kSample = 0; kSample <  setting.n_sample; kSample++)
   {
-    SamplePixel(kSample, imageCoords, imageRes);
+    if(!SamplePixel(kSample, imageCoords, imageRes)) continue;
+    ++coveredSamples;
 
     for(int kBand = 0; kBand <  setting.n_wave; kBand++)
     {
@@ -496,8 +511,8 @@ void main()
 
 	for(int kBand = 0; kBand <  setting.n_wave; kBand++)
 	{
-		Radiance[kBand] = setting.n_sample > 0
-      ? RadianceSum[kBand] / float(setting.n_sample) : 0.0;
+		Radiance[kBand] = coveredSamples > 0
+      ? RadianceSum[kBand] / float(coveredSamples) : 0.0;
 
     float wavelength = waveSets[kBand];
     if(wavelength > 50) wavelength = wavelength / 1000.0;
@@ -506,10 +521,12 @@ void main()
       float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
       float referenceIrradiance = lightSet.direct * cosSolarZenith
         + lightSet.diffuse * 0.5;
-      Radiance[kBand] = referenceIrradiance > EPSION
-        ? (specularPathEncountered
-            ? max(M_PI * Radiance[kBand] / referenceIrradiance, 0.0)
-            : clamp(M_PI * Radiance[kBand] / referenceIrradiance, 0.0, 1.0)) : 0.0;
+      // Apparent reflectance (HDRF). Values above 1 are physical for slopes
+      // facing the sun, the hot spot and specular glints, so only NaN/Inf
+      // and negative noise are removed; display code applies its own range.
+      float hdrf = referenceIrradiance > EPSION
+        ? M_PI * Radiance[kBand] / referenceIrradiance : 0.0;
+      Radiance[kBand] = (isnan(hdrf) || isinf(hdrf)) ? 0.0 : max(hdrf, 0.0);
     }
     else if(setting.isTemperature == 1)
     {

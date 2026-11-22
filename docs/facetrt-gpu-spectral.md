@@ -37,4 +37,17 @@ node validation/facetrt-gpu/run.mjs <project.json绝对路径> <新的检查输�
 
 此处仅验证与原有实现的一致性，不能视为真实场景辐射精度验证。性能实测与检查摘要见本次目录中的 `baseline-summary.json`、`gpu-summary.json`、`audit-summary.json` 和 `final-status.log`。
 
+## 2026-11-20 修正
+
+- **光照来自工程设置。** FacetRT 不再固定使用 700 W/m² 法向直射加 50 W/m² 天空漫射；旧的非光谱宽带路径此前用的是 100 W/m²。现在读取与 FacetEB 相同的 `Esun_.dat` / `Esky_.dat` 光谱形状和 `directScatteringRatio`：
+  - 水平总量取原默认值 700·cosθs + 50 W/m²（光学输出为归一化反射率，起作用的只有直散比和光谱形状）；
+  - 逐波段的法向直射与天空漫射写入 `FacetRTParameters::bandBeamNormal` / `bandSkyDiffuse`；
+  - 非光谱宽带路径使用同一组宽带值；
+  - 低太阳角下被丢弃或截去的直射计入漫射。
+
+  OBJ 输入，或 XML 中没有上述设置时，保持 700 / 50 W/m²。
+- **逐波段光照与 push constant。** `solveSpectralBand` 新增可选参数 `beam`，逐波段设置 `SpectralPush.beam`。push constant 的布局和大小（56 B）不变。
+- **背景观测方向。** 影像中的背景 Hapke 方向反射因子按天顶观测计算，与方向发射率一致。此前按面元法向观测，对水平地面结果相同。`F[f+9]`（相角对应的 opposition 项）和 `F[f+11]`（观测余弦）由 CPU 计算，`spectral.comp` 不变，CPU 审计路径同步修改。
+- **等深片元排序。** CPU 光栅与 GPU（`visibility_resolve.comp` / `direct_resolve.comp`）使用同一键：深度相同时中心块片元在前，其次按侧编号。
+
 2026-10-13 最终检查全部通过：C++ 生理／能量物理测试 2/2，FacetRT 3／84 波段对照及 10 项类别切换检查，原生 FacetEB 生理／土壤／稳定度检查，SCOPE 1.73 单日及 SCOPE 2 全部 30 场景回归。SCOPE 2 沿用原规则，13 个未过饱和场景用于主阈值评分，17 个过饱和场景单独保留；无失败或未收敛的 FacetEB 场景，阈值未改动。可留存的构建哈希、性能及验证摘要和评分 CSV 位于 `validation/facetrt-gpu/results/`。

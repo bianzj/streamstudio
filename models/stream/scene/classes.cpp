@@ -1,4 +1,4 @@
-﻿#include "classes.h"
+#include "classes.h"
 #include "raster.h"
 
 #include <cpl_json.h>
@@ -103,6 +103,17 @@ ClassTable loadClassTable(const std::filesystem::path& file)
             entry.canopy.leafWidth = static_cast<float>(number(canopy, "leafWidth", 0.05, context));
             entry.canopy.leafProjection = static_cast<float>(number(canopy, "leafProjection", 0.5, context));
             entry.canopy.hotspot = static_cast<float>(number(canopy, "hotspot", 0.2, context));
+            // FIX(2026-11-21 C9): crown / row structure is not simulated (physics/effective_lai.cpp is not called).
+            // Record the keys instead of ignoring them silently; image.cpp warns and writes them to the summary.
+            for (const char* key : {"treeStand", "canopyHeight", "crownShape", "crownHeight", "crownRadius", "rows", "cropRows"})
+                if (canopy.GetObj(key).IsValid())
+                    entry.ignoredStructure += (entry.ignoredStructure.empty() ? "" : ",") + std::string("canopy.") + key;
+            for (const char* key : {"rows", "cropRows", "crown", "structure"})
+                if (item.GetObj(key).IsValid())
+                    entry.ignoredStructure += (entry.ignoredStructure.empty() ? "" : ",") + std::string(key);
+            if (canopy.GetObj("treeStand").IsValid()) entry.canopy.treeStand = static_cast<float>(number(canopy, "treeStand", 0.0, context));
+            if (canopy.GetObj("canopyHeight").IsValid()) entry.canopy.canopyHeight = static_cast<float>(number(canopy, "canopyHeight", 0.0, context));
+            if (canopy.GetObj("crownShape").IsValid()) entry.canopy.crownShape = static_cast<float>(number(canopy, "crownShape", 0.0, context));
             const auto leaf = item.GetObj("leaf");
             entry.leaf.cab = static_cast<float>(number(leaf, "cab", entry.leaf.cab, context));
             entry.leaf.cw = static_cast<float>(number(leaf, "cw", entry.leaf.cw, context));
@@ -111,7 +122,8 @@ ClassTable loadClassTable(const std::filesystem::path& file)
             entry.leaf.n = static_cast<float>(number(leaf, "n", entry.leaf.n, context));
             entry.leaf.reflTir = static_cast<float>(number(leaf, "reflTir", entry.leaf.reflTir, context));
             entry.leaf.transTir = static_cast<float>(number(leaf, "transTir", entry.leaf.transTir, context));
-            if (!(entry.leaf.n > 0)) throw std::runtime_error("地类参数 " + context + ".leaf.n 须大于 0");
+            // PROSPECT is defined for N >= 1 (one compact layer at least); N < 1 gives non-physical R/T.
+            if (!(entry.leaf.n >= 1)) throw std::runtime_error("地类参数 " + context + ".leaf.n 须不小于 1（PROSPECT 结构参数）");
             const auto photo = item.GetObj("photosynthesis");
             const auto pathway = photo.GetString("pathway", "none");
             entry.photosynthesis.pathway = pathway == "C3" ? 3 : pathway == "C4" ? 4 : 0;
@@ -119,13 +131,17 @@ ClassTable loadClassTable(const std::filesystem::path& file)
             entry.photosynthesis.ballBerrySlope = static_cast<float>(number(photo, "ballBerrySlope", 9, context));
             entry.photosynthesis.respiration = static_cast<float>(number(photo, "respiration", 0.015, context));
             entry.photosynthesis.stress = static_cast<float>(number(photo, "stress", 1, context));
-            entry.photosynthesis.temperatureCorrection = photo.GetBool("temperatureCorrection", false);
+            // FIX(2026-11-21 B3): default true as TiRT biochemical.py (tcor = 1) and StreamEarth (Tcor = 1); false left
+            // Vcmax/Rd/Kc/Ko at their 25 °C values for every class except grassland.
+            entry.photosynthesis.temperatureCorrection = photo.GetBool("temperatureCorrection", true);
             const auto temperature = photo.GetArray("temperature");
             if (temperature.IsValid() && temperature.Size() == 5)
                 for (int k = 0; k < 5; ++k) entry.photosynthesis.temperature[k] = static_cast<float>(temperature[k].ToDouble());
             const auto ground = item.GetObj("ground");
             if (ground.IsValid()) {
                 entry.ground = readGround(ground, soilGround, context + ".ground");
+                // Any non-soil ground (impervious, snow, water) is a flat surface with a constant emissivity: no
+                // moisture-dependent emissivity and no Hapke soil table (water: 2026-11-20, used to default to soil).
                 if (ground.GetString("surface", "soil") != "soil") {
                     entry.groundKind = GroundKind::Flat;
                     entry.groundReflectance = static_cast<float>(number(ground, "reflectance", 0.15, context + ".ground"));

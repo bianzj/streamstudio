@@ -40,7 +40,13 @@ struct ShortwaveAbsorption {
     bool partitionLimited = false;
 };
 
+// FIX(2026-11-21 C7): the Erbs clearness index includes the orbital (Sun-Earth distance) factor E0 of the day, as
+// TiRT radiation.py:218-221. dayOfYear <= 0 uses the perihelion value 1.033 (TiRT without a date); the 3-argument
+// form is kept for compatibility and is that no-date case.
+// FIX(2026-11-21 C10): with the sun at or below the horizon (SZA >= 90°) there is no beam: the Erbs fraction is 1.
 double requestedDiffuseFraction(double globalShortwave, double szaDeg, double configured);
+double requestedDiffuseFraction(double globalShortwave, double szaDeg, double configured, int dayOfYear);
+// FIX(2026-11-21 C10): SZA >= 90° returns 1 (all diffuse) whether or not the DNI limit is enforced.
 double admissibleDiffuseFraction(double globalShortwave, double szaDeg, int dayOfYear, double configured,
                                  bool enforceLimit, double* limit = nullptr);
 
@@ -57,6 +63,8 @@ struct ShortwaveComponentsT {
     T soilSunlitFraction{}, laiSunlit{}, absorbed{}, incident{};
 };
 // soil: per-bin reflectance (std::vector<float> or std::vector<Ad>).
+// FIX(2026-11-21 C10): when the receiving surface is not sunlit (sunlit == false or SZA >= 90°) the whole global
+// shortwave is distributed as diffuse sky radiation (the direct part used to be dropped), so incident = global.
 template <class T, class SoilSpectrum>
 ShortwaveComponentsT<T> shortwaveComponents(const SolarBins& sun, const std::vector<float>& leafReflectance,
                                             const std::vector<float>& leafTransmittance, const SoilSpectrum& soil,

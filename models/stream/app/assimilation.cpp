@@ -1,5 +1,6 @@
 #include "assimilation.h"
 #include "inversion.h"  // QA bit constants shared with the LST/LSCT retrieval
+#include "../forcing/utc.h"  // FIX(2026-11-21 C7): overpass day of year
 #include "../physics/canopy.h"
 #include "../physics/dual.h"
 #include "../physics/shortwave.h"
@@ -176,6 +177,10 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
     const auto opticalQa = optionalBands(as.opticalQa, static_cast<int>(config.opticalBands.size()), grid, "reflectance QA");
     const std::vector<double> lstWavelength{as.lstWavelengthUm};
     const int maxIterations = eb ? kMaxIterationsEb : kMaxIterationsRt;
+    // FIX(2026-11-21 C7): day of year of the overpass for the orbital factor of the Erbs clearness index.
+    const UtcTime overpassTime = utcFromSeconds(in.overpass);
+    const int dayOfYear = static_cast<int>(daysFromCivil(overpassTime.year, overpassTime.month, overpassTime.day) -
+                                           daysFromCivil(overpassTime.year, 1, 1)) + 1;
 
     AssimilationResult result;
     for (int k = 0; k < 4; ++k) result.components[k] = background[k];
@@ -184,17 +189,20 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
     result.vcmax.assign(pixels, kNaN);
     result.analysed.assign(pixels, 0);
     std::vector<std::vector<float>> uncertainty(kKinds, std::vector<float>(pixels, kNaN));
-    std::vector<std::vector<float>> qaBands(7, std::vector<float>(pixels, kNaN));  // flags, O-B, O-A, O-A rms, DFS, n, iterations
+    // FIX(2026-11-21 S-5 QA): bands 8-9 (1-based) = MAP cost at the background / at the analysis (appended).
+    std::vector<std::vector<float>> qaBands(9, std::vector<float>(pixels, kNaN));  // flags, O-B, O-A, O-A rms, DFS, n, iterations, J_b, J_a
     std::vector<std::vector<float>> backgroundControls(3, std::vector<float>(pixels, kNaN));
     std::vector<std::vector<float>> fluxes(eb ? 4 : 0, std::vector<float>(pixels, kNaN));
 
     long long analysed = 0, noObservation = 0, failed = 0, notConverged = 0, illConditioned = 0, lowSupport = 0, observationsUsed = 0;
+    // FIX(2026-11-21 S-5 QA): stop reasons of the analysed pixels
+    long long stopConverged = 0, stopStalled = 0, stopNotUpdated = 0, stopIterationLimit = 0, stopSingular = 0, stopStepFailed = 0;
     double sumOmb = 0, sumOma = 0, sumDfs = 0;
     long long thermalPixels = 0;
     std::atomic<int> rowsDone{0};
     const int rowCount = in.endRow - in.startRow;
 
-    #pragma omp parallel for schedule(dynamic, 2) reduction(+:analysed, noObservation, failed, notConverged, illConditioned, lowSupport, observationsUsed, sumOmb, sumOma, sumDfs, thermalPixels)
+    #pragma omp parallel for schedule(dynamic, 2) reduction(+:analysed, noObservation, failed, notConverged, illConditioned, lowSupport, observationsUsed, sumOmb, sumOma, sumDfs, thermalPixels, stopConverged, stopStalled, stopNotUpdated, stopIterationLimit, stopSingular, stopStepFailed)
     for (int row = in.startRow; row < in.endRow; ++row) {
         for (int column = in.startColumn; column < in.endColumn; ++column) {
             const size_t pixel = static_cast<size_t>(row) * grid.width + column;
@@ -219,6 +227,8 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
             ThermalScene scene;
             const bool sceneOk = thermalSceneAt(in.terrain, pixel, sun.zenith, sun.azimuth, vz, va, scene);
             setThermalMaterial(scene, config, *entry, in.soilEmissivity, code);
+            const double skyTemperature = in.skyLongwave ? skyTemperatureFromLongwave((*in.skyLongwave)[pixel]) : NAN;
+            scene.skyTemperature = skyTemperature;
             std::vector<ThermalScene> viewScenes(as.views.size());
             std::vector<char> viewOk(as.views.size(), 0);
             for (size_t v = 0; v < as.views.size(); ++v) {
@@ -226,6 +236,7 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
                 if (!(z >= 0 && z < 90) || !(a >= -360 && a <= 360)) continue;
                 viewOk[v] = thermalSceneAt(in.terrain, pixel, sun.zenith, sun.azimuth, z, a, viewScenes[v]) ? 1 : 0;
                 setThermalMaterial(viewScenes[v], config, *entry, in.soilEmissivity, code);
+                viewScenes[v].skyTemperature = skyTemperature;
             }
             std::vector<Observation> obs;
             const auto temperatureValid = [](float y) { return std::isfinite(y) && y >= kTemperatureLow && y <= kTemperatureHigh; };
@@ -385,7 +396,7 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
                                 if (!(diffuse >= 0.0 && diffuse <= 1.0))
                                     diffuse = requestedDiffuseFraction(
                                         eb && in.shortwave && std::isfinite((*in.shortwave)[pixel]) ? (*in.shortwave)[pixel] : 0.0,
-                                        sun.zenith, config.diffuseFraction);
+                                        sun.zenith, config.diffuseFraction, dayOfYear);  // FIX(2026-11-21 C7): E0 of the overpass day
                             }
                             const auto& leafR = in.leafBandReflectance.at(code);
                             const auto& leafT = in.leafBandTransmittance.at(code);
@@ -422,28 +433,52 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
             double omb = 0.0;
             int thermalCount = 0;
             Matrix posterior{};
-            for (int iteration = 0; iteration < maxIterations; ++iteration) {
-                if (!evaluate(x)) { ok = iteration > 0; break; }
+            // FIX(2026-11-21 S-4/S-5): (a) every GN step is accepted only after the observation operator evaluated at the
+            // candidate and the MAP cost J decreased (backtracking fractions 1, 1/2, 1/4 as the StreamEarth native-MAP
+            // tool); a candidate whose evaluation fails is treated as a rejected step, not as a usable analysis.
+            // (b) The analysis (x, h, EB outcome) is therefore always one consistently evaluated state; a pixel is
+            // flagged RetrievalFailed and NOT analysed only when the operator fails at the background. Previously a
+            // failed evaluate() at iteration >= 1 left ok = true, the pixel was counted as analysed and written with
+            // the previous iterate while also carrying RetrievalFailed.
+            const auto mapCost = [&](const std::array<double, kMaxControls>& state, const std::vector<Ad>& values) {
+                std::vector<double> residual(m);
+                for (size_t i = 0; i < m; ++i) residual[i] = obs[i].y - values[i].v;
+                const auto weighted = applyPrecision(residual);
+                double total = 0.0;
+                for (size_t i = 0; i < m; ++i) total += residual[i] * weighted[i];
+                for (int c = 0; c < n; ++c)
+                    for (int d = 0; d < n; ++d) total += (state[c] - xb[c]) * backgroundInverse[c][d] * (state[d] - xb[d]);
+                return total;
+            };
+            double costGood = 0.0, costBackground = std::numeric_limits<double>::quiet_NaN();
+            bool stalled = false, stepFailed = false;  // FIX(2026-11-21 S-5 QA): stop reasons
+            int acceptedSteps = 0;
+            if (!evaluate(x)) ok = false;
+            else {
                 xGood = x; hGood = h; outcomeGood = outcome;
-                if (iteration == 0) {
-                    for (size_t i = 0; i < m; ++i)
-                        if (obs[i].thermal) { omb += obs[i].y - h[i].v; ++thermalCount; }
-                }
+                for (size_t i = 0; i < m; ++i)
+                    if (obs[i].thermal) { omb += obs[i].y - h[i].v; ++thermalCount; }
+                costGood = mapCost(xGood, hGood);
+                costBackground = costGood;
+            }
+            for (int iteration = 0; ok && iteration < maxIterations; ++iteration) {
+                const std::array<double, kMaxControls>& xs = xGood;
+                const std::vector<Ad>& hs = hGood;
                 Matrix a = backgroundInverse;
                 std::array<double, kMaxControls> g{};
                 std::vector<double> innovation(m);
                 for (size_t i = 0; i < m; ++i) {
-                    innovation[i] = obs[i].y - h[i].v;
-                    for (int c = 0; c < n; ++c) innovation[i] += h[i].d[c] * (x[c] - xb[c]);
+                    innovation[i] = obs[i].y - hs[i].v;
+                    for (int c = 0; c < n; ++c) innovation[i] += hs[i].d[c] * (xs[c] - xb[c]);
                 }
                 const auto weightedInnovation = applyPrecision(innovation);
                 for (int c = 0; c < n; ++c) {
                     std::vector<double> column(m);
-                    for (size_t i = 0; i < m; ++i) column[i] = h[i].d[c];
+                    for (size_t i = 0; i < m; ++i) column[i] = hs[i].d[c];
                     const auto weightedColumn = applyPrecision(column);
                     for (size_t i = 0; i < m; ++i) {
-                        g[c] += h[i].d[c] * weightedInnovation[i];
-                        for (int d = 0; d < n; ++d) a[d][c] += h[i].d[d] * weightedColumn[i];
+                        g[c] += hs[i].d[c] * weightedInnovation[i];
+                        for (int d = 0; d < n; ++d) a[d][c] += hs[i].d[d] * weightedColumn[i];
                     }
                 }
                 if (!invert(a, n)) { conditioned = false; break; }
@@ -453,21 +488,59 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
                     double increment = 0.0;
                     for (int d = 0; d < n; ++d) increment += a[c][d] * g[d];
                     next[c] = std::clamp(xb[c] + increment, low[c], high[c]);
-                    step = std::max(step, std::abs(next[c] - x[c]) / sd[c]);
+                    step = std::max(step, std::abs(next[c] - xs[c]) / sd[c]);
                 }
-                x = next;
                 ++iterations;
-                if (step < kStepTolerance) { converged = true; break; }
+                const unsigned flagsBefore = flags;
+                if (step < kStepTolerance) {
+                    // Converged: take the (tiny) final step when the operator evaluates there.
+                    if (evaluate(next)) { xGood = next; hGood = h; outcomeGood = outcome; costGood = mapCost(xGood, hGood); }
+                    else flags = flagsBefore;
+                    converged = true;
+                    break;
+                }
+                bool accepted = false, evaluated = false;
+                unsigned failureFlags = 0;
+                for (const double fraction : {1.0, 0.5, 0.25}) {
+                    std::array<double, kMaxControls> candidate = xs;
+                    for (int c = 0; c < n; ++c) candidate[c] = xs[c] + fraction * (next[c] - xs[c]);
+                    if (!evaluate(candidate)) { failureFlags |= flags & ~flagsBefore; flags = flagsBefore; continue; }
+                    evaluated = true;
+                    const double candidateCost = mapCost(candidate, h);
+                    if (std::isfinite(candidateCost) && candidateCost < costGood - 1e-12 * (1.0 + costGood)) {
+                        xGood = candidate; hGood = h; outcomeGood = outcome; costGood = candidateCost;
+                        accepted = true;
+                        break;
+                    }
+                }
+                // FIX(2026-11-21 S-5 QA): classify the stop instead of calling every rejected step "not converged".
+                if (!accepted) {
+                    if (evaluated) stalled = true;                        // evaluated, but no lower cost along the GN direction
+                    else { stepFailed = true; flags |= failureFlags; }    // the operator failed on every trial step
+                    break;
+                }
+                ++acceptedSteps;
             }
             if (!ok || hGood.empty()) { ++failed; finish(flags | kQaRetrievalFailed); continue; }
             if (!conditioned) flags |= kQaIllConditioned;
-            // Analysis state: evaluate at the last iterate; fall back to the last evaluated state.
-            if (conditioned && evaluate(x)) { hGood = h; outcomeGood = outcome; xGood = x; }
-            else if (conditioned) { flags |= kQaRetrievalFailed; converged = false; }
+            // Analysis state: the last accepted (evaluated) iterate = the lowest-cost evaluated state.
             x = xGood;
             h = hGood;
             outcome = outcomeGood;
-            if (!converged) flags |= kQaNotConverged;
+            // FIX(2026-11-21 S-5 QA): bit 10 / bit 11 for a line-search stop (not failures, outside the default reject
+            // mask); bit 9 only for the iteration limit, a singular normal matrix or an operator failure on every trial.
+            if (converged) ++stopConverged;
+            else if (stalled && acceptedSteps > 0) { flags |= kQaLineSearchStalled; ++stopStalled; }
+            else if (stalled) { flags |= kQaNotUpdated; ++stopNotUpdated; }
+            else {
+                flags |= kQaNotConverged;
+                if (stepFailed) ++stopStepFailed;
+                else if (!conditioned) ++stopSingular;
+                else ++stopIterationLimit;
+            }
+            qaBands[7][pixel] = static_cast<float>(costBackground);  // FIX(2026-11-21 S-5 QA): MAP cost at the background
+            qaBands[8][pixel] = static_cast<float>(costGood);        //                          and at the analysis
+            // (Former loop and post-loop re-evaluation replaced by the above — FIX(2026-11-21 S-4/S-5).)
 
             // Posterior covariance and DFS at the analysis.
             Matrix a = backgroundInverse;
@@ -538,7 +611,7 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
             ++analysed;
             observationsUsed += static_cast<long long>(m);
             if (std::isfinite(dfs)) sumDfs += dfs;
-            if (!converged) ++notConverged;
+            if (flags & kQaNotConverged) ++notConverged;  // FIX(2026-11-21 S-5 QA): bit 9 only (stalls / not updated counted apart)
             if (flags & kQaIllConditioned) ++illConditioned;
         }
         const int done = ++rowsDone;
@@ -559,7 +632,8 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
                "soil moisture analysis 1-sigma (m3 m-3)", "Vcmax25 analysis 1-sigma (umol m-2 s-1)", "LAI analysis 1-sigma"});
     writeTiff(dir / "analysis_qa.tif", grid, qaBands,
               {"QA flags", "mean O-B thermal (K)", "mean O-A thermal (K)", "RMS O-A thermal (K)",
-               "degrees of freedom for signal", "observations used", "iterations"});
+               "degrees of freedom for signal", "observations used", "iterations",
+               "MAP cost at background", "MAP cost at analysis"});  // FIX(2026-11-21 S-5 QA): bands 8-9 appended
     result.products = {"analysis_components.tif", "background_components.tif", "analysis_uncertainty.tif", "analysis_qa.tif"};
     if (eb || withOptical) {
         std::vector<std::vector<float>> controls{result.soilMoisture, result.vcmax, result.lai};
@@ -623,6 +697,21 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
     summary.Add("noObservationPixels", static_cast<GInt64>(noObservation));
     summary.Add("failedPixels", static_cast<GInt64>(failed));
     summary.Add("notConvergedPixels", static_cast<GInt64>(notConverged));
+    // FIX(2026-11-21 S-5 QA): why the Gauss-Newton iteration stopped (analysed pixels) and the QA bits involved.
+    {
+        CPLJSONObject stops;
+        stops.Add("converged", static_cast<GInt64>(stopConverged));
+        stops.Add("lineSearchStalled", static_cast<GInt64>(stopStalled));
+        stops.Add("notUpdated", static_cast<GInt64>(stopNotUpdated));
+        stops.Add("iterationLimit", static_cast<GInt64>(stopIterationLimit));
+        stops.Add("singularNormalMatrix", static_cast<GInt64>(stopSingular));
+        stops.Add("stepEvaluationFailed", static_cast<GInt64>(stopStepFailed));
+        summary.Add("stopReasons", stops);
+        summary.Add("qaBits", "0 input invalid, 1 cloud, 2 out of range, 3 retrieval failed (not analysed), 4 ill-conditioned, "
+                              "8 low support, 9 not converged (iteration limit / singular / operator failed on every trial step), "
+                              "10 line-search stalled (cost lowered, best state kept), 11 not updated (analysis = background); "
+                              "default reject mask 895 = bits 0-6, 8, 9");
+    }
     summary.Add("illConditionedPixels", static_cast<GInt64>(illConditioned));
     summary.Add("lowSupportPixels", static_cast<GInt64>(lowSupport));
     summary.Add("observationsUsed", static_cast<GInt64>(observationsUsed));
@@ -645,6 +734,9 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
     log("同化（" + std::string(eb ? "EB 背景：土壤水分 + Vcmax" : "RT 背景：四组分温度") + (withOptical ? " + LAI" : "") + "）：分析 " +
         std::to_string(analysed) + " 个像元，无观测 " + std::to_string(noObservation) + "，失败 " + std::to_string(failed) +
         "，未收敛 " + std::to_string(notConverged) +
+        // FIX(2026-11-21 S-5 QA): stop reasons
+        "（收敛 " + std::to_string(stopConverged) + "，线搜索停滞 " + std::to_string(stopStalled) + "，未更新 " +
+        std::to_string(stopNotUpdated) + "，迭代上限 " + std::to_string(stopIterationLimit) + "）" +
         (thermalPixels > 0 ? "，平均 O−B " + format(sumOmb / thermalPixels) + " K，O−A " + format(sumOma / thermalPixels) + " K" : "") +
         (analysed > 0 ? "，平均 DFS " + format(sumDfs / analysed) : ""));
     if (config.terrainRadiation == TerrainRadiation::Hill || config.terrainRadiation == TerrainRadiation::Ridge)

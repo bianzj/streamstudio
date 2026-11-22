@@ -79,6 +79,7 @@ export const webApi = {
   histreamProxyInfo: () => request('/api/histream-proxy/info'),
   runHistreamProxy: (data) => post('/api/histream-proxy/run', data),
   run: (data) => post('/api/run', data),
+  preflight: (data) => post('/api/run/preflight', data),
   stop: () => post('/api/stop'),
   reset: () => post('/api/reset'),
   onSimulationEvent: (callback) => {

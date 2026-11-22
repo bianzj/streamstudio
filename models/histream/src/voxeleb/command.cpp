@@ -22,6 +22,38 @@ struct ScatteringAggregate {
     double absorbedShortwave{0}, absorbedPar{0}, transmittanceResidual{0}, truncatedResidual{0};
 };
 
+// Zeroes every voxel field that only a shortwave pass would write. A node with no
+// sun and no measured shortwave contributes exactly zero to all of them, so a
+// skipped node has to clear them explicitly instead of inheriting the previous
+// node's radiance.
+void clearShortwaveFields(const std::shared_ptr<VoxelebIO>& modelio)
+{
+    nvvk::CommandPool commandPool(modelio->m_device, modelio->m_queueIndex);
+    vk::CommandBuffer command = commandPool.createCommandBuffer();
+    const VkDeviceSize voxelCount = static_cast<VkDeviceSize>(modelio->n_voxel);
+    // Buffer sizes are not stored on nvvk::Buffer, so they follow the layouts the
+    // buffer builder uses: VoxelDir, VoxelNetRad and VoxelPnet are per voxel and
+    // the radiance field holds DIFFUSENUM directions per voxel.
+    const std::array<std::pair<nvvk::Buffer*, VkDeviceSize>, 4> ranges{{
+        {modelio->m_voxelio->m_pDirBuffer.get(), voxelCount * sizeof(VoxelDir)},
+        {modelio->m_voxelio->m_pNetRadBuffer.get(), voxelCount * sizeof(VoxelNetRad)},
+        {modelio->m_voxelio->m_pPnetBuffer.get(), voxelCount * sizeof(VoxelPnet)},
+        {modelio->m_voxelio->m_pRadsBuffer.get(),
+         voxelCount * DIFFUSENUM * static_cast<VkDeviceSize>(sizeof(VoxelRad))}}};
+    for (const auto& [buffer, bytes] : ranges) {
+        if (buffer && buffer->buffer && bytes > 0) {
+            vkCmdFillBuffer(command, buffer->buffer, 0, bytes, 0U);
+        }
+    }
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
+                         0, nullptr, 0, nullptr);
+    commandPool.submitAndWait(command);
+}
+
 void clearEnergyState(const std::shared_ptr<VoxelebIO>& modelio)
 {
     // DEFERRED[低] 性能: 每次 EB 迭代都新建/销毁一个 nvvk::CommandPool 并 submitAndWait 一个 4 字节 fill（readEnergyState 同样），50 次迭代 × 每节点产生大量池创建与同步往返；建议：把 vkCmdFillBuffer 直接录入 budget 派发的命令缓冲（submit 中已有 TRANSFER_WRITE→SHADER 屏障）。
@@ -156,9 +188,12 @@ void writeScatteringStats(const std::shared_ptr<VoxelebIO>& modelio,
     }
     output << "  ],\n  \"valid\": " << (valid ? "true" : "false") << "\n}\n";
     output.close();
+    uint64_t truncations = 0;
+    for (const auto& value : stats) truncations += value.maxStepTruncations;
     std::cout << "SHORTWAVE_SCATTERING\tnode=" << modelio->k_node
         << "\trequested=" << modelio->shortwaveScatteringOrders
         << "\telapsedMs=" << milliseconds
+        << "\ttruncations=" << truncations
         << "\tdiagnostics=" << file.string() << std::endl;
     if (!valid) throw std::runtime_error("Invalid shortwave scattering state: " + file.string());
 }
@@ -210,6 +245,27 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     std::vector<VkSemaphore> beginSemaph;
     beginSemaph.emplace_back(modelio->m_semaphores[0]);
 
+    // A node with the sun below the horizon and no measured shortwave has no
+    // sunbeam and no sky VNIR source: the gap, direct and every scattering order
+    // would accumulate exactly zero. Clearing those fields and skipping the three
+    // passes is numerically identical to tracing them and removes the dominant
+    // cost of night nodes.
+    constexpr float kShortwaveFloor = 1.0e-3f;
+    const float solarZenith = modelio->angles.empty() ? 180.0f : modelio->angles.front().sza;
+    const bool noShortwaveNode = !(modelio->meteo.Rin > kShortwaveFloor) && solarZenith >= 90.0f;
+
+    std::array<double, 3> orderMilliseconds{};
+    std::array<ScatteringAggregate, 4> scatteringStats{};
+    if (noShortwaveNode) {
+        const auto skipBegin = std::chrono::steady_clock::now();
+        clearShortwaveFields(modelio);
+        const double skipMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - skipBegin).count();
+        writeScatteringStats(modelio, scatteringStats, skipMs, orderMilliseconds);
+        std::cout << "SHORTWAVE_SKIPPED\tnode=" << modelio->k_node
+                  << "\trin=" << modelio->meteo.Rin
+                  << "\tsza=" << solarZenith << std::endl;
+    } else {
     submit(modelio, VoxelEBStage::gap, voxelSize1D, std::nullopt, std::nullopt);
     waitFence(modelio);
 
@@ -217,8 +273,6 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     waitFence(modelio);
 
     const auto shortwaveBegin = std::chrono::steady_clock::now();
-    std::array<double, 3> orderMilliseconds{};
-    std::array<ScatteringAggregate, 4> scatteringStats{};
     if (uint64_t(modelio->n_voxel) * 64 > UINT32_MAX) {
         throw std::runtime_error("One spectral group exceeds the scattering diagnostic counter capacity");
     }
@@ -229,6 +283,7 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     // Each spectral group owns the entire directional field until all its
     // orders finish. Reusing two fields keeps memory independent of K.
     const int width = std::max(setting.n_jump, 1);
+    bool skyTransmittanceReady = false;
     for (int first = 0; first < 2001;) {
         resetScatteringStats(modelio);
         int end = std::min(first + width, 2001);
@@ -236,10 +291,14 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
         if (first < 301 && end > 301) end = 301;
         setting.scatteringBandStart = first;
         setting.scatteringBandEnd = end;
-        setting.scatteringStage = 1;
+        // Stage 1 traces the spectrally neutral uncollided sky field once per
+        // node and stores its gap transmittance; later groups (stage 4) only
+        // rescale it by their sky irradiance instead of retracing 64 rays.
+        setting.scatteringStage = skyTransmittanceReady ? 4 : 1;
         setting.scatteringOrder = 0;
         submit(modelio, VoxelEBStage::scatteringVNIR, voxelSize1D, std::nullopt, std::nullopt);
         waitFence(modelio);
+        skyTransmittanceReady = true;
         for (int order = 1; order <= modelio->shortwaveScatteringOrders; ++order) {
             const auto orderBegin = std::chrono::steady_clock::now();
             setting.scatteringOrder = order;
@@ -272,6 +331,7 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     const double shortwaveMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - shortwaveBegin).count();
     writeScatteringStats(modelio, scatteringStats, shortwaveMs, orderMilliseconds);
+    }
 
     submit(modelio, VoxelEBStage::directTIR, voxelSize1D, std::nullopt, std::nullopt);
     waitFence(modelio);
@@ -288,17 +348,19 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     // Stomatal state reacts to leaf-surface humidity outside the temperature
     // Newton step; later iterations solve temperature with physiology frozen.
     constexpr int physiologyIterations = 25;
+    // Aerodynamic resistances depend on meteorology, canopy structure and the
+    // (frozen during EB) flow field only, never on surface temperature: the
+    // free-convection term is applied per state in evapo/budget. Evaluate
+    // them once per node instead of on every iteration.
+    submit(modelio, VoxelEBStage::aero, voxelSize1D, std::nullopt, std::nullopt);
+    waitFence(modelio);
     // DEFERRED[中] 数值: 能量平衡迭代上限 50 写死且前 25 次才更新生理；未收敛时只记录 energyFinalUnconvergedStateCount，后续仍 updateTp 推进时间节点，若调用方不检查该计数，未收敛（甚至振荡）的温度会被当作正常结果传播到下一时间步；建议：将上限与生理冻结轮数做成配置项，并在未收敛计数>0 时输出警告/在结果元数据中标记。
     for(int kiter = 0;kiter < 50; kiter++) {
-
+        // Also read by budget.comp for its damping schedule; the biochemical
+        // pass only runs (and reads it) while kiter < physiologyIterations.
+        setting.energyIteration = kiter;
 
         submit(modelio, VoxelEBStage::diffuseTIR, voxelSize1D, std::nullopt, std::nullopt);
-        waitFence(modelio);
-
-        //--------------------------------------------------
-
-
-        submit(modelio, VoxelEBStage::aero, voxelSize1D, std::nullopt, std::nullopt);
         waitFence(modelio);
 
         //--------------------------------------------------
@@ -336,8 +398,6 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     // The final budget dispatch only writes G/checks residuals; it cannot
     // make another temperature update or advance the physical time node.
     submit(modelio, VoxelEBStage::diffuseTIR, voxelSize1D, std::nullopt, std::nullopt);
-    waitFence(modelio);
-    submit(modelio, VoxelEBStage::aero, voxelSize1D, std::nullopt, std::nullopt);
     waitFence(modelio);
     if(modelio->energyIterations < physiologyIterations) {
         setting.energyIteration = modelio->energyIterations;

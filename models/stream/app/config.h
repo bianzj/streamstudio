@@ -110,7 +110,12 @@ struct ImageConfig {
     double maxAerodynamicResistance = 400.0;
     double referenceHeight = 15.0;
     double heatRoughnessKb = -1.0;  // >0 overrides the per-class value in classes.json
+                                    // FIX(2026-11-21 B4): bare-soil path only (LAI < 0.5), see energy.h Ground
+    // Soil emissivity (dry end). When `soilEmissivitySet` (energy.soilEmissivity given) it replaces
+    // ground.emissivity of every soil class, so the EB balance and the imaging / retrieval use one value;
+    // otherwise both use the class value of classes.json (0.955 for all soil classes).
     double soilEmissivity = 0.955;
+    bool soilEmissivitySet = false;
     // Emissivity of saturated soil. Negative keeps the built-in dry-to-wet gain
     // (soilEmissivity + 0.03, capped at 0.995), see physics/soil_emissivity.h.
     double soilEmissivityWet = -1.0;
@@ -131,10 +136,22 @@ struct ImageConfig {
     double soilHeatFraction = 0.25;
     int solarBinWidth = 50;  // nm, energy-balance shortwave grouping (1 = full 1 nm integration)
     int maxIterations = 50;
-    int maxStabilityIterations = 60;
+    int maxStabilityIterations = 60;  // accepted for compatibility; the solver shares maxIterations (unused)
+    // Reflected sky of the thermal brightness (2026-11-20). "skyLongwave": {"mode": "auto" | "none"} or a
+    // constant / raster field {"value": W m-2} / {"file": ..., "band": n}. auto: EB uses ERA5 strd at the
+    // overpass; RT uses the Swinbank clear-sky L↓ of the shaded component temperature. none: legacy (no term).
+    enum class SkySource { Auto, None, Field } skySource = SkySource::Auto;
+    Field skyLongwave;
     InversionConfig inversion;
     AssimilationConfig assimilation;
     int threads = 0;
+    // FIX(2026-11-21 C9): crown / row structure keys given in the run config (surface.*); not simulated, the run
+    // warns and records a homogeneous canopy in scene_summary.json.
+    std::vector<std::string> ignoredStructureKeys;
+    // FIX(2026-11-21 B10): EB spin-up before the overpass, hours (temperature.spinupHours, default 24). The march
+    // starts at the whole hour floor(overpass - spinupHours); if the ERA5 pack does not cover it, at the earliest
+    // covered hour (warning). The former start was always 00 UTC of the overpass day.
+    double spinupHours = 24.0;
 };
 
 ImageConfig readImageConfig(const std::string& path);

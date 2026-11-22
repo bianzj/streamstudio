@@ -1,6 +1,8 @@
 #include "utils.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -495,17 +497,41 @@ std::vector<std::string> Utils::splitt(std::string& s, std::string& deli)
 
 float Utils::expint(float x)
 {
-	// DEFERRED[中] 数值: 用步长 0.001 的左矩形法在 t∈[1,100) 上积分 E1(x)=∫₁^∞ e^{-xt}/t dt，截断丢掉 E1(100x)，x=0.01 时相对误差约 5%、x=0.001 时约 29%（PROSPECT 近红外弱吸收波段 Kall 正处于此量级），且矩形法有 O(0.0005) 的系统偏差；每次调用 9.9 万次 exp，fluspect 每材质调用 2001 次，约 2×10⁸ 次 exp；建议：使用级数（x<1：-γ-ln x-Σ(-x)^k/(k·k!)）+ 连分式（x≥1）的标准实现。
-	int i1 = 1000;
-	int i2 = 100000;
-	double sum = 0.0, ii;
-	for (int i = i1; i < i2; i++)
-	{
-		ii = i / 1000.0;
-		sum = sum + exp(-x * ii) / ii * 0.001;
+	// Exponential integral E1(x) = int_1^inf exp(-x t)/t dt (MATLAB expint),
+	// used by PROSPECT. The former left-rectangle quadrature on t in [1,100)
+	// cost ~1e5 exp() per call (2e8 per PROSPECT material, ~10 s of VoxelEB
+	// start-up) and dropped the E1(100x) tail (5 % error at x = 0.01).
+	// Standard evaluation: power series for x <= 1, Lentz continued fraction
+	// for x > 1 (Numerical Recipes expint, n = 1), relative error ~1e-12.
+	const double v = static_cast<double>(x);
+	if (!(v > 0.0)) return std::numeric_limits<float>::infinity();
+	constexpr double euler = 0.57721566490153286061;
+	constexpr double eps = 1.0e-15;
+	if (v <= 1.0) {
+		double sum = 0.0;
+		double term = 1.0;
+		for (int k = 1; k < 200; ++k) {
+			term *= -v / k;               // (-x)^k / k!
+			const double delta = term / k;
+			sum += delta;
+			if (std::abs(delta) < eps * std::max(1.0, std::abs(sum))) break;
+		}
+		return static_cast<float>(-euler - std::log(v) - sum);
 	}
-	return sum;
-
+	double b = v + 1.0;
+	double c = 1.0 / 1.0e-300;
+	double d = 1.0 / b;
+	double h = d;
+	for (int i = 1; i < 200; ++i) {
+		const double a = -static_cast<double>(i) * i;
+		b += 2.0;
+		d = 1.0 / (a * d + b);
+		c = b + a / c;
+		const double delta = c * d;
+		h *= delta;
+		if (std::abs(delta - 1.0) < eps) break;
+	}
+	return static_cast<float>(h * std::exp(-v));
 }
 
 float* Utils::infile2num(std::string infileName, int skip, int col, int& num)

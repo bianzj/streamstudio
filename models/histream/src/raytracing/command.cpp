@@ -5,6 +5,9 @@
 #include "command.h"
 #include "base/vkcheck.h"
 
+#include <algorithm>
+#include <chrono>
+
 
 Command::Command()
 {
@@ -37,17 +40,28 @@ bool Command::run(std::shared_ptr<RaytracingIO> &raytracingio){
 
     const int imageHeight = std::max(1, raytracingio->imageSize.y);
     const int imageWidth = std::max(1, raytracingio->imageSize.x);
-    // Periodic traversal can multiply TLAS work for every primary miss. Keep
-    // each Vulkan submission small enough to avoid a Windows TDR while still
-    // completing and downloading one observation direction at a time.
-    const int rowsPerSubmit = raytracingio->periodicNeighborCount > 0
-        ? std::max(1, std::min(imageHeight, 2048 / imageWidth))
-        : imageHeight;
-    for (int row = 0; row < imageHeight; row += rowsPerSubmit) {
+    // Each submission is sized by measured GPU time, not by a fixed row
+    // count. The old rule (2048 threads per submission whenever periodic
+    // traversal was on, the whole image otherwise) left the GPU mostly idle
+    // in the first case and risked a Windows TDR (2 s) for large images with
+    // many samples in the second. Start with ~64k pixels, then grow or shrink
+    // the slab towards ~120 ms per submission.
+    constexpr double targetMilliseconds = 120.0;
+    int rowsPerSubmit = std::clamp((1 << 16) / imageWidth, 1, imageHeight);
+    for (int row = 0; row < imageHeight;) {
+        const int rows = std::min(rowsPerSubmit, imageHeight - row);
         raytracingio->setting.imageOffsetY = row;
-        raytracingio->dispatchRowCount = std::min(rowsPerSubmit, imageHeight - row);
+        raytracingio->dispatchRowCount = rows;
+        const auto begin = std::chrono::steady_clock::now();
         submit(raytracingio, nullptr, nullptr);
         waitFence(raytracingio);
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count();
+        row += rows;
+        const double scale = std::clamp(
+            targetMilliseconds / std::max(elapsed, 1.0), 0.25, 4.0);
+        rowsPerSubmit = std::clamp(
+            static_cast<int>(rows * scale), 1, imageHeight);
     }
     raytracingio->setting.imageOffsetY = 0;
     raytracingio->dispatchRowCount = 0;

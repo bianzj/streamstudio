@@ -24,7 +24,8 @@ buffer ScatteringStatsBuffer {
 #define scatteringStats ScatteringStatsBuffer(setting.scatteringStatsAddress).records
 
 uint scatteringStatsSlot() {
-    return setting.scatteringStage == 1 ? 3u
+    // Stage 4 reuses the stage-1 sky trace: same (sky zero) record.
+    return (setting.scatteringStage == 1 || setting.scatteringStage == 4) ? 3u
         : uint(clamp(setting.scatteringOrder, 1, 3) - 1);
 }
 

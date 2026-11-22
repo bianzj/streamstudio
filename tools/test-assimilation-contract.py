@@ -125,6 +125,84 @@ def test_weight_fractions_and_radiance_fractions_are_distinct_products(tmp_path)
     np.testing.assert_allclose(actual, expected/expected.sum(), atol=1e-6)
 
 
+# ---- thermal forward operator (2026-11-20): reflected sky, night weights, retrieval consistency ----
+C1, C2, SIGMA = 1.1910439340652e8, 14388.291040407, 5.670374419e-8
+
+
+def planck(t, wl):
+    return C1/(wl**5*np.expm1(C2/(wl*t)))
+
+
+def inverse_planck(radiance, wl):
+    return C2/(wl*np.log1p(C1/(radiance*wl**5)))
+
+
+def run_thermal(tmp_path, tag, *, components, lai=0., overpass='2019-07-15T04:00:00Z', sky=None, inversion=None,
+                thermal=True, soil_moisture=.05):
+    out = tmp_path/tag
+    out.mkdir()
+    config = dict(kind='stream-image-config', schemaVersion=2, outputDir=str(out),
+        dataDir=str(RUNTIME/'stream-defined'), overpass=overpass,
+        surface=dict(type=dict(file=raster(tmp_path/f'{tag}_type.tif', [10])), lai=dict(value=lai),
+                     soilMoisture=dict(value=soil_moisture), latitude=dict(value=40.), longitude=dict(value=116.),
+                     dem=dict(value=0.)),
+        view=dict(vza=dict(value=0.), vaa=dict(value=0.)), optical=dict(enabled=False),
+        thermal=dict(enabled=thermal, bands=[dict(name='TIR', center=10.5, fwhm=.5)] if thermal else []), threads=1,
+        temperature=dict(mode='rt', components={k: dict(value=v) for k, v in zip(
+            ('soilSunlit', 'soilShaded', 'leafSunlit', 'leafShaded'), components)},
+            energy=dict(soilEmissivityModel='constant')))
+    if sky is not None:
+        config['skyLongwave'] = sky
+    if inversion:
+        config['inversion'] = inversion
+    path = tmp_path/f'{tag}.json'
+    path.write_text(json.dumps(config), encoding='utf-8')
+    env = dict(os.environ, PATH=str(RUNTIME) + os.pathsep + os.environ['PATH'])
+    result = subprocess.run([str(RUNTIME/'stream.exe'), 'run', str(path)], capture_output=True,
+                            encoding='utf-8', errors='replace', env=env, timeout=60)
+    assert result.returncode == 0, result.stderr + result.stdout
+    return out
+
+
+def read_band(path, band=1):
+    with gdal.Open(str(path)) as ds:
+        return float(ds.GetRasterBand(band).ReadAsArray()[0, 0])
+
+
+def test_bare_soil_brightness_includes_reflected_sky(tmp_path):
+    # Dry bare soil, constant emissivity 0.955 (classes.json), isothermal 300 K, configured L↓ = 350 W m-2.
+    out = run_thermal(tmp_path, 'sky', components=[300.]*4, sky=dict(value=350.))
+    t_sky = (350./SIGMA) ** .25
+    expected = inverse_planck(.955*planck(300., 10.5) + .045*planck(t_sky, 10.5), 10.5)
+    assert abs(read_band(out/'tir_brightness_temperature.tif') - expected) < 2e-3
+    # The LST product stays emitted radiance / emissivity.
+    assert abs(read_band(out/'tir_surface_temperature.tif') - 300.) < 2e-3
+    legacy = run_thermal(tmp_path, 'nosky', components=[300.]*4, sky=dict(mode='none'))
+    assert abs(read_band(legacy/'tir_brightness_temperature.tif') - inverse_planck(.955*planck(300., 10.5), 10.5)) < 2e-3
+
+
+def test_night_thermal_has_no_sunlit_components(tmp_path):
+    night = '2019-07-15T16:00:00Z'  # local midnight at 116 E
+    a = run_thermal(tmp_path, 'night_a', components=[320., 290., 315., 292.], lai=2., overpass=night, sky=dict(mode='none'))
+    b = run_thermal(tmp_path, 'night_b', components=[250., 290., 250., 292.], lai=2., overpass=night, sky=dict(mode='none'))
+    assert abs(read_band(a/'tir_brightness_temperature.tif') - read_band(b/'tir_brightness_temperature.tif')) < 1e-4
+
+
+def test_lst_retrieval_inverts_the_forward_operator_with_sky(tmp_path):
+    sky = dict(value=380.)
+    forward = run_thermal(tmp_path, 'forward', components=[305.]*4, lai=2., sky=sky)
+    observed = read_band(forward/'tir_brightness_temperature.tif')
+    retrieval = run_thermal(tmp_path, 'retrieve', components=[305.]*4, lai=2., sky=sky, thermal=False,
+        inversion=dict(target='lst', observations=[dict(kind='brightness', value=dict(value=observed), wavelength=10.5, sigma=.5)]))
+    assert abs(read_band(retrieval/'lst.tif') - 305.) < 5e-3
+
+
+def test_rt_mode_reads_soil_emissivity_settings(tmp_path):
+    # Constant vs Hapke soil emissivity must change an oblique bare-soil brightness in RT mode as well.
+    out = run_thermal(tmp_path, 'const', components=[300.]*4, sky=dict(mode='none'))
+    assert abs(read_band(out/'tir_brightness_temperature.tif') - inverse_planck(.955*planck(300., 10.5), 10.5)) < 2e-3
+
+
 @pytest.mark.skipif(os.name != 'nt', reason='Windows case-insensitive file identity')
 def test_native_rejects_same_brightness_file_with_different_case(tmp_path):
     result, _ = run(tmp_path, dict(views=[dict(data=str(tmp_path/'OBS.tif'),

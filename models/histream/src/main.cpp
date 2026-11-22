@@ -30,6 +30,23 @@ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 using namespace std;
 
+namespace {
+// Process exit codes (server.mjs HISTREAM_EXIT mirrors these):
+//   0 success, 1 run failed, 2 FacetEB finished with non-converged nodes
+//   (results kept), 3 resource creation failed, 4 initialization failed,
+//   5 device query failed, 64 usage error (EX_USAGE).  Usage errors used to
+//   share code 2 with "non-converged", so the server could not tell them apart.
+constexpr int kExitUsage = 64;
+
+void printUsage(const histream::ExtensionRegistry& extensions) {
+    std::cerr << "Usage: histream <eVoxelEB|eFacetEB|eFacetRT|eVoxelRT|eRaytracing> <project.json> [output.json]\n"
+                 "       histream <eVoxelEB|eVoxelRT|eRaytracing> --builtin-example\n"
+                 "       histream --list-devices\n";
+    for (const auto& extension : extensions.modes())
+        std::cerr << "       " << extension.usage << '\n';
+}
+}
+
 int main(int argc, char **argv) {
 
 #ifdef _WIN32
@@ -57,10 +74,15 @@ int main(int argc, char **argv) {
     // std::string path= "D://data//hyperSpectral//test_1202";
     // std::string filePath;
 
-    std::string mode = argc > 1 ? argv[1] : "eVoxelEB";
+    std::string mode = argc > 1 ? argv[1] : "";
     // Out-of-tree extension modes (none in the core build; see src/base/extension.h).
     histream::ExtensionRegistry extensions;
     histream::registerExtensions(extensions);
+    if (mode.empty()) {
+        // No arguments: print usage instead of silently running a built-in example.
+        printUsage(extensions);
+        return kExitUsage;
+    }
     if (const auto* extension = extensions.find(mode)) {
         try {
             return extension->run(argc, argv, histream::executablePath(argv[0]));
@@ -83,18 +105,29 @@ int main(int argc, char **argv) {
     std::string outputPath = argc > 3 ? argv[3] : "";
     if (mode != "eVoxelEB" && mode != "eFacetEB" && mode != "eFacetRT"
         && mode != "eVoxelRT" && mode != "eRaytracing") {
-        std::cerr << "Usage: histream [eVoxelEB|eFacetEB|eFacetRT|eVoxelRT|eRaytracing] [project.json] [output.json]\n"
-                     "       histream --list-devices\n";
-        for (const auto& extension : extensions.modes())
-            std::cerr << "       " << extension.usage << '\n';
-        return 2;
+        printUsage(extensions);
+        return kExitUsage;
+    }
+    // An empty project path used to fall through to FileIO's built-in XML
+    // example, silently writing into the example directory and exiting 0.
+    // Keep that only behind the explicit --builtin-example switch (Voxel/
+    // Raytracing modes; Facet modes have no built-in example).
+    if (inputPath == "--builtin-example") {
+        if (mode == "eFacetEB" || mode == "eFacetRT") {
+            std::cerr << "--builtin-example is not available for " << mode << '\n';
+            return kExitUsage;
+        }
+        inputPath.clear();
+    } else if (inputPath.empty()) {
+        std::cerr << "HiStream: project.json path is required for " << mode << '\n';
+        printUsage(extensions);
+        return kExitUsage;
     }
 
     // Engine path strings are native code-page strings (std::filesystem::path::string()),
     // so GDAL must interpret file names the same way in every module.
     CPLSetConfigOption("GDAL_FILENAME_IS_UTF8", "NO");
 
-    // DEFERRED[低] 错误处理: 默认模式 eVoxelEB 且未给工程路径时 inputPath 为空，Engine::input 仍会 readJson("")，报出含义不清的文件错误而不是用法提示；建议：inputPath 为空时直接打印 Usage 并返回 2。
     Engine engine;
     try {
         engine.input(inputPath, mode, outputPath);

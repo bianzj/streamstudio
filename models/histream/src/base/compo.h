@@ -22,9 +22,9 @@ public:
 
     /// fluspect model
     float calctav(float alfa,float nr);
-    void fluspect(OptCoeff fluspectCoeff, FluspectParam fluspectParam, std::vector<Spectral>& spectrals);
+    void fluspect(const OptCoeff& fluspectCoeff, FluspectParam fluspectParam, std::vector<Spectral>& spectrals);
     // bsm model
-    void bsm(OptCoeff bsmCoeff, BSMParam bsm, std::vector<Spectral> &spectral);
+    void bsm(const OptCoeff& bsmCoeff, BSMParam bsm, std::vector<Spectral> &spectral);
 
     // Resolve every source (model, panel values, imported TXT) onto requested wavelengths.
     std::vector<Spectral> resolveSpectrals(const SpectralXml& material,

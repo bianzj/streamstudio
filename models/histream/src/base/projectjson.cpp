@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -247,29 +249,121 @@ bool ProjectJson::hasSpecularReflection() const {
     return false;
 }
 
+// Sensor band list.  MUST stay rule-for-rule identical to sensorBandValues() in
+// src/renderer/src/project-schema.js: the server rasterizes Facet results with
+// the JS list, so any difference in band count or order makes it read the
+// per-band records at the wrong offsets.  JS rules reproduced here:
+//   * values are rounded to 6 decimals (cleanNumber) and de-duplicated on that key;
+//   * a continuous range yields floor((end-start)/step + 1e-9) + 1 bands and also
+//     appends `end` when the step does not land on it exactly;
+//   * custom bands keep their room: the range is truncated to 800 - (#custom);
+//   * the merged list is sorted by wavelength and then truncated to 800.
+// Arithmetic is done in double as in JS; the result is converted to float last.
 std::vector<float> ProjectJson::sensorBands() const {
-    std::vector<float> values;
-    std::set<long long> keys;
-    const auto add = [&](float value) {
-        if (!(value > 0.0f) || !std::isfinite(value)) return;
-        const long long key = std::llround(value * 1000000.0);
-        if (keys.insert(key).second) values.push_back(value);
+    constexpr size_t kMaxSensorBands = 800;  // project-schema.js MAX_SENSOR_BANDS
+    const auto cleanNumber = [](double value) { return std::round(value * 1000000.0) / 1000000.0; };
+    const auto bandKey = [](double cleaned) { return std::llround(cleaned * 1000000.0); };
+    // JS Number(token): the whole token must be numeric.
+    const auto parseNumber = [](const std::string& token, double& parsed) {
+        if (token.empty()) return false;
+        char* end = nullptr;
+        parsed = std::strtod(token.c_str(), &end);
+        return end == token.c_str() + token.size() && std::isfinite(parsed);
     };
-    const std::vector<float> custom = numbers(sensor().contains("bands") ? sensor()["bands"] : Json{});
-    if (boolean(sensor(), "continuousBands", false)) {
-        const float start = number(sensor(), "bandStart", 400.0f);
-        const float end = number(sensor(), "bandEnd", 2500.0f);
-        const float step = number(sensor(), "bandStep", 10.0f);
-        if (start > 0.0f && end >= start && step > 0.0f) {
-            for (int index = 0; index < 800 && start + index * step <= end + 1e-5f; ++index)
-                add(start + index * step);
+    // project-schema.js number(value, fallback): null/blank -> fallback.
+    const auto jsNumber = [&](const char* key, double fallback) {
+        const Json& owner = sensor();
+        const auto found = owner.find(key);
+        if (found == owner.end() || found->is_null()) return fallback;
+        double parsed = fallback;
+        if (found->is_number()) parsed = found->get<double>();
+        else if (found->is_boolean()) parsed = found->get<bool>() ? 1.0 : 0.0;
+        else if (found->is_string()) {
+            std::string text = found->get<std::string>();
+            const auto first = text.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos) return fallback;
+            text = text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+            if (!parseNumber(text, parsed)) return fallback;
+        } else return fallback;
+        return std::isfinite(parsed) ? parsed : fallback;
+    };
+    // JS truthiness of sensor.continuousBands.
+    const auto truthy = [&](const char* key) {
+        const Json& owner = sensor();
+        const auto found = owner.find(key);
+        if (found == owner.end() || found->is_null()) return false;
+        if (found->is_boolean()) return found->get<bool>();
+        if (found->is_number()) { const double v = found->get<double>(); return v != 0.0 && !std::isnan(v); }
+        if (found->is_string()) return !found->get<std::string>().empty();
+        return true;
+    };
+    // JS: String(sensor.bands || '').split(/[\s,;]+/).map(Number).filter(finite && > 0)
+    std::vector<double> custom;
+    {
+        std::string text;
+        const Json& owner = sensor();
+        const auto found = owner.find("bands");
+        if (found != owner.end()) {
+            const auto append = [&text](const Json& item) {
+                if (!text.empty()) text += ',';
+                if (item.is_string()) text += item.get<std::string>();
+                else if (item.is_number()) text += item.dump();
+            };
+            if (found->is_array()) for (const auto& item : *found) append(item);
+            else if (found->is_string() || found->is_number()) append(*found);
+        }
+        std::string token;
+        const auto flush = [&]() {
+            double parsed = 0.0;
+            if (parseNumber(token, parsed) && parsed > 0.0) custom.push_back(parsed);
+            token.clear();
+        };
+        for (const char ch : text) {
+            if (ch == ',' || ch == ';' || std::isspace(static_cast<unsigned char>(ch))) flush();
+            else token += ch;
+        }
+        flush();
+    }
+    std::set<long long> customKeys;
+    for (double value : custom) customKeys.insert(bandKey(cleanNumber(value)));
+
+    std::vector<double> merged;
+    if (truthy("continuousBands")) {
+        const double start = jsNumber("bandStart", 400.0);
+        const double end = jsNumber("bandEnd", 2500.0);
+        const double step = jsNumber("bandStep", 10.0);
+        if (start > 0.0 && end >= start && step > 0.0) {
+            const double count = std::floor((end - start) / step + 1e-9) + 1.0;
+            const double capacity = static_cast<double>(
+                kMaxSensorBands > customKeys.size() ? kMaxSensorBands - customKeys.size() : 0);
+            const size_t generated = static_cast<size_t>((std::min)(count, capacity));
+            for (size_t index = 0; index < generated; ++index)
+                merged.push_back(cleanNumber(start + static_cast<double>(index) * step));
+            if (count <= capacity && static_cast<double>(merged.size()) < capacity &&
+                std::abs(start + (count - 1.0) * step - end) > 1e-6)
+                merged.push_back(cleanNumber(end));
         }
     }
-    for (float value : custom) add(value);
+    merged.insert(merged.end(), custom.begin(), custom.end());
+    std::vector<double> unique;
+    std::set<long long> keys;
+    for (double value : merged) {
+        const double cleaned = cleanNumber(value);
+        if (keys.insert(bandKey(cleaned)).second) unique.push_back(cleaned);
+    }
+    std::sort(unique.begin(), unique.end());
+    if (unique.size() > kMaxSensorBands) {
+        // Same truncation as JS slice(0, 800); report it instead of dropping silently.
+        std::cerr << "HiStream: sensor band list truncated from " << unique.size()
+                  << " to " << kMaxSensorBands << " bands\n";
+        unique.resize(kMaxSensorBands);
+    }
+    std::vector<float> values;
+    values.reserve(unique.size());
+    for (double value : unique) values.push_back(static_cast<float>(value));
+    // The engine needs at least one band; the GUI rejects an empty list
+    // (validateProject) and server.mjs falls back to the same 10500 nm.
     if (values.empty()) values.push_back(10500.0f);
-    std::sort(values.begin(), values.end());
-    // DEFERRED[低] 错误处理: 连续波段循环上限 800 与此处 resize(800) 都会静默丢弃波段（排序后截掉的是最长波长，如热红外 10500 nm），用户不会收到任何提示；建议：超限时告警或报错。
-    if (values.size() > 800) values.resize(800);
     return values;
 }
 

@@ -12,8 +12,15 @@
 #include "src/voxelrt/voxelrt.h"
 #include "src/base/appsetting.h"
 #include "src/base/fileio.h"
+// CMake defines HISTREAM_ENABLE_FACET=0 when the Facet backends are not compiled
+// (option HISTREAM_ENABLE_FACET=OFF); other build setups keep them enabled.
+#ifndef HISTREAM_ENABLE_FACET
+#define HISTREAM_ENABLE_FACET 1
+#endif
+#if HISTREAM_ENABLE_FACET
 #include "../facetrt/facetrt.h"
 #include "../faceteb/faceteb.h"
+#endif
 
 #include <filesystem>
 #include <utility>
@@ -45,10 +52,12 @@ private:
     std::shared_ptr<VoxelebIO>  m_pVoxelebio;
     std::shared_ptr<Voxelrt>    m_pVoxelrt;
     std::shared_ptr<VoxelrtIO>  m_pVoxelrtio;
+#if HISTREAM_ENABLE_FACET
     std::shared_ptr<Facetrt>    m_pFacetrt;
     std::shared_ptr<FacetrtIO>  m_pFacetrtio;
     std::shared_ptr<Faceteb>    m_pFaceteb;
     std::shared_ptr<FacetebIO>  m_pFacetebio;
+#endif
 
 };
 

@@ -44,6 +44,9 @@ layout(local_size_x = GROUP_SIZEXY, local_size_y = GROUP_SIZEXY) in;
 
 float Radiance[MAXBAND];
 float RadianceSum[MAXBAND];
+// Fraction of the current sample covered by the scene (1 - transmittance
+// that escaped to an unmodelled sky or past the step budget).
+float sampleCoverage = 1.0;
 
 bool isOpticalBand(float wavelength)
 {
@@ -58,8 +61,18 @@ int atmosphereBand(float wavelength)
     return clamp(int(round(wavelengthNm - 400.0)), 0, NUM_VNIR - 1);
 }
 
+// The solar pass only computes visibility for y > 0.01 (and the direct/
+// scattering passes skip the beam below it). Below that cutoff the measured
+// horizontal beam share Rin*direct is moved into the isotropic diffuse share,
+// as in voxelrad_scattering_VNIR.comp, so the incident shortwave is conserved.
+bool solarBeamActive()
+{
+    return normalize(lightSet.direction).y > 0.01;
+}
+
 float directSpectralIrradiance(float wavelength)
 {
+    if(!solarBeamActive()) return 0.0;
     int band = atmosphereBand(wavelength);
     return max(ubom.meteo.Rin, 0.0) * max(atomConds[band].direct, 0.0) * 0.001;
 }
@@ -67,7 +80,9 @@ float directSpectralIrradiance(float wavelength)
 float diffuseSpectralIrradiance(float wavelength)
 {
     int band = atmosphereBand(wavelength);
-    return max(ubom.meteo.Rin, 0.0) * max(atomConds[band].diffuse, 0.0) * 0.001;
+    float share = max(atomConds[band].diffuse, 0.0)
+        + (solarBeamActive() ? 0.0 : max(atomConds[band].direct, 0.0));
+    return max(ubom.meteo.Rin, 0.0) * share * 0.001;
 }
 
 // Rin*direct is horizontal irradiance (as in the energy balance); scattering
@@ -78,12 +93,26 @@ float beamNormalScale()
 }
 
 // Optical output is the hemispherical-directional reflectance factor:
-// pi*L divided by the global horizontal irradiance.
+// pi*L divided by the global horizontal irradiance (beam + diffuse; the
+// beam share is already folded into diffuse below the solar cutoff).
 float referenceIrradiance(float wavelength)
 {
-    return normalize(lightSet.direction).y > 0.0
-        ? directSpectralIrradiance(wavelength) + diffuseSpectralIrradiance(wavelength)
-        : diffuseSpectralIrradiance(wavelength);
+    return directSpectralIrradiance(wavelength) + diffuseSpectralIrradiance(wavelength);
+}
+
+// diffuseTrad stores the *absorbed* incident longwave (incident * (1-r-t) of
+// the TIR band, voxelrad_diffuse_TIR_single.comp). The reflected-sky term
+// needs the incident field, so undo that factor before inverting to a
+// brightness temperature; low-emissivity metal roofs were otherwise far too
+// cold in reflection. Vegetation stores the two-face total; one face sees half.
+float incidentLongwaveEnvironmentTemperature(int bufferId, uint spectralId, bool vegetation)
+{
+    SpectralMaterial tir = spectralMaterials[spectralId * NBAND + NUM_VNIR];
+    float absorptance = clamp(1.0 - tir.reflectance - tir.transmittance, 0.0, 1.0);
+    float incident = absorptance > 1.0e-3
+        ? voxelNetRads[bufferId].diffuseTrad / absorptance
+        : max(ubom.meteo.Rli, 0.0);
+    return Inv_Stefen_Boltzmann(incident * (vegetation ? 0.5 : 1.0), 1);
 }
 
 bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
@@ -96,6 +125,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
     for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
         Radiance[kwave] = 0.0;
     }
+    sampleCoverage = 1.0;
     vec3 ffnormal;
     ivec3 voxelId;
     int bufferId,alignBufferId;
@@ -139,9 +169,11 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
         if(prd.hitT == INFINITY)
         {
             if(setting.skyboxEnabled == 0) {
-                // Preserve the existing COS/default sky response when the
-                // visual skybox is disabled.
-                return false;
+                // No modelled sky radiance: keep the canopy contribution
+                // gathered so far and report the escaped part as uncovered
+                // (see voxelrt/voxelrad_image.comp).
+                sampleCoverage = 1.0 - alpha_toSensor;
+                return true;
             }
             for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
                 float wavelength = wave[kwave];
@@ -193,9 +225,8 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 
 			canopy = canopies[canopyId];
             uint spectralBase = spectralId * setting.n_wave;
-            // Vegetation stores the two-face total; one face sees half of it.
-            float envTemp = Inv_Stefen_Boltzmann(voxelNetRads[bufferId].diffuseTrad
-                * (typeId == TYPE_VEGETATION ? 0.5 : 1.0), 1);
+            float envTemp = incidentLongwaveEnvironmentTemperature(
+                bufferId, spectralId, typeId == TYPE_VEGETATION);
 
             // LST = voxelNetRads[bufferId].diffuseVrad;
             // LST = voxelHeatFlux[bufferId].Gshaded;
@@ -258,10 +289,15 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 						float wavelength = wave[kwave];
 						if(isOpticalBand(wavelength))
 						{
+							// Image accumulates pi*L (as the leaf term). HG is per
+							// steradian, so the single-scattered beam is pi*p*E.
 							float directSource = directSpectralIrradiance(wavelength)
-								* beamNormalScale() * alpha_toSolar * scatteringPhase;
+								* beamNormalScale() * alpha_toSolar * PI * scatteringPhase;
+							// skyDiffuse scales the sky to this voxel's two-face total;
+							// isotropic scattering re-emits its mean (0.5x), as for
+							// leaves (was 1/(4*pi), i.e. 2*pi too small).
 							float diffuseSource = diffuseSpectralIrradiance(wavelength)
-								* voxelDirs[bufferId].skyDiffuse * 0.0795774715;
+								* voxelDirs[bufferId].skyDiffuse * 0.5;
 							Radiance[kwave] += alpha_toSensor * scatteringFraction
 								* (directSource + diffuseSource);
 						}
@@ -389,7 +425,8 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
             thermalId = meshLinks[meshId].thermalId;
             uint bioId = meshLinks[meshId].bioId;
             uint spectralBase = spectralId * setting.n_wave;
-            float envTemp = Inv_Stefen_Boltzmann(voxelNetRads[alignBufferId].diffuseTrad, 1);
+            float envTemp = incidentLongwaveEnvironmentTemperature(
+                alignBufferId, spectralId, false);
 
             // LST = voxelNetRads[alignBufferId].diffuseTrad + voxelNetRads[alignBufferId].directTrad + voxelNetRads[alignBufferId].directVrad + voxelNetRads[alignBufferId].diffuseVrad;
             // float sunlitTemperature1 = voxelTempes[alignBufferId].sunlit;
@@ -528,7 +565,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 		ffnormal = sstate.normal;
 		ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
     }
-    return alpha_toSensor < 0.001;
+    // Step budget exhausted: the remaining transmittance is unresolved.
+    sampleCoverage = 1.0 - alpha_toSensor;
+    return true;
 }
 
 bool SamplePixel(vec2 imageCoords,vec2 sizeImage,int smpl)
@@ -587,6 +626,7 @@ void main()
         RadianceSum[kwave] = 0.0;
     }
     int validSampleCount = 0;
+    float coveredWeight = 0.0;
 
     // int bufferId = int((imageCoords.y * imageRes.x + imageCoords.x ));
     // LST = imageCoords.x;
@@ -598,22 +638,26 @@ void main()
         if(SamplePixel(imageCoords, imageRes, smpl))
         {
             validSampleCount++;
+            coveredWeight += sampleCoverage;
             for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
                 RadianceSum[kwave] += Radiance[kwave];
             }
         }
     }
 
+    // Coverage-weighted mean of the covered pixel part; uncovered pixels stay
+    // 0 for the host sky fill.
+    bool covered = coveredWeight > 1.0e-3 * float(max(validSampleCount, 1));
     for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
-        float value = validSampleCount > 0
-            ? RadianceSum[kwave] / float(validSampleCount)
+        float value = covered
+            ? RadianceSum[kwave] / coveredWeight
             : 0.0;
         float wavelength = wave[kwave];
         if(isOpticalBand(wavelength)) {
             float reference = referenceIrradiance(wavelength);
-            value = reference > EPSION
-                ? clamp(value / reference, 0.0, 1.0)
-                : 0.0;
+            // HDRF > 1 is physical: remove only NaN/Inf and negative noise.
+            float hdrf = reference > EPSION ? value / reference : 0.0;
+            value = (isnan(hdrf) || isinf(hdrf)) ? 0.0 : max(hdrf, 0.0);
         }
         int bufferId = int(n_pixel * uint(kwave)
             + uint(imageCoords.y * imageRes.x + imageCoords.x));

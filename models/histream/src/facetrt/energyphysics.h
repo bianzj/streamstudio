@@ -8,12 +8,22 @@
 namespace facetphysics {
 
 inline constexpr double facetEnergyResidualThreshold = 2.0;
+// Cap on the largest temperature-equivalent residual |R| / (dR/dT) of any
+// facet side. The 0.1 % count alone let a converged node keep a few facets
+// tens of W/m2 (> 1 K) out of balance.
+inline constexpr double facetEnergyMaxEquivalentK = 0.5;
 inline bool facetEnergyViolation(double residual) {
     return !std::isfinite(residual) || std::abs(residual) >= facetEnergyResidualThreshold;
 }
 inline bool facetEnergyConverged(uint32_t failingFacets, uint32_t totalFacets) {
     // Strictly less than 0.1%; integer arithmetic avoids boundary rounding.
     return totalFacets > 0 && uint64_t(failingFacets) * 1000U < totalFacets;
+}
+inline bool facetEnergyConverged(uint32_t failingFacets, uint32_t totalFacets,
+                                 double maximumEquivalentK) {
+    return facetEnergyConverged(failingFacets, totalFacets) &&
+        std::isfinite(maximumEquivalentK) &&
+        maximumEquivalentK <= facetEnergyMaxEquivalentK;
 }
 
 // Cell-centred finite volumes, metres below the surface. The lower Dirichlet

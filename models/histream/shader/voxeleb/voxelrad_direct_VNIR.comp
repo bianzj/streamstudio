@@ -78,6 +78,8 @@ void main()
     // is applied later as the moving sunlit fraction. Gating the direct term
     // with alpha_toSolar makes both conditional temperatures shaded exactly
     // under a crown and erases the shadow.
+    // Below the y <= 0.01 cutoff the beam share is not lost: the scattering
+    // pass folds Rin*direct into its isotropic sky source (groupIllumination).
     if(solarDirection.y <= 0.01) return;
 
     // Rin*direct is horizontal irradiance. Convert it to the irradiance on the

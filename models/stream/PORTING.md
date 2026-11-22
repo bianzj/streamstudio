@@ -6,12 +6,12 @@
 
 | 本目录 | 参考来源 | 处理 |
 | --- | --- | --- |
-| `physics/optics.*` | `base/leafopt.py` fluspect、`base/soilopt.py` BSM、`scifuns.cpp` calctav | 数值逐项保留 |
+| `physics/optics.*` | `base/leafopt.py` fluspect、`base/soilopt.py` BSM、`scifuns.cpp` calctav | 数值逐项保留；BSM 湿土于 2026-11-20 改为 SCOPE soilwat（k = 0..6 水膜 Poisson 混合、双程 tw），与 `soilopt._soilwat` 相差 < 2×10⁻⁶ |
 | `physics/radiosity.*` | `base/node_radiosity.py` 的 `hom3` 调度、`base/canopy_closure.py` | 均匀冠层两层的 5 状态节点系统：交换因子、全阶短波/长波、有效发射率、方向多次散射 |
 | `physics/canopy.*` | `base/canopy_closure.py` fractions/reflectance、`base/hotspot.py`、`base/row_closure.py`、`base/vnir.py` | 均匀冠层标准闭合：双尺度热点、两层光照叶近似、球面叶片一次散射系数 |
 | `physics/shortwave.*` | `base/tirteb_radiation.py` `_plane_prepare_shortwave`、`base/radiation.py` 直散分配 | 默认 50 nm 分组（约 41 个波段）节点辐射度吸收，`spectralBinNm` 可设 1 做 1 nm 全谱；0.8/0.2 直散分配、晴空 DNI 限幅、PAR |
 | `physics/energy.*` | `base/pipeline.py`、`base/aerodynamic.py`、`base/eb.py`、`base/biochemical.py`、`base/evapo.py` | TIRTEB 组件能量平衡、气动/气孔阻抗、温度修正、1/L 松弛求解 |
-| `physics/heat_conduction.*` | `base/heat_conduction.py` | `surface` 7 h 温度历史卷积（TIRTEB 为 48 h）、`depth` 2 m 土柱（16 节点，向后欧拉） |
+| `physics/heat_conduction.*` | `base/heat_conduction.py` | `surface` 7 h 温度历史卷积（与 TIRTEB `HISTORY_SECONDS` 相同）、`depth` 2 m 土柱（16 节点，向后欧拉） |
 | `physics/brightness.h` | `base/brightness.py` / TiRT c1、c2 | Planck 辐亮度与反演亮温 |
 | `forcing/*` | 无（TiRT 读 CSV 气象） | 直接读 ERA5 / ERA5-Land NetCDF |
 | `scene/classes.*`、`classes/classes.json` | `base/io.py` `read_defined`、`defined.txt` | IGBP 参数表，带单位说明 |
@@ -21,31 +21,34 @@
 
 与 TIRTEB 现行默认值一致：
 
-- **短波**：`shortwave_diffuse_fraction=0.2`；`-1` 时按 Erbs 反算。启用 `shortwave_enforce_solar_limit`：晴空 DNI（Meinel，Kasten–Young 大气质量、年内日地修正）为直射上限，超出的直射功率转为漫射，总短波保持不变。
+- **短波**：`shortwave_diffuse_fraction=0.2`；`-1` 时按 Erbs 反算（晴空指数含日地距离因子 E0，与 TiRT `radiation.py` 一致，2026-11-21 FIX C7；太阳在地平线以下时散射比取 1）。启用 `shortwave_enforce_solar_limit`：晴空 DNI（Meinel，Kasten–Young 大气质量、年内日地修正）为直射上限，超出的直射功率转为漫射，总短波保持不变。受光面不被照亮（SPA 天顶角 ≥ 90° 或坡面背光）时全部短波按漫射分配，不再丢弃直射部分；节点短波与冠层直射几何使用同一 SPA 太阳位置（2026-11-21 FIX C10）。
+- **气孔温度修正**（2026-11-21 FIX B3）：所有 C3/C4 地类开启 Vcmax/Rd/Kc/Ko 温度修正（TiRT `tcor=1`、StreamEarth `Tcor=1`），`classes.json` 省略 `temperatureCorrection` 时缺省为 true。此前只有草地开启，且 PORTING 未将其列为有意差异。
+- **kB⁻¹**（2026-11-21 FIX B4 说明）：`heatRoughnessKb` 只作用于裸土整体阻抗（LAI=0 全部、LAI<0.5 按 1−smoothstep 权重），LAI≥0.5 时由冠层阻抗网络决定，与 TiRT `_bulk_resistance`（z0h=0.1·z0 只用于裸土/城市）相同。
 - **长波**：`hom3` 节点辐射度全阶，土壤—冠层互易；节点发射按光照/阴影温度四次方与面积份额混合。
 - **气动**：Raupach `d`、`z0`（`G1=max(3.3,(Cs+Cr·LAI/2)^-1/2)`），冠层上方/叶边界/冠层内到土壤分段阻抗，每段上限 400 s m⁻¹；有效风速 `sqrt(u²+wstar²)`，`wstar` 由场景显热；LAI<0.5 时按 smoothstep 混合到裸土；稳定层结全廓线统一 `xeff=min(1/L,1/zref)`。
 - **气孔**：Farquhar/Ball-Berry，净光合 ≤0 时不再取 625000 s m⁻¹，而是 `stomatal_g0=0.01 mol m⁻² s⁻¹` 下限；阻抗换算用 `rho_air/M_air`。
 - **温度修正**：默认 `temperature_method=robust`（0.8 阻尼、单步上限 5 K，最多 50 次迭代），可设 `direct`（含潜热导数的近似导数）；温度保护范围 240–380 K。
 - **稳定度**：`1/L` 按 0.5 松弛更新，限制在 ±5 m⁻¹，目标仅使用 H（`-κgH/(ρcpTa u*³)`）。迭代中要求组分最大能量残差 ≤0.5 W m⁻²、阵风显热残差 ≤1 W m⁻²、稳定度残差 ≤`1e-4+0.02|target|` m⁻¹。返回前重新计算，最终验收分别使用 5 W m⁻²、2 W m⁻²及两倍上述稳定度容差；最终 QA 与迭代提前退出条件不同。
 - **土壤热**：默认 `surface`（7 h 温度历史卷积，保存真实时间间隔）；`depth` 为 2 m 土柱，表层通量含半格储热；`direct` 为 `G = f·Rn`。
-- **初值**：土壤与叶片取首日平均气温；热历史与土柱从该温度自洽推进。
+- **初值与起转**（2026-11-21 FIX B9/B10 更正）：能量平衡从过境前 `temperature.spinupHours`（缺省 24 h，取整点）开始逐时推进；ERA5 数据包不覆盖该起点时退回数据包连续覆盖的最早时次并给出警告，`scene_summary.json` 的 `temperature.spinupHoursUsed`/`marchStart` 记录实际起转。土壤（光照/阴影）初值取起转起点的 ERA5 `skt`（无有效值时退回首个模拟日平均气温），`depth` 土柱按 `stl1`/`stl2` 初始化；叶片初值取首个模拟日（起点起 24 h）平均气温。此前文档写“土壤与叶片取首日平均气温”与代码（`image.cpp` initialState）不符；此前起点固定为过境当天 00 UTC，东亚上午过境只积分约 2.5 h。
 - **水体（17）**：不求能量平衡，四组分取过境时刻插值的 ERA5 `skt`。
 
 ## 方向成像（`app/image.cpp`）
 
 - **光学**：`canopyReflectance` = 一次散射（球面叶片系数、热点四组分）+ 节点辐射度多次散射（直射与天空）。不再使用 StreamEarth 的二流核。
-- **热红外**：`fractions × 发射率 + homThermalScatter` 得到四组分有效发射率，按 Planck 在波段中心波长合成辐亮度，再反演亮温；方向温度 = 辐亮度/有效发射率反演。半高宽只记录，不参与积分（与 TiRT 观测一致）。
-- **波段发射率**：叶片 `1−reflTir−transTir`；土壤/不透水面/冰雪用 `classes.json` 的 `ground.emissivity`；EB 宽带发射率另取 `leafEmissivity=0.985`、`soilEmissivity=0.955`。土壤发射率随像元含水量在干端值与该值的饱和端之间插值（`physics/soil_emissivity.h`，与 BSM 共用 `SMC ≥ 0.05`、`SMCp = 0.25` 的几何，缺省增益 +0.03、上限 0.995，`energy.soilEmissivityWet` 可覆盖饱和值）；不透水面与冰雪不随含水量变化。
+- **热红外**：`fractions × 发射率 + homThermalScatter` 得到四组分有效发射率，按 Planck 在波段中心波长合成发射辐亮度，加反射天空项 (1 − Σw)·B(T_sky)（T_sky 由下行长波换算，见 README“热红外观测算子”）后反演亮温；方向温度 = 发射辐亮度/有效发射率反演，不含反射天空。太阳在局地地平线以下时，光照组分的权重并入阴影组分。半高宽只记录，不参与积分（与 TiRT 观测一致）。
+- **波段发射率**：叶片 `1−reflTir−transTir`；土壤/不透水面/冰雪/水体用 `classes.json` 的 `ground.emissivity`；EB 宽带叶片发射率另取 `leafEmissivity=0.985`，土壤干端发射率与成像共用地类值（配置 `energy.soilEmissivity` 时两者同时替换）。土壤发射率随像元含水量在干端值与该值的饱和端之间插值（`physics/soil_emissivity.h`，与 BSM 共用 `SMC ≥ 0.05`、`SMCp = 0.25` 的几何，缺省增益 +0.03、上限 0.995，`energy.soilEmissivityWet` 可覆盖饱和值）；不透水面与冰雪不随含水量变化。
 
 ## 与 TIRTEB 的有意差异
 
 1. **短波光谱分组**：EB 默认按 50 nm 分组（约 41 个波段），与 TIRTEB 当前默认一致；`energy.spectralBinNm` 可设为 1 做 1 nm 全谱（叶片/土壤反射率取组内均值，太阳谱按组积分）。成像按波段中心单色计算。
 2. **土壤热历史窗**：STREAM 与 TIRTEB 均只保留最近 7 h（`physics/heat_conduction.cpp` 的 `kHistorySeconds`）；更早的清晨温度不再进入表面热通量卷积。
 3. **城市**：保留不透水地面 + 绿地冠层的四组分简化，不移植 TIRTEB 的屋顶/墙面/街道多组分与城市辐射度。城市结果不能与 TIRTEB 城市分支逐像元比较。
-4. **几何**：只支持均匀冠层与裸地；垄行、离散树冠、单坡、复合地形、DEM 光线追踪未移植。
-5. **联合后备求解**：标量温度/稳定度不收敛时本版只标记 `converged=false` 并保留结果，尚未移植 TIRTEB 的信赖域 T/H/1/L 联合后备。
-6. **土壤阻抗默认值**：`input_tirteb.csv` 的 `soil_rss=200` 常数模式；STREAM 同为常数 200，可在配置中改为 `sellers` 含水量关系。土壤水分仍驱动 BSM 光谱；用户输入的土壤水大于 1 时按百分数除以 100，BSM 内限制在 0.05–0.55。
-7. **叶片发射率**：EB 宽带取 0.985；成像按 `1−reflTir−transTir`（现表为 0.975）。TIRTEB 同样区分宽带与观测波段发射率。
+4. **几何**：冠层只支持均匀冠层与裸地；垄行、离散树冠（`physics/effective_lai.cpp` 已编译但未调用，地类表中给出 `treeStand`/`canopyHeight`/`crownShape`/`rows` 等参数时运行日志警告并在 `scene_summary.json` 的 `canopyStructure` 中记录“按均质冠层处理”）与 DEM 光线追踪未移植。地形（2026-11-21 FIX B-S4 更正，此前写“单坡、复合地形未移植”与代码不符）：已实现单一坡（single）、DEM 面元（facet）、山包复合坡（hill）与山脊复合坡（ridge）——短波按坡面入射与天空视角（hill 为锥面方位解析积分，`forcing/pixel_forcing.cpp`），热红外在坡面局地坐标中计算（天顶角与相对方位角，2026-11-21 FIX S-2），hill/ridge 按 12 方位面元或两翼加端面合成（`app/thermal_view.cpp`）；LST/LSCT 反演与同化使用同一地形观测算子（2026-11-21 FIX S-1）。不计他山遮挡与周围地面反射。
+5. **冠层上方阻抗 rar**：稳定度修正项 phstar 放在 1/(κu*) 括号内（2026-11-20 修正；TIRTEB `aerodynamic.py` 与 SCOPE resistances.m 把它直接减在 s m⁻¹ 量纲的阻抗上）。中性层结无差别；北京 Landsat 300 m 示例白天不稳定像元组分温度平均降低约 0.02–0.27 K，个别像元达 5–6 K。
+6. **联合后备求解**：标量温度/稳定度不收敛时本版只标记 `converged=false` 并保留结果，尚未移植 TIRTEB 的信赖域 T/H/1/L 联合后备。
+7. **土壤阻抗默认值**：`input_tirteb.csv` 的 `soil_rss=200` 常数模式；STREAM 同为常数 200，可在配置中改为 `sellers` 含水量关系。土壤水分仍驱动 BSM 光谱；用户输入的土壤水大于 1 时按百分数除以 100，BSM 内限制在 0.05–0.55。
+8. **叶片发射率**：EB 宽带取 0.985；成像按 `1−reflTir−transTir`（现表为 0.975）。TIRTEB 同样区分宽带与观测波段发射率。
 
 ## ERA5（`forcing/*`）
 
@@ -61,9 +64,10 @@
 - 土壤：`emissivity=0.955`（干端值，实际发射率按像元含水量升到饱和端）、`conductivity=1.55`、热惯量 1418.4（`volumetricCapacity` 由 `I²/λ` 换算为 1.298e6）、`surfaceResistance=200` 常数模式。
 - 城市（13）：不透水地面（反射率 0.15、发射率 0.95、表面阻抗 3662.86 s m⁻¹、热惯量 2000、导热率 1.5）+ 输入 LAI 的城市绿地（C3，Vcmax 60）。
 - 冰雪（15）：地面反射率 0.75、发射率 0.985、表面阻抗 100 s m⁻¹、导热率 0.5、热惯量 600；不进行光合作用。
-- 裸地（16）、未分类（0）：光合途径为 0，按无气孔处理。
+- 裸地（16）、未分类（0）：光合途径为 `none`（代码中为 0），按无气孔处理（叶片阻抗 625000 s m⁻¹）；裸地叶片结构参数 N = 1.5（PROSPECT 要求 N ≥ 1，加载时校验）。
+- 水体（17）：`ground.surface = water`，按平面地面处理，发射率 0.99 不随土壤水分变化，不建 Hapke 角度表。
 - 填充值 18 与 255 一律视为填充。
 
 ## 未移植
 
-植被生长（CTSM）、水碳收支、EnKF 同化、降水、参数化山体与单一坡面、垄行与树冠结构参数、六组分城市、`legacy` 能量平衡方案、TIRTEB 的联合信赖域后备。
+植被生长（CTSM）、水碳收支、EnKF 同化、降水、垄行与树冠结构参数（`effective_lai.cpp` 未接入，见上文“几何”）、六组分城市、`legacy` 能量平衡方案、TIRTEB 的联合信赖域后备。（2026-11-21 FIX B-S4：删去此处“参数化山体与单一坡面”，二者已实现。）

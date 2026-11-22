@@ -123,7 +123,19 @@ bool TraversalDirection(vec3 lightDirection)
         voxelId0.z - semiRange.z);
 
     float visibility;
-    if(typeId0 == TYPE_BUILDING && faceId == 0)
+    vec3 storedNormal = vec3(voxelLinks[bufferId0].normalX, voxelLinks[bufferId0].normalY,
+                             voxelLinks[bufferId0].normalZ);
+    if(typeId0 == TYPE_BUILDING && faceId == 0 && length(storedNormal) > 0.5)
+    {
+        // As VoxelEB: start on the cube face that the stored facet normal
+        // points through, so walls and slopes see the sun from outside.
+        vec3 n = normalize(storedNormal);
+        vec3 origin = voxelMinimum + vec3(0.5)
+            + n * (0.5 / max(max(abs(n.x), abs(n.y)), abs(n.z)));
+        visibility = SolarVisibilityFromOrigin(
+            origin, normalize(lightDirection), nanoVDBLink, semiRange);
+    }
+    else if(typeId0 == TYPE_BUILDING && faceId == 0)
     {
         vec3 direction = normalize(lightDirection);
         vec3 topOrigin = voxelMinimum + vec3(0.5, 1.0, 0.5);

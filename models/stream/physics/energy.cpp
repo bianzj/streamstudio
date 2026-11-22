@@ -100,6 +100,8 @@ double canopyWeight(double lai)
 
 double bulkResistance(double height, double roughness, double wind, const Similarity& similarity, double heatRoughnessKb)
 {
+    // FIX(2026-11-21 B4): kB^-1 acts only here, i.e. on the bare-soil bulk path (LAI = 0, and the 1 - smoothstep share
+    // for LAI < 0.5), as z0h = 0.1 z0 in TiRT _bulk_resistance; the canopy network has no kB^-1 term (see energy.h).
     height = std::max(height, 1.01);
     roughness = std::clamp(roughness, 1e-4, height / 2.0);
     wind = std::max(wind, 0.05);
@@ -182,8 +184,11 @@ Resistances aerodynamicResistances(const EnergySurface& surface, const Forcing& 
     const double rai = z > zr ? 1.0 / (kVonKarman * ustar) *
         (std::log(std::max((z - displacement) / std::max(zr - displacement, 1e-6), 1.01)) -
          similarity.psih(z - displacement) + similarity.psih(zr - displacement)) : 0.0;
-    const double rar = 1.0 / (kVonKarman * ustar) * ((zr - hc) / std::max(zr - displacement, 1e-6)) -
-                       similarity.phstar(zr, zr, displacement) + similarity.phstar(hc, zr, displacement);
+    // 2026-11-20: the stability terms belong inside 1/(κu*) (they were subtracted from the resistance in s m-1, a
+    // unit error inherited from SCOPE resistances.m / TIRTEB). phstar = 0 when neutral, so neutral runs are unchanged.
+    // FIX(2026-11-21 B9): duplicated copy of the two comment lines above removed.
+    const double rar = 1.0 / (kVonKarman * ustar) * ((zr - hc) / std::max(zr - displacement, 1e-6) -
+                       similarity.phstar(zr, zr, displacement) + similarity.phstar(hc, zr, displacement));
     const double profile = n > 1e-12 ? hc * std::sinh(n) / (n * kh) : hc / kh;
     const double rac = n > 1e-12 ? profile * (logRatio(n) - logRatio(n * (roughness + displacement) / hc)) : 0.0;
     const double windLeaf = std::max(canopyWind * std::exp(n * ((roughness + displacement) / hc - 1.0)), 0.01);
@@ -548,7 +553,7 @@ EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& f
     // One joint iteration, at most maxIterations (default 50) in total: each pass evaluates the fluxes, takes a
     // damped Newton step on the four component temperatures, updates the convective-gust heat flux and relaxes
     // 1/L towards its Monin-Obukhov target. Converged when energy, gust and stability residuals are all small.
-    // DEFERRED[低] 可维护性: surface.maxStabilityIterations（配置 maxStabilityIterations，README 称"外层迭代上限 60"）在本求解器中从未使用，温度与 1/L 共用 maxIterations；用户调这个参数没有任何效果；建议：删除该配置项，或恢复内外两层迭代
+    // maxStabilityIterations is accepted for compatibility only: temperature and 1/L share maxIterations (README).
     for (int iteration = 0; iteration < std::max(1, surface.maxIterations); ++iteration) {
         fluxes(surface, forcing, shortwave, szaDeg, sunlit, inverse, density, dtSeconds, state.sceneSensible,
                state, solution);

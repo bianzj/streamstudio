@@ -198,20 +198,20 @@ float Compo::calctav(float alfa,float nr)
     return tav;
 }
 
-void Compo::fluspect(OptCoeff fluspectCoeff, FluspectParam fluspectParam, std::vector<Spectral>& spectrals)
+void Compo::fluspect(const OptCoeff& fluspectCoeff, FluspectParam fluspectParam, std::vector<Spectral>& spectrals)
 {
     float Cab         = fluspectParam.Cab;
     float Cw          = fluspectParam.Cw;
     float Cdm         = fluspectParam.Cdm;
     float Cs          = fluspectParam.Cs;
     float N           = fluspectParam.N;
-    std::vector<float> &nr_         = fluspectCoeff.nr_;
-    std::vector<float> &kdm_        = fluspectCoeff.kdm_;
-    std::vector<float> &kab_         = fluspectCoeff.kab_;
-    std::vector<float> &kw_         = fluspectCoeff.kw_;
-    std::vector<float> &ks_         = fluspectCoeff.ks_;
-    std::vector<float> &phiI_       = fluspectCoeff.phiI_;
-    std::vector<float> &phiII_      = fluspectCoeff.phiII_;
+    const std::vector<float> &nr_         = fluspectCoeff.nr_;
+    const std::vector<float> &kdm_        = fluspectCoeff.kdm_;
+    const std::vector<float> &kab_         = fluspectCoeff.kab_;
+    const std::vector<float> &kw_         = fluspectCoeff.kw_;
+    const std::vector<float> &ks_         = fluspectCoeff.ks_;
+    const std::vector<float> &phiI_       = fluspectCoeff.phiI_;
+    const std::vector<float> &phiII_      = fluspectCoeff.phiII_;
 
     float nr, Kdm, Kab, Kw, Ks, phiII, phiI, Kall, t1, t2, tau, kChlrel,
             t12, r12, t21, r21, denom, Ra, r, D, rq, tq, a, b, bNm1, bN2_g, a2, Rsub, Tsub,
@@ -472,13 +472,13 @@ bool Compo::createCompProperty(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
 
 
 
-void Compo::bsm(OptCoeff bsmCoeff,BSMParam bsm,std::vector<Spectral>& spectrals){
+void Compo::bsm(const OptCoeff& bsmCoeff,BSMParam bsm,std::vector<Spectral>& spectrals){
 
-    std::vector<float> &gsv1_ = bsmCoeff.gsv1_;
-    std::vector<float> &gsv2_ = bsmCoeff.gsv2_;
-    std::vector<float> &gsv3_ = bsmCoeff.gsv3_;
-    std::vector<float> &kw_ = bsmCoeff.kw_;
-    std::vector<float> &nw_ = bsmCoeff.nw_;
+    const std::vector<float> &gsv1_ = bsmCoeff.gsv1_;
+    const std::vector<float> &gsv2_ = bsmCoeff.gsv2_;
+    const std::vector<float> &gsv3_ = bsmCoeff.gsv3_;
+    const std::vector<float> &kw_ = bsmCoeff.kw_;
+    const std::vector<float> &nw_ = bsmCoeff.nw_;
 
     float B = bsm.BSMBrightness;
     float lat = bsm.BSMlat;

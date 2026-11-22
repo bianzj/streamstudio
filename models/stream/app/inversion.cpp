@@ -90,6 +90,9 @@ struct Sample {
     float value = kNaN, sigma = 0, wavelength = 0;
     float weights[kComponents]{};
     float fixedEmissivity = 1;  // sum of the weights with the fixed class soil emissivity (LST-product convention)
+    // Brightness observations: isotropic sky radiance B(T_sky, λ) and the reflected sky term (1 − Σw)·B(T_sky, λ)
+    // of the shared forward operator (thermal_view.cpp). LST observations are emitted-only (0).
+    float sky = 0, reflected = 0;
     bool lst = false;
     bool valid() const { return std::isfinite(value); }
 };
@@ -103,7 +106,7 @@ bool model(const Sample& sample, const double t[kComponents], double& value, dou
         if (sample.weights[k] > 0.0f && std::isfinite(t[k])) radiance += sample.weights[k] * planck(t[k], wavelength);
     const double divisor = sample.lst ? std::max(static_cast<double>(sample.fixedEmissivity), 1e-6) : 1.0;
     if (!(radiance > 0.0)) return false;
-    value = inversePlanck(radiance / divisor, wavelength);
+    value = inversePlanck((radiance + sample.reflected) / divisor, wavelength);
     if (!std::isfinite(value)) return false;
     const double slope = divisor * planckDerivative(value, wavelength);
     for (int k = 0; k < kComponents; ++k)
@@ -129,8 +132,11 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         (lsct ? "，背景场 σ = " + format(inv.priorSd, 1) + " K、相关系数 " + format(inv.priorCorrelation, 2) +
                 (inv.window > 1 ? "，" + std::to_string(inv.window) + "×" + std::to_string(inv.window) + " 同地类窗口" : "，逐像元")
               : "，发射率误差 " + format(inv.emissivitySd, 3)));
+    // FIX(2026-11-21 S-1): the observation weights now come from the imaging operator (thermalSceneAt +
+    // thermalSceneWeights), terrain included; the former warning "weights on a horizontal surface" no longer applies.
     if (config.terrainRadiation != TerrainRadiation::None)
-        log("警告：反演的观测权重按水平地表几何计算，未计入地形坡面（正向成像仍按所选地形方式）");
+        log(std::string("反演的观测权重按与正向成像相同的地形观测算子计算（") +
+            (in.terrain ? "单坡/面元按局地几何，山包/山脊按面元合成" : "警告：未提供地形场，按水平地表") + "）");
 
     // ---------- observations ----------
     std::vector<std::vector<float>> values(observations), obsVza(observations), obsVaa(observations);
@@ -163,14 +169,23 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
             const Sun sun = solarPosition(in.overpass, lat, lon, in.dem[pixel]);
             if (!sun.ok) { flags[local] |= kQaInputInvalid; continue; }
             const int code = static_cast<int>(std::lround(in.type[pixel]));
-            const double leafEmissivity = std::clamp(1.0 - entry->leaf.reflTir - entry->leaf.transTir, 0.01, 1.0);
-            const double soilFixed = std::clamp(static_cast<double>(entry->ground.emissivity), 0.01, 1.0);
+            // FIX(2026-11-21 S-1): leaf / soil emissivity, Hapke table and hom3 nodes are now set up by setThermalMaterial
+            // and thermalSceneWeights (the imaging operator) per observation; the local copies were removed.
             const double moisture = std::isfinite(in.soilMoisture[pixel]) ? static_cast<double>(in.soilMoisture[pixel])
                                                                            : static_cast<double>(in.classes.defaultSoilMoisture);
-            const bool soil = entry->groundKind == GroundKind::Soil;
-            const double soilMoist = soil ? soilEmissivityAtMoisture(soilFixed, config.soilEmissivityWet, moisture) : soilFixed;
-            const auto table = soil && config.hapkeSoilEmissivity ? in.soilEmissivity.find(code) : in.soilEmissivity.end();
-            const HomCanopy nodes(leafArea);
+            // Sky temperature of the reflected term, identical to the forward imaging of this run. In RT "auto" mode
+            // without component temperatures (plain LST retrieval) the observed brightness stands in for the air
+            // temperature of the Swinbank clear-sky L↓.
+            double skyTemperature = in.skyLongwave ? skyTemperatureFromLongwave(in.skyLongwave->at(pixel)) : NAN;
+            if (!std::isfinite(skyTemperature) && in.skyFromObservations) {
+                double sum = 0.0;
+                int count = 0;
+                for (size_t j = 0; j < observations; ++j) {
+                    const float v = values[j][pixel];
+                    if (std::isfinite(v) && v >= kMinTemperature && v <= kMaxTemperature) { sum += v; ++count; }
+                }
+                if (count) skyTemperature = skyTemperatureFromLongwave(swinbankLongwave(sum / count));
+            }
             int valid = 0;
             for (size_t j = 0; j < observations; ++j) {
                 Sample& sample = samples[local * observations + j];
@@ -181,18 +196,32 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 if (!std::isfinite(value)) continue;
                 if (value < kMinTemperature || value > kMaxTemperature) { ++outOfRangeValues; continue; }
                 if (!std::isfinite(zenith) || zenith < 0 || zenith >= 90 || !std::isfinite(azimuth)) continue;
-                const double view = std::min<double>(zenith, 89.9);
-                const double relative = std::fmod(azimuth - sun.azimuth, 360.0);
-                const double soilE = table != in.soilEmissivity.end() ? std::clamp(table->second.at(view, moisture), 0.01, 1.0) : soilMoist;
-                const auto weights = thermalWeights(nodes, leafArea, entry->canopy.hotspot, sun.zenith, view, relative, leafEmissivity, soilE);
-                const auto fixed = config.referenceSurfaceTemperature
-                    ? thermalWeights(nodes, leafArea, entry->canopy.hotspot, sun.zenith, view, relative, leafEmissivity, soilFixed) : weights;
-                double fixedSum = 0.0;
-                for (int k = 0; k < kComponents; ++k) { sample.weights[k] = static_cast<float>(weights[k]); fixedSum += fixed[k]; }
+                // FIX(2026-11-21 S-1): weights of the imaging operator (thermal_view.cpp) for this view, terrain included
+                // (single slope / facet: local zenith and azimuth; hill / ridge: facet composite). They used to be the
+                // horizontal thermalWeights, so retrieval and imaging disagreed in terrain mode.
+                ThermalScene scene;
+                const TerrainFields flat;
+                if (!thermalSceneAt(in.terrain ? *in.terrain : flat, pixel, sun.zenith, sun.azimuth, zenith, azimuth, scene)) continue;
+                setThermalMaterial(scene, config, *entry, in.soilEmissivity, code);
+                std::array<double, kComponents> weights{}, fixed{};
+                double reflectivity = 0.0;
+                if (!thermalSceneWeights(scene, leafArea, moisture, weights, fixed, reflectivity)) continue;
+                double fixedSum = 0.0, weightSum = 0.0;
+                for (int k = 0; k < kComponents; ++k) {
+                    sample.weights[k] = static_cast<float>(weights[k]);
+                    fixedSum += fixed[k];
+                    weightSum += weights[k];
+                }
                 sample.fixedEmissivity = static_cast<float>(std::clamp(fixedSum, 1e-6, 1.0));
                 sample.wavelength = static_cast<float>(item.wavelength);
                 sample.sigma = static_cast<float>(item.sigma);
                 sample.lst = item.kind == ObservationKind::Lst;
+                if (!sample.lst && std::isfinite(skyTemperature)) {
+                    sample.sky = static_cast<float>(planck(skyTemperature, item.wavelength));
+                    // FIX(2026-11-21 S-1): mean directional reflectivity of the composite (= 1 - sum w when flat).
+                    sample.reflected = static_cast<float>(std::clamp(reflectivity, 0.0, 1.0) * sample.sky);
+                }
+                (void)weightSum;
                 sample.value = value;
                 ++valid;
             }
@@ -207,6 +236,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
     progress(in.progressStart + 0.1 * span, lsct ? "组分温度反演" : "地表温度反演");
     std::atomic<int> rowsDone{0};
     long long retrieved = 0, failed = 0, notConverged = 0, lowSupport = 0, outOfRange = 0, illConditioned = 0;
+    long long stopConverged = 0, stopStalled = 0, stopNotUpdated = 0;  // FIX(2026-11-21 S-5 QA): LSCT stop reasons
     double dfsSum = 0.0, residualSum = 0.0;
 
     if (!lsct) {
@@ -238,9 +268,9 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                         double value, gradient[kComponents];
                         if (!model(sample, temperatures, value, gradient)) { ok = false; break; }
                         const double slope = gradient[0] + gradient[1] + gradient[2] + gradient[3];
-                        // Emissivity error: d(model)/d(epsilon) = B(T) / (divisor * B'(model)).
+                        // Emissivity error: d(model)/d(epsilon) = (B(T) − B_sky) / (divisor * B'(model)); B_sky = 0 for LST.
                         const double divisor = sample.lst ? sample.fixedEmissivity : 1.0;
-                        const double emissivityTerm = inv.emissivitySd * planck(t, sample.wavelength) /
+                        const double emissivityTerm = inv.emissivitySd * (planck(t, sample.wavelength) - sample.sky) /
                                                       (divisor * planckDerivative(value, sample.wavelength));
                         const double variance = static_cast<double>(sample.sigma) * sample.sigma + emissivityTerm * emissivityTerm;
                         numerator += slope * (sample.value - value) / variance;
@@ -254,7 +284,9 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 if (!ok) { qa[pixel] = static_cast<float>(flag | kQaRetrievalFailed); ++failed; continue; }
                 if (!converged) { flag |= kQaNotConverged; ++notConverged; }
                 // Residual over all observations; effective emissivity of the first valid view.
-                double squares = 0.0, weightSum = -1.0;
+                // FIX(2026-11-21 S-3): the information (sum slope^2 / variance) is re-evaluated at the returned t, so
+                // the reported sigma belongs to the solution (it used to come from the iterate before the last update).
+                double squares = 0.0, weightSum = -1.0, finalInformation = 0.0;
                 int n = 0;
                 const double temperatures[kComponents] = {t, t, t, t};
                 for (size_t j = 0; j < observations; ++j) {
@@ -262,8 +294,18 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                     if (!sample.valid()) continue;
                     if (weightSum < 0.0) { weightSum = 0.0; for (int k = 0; k < kComponents; ++k) weightSum += sample.weights[k]; }
                     double value, gradient[kComponents];
-                    if (model(sample, temperatures, value, gradient)) { squares += (sample.value - value) * (sample.value - value); ++n; }
+                    if (model(sample, temperatures, value, gradient)) {
+                        squares += (sample.value - value) * (sample.value - value);
+                        ++n;
+                        const double slope = gradient[0] + gradient[1] + gradient[2] + gradient[3];
+                        const double divisor = sample.lst ? sample.fixedEmissivity : 1.0;
+                        const double emissivityTerm = inv.emissivitySd * (planck(t, sample.wavelength) - sample.sky) /
+                                                      (divisor * planckDerivative(value, sample.wavelength));
+                        finalInformation += slope * slope /
+                                            (static_cast<double>(sample.sigma) * sample.sigma + emissivityTerm * emissivityTerm);
+                    }
                 }
+                if (finalInformation > 0.0) information = finalInformation;
                 if (t < kValidLow || t > kValidHigh) { qa[pixel] = static_cast<float>(flag | kQaOutOfRange); ++outOfRange; continue; }
                 lst[pixel] = static_cast<float>(t);
                 sd[pixel] = static_cast<float>(1.0 / std::sqrt(information));
@@ -299,11 +341,13 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         }
         std::vector<float> qa(grid.size(), kNaN), residual(grid.size(), kNaN), dfs(grid.size(), kNaN), used(grid.size(), kNaN),
             iterations(grid.size(), kNaN);
+        // FIX(2026-11-21 S-5 QA): MAP cost at the background and at the analysis (lsct_qa.tif bands 6-7, appended).
+        std::array<std::vector<float>, 2> costs{std::vector<float>(grid.size(), kNaN), std::vector<float>(grid.size(), kNaN)};
         std::array<std::vector<float>, 4> shares, radianceShares;
         for (auto& band : shares) band.assign(grid.size(), kNaN);
         for (auto& band : radianceShares) band.assign(grid.size(), kNaN);
         const int half = inv.window / 2;
-        #pragma omp parallel for schedule(dynamic, 2) reduction(+:retrieved, failed, notConverged, lowSupport, outOfRange, illConditioned, dfsSum, residualSum)
+        #pragma omp parallel for schedule(dynamic, 2) reduction(+:retrieved, failed, notConverged, lowSupport, outOfRange, illConditioned, dfsSum, residualSum, stopConverged, stopStalled, stopNotUpdated)
         for (int row = in.startRow; row < in.endRow; ++row) {
             std::vector<const Sample*> set;
             for (int column = in.startColumn; column < in.endColumn; ++column) {
@@ -371,16 +415,58 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 double gradient[kComponents], squares = 0.0;
                 bool ok = true, converged = false;
                 int iteration = 0;
-                for (; iteration < inv.maxIterations; ++iteration) {
-                    if (!normal(hessian, gradient, squares) || !invert(hessian, m)) { ok = false; break; }
-                    double largest = 0.0;
-                    for (int a = 0; a < m; ++a) {
-                        double step = 0.0;
-                        for (int b = 0; b < m; ++b) step += hessian[a][b] * gradient[b];
-                        x[index[a]] = std::clamp(x[index[a]] + step, kMinTemperature, kMaxTemperature);
-                        largest = std::max(largest, std::abs(step));
+                // FIX(2026-11-21 S-5): MAP cost J(x) = sum ((y - h)/sigma)^2 + (x - xb)^T B^-1 (x - xb) for the backtracking
+                // line search; GN steps are accepted only when they lower J (fractions 1, 1/2, 1/4, as the StreamEarth
+                // native-MAP tool), instead of being applied blindly with bound clipping only.
+                const auto cost = [&](const double* state, double& value) {
+                    value = 0.0;
+                    for (int a = 0; a < m; ++a)
+                        for (int b = 0; b < m; ++b)
+                            value += (state[index[a]] - xb[index[a]]) * backgroundInverse[a][b] * (state[index[b]] - xb[index[b]]);
+                    for (const Sample* sample : set) {
+                        double modelValue, full[kComponents];
+                        if (!model(*sample, state, modelValue, full)) return false;
+                        const double difference = (sample->value - modelValue) / sample->sigma;
+                        value += difference * difference;
                     }
-                    if (largest < inv.tolerance) { converged = true; ++iteration; break; }
+                    return std::isfinite(value);
+                };
+                double currentCost = 0.0, backgroundCost = NAN;
+                bool stalled = false, stepFailed = false;  // FIX(2026-11-21 S-5 QA): stop reasons
+                int acceptedSteps = 0;
+                if (!cost(x, currentCost)) ok = false;
+                backgroundCost = currentCost;
+                for (; ok && iteration < inv.maxIterations; ++iteration) {
+                    if (!normal(hessian, gradient, squares) || !invert(hessian, m)) { ok = false; break; }
+                    double largest = 0.0, step[kComponents]{};
+                    for (int a = 0; a < m; ++a) {
+                        for (int b = 0; b < m; ++b) step[a] += hessian[a][b] * gradient[b];
+                        largest = std::max(largest, std::abs(step[a]));
+                    }
+                    if (largest < inv.tolerance) {
+                        for (int a = 0; a < m; ++a) x[index[a]] = std::clamp(x[index[a]] + step[a], kMinTemperature, kMaxTemperature);
+                        cost(x, currentCost);
+                        converged = true; ++iteration; break;
+                    }
+                    bool accepted = false, evaluated = false;
+                    for (const double fraction : {1.0, 0.5, 0.25}) {
+                        double candidate[kComponents];
+                        for (int k = 0; k < kComponents; ++k) candidate[k] = x[k];
+                        for (int a = 0; a < m; ++a)
+                            candidate[index[a]] = std::clamp(x[index[a]] + fraction * step[a], kMinTemperature, kMaxTemperature);
+                        double candidateCost;
+                        if (!cost(candidate, candidateCost)) continue;
+                        evaluated = true;
+                        if (candidateCost < currentCost - 1e-12 * (1.0 + currentCost)) {
+                            for (int k = 0; k < kComponents; ++k) x[k] = candidate[k];
+                            currentCost = candidateCost;
+                            accepted = true;
+                            break;
+                        }
+                    }
+                    // FIX(2026-11-21 S-5 QA): no descent along the GN direction -> stalled (evaluated) or step failure.
+                    if (!accepted) { (evaluated ? stalled : stepFailed) = true; ++iteration; break; }
+                    ++acceptedSteps;
                 }
                 // Posterior covariance at the solution.
                 if (!ok || !normal(hessian, gradient, squares) || !invert(hessian, m)) {
@@ -388,7 +474,15 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                     ++failed; ++illConditioned;
                     continue;
                 }
-                if (!converged) { flag |= kQaNotConverged; ++notConverged; }
+                // FIX(2026-11-21 S-5 QA): bit 10 (stalled after lowering the cost) and bit 11 (not updated) are not
+                // failures; bit 9 only for the iteration limit or an operator failure on every trial step.
+                if (converged) ++stopConverged;
+                else if (stalled && acceptedSteps > 0) { flag |= kQaLineSearchStalled; ++stopStalled; }
+                else if (stalled) { flag |= kQaNotUpdated; ++stopNotUpdated; }
+                else { flag |= kQaNotConverged; ++notConverged; }
+                costs[0][pixel] = static_cast<float>(backgroundCost);
+                costs[1][pixel] = static_cast<float>(currentCost);
+                (void)stepFailed;
                 // Degrees of freedom for signal: m - tr(A B^-1).
                 double trace = 0.0;
                 for (int a = 0; a < m; ++a) for (int b = 0; b < m; ++b) trace += hessian[a][b] * backgroundInverse[b][a];
@@ -438,8 +532,9 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         writeTiff(dir / "lsct.tif", grid, {posterior.begin(), posterior.end()}, names);
         writeTiff(dir / "lsct_uncertainty.tif", grid, {sd.begin(), sd.end()},
                   {"Tss uncertainty 1-sigma (K)", "Tsh uncertainty 1-sigma (K)", "Tcs uncertainty 1-sigma (K)", "Tch uncertainty 1-sigma (K)"});
-        writeTiff(dir / "lsct_qa.tif", grid, {qa, residual, dfs, used, iterations},
-                  {"quality flags", "residual RMS (K)", "degrees of freedom for signal", "observations used", "iterations"});
+        writeTiff(dir / "lsct_qa.tif", grid, {qa, residual, dfs, used, iterations, costs[0], costs[1]},
+                  {"quality flags", "residual RMS (K)", "degrees of freedom for signal", "observations used", "iterations",
+                   "MAP cost at background", "MAP cost at analysis"});  // FIX(2026-11-21 S-5 QA): bands 6-7 appended
         writeTiff(dir / "lsct_fractions.tif", grid, {shares.begin(), shares.end()},
                   {"Tss normalized effective weight", "Tsh normalized effective weight", "Tcs normalized effective weight", "Tch normalized effective weight"});
         writeTiff(dir / "lsct_radiance_fractions.tif", grid, {radianceShares.begin(), radianceShares.end()},
@@ -462,7 +557,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
 
     result.summary.Add("target", lsct ? "lsct" : "lst");
     result.summary.Add("method", lsct ? "MAP Gauss-Newton, background = run component temperatures" : "weighted Gauss-Newton, single radiometric temperature");
-    result.summary.Add("observationModel", "STREAM forward thermal: TiRT four-component weights + hom3 multiple scattering, top of canopy, no atmosphere");
+    result.summary.Add("observationModel", "STREAM forward thermal: TiRT four-component weights + hom3 multiple scattering, top of canopy, no atmosphere; brightness observations include the reflected sky (1 - effective emissivity) B(T_sky)");
     CPLJSONArray list;
     for (const auto& item : inv.observations) {
         CPLJSONObject entry;
@@ -486,6 +581,10 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
     if (lsct) {
         counts.Add("lowSupportPixels", static_cast<GInt64>(lowSupport));
         counts.Add("illConditionedPixels", static_cast<GInt64>(illConditioned));
+        // FIX(2026-11-21 S-5 QA): stop reasons (bit 10 stalled, bit 11 not updated; neither in the default reject mask)
+        counts.Add("convergedPixels", static_cast<GInt64>(stopConverged));
+        counts.Add("lineSearchStalledPixels", static_cast<GInt64>(stopStalled));
+        counts.Add("notUpdatedPixels", static_cast<GInt64>(stopNotUpdated));
     }
     long long cloud = 0, invalid = 0;
     for (const unsigned flag : flags) { if (flag & kQaCloud) ++cloud; else if (flag & kQaInputInvalid) ++invalid; }

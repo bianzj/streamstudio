@@ -307,7 +307,7 @@
           <label class="dialog-field dialog-field-wide"><span>示例</span><select class="select" id="exampleSelect" name="id" required></select></label>
           <div class="notice dialog-field-wide" id="exampleSummary"></div>
           <label class="dialog-field dialog-field-wide"><span>复制到目录</span><input class="input path-input" id="exampleDirectory" name="directory" type="text" required autocomplete="off" spellcheck="false"></label>
-          <div class="notice dialog-field-wide">示例会复制到该目录下再打开，运行结果写入副本，不修改内置示例。</div>
+          <div class="notice dialog-field-wide">示例会复制到该目录下再打开，运行结果写入副本（output/），不修改内置示例。重复打开同一示例会覆盖该副本的工程文件，output/ 中的历史结果保留。</div>
         </div>
         <footer><span>project.json</span><button class="button primary" id="submitExampleBtn" type="submit">复制并打开</button></footer>
       </form>

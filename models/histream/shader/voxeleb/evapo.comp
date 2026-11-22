@@ -134,6 +134,9 @@ void main()
         lambda = (2.501 - 0.002361*(Tc-273.15))*1E6;
         
         if(raa < 1) raa = 1;
+        // Ground surfaces add free convection when warmer than the air
+        // (budget.comp uses the same effective resistance per state).
+        raa = groundExchangeRaa(raa, Tc, Ta, typeId);
         // H = raa;
         H = (RHOA * CP) / raa * (Tc-273.15 - Ta);
         LE = RHOA / (raa + rss) * lambda * (qi - qa);

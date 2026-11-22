@@ -39,3 +39,24 @@ test('rewrite every assimilation file path', () => {
   assert.equal(input.assimilation.opticalQa, 'mapped/f')
   assert.equal(input.assimilation.views[0].uncertainty, 'mapped/h')
 })
+// 2026-11-20: RT runs forward the soil emissivity settings; constant geometry is range-checked; reflected sky.
+const rtScene = extra => ({ ...scene({}), assimilation: undefined, thermal: { enabled: true, bands: [{ name: 'T', center: 10.5, fwhm: 0.5 }] }, ...extra })
+const compileRt = extra => store.buildEngineConfig(rtScene(extra), { outputDir: dir, dataDir: dir })
+test('RT mode writes the soil emissivity settings', () => {
+  const temperature = { ...rtScene({}).temperature, energy: { soilEmissivityModel: 'constant', soilEmissivityK: 2, surfaceTemperatureNormalisation: 'directional', soilEmissivity: 0.96 } }
+  const energy = compileRt({ temperature }).temperature.energy
+  assert.deepEqual(energy, { soilEmissivityModel: 'constant', soilEmissivityK: 2, surfaceTemperatureNormalisation: 'directional', soilEmissivity: 0.96 })
+  assert.equal(compileRt({}).temperature.energy.soilEmissivityModel, 'hapke')
+})
+test('reject out-of-range constant geometry', () => {
+  assert.throws(() => compileRt({ view: { vza: { value: 120 }, vaa: { value: 0 } } }))
+  assert.throws(() => compileRt({ view: { vza: { value: 0 }, vaa: { value: 400 } } }))
+  assert.throws(() => compileRt({ surface: { ...rtScene({}).surface, latitude: { value: 200 } } }))
+  assert.doesNotThrow(() => compileRt({ surface: { ...rtScene({}).surface, longitude: { value: 300 } } }))
+})
+test('reflected sky options', () => {
+  assert.equal(compileRt({}).skyLongwave, undefined)
+  assert.deepEqual(compileRt({ skyLongwave: { mode: 'none' } }).skyLongwave, { mode: 'none' })
+  assert.deepEqual(compileRt({ skyLongwave: { value: 350 } }).skyLongwave, { value: 350 })
+  assert.throws(() => compileRt({ skyLongwave: { value: 900 } }))
+})

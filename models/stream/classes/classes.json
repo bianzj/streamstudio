@@ -1,7 +1,7 @@
 {
   "kind": "stream-classes",
   "schemaVersion": 1,
-  "description": "STREAM 遥感影像模拟的 IGBP 地类参数。冠层、叶片光学与光合参数沿用 StreamEarth defined.cpp，土壤与空气动力学参数对齐 TiRT/TIRTEB 默认值（2026-10 版本）；城市（13）、冰雪（15）地面与光合途径的调整见 models/stream/PORTING.md。 2026-10-28：新增 ground.heatRoughnessKb（kB⁻¹=ln(z0/z0h)），裸土/城市 5、稀疏灌丛 3、短植被 2、森林 1.5、冰雪 2；决定地表与大气耦合强度，直接影响日较差。",
+  "description": "STREAM 遥感影像模拟的 IGBP 地类参数。光合参数（Vcmax、Ball-Berry 斜率、暗呼吸比例、温度参数）多数地类与 StreamEarth defined.cpp 逐项相同（2026-11-21 已核对），冠层与叶片光学参数以同一文件为来源（未逐项核对）；以下各项与 StreamEarth 不同，为本表的调整（2026-11-21 B-S3 如实说明，此前写作“沿用”）：草地（10）Vcmax 100（Earth 35）；农田（12）、农田与自然植被镶嵌（14）为 C4（Earth 为 C3）；城市（13）绿地为 C3、Vcmax 60（Earth 无光合）；裸地（16）、未分类（0）无光合（Earth 裸地 Vcmax 20）。土壤与空气动力学参数对齐 TiRT/TIRTEB 默认值（2026-10 版本）；城市（13）、冰雪（15）地面与光合途径的调整见 models/stream/PORTING.md。 2026-10-28：新增 ground.heatRoughnessKb（kB⁻¹=ln(z0/z0h)），裸土/城市 5、稀疏灌丛 3、短植被 2、森林 1.5、冰雪 2；只作用于裸土整体阻抗（LAI=0 全部、0<LAI<0.5 按 1−smoothstep 权重混合），LAI≥0.5 的植被像元由冠层阻抗网络决定、该参数不起作用（与 TiRT aerodynamic.py 的 z0h=0.1·z0 只用于裸土/城市整体阻抗一致；2026-11-21 B4 更正了此前“直接影响日较差”的笼统说法）。 2026-11-20：未分类（0）与裸地（16）按 PORTING 改为无光合（pathway none，无气孔）；裸地叶片结构参数 N 由 0.5 改为 1.5（PROSPECT 要求 N≥1）；水体（17）地面标为 water（发射率不随土壤水分、无 Hapke 角度项）。 2026-11-21（B3）：所有 C3/C4 地类开启 photosynthesis.temperatureCorrection（Vcmax/Rd/Kc/Ko 的 Q10 与高低温抑制，TiRT tcor=1、StreamEarth Tcor=1 的缺省做法；此前只有草地开启），省略该字段时缺省也为 true。",
   "soil": {
     "optics": {
       "brightness": 0.25,
@@ -50,17 +50,7 @@
         "transTir": 0
       },
       "photosynthesis": {
-        "pathway": "C3",
-        "vcmax": 80,
-        "ballBerrySlope": 9,
-        "respiration": 0.015,
-        "temperature": [
-          0.2,
-          0.3,
-          281,
-          308,
-          328
-        ]
+        "pathway": "none"
       },
       "ground": {
         "surface": "soil",
@@ -97,7 +87,8 @@
           278,
           308,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -134,7 +125,8 @@
           288,
           313,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -171,7 +163,8 @@
           278,
           303,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -208,7 +201,8 @@
           283,
           311,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -245,7 +239,8 @@
           281,
           307,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -282,7 +277,8 @@
           278,
           313,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -319,7 +315,8 @@
           278,
           313,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -356,7 +353,8 @@
           288,
           303,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -393,7 +391,8 @@
           288,
           303,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -468,7 +467,8 @@
           288,
           303,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -505,7 +505,8 @@
           281,
           308,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -542,7 +543,8 @@
           283,
           311,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "impervious",
@@ -584,7 +586,8 @@
           281,
           308,
           328
-        ]
+        ],
+        "temperatureCorrection": true
       },
       "ground": {
         "surface": "soil",
@@ -638,22 +641,12 @@
         "cw": 0.002,
         "cdm": 0.001,
         "cs": 0.0,
-        "n": 0.5,
+        "n": 1.5,
         "reflTir": 0.025,
         "transTir": 0
       },
       "photosynthesis": {
-        "pathway": "C3",
-        "vcmax": 20,
-        "ballBerrySlope": 9,
-        "respiration": 0.012,
-        "temperature": [
-          0.2,
-          0.3,
-          281,
-          308,
-          328
-        ]
+        "pathway": "none"
       },
       "ground": {
         "surface": "soil",
@@ -683,6 +676,7 @@
         "pathway": "none"
       },
       "ground": {
+        "surface": "water",
         "emissivity": 0.99,
         "heatRoughnessKb": 2.0
       }

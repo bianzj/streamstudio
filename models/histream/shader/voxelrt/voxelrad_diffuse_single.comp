@@ -88,13 +88,55 @@ void writeCollisionOrder(uint bufferId, uint band, int order, float value)
     else voxelRads[index].induced = value;
 }
 
+// Single optical/thermal split shared with the image pass and the C++ band
+// names: <= 2.5 um is a normalized-illumination band, longer wavelengths are
+// Planck-radiance bands (accepts nm or um). Previously this pass used 5000 nm,
+// so 2.5-5 um bands were optical here but thermal in the image.
+bool isThermalWavelength(float wavelength)
+{
+    return !(wavelength <= 2.5 || (wavelength > 50.0 && wavelength <= 2500.0));
+}
+
+vec3 rotateDiffuseAzimuth(vec3 direction, float angle);
+
+// Solid receivers integrate the incident field over the hemisphere of their
+// stored outward normal, cosine weighted (irradiance per facet area; equals
+// pi*L for an isotropic field), as VoxelEB's diffuse TIR / scattering do.
+// Vegetation keeps the fixed 2/N weight (two-face total).
+float solidHemisphereCosineSum(vec3 normal, float azimuthOffset)
+{
+    float sum = 0.0;
+    for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
+        sum += max(dot(normal, normalize(rotateDiffuseAzimuth(
+            DIFFUSE_DIRECTIONS[angle], azimuthOffset))), 0.0);
+    return max(sum, 1.0e-6);
+}
+
+float receiverQuadratureWeight(bool surfaceReceiver, vec3 normal,
+                               float cosineSum, vec3 direction)
+{
+    return surfaceReceiver
+        ? max(dot(normal, normalize(direction)), 0.0) / cosineSum
+        : DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+}
+
+// A solid receiver's own cell is where its field is sampled, not an external
+// reflector/emitter (as VoxelEB traceIncoming): outward rays that start
+// behind the cell's own facet must pass through it.
+bool isOwnSolidCell(bool surfaceReceiver, uint bufferId0, int alignBufferId)
+{
+    return surfaceReceiver && alignBufferId >= 0
+        && voxelLinks[alignBufferId].instanceId == voxelLinks[bufferId0].instanceId
+        && all(equal(voxelLinks[alignBufferId].voxelId, voxelLinks[bufferId0].voxelId));
+}
+
 float voxelSurfaceEmission(float wavelength, float sunlitTemperature,
                            float shadedTemperature, float sunlitFraction,
                            float emissivity, float pathTransmittance)
 {
     // Optical transport is normalized illumination; thermal emission uses
     // Planck spectral radiance in W m-2 sr-1 um-1, with temperatures in K.
-    if(wavelength <= 5000.0) return 0.0;
+    if(!isThermalWavelength(wavelength)) return 0.0;
     float fraction = clamp(sunlitFraction, 0.0, 1.0);
     float radiance = fraction * Planck(wavelength, sunlitTemperature)
         + (1.0 - fraction) * Planck(wavelength, shadedTemperature);
@@ -208,6 +250,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
   
   bool isvegfirst = true;
   bool surfaceReceiver = typeId0 == TYPE_BUILDING || typeId0 == TYPE_SOIL || typeId0 == TYPE_WATER;
+  vec3 receiverNormal = surfaceReceiver ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
   ////////////////////////////////////////////////////////
   //  Iteration in difuse angle
   ////////////////////////////////////////////////////////
@@ -222,10 +265,11 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
     alpha_toVoxel = 1.0;
 	  voxelRads[voxelRadiationIndex(bufferId0, iangle)].induced = 0.0;
 
-    // A solid surface only receives radiance through its upper hemisphere.
-    // Rays into the object interior would hit its own inner facets and add the
-    // object's emission/reflection to its own incident environment.
-    if(surfaceReceiver && directioni0.y < 0.0) continue;
+    // A solid surface only receives radiance through the hemisphere of its
+    // outward normal (walls and slopes included, not just +y). Rays into the
+    // object interior would hit its own inner facets and add the object's
+    // emission/reflection to its own incident environment.
+    if(surfaceReceiver && dot(directioni, receiverNormal) <= 0.0) continue;
 
     /////////////////////////////////////////////////////
     /// Iteration in travel step
@@ -355,10 +399,12 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
                     * absorptionFraction * alpha_toVoxel;
                 float scatteringPhase = mediumPhaseHG(canopy,
                     dot(normalize(lightSet.direction), directioni));
-                radiance += alpha_toSolar * Esun / max(cosSolar, 0.001)
+                // Fields are pi*L and Esun is beam-normal (as for leaves): the
+                // per-steradian HG phase gives pi*p*E, without /cos(sza).
+                radiance += alpha_toSolar * Esun * PI
                     * scatteringFraction * scatteringPhase * alpha_toVoxel;
               } else {
-                if(wavelength > 5000){
+                if(isThermalWavelength(wavelength)){
                   sunlitRadiance = Planck(wavelength,sunlitTemperature);
                   shadedRadiance = Planck(wavelength,shadedTemperature);
                   thermalRadiance = (1-alpha_toSolar)*shadedRadiance + alpha_toSolar*sunlitRadiance;
@@ -381,7 +427,8 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
       }// if vegetation
 
 
-      if (isSolidVoxel(alignBufferId))
+      if (isSolidVoxel(alignBufferId)
+          && !isOwnSolidCell(surfaceReceiver, bufferId0, alignBufferId))
       {
         alignBufferId = ResolveVoxelSurfaceState(alignBufferId, sstate.normal);
         //////////////////////////////
@@ -465,15 +512,10 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
       ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
     }
 
-    if((kstep >= setting.maxStep) && (alpha_toVoxel > 0.05))
-    {
-        float skyrad = alpha_toVoxel*Esky;
-        //skyrad = 0.5;
-        uint index = voxelRadiationIndex(bufferId0, iangle);
-        atomicAdd(voxelRads[index].induced,
-            skyrad,
-            gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
-    }
+    // A step limit is an unresolved path, not a connection to the sky (as
+    // VoxelEB): keep the accumulated source terms and add sky only on an
+    // actual upward miss above. The old fallback added Esky here even for
+    // downward rays.
   }
   return false;
 }
@@ -502,6 +544,8 @@ void voxel_raytracing_diffuse_packet(
   ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
   uint receiverType = meshLinks[instanceLinks[voxelLinks[bufferId0].instanceId].meshId].type;
   bool surfaceReceiver = receiverType == TYPE_BUILDING || receiverType == TYPE_SOIL || receiverType == TYPE_WATER;
+  vec3 receiverNormal = surfaceReceiver ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
+  float cosineSum = surfaceReceiver ? solidHemisphereCosineSum(receiverNormal, azimuthOffset) : 1.0;
 
   for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; ++iangle)
   {
@@ -515,8 +559,10 @@ void voxel_raytracing_diffuse_packet(
     vec3 direction0 = rotateDiffuseAzimuth(
         DIFFUSE_DIRECTIONS[iangle], azimuthOffset);
     vec3 direction = normalize(direction0);
-    // Surface receivers integrate the upper hemisphere only (see above).
-    if(surfaceReceiver && direction0.y < 0.0) continue;
+    // Surface receivers integrate their outer (normal) hemisphere only.
+    if(surfaceReceiver && dot(direction, receiverNormal) <= 0.0) continue;
+    float quadratureWeight = receiverQuadratureWeight(
+        surfaceReceiver, receiverNormal, cosineSum, direction);
     Ray ray = Ray(voxelPos0, direction);
     ConfigureCone(voxelPos0, direction, 0.0, 0.0);
     float alphaToVoxel = 1.0;
@@ -602,11 +648,12 @@ void voxel_raytracing_diffuse_packet(
                   * canopy.emissionScale * absorptionFraction * alphaToVoxel;
               float scatteringPhase = mediumPhaseHG(
                   canopy, dot(normalize(lightSet.direction), direction));
+              // pi*L field, beam-normal Esun, per-steradian HG: pi*p*E.
               radiance += alphaToSolar * packetEsun[bandOffset]
-                  / max(cosSolar, 0.001) * scatteringFraction
+                  * PI * scatteringFraction
                   * scatteringPhase * alphaToVoxel;
             } else {
-              if(wavelength > 5000) {
+              if(isThermalWavelength(wavelength)) {
                 float thermalRadiance =
                     (1.0 - alphaToSolar)
                         * Planck(wavelength, shadedTemperature)
@@ -628,7 +675,8 @@ void voxel_raytracing_diffuse_packet(
         }
       }
 
-      if(isSolidVoxel(alignBufferId))
+      if(isSolidVoxel(alignBufferId)
+          && !isOwnSolidCell(surfaceReceiver, bufferId0, alignBufferId))
       {
         alignBufferId = ResolveVoxelSurfaceState(alignBufferId, sstate.normal);
         uint instanceId = voxelLinks[alignBufferId].instanceId;
@@ -678,16 +726,11 @@ void voxel_raytracing_diffuse_packet(
           dot(ray.direction, faceNormal) > 0 ? faceNormal : -faceNormal);
     }
 
-    if(kstep >= setting.maxStep && alphaToVoxel > 0.05) {
-      for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset)
-        compensatedAdd(directionalRadiance[bandOffset],
-            directionalCorrection[bandOffset],
-            alphaToVoxel * packetEsky[bandOffset]);
-    }
+    // Step limit: unresolved path, never a sky connection (see above).
 
     for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset)
       packetRadiance[bandOffset] += directionalRadiance[bandOffset]
-          * DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+          * quadratureWeight;
   }
 }
 
@@ -714,12 +757,16 @@ void voxel_collision_order_packet(
   ivec3 voxelRes = ivec3(setting.voxelSize);
   uint receiverType = meshLinks[instanceLinks[voxelLinks[bufferId0].instanceId].meshId].type;
   bool surfaceReceiver = receiverType == TYPE_BUILDING || receiverType == TYPE_SOIL || receiverType == TYPE_WATER;
+  vec3 receiverNormal = surfaceReceiver ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
+  float cosineSum = surfaceReceiver ? solidHemisphereCosineSum(receiverNormal, azimuthOffset) : 1.0;
 
   for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; ++iangle)
   {
     vec3 direction0 = rotateDiffuseAzimuth(DIFFUSE_DIRECTIONS[iangle], azimuthOffset);
     vec3 direction = normalize(direction0);
-    if(surfaceReceiver && direction0.y < 0.0) continue;
+    if(surfaceReceiver && dot(direction, receiverNormal) <= 0.0) continue;
+    float quadratureWeight = receiverQuadratureWeight(
+        surfaceReceiver, receiverNormal, cosineSum, direction);
     Ray ray = Ray(voxelPos0, direction);
     ConfigureCone(voxelPos0, direction, 0.0, 0.0);
     float alphaToVoxel = 1.0;
@@ -776,7 +823,8 @@ void voxel_collision_order_packet(
         }
       }
 
-      if(isSolidVoxel(alignBufferId))
+      if(isSolidVoxel(alignBufferId)
+          && !isOwnSolidCell(surfaceReceiver, bufferId0, alignBufferId))
       {
         alignBufferId = ResolveVoxelSurfaceState(alignBufferId, sstate.normal);
         MeshLink surface = meshLinks[instanceLinks[voxelLinks[alignBufferId].instanceId].meshId];
@@ -789,16 +837,18 @@ void voxel_collision_order_packet(
           float trans = spectralMaterials[materialIndex].transmittance;
           float incident = readCollisionOrder(uint(alignBufferId), uint(kwave), order - 1);
           float weight;
-          if(wave[kwave] > 5000.0) {
+          if(isThermalWavelength(wave[kwave])) {
             weight = surface.type == TYPE_WATER
                 ? waterDirectionalReflectance(surface.bioId, refl, outgoing, sstate.normal)
                 : surfaceThermalReflectance(refl, trans, outgoing, sstate.normal,
                     surface.angularEffectStrength);
           } else {
-            weight = 0.5 * (surface.type == TYPE_WATER
+            // The surface's stored field is its (cosine-weighted) irradiance,
+            // so reflected pi*L = weight * E, as in the image pass (no 0.5).
+            weight = surface.type == TYPE_WATER
                 ? waterCoxMunkWeight(surface.bioId, refl, sstate.normal, outgoing, sstate.normal)
                 : backgroundReflectanceWeight(refl, sstate.normal, outgoing,
-                    sstate.normal, surface.angularEffectStrength));
+                    sstate.normal, surface.angularEffectStrength);
           }
           directional[bandOffset] += alphaToVoxel * weight * incident;
         }
@@ -812,8 +862,8 @@ void voxel_collision_order_packet(
     }
 
     for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset) {
-      packetRadiance[bandOffset] += directional[bandOffset] * DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
-      packetTail[bandOffset] += directionalTail[bandOffset] * DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+      packetRadiance[bandOffset] += directional[bandOffset] * quadratureWeight;
+      packetTail[bandOffset] += directionalTail[bandOffset] * quadratureWeight;
     }
   }
 }
@@ -909,9 +959,10 @@ void main()
     }
     for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset) {
       float wavelength = wave[kwave + bandOffset];
-      packetEsun[bandOffset] = wavelength > 5000
+      bool thermalBand = isThermalWavelength(wavelength);
+      packetEsun[bandOffset] = thermalBand
           ? 0.0 : lightSet.direct;
-      packetEsky[bandOffset] = wavelength > 5000
+      packetEsky[bandOffset] = thermalBand
           ? Planck(wavelength, lightSet.skyTemperature)
           : lightSet.diffuse;
     }
@@ -956,13 +1007,16 @@ void main()
       wavelength = wave[kwave];
           Esun = lightSet.direct;
           Esky = lightSet.diffuse;
-          if(wavelength > 5000){
+          if(isThermalWavelength(wavelength)){
             // Longwave illumination comes from the configured sky and
             // surrounding thermal emitters, not a 6000 K solar radiance.
             Esun = 0.0;
             Esky = Planck(wavelength, lightSet.skyTemperature);
           }
 
+          bool surfaceReceiver0 = isSolidVoxel(int(bufferId0));
+          vec3 receiverNormal0 = surfaceReceiver0
+              ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
           const int diffuseSampleSets = 5;
           float sampledRadiance = 0.0;
           for(int kiter = 0; kiter < diffuseSampleSets; kiter++)
@@ -981,17 +1035,23 @@ void main()
               // Order SSBO accesses without synchronizing inactive lanes.
               memoryBarrierBuffer();
 
+              float cosineSum0 = surfaceReceiver0
+                  ? solidHemisphereCosineSum(receiverNormal0, iterationOffset) : 1.0;
               float iterationRadiance = 0.0;
               float iterationCorrection = 0.0;
               for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
               {
                   uint index = voxelRadiationIndex(bufferId0, iangle);
                   voxelRads[index].cumulated = voxelRads[index].induced;
+                  // Vegetation: fixed 2/N; solids: cosine weight over the
+                  // outer hemisphere (skipped directions hold zero).
+                  float weight = receiverQuadratureWeight(surfaceReceiver0,
+                      receiverNormal0, cosineSum0, rotateDiffuseAzimuth(
+                          DIFFUSE_DIRECTIONS[iangle], iterationOffset));
                   compensatedAdd(iterationRadiance, iterationCorrection,
-                      finiteNonnegative(voxelRads[index].induced));
+                      finiteNonnegative(voxelRads[index].induced) * weight);
               }
-              sampledRadiance += iterationRadiance
-                  * DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
+              sampledRadiance += iterationRadiance;
           }// for iteration
 
           // Preserve incoming spectral radiance. Surface absorptance and

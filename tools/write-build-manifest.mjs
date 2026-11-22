@@ -35,8 +35,30 @@ const sourceFiles = [
 ]
 const sources = [...new Set(sourceFiles)]
   .map(file => ({ path: path.relative(root, file).replaceAll('\\', '/'), sha256: sha256(file) }))
-const shaderBinaries = inventory(path.join(runtime, 'shader'), p => p.endsWith('.spv'))
+// SPIR-V modules the CMake build actually produces (keep in sync with
+// models/histream/CMakeLists.txt).  The runtime shader/ directory also holds
+// files that are copied, not compiled (copy-core-shaders.cmake never deletes
+// deployed files), e.g. old shader/cases/VoxelTriTracing/*.spv; those are listed
+// separately as staleShaderBinaries so "manifest matches" means "built from
+// the current sources" and nothing else.
+const shaderSourceRoot = path.join(root, 'models/histream/shader')
+const facetShaders = ['visibility.vert', 'visibility.frag', 'visibility_resolve.comp', 'direct_resolve.comp', 'radiosity.comp', 'incident.comp']
+const builtShaderModules = new Set([
+  ...['offline.rgen', 'closestHit.rchit', 'rmiss.rmiss', 'shadow.rmiss'].map(file => `raytracing/${file}.spv`),
+  ...[...facetShaders, 'spectral.comp'].map(file => `facetrt/${file}.spv`),
+  ...[...facetShaders, 'energy.comp'].map(file => `faceteb/${file}.spv`),
+  ...['voxeleb', 'voxelrt'].flatMap(kind => fs.readdirSync(path.join(shaderSourceRoot, kind))
+    .filter(file => file.endsWith('.comp')).map(file => `${kind}/${file}.spv`))
+].map(file => file.toLowerCase()))
+const deployedShaderBinaries = inventory(path.join(runtime, 'shader'), p => p.endsWith('.spv'))
   .map(file => ({ path: path.relative(runtime, file).replaceAll('\\', '/'), sha256: sha256(file) }))
+const isBuiltShader = entry => builtShaderModules.has(entry.path.replace(/^shader\//, '').toLowerCase())
+const shaderBinaries = deployedShaderBinaries.filter(isBuiltShader)
+const staleShaderBinaries = deployedShaderBinaries.filter(entry => !isBuiltShader(entry))
+const missingShaderBinaries = [...builtShaderModules]
+  .filter(module => !shaderBinaries.some(entry => entry.path.replace(/^shader\//, '').toLowerCase() === module))
+if (staleShaderBinaries.length) console.warn(`write-build-manifest: ${staleShaderBinaries.length} deployed .spv not produced by this build (listed as staleShaderBinaries): ${staleShaderBinaries.map(entry => entry.path).join(', ')}`)
+if (missingShaderBinaries.length) console.warn(`write-build-manifest: ${missingShaderBinaries.length} expected .spv missing from runtime: ${missingShaderBinaries.join(', ')}`)
 let commit = '', dirty = null
 const git = process.env.GIT_EXECUTABLE || 'git'
 try {
@@ -54,8 +76,9 @@ const manifest = {
   createdAt: new Date().toISOString(), commit, dirty,
   sourceTreeSha256: crypto.createHash('sha256').update(JSON.stringify(sources)).digest('hex'),
   engine: { path: path.basename(engine), sha256: sha256(engine) },
-  runtimeBinaries, sources, shaderBinaries
+  runtimeBinaries, sources, shaderBinaries, staleShaderBinaries, missingShaderBinaries
 }
 fs.writeFileSync(path.join(runtime, 'build-manifest.json'), JSON.stringify(manifest, null, 2) + '\n')
 console.log(JSON.stringify({ version: manifest.applicationVersion, engineSHA256: manifest.engine.sha256,
-  sourceTreeSHA256: manifest.sourceTreeSha256, shaderCount: shaderBinaries.length }))
+  sourceTreeSHA256: manifest.sourceTreeSha256, shaderCount: shaderBinaries.length,
+  staleShaderCount: staleShaderBinaries.length, missingShaderCount: missingShaderBinaries.length }))

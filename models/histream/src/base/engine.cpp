@@ -37,6 +37,7 @@ std::filesystem::path executableDirectory()
 
 void Engine::init(Mode mode)
 {
+#if HISTREAM_ENABLE_FACET
     if (mode == Mode::eFacetRT) {
         m_pFacetrt = std::make_shared<Facetrt>();
         m_pFacetrtio = std::make_shared<FacetrtIO>();
@@ -47,6 +48,10 @@ void Engine::init(Mode mode)
         m_pFacetebio = std::make_shared<FacetebIO>();
         return;
     }
+#else
+    if (mode == Mode::eFacetRT || mode == Mode::eFacetEB)
+        throw std::runtime_error("This HiStream build has no Facet backends (HISTREAM_ENABLE_FACET=OFF)");
+#endif
 
     int gpuIndex = 0;
     std::string backend = "gpu";
@@ -123,6 +128,7 @@ void Engine::input(std::string path, std::string V, std::string outputPath){
     }
     if (m_mode == Mode::eFacetRT || m_mode == Mode::eFacetEB) {
         init(m_mode);
+#if HISTREAM_ENABLE_FACET
         if (m_mode == Mode::eFacetRT) {
             m_pFacetrtio->inputPath = m_inputPath;
             m_pFacetrtio->shaderDirectory = facetShaderDirectory("facetrt");
@@ -132,6 +138,7 @@ void Engine::input(std::string path, std::string V, std::string outputPath){
             m_pFacetebio->shaderDirectory = facetShaderDirectory("faceteb");
             m_pFacetebio->outputPath = m_outputPath;
         }
+#endif
         return;
     }
 
@@ -164,14 +171,18 @@ void Engine::input(std::string path, std::string V, std::string outputPath){
 
 bool Engine::create() {
 
-    if (!((m_mode == Mode::eFacetRT && m_pFacetrt && m_pFacetrtio) ||
+    if (!(
+#if HISTREAM_ENABLE_FACET
+          (m_mode == Mode::eFacetRT && m_pFacetrt && m_pFacetrtio) ||
           (m_mode == Mode::eFacetEB && m_pFaceteb && m_pFacetebio) ||
+#endif
           (m_mode == Mode::eRaytracing && m_pRaytracing && m_pRaytracingio) ||
           (m_mode == Mode::eVoxelEB && m_pVoxeleb && m_pVoxelebio) ||
           (m_mode == Mode::eVoxelRT && m_pVoxelrt && m_pVoxelrtio))) {
         throw std::runtime_error("Engine::create: engine not initialized, call input() first");
     }
 
+#if HISTREAM_ENABLE_FACET
     if (m_mode == Mode::eFacetRT) {
         if (!m_pFacetrt || !m_pFacetrt->setup(m_pFacetrtio)) return false;
         if (!m_pFacetrt->upload(m_pFacetrtio)) return false;
@@ -182,6 +193,7 @@ bool Engine::create() {
         if (!m_pFaceteb->upload(m_pFacetebio)) return false;
         return m_pFaceteb->create(m_pFacetebio);
     }
+#endif
     if(m_mode == Mode::eRaytracing) {
         return m_pRaytracing->create(m_pRaytracingio);
     }else if(m_mode == Mode::eVoxelEB){
@@ -217,22 +229,29 @@ std::string Engine::facetShaderDirectory(const char* name) const
 }
 
 int Engine::run() {
-    if (!((m_mode == Mode::eFacetRT && m_pFacetrt && m_pFacetrtio) ||
+    if (!(
+#if HISTREAM_ENABLE_FACET
+          (m_mode == Mode::eFacetRT && m_pFacetrt && m_pFacetrtio) ||
           (m_mode == Mode::eFacetEB && m_pFaceteb && m_pFacetebio) ||
+#endif
           (m_mode == Mode::eRaytracing && m_pRaytracing && m_pRaytracingio && m_pFileio) ||
           (m_mode == Mode::eVoxelEB && m_pVoxeleb && m_pVoxelebio && m_pFileio) ||
           (m_mode == Mode::eVoxelRT && m_pVoxelrt && m_pVoxelrtio && m_pFileio))) {
         throw std::runtime_error("Engine::run: engine not initialized, call input() first");
     }
 
+#if HISTREAM_ENABLE_FACET
     if (m_mode == Mode::eFacetRT) {
         return m_pFacetrt && m_pFacetrt->run(m_pFacetrtio) ? 0 : 1;
     }
     if (m_mode == Mode::eFacetEB) {
         if (!m_pFaceteb || !m_pFacetebio) return 1;
         m_pFaceteb->run(m_pFacetebio);
+        // 0 = converged, 2 = finished with non-converged nodes (results kept;
+        // the server maps only this FacetEB code to status non_converged), 1 = failed.
         return m_pFacetebio->exitCode;
     }
+#endif
     if (m_mode == Mode::eRaytracing) {
         return m_pRaytracing && m_pRaytracing->run(m_pRaytracingio, m_pFileio) ? 0 : 1;
     }
@@ -247,6 +266,7 @@ int Engine::run() {
 
 void Engine::destroy() {
 
+#if HISTREAM_ENABLE_FACET
     if (m_mode == Mode::eFacetRT) {
         if (m_pFacetrt) m_pFacetrt->destroy(m_pFacetrtio);
         return;
@@ -255,6 +275,7 @@ void Engine::destroy() {
         if (m_pFaceteb) m_pFaceteb->destroy(m_pFacetebio);
         return;
     }
+#endif
     if(m_mode == Mode::eRaytracing) {
         if (m_pRaytracing) m_pRaytracing->destroy(m_pRaytracingio);
     }

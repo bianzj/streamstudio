@@ -119,6 +119,11 @@ constexpr uint32_t kRasterLayers = 64;
 constexpr uint32_t kLargeSceneRasterSize = 2048;
 constexpr uint32_t kLargeSceneRasterLayers = 16;
 constexpr uint32_t kMaximumRasterLayers = 64;
+// The retained CPU rasterizer and the GPU shaders can both resolve 256 layers;
+// a run that overflows doubles the reserved depth (see growCpuRasterLayers and
+// FacetrtVulkan::growRasterLayers) instead of failing.
+constexpr uint32_t kMaximumCpuRasterLayers = 128;
+constexpr uint64_t kMaximumCpuFragmentBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr float kLargeSceneExtent = 1000.0f;
 constexpr uint32_t kSkyDirectionCount = 40;
 constexpr uint32_t kIterations = 64;
@@ -169,6 +174,10 @@ struct FacetRTParameters {
     SurfaceParameters ground{{0.20f}, {0.0f}, 0.05f, 0.0f, 305.0f, 295.0f};
     float skyTemperature{250.0f};
     bool acceleratedSolver{};
+    // FacetRT per-band illumination (beam-normal direct and horizontal sky
+    // diffuse) from the light settings; empty = Scene broadband defaults.
+    std::vector<float> bandBeamNormal;
+    std::vector<float> bandSkyDiffuse;
 };
 
 struct Scene {
@@ -182,6 +191,11 @@ struct Scene {
     float sunZenith{30.0f};
     float sunAzimuth{135.0f};
     float backgroundAngularStrength{};
+    // FacetRT broadband illumination. Defaults are the historical values
+    // (700 W m-2 beam normal, 50 W m-2 horizontal sky); configureFacetRTLight
+    // replaces them from the project light settings when present.
+    float beamNormalIrradiance{kBeamNormalIrradiance};
+    float skyDiffuseIrradiance{kSkyDiffuseIrradiance * 0.5f};
     uint32_t visibilityRasterSize{kRasterSize};
     uint32_t visibilityRasterLayers{kRasterLayers};
     uint32_t periodicNeighborCount{};
@@ -190,6 +204,18 @@ struct Scene {
 
     uint32_t facetCount() const { return static_cast<uint32_t>(vertices.size() / 3U); }
 };
+
+float bandBeamIrradiance(const Scene& scene, const FacetRTParameters& parameters, size_t band)
+{
+    return band < parameters.bandBeamNormal.size()
+        ? parameters.bandBeamNormal[band] : scene.beamNormalIrradiance;
+}
+
+float bandSkyIrradiance(const Scene& scene, const FacetRTParameters& parameters, size_t band)
+{
+    return band < parameters.bandSkyDiffuse.size()
+        ? parameters.bandSkyDiffuse[band] : scene.skyDiffuseIrradiance;
+}
 
 uint32_t adaptiveVisibilityRasterLayers(const Scene& scene)
 {
@@ -217,6 +243,34 @@ struct Edge {
     uint32_t neighbor{};
     uint32_t count{};
 };
+
+// The retained CPU rasterizer fails on a full per-pixel fragment list and the
+// run cannot resume afterwards, so grow the reserved depth and repeat the pass.
+bool isCpuRasterOverflow(const std::exception& error)
+{
+    const std::string message = error.what();
+    return message == "CPU A-buffer overflow" ||
+           message == "CPU sunlight A-buffer overflow";
+}
+
+bool growCpuRasterLayers(Scene& scene)
+{
+    const uint32_t current = std::max(kRasterLayers, scene.visibilityRasterLayers);
+    if (current >= kMaximumCpuRasterLayers) {
+        return false;
+    }
+    const uint32_t next = std::min(kMaximumCpuRasterLayers, current * 2U);
+    const uint64_t pixels = uint64_t(scene.visibilityRasterSize) *
+                            uint64_t(scene.visibilityRasterSize);
+    // Fragment is 12 bytes on the CPU rasterizer.
+    if (pixels * uint64_t(next) * 12ULL > kMaximumCpuFragmentBytes) {
+        return false;
+    }
+    scene.visibilityRasterLayers = next;
+    std::cout << "facetrt: CPU A-buffer overflow at " << current
+              << " layers; reserving " << next << " layers per pixel" << std::endl;
+    return true;
+}
 
 struct CpuGraph {
     std::vector<uint32_t> rowOffsets;
@@ -548,7 +602,7 @@ std::vector<facetvk::SurfaceOptics> makeOptics(const Scene& scene,
             optics[side].transmittance = leaf ? 0.05f : 0.0f;
             optics[side].directIrradiance =
                 sunlit[side] * std::max(0.0f, dot(sideNormal, sun)) *
-                kBeamNormalIrradiance;
+                scene.beamNormalIrradiance;
         }
     }
     return optics;
@@ -616,6 +670,26 @@ float facetHapkeKernel(float mu0, float mu, float phaseAngle,
         mu0 / std::max(mu0 + mu, 1.0e-5f) * (1.0f + opposition + multiple);
 }
 
+// Full-strength (strength 1) Hapke reflectance factor of the heterogeneous
+// background, clamped to [0,1]; `base` is the already clamped Lambert value.
+float hapkeClampedFactor(float base, float mu0, float mu, float phaseAngle)
+{
+    const float singleScatteringAlbedo = std::clamp(
+        4.0f * base / std::pow(1.0f + base, 2.0f), 1.0e-5f, 0.999f);
+    const float directional = facetHapkeKernel(
+        mu0, mu, phaseAngle, singleScatteringAlbedo);
+    const float referenceH = facetHapkeH(1.0f, singleScatteringAlbedo);
+    const float reference = singleScatteringAlbedo / (8.0f * kPi) *
+        referenceH * referenceH;
+    // Hapke's r is per beam irradiance normal to the beam; direct irradiance
+    // is already projected onto the facet, so use the BRF r/mu0.
+    return std::clamp(
+        base * directional / mu0 / std::max(reference, 1.0e-6f), 0.0f, 1.0f);
+}
+
+// Directional reflectance factor for one illumination and one viewing
+// direction. Image products use it (viewing direction: zenith, see
+// kImageViewDirection); the energy balance uses the hemispherical albedo below.
 float backgroundHapkeReflectance(float reflectance, Vec3 incoming, Vec3 outgoing,
                                  const Vec3& surfaceNormal, float strength)
 {
@@ -628,24 +702,155 @@ float backgroundHapkeReflectance(float reflectance, Vec3 incoming, Vec3 outgoing
     const float mu = std::max(dot(normal, outgoing), 1.0e-4f);
     const float phaseAngle = std::acos(std::clamp(dot(incoming, outgoing), -1.0f, 1.0f));
     const float base = std::clamp(reflectance, 0.0f, 0.999f);
-    const float singleScatteringAlbedo = std::clamp(
-        4.0f * base / std::pow(1.0f + base, 2.0f), 1.0e-5f, 0.999f);
-    const float directional = facetHapkeKernel(
-        mu0, mu, phaseAngle, singleScatteringAlbedo);
-    const float referenceH = facetHapkeH(1.0f, singleScatteringAlbedo);
-    const float reference = singleScatteringAlbedo / (8.0f * kPi) *
-        referenceH * referenceH;
-    // Hapke's r is per beam irradiance normal to the beam; direct irradiance
-    // is already projected onto the facet, so use the BRF r/mu0.
-    const float hapke = std::clamp(
-        base * directional / mu0 / std::max(reference, 1.0e-6f), 0.0f, 1.0f);
+    const float hapke = hapkeClampedFactor(base, mu0, mu, phaseAngle);
     return base + (hapke - base) * std::clamp(strength, 0.0f, 1.0f);
 }
 
-float infraredHapkeEmissivity(float baseEmissivity, float cosine,
-                              float strength)
+// Image products observe the background from the zenith (nadir sensor): the
+// optical reflectance factor and the thermal directional emissivity both use
+// this viewing direction, folded into the hemisphere of the receiving side.
+const Vec3 kImageViewDirection{0.0f, 1.0f, 0.0f};
+
+// 16-point Gauss-Legendre rule on [0,1], used for the hemispherical integrals.
+struct UnitGaussLegendre {
+    std::array<double, 16> node{}, weight{};
+    UnitGaussLegendre()
+    {
+        constexpr int n = 16;
+        for (int i = 0; i < n; ++i) {
+            double x = std::cos(3.14159265358979323846 * (i + 0.75) / (n + 0.5));
+            double derivative = 1.0;
+            for (int iteration = 0; iteration < 100; ++iteration) {
+                double p0 = 1.0, p1 = x;
+                for (int k = 2; k <= n; ++k) {
+                    const double p2 = ((2.0 * k - 1.0) * x * p1 - (k - 1.0) * p0) / k;
+                    p0 = p1; p1 = p2;
+                }
+                derivative = n * (x * p1 - p0) / (x * x - 1.0);
+                const double step = p1 / derivative;
+                x -= step;
+                if (std::abs(step) < 1.0e-15) break;
+            }
+            node[size_t(i)] = 0.5 * (x + 1.0);
+            weight[size_t(i)] = 1.0 / ((1.0 - x * x) * derivative * derivative);
+        }
+    }
+};
+
+const UnitGaussLegendre& unitGaussLegendre()
 {
-    const float base = std::clamp(baseEmissivity, 0.0f, 1.0f);
+    static const UnitGaussLegendre rule;
+    return rule;
+}
+
+// Directional-hemispherical albedo A(mu0) = (1/pi) Int BRF mu dOmega of the
+// clamped full-strength Hapke factor, tabulated in Lambert base and mu0, and the
+// bihemispherical albedo 2 Int A(mu0) mu0 dmu0 for diffuse illumination.
+struct HapkeAlbedoTable {
+    static constexpr int kBaseCount = 101;
+    static constexpr int kMuCount = 65;
+    static constexpr int kAzimuthCount = 32;
+    std::vector<float> directional;
+    std::vector<float> bihemispherical;
+
+    static float baseAt(int index) { return 0.999f * index / (kBaseCount - 1); }
+
+    static double albedo(float base, double mu0)
+    {
+        const auto& rule = unitGaussLegendre();
+        mu0 = std::clamp(mu0, 1.0e-4, 1.0);
+        const double sin0 = std::sqrt(std::max(0.0, 1.0 - mu0 * mu0));
+        double sum = 0.0;
+        for (size_t m = 0; m < rule.node.size(); ++m) {
+            const double mu = rule.node[m];
+            const double sinMu = std::sqrt(std::max(0.0, 1.0 - mu * mu));
+            double azimuthal = 0.0;
+            // The integrand is symmetric in relative azimuth: midpoints on [0,pi].
+            for (int a = 0; a < kAzimuthCount; ++a) {
+                const double phi = 3.14159265358979323846 * (a + 0.5) / kAzimuthCount;
+                const double cosPhase = std::clamp(
+                    mu0 * mu + sin0 * sinMu * std::cos(phi), -1.0, 1.0);
+                azimuthal += hapkeClampedFactor(
+                    base, static_cast<float>(std::max(mu0, 1.0e-4)),
+                    static_cast<float>(std::max(mu, 1.0e-4)),
+                    static_cast<float>(std::acos(cosPhase)));
+            }
+            sum += rule.weight[m] * mu * azimuthal / kAzimuthCount;
+        }
+        return 2.0 * sum;
+    }
+
+    HapkeAlbedoTable()
+        : directional(size_t(kBaseCount) * kMuCount), bihemispherical(kBaseCount)
+    {
+        const auto& rule = unitGaussLegendre();
+        for (int b = 0; b < kBaseCount; ++b) {
+            for (int m = 0; m < kMuCount; ++m) {
+                directional[size_t(b) * kMuCount + m] = static_cast<float>(
+                    albedo(baseAt(b), double(m) / (kMuCount - 1)));
+            }
+            double sum = 0.0;
+            for (size_t m = 0; m < rule.node.size(); ++m)
+                sum += rule.weight[m] * rule.node[m] * albedo(baseAt(b), rule.node[m]);
+            bihemispherical[size_t(b)] = static_cast<float>(2.0 * sum);
+        }
+    }
+
+    float sampleDirectional(float base, float mu0) const
+    {
+        const float x = std::clamp(base / 0.999f, 0.0f, 1.0f) * (kBaseCount - 1);
+        const float y = std::clamp(mu0, 0.0f, 1.0f) * (kMuCount - 1);
+        const int b0 = std::min(static_cast<int>(x), kBaseCount - 2);
+        const int m0 = std::min(static_cast<int>(y), kMuCount - 2);
+        const float fx = x - b0, fy = y - m0;
+        const auto at = [&](int b, int m) { return directional[size_t(b) * kMuCount + m]; };
+        return (1.0f - fx) * ((1.0f - fy) * at(b0, m0) + fy * at(b0, m0 + 1)) +
+               fx * ((1.0f - fy) * at(b0 + 1, m0) + fy * at(b0 + 1, m0 + 1));
+    }
+
+    float sampleBihemispherical(float base) const
+    {
+        const float x = std::clamp(base / 0.999f, 0.0f, 1.0f) * (kBaseCount - 1);
+        const int b0 = std::min(static_cast<int>(x), kBaseCount - 2);
+        const float fx = x - b0;
+        return (1.0f - fx) * bihemispherical[size_t(b0)] + fx * bihemispherical[size_t(b0) + 1U];
+    }
+};
+
+const HapkeAlbedoTable& hapkeAlbedoTable()
+{
+    static const HapkeAlbedoTable table;
+    return table;
+}
+
+// Energy-balance reflectance of a background side. The Hapke factor above is
+// normalized at nadir without the opposition peak, so its hemispherical albedo
+// exceeds the Lambert value (about 1.3-2.5x for base 0.2); using the factor or
+// its raw albedo would create energy. The energy balance therefore keeps the
+// Lambert value as the white-sky (bihemispherical) albedo and only takes the
+// sun-angle dependence from Hapke: diffuse light sees `base`, the direct beam
+// base * A(mu0) / A_bihemispherical, weighted by the two incident fluxes.
+// strength 0 returns the Lambert value unchanged.
+float backgroundHapkeEnergyReflectance(float reflectance, float mu0,
+                                       float directIrradiance,
+                                       float diffuseIrradiance, float strength)
+{
+    const float base = std::clamp(reflectance, 0.0f, 0.999f);
+    const float s = std::clamp(strength, 0.0f, 1.0f);
+    if (!(s > 0.0f) || !(base > 0.0f)) return base;
+    const HapkeAlbedoTable& table = hapkeAlbedoTable();
+    const float direct = std::max(0.0f, directIrradiance);
+    const float diffuse = std::max(0.0f, diffuseIrradiance);
+    const float bihemispherical = std::max(table.sampleBihemispherical(base), 1.0e-6f);
+    const float beamAlbedo = base * table.sampleDirectional(base, mu0) / bihemispherical;
+    const float hapke = direct + diffuse > 0.0f
+        ? (direct * beamAlbedo + diffuse * base) / (direct + diffuse)
+        : base;
+    return base + (std::clamp(hapke, 0.0f, 0.999f) - base) * s;
+}
+
+float infraredHapkeDirectionalFactor(float base, float cosine)
+{
     const float singleScatteringAlbedo = std::clamp(
         1.0f - base * base, 1.0e-5f, 0.999f);
     const auto directional = [singleScatteringAlbedo](float mu) {
@@ -653,10 +858,18 @@ float infraredHapkeEmissivity(float baseEmissivity, float cosine,
         return root * (1.0f + 2.0f * mu / 1.5f) /
             (1.0f + 2.0f * mu / 1.5f * root);
     };
-    const float hapke = std::clamp(
+    return std::clamp(
         base * directional(std::clamp(cosine, 1.0e-4f, 1.0f)) /
             std::max(directional(1.0f), 1.0e-6f),
         0.0f, 1.0f);
+}
+
+// Directional emissivity toward one viewing cosine (image products).
+float infraredHapkeEmissivity(float baseEmissivity, float cosine,
+                              float strength)
+{
+    const float base = std::clamp(baseEmissivity, 0.0f, 1.0f);
+    const float hapke = infraredHapkeDirectionalFactor(base, cosine);
     return base + (hapke - base) * std::clamp(strength, 0.0f, 1.0f);
 }
 
@@ -1010,6 +1223,7 @@ std::vector<facetvk::SurfaceOptics> makeEnergyShortwaveOptics(
     const Scene& scene,
     const std::vector<float>& sunlit,
     float directNormalIrradiance,
+    float diffuseIrradiance,
     size_t firstSample,
     size_t lastSample,
     const std::vector<float>& spectralWeight)
@@ -1017,9 +1231,10 @@ std::vector<facetvk::SurfaceOptics> makeEnergyShortwaveOptics(
     const facetvk::Direction direction = sunDirection(scene);
     const Vec3 sun{direction.x, direction.y, direction.z};
     std::vector<facetvk::SurfaceOptics> optics(scene.facetCount() * 2U);
-    for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
-        const bool leaf = facet < scene.leafFacetCount;
-        const SurfaceParameters& surface = surfaceForFacet(scene, facet);
+    // Window-mean reflectance/transmittance depend only on the material (and
+    // the leaf/ground fallback), not on the facet: evaluate the ~100-sample
+    // window integral once per material instead of twice per facet.
+    const auto windowOptics = [&](const SurfaceParameters& surface, bool leaf) {
         const float meanReflectance =
             surface.energyReflectance.empty()
                 ? shortwaveWeightedBandValue(
@@ -1027,17 +1242,42 @@ std::vector<facetvk::SurfaceOptics> makeEnergyShortwaveOptics(
                 : windowBandValue(
                     surface.energyReflectance, firstSample, lastSample,
                     spectralWeight, leaf ? 0.10f : 0.20f);
-        const float reflectance = std::clamp(
-            meanReflectance * reflectanceTextureFactor(scene, facet),
-            0.0f, 1.0f);
-        const float transmittance = std::clamp(
+        const float meanTransmittance =
             surface.energyTransmittance.empty()
                 ? shortwaveWeightedBandValue(
                     surface.transmittance, leaf ? 0.05f : 0.0f)
                 : windowBandValue(
                     surface.energyTransmittance, firstSample, lastSample,
-                    spectralWeight, leaf ? 0.05f : 0.0f),
-            0.0f, 1.0f - reflectance);
+                    spectralWeight, leaf ? 0.05f : 0.0f);
+        return std::array<float, 2>{meanReflectance, meanTransmittance};
+    };
+    const size_t materialCount = scene.materials.size();
+    // [material][leaf] ; index materialCount holds the fallback surfaces.
+    std::vector<std::array<std::array<float, 2>, 2>> materialWindow(materialCount + 1U);
+    for (size_t material = 0; material < materialCount; ++material)
+        for (int leaf = 0; leaf < 2; ++leaf)
+            materialWindow[material][leaf] = windowOptics(scene.materials[material], leaf != 0);
+    // Same fallbacks as surfaceForFacet(): default object surface, and the
+    // ground fallback returned for an out-of-range non-leaf facet index.
+    materialWindow[materialCount][1] = windowOptics(SurfaceParameters{}, true);
+    materialWindow[materialCount][0] = windowOptics(
+        surfaceForFacet(scene, std::numeric_limits<uint32_t>::max()), false);
+    parallelRanges(scene.facetCount(), 4096U, [&](size_t begin, size_t end) {
+    for (uint32_t facet = static_cast<uint32_t>(begin); facet < end; ++facet) {
+        const bool leaf = facet < scene.leafFacetCount;
+        const uint32_t materialIndex =
+            facet < scene.materialIndices.size()
+            ? scene.materialIndices[facet]
+            : std::numeric_limits<uint32_t>::max();
+        const auto& window = materialIndex < materialCount
+            ? materialWindow[materialIndex][leaf ? 1 : 0]
+            : materialWindow[materialCount][leaf ? 1 : 0];
+        const float meanReflectance = window[0];
+        const float reflectance = std::clamp(
+            meanReflectance * reflectanceTextureFactor(scene, facet),
+            0.0f, 1.0f);
+        const float transmittance = std::clamp(
+            window[1], 0.0f, 1.0f - reflectance);
         const facetvk::Vertex& vertex = scene.vertices[facet * 3U];
         const Vec3 normal{
             vertex.normal[0], vertex.normal[1], vertex.normal[2]};
@@ -1045,19 +1285,25 @@ std::vector<facetvk::SurfaceOptics> makeEnergyShortwaveOptics(
             const uint32_t side = facet * 2U + localSide;
             const float sign = localSide == 0U ? 1.0f : -1.0f;
             const Vec3 sideNormal = multiply(normal, sign);
+            const float cosIncidence = dot(sideNormal, sun);
+            const float directIrradiance =
+                std::clamp(sunlit[side], 0.0f, 1.0f) *
+                std::max(0.0f, cosIncidence) * directNormalIrradiance;
+            // The radiosity solve is hemispherical: the background uses its
+            // directional-hemispherical (beam) and bihemispherical (sky)
+            // albedo, not the directional factor of one viewing direction.
             const float sideReflectance = leaf ? reflectance :
-                backgroundHapkeReflectance(
-                    reflectance, sun, sideNormal, sideNormal,
+                backgroundHapkeEnergyReflectance(
+                    reflectance, std::max(cosIncidence, 0.0f),
+                    directIrradiance, diffuseIrradiance,
                     scene.backgroundAngularStrength);
             optics[side].reflectance = sideReflectance;
             optics[side].transmittance = std::min(
                 transmittance, 1.0f - sideReflectance);
-            optics[side].directIrradiance =
-                std::clamp(sunlit[side], 0.0f, 1.0f) *
-                std::max(0.0f, dot(sideNormal, sun)) *
-                directNormalIrradiance;
+            optics[side].directIrradiance = directIrradiance;
         }
     }
+    });
     return optics;
 }
 
@@ -1068,7 +1314,6 @@ std::vector<facetvk::SurfaceOptics> makeEnergyLongwaveOptics(
 {
     std::vector<facetvk::SurfaceOptics> optics(scene.facetCount() * 2U);
     for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
-        const bool ground = facet >= scene.leafFacetCount;
         const SurfaceParameters& surface = surfaceForFacet(scene, facet);
         const float reflectance =
             std::clamp(surface.tirReflectance, 0.0f, 1.0f);
@@ -1076,15 +1321,14 @@ std::vector<facetvk::SurfaceOptics> makeEnergyLongwaveOptics(
             surface.tirTransmittance, 0.0f, 1.0f - reflectance);
         const float emissivity =
             std::max(0.0f, 1.0f - reflectance - transmittance);
-        const facetvk::Vertex& vertex = scene.vertices[facet * 3U];
-        const Vec3 normal{vertex.normal[0], vertex.normal[1], vertex.normal[2]};
         for (uint32_t localSide = 0; localSide < 2U; ++localSide) {
             const uint32_t side = facet * 2U + localSide;
-            const float sign = localSide == 0U ? 1.0f : -1.0f;
-            const Vec3 sideNormal = multiply(normal, sign);
-            const float sideEmissivity = ground ? infraredHapkeEmissivity(
-                emissivity, std::abs(sideNormal[1]),
-                scene.backgroundAngularStrength) : emissivity;
+            // Energy exchange is hemispherical. As for the shortwave albedo,
+            // the Lambert value is kept as the hemispherical emissivity; the
+            // Hapke directional emissivity (normalized at nadir) only shapes
+            // image products. Previously sloped ground used its zenith-view
+            // directional value here.
+            const float sideEmissivity = emissivity;
             optics[side].reflectance = std::clamp(
                 1.0f - transmittance - sideEmissivity, 0.0f, 1.0f);
             optics[side].transmittance = transmittance;
@@ -1173,7 +1417,7 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
                     1.0f - transmittance - emissivity, 0.0f, 1.0f);
             } else if (!object) {
                 reflectance = backgroundHapkeReflectance(
-                    reflectance, sun, sideNormal, sideNormal,
+                    reflectance, sun, kImageViewDirection, sideNormal,
                     scene.backgroundAngularStrength);
             }
             optics[side].reflectance = reflectance;
@@ -1191,7 +1435,7 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
             } else {
                 optics[side].directIrradiance =
                     sunlit[side] * std::max(0.0f, dot(sideNormal, sun)) *
-                    kBeamNormalIrradiance;
+                    bandBeamIrradiance(scene, parameters, band);
             }
         }
     }
@@ -1217,8 +1461,11 @@ void appendSurfaceStates(const Scene& scene,
     const facetvk::Direction direction = sunDirection(scene);
     const Vec3 sun{direction.x, direction.y, direction.z};
     const auto finish = [&](float value) {
-        value = std::max(0.0f, value * outputScale);
-        return clampUnit ? std::min(value, 1.0f) : value;
+        // Apparent reflectance above 1 is physical on sun-facing facets; the
+        // historical clampUnit flag no longer caps it (GPU spectral.comp
+        // finish() matches). Only negative values are removed.
+        (void)clampUnit;
+        return std::max(0.0f, value * outputScale);
     };
     for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
         const facetvk::Vertex& vertex = scene.vertices[facet * 3U];
@@ -1274,10 +1521,15 @@ void prepareGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const
         p[5] = object ? 1.0f : 0.0f;
         p[6] = sunlit[2U * f]; p[7] = sunlit[2U * f + 1U];
         p[8] = std::max(dot(normal, incoming), 1.0e-4f);
-        const float phase = std::acos(std::clamp(dot(incoming, normal), -1.0f, 1.0f));
+        // Image view direction (zenith) folded into this facet's hemisphere,
+        // exactly as backgroundHapkeReflectance does on the CPU path. Flipping
+        // both directions for the back side leaves mu and the phase unchanged.
+        Vec3 outgoing = kImageViewDirection;
+        if (dot(outgoing, normal) < 0) outgoing = multiply(outgoing, -1.0f);
+        const float phase = std::acos(std::clamp(dot(incoming, outgoing), -1.0f, 1.0f));
         p[9] = 1.0f / (1.0f + std::tan(0.5f * phase) / 0.1f);
         p[10] = std::abs(rawNormal[1]);
-        p[11] = std::max(dot(normal, normal), 1.0e-4f);
+        p[11] = std::max(dot(normal, outgoing), 1.0e-4f);
     }
     // Spectral tables and blackbody radiance are material properties: evaluate
     // once per material/band instead of repeating expm1 for every oriented side.
@@ -1297,7 +1549,8 @@ void prepareGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const
         }
     }
     model.beginSpectral(facets, materialBands, static_cast<uint32_t>(parameters.wavelengths.size()), materials,
-                        direction, scene.backgroundAngularStrength, kBeamNormalIrradiance);
+                        direction, scene.backgroundAngularStrength,
+                        bandBeamIrradiance(scene, parameters, 0));
 }
 
 std::vector<facetvk::SurfaceOptics> makeStateSpectralOptics(
@@ -1342,7 +1595,7 @@ std::vector<facetvk::SurfaceOptics> makeStateSpectralOptics(
             float emissivity = std::max(0.0f, 1.0f - reflectance - transmittance);
             if (!object && optical) {
                 reflectance = backgroundHapkeReflectance(
-                    reflectance, sun, sideNormal, sideNormal,
+                    reflectance, sun, kImageViewDirection, sideNormal,
                     scene.backgroundAngularStrength);
             } else if (!object) {
                 emissivity = infraredHapkeEmissivity(
@@ -1418,6 +1671,12 @@ public:
         m_center = multiply(add(extendedMinimum, extendedMaximum), 0.5f);
         m_radius = std::max(0.5f * std::sqrt(dot(diagonal, diagonal)) * 1.001f,
                             1.0e-4f);
+        // x/y window over the central block only (see makeProjection in
+        // facetrt_vulkan.cpp); depth keeps the replica-wide sphere.
+        const Vec3 centralDiagonal = subtract(scene.maximum, scene.minimum);
+        m_windowCenter = multiply(add(scene.minimum, scene.maximum), 0.5f);
+        m_windowRadius = std::max(
+            0.5f * std::sqrt(dot(centralDiagonal, centralDiagonal)) * 1.001f, 1.0e-4f);
     }
 
     uint32_t rasterize(const facetvk::Direction& inputDirection,
@@ -1451,10 +1710,11 @@ public:
                     vertex.position[0] + tileTranslation[0], vertex.position[1],
                     vertex.position[2] + tileTranslation[2]};
                 const Vec3 relative = subtract(position, m_center);
+                const Vec3 windowRelative = subtract(position, m_windowCenter);
                 projected[corner].x =
-                    (0.5f + 0.5f * dot(relative, right) / m_radius) * m_width - jitterX;
+                    (0.5f + 0.5f * dot(windowRelative, right) / m_windowRadius) * m_width - jitterX;
                 projected[corner].y =
-                    (0.5f + 0.5f * dot(relative, up) / m_radius) * m_height - jitterY;
+                    (0.5f + 0.5f * dot(windowRelative, up) / m_windowRadius) * m_height - jitterY;
                 projected[corner].depth =
                     0.5f - dot(relative, view) / (2.0f * m_radius);
             }
@@ -1531,18 +1791,22 @@ private:
     uint32_t m_layers{};
     Vec3 m_center{};
     float m_radius{};
+    Vec3 m_windowCenter{};
+    float m_windowRadius{};
     size_t m_pixelCount{};
     std::unique_ptr<std::atomic<uint32_t>[]> m_counts;
     std::vector<Fragment> m_fragments;
 };
 
 // Fragments of one pixel arrive in thread-dependent order; this total order
-// keeps the depth sort, and so the visibility graph, reproducible.
+// keeps the depth sort, and so the visibility graph, reproducible. Equal depths
+// use the GPU key (visibility_resolve/direct_resolve.comp compare cameraSide
+// with the replica bit 0x80000000 set): central fragments first, then side id.
 bool fragmentBefore(const Fragment& a, const Fragment& b)
 {
     if (a.depth != b.depth) return a.depth < b.depth;
-    if (a.cameraSide != b.cameraSide) return a.cameraSide < b.cameraSide;
-    return a.central > b.central;
+    if (a.central != b.central) return a.central;
+    return a.cameraSide < b.cameraSide;
 }
 
 using Progress = std::function<void(int, const std::string&)>;
@@ -1813,7 +2077,7 @@ void fillUnsampledSunlit(const Scene& scene, std::vector<float>& sunlit)
 facetvk::SolveResult solveCpu(const CpuGraph& graph,
                               const std::vector<facetvk::SurfaceOptics>& optics,
                               const Progress& progress,
-                              float skyRadiosity = kSkyDiffuseIrradiance,
+                              float skyRadiosity,
                               uint32_t maximumIterations = kIterations,
                               float relaxation = 1.0f)
 {
@@ -1953,11 +2217,13 @@ RunResult runCpu(const Scene& scene, const Progress& progress)
     const std::vector<facetvk::SurfaceOptics> optics = makeOptics(scene, result.sunlit);
     progress(80, "CPU radiosity solve");
     const auto solveBegin = Clock::now();
-    result.solution = solveCpu(graph, optics, progress);
+    // Same sky as the spectral path (Scene::skyDiffuseIrradiance; the legacy
+    // broadband path previously used 100 W m-2 against 50 in the spectral path).
+    result.solution = solveCpu(graph, optics, progress, scene.skyDiffuseIrradiance);
     progress(98, "CPU diffuse baseline and direct-light enhancement");
     const facetvk::SolveResult diffuseSolution =
         solveCpu(graph, withoutDirectLight(optics),
-                 [](int, const std::string&) {});
+                 [](int, const std::string&) {}, scene.skyDiffuseIrradiance);
     result.lightEnhancement =
         lightEnhancement(result.solution.radiosity, diffuseSolution.radiosity);
     const auto solveEnd = Clock::now();
@@ -1977,18 +2243,22 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
     const bool auditEnabled = auditFlag && std::string(auditFlag) == "1";
     std::vector<float> previousAuditRaw;
     bool previousThermal = false, allThermal = true, anyThermal = false;
-    const float reference = kBeamNormalIrradiance * std::max(0.0f, sunDirection(scene).y) + kSkyDiffuseIrradiance * 0.5f;
+    const float cosineSolarZenith = std::max(0.0f, sunDirection(scene).y);
     for (size_t band = 0; band < parameters.wavelengths.size(); ++band) {
         const float wavelength = parameters.wavelengths[band];
         const bool thermal = !isOpticalWavelength(wavelength);
         const bool warm = parameters.acceleratedSolver && band > 0 && previousThermal == thermal;
         allThermal = allThermal && thermal; anyThermal = anyThermal || thermal;
+        // Per-band light from the project settings (configureFacetRTLight).
+        const float beam = thermal ? 0.0f : bandBeamIrradiance(scene, parameters, band);
+        const float reference = beam * cosineSolarZenith + bandSkyIrradiance(scene, parameters, band);
         const float scale = thermal || reference <= 1e-8f ? 1.0f : 1.0f / reference;
-        const float sky = thermal ? planckRadiance(wavelength, parameters.skyTemperature) : kSkyDiffuseIrradiance * 0.5f;
+        const float sky = thermal ? planckRadiance(wavelength, parameters.skyTemperature)
+                                  : bandSkyIrradiance(scene, parameters, band);
         progress(82 + static_cast<int>(15U * band / parameters.wavelengths.size()),
                  "GPU resident spectral solve " + std::to_string(band + 1U) + "/" + std::to_string(parameters.wavelengths.size()));
         const auto stats = model.solveSpectralBand(static_cast<uint32_t>(band), thermal, sky, scale,
-                                                   parameters.acceleratedSolver, warm);
+                                                   parameters.acceleratedSolver, warm, false, beam);
         result.spectralIterations.push_back(stats.iterations);
         if (band == 0) {
             result.solution.iterations = stats.iterations; result.solution.maxDelta = stats.maxDelta;
@@ -2022,11 +2292,11 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
                                                             : referenceSolve.iterations - stats.iterations);
             std::vector<float> states;
             appendSurfaceStates(scene, optics, emission, referenceSolve.radiosity,
-                                thermal ? 0.0f : kBeamNormalIrradiance, scale, !thermal, states);
+                                beam, scale, !thermal, states);
             for (size_t side = 0; side < optics.size(); ++side) {
                 check(audit.raw[side], referenceSolve.radiosity[side], result.spectralRawError);
                 const float value = thermal ? referenceSolve.radiosity[side]
-                    : std::clamp(referenceSolve.radiosity[side] / reference, 0.0f, 1.0f);
+                    : std::clamp(referenceSolve.radiosity[side] * scale, 0.0f, 1.0f);
                 check(audit.output[side], value, result.spectralOutputError);
             }
             for (size_t k = 0; k < states.size(); ++k) check(audit.states[k], states[k], result.spectralStatesError);
@@ -2035,7 +2305,7 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
             ++result.spectralBandsChecked;
         }
         if (band == 0 && !thermal) {
-            model.solveSpectralBand(0, false, sky, scale, parameters.acceleratedSolver, false, true);
+            model.solveSpectralBand(0, false, sky, scale, parameters.acceleratedSolver, false, true, beam);
         }
         previousThermal = thermal;
     }
@@ -2094,10 +2364,10 @@ RunResult runGpu(const Scene& scene,
         const std::vector<facetvk::SurfaceOptics> optics =
             makeOptics(scene, result.sunlit);
         result.solution =
-            model.solve(optics, kSkyDiffuseIrradiance, kIterations, 1.0f);
+            model.solve(optics, scene.skyDiffuseIrradiance, kIterations, 1.0f);
         progress(98, "GPU diffuse baseline and direct-light enhancement");
         const facetvk::SolveResult diffuseSolution =
-            model.solve(withoutDirectLight(optics), kSkyDiffuseIrradiance,
+            model.solve(withoutDirectLight(optics), scene.skyDiffuseIrradiance,
                         kIterations, 1.0f);
         result.lightEnhancement =
             lightEnhancement(result.solution.radiosity,
@@ -2121,12 +2391,14 @@ RunResult runGpu(const Scene& scene,
         std::vector<float> previousRawRadiosity;
         const float cosineSolarZenith =
             std::max(0.0f, sunDirection(scene).y);
-        const float opticalReferenceIrradiance =
-            kBeamNormalIrradiance * cosineSolarZenith +
-            kSkyDiffuseIrradiance * 0.5f;
         for (size_t band = 0; band < spectralParameters->wavelengths.size(); ++band) {
             const float wavelength = spectralParameters->wavelengths[band];
             const bool thermal = !isOpticalWavelength(wavelength);
+            // Per-band light, identical to runGpuSpectral.
+            const float bandBeam = thermal ? 0.0f
+                : bandBeamIrradiance(scene, *spectralParameters, band);
+            const float opticalReferenceIrradiance = bandBeam * cosineSolarZenith +
+                bandSkyIrradiance(scene, *spectralParameters, band);
             allThermal = allThermal && thermal;
             anyThermal = anyThermal || thermal;
             progress(82 + static_cast<int>(
@@ -2143,7 +2415,7 @@ RunResult runGpu(const Scene& scene,
             const float skyRadiance = thermal
                 ? planckRadiance(wavelength,
                                  spectralParameters->skyTemperature)
-                : kSkyDiffuseIrradiance * 0.5f;
+                : bandSkyIrradiance(scene, *spectralParameters, band);
             const std::vector<float>* initialRadiosity =
                 spectralParameters->acceleratedSolver && hasPreviousBand &&
                 previousBandWasThermal == thermal
@@ -2163,7 +2435,7 @@ RunResult runGpu(const Scene& scene,
                 hasPreviousBand = true;
             }
             appendSurfaceStates(scene, optics, stateEmission, bandSolution.radiosity,
-                                thermal ? 0.0f : kBeamNormalIrradiance,
+                                bandBeam,
                                 thermal || opticalReferenceIrradiance <= 1.0e-8f
                                     ? 1.0f : 1.0f / opticalReferenceIrradiance,
                                 !thermal, result.bandStates);
@@ -2172,8 +2444,8 @@ RunResult runGpu(const Scene& scene,
             // same direct and diffuse illumination used by this solve.
             if (!thermal && opticalReferenceIrradiance > 1.0e-8f) {
                 for (float& value : bandSolution.radiosity) {
-                    value = std::clamp(
-                        value / opticalReferenceIrradiance, 0.0f, 1.0f);
+                    value = std::max(
+                        value / opticalReferenceIrradiance, 0.0f);
                 }
             }
             if (multiBand) {
@@ -2194,9 +2466,8 @@ RunResult runGpu(const Scene& scene,
                                   kIterations, 1.0f);
                     if (opticalReferenceIrradiance > 1.0e-8f) {
                         for (float& value : diffuseSolution.radiosity) {
-                            value = std::clamp(
-                                value / opticalReferenceIrradiance,
-                                0.0f, 1.0f);
+                            value = std::max(
+                                value / opticalReferenceIrradiance, 0.0f);
                         }
                     }
                     result.lightEnhancement = lightEnhancement(
@@ -2386,7 +2657,7 @@ std::string facetInputView(const std::string& path)
         << "<couplingIterations>" << ProjectJson::integer(control, "couplingIterations", 60) << "</couplingIterations>"
         << "<temperatureTolerance>" << ProjectJson::number(control, "temperatureTolerance", 0.05f) << "</temperatureTolerance>"
         << "<stabilityCorrection>" << (ProjectJson::boolean(control, "stabilityCorrection", false) ? 1 : 0) << "</stabilityCorrection>"
-        << "<temperatureRelaxation>" << ProjectJson::number(control, "temperatureRelaxation", 0.5f) << "</temperatureRelaxation>"
+        << "<temperatureRelaxation>" << ProjectJson::number(control, "temperatureRelaxation", 0.8f) << "</temperatureRelaxation>"
         << "<spectralAccelerationWidth>" << ProjectJson::number(control, "spectralAccelerationWidth", 100.0f) << "</spectralAccelerationWidth>"
         << "<radiationSolver>" << xmlEscaped(ProjectJson::string(control, "radiationSolver", "traditional")) << "</radiationSolver>"
         << "<vegetationTemperatureMethod>" << ProjectJson::integer(control, "vegetationTemperatureMethod", 0) << "</vegetationTemperatureMethod>"
@@ -2563,9 +2834,13 @@ std::string facetInputView(const std::string& path)
     }
     xml << "</Biochemistry></Attribute><Meteorology>"
         << "<filePath>" << xmlEscaped(project.meteorologyPath().string()) << "</filePath>"
-        << "<referenceHeight>" << ProjectJson::number(meteo, "z", 10) << "</referenceHeight>"
-        << "<initialSoilTemperature>" << ProjectJson::number(meteo, "Tsold", 300) << "</initialSoilTemperature>"
-        << "<carbonDioxide>" << ProjectJson::number(meteo, "Ca", 380) << "</carbonDioxide>"
+        << "<referenceHeight>" << ProjectJson::number(meteo, "z", 10) << "</referenceHeight>";
+    // Initial soil temperature only when the project sets a number. Absent or
+    // null Tsold leaves the tag out, and FacetEB starts the ground from the
+    // first meteorological air temperature (the documented default).
+    if (const float tsold = ProjectJson::number(meteo, "Tsold", -1.0f); tsold > 0.0f)
+        xml << "<initialSoilTemperature>" << tsold << "</initialSoilTemperature>";
+    xml << "<carbonDioxide>" << ProjectJson::number(meteo, "Ca", 380) << "</carbonDioxide>"
         << "<startTimeNode>" << ProjectJson::integer(meteo, "start", 0) << "</startTimeNode>"
         << "<endTimeNode>" << ProjectJson::integer(meteo, "end", 1) << "</endTimeNode>"
         << "<dTime>" << ProjectJson::number(meteo, "dTime", 1800) << "</dTime>"
@@ -3062,6 +3337,16 @@ static float directHorizontalToNormal(float totalShortwave, float directSpectrum
     return std::min(1400.0f, horizontalDirect / cosineSolarZenith) / horizontalDirect;
 }
 
+// Part of the horizontal direct irradiance that survives the beam-normal
+// conversion above (1 normally; < 1 when the sun is below cos 1e-4 or the
+// 1400 W m-2 cap applies). Callers add the remainder to the sky diffuse so
+// the horizontal shortwave total stays equal to the forcing (energy and image).
+static float directHorizontalKeptFraction(float directNormalFactor,
+                                          float cosineSolarZenith)
+{
+    return std::clamp(directNormalFactor * std::max(cosineSolarZenith, 0.0f), 0.0f, 1.0f);
+}
+
 std::vector<float> readScalarSpectrum(const std::filesystem::path& path)
 {
     std::ifstream input(path);
@@ -3097,23 +3382,75 @@ ShortwaveSpectrum loadShortwaveSpectrum(
     }
     spectrum.direct.resize(count);
     spectrum.diffuse.resize(count);
-    double integral = 0.0;
-    for (size_t index = 0; index + 1U < count; ++index) {
-        integral += 0.5 * (
-            spectrum.direct[index] + spectrum.direct[index + 1U] +
-            spectrum.diffuse[index] + spectrum.diffuse[index + 1U]);
-    }
-    // Samples are spaced by 1 nm; convert the integral to micrometres.
-    integral *= 0.001;
-    if (!(integral > 0.0) || !std::isfinite(integral)) {
-        spectrum.direct.assign(N1, 0.5f * directFraction);
-        spectrum.diffuse.assign(N1, 0.5f * (1.0f - directFraction));
-        return spectrum;
-    }
-    const float inverseIntegral = static_cast<float>(1.0 / integral);
-    for (float& value : spectrum.direct) value *= inverseIntegral;
-    for (float& value : spectrum.diffuse) value *= inverseIntegral;
+    // As VoxelEB (fileio.cpp atomConds): each file only supplies a spectral
+    // shape; the configured directScatteringRatio sets the direct/diffuse split.
+    // (The shapes were previously normalized jointly, so the split came from
+    // the files, about 0.806 for the bundled Esun_/Esky_, and the setting was
+    // ignored whenever the files existed.)
+    const auto normalizeShape = [count](std::vector<float>& values, float fraction) {
+        double integral = 0.0;
+        for (size_t index = 0; index + 1U < count; ++index)
+            integral += 0.5 * (values[index] + values[index + 1U]);
+        // Samples are spaced by 1 nm; convert the integral to micrometres.
+        integral *= 0.001;
+        if (!(integral > 0.0) || !std::isfinite(integral)) {
+            // Flat per-micrometre shape with the requested integral.
+            values.assign(count, static_cast<float>(fraction / (0.001 * double(count - 1U))));
+            return;
+        }
+        const float scale = static_cast<float>(fraction / integral);
+        for (float& value : values) value *= scale;
+    };
+    const float fraction = std::clamp(directFraction, 0.0f, 1.0f);
+    normalizeShape(spectrum.direct, fraction);
+    normalizeShape(spectrum.diffuse, 1.0f - fraction);
     return spectrum;
+}
+
+// FacetRT illumination. Without light settings (OBJ input, or XML without
+// directScatteringRatio/Esun/Esky) the historical 700 W m-2 beam-normal and
+// 50 W m-2 sky are kept. Otherwise the same Esun/Esky shapes and
+// directScatteringRatio as FacetEB are used with the historical horizontal
+// total for this sun (700 cos + 50 W m-2; optical outputs are normalized, so
+// only the direct/diffuse split and the spectral shape matter). Direct light
+// lost to low sun or the beam cap is returned to the sky diffuse.
+void configureFacetRTLight(const std::string& xml, const std::filesystem::path& inputPath,
+                           Scene& scene, FacetRTParameters& parameters)
+{
+    parameters.bandBeamNormal.clear();
+    parameters.bandSkyDiffuse.clear();
+    if (xml.empty()) return;
+    const bool hasRatio = !trim(firstXmlTag(xml, "directScatteringRatio")).empty();
+    const bool hasSpectra = !trim(firstXmlTag(xml, "esunFileName")).empty() &&
+                            !trim(firstXmlTag(xml, "eskyFileName")).empty();
+    if (!hasRatio && !hasSpectra) return;
+    const float directFraction = std::clamp(
+        xmlFloat(xml, "directScatteringRatio", 0.8f), 0.0f, 1.0f);
+    const ShortwaveSpectrum spectrum = loadShortwaveSpectrum(xml, inputPath, directFraction);
+    const size_t samples = spectrum.sampleCount();
+    if (samples < 2U) return;
+    const float cosine = std::max(0.0f, sunDirection(scene).y);
+    const float total = kBeamNormalIrradiance * cosine + kSkyDiffuseIrradiance * 0.5f;
+    const float directIntegral = spectrum.integrate(spectrum.direct, 0U, samples - 1U);
+    const float diffuseIntegral = spectrum.integrate(spectrum.diffuse, 0U, samples - 1U);
+    const float normalFactor = directHorizontalToNormal(total, directIntegral, cosine);
+    const float lost = 1.0f - directHorizontalKeptFraction(normalFactor, cosine);
+    scene.beamNormalIrradiance = total * directIntegral * normalFactor;
+    scene.skyDiffuseIrradiance = total * (diffuseIntegral + directIntegral * lost);
+    parameters.bandBeamNormal.resize(parameters.wavelengths.size(), 0.0f);
+    parameters.bandSkyDiffuse.resize(parameters.wavelengths.size(), 0.0f);
+    for (size_t band = 0; band < parameters.wavelengths.size(); ++band) {
+        const float wavelength = parameters.wavelengths[band];
+        if (!isOpticalWavelength(wavelength)) continue; // thermal: sky from skyTemperature
+        // Spectral irradiance per nm, the same units as the FacetEB images.
+        const float direct = total * spectrum.directAt(wavelength) * 0.001f;
+        parameters.bandBeamNormal[band] = direct * normalFactor;
+        parameters.bandSkyDiffuse[band] =
+            total * spectrum.diffuseAt(wavelength) * 0.001f + direct * lost;
+    }
+    std::cout << "facetrt: illumination from light settings, direct fraction "
+              << directFraction << ", beam normal " << scene.beamNormalIrradiance
+              << " W m-2, sky " << scene.skyDiffuseIrradiance << " W m-2" << std::endl;
 }
 
 struct ObjGeometry {
@@ -3465,6 +3802,13 @@ Scene loadProjectScene(const std::string& inputFile)
         // sampling without requiring a multi-gigabyte fragment buffer.
         scene.visibilityRasterLayers = kLargeSceneRasterLayers;
     }
+    // Developer/validation override of the visibility raster (e.g. a 4096
+    // reference run to measure sampling bias): 512..8192, power of two.
+    if (const char* requestedRaster = std::getenv("HISTREAM_FACET_RASTER_SIZE")) {
+        const int size = std::atoi(requestedRaster);
+        if (size >= 512 && size <= 8192 && (size & (size - 1)) == 0)
+            scene.visibilityRasterSize = static_cast<uint32_t>(size);
+    }
     const FacetRTParameters radiativeParameters =
         facetRTParametersFromInput(xml, inputPath);
     scene.backgroundAngularStrength = std::clamp(
@@ -3518,7 +3862,32 @@ Scene loadProjectScene(const std::string& inputFile)
                                   radiativeParameters.wavelengths,
                                   opticalCoefficients, inputPath, material);
             const auto physicalName=physicalNames.empty()?std::string{}:physicalNames[std::min(index,physicalNames.size()-1U)];
-            const auto physical=namedXmlBlock(xml,"surfaceEnergy",physicalName);
+            // An empty name would match the first surfaceEnergy block of any material.
+            const auto physical=physicalName.empty()?std::string{}:namedXmlBlock(xml,"surfaceEnergy",physicalName);
+            if(physical.empty()) {
+                // No explicit surface-energy block (direct XML input, or an object
+                // whose material is missing from the project): classify by the
+                // object type instead of assuming leaves. Rule, in order:
+                //  1. componentType Vegetation -> leaf, unless the material name
+                //     marks woody parts (*wood*, e.g. tree_trunk_wood);
+                //  2. any other non-empty componentType (Building, Water, Soil, ...)
+                //     -> solid surface, no stomata/photosynthesis;
+                //  3. no componentType (legacy XML): leafBio block -> leaf,
+                //     soilSet/waterSet block -> solid, otherwise leaf (legacy default).
+                std::string lowered = physicalName;
+                std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                const bool woody = lowered.find("wood") != std::string::npos;
+                if (componentType == "Vegetation") material.vegetation = !woody;
+                else if (!componentType.empty()) material.vegetation = false;
+                else if (!physicalName.empty() && !namedXmlBlock(xml, "leafBio", physicalName).empty())
+                    material.vegetation = true;
+                else if (!physicalName.empty() &&
+                         (!namedXmlBlock(xml, "soilSet", physicalName).empty() ||
+                          !namedXmlBlock(xml, "waterSet", physicalName).empty()))
+                    material.vegetation = false;
+                else material.vegetation = !woody;
+            }
             if(!physical.empty()) {
                 material.photovoltaic=xmlFloat(physical,"photovoltaic",0)>0.5f;
                 material.vegetation=xmlFloat(physical,"vegetation",1)>0.5f && !material.photovoltaic;
@@ -3736,22 +4105,35 @@ try {
     }
     const std::string resultFile = outputFileFromInput(inputPath, outputFile, "facetrt.json");
     const std::filesystem::path input(inputPath);
-    const Scene scene = input.extension() == ".obj" || input.extension() == ".OBJ"
+    Scene scene = input.extension() == ".obj" || input.extension() == ".OBJ"
         ? loadTreeWithSoil(inputPath)
         : loadProjectScene(inputPath);
     const std::string xml =
         input.extension() == ".obj" || input.extension() == ".OBJ"
         ? std::string{} : readTextFile(inputPath);
-    const FacetRTParameters parameters =
+    FacetRTParameters parameters =
         xml.empty() ? FacetRTParameters{} : facetRTParametersFromInput(xml, input);
+    // Same light source as FacetEB (Esun/Esky shapes, directScatteringRatio).
+    configureFacetRTLight(xml, input, scene, parameters);
     const Progress progress = [](int value, const std::string& stage) {
         std::cout << "PROGRESS\t" << value << '\t' << stage << std::endl;
     };
     const std::string requestedBackend = facetBackendFromInput(xml);
+    // The retained CPU rasterizer cannot resume after a full fragment list, so
+    // repeat the whole run with a deeper A-buffer instead of failing.
+    const auto runCpuWithLayerRetry = [&]() {
+        for (;;) {
+            try {
+                return runCpu(scene, progress);
+            } catch (const std::exception& error) {
+                if (!isCpuRasterOverflow(error) || !growCpuRasterLayers(scene)) throw;
+            }
+        }
+    };
     RunResult result;
     if (requestedBackend == "cpu") {
         std::cout << "facetrt: using retained CPU raster backend, " << cpuThreadCount() << " threads" << std::endl;
-        result = runCpu(scene, progress);
+        result = runCpuWithLayerRetry();
     } else if (requestedBackend == "auto") {
         try {
             result = runGpu(scene, shaderDirectory, progress,
@@ -3759,7 +4141,7 @@ try {
         } catch (const std::exception& gpuError) {
             std::cerr << "facetrt: GPU backend unavailable (" << gpuError.what()
                       << "); falling back to retained CPU raster backend\n";
-            result = runCpu(scene, progress);
+            result = runCpuWithLayerRetry();
         }
     } else {
         result = runGpu(scene, shaderDirectory, progress,
@@ -3834,12 +4216,15 @@ try {
     const float temperatureTolerance = std::clamp(
         xmlFloat(xml, "temperatureTolerance", 0.05f), 0.001f, 10.0f);
     const float temperatureRelaxation = std::clamp(
-        xmlFloat(xml, "temperatureRelaxation", 0.5f), 0.05f, 1.0f);
+        xmlFloat(xml, "temperatureRelaxation", 0.8f), 0.05f, 1.0f);
     FacetRunIndex runIndex{outputDirectory / "faceteb_run.json", {
         {"kind", "faceteb-run"}, {"schemaVersion", 1}, {"status", "running"},
         {"startedAt", utcTimestamp()}, {"input", inputPath},
         {"requested", {{"startNode", startNode}, {"endNodeExclusive", endNode}}},
         {"convergence", {{"temperatureTolerance_K", temperatureTolerance},
+            // The setting is kept for compatibility; convergence is decided by
+            // the energy-residual criterion below only.
+            {"temperatureToleranceRole", "recorded only; not part of the convergence criterion"},
             {"iterationBudget", maximumCouplingIterations},
             {"stomatalSearchMaxIterations", facetphysics::leafStomatalMaxIterations},
             {"stomatalInnerLogTolerance", facetphysics::leafStomatalLogTolerance},
@@ -3848,8 +4233,9 @@ try {
             {"stomatalMismatchDiagnosticOnly", true},
             {"energyResidualThreshold_W_m2", facetphysics::facetEnergyResidualThreshold},
             {"maximumFailingFacetFractionExclusive", 0.001},
+            {"maximumTemperatureEquivalentResidual_K", facetphysics::facetEnergyMaxEquivalentK},
             {"facetCounting", "one facet; maximum absolute residual over both solved states and independent sides"},
-            {"criterion", "count(facets with abs(energy residual) >= 2 W/m2) / total facets < 0.001; all other metrics are diagnostic only"}}},
+            {"criterion", "count(facets with abs(energy residual) >= 2 W/m2) / total facets < 0.001 AND max over facet sides of abs(residual)/(dR/dT) <= 0.5 K"}}},
         {"completed", ProjectJson::Json::array()}, {"products", ProjectJson::Json::array()}
     }};
     runIndex.write();
@@ -3996,12 +4382,19 @@ try {
     bool useCpuBackend = requestedBackend == "cpu";
     facetvk::GraphDiagnostics graph;
     const auto buildCpuBackend = [&]() {
-        std::cout << "PROGRESS\t5\t构建 CPU 面元可见性图（" << cpuThreadCount() << " 线程）" << std::endl;
-        cpuGraph = buildCpuGraph(scene, [](int value, const std::string& stage) {
-            std::cout << "PROGRESS\t" << value << '\t' << stage << std::endl;
-        });
-        graph = cpuGraph.diagnostics;
-        useCpuBackend = true;
+        for (;;) {
+            try {
+                std::cout << "PROGRESS\t5\t构建 CPU 面元可见性图（" << cpuThreadCount() << " 线程）" << std::endl;
+                cpuGraph = buildCpuGraph(scene, [](int value, const std::string& stage) {
+                    std::cout << "PROGRESS\t" << value << '\t' << stage << std::endl;
+                });
+                graph = cpuGraph.diagnostics;
+                useCpuBackend = true;
+                return;
+            } catch (const std::exception& error) {
+                if (!isCpuRasterOverflow(error) || !growCpuRasterLayers(scene)) throw;
+            }
+        }
     };
     if (useCpuBackend) {
         buildCpuBackend();
@@ -4027,6 +4420,20 @@ try {
                        skyRadiosity, iterations, relaxation)
             : model.solve(optics, skyRadiosity, iterations, relaxation);
     };
+    // Shortwave energy windows: visible windows (r+t ~ 0.1-0.2) converge in a
+    // handful of Jacobi sweeps, NIR windows need many more. On the GPU stop
+    // once the last sweep changes no side by more than 1e-5 of the window
+    // irradiance (error <= delta * w / (1 - w), i.e. <= 1e-4 relative for
+    // w = 0.9), checked every 8 sweeps, instead of always running 64.
+    const auto solveShortwaveWindow = [&](const std::vector<facetvk::SurfaceOptics>& optics,
+                                          float skyRadiosity,
+                                          float referenceIrradiance) {
+        if (useCpuBackend)
+            return solveRadiation(optics, skyRadiosity, kIterations, 1.0f);
+        const float tolerance = std::max(1.0e-6f, 1.0e-5f * referenceIrradiance);
+        return model.solveAccelerated(optics, skyRadiosity, nullptr,
+                                      kIterations, 8U, tolerance, 1.0f);
+    };
     const auto incidentRadiation = [&](const facetvk::SolveResult& solution,
                                        const std::vector<facetvk::SurfaceOptics>& optics,
                                        float skyRadiosity) {
@@ -4035,11 +4442,20 @@ try {
             : model.incidentIrradiance(solution, optics, skyRadiosity);
     };
     const auto computeSunlit = [&]() {
-        std::vector<float> sunlit = useCpuBackend
-            ? computeCpuSunlit(scene)
-            : model.computeSunlitFraction(sunDirection(scene));
-        fillUnsampledSunlit(scene, sunlit);
-        return sunlit;
+        for (;;) {
+            try {
+                std::vector<float> sunlit = useCpuBackend
+                    ? computeCpuSunlit(scene)
+                    : model.computeSunlitFraction(sunDirection(scene));
+                fillUnsampledSunlit(scene, sunlit);
+                return sunlit;
+            } catch (const std::exception& error) {
+                // Only the retained CPU rasterizer throws here; the GPU grows
+                // its own A-buffer and rebuilds the visibility graph.
+                if (!useCpuBackend || !isCpuRasterOverflow(error) ||
+                    !growCpuRasterLayers(scene)) throw;
+            }
+        }
     };
 
     const char* energyBackend = std::getenv("HISTREAM_FACET_ENERGY_BACKEND");
@@ -4085,6 +4501,9 @@ try {
     const float configuredSoilTemperature = xmlFloat(xml, "initialSoilTemperature", -1.0f);
     const bool hasInitialSoilTemperature =
         configuredSoilTemperature >= 150.0f && configuredSoilTemperature <= 400.0f;
+    runIndex.value["initialSoilTemperature"] = hasInitialSoilTemperature
+        ? ProjectJson::Json{{"source", "configured"}, {"value_K", configuredSoilTemperature}}
+        : ProjectJson::Json{{"source", "first meteorological air temperature"}};
     const float columnExtentX = std::max(1.0e-3f, scene.maximum[0] - scene.minimum[0]);
     const float columnExtentZ = std::max(1.0e-3f, scene.maximum[2] - scene.minimum[2]);
     const float columnSize = std::clamp(
@@ -4241,13 +4660,24 @@ try {
             geometry << vertex.position[0] << ',' << vertex.position[1]
                      << ',' << vertex.position[2];
         }
-        geometry << "]\n}\n";
+        geometry << "],\n  \"wavelengths\": [";
+        // Actual engine band list and per-side node-record width
+        // (energy_T=*.bin: 11 scalars + lit/shaded per band).
+        for (size_t band = 0; band < radiativeParameters.wavelengths.size(); ++band) {
+            if (band) geometry << ',';
+            geometry << radiativeParameters.wavelengths[band];
+        }
+        geometry << "],\n  \"stepRecordFloats\": "
+                 << (11U + 2U * radiativeParameters.wavelengths.size()) << "\n}\n";
         geometry.close();
         if (!geometry) throw std::runtime_error("FacetEB cannot write shared geometry");
     }
     const auto totalBegin = Clock::now();
     double lumpedElapsedSeconds=0;
     for (int node = startNode; node < endNode; ++node) {
+        const auto nodeBegin = Clock::now();
+        auto shortwaveDone = nodeBegin;
+        auto couplingDone = nodeBegin;
         const float dTime=nodeTimeSteps.empty()?std::max(1.0f,xmlFloat(xml,"dTime",1800.0f)):nodeTimeSteps[size_t(node)];
         const double lumpedPreviousSeconds=lumpedElapsedSeconds;
         lumpedElapsedSeconds+=dTime;
@@ -4340,6 +4770,10 @@ try {
             : 0.0f;
         const float directNormalFactor = directHorizontalToNormal(
             totalShortwave, directSpectrumIntegral, cosineSolarZenith);
+        // Horizontal direct dropped by the conversion (sun below cos 1e-4 or
+        // the beam cap) is added to the sky diffuse: total shortwave is conserved.
+        const float lostDirectFraction = 1.0f -
+            directHorizontalKeptFraction(directNormalFactor, cosineSolarZenith);
         std::vector<float> absorbedParPhotons(surfaceCount, 0.0f);
         std::vector<float> incidentParPhotons(surfaceCount, 0.0f);
         if (totalShortwave > 0.0f && shortwaveSampleCount >= 2U) {
@@ -4370,24 +4804,30 @@ try {
                 const float windowDirectNormal =
                     totalShortwave * directFraction * directNormalFactor;
                 const float windowDiffuse =
-                    totalShortwave * diffuseFraction;
+                    totalShortwave * (diffuseFraction + directFraction * lostDirectFraction);
                 const std::vector<facetvk::SurfaceOptics> windowOptics =
                     makeEnergyShortwaveOptics(
-                        scene, sunlit, windowDirectNormal, firstSample,
+                        scene, sunlit, windowDirectNormal, windowDiffuse, firstSample,
                         lastSample, spectralWeight);
                 // Photon conversion at the irradiance-weighted window wavelength.
                 const float windowWavelength = windowBandValue(
                     wavelengthNm, firstSample, lastSample, spectralWeight,
                     400.0f + static_cast<float>(firstSample + lastSample) / 2.0f);
-                const facetvk::SolveResult windowSolution = solveRadiation(
-                    windowOptics, windowDiffuse, kIterations, 1.0f);
+                const facetvk::SolveResult windowSolution = solveShortwaveWindow(
+                    windowOptics, windowDiffuse, windowDirectNormal + windowDiffuse);
                 const std::vector<float> windowIncident =
                     incidentRadiation(
                         windowSolution, windowOptics, windowDiffuse);
-                const facetvk::SolveResult windowDiffuseSolution =
-                    solveRadiation(
+                // The direct-free solve only feeds lightEnhancement, which is
+                // reported for the final node; skip it on every other node.
+                facetvk::SolveResult windowDiffuseSolution;
+                if (node == endNode - 1) {
+                    windowDiffuseSolution = solveShortwaveWindow(
                         withoutDirectLight(windowOptics), windowDiffuse,
-                        kIterations, 1.0f);
+                        windowDirectNormal + windowDiffuse);
+                } else {
+                    windowDiffuseSolution.radiosity.assign(surfaceCount, 0.0f);
+                }
                 for (size_t side = 0; side < surfaceCount; ++side) {
                     const float absorptance = std::clamp(
                         1.0f - windowOptics[side].reflectance -
@@ -4428,6 +4868,7 @@ try {
             }
         }
 
+        shortwaveDone = Clock::now();
         const float skyLongwave = meteo.longwave > 0.0f
             ? meteo.longwave
             : kStefanBoltzmann * std::pow(skyTemperature, 4.0f);
@@ -4470,7 +4911,10 @@ try {
         uint32_t failingEnergyFacets = 0;
         double lumpedSurfaceResidual=0;
         const auto energyConverged = [&]() {
-            return facetphysics::facetEnergyConverged(failingEnergyFacets, scene.facetCount()) && lumpedSurfaceResidual<2;
+            return facetphysics::facetEnergyConverged(
+                       failingEnergyFacets, scene.facetCount(),
+                       maximumEnergyResidualEquivalent) &&
+                lumpedSurfaceResidual<2;
         };
         // The maximum over states/sides prevents cancellation and double counting.
         const auto countFailingEnergyFacets = [&]() {
@@ -5091,6 +5535,7 @@ try {
             updateStability(false);
         }
         const bool converged = energyConverged();
+        couplingDone = Clock::now();
         allNodesConverged = allNodesConverged && converged;
         ProjectJson::Json diagnostic{
             {"node", node}, {"converged", converged}, {"stabilityCorrection", stabilityCorrection},
@@ -5185,10 +5630,12 @@ try {
                 ? totalShortwave * shortwaveSpectrum.directAt(wavelength) * 0.001f
                 : 0.0f;
             const float diffuseSpectralIrradiance = optical
-                ? totalShortwave * shortwaveSpectrum.diffuseAt(wavelength) * 0.001f
+                ? totalShortwave * shortwaveSpectrum.diffuseAt(wavelength) * 0.001f +
+                    directSpectralIrradiance * lostDirectFraction
                 : 0.0f;
             // Same illumination as the energy solve: horizontal direct
-            // irradiance converted to the beam-normal value, full sky diffuse.
+            // irradiance converted to the beam-normal value, sky diffuse plus
+            // any direct share dropped by that conversion.
             const float directNormalSpectralIrradiance =
                 directSpectralIrradiance * directNormalFactor;
             std::vector<std::array<float, 2>> stateEmission;
@@ -5201,8 +5648,14 @@ try {
                 ? diffuseSpectralIrradiance
                 // DEFERRED[低] 物理: 热红外图像的天空辐射用固定 skyTemperature 的普朗克辐射，而能量平衡用的是气象驱动 meteo.longwave（Rli）；两者不一致会使热红外图像与求得的温度场不自洽；建议：由 Rli 反推等效天空亮温 (Rli/σ)^(1/4) 用于光谱天空辐射。
                 : planckRadiance(wavelength, skyTemperature);
-            const facetvk::SolveResult spectralSolution = solveRadiation(
-                spectralOptics, skySpectralRadiance, kIterations, 1.0f);
+            // Same residual-based early exit as the shortwave windows, scaled
+            // by the band's illumination (optical) or by the Planck radiance
+            // at air temperature (thermal; r+t is small there).
+            const float bandReference = optical
+                ? directNormalSpectralIrradiance + diffuseSpectralIrradiance
+                : std::max(skySpectralRadiance, planckRadiance(wavelength, airTemperature));
+            const facetvk::SolveResult spectralSolution = solveShortwaveWindow(
+                spectralOptics, skySpectralRadiance, bandReference);
             spectralStates[band].reserve(surfaceCount * 2U);
             if (optical) {
                 // Reflectance factor relative to the global horizontal
@@ -5432,6 +5885,18 @@ try {
         std::cout << "FACET_CONVERGENCE\t" << node << '\t' << (converged ? 1 : 0)
                   << '\t' << couplingIterations << '\t' << maximumTemperatureDelta
                   << '\t' << maximumEnergyResidual << '\t' << maximumEnergyResidualEquivalent << std::endl;
+        {
+            const auto seconds = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double>(b - a).count();
+            };
+            const auto nodeEnd = Clock::now();
+            // Per-node phase timing (s): shortwave windows, RT-EB coupling,
+            // band images + products. Parsed by the server for ETA/diagnostics.
+            std::cout << "FACET_TIMING\t" << node << '\t'
+                      << seconds(nodeBegin, shortwaveDone) << '\t'
+                      << seconds(shortwaveDone, couplingDone) << '\t'
+                      << seconds(couplingDone, nodeEnd) << std::endl;
+        }
         }
         if (synchronizeStepOutput) {
             // Backpressure: never overlap the next GPU solve with the current
@@ -5494,6 +5959,10 @@ try {
         }
         output << ']' << (comma ? "," : "") << '\n';
     };
+    // Actual engine band list and per-side record width of the node files
+    // (11 scalars + lit/shaded per band), so readers need not rebuild them.
+    writeArray("wavelengths", radiativeParameters.wavelengths, true);
+    output << "  \"stepRecordFloats\": " << (11U + 2U * radiativeParameters.wavelengths.size()) << ",\n";
     writeArray("sunlit", latest.sunlit, true);
     writeArray("radiosity", latest.solution.radiosity, true);
     writeArray("lightEnhancement", latest.lightEnhancement, true);

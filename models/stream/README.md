@@ -3,7 +3,7 @@
 Stream Studio 中与 HiStream 三维引擎相互独立的影像级引擎：一次运行对应一个过境时刻，输出整景光学反射率、热红外亮温与方向温度。组分温度有两种来源：
 
 - **RT**：已知组分温度，直接给出 Tss/Tsh/Tcs/Tch（常数、单波段/24 波段栅格，或 4 波段 `components.tif`）；
-- **EB**：未知温度，由 ERA5 / ERA5-Land 逐小时数据（一天到一年的数据包）驱动，从过境当天 00 UTC 逐时次求解四组分能量平衡到过境时刻，再成像。物理与默认值对齐 TiRT/TIRTEB：`hom3` 节点辐射度全阶长波与短波、均匀冠层标准热点闭合、Raupach 气动阻抗（含对流阵风与 400 s m⁻¹ 分段限幅）、Farquhar 气孔 `g0` 下限、1/L 松弛稳定度、7 h 表面热历史或 2 m 土柱。
+- **EB**：未知温度，由 ERA5 / ERA5-Land 逐小时数据（一天到一年的数据包）驱动，从过境前 `temperature.spinupHours`（缺省 24 h；2026-11-21 FIX B10，此前固定从过境当天 00 UTC 起算）逐时次求解四组分能量平衡到过境时刻，再成像。物理与默认值对齐 TiRT/TIRTEB：`hom3` 节点辐射度全阶长波与短波、均匀冠层标准热点闭合、Raupach 气动阻抗（含对流阵风与 400 s m⁻¹ 分段限幅）、Farquhar 气孔 `g0` 下限、1/L 松弛稳定度、7 h 表面热历史或 2 m 土柱。
 
 本目录是 STREAM 的唯一源码；物理基准、模块对照以及与 TIRTEB 的有意差异见 [PORTING.md](PORTING.md)。
 
@@ -49,15 +49,37 @@ stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...
   "view": { "vza": { "value": 0 }, "vaa": { "value": 0 } },
   "optical": { "enabled": true, "bands": [{ "name": "B4", "center": 655, "fwhm": 37 }] },
   "thermal": { "enabled": true, "bands": [{ "name": "B10", "center": 10.9, "fwhm": 0.6 }] },
-  "temperature": { "mode": "rt", "components": { "file": "components.tif" } },
+  "temperature": { "mode": "rt", "components": { "file": "components.tif" },
+                   "energy": { "soilEmissivityModel": "hapke", "surfaceTemperatureNormalisation": "retrieval" } },
   // 或 { "mode": "eb", "era5": { "pack": "...\\pack.json" }, "soilMoisture": { "source": "era5" },
   //      "elevationCorrection": true, "energy": { "scheme": "tirt", "soilHeatMethod": "surface",
   //      "temperatureMethod": "robust", "diffuseFraction": 0.2, "enforceSolarLimit": true,
   //      "soilResistance": { "method": "constant", "value": 200 } } }
+  "skyLongwave": { "mode": "auto" },   // 可选：反射天空项的下行长波，见下文“热红外观测算子”
   "region": { "startRow": 0, "endRow": 100, "startColumn": 0, "endColumn": 100 },
   "threads": 0
 }
 ```
+
+`view.vaa` 是从像元指向传感器的方位角（北起顺时针，与 SPA 太阳方位同一约定），VAA = 太阳方位角时为热点方向；“传感器看向像元”的方位需先加 180°。VZA、VAA、纬度、经度为常数时须分别在 [0, 90)、[−360, 360]、[−90, 90]、[−180, 360] 内，否则配置报错。
+
+### 热红外观测算子
+
+正向成像、LST/LSCT 反演与同化共用 `app/thermal_view.cpp`：四组分权重 w_k（TiRT 比例 × 发射率 + `hom3` 多次散射），冠层顶亮温
+
+L = Σ w_k B(T_k) + (1 − Σ w_k) · B(T_sky)，T_sky = (L↓/σ)^¼
+
+第二项是各向同性天空长波的反射（Kirchhoff：方向—半球反射率 = 1 − 方向有效发射率，2026-11-20 起加入）。`tir_surface_temperature.tif`（LST 产品约定）仍为 Σ w_k B(T_k) / ε，不含反射天空。L↓ 来源由 `skyLongwave` 决定：
+
+| 配置 | L↓ |
+| --- | --- |
+| 省略或 `{ "mode": "auto" }` | EB：过境时刻 ERA5 `strd`；RT：Swinbank 晴空公式 5.31×10⁻¹³ T⁶，T 取阴影叶片温度（无叶取阴影/光照土壤温度）代替气温；只做 LST 反演且没有组分温度时取该像元观测亮温的均值 |
+| `{ "value": 350 }` 或 `{ "file": "...", "band": 1 }` | 指定常数 / 同网格栅格（W m⁻²，0 表示该像元不计） |
+| `{ "mode": "none" }` | 不计反射天空（2026-11-20 之前的行为） |
+
+L↓ 由背景状态一次确定，反演/同化改变组分温度后不再重算，保证反演与其结果的正向图像用同一算子。宽带 L↓ 折算为黑体天空温度会高估大气窗区（8–13 μm）的天空辐亮度，对 ε≈0.97 的地表约多出 0.1–0.2 K；需要更精确时请给出窗区等效的 L↓。`scene_summary.json` 的 `reflectedSky` 记录来源。
+
+太阳在（局地坡面）地平线以下时没有光照组分：光照土壤/叶片的权重并入阴影组分（与光学路径一致），有效发射率不变。`soilEmissivityModel`、`soilEmissivityK`、`surfaceTemperatureNormalisation`、`soilEmissivity`、`soilEmissivityWet` 写在 `temperature.energy` 下，EB 与 RT 两种模式都读取。
 
 ### 能量平衡参数（`energy`）
 
@@ -69,16 +91,22 @@ stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...
 | `diffuseFraction` | `0.2` | 直/散分配；`-1` 为 Erbs 反算 |
 | `enforceSolarLimit` | `true` | 晴空 DNI 上限，超出直射转漫射 |
 | `soilResistance.method` | `constant` | `constant` 或 `sellers`（含水量关系） |
-| `soilResistance.value` | `200` | 常数土壤阻抗 s m⁻¹ |
+| `soilResistance.value` | `200` | 常数土壤阻抗 s m⁻¹；须为 (0, 100000] 的数值，否则报错（2026-11-21 FIX B-S1） |
 | `stomatalG0` | `0.01` | 气孔导度下限 mol m⁻² s⁻¹ |
 | `minWindSpeed` / `maxAerodynamicResistance` | `0.05` / `400` | 风与分段气动阻抗限制 |
 | `referenceHeight` | `15` | 气象参考高度 m（冠层更高时抬到冠层顶以上 0.1 m） |
-| `soilEmissivity` / `leafEmissivity` | `0.955` / `0.985` | EB 宽带发射率；`soilEmissivity` 是干端值 |
-| `soilEmissivityWet` | 干端 +0.03（≤0.995） | 饱和土壤发射率；土壤发射率按像元含水量在 `soilEmissivity` 与该值之间插值（见 `physics/soil_emissivity.h`） |
+| `soilEmissivity` / `leafEmissivity` | 地类值 / `0.985` | EB 宽带发射率；`soilEmissivity` 是干端值，给出时同时替换 `classes.json` 中所有土壤地类的 `ground.emissivity`，能量平衡与成像/反演共用；省略时两者都用地类值（表内土壤均为 0.955） |
+| `soilEmissivityWet` | 干端 +0.03（≤0.995） | 饱和土壤发射率；土壤发射率按像元含水量在干端值与该值之间插值（见 `physics/soil_emissivity.h`） |
 | `soilConductivity` / `soilVolumetricCapacity` | `1.55` / `1.298e6` | 土壤热参数（仅土壤地类） |
 | `soilHeatFraction` | `0.25` | 仅 `direct` 方法使用 |
 | `spectralBinNm` | `50` | EB 短波分组宽度（nm）；默认 50 nm（约 41 个波段），可设 `1` 做 1 nm 全谱，或设 10 折中 |
-| `maxIterations` / `maxStabilityIterations` | `50` / `60` | 内层/外层迭代上限 |
+| `maxIterations` | `50` | 温度与 1/L 联合迭代上限 |
+| `maxStabilityIterations` | — | 已不使用（温度与 1/L 共用 `maxIterations`），保留只为兼容旧配置 |
+| `heatRoughnessKb` | 地类值 | 裸土整体阻抗的 kB⁻¹=ln(z0/z0h)；只作用于 LAI<0.5 的裸土路径（LAI≥0.5 无效，与 TiRT 相同，2026-11-21 FIX B4 说明） |
+
+起转时长 `temperature.spinupHours`（与 `era5` 同级，缺省 24，范围 0–240 h；2026-11-21 FIX B10）：能量平衡从过境前该时长的整点开始推进；数据包不覆盖时从数据包可用的最早时次开始并警告，实际值记入 `scene_summary.json` 的 `temperature.spinupHoursUsed`。缺省 24 h 的理由：TIRTEB 以整日气象从首个时次连续推进、用首日平均气温初始化，表面热历史保留 7 h；过境前 24 h 覆盖完整的昼夜循环（含夜间降温），与经度无关。
+
+地形（`surface.terrain` 为 single / facet / hill / ridge）时，水平 ERA5 短波先按 `diffuseFraction` 与晴空 DNI 上限（按真实太阳天顶角）分为直射/漫射，再把直射乘局地入射余弦 cos i / cos θs、漫射乘天空视角因子得到坡面短波；能量平衡以该坡面短波、固定的坡面漫射份额和局地入射角 i（冠层直射消光、光照组分比例、长波光照/阴影划分）求解，复合地形取面积平均的 max(0, cos i)。水平像元保持原算法。`eb_forcing.tif` 的下行短波为水平值。
 
 纬度、经度省略时由地表类型栅格的地理参考换算为 WGS84。
 
@@ -99,18 +127,37 @@ stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...
 - `optical`（可选）：波段数 = 光学波段数，给出时 LAI 也作为控制变量；`views` 只用于亮温；
 - 控制变量：RT 背景为四组分温度；EB 背景为土壤水分 + Vcmax（组分温度由过境时刻能量平衡的隐式微分 dT/dx = −(∂R/∂T)⁻¹∂R/∂x 给出）；不含发射率；
 - 雅可比来自模型内置的可微算子：物理核为标量类型模板，同化以 `Dual<8>`（`physics/dual.h`）前向自动微分运行与成像相同的代码；
-- 输出 `analysis_components.tif`、`background_components.tif`、`analysis_uncertainty.tif`、`analysis_qa.tif`（质量位、O−B、O−A、O−A RMS、DFS、观测数、迭代），EB 或有光学时加 `analysis_controls.tif`、`background_controls.tif`，EB 加 `analysis_fluxes.tif`；本次 `optical_*`/`tir_*` 为分析场的正向图像。
+- 输出 `analysis_components.tif`、`background_components.tif`、`analysis_uncertainty.tif`、`analysis_qa.tif`（质量位、O−B、O−A、O−A RMS、DFS、观测数、迭代、MAP 代价 J_b、J_a；质量位见下文“温度反演”一节的 QA 表），EB 或有光学时加 `analysis_controls.tif`、`background_controls.tif`，EB 加 `analysis_fluxes.tif`；本次 `optical_*`/`tir_*` 为分析场的正向图像。
 
-默认值：σ_o 亮温 0.5 K、LST 1.0 K、组分 2.0 K、反射率 0.02；σ_b 组分温度 5 K（相关 0.5）、土壤水分 0.10、Vcmax 30%、LAI 30%；RT 20 次、EB 10 次迭代。
+默认值：σ_o 亮温 0.5 K、LST 1.0 K、组分 2.0 K、反射率 0.02；σ_b 组分温度 5 K（相关 0.5）、土壤水分 0.10、Vcmax 30%、LAI 30%；RT 20 次、EB 10 次迭代。每个 Gauss–Newton 步都要在候选点求值、确认 MAP 代价下降后才接受，否则依次回溯到 1/2、1/4（2026-11-21 FIX S-5）。EB 背景的雅可比只是过境节点的隐式导数，不含热历史，GN 方向不一定是下降方向，因此多数 EB 像元以“线搜索停滞”（位 10，代价已下降，默认不拒收）结束。
 
 ## 温度反演（LST / LSCT，脚本接口）
 
 配置块 `inversion`（可选，不能与 `assimilation` 同时使用）让引擎在同一次运行里从热红外观测反演 LST 或四组分温度 LSCT，观测算子与正向成像共用 `app/thermal_view.cpp` 的四组分权重（TiRT 比例 × 发射率 + `hom3` 多次散射、Hapke/含水量土壤发射率）；工作台不再单独列出：
 
 - `target: "lst"`：每像元一个辐射温度，1/σ² 加权 Gauss–Newton，发射率误差并入不确定度；输出 `lst.tif`、`lst_uncertainty.tif`、`lst_qa.tif`；
-- `target: "lsct"`：以 RT 输入或 EB 解为背景的 MAP Gauss–Newton，可选同地类 s×s 窗口；输出 `lsct.tif`、`lsct_uncertainty.tif`（后验 1σ）、`lsct_qa.tif`（质量位、残差、DFS、观测数、迭代）、`lsct_fractions.tif`，后验组分温度同时用于本次热红外成像。
+- `target: "lsct"`：以 RT 输入或 EB 解为背景的 MAP Gauss–Newton，可选同地类 s×s 窗口；输出 `lsct.tif`、`lsct_uncertainty.tif`（后验 1σ）、`lsct_qa.tif`（质量位、残差、DFS、观测数、迭代、MAP 代价 J_b、J_a）、`lsct_fractions.tif`（中心像元首个有效观测的四组分归一化有效权重 w_k/Σw，不是几何面积比例）、`lsct_radiance_fractions.tif`（同一观测按后验温度计算的发射辐亮度贡献比例 w_k B(T_k)/Σ w_j B(T_j)，不含反射天空），后验组分温度同时用于本次热红外成像。
 
-质量位与 LS4T `base/quality.py` 一致（位 9 为未收敛）。字段说明与配置示例见 [地表温度与组分温度反演：方法与接口](../../docs/lst-lsct-inversion.md) 第 6 节。卫星分裂窗 LST 与产品链由 LS4T 承担。
+亮温观测的模型值含反射天空项（同上节），LST 产品观测不含；EB 运行时 `scene_summary.json` 的 `components` 统计与 `components.tif` 一致（EB 解），被反演/同化后验替换时另有 `posteriorComponents`。
+
+质量位 0–8 与 LS4T `base/quality.py` 一致，位 9–11 为 STREAM 扩展。反演（`lst_qa.tif`/`lsct_qa.tif` 第 1 波段）与同化（`analysis_qa.tif` 第 1 波段）共用同一套定义（2026-11-21 FIX S-5 QA 调整）：
+
+| 位 | 值 | 含义 | 默认拒收（`rejectQaBits=895`） |
+| --- | --- | --- | --- |
+| 0 | 1 | 输入无效 | 是 |
+| 1 | 2 | 云/掩膜 | 是 |
+| 2 | 4 | 超出合理范围（反演 200–380 K；同化控制量停在边界） | 是 |
+| 3 | 8 | 反演失败（背景点算子求值失败等；该像元不计入分析，分析场为背景） | 是 |
+| 4 | 16 | 病态（法方程奇异、EB 隐式导数无效） | 是 |
+| 5 | 32 | LS4T 归一化失败（STREAM 不设置） | 是 |
+| 6 | 64 | LS4T 廓线不匹配（STREAM 不设置） | 是 |
+| 7 | 128 | LS4T 融合拒收（STREAM 不设置） | 否 |
+| 8 | 256 | 信息量不足（LSCT DFS < 1；同化 DFS < 0.2） | 是 |
+| 9 | 512 | 未收敛：达到迭代上限时代价仍在下降，或法方程奇异，或每个试探步长上算子都求值失败 | 是 |
+| 10 | 1024 | 线搜索停滞：至少一个 Gauss–Newton 步已降低 MAP 代价，之后沿 GN 方向（步长 1、1/2、1/4）无法再降低；输出代价最低的已求值状态 | 否 |
+| 11 | 2048 | 未更新：没有任何步长能降低代价，分析 = 背景（J_a = J_b） | 否 |
+
+“收敛”的判据是 GN 步长：每个控制量的步长都小于 1e-3 倍背景 σ（LSCT 为 1e-3 K）。MAP 代价 J = Σ(y−h)ᵀR⁻¹(y−h) + (x−x_b)ᵀB⁻¹(x−x_b) 写在 `analysis_qa.tif` 第 8/9 波段（背景/分析）和 `lsct_qa.tif` 第 6/7 波段。线搜索保证 J_a ≤ J_b。各停止原因的像元数记在 `scene_summary.json` 中：同化为 `assimilation.stopReasons`，反演为 `inversion.counts`。字段说明与配置示例见 [地表温度与组分温度反演：方法与接口](../../docs/lst-lsct-inversion.md) 第 6 节。卫星分裂窗 LST 与产品链由 LS4T 承担。
 
 ## 反演原型
 
@@ -126,8 +173,8 @@ LST（分裂窗）与 LSCT（组分温度）反演的算法、产品字段、数
 | `tir_brightness_temperature.tif`、`tir_surface_temperature.tif` | 各热红外波段亮温、发射率归一化方向温度（K） |
 | `solar_geometry.tif` | 过境时刻太阳天顶角、方位角 |
 | `components.tif` + `components.json` | EB：过境时刻 Tss、Tsh、Tcs、Tch（K），可直接作为 RT 的组分温度文件 |
-| `eb_forcing.tif` | EB：过境时刻气温、水汽压、气压、风速、下行短波、下行长波、土壤水分 |
+| `eb_forcing.tif` | EB：过境时刻气温、水汽压、气压、风速、下行短波（水平面）、下行长波、土壤水分 |
 | `eb_fluxes.tif` | EB：净辐射、显热、潜热、土壤热通量（W m⁻²）、迭代次数、是否收敛、Obukhov 长度（m）、摩擦速度 u*（m s⁻¹）、稳定度是否收敛；以及能量残差、稳定度残差、稳定度限幅、阵风残差、空气密度、气动粗糙度/位移/冠层权重、短波限幅标记 |
-| `scene_summary.json` | 像元计数、各波段统计、EB 时次、收敛像元数等 |
+| `scene_summary.json` | 像元计数、各波段统计、EB 时次、收敛像元数、反射天空来源（`reflectedSky`）等 |
 
 GeoTIFF 沿用地表类型栅格的网格和坐标系，空值为 NaN。

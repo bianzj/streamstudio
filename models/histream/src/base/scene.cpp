@@ -284,11 +284,161 @@ float triangleAreaInsideVoxel(const glm::vec3& a, const glm::vec3& b,
     return area;
 }
 
+// Winding-independent outward orientation for building shells. OBJ assets do
+// not guarantee consistent winding (the urban_block roofs all face down, its
+// wall triangles are mixed), yet the shaders use the stored cell normal to
+// pick the receiving hemisphere, the solar-visibility start face and the
+// direct-beam projection. Triangles are grouped into connected shells (shared
+// vertex positions); a point is inside a shell when a vertical ray upward
+// crosses an odd number of that shell's non-vertical triangles (open-bottomed
+// buildings work, the ray never needs the base), and inside the solid when it
+// is inside any shell, so overlapping podium/tower shells and coplanar roofs
+// do not cancel. Coordinates are in voxel units.
+class SolidClosureIndex {
+public:
+    SolidClosureIndex(const std::vector<const ObjMesh*>& meshes, float inverseVoxelSize)
+    {
+        std::unordered_map<ObjVoxelCoord, uint32_t, ObjVoxelCoordHash> vertexIds;
+        auto vertexId = [&](const glm::vec3& p) {
+            const ObjVoxelCoord key{static_cast<int>(std::lround(p.x * 1024.0f)),
+                                    static_cast<int>(std::lround(p.y * 1024.0f)),
+                                    static_cast<int>(std::lround(p.z * 1024.0f))};
+            const auto inserted = vertexIds.emplace(key, static_cast<uint32_t>(parent_.size()));
+            if (inserted.second) parent_.push_back(inserted.first->second);
+            return inserted.first->second;
+        };
+        glm::vec2 lo(std::numeric_limits<float>::max());
+        glm::vec2 hi(-std::numeric_limits<float>::max());
+        std::vector<uint32_t> firstVertex;
+        for (const ObjMesh* mesh : meshes) {
+            const size_t count = mesh->indices.size() / 3;
+            for (size_t t = 0; t < count; ++t) {
+                const uint32_t i0 = mesh->indices[t * 3 + 0];
+                const uint32_t i1 = mesh->indices[t * 3 + 1];
+                const uint32_t i2 = mesh->indices[t * 3 + 2];
+                if (i0 >= mesh->vertices.size() || i1 >= mesh->vertices.size()
+                    || i2 >= mesh->vertices.size()) continue;
+                Tri tri{mesh->vertices[i0].pos * inverseVoxelSize,
+                        mesh->vertices[i1].pos * inverseVoxelSize,
+                        mesh->vertices[i2].pos * inverseVoxelSize, 0U};
+                const uint32_t va = vertexId(tri.a);
+                unite(va, vertexId(tri.b));
+                unite(va, vertexId(tri.c));
+                // Vertical triangles connect shells but have a degenerate
+                // footprint and cannot be crossed by a vertical ray.
+                const float footprint = (tri.b.x - tri.a.x) * (tri.c.z - tri.a.z)
+                    - (tri.c.x - tri.a.x) * (tri.b.z - tri.a.z);
+                if (std::abs(footprint) <= 1.0e-8f) continue;
+                tris_.push_back(tri);
+                firstVertex.push_back(va);
+                for (const glm::vec3& p : {tri.a, tri.b, tri.c}) {
+                    lo = glm::min(lo, glm::vec2(p.x, p.z));
+                    hi = glm::max(hi, glm::vec2(p.x, p.z));
+                }
+            }
+        }
+        if (tris_.empty()) return;
+        for (size_t index = 0; index < tris_.size(); ++index)
+            tris_[index].shell = find(firstVertex[index]);
+        origin_ = lo;
+        const glm::vec2 extent = glm::max(hi - lo, glm::vec2(1.0f));
+        bucket_ = std::max({4.0f, extent.x / 1024.0f, extent.y / 1024.0f});
+        nx_ = static_cast<int>(extent.x / bucket_) + 1;
+        nz_ = static_cast<int>(extent.y / bucket_) + 1;
+        buckets_.assign(static_cast<size_t>(nx_) * nz_, {});
+        for (size_t index = 0; index < tris_.size(); ++index) {
+            const Tri& t = tris_[index];
+            const int x0 = cellX(std::min({t.a.x, t.b.x, t.c.x}));
+            const int x1 = cellX(std::max({t.a.x, t.b.x, t.c.x}));
+            const int z0 = cellZ(std::min({t.a.z, t.b.z, t.c.z}));
+            const int z1 = cellZ(std::max({t.a.z, t.b.z, t.c.z}));
+            for (int z = z0; z <= z1; ++z)
+                for (int x = x0; x <= x1; ++x)
+                    buckets_[static_cast<size_t>(z) * nx_ + x].push_back(
+                        static_cast<uint32_t>(index));
+        }
+    }
+
+    bool empty() const { return tris_.empty(); }
+
+    bool inside(glm::vec3 p) const
+    {
+        if (tris_.empty()) return false;
+        // Tiny irrational shift keeps the query off shared edges/vertices.
+        p.x += 7.3e-4f;
+        p.z += 4.1e-4f;
+        if (p.x < origin_.x || p.y != p.y || p.z < origin_.y) return false;
+        const int x = static_cast<int>((p.x - origin_.x) / bucket_);
+        const int z = static_cast<int>((p.z - origin_.y) / bucket_);
+        if (x >= nx_ || z >= nz_) return false;
+        std::vector<std::pair<uint32_t, int>> crossings;
+        for (uint32_t index : buckets_[static_cast<size_t>(z) * nx_ + x]) {
+            const Tri& t = tris_[index];
+            const float d = (t.b.x - t.a.x) * (t.c.z - t.a.z)
+                - (t.c.x - t.a.x) * (t.b.z - t.a.z);
+            const float u = ((t.b.x - p.x) * (t.c.z - p.z)
+                - (t.c.x - p.x) * (t.b.z - p.z)) / d;
+            const float v = ((t.c.x - p.x) * (t.a.z - p.z)
+                - (t.a.x - p.x) * (t.c.z - p.z)) / d;
+            const float w = 1.0f - u - v;
+            if (u < 0.0f || v < 0.0f || w < 0.0f) continue;
+            const float height = u * t.a.y + v * t.b.y + w * t.c.y;
+            if (height <= p.y) continue;
+            auto found = std::find_if(crossings.begin(), crossings.end(),
+                [&](const auto& entry) { return entry.first == t.shell; });
+            if (found == crossings.end()) crossings.emplace_back(t.shell, 1);
+            else ++found->second;
+        }
+        for (const auto& entry : crossings)
+            if ((entry.second & 1) != 0) return true;
+        return false;
+    }
+
+    // Returns the facet normal pointing out of the solid. When both sides test
+    // alike (hidden faces inside overlapping volumes, open sheets) a mostly
+    // horizontal facet is taken as a roof facing up; others keep their winding.
+    glm::vec3 outward(const glm::vec3& centroid, const glm::vec3& normal) const
+    {
+        constexpr float offset = 0.02f; // voxel units
+        const bool front = inside(centroid + offset * normal);
+        const bool back = inside(centroid - offset * normal);
+        if (front != back) return front ? -normal : normal;
+        return std::abs(normal.y) >= 0.5f && normal.y < 0.0f ? -normal : normal;
+    }
+
+private:
+    struct Tri { glm::vec3 a, b, c; uint32_t shell; };
+    uint32_t find(uint32_t value)
+    {
+        while (parent_[value] != value) {
+            parent_[value] = parent_[parent_[value]];
+            value = parent_[value];
+        }
+        return value;
+    }
+    void unite(uint32_t left, uint32_t right)
+    {
+        left = find(left);
+        right = find(right);
+        if (left != right) parent_[right] = left;
+    }
+    int cellX(float x) const { return std::clamp(static_cast<int>((x - origin_.x) / bucket_), 0, nx_ - 1); }
+    int cellZ(float z) const { return std::clamp(static_cast<int>((z - origin_.y) / bucket_), 0, nz_ - 1); }
+    std::vector<Tri> tris_;
+    std::vector<uint32_t> parent_;
+    std::vector<std::vector<uint32_t>> buckets_;
+    glm::vec2 origin_{0.0f};
+    float bucket_ = 4.0f;
+    int nx_ = 0;
+    int nz_ = 0;
+};
+
 std::vector<glm::ivec3> voxelizeObjSurface(const ObjMesh& mesh, float voxelSize,
                                            float fillThreshold,
                                            size_t& rejectedVoxelCount,
                                            std::vector<float>* leafDensities = nullptr,
-                                           std::vector<glm::vec3>* surfaceNormals = nullptr)
+                                           std::vector<glm::vec3>* surfaceNormals = nullptr,
+                                           const SolidClosureIndex* closure = nullptr)
 {
     if (!(voxelSize > 0.0f)) {
         throw std::runtime_error("OBJ voxelization requires voxelSize > 0");
@@ -313,7 +463,11 @@ std::vector<glm::ivec3> voxelizeObjSurface(const ObjMesh& mesh, float voxelSize,
         const glm::vec3 c = mesh.vertices[ic].pos * inverseVoxelSize;
         const glm::vec3 faceCross = glm::cross(b - a, c - a);
         if (glm::length(faceCross) <= 1.0e-10f) continue;
-        const glm::vec3 faceNormal = glm::normalize(faceCross);
+        glm::vec3 faceNormal = glm::normalize(faceCross);
+        // Orient by geometry, not winding, before area-weighting so mixed
+        // winding cannot cancel or invert a cell normal.
+        if (surfaceNormals && closure && !closure->empty())
+            faceNormal = closure->outward((a + b + c) / 3.0f, faceNormal);
 
         const glm::vec3 minimum = glm::min(a, glm::min(b, c));
         const glm::vec3 maximum = glm::max(a, glm::max(b, c));
@@ -811,11 +965,15 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
             const std::vector<hexprojection::Cell> fine(
                 values.begin() + static_cast<std::ptrdiff_t>(fineOffset),
                 values.end());
-            if (!fine.empty()) {
-                root.ax = fine.front()[0];
-                root.ay = fine.front()[1];
-                root.az = fine.front()[2];
-                root.rho = fine.front()[3];
+            // Level 0 of every table is the 1^3 parent itself (validated on
+            // load), so the root descriptor uses it rather than one corner
+            // cell of the finest level; aeresist LAI and escape extinction
+            // read these root values.
+            if (!values.empty()) {
+                root.ax = values.front()[0];
+                root.ay = values.front()[1];
+                root.az = values.front()[2];
+                root.rho = values.front()[3];
             }
 
             // Keep the six face beta values in metadata slots 6 and 7;
@@ -1039,14 +1197,28 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
     std::vector<bool> propertyOpaque(propertyMeshCount, false);
     std::vector<bool> propertyGround(propertyMeshCount, false);
     size_t totalActive = 0;
+    // Load the property meshes first so building normals can be oriented
+    // against the closed shell formed by all building meshes of this OBJ
+    // (walls alone have no roof to close them).
+    std::vector<ObjMesh> sourceMeshes(propertyMeshCount);
+    std::vector<const ObjMesh*> buildingShell;
     for (size_t meshIndex = 0; meshIndex < propertyMeshCount; ++meshIndex) {
         // DEFERRED[低] 性能: 每个属性网格都先整份复制 objLoader.m_objmesh，separateMeshes 时又用 loadMesh 重新解析整个 OBJ 文件，N 个网格即解析 N+1 次、复制 N 次；百万面 OBJ 时耗时与内存都显著放大（下方 source.scene = completeScene 也是逐网格整份复制）；建议：一次解析按对象名分组，只在需要时引用而非复制。
-        ObjMesh sourceMesh = objLoader.m_objmesh;
         if (separateMeshes) {
             ObjLoader meshLoader;
             meshLoader.loadMesh(entity.objFile, entity.meshNames[meshIndex], true);
-            sourceMesh = std::move(meshLoader.m_objmesh);
+            sourceMeshes[meshIndex] = std::move(meshLoader.m_objmesh);
+        } else {
+            sourceMeshes[meshIndex] = objLoader.m_objmesh;
         }
+        const Type propertyType = meshIndex < entity.types.size() ? entity.types[meshIndex] : entity.type;
+        if (propertyType == Type::BUILDING && !sourceMeshes[meshIndex].indices.empty()
+            && (separateMeshes || buildingShell.empty()))
+            buildingShell.push_back(&sourceMeshes[meshIndex]);
+    }
+    const SolidClosureIndex buildingClosure(buildingShell, 1.0f / modelio->stepsize_surface);
+    for (size_t meshIndex = 0; meshIndex < propertyMeshCount; ++meshIndex) {
+        const ObjMesh& sourceMesh = sourceMeshes[meshIndex];
         if (sourceMesh.indices.empty()) continue;
 
         size_t rejectedVoxelCount = 0;
@@ -1058,7 +1230,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             sourceMesh, modelio->stepsize_surface,
             entity.voxelFillThreshold, rejectedVoxelCount,
             &propertyLeafDensities[meshIndex],
-            opaque ? &propertyNormals[meshIndex] : nullptr);
+            opaque ? &propertyNormals[meshIndex] : nullptr,
+            propertyType == Type::BUILDING ? &buildingClosure : nullptr);
         propertyMeshes[meshIndex] = designer.createTriVoxels(activeXYZ, opaque);
         totalActive += activeXYZ.size();
         std::cout << "OBJ mesh voxelization: " << entity.objFile

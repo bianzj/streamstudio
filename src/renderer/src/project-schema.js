@@ -190,6 +190,10 @@ function normalizeMovement(item = {}) {
   }
 }
 
+// Sensor band list.  The HiStream engine reproduces these exact rules in
+// ProjectJson::sensorBands() (models/histream/src/base/projectjson.cpp); the
+// server rasterizes Facet per-band records with this list, so change both
+// sides together (rounding, end-append, custom-band capacity, sort, 800 cap).
 export function sensorBandValues(sensor = {}) {
   const customValues = String(sensor.bands || '').split(/[\s,;]+/).map(Number)
     .filter((value) => Number.isFinite(value) && value > 0)
@@ -519,19 +523,25 @@ export function createDefaultProject(options = {}) {
         image: true, process: false, radiationProcess: false, energyProcess: false, temperature: true, albedo: false
       },
       control: {
-        depth: 4, samples: 32, gpu: 0, specularEnabled: true,
+        depth: 4, raytracingDepth: 16, samples: 32, gpu: 0, specularEnabled: true,
         facetBackend: 'gpu',
         computeBackend: 'gpu',
         cpuThreads: DEFAULT_CPU_THREADS,
         heterogeneousVoxel: false,
         periodicTraversalCount: 0,
         skyboxEnabled: false,
-        radiationSolver: 'traditional',
+        // Spectral-batch solver: same physics as 'traditional' (verified on the
+        // VoxelRT/VoxelEB/FacetRT smoke cases, means equal to 1e-5) but
+        // 1.1-1.6x faster; 'traditional' stays selectable for verification.
+        radiationSolver: 'accelerated',
         spectralAccelerationWidth: 100,
         shortwaveScatteringOrders: 1,
         voxelCollisionOrders: 2,
         radiationMaxSteps: 64,
-        couplingIterations: options.mode === 'eFacetEB' ? 60 : 20, temperatureTolerance: 0.05, temperatureRelaxation: 0.5,
+        // FacetEB temperature step damping. Smoke cases (crop/urban) converge
+        // in 9-12 coupling iterations at 0.8 versus 16-19 at the former 0.5;
+        // 1.0 is faster still but takes multi-kelvin steps on dense canopies.
+        couplingIterations: options.mode === 'eFacetEB' ? 60 : 20, temperatureTolerance: 0.05, temperatureRelaxation: 0.8,
         stabilityCorrection: false,
         soilTemperatureMethod: 2,
         vegetationTemperatureMethod: 0
@@ -786,6 +796,11 @@ export function normalizeProject(value = {}) {
         ...defaults.configuration.control,
         ...(configuration.control || {}),
         heterogeneousVoxel: Boolean(configuration.control?.heterogeneousVoxel),
+        // RayTracing scattering-order budget, separate from "depth" (which
+        // VoxelRT uses as its DDA step budget). Russian roulette from bounce 3.
+        raytracingDepth: Math.max(1, Math.min(64, Math.round(number(
+          configuration.control?.raytracingDepth, 16
+        )))),
         // Legacy projects used a separate switch plus periodicNeighborCount.
         // New projects use one 0..20 value, where zero means disabled.
         periodicBoundary: undefined,
@@ -802,8 +817,8 @@ export function normalizeProject(value = {}) {
         computeBackend: ['cpu', 'auto'].includes(configuration.control?.computeBackend)
           ? configuration.control.computeBackend : 'gpu',
         cpuThreads: normalizeCpuThreads(configuration.control?.cpuThreads),
-        radiationSolver: configuration.control?.radiationSolver === 'accelerated'
-          ? 'accelerated' : 'traditional',
+        radiationSolver: configuration.control?.radiationSolver === 'traditional'
+          ? 'traditional' : 'accelerated',
         spectralAccelerationWidth: Math.max(1, Math.min(1000, number(
           configuration.control?.spectralAccelerationWidth, 100
         ))),
@@ -1135,10 +1150,10 @@ export function projectToXml(value, paths = {}) {
     <radiationSolver>${c.control.radiationSolver === 'accelerated' ? 'accelerated' : 'traditional'}</radiationSolver>
     <spectralAccelerationWidth>${Math.max(1, Math.min(1000, number(c.control.spectralAccelerationWidth, 100)))}</spectralAccelerationWidth>
     <GPU>${number(c.control.gpu, 0)}</GPU>
-    <couplingIterations>${number(c.control.couplingIterations, 20)}</couplingIterations>
+    <couplingIterations>${number(c.control.couplingIterations, project.mode === 'eFacetEB' ? 60 : 20)}</couplingIterations>
     <temperatureTolerance>${number(c.control.temperatureTolerance, 0.05)}</temperatureTolerance>
     <stabilityCorrection>${c.control.stabilityCorrection === true ? 1 : 0}</stabilityCorrection>
-    <temperatureRelaxation>${number(c.control.temperatureRelaxation, 0.5)}</temperatureRelaxation>
+    <temperatureRelaxation>${number(c.control.temperatureRelaxation, 0.8)}</temperatureRelaxation>
     <soilTemperatureMethod>${Math.max(0, Math.min(2, Math.round(number(c.control.soilTemperatureMethod, 2))))}</soilTemperatureMethod>
     <shortwaveScatteringOrders>${c.control.shortwaveScatteringOrders}</shortwaveScatteringOrders>
     <voxelCollisionOrders>${c.control.voxelCollisionOrders}</voxelCollisionOrders>

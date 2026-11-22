@@ -3,7 +3,11 @@
 
 namespace stream {
 
-// Homogeneous canopy unless a crown (treeStand, canopyHeight, b) or row structure is supplied.
+// FIX(2026-11-21 C9): every canopy is simulated as a homogeneous (turbid-medium) canopy. The crown fields below
+// (treeStand, canopyHeight, crownShape) and CropRows are only consumed by physics/effective_lai.cpp, which is compiled
+// but not called by the imaging, the energy balance, the inversion or the assimilation (porting pending). When they
+// are given in classes.json the run logs a warning and records "homogeneous" in scene_summary.json canopyStructure.
+// (Former comment, misleading: "Homogeneous canopy unless a crown (treeStand, canopyHeight, b) or row structure is supplied.")
 struct Canopy {
     float lai = 0.0f;
     float height = 1.0f;          // m, aerodynamic canopy height

@@ -46,8 +46,9 @@ float backgroundEmissivity(float value,uint f) {
     return result;
 }
 float finish(float value) {
-    float v=max(0.0,value*pc.scale);
-    return pc.thermal==0u?min(v,1.0):v;
+    // Apparent reflectance may exceed 1 on sun-facing facets; keep it.
+    // Must match appendSurfaceStates() in facetrtcore.cpp (CPU parity).
+    return max(0.0,value*pc.scale);
 }
 void main() {
     uint s=gl_GlobalInvocationID.x,n=2u*pc.facets;

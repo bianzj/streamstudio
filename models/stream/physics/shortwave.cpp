@@ -74,9 +74,20 @@ std::vector<float> binSpectrum(const SolarBins& bins, const std::vector<float>& 
 
 double requestedDiffuseFraction(double globalShortwave, double szaDeg, double configured)
 {
+    // FIX(2026-11-21 C7): no date -> perihelion orbital factor (TiRT _orbital_factor without solar_day_of_year).
+    return requestedDiffuseFraction(globalShortwave, szaDeg, configured, 0);
+}
+
+double requestedDiffuseFraction(double globalShortwave, double szaDeg, double configured, int dayOfYear)
+{
     if (configured >= 0.0 && configured <= 1.0) return configured;
+    // FIX(2026-11-21 C10): sun at / below the horizon: no beam. (cos was floored at 1e-6, so kt hit 1.2 and the
+    // Erbs fraction became 0.165, i.e. 83 % "direct" with the sun down.)
+    if (!(szaDeg < 90.0)) return 1.0;
     const double cosine = std::max(std::cos(szaDeg * kPi / 180.0), 1e-6);
-    const double clearness = std::clamp(globalShortwave / (kSolarConstant * cosine), 0.0, 1.2);
+    // FIX(2026-11-21 C7): extraterrestrial horizontal irradiance includes E0 (TiRT radiation.py:218-221; it was
+    // already used by the clearnessIndex diagnostic below, so kt and its diagnostic disagreed by up to ±3.3 %).
+    const double clearness = std::clamp(globalShortwave / (kSolarConstant * orbitalFactor(dayOfYear) * cosine), 0.0, 1.2);
     double fraction;
     if (clearness <= 0.22) fraction = 1.0 - 0.09 * clearness;
     else if (clearness <= 0.80)
@@ -89,9 +100,11 @@ double requestedDiffuseFraction(double globalShortwave, double szaDeg, double co
 double admissibleDiffuseFraction(double globalShortwave, double szaDeg, int dayOfYear, double configured,
                                  bool enforceLimit, double* limit)
 {
-    const double requested = requestedDiffuseFraction(globalShortwave, szaDeg, configured);
+    const double requested = requestedDiffuseFraction(globalShortwave, szaDeg, configured, dayOfYear);  // FIX(2026-11-21 C7): E0 of the day
     const double normalLimit = solarDirectNormalLimit(szaDeg, dayOfYear);
     if (limit) *limit = normalLimit;
+    // FIX(2026-11-21 C10): no beam below the horizon, also when the DNI limit is not enforced.
+    if (!(szaDeg < 90.0) && globalShortwave > 0.0) return 1.0;
     if (!enforceLimit) return requested;
     const double total = std::max(globalShortwave, 0.0);
     if (total <= 0.0) return requested;
@@ -104,7 +117,7 @@ ShortwaveAbsorption absorbShortwave(const SolarBins& sun, const OpticalSpectra& 
                                     bool enforceLimit, bool sunlit)
 {
     ShortwaveAbsorption result;
-    result.diffuseFractionRequested = requestedDiffuseFraction(globalShortwave, szaDeg, requestedFraction);
+    result.diffuseFractionRequested = requestedDiffuseFraction(globalShortwave, szaDeg, requestedFraction, dayOfYear);  // FIX(2026-11-21 C7)
     result.directNormalLimit = solarDirectNormalLimit(szaDeg, dayOfYear);
     const double cosine = std::cos(szaDeg * kPi / 180.0);
     result.clearnessIndex = cosine > 0.0
@@ -113,6 +126,9 @@ ShortwaveAbsorption absorbShortwave(const SolarBins& sun, const OpticalSpectra& 
     if (globalShortwave <= 0.0 || sun.size() == 0) return result;
     result.diffuseFraction = admissibleDiffuseFraction(globalShortwave, szaDeg, dayOfYear, requestedFraction,
                                                       enforceLimit, &result.directNormalLimit);
+    // FIX(2026-11-21 C10): a receiving surface that is not sunlit gets no beam; the whole flux is diffuse (it is
+    // also distributed that way in shortwaveComponents), so the diagnostics report fd = 1 / partition limited.
+    if (!(sunlit && szaDeg < 90.0)) result.diffuseFraction = 1.0;
     result.partitionLimited = result.diffuseFraction > result.diffuseFractionRequested + 1e-12;
     result.directNormal = (szaDeg < 90.0 && globalShortwave > 0.0)
         ? globalShortwave * (1.0 - result.diffuseFraction) / std::max(cosine, 1e-12)
@@ -155,6 +171,9 @@ ShortwaveComponentsT<T> shortwaveComponents(const SolarBins& sun, const std::vec
     ShortwaveComponentsT<T> out;
     if (!(globalShortwave > 0.0) || sun.size() == 0 || !(sun.directTotal > 0.0) || !(sun.diffuseTotal > 0.0)) return out;
     const bool lit = sunlit && szaDeg < 90.0;
+    // FIX(2026-11-21 C10): without a sunlit surface the direct part (1 - fd) SW was dropped (esun = 0 below), losing
+    // up to 83 % of the shortwave near sunrise/sunset; route it to the diffuse sky term so absorbed + reflected = SW.
+    if (!lit) diffuseFraction = 1.0;
     const double extinction = kG / std::max(std::cos(std::min(szaDeg, 85.0) * kPi / 180.0), 1e-6);
     const double directScale = globalShortwave * (1.0 - diffuseFraction) / sun.directTotal;
     const double diffuseScale = globalShortwave * diffuseFraction / sun.diffuseTotal;

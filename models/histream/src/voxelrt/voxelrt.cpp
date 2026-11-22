@@ -24,7 +24,9 @@ float planckRadiance(const float wavelengthNanometers, const float temperatureKe
 
 void writeVoxelrtProcessField(std::ostream& metadata, const float wavelength,
                              const int offset) {
-    const bool thermal = wavelength > 5000.0f;
+    // Same optical/thermal split as voxelrtBandNames and the VoxelRT shaders:
+    // > 2.5 um (nm or um input) is a Planck-radiance band.
+    const bool thermal = (wavelength > 50.0f ? wavelength / 1000.0f : wavelength) > 2.5f;
     metadata << "{\"id\":\"" << (thermal ? "spectral_radiance_" : "illumination_")
              << wavelength << "\",\"aliases\":[\"radiosity_" << wavelength
              << "\"],\"label\":\""
@@ -216,6 +218,21 @@ bool Voxelrt::run(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &
     modelio->k_node = -1;
     std::cout << "PROGRESS\t5\t加载体元场景与辐射参数" << std::endl;
 
+    // The gap and diffuse passes depend on the sun only, never on the view:
+    // reuse them for every observation/waypoint that shares the previous sun.
+    bool transportValid = false;
+    float transportSza = 0.0f, transportSaa = 0.0f;
+    const auto runTransport = [&](const Angle& sun) {
+        const bool reuse = transportValid && sun.sza == transportSza && sun.saa == transportSaa;
+        if (modelio->acceleratedRadiationSolver) {
+            m_pCommand->runRTAccelerated(modelio, 4, reuse);
+        } else {
+            m_pCommand->runRT(modelio, reuse);
+        }
+        transportValid = true;
+        transportSza = sun.sza;
+        transportSaa = sun.saa;
+    };
 
     if(modelio->isUAVTrave && modelio->n_pos > 0) {
 
@@ -226,16 +243,7 @@ bool Voxelrt::run(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &
             std::cout << "OBSERVATION\t航点 " << (kpos + 1) << "/" << modelio->n_pos
                       << " X=" << position.x << " Y=" << position.y
                       << " H=" << position.z << std::endl;
-//            Angle angle = modelio->angles[kangle];
-//            std::cout << "Angle Info:"
-//                      << "    vza_" << std::to_string(angle.vza) << "    vaa_" << std::to_string(angle.vaa)
-//                      << "    sza_" << std::to_string(angle.sza) << "    saa_" << std::to_string(angle.saa)
-//                      << std::endl;
-            if (modelio->acceleratedRadiationSolver) {
-                m_pCommand->runRTAccelerated(modelio);
-            } else {
-                m_pCommand->runRT(modelio);
-            }
+            runTransport(modelio->angles.front());
             if (modelio->isRadiationProcess && kpos == 0) {
                 outputRadiationProcess(modelio);
             }
@@ -253,11 +261,7 @@ bool Voxelrt::run(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &
                       << "    vza_" << std::to_string(angle.vza) << "    vaa_" << std::to_string(angle.vaa)
                       << "    sza_" << std::to_string(angle.sza) << "    saa_" << std::to_string(angle.saa)
                       << std::endl;
-            if (modelio->acceleratedRadiationSolver) {
-                m_pCommand->runRTAccelerated(modelio);
-            } else {
-                m_pCommand->runRT(modelio);
-            }
+            runTransport(angle);
             if (modelio->isRadiationProcess && kangle == 0) {
                 outputRadiationProcess(modelio);
             }
@@ -340,8 +344,10 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
                 std::isfinite(environmentValue) ? std::max(0.0f, environmentValue) : 0.0f;
             const float wavelength = band < static_cast<int>(modelio->waves.size())
                 ? modelio->waves[band] : static_cast<float>(band + 1);
-            // DEFERRED[中] 物理: 热红外判定阈值为 >5000 nm，而 voxelrtBandNames 用 >2.5 µm、FacetRT 用 >2500 nm；3–5 µm 中波红外波段在此被当作光学波段（加上 light.direct、不计发射），过程输出与图像波段名含义不一致；建议：统一用一个共享的 isThermalWavelength() 判定。
-            const bool isThermalBand = wavelength > 5000.0f;
+            // One optical/thermal split (> 2.5 um) shared with voxelrtBandNames
+            // and the diffuse/image shaders, so 3-5 um bands are thermal everywhere.
+            const bool isThermalBand =
+                (wavelength > 50.0f ? wavelength / 1000.0f : wavelength) > 2.5f;
             float shadedRadiance = environmentRadiance;
             // Optical values are normalized incoming illumination. Longwave
             // values use Planck radiance and must never include that fraction.

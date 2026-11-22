@@ -45,6 +45,12 @@ const MAX_RESULT_BYTES = Number(process.env.STREAM_STUDIO_MAX_RESULT_BYTES) || 8
 const runTimeoutLabel = () => (RUN_TIMEOUT_MS >= 60000
   ? `${Math.round(RUN_TIMEOUT_MS / 60000)} 分钟`
   : `${Math.max(1, Math.round(RUN_TIMEOUT_MS / 1000))} 秒`)
+// histream.exe exit codes (see models/histream/src/main.cpp).  Only FacetEB uses
+// 2 = "finished, some nodes non-converged, results kept"; usage errors moved to 64
+// so they are no longer mistaken for a non-converged run.
+const HISTREAM_EXIT = Object.freeze({ ok: 0, failed: 1, facetNonConverged: 2, resources: 3, initialization: 4, usage: 64 })
+const histreamResultCodes = (mode) => mode === 'eFacetEB'
+  ? [HISTREAM_EXIT.ok, HISTREAM_EXIT.facetNonConverged] : [HISTREAM_EXIT.ok]
 const defaultSceneAsset = join(RESOURCE_ROOT, 'assets', 'obj-library', 'building', 'house_a.obj')
 const histreamCandidates = [
   join(RESOURCE_ROOT, 'engine', 'histream.exe'),
@@ -167,8 +173,12 @@ function createIsolatedRun(input, project, mode, engine) {
   if (isEnergyBalanceMode(mode) && !meteo) throw new Error('找不到本轮气象驱动：' + meteoPath)
   const sensor = project.configuration.sensor
   const perspective = ['perspective', 'central', 'center'].includes(String(sensor.projection))
+  // Requested nodes follow the engine rule (fileio_json.cpp / facetrtcore.cpp):
+  // start = max(0, start), end = max(start + 1, end) — end <= start still runs one node.
+  const meteoStart = Math.max(0, Math.round(Number(project.configuration.meteo?.start) || 0))
+  const meteoEnd = Math.max(meteoStart + 1, Math.round(Number(project.configuration.meteo?.end) || 0))
   const nodes = isEnergyBalanceMode(mode)
-    ? Array.from({ length: project.configuration.meteo.end - project.configuration.meteo.start }, (_, index) => project.configuration.meteo.start + index) : []
+    ? Array.from({ length: meteoEnd - meteoStart }, (_, index) => meteoStart + index) : []
   const run = { runId, outputDir, manifest: {
     kind: 'histream-run', schemaVersion: 1, runId, mode, status: 'preparing', startedAt: new Date().toISOString(),
     outputDir: windowsPath(outputDir),
@@ -768,6 +778,80 @@ function assertFacetScale(project, baseDir, mode) {
 
 const atmosphereLutCache = new Map()
 
+// Run preflight: scale, memory and duration estimates shown before a run.
+// Durations come from earlier completed runs of the same mode in this
+// project's output/runs (seconds per node or per observation, median of the
+// latest three), so they reflect this scene on this machine.
+function durationLabel(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0))
+  return value < 90 ? ` 秒` : value < 5400 ? ` 分钟` : ` 小时`
+}
+
+function runPreflight(input, project, mode) {
+  const baseDir = dirname(input)
+  const c = project.configuration
+  const warnings = []
+  const energy = isEnergyBalanceMode(mode)
+  const meteoStart = Math.max(0, Math.round(Number(c.meteo?.start) || 0))
+  const meteoEnd = Math.max(meteoStart + 1, Math.round(Number(c.meteo?.end) || 0))
+  const nodes = energy ? meteoEnd - meteoStart : 1
+  const perspective = ['perspective', 'central', 'center'].includes(String(c.sensor?.projection))
+  const angles = perspective ? 1 : Math.max(1, sensorViewAngles(c.sensor, c.light?.azimuth).length)
+  const bands = Math.max(1, sensorBandValues(c.sensor).length)
+  const result = { mode, nodes, angles, bands, timeoutSeconds: Math.round(RUN_TIMEOUT_MS / 1000), warnings }
+  if (mode === 'eFacetRT' || mode === 'eFacetEB') {
+    const estimate = estimateFacetTriangles(project, baseDir)
+    const raster = Math.max(Number(c.scene?.x) || 0, Number(c.scene?.y) || 0) >= 1000 ? 2048 : 1024
+    result.facet = { triangles: estimate.total, limit: MAX_FACET_TRIANGLES, raster,
+      largest: estimate.details[0] || null,
+      aBufferMiB: Math.round(raster * raster * 64 * 8 / 1048576) }
+    if (estimate.total > MAX_FACET_TRIANGLES) warnings.push(`面元约 ${estimate.total.toLocaleString('zh-CN')} 个，超过上限 ${MAX_FACET_TRIANGLES.toLocaleString('zh-CN')}，运行会被拒绝；请改用体元模式或简化模型`)
+    else if (estimate.total > MAX_FACET_TRIANGLES * 0.6) warnings.push(`面元约 ${estimate.total.toLocaleString('zh-CN')} 个，接近上限，可见性图与显存开销较大`)
+    const periodic = Math.round(Number(c.control?.periodicTraversalCount) || 0)
+    if (periodic > 0) result.facet.periodicTiles = periodic <= 4 ? 4 : periodic <= 8 ? 8 : periodic <= 12 ? 12 : 20
+  } else if (mode === 'eVoxelRT' || mode === 'eVoxelEB') {
+    const voxel = Math.max(0.01, Number(c.scene?.voxel) || 1)
+    const grid = [Math.ceil((Number(c.scene?.x) || 0) / voxel), Math.ceil((Number(c.scene?.y) || 0) / voxel),
+      Math.ceil((Number(c.scene?.height) || 0) / voxel)]
+    const cells = grid[0] * grid[1] * grid[2]
+    // Active voxels are typically 1-5 % of the grid for surface scenes; the
+    // bound below uses 5 % and the per-voxel radiance field of each engine.
+    const activeBound = Math.ceil(cells * 0.05)
+    const perVoxelBytes = mode === 'eVoxelRT' ? (64 + 2 * bands) * 8 : 64 * 12
+    result.voxel = { size: voxel, grid, cells, activeBound, radianceMiB: Math.round(activeBound * perVoxelBytes / 1048576) }
+    if (cells > 400e6) warnings.push(`体元网格 ${grid.join('×')}（${(cells / 1e6).toFixed(0)} M 格）过大，建议增大体元尺寸`)
+    if (result.voxel.radianceMiB > 16384) warnings.push(`体元辐射场估计可达 ${(result.voxel.radianceMiB / 1024).toFixed(1)} GB 显存`)
+  }
+  // History-based duration estimate.
+  const root = resolve(baseDir, normalizeHostPath(c.outDir || 'output'), 'runs')
+  const samples = []
+  if (existsSync(root)) {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      try {
+        const manifest = JSON.parse(readFileSync(join(root, entry.name, 'run-manifest.json'), 'utf8'))
+        if (manifest.mode !== mode || !['completed', 'non_converged'].includes(manifest.status) || !manifest.finishedAt) continue
+        const seconds = (Date.parse(manifest.finishedAt) - Date.parse(manifest.startedAt)) / 1000
+        const units = energy ? Math.max(1, manifest.completed?.nodeCount || manifest.requested?.nodeCount || 1)
+          : Math.max(1, manifest.requested?.viewAngles?.length || 1)
+        if (seconds > 0) samples.push({ at: manifest.finishedAt, perUnit: seconds / units })
+      } catch {}
+    }
+  }
+  samples.sort((a, b) => String(b.at).localeCompare(String(a.at)))
+  const recent = samples.slice(0, 3).map(sample => sample.perUnit).sort((a, b) => a - b)
+  if (recent.length) {
+    const perUnit = recent[recent.length >> 1]
+    result.estimateSeconds = Math.round(perUnit * (energy ? nodes : angles))
+    result.estimateBasis = `${recent.length} 次同模式历史运行，约 ${perUnit.toFixed(1)} s/${energy ? '节点' : '观测'}`
+    if (result.estimateSeconds > RUN_TIMEOUT_MS / 1000) warnings.push(`预计约 ${durationLabel(result.estimateSeconds)}，超过单次运行上限 ${runTimeoutLabel()}，将被中途终止；请减少节点/观测数，或设置 STREAM_STUDIO_RUN_TIMEOUT_MS`)
+    else if (result.estimateSeconds > 0.8 * RUN_TIMEOUT_MS / 1000) warnings.push(`预计约 ${durationLabel(result.estimateSeconds)}，接近单次运行上限 ${runTimeoutLabel()}`)
+  } else if (energy && nodes > 24) {
+    warnings.push(`本次 ${nodes} 个时间节点且无历史耗时可参考；单次运行上限为 ${runTimeoutLabel()}，建议先用少量节点试算`)
+  }
+  return result
+}
+
 function loadAtmosphereLut(path) {
   const normalized = resolve(normalizeHostPath(path))
   if (!existsSync(normalized)) throw new Error(`找不到大气查找表：${normalized}`)
@@ -1036,7 +1120,12 @@ function readRadiosityResult(jsonPath, geometryOnly = false) {
   const arrays = {}
   arrays.vertexPositions = readFixed('vertexPositions', facetCount * 9)
   if (!arrays.vertexPositions) throw new Error('面元结果缺少完整的三角形坐标')
-  if (geometryOnly) return { facetCount, vertexPositions: arrays.vertexPositions, backend, metrics: [], bandRadiosity: new Float32Array(0) }
+  if (geometryOnly) {
+    // The FacetEB step-sync geometry file may also carry the engine's actual
+    // band list ("wavelengths", written after vertexPositions); use it when present.
+    const geometryWavelengths = (readDynamic('wavelengths') || []).filter((value) => Number.isFinite(value) && value > 0)
+    return { facetCount, vertexPositions: arrays.vertexPositions, backend, metrics: [], bandRadiosity: new Float32Array(0), wavelengths: geometryWavelengths }
+  }
   arrays.wavelengths = readDynamic('wavelengths')
   // 文件内的写入顺序：sunlit, radiosity, lightEnhancement, temperature, ...
   const metricKeys = ['sunlit', 'radiosity', 'lightEnhancement', 'temperature', 'netRadiation', 'sensibleHeat', 'latentHeat', 'storageHeat', 'photovoltaicPower']
@@ -1322,7 +1411,7 @@ function readProcessResult(metadataPath, maximumElements = THREE_DIMENSIONAL_FAC
 }
 
 function writeRadiosityTiffForAngle(jsonPath, inputPath, mode, viewAngleOverride = null, includeProcess = true, removeStepFiles = false, step = null, sharedResult = null) {
-  const { facetCount, metrics, vertexPositions, backend, bandRadiosity, bandStates = new Float32Array(0) } = sharedResult || readRadiosityResult(jsonPath, Boolean(step))
+  const { facetCount, metrics, vertexPositions, backend, bandRadiosity, bandStates = new Float32Array(0), wavelengths: engineWavelengths = [] } = sharedResult || readRadiosityResult(jsonPath, Boolean(step))
   if (!vertexPositions || vertexPositions.length < facetCount * 9) throw new Error('面元结果缺少完整的三角形坐标')
   if (!inputPath || !existsSync(inputPath)) throw new Error('找不到生成影像所需的 project.json')
   const project = projectFromSource(readFileSync(inputPath, 'utf8'))
@@ -1333,8 +1422,17 @@ function writeRadiosityTiffForAngle(jsonPath, inputPath, mode, viewAngleOverride
   }
   const width = positiveInteger(sensor.x, 512)
   const height = positiveInteger(sensor.y, 512)
-  const wavelengths = sensorBandValues(sensor)
-  if (!wavelengths.length) wavelengths.push(1)
+  // Band list: prefer the list the engine actually solved (written into the
+  // result as "wavelengths"); otherwise use the shared rule in project-schema.js,
+  // which ProjectJson::sensorBands() reproduces exactly.  A mismatch means an
+  // engine/server version skew, so it is reported instead of silently mixed.
+  const requestedWavelengths = sensorBandValues(sensor)
+  if (!requestedWavelengths.length) requestedWavelengths.push(10500) // engine fallback (ProjectJson::sensorBands)
+  const wavelengths = engineWavelengths.length ? [...engineWavelengths] : requestedWavelengths
+  if (engineWavelengths.length && (engineWavelengths.length !== requestedWavelengths.length
+    || engineWavelengths.some((value, index) => Math.abs(value - requestedWavelengths[index]) > 1e-3))) {
+    console.warn(`面元结果波段与工程配置不一致：引擎 ${engineWavelengths.length} 个，工程 ${requestedWavelengths.length} 个；按引擎写出的波段出图`)
+  }
   const temperatureOutput = isEnergyBalanceMode(mode) && Boolean(sensor.temperature)
   const imageBandCount = temperatureOutput ? 1 : wavelengths.length
   const isOpticalWavelength = (wavelength) => {
@@ -1788,7 +1886,14 @@ function writeRadiosityTiffForAngle(jsonPath, inputPath, mode, viewAngleOverride
   const vaa = angleToken(namingViewAngles[1])
   const staticRadiosity = metrics.find(([id]) => id === 'radiosity')?.[2]
   const surfaceValueCount = facetCount * 2
-  const staticBandValues = (band) => bandRadiosity.length >= surfaceValueCount * wavelengths.length
+  // Per-band FacetRT values must cover exactly this band list.  Only results
+  // without any bandRadiosity (broadband legacy files) fall back to radiosity;
+  // a present-but-mismatched array used to fall back silently and fill every
+  // band with the broadband value.
+  if (bandRadiosity.length && bandRadiosity.length !== surfaceValueCount * wavelengths.length) {
+    throw new Error(`面元逐波段结果与波段数不一致：bandRadiosity 含 ${bandRadiosity.length / surfaceValueCount} 个波段，出图需要 ${wavelengths.length} 个；请用当前引擎重新运行模拟`)
+  }
+  const staticBandValues = (band) => bandRadiosity.length
     ? bandRadiosity.slice(band * surfaceValueCount, (band + 1) * surfaceValueCount)
     : staticRadiosity
   const coupledFacetEb = String(backend || '').includes('RT-EB coupled')
@@ -1809,7 +1914,17 @@ function writeRadiosityTiffForAngle(jsonPath, inputPath, mode, viewAngleOverride
     }
     // Current layout: 11 side fields (… sunlit part, sunlit T, shaded T) then a
     // sunlit-point and a shaded-point value per band; legacy: 9 + one per band.
+    // For a given band count the two sizes can never coincide, so a record that
+    // matches neither is a band-count mismatch (engine/server skew) and must not
+    // be decoded with the legacy offsets (that used to misread every field).
     const stateLayout = recordFloats === 11 + 2 * wavelengths.length
+    const legacyLayout = recordFloats === 9 + wavelengths.length
+    if (!stateLayout && !legacyLayout) {
+      const engineBands = (recordFloats - 11) % 2 === 0 ? (recordFloats - 11) / 2 : null
+      throw new Error(`FacetEB 节点结果与波段数不一致：每个面 ${recordFloats} 个字段`
+        + (engineBands !== null ? `（引擎按 ${engineBands} 个波段写出）` : '')
+        + `，出图需要 ${wavelengths.length} 个波段；请用当前引擎重新运行模拟：` + basename(stepPath))
+    }
     const data = { buffer, recordFloats, recordBytes: recordFloats * 4, path: stepPath, stateLayout }
     activeStep = { token: time.token, data }
     return data
@@ -1972,14 +2087,14 @@ function writeRadiosityTiffForAngle(jsonPath, inputPath, mode, viewAngleOverride
   return { tifPath: tifPaths[0] || '', tifPaths, processPaths, width, height, bands: imageBandCount, bandNames, visiblePixels: orthVisiblePixels }
 }
 
-function writeRadiosityTiff(jsonPath, inputPath, mode, step = null) {
+function writeRadiosityTiff(jsonPath, inputPath, mode, step = null, cachedGeometry = null) {
   if (!inputPath || !existsSync(inputPath)) throw new Error('找不到生成影像所需的 project.json')
   const project = projectFromSource(readFileSync(inputPath, 'utf8'))
   const { sensor, light } = project.configuration
   const perspective = ['perspective', 'central', 'center'].includes(String(sensor.projection || 'parallel').trim().toLowerCase())
   const configuredAngles = sensorViewAngles(sensor, light.azimuth)
   const angles = perspective ? [null] : (configuredAngles.length ? configuredAngles : [[0, 0]])
-  const sharedResult = step ? { ...readRadiosityResult(jsonPath, true), sunRasters: new Map() } : null
+  const sharedResult = step ? { ...(cachedGeometry || readRadiosityResult(jsonPath, true)), sunRasters: new Map() } : null
   const results = angles.map((angle, index) => writeRadiosityTiffForAngle(
     jsonPath, inputPath, mode, angle, index === 0, !step && index === angles.length - 1, step, sharedResult))
   // Delete only this completed node, after every direction succeeds. On export
@@ -1999,12 +2114,24 @@ function writeRadiosityTiff(jsonPath, inputPath, mode, step = null) {
   }
 }
 
-function exportFacetStep(running, jsonPath, inputPath, step) {
+// FacetEB node images are produced by one worker per run that stays alive for
+// all nodes and keeps the parsed facet geometry (tens of MB of JSON) in
+// memory. The former one-worker-per-node scheme re-loaded server.mjs and
+// re-parsed the geometry for every node while the engine waited for its ACK.
+// Very large results (above FACET_STEP_RESIDENT_FACETS) still use a fresh
+// worker per node so its heap is released before the engine continues.
+const FACET_STEP_RESIDENT_FACETS = Number(process.env.STREAM_STUDIO_FACET_STEP_RESIDENT_FACETS ?? 3_000_000)
+
+function facetStepWorkerOptions(kind, extra = {}) {
+  return {
+    workerData: { kind, ...extra },
+    execArgv: process.execArgv.filter(arg => !arg.startsWith('--input-type'))
+  }
+}
+
+function exportFacetStepOnce(running, jsonPath, inputPath, step) {
   return new Promise((resolveStep, rejectStep) => {
-    const worker = new Worker(new URL(import.meta.url), {
-      workerData: { kind: 'facet-step', jsonPath, inputPath, step },
-      execArgv: process.execArgv.filter(arg => !arg.startsWith('--input-type'))
-    })
+    const worker = new Worker(new URL(import.meta.url), facetStepWorkerOptions('facet-step', { jsonPath, inputPath, step }))
     running.facetWorker = worker
     let result, failure
     worker.on('message', (message) => { result = message })
@@ -2016,6 +2143,48 @@ function exportFacetStep(running, jsonPath, inputPath, step) {
       if (failure || code !== 0 || !result) rejectStep(failure || new Error('节点出图线程异常结束'))
       else resolveStep(result)
     })
+  })
+}
+
+function facetResultCount(jsonPath) {
+  try {
+    const fd = openSync(jsonPath, 'r')
+    try {
+      const buffer = Buffer.alloc(4096)
+      const bytes = readSync(fd, buffer, 0, buffer.length, 0)
+      return Number(buffer.toString('utf8', 0, bytes).match(/"facetCount"\s*:\s*(\d+)/)?.[1]) || 0
+    } finally { closeSync(fd) }
+  } catch { return 0 }
+}
+
+function exportFacetStep(running, jsonPath, inputPath, step) {
+  if (facetResultCount(jsonPath) > FACET_STEP_RESIDENT_FACETS) return exportFacetStepOnce(running, jsonPath, inputPath, step)
+  return new Promise((resolveStep, rejectStep) => {
+    let service = running.facetStepService
+    if (!service || service.dead) {
+      const worker = new Worker(new URL(import.meta.url), facetStepWorkerOptions('facet-step-service'))
+      service = { worker, pending: null, dead: false }
+      running.facetStepService = service
+      running.facetWorker = worker
+      worker.on('message', (message) => {
+        const pending = service.pending
+        service.pending = null
+        if (!pending) return
+        if (message?.ok) pending.resolve(message.result)
+        else pending.reject(new Error(message?.error || '节点出图失败'))
+      })
+      const fail = (error) => {
+        service.dead = true
+        if (running.facetWorker === worker) running.facetWorker = null
+        const pending = service.pending
+        service.pending = null
+        pending?.reject(error)
+      }
+      worker.on('error', fail)
+      worker.on('exit', (code) => fail(new Error(`节点出图线程已退出（${code}）`)))
+    }
+    service.pending = { resolve: resolveStep, reject: rejectStep }
+    service.worker.postMessage({ jsonPath, inputPath, step })
   })
 }
 
@@ -2433,14 +2602,27 @@ function openExample(data) {
   const directory = normalizeHostPath(data.directory || defaultExampleDirectory()).replace(/^"|"$/g, '')
   if (!isAbsolute(directory)) throw new Error('示例保存目录必须是绝对路径')
   const folder = basename(sourceDirectory)
-  let target = join(resolve(directory), folder)
-  for (let suffix = 2; existsSync(target) && readdirSync(target).length; suffix += 1) target = join(resolve(directory), `${folder}_${suffix}`)
-  // Runs write into output/, so an example is never opened in place.
+  const target = join(resolve(directory), folder)
+  // Opening the same example again overwrites that copy in place instead of piling up
+  // <name>_2, <name>_3 folders. Only the files the example ships are replaced; anything else
+  // in the folder — notably output/ with earlier runs — is left as it is. Runs write into
+  // output/, so an example is never opened in place.
+  const overwritten = existsSync(target) && (statSync(target).isFile() || readdirSync(target).length > 0)
+  if (overwritten) {
+    if (statSync(target).isFile()) rmSync(target, { force: true })
+    else {
+      for (const entry of readdirSync(sourceDirectory, { withFileTypes: true })) {
+        if (entry.name === 'output') continue
+        rmSync(join(target, entry.name), { recursive: true, force: true })
+      }
+    }
+  }
   cpSync(sourceDirectory, target, { recursive: true, filter: (path) => relative(sourceDirectory, path).split(/[\\/]/)[0] !== 'output' })
   mkdirSync(join(target, 'output'), { recursive: true })
   const copiedProject = join(target, basename(sourceFile))
   const streamProject = streamService.openProjectFile(copiedProject)
-  return streamProject ? { path: streamProject.path, streamProject } : openProject(copiedProject)
+  const opened = streamProject ? { path: streamProject.path, streamProject } : openProject(copiedProject)
+  return { ...opened, overwritten }
 }
 
 function resolveAsset(value) {
@@ -2660,16 +2842,22 @@ function filenameToken(stem, key) {
   return value.slice(0, end)
 }
 
+// Throws a descriptive Error when the ENVI pair cannot be converted; the caller
+// (convertEnviResults) records it as a visible per-file failure.
 function convertEnviToTiff(headerPath, mode) {
   const metadata = enviMetadata(readFileSync(headerPath, 'utf8'))
   const width = Number(metadata.samples), height = Number(metadata.lines), bands = Number(metadata.bands)
   const type = Number(metadata['data type'] || 4)
   const imagePath = headerPath.slice(0, -extname(headerPath).length) + '.img'
-  if (![width, height, bands].every((value) => Number.isInteger(value) && value > 0) || type !== 4 || !existsSync(imagePath)) return null
-  if (Number(metadata['byte order'] ?? 0) !== 0 || String(metadata.interleave || 'bsq').trim().toLowerCase() !== 'bsq' || Number(metadata['header offset'] || 0) !== 0) return null
+  if (![width, height, bands].every((value) => Number.isInteger(value) && value > 0)) throw new Error(`头文件尺寸无效（samples=${metadata.samples}, lines=${metadata.lines}, bands=${metadata.bands}）`)
+  if (type !== 4) throw new Error(`不支持的数据类型 ${type}（只支持 4 = float32）`)
+  if (!existsSync(imagePath)) throw new Error('缺少对应的 .img 数据文件')
+  if (Number(metadata['byte order'] ?? 0) !== 0) throw new Error('只支持小端字节序（byte order = 0）')
+  if (String(metadata.interleave || 'bsq').trim().toLowerCase() !== 'bsq') throw new Error(`只支持 BSQ 交错方式，实际为 ${metadata.interleave}`)
+  if (Number(metadata['header offset'] || 0) !== 0) throw new Error('只支持 header offset = 0')
   const source = readFileSync(imagePath)
   const expected = width * height * bands * 4
-  if (source.length < expected) return null
+  if (source.length < expected) throw new Error(`.img 数据不完整：${source.length} 字节，应为 ${expected} 字节`)
   const values = new Float32Array(width * height * bands)
   for (let index = 0; index < values.length; index += 1) values[index] = source.readFloatLE(index * 4)
   const names = String(metadata['band names'] || '').replace(/[{}]/g, '').split(',').map((value) => value.trim()).filter(Boolean)
@@ -2699,18 +2887,24 @@ function convertEnviToTiff(headerPath, mode) {
   return tiffPath
 }
 
+// Returns { converted: [tiffPath…], failures: [{ file, reason }…] }.  Failures
+// used to be filtered out silently, leaving a "completed" run without images.
 function convertEnviResults(directory, mode) {
-  if (!existsSync(directory) || !statSync(directory).isDirectory()) return []
+  const converted = [], failures = []
+  if (!existsSync(directory) || !statSync(directory).isDirectory()) return { converted, failures }
   const energyBalance = isEnergyBalanceMode(mode)
-  return readdirSync(directory, { withFileTypes: true })
+  const headers = readdirSync(directory, { withFileTypes: true })
     .filter((entry) => entry.isFile() && extname(entry.name).toLowerCase() === '.hdr')
     .filter((entry) => {
       const stem = basename(entry.name, extname(entry.name))
       const hasTime = filenameToken(stem, 'T') !== ''
       return energyBalance ? hasTime : !hasTime
     })
-    .map((entry) => convertEnviToTiff(join(directory, entry.name), mode))
-    .filter(Boolean)
+  for (const entry of headers) {
+    try { converted.push(convertEnviToTiff(join(directory, entry.name), mode)) }
+    catch (error) { failures.push({ file: entry.name, reason: error.message }) }
+  }
+  return { converted, failures }
 }
 
 function tiffObservation(name) {
@@ -4102,6 +4296,20 @@ async function api(request, response, url) {
       return json(response, 400, { error: error.message })
     }
   }
+  if (request.method === 'POST' && url.pathname === '/api/run/preflight') {
+    try {
+      const data = await body(request)
+      if (!modes.has(data.mode)) throw new Error('不支持的计算模式')
+      const input = resolveProjectFile(data.inputPath || projectFile)
+      const stored = readProject(input)
+      const project = stored.project ? normalizeStoredProjectPaths(stored.project, dirname(input)) : null
+      if (!project) throw new Error('无法读取工程配置')
+      json(response, 200, runPreflight(input, project, data.mode))
+    } catch (error) {
+      json(response, 400, { error: error.message })
+    }
+    return
+  }
   if (request.method === 'POST' && url.pathname === '/api/run') {
     let runtimeScene = null
     let run = null
@@ -4194,18 +4402,36 @@ async function api(request, response, url) {
       running.histreamRun = { runId: run.runId, outputDir: windowsPath(run.outputDir), startedAt, mode: data.mode }
       writeRunManifest(run, { status: 'running', pid: running.pid, command: [engine, ...args] })
       // 单次运行硬超时：到点终止整棵进程树，并按超时结束（结果不完整）。
-      const runTimer = setTimeout(() => {
+      // 只计引擎执行时间：FacetEB 逐节点出图期间引擎阻塞等待 FACET_ACK，
+      // 这段结果后处理时间暂停计时（与用户手册“结果后处理不计入”一致）。
+      let runTimer = null, runTimerStartedAt = 0, runTimeRemaining = RUN_TIMEOUT_MS
+      const onRunTimeout = () => {
+        runTimer = null
         if (running.histreamTimedOut) return
         running.histreamTimedOut = true
         emit({ type: 'error', text: `运行超过 ${runTimeoutLabel()}，已终止` })
         try { spawn('taskkill', ['/pid', String(running.pid), '/T', '/F'], { windowsHide: true }).on('error', () => running.kill('SIGKILL')) }
         catch { try { running.kill('SIGKILL') } catch {} }
-      }, RUN_TIMEOUT_MS)
-      if (typeof runTimer.unref === 'function') runTimer.unref()
+      }
+      const resumeRunTimer = () => {
+        if (runTimer || running.histreamTimedOut || running.histreamFinished) return
+        runTimerStartedAt = Date.now()
+        runTimer = setTimeout(onRunTimeout, Math.max(0, runTimeRemaining))
+        if (typeof runTimer.unref === 'function') runTimer.unref()
+      }
+      const pauseRunTimer = () => {
+        if (!runTimer) return
+        clearTimeout(runTimer)
+        runTimer = null
+        runTimeRemaining -= Date.now() - runTimerStartedAt
+      }
+      resumeRunTimer()
       emit({ type: 'started', pid: running.pid, runId: run.runId, outputDir: windowsPath(run.outputDir), command: `"${windowsPath(engine)}" ${args.map((item) => `"${windowsPath(item)}"`).join(' ')}` })
       running.stdout.setEncoding('utf8')
       running.stderr.setEncoding('utf8')
-      running.stdout.on('data', (chunk) => emit({ type: 'stdout', text: chunk.toString() }))
+      // engine:true marks raw engine stdout; the client re-assembles lines
+      // split across chunks before parsing PROGRESS / diagnostics records.
+      running.stdout.on('data', (chunk) => emit({ type: 'stdout', text: chunk.toString(), engine: true }))
       running.stderr.on('data', (chunk) => emit({ type: 'stderr', text: chunk.toString() }))
       let streamedSteps = 0, stepOutputError = null, stepPending = false
       const nodeDiagnostics = new Map()
@@ -4221,6 +4447,9 @@ async function api(request, response, url) {
             return
           }
           if (!line.startsWith('FACET_STEP\t') || running.histreamReset || running.histreamStopped) return
+          // The engine now blocks until FACET_ACK: pause the run timeout while
+          // this node is post-processed and resume it once the engine continues.
+          pauseRunTimer()
           try {
             const match = /^FACET_STEP\t(\d+)\t(DOY\d+_\d{2}-\d{2})\t([\d.eE+-]+)(?:\t([\d.eE+-]+)\t([\d.eE+-]+))?$/.exec(line)
             if (!match || stepPending) throw new Error('面元节点输出协议异常')
@@ -4230,6 +4459,7 @@ async function api(request, response, url) {
             stepPending = true
             emit({ type: 'stdout', text: `节点 ${step.node + 1} 已计算，正在逐方向保存图像：${step.token}` })
             verifyFrozenRunInputs(run.manifest, runInput)
+            const exportStartedAt = Date.now()
             const result = await exportFacetStep(running, radiosityJsonPath, runInput, step)
             if (running.histreamReset || running.histreamStopped || running.exitCode !== null) return
             streamedSteps += 1
@@ -4237,12 +4467,15 @@ async function api(request, response, url) {
             run.manifest.completed.nodes.push({ ...step, ...nodeDiagnostics.get(step.node) })
             run.manifest.completed.nodeCount = run.manifest.completed.nodes.length
             writeRunManifest(run, { completed: { ...run.manifest.completed, products: runProductPaths(run.outputDir) } })
-            emit({ type: 'stdout', text: `节点 ${step.node + 1} 已保存 ${result.tifPaths.length} 个 TIFF，输出缓存已释放：${step.token}` })
+            emit({ type: 'stdout', text: `节点 ${step.node + 1} 已保存 ${result.tifPaths.length} 个 TIFF（出图 ${((Date.now() - exportStartedAt) / 1000).toFixed(2)} s），输出缓存已释放：${step.token}` })
+            resumeRunTimer()
             running.stdin.write(`FACET_ACK\t${step.node}\n`)
           } catch (error) {
             if (running.histreamReset || running.histreamStopped) return
             stepOutputError = error
             emit({ type: 'error', text: `节点影像生成失败（已保留节点文件）：${error.message}` })
+            // The engine aborts on FACET_ERROR; keep the timeout armed for its shutdown.
+            resumeRunTimer()
             running.stdin.end('FACET_ERROR\n')
           }
         })
@@ -4254,7 +4487,8 @@ async function api(request, response, url) {
         if (!running.pid && child === running) { child = null; childExecutable = '' }
       })
       const completeHistreamRun = (code, signal) => {
-        clearTimeout(runTimer)
+        running.histreamFinished = true
+        pauseRunTimer()
         if (running.facetWorker) void running.facetWorker.terminate()
         if (running.histreamReset) {
           writeRunManifest(run, { status: 'stopped', finishedAt: new Date().toISOString(), completed: { ...run.manifest.completed, products: runProductPaths(run.outputDir) } })
@@ -4265,7 +4499,13 @@ async function api(request, response, url) {
         }
         let finalCode = stepOutputError ? 1 : code
         if (running.histreamTimedOut && (finalCode === null || finalCode === undefined)) finalCode = 1
-        if ([0, 2].includes(code) && radiosityJsonPath && !streamedSteps && !stepOutputError) {
+        // Codes that still carry results: 0, plus 2 for FacetEB only (non-converged).
+        const resultCodes = histreamResultCodes(data.mode)
+        if (code === HISTREAM_EXIT.usage && !stepOutputError) {
+          stepOutputError = new Error(`引擎参数用法错误（退出码 ${HISTREAM_EXIT.usage}）：请检查引擎版本是否支持模式 ${data.mode}`)
+          emit({ type: 'error', text: stepOutputError.message })
+        }
+        if (resultCodes.includes(code) && radiosityJsonPath && !streamedSteps && !stepOutputError) {
           try {
             verifyFrozenRunInputs(run.manifest, runInput)
             const tif = writeRadiosityTiff(radiosityJsonPath, runInput, data.mode)
@@ -4283,22 +4523,35 @@ async function api(request, response, url) {
             if (!keepThreeDimensionalResults && existsSync(radiosityJsonPath)) unlinkSync(radiosityJsonPath)
           }
         }
-        if (streamedSteps && [0, 2].includes(code) && !keepThreeDimensionalResults && existsSync(radiosityJsonPath)) unlinkSync(radiosityJsonPath)
-        if ([0, 2].includes(finalCode) && !radiosityJsonPath) {
-          try { convertEnviResults(run.outputDir, data.mode) }
+        if (streamedSteps && resultCodes.includes(code) && !keepThreeDimensionalResults && existsSync(radiosityJsonPath)) unlinkSync(radiosityJsonPath)
+        let conversionWarnings = []
+        if (resultCodes.includes(finalCode) && !radiosityJsonPath) {
+          try {
+            // ENVI→TIFF failures are reported per file instead of being dropped
+            // silently; the run keeps its status unless no image converted at all.
+            const conversion = convertEnviResults(run.outputDir, data.mode)
+            conversionWarnings = conversion.failures.map(({ file, reason }) => `${file}：${reason}`)
+            for (const warning of conversionWarnings) emit({ type: 'error', text: `ENVI 结果转换 TIFF 失败（原始文件已保留）：${warning}` })
+            if (conversion.failures.length && !conversion.converted.length) {
+              throw new Error(`全部 ${conversion.failures.length} 个 ENVI 结果均未能转换为 TIFF`)
+            }
+          }
           catch (error) { finalCode = 1; stepOutputError = error }
         }
         let nativeRun = {}
         try { nativeRun = JSON.parse(readFileSync(join(run.outputDir, 'faceteb_run.json'), 'utf8')) } catch {}
-        if (nativeRun.completed && [0, 2].includes(finalCode)) run.manifest.completed.nodes = nativeRun.completed
+        if (nativeRun.completed && resultCodes.includes(finalCode)) run.manifest.completed.nodes = nativeRun.completed
         if (nativeRun.completed) run.manifest.computedNodes = nativeRun.completed
         if (!nativeRun.completed && finalCode === 0 && !streamFacetSteps) run.manifest.completed.nodes = run.manifest.requested.nodes.map(node => ({ node, completionSource: 'engine-exit' }))
         run.manifest.completed.nodeCount = run.manifest.completed.nodes.length || (finalCode === 0 && !isEnergyBalanceMode(data.mode) ? 1 : 0)
-        const status = running.histreamTimedOut ? 'timeout' : running.histreamStopped ? 'stopped' : finalCode === 2 ? 'non_converged' : finalCode === 0 ? 'completed' : 'failed'
+        const nonConverged = data.mode === 'eFacetEB' && finalCode === HISTREAM_EXIT.facetNonConverged
+        const status = running.histreamTimedOut ? 'timeout' : running.histreamStopped ? 'stopped' : nonConverged ? 'non_converged' : finalCode === 0 ? 'completed' : 'failed'
         writeRunManifest(run, { status, finishedAt: new Date().toISOString(), exitCode: finalCode, signal,
           ...(running.histreamTimedOut ? { error: `运行超过 ${runTimeoutLabel()}，已终止` } : {}),
+          ...(conversionWarnings.length ? { warnings: conversionWarnings } : {}),
           ...(stepOutputError ? { error: stepOutputError.message } : {}), completed: { ...run.manifest.completed, products: runProductPaths(run.outputDir) } })
-        emit({ type: 'closed', code: finalCode, signal, status, runId: run.runId, outputDir: windowsPath(run.outputDir), elapsed: Date.now() - startedAt })
+        emit({ type: 'closed', code: finalCode, signal, status, runId: run.runId, outputDir: windowsPath(run.outputDir), elapsed: Date.now() - startedAt,
+          ...(conversionWarnings.length ? { warnings: conversionWarnings } : {}) })
         runtimeScene?.cleanup()
         if (child === running) { child = null; childExecutable = '' }
       }
@@ -4459,6 +4712,22 @@ if (isMainThread && envSetting('STREAM_STUDIO_SERVER_AUTOSTART', 'HISTREAM_STUDI
 else if (workerData?.kind === 'facet-step') {
   parentPort.postMessage(writeRadiosityTiff(workerData.jsonPath, workerData.inputPath, 'eFacetEB', workerData.step))
   parentPort.close()
+}
+else if (workerData?.kind === 'facet-step-service') {
+  // Geometry is parsed once and reused while the result file is unchanged.
+  let cache = null
+  parentPort.on('message', ({ jsonPath, inputPath, step }) => {
+    try {
+      const info = statSync(jsonPath)
+      if (!cache || cache.path !== jsonPath || cache.size !== info.size || cache.mtimeMs !== info.mtimeMs) {
+        cache = null
+        cache = { path: jsonPath, size: info.size, mtimeMs: info.mtimeMs, geometry: readRadiosityResult(jsonPath, true) }
+      }
+      parentPort.postMessage({ ok: true, result: writeRadiosityTiff(jsonPath, inputPath, 'eFacetEB', step, cache.geometry) })
+    } catch (error) {
+      parentPort.postMessage({ ok: false, error: error?.message || String(error) })
+    }
+  })
 }
 
 export { server, stopEngines }

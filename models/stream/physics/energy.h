@@ -13,7 +13,7 @@ struct Photosynthesis {
     float ballBerrySlope = 9.0f;
     float respiration = 0.015f;    // dark respiration / Vcmax25
     float stress = 1.0f;
-    bool temperatureCorrection = false;
+    bool temperatureCorrection = true;  // FIX(2026-11-21 B3): TiRT default tcor = 1 (was false)
     float temperature[5] = {0.2f, 0.3f, 281.0f, 308.0f, 328.0f};
 };
 
@@ -38,6 +38,11 @@ struct Ground {
     // kB^-1 = ln(z0/z0h) of this class. Arid bare soil / gravel is 5-10 (Beljaars & Holtslag), short vegetation
     // about 2, tall vegetation about 1.5; it sets how strongly the surface is coupled to the air and therefore how
     // wide the diurnal cycle is.
+    // FIX(2026-11-21 B4): documentation only. Like TiRT aerodynamic.py (_bulk_resistance, z0h = 0.1 z0, used only by
+    // the bare-soil and urban bulk paths), kB^-1 enters only the bare-soil bulk resistance: fully for LAI = 0 and with
+    // weight 1 - smoothstep(LAI / 0.5) for 0 < LAI < 0.5. For LAI >= 0.5 it has no effect: the canopy network
+    // (rai + rar + rac, leaf boundary layer 70/LAI sqrt(w/u), soil path soilProfile + rbs) carries the excess heat
+    // resistance. The class values of vegetated classes therefore matter only for sparse (LAI < 0.5) pixels.
     double heatRoughnessKb = 2.302585093;
     ThermalMaterial material() const { return ThermalMaterial{conductivity, volumetricCapacity}; }
 };

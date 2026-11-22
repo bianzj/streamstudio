@@ -19,6 +19,20 @@ struct EdgeHashOverflow : std::runtime_error
     }
 };
 
+// A per-pixel fragment list that still fits the device is recoverable: the
+// layer count is doubled and the visibility resources are rebuilt, which is
+// much cheaper than failing a multi-node run.
+struct RasterLayerOverflow : std::runtime_error
+{
+    RasterLayerOverflow()
+        : std::runtime_error(
+              "Visibility A-buffer overflow: the per-pixel fragment list was full and the "
+              "device memory budget does not allow more layers; reduce scene density or "
+              "restore the retained CPU rasterizer")
+    {
+    }
+};
+
 // Geometry is uploaded as a non-indexed triangle list. The three vertices of
 // one facet must be consecutive and carry the same unit normal.
 struct Vertex
@@ -152,8 +166,10 @@ class FacetrtVulkan
     void beginSpectral(const std::vector<float> &facets, const std::vector<float> &materialBands,
                        uint32_t bands, uint32_t materials, const Direction &sun, float backgroundStrength,
                        float beamIrradiance);
+    // beam >= 0 overrides the beam-normal irradiance given to beginSpectral for
+    // this band (per-band light; the push-constant layout is unchanged).
     SolveResult solveSpectralBand(uint32_t band, bool thermal, float sky, float scale, bool accelerated,
-                                  bool warmStart, bool diffuse = false);
+                                  bool warmStart, bool diffuse = false, float beam = -1.0f);
     std::vector<float> readSpectralOutput();
     SpectralAudit readSpectralAudit(uint32_t band);
     // Audit-only restore after the retained reference solver used m_optics.
@@ -244,6 +260,16 @@ class FacetrtVulkan
     void destroySolveResources();
     void destroyBuffer(Buffer &buffer) const;
 
+    // Doubles the A-buffer depth when the device still has room for it. The
+    // caller rebuilds the visibility resources afterwards. Returns false once
+    // the shader limit (256 layers) or the memory budget is reached.
+    [[nodiscard]] bool growRasterLayers();
+    [[nodiscard]] uint64_t rasterLayerBudgetBytes() const;
+    // Directions of the most recent visibility graph, so an overflow detected
+    // later (sun visibility) can rebuild the graph the solve resources use.
+    std::vector<Direction> m_visibilityDirections;
+    std::vector<float> computeSunlitFractionOnce(const Direction &sunDirection);
+
     [[nodiscard]] Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
                                       VkMemoryPropertyFlags properties) const;
     void uploadBuffer(Buffer &destination, const void *data, VkDeviceSize size) const;
@@ -330,6 +356,17 @@ class FacetrtVulkan
     VkPipelineLayout m_energyPipelineLayout{VK_NULL_HANDLE};
     VkPipeline m_energyPipeline{VK_NULL_HANDLE};
     EnergyPush m_energyPush{};
+    // Ping-pong buffer and iteration count of the last evaluateEnergy solve,
+    // read back by readEnergyState(true).
+    uint32_t m_energyRadiosityPing{0};
+    uint32_t m_energyIterations{0};
+    // Every recordIterations() call bumps m_solveGeneration. evaluateEnergy()
+    // warm-starts from its previous radiosity only if no other solve has
+    // touched the ping-pong buffers since (generation unchanged).
+    uint64_t m_solveGeneration{0};
+    uint64_t m_energyWarmGeneration{0};
+    // Deepest A-buffer list reported by the last overflowing raster pass.
+    uint32_t m_requiredRasterLayers{0};
     Buffer m_spectralFacets, m_spectralMaterials, m_spectralEmission, m_spectralPrevious, m_spectralOutput;
     Buffer m_spectralConvergence;
     Buffer m_spectralDispatch;

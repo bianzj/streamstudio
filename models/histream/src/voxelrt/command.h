@@ -15,9 +15,12 @@ public:
     bool create(std::shared_ptr<VoxelrtIO> &VoxellstIO);
 //    bool run(std::shared_ptr<VoxelrtIO> &VoxelrtIO);
 
-    bool runRT(std::shared_ptr<VoxelrtIO> &modelio);
+    // reuseTransport: the sun direction is unchanged since the previous call,
+    // so the gap and diffuse fields (view independent) are still valid and
+    // only the image pass runs.
+    bool runRT(std::shared_ptr<VoxelrtIO> &modelio, bool reuseTransport = false);
     bool runRTAccelerated(std::shared_ptr<VoxelrtIO> &modelio,
-                          int spectralBatchSize = 4);
+                          int spectralBatchSize = 4, bool reuseTransport = false);
 
 //    void submit(std::shared_ptr<VoxelrtIO> &VoxelrtIO,glm::ivec3 dispatchSize,
 //                VkDescriptorSet descSet, VkPipelineLayout pipelineLayout,

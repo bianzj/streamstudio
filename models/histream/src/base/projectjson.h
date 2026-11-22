@@ -35,6 +35,8 @@ public:
     std::filesystem::path runtimeDefinedDirectory() const;
     std::filesystem::path meteorologyPath() const;
 
+    // Same rules as sensorBandValues() in src/renderer/src/project-schema.js
+    // (see projectjson.cpp); the server relies on identical band lists.
     std::vector<float> sensorBands() const;
     std::vector<std::array<float, 2>> viewAngles() const;
 

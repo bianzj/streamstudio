@@ -266,7 +266,11 @@ void main()
         // dynamic variable in time
         // The aerodynamic reference level must be above displacement height.
         z = max(ubom.meteo.z, hcmax + max(2.0, 0.5 * hcmax));
-        u = max(localWindSpeed(bufferId0), 0.05); // obstacle- and canopy-resolved wind
+        // The logarithmic profile below needs the wind at the reference height
+        // z. A flow-resolved cell speed is an in-canopy/obstacle value and must
+        // not be passed through that profile again (see the localExchange
+        // branch above, which is the only consumer of resolved local wind).
+        u = max(ubom.meteo.u, 0.05);
         kappa = KAPPA; 
 
         if(aerotype == AEROTYPE_URBAN){
@@ -360,15 +364,18 @@ void main()
             // surfLs[surf1DId].ustar = ustar;
             aeroConds[aeroId].ustar = ustar;
             // initial and roughness layers
+            // Roughness-sublayer resistance: the stability terms (phstar,
+            // dimensionless) belong inside 1/(kappa u*); SCOPE's resistances.m
+            // closes the bracket early, which only cancels while L is neutral.
             if (z > zr)
             {
                 rai = (1.0 / (kappa*ustar)*(log((z - d) / (zr - d)) - ph_z + ph_zr));  //这里是空气1层；
-                rar = 1.0 / (kappa*ustar)*((zr - hcmax) / (zr - d)) - phs_zr + phs_h;  //这里是空气2层；
+                rar = 1.0 / (kappa*ustar)*((zr - hcmax) / (zr - d) - phs_zr + phs_h);  //这里是空气2层；
             }
             else
             {
                 rai = 0;
-                rar = 1.0 / (kappa*ustar)*((z - hcmax) / (z - d)) - phs_zr + phs_h;
+                rar = 1.0 / (kappa*ustar)*((z - hcmax) / (z - d) - phs_zr + phs_h);
             }
             /////////////////////////////////////////////////////////////////////////////////////////////////////
             kh0 = kappa*ustar*(zr - d);    //Diffusivity for heat
@@ -426,7 +433,10 @@ void main()
                 // standard forced-convection coefficient to aerodynamic
                 // resistance; the local canopy wind is retained but bounded by
                 // half of the reference wind for small exposed woody surfaces.
-                float localWind = max(uh, 0.5 * max(u, 0.1));
+                // Forced convection uses the near-surface (flow-resolved when
+                // the flow field is on) speed directly, not through a profile.
+                float uLocal = max(localWindSpeed(bufferId0), 0.05);
+                float localWind = max(uh, 0.5 * max(uLocal, 0.1));
                 float heatTransfer = 8.3 + 4.1 * localWind;
                 if(soilSets[meshLink.bioId].thermalClass == 1)
                 {
@@ -434,7 +444,7 @@ void main()
                     // thinner thermal boundary layer than a wall or ground
                     // plane. Use the reference wind and a material scale.
                     heatTransfer = max(soilSets[meshLink.bioId].convectiveScale, 0.1)
-                        * (18.0 + 8.0 * max(u, 0.1));
+                        * (18.0 + 8.0 * max(uLocal, 0.1));
                 }
                 raa = RHOA * CP / max(heatTransfer, 1.0);
                 if(isnan(raa) || isinf(raa) || raa < 1.0) raa = 50.0;

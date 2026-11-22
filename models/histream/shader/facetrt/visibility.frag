@@ -36,6 +36,9 @@ void main()
     const uint layer = atomicAdd(pixelCounts[pixel], 1u);
     if (layer >= pc.raster.z) {
         atomicAdd(statistics[0], 1u);
+        // Deepest list seen, so the host can size the next A-buffer at once
+        // instead of doubling and rebuilding the visibility graph repeatedly.
+        atomicMax(statistics[2], layer + 1u);
         return;
     }
 

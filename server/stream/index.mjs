@@ -158,12 +158,10 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   function submitRun(data) {
     assertEngine()
     const scene = data.scene && typeof data.scene === 'object' ? data.scene : data
-    // DEFERRED[中] Bug: 前端 streamApi.run 把 projectPath 放在 { scene } 里（即 data.scene.projectPath），这里读 data.projectPath 永远为空，这个分支是死代码；输出目录实际靠前端拼出的 scene.outputRoot；建议：统一字段位置（服务端读 scene.projectPath 或前端放到顶层），只保留一处推导输出目录的逻辑
-    const projectPath = String(data.projectPath || '').trim().replace(/^"|"$/g, '')
-    // DEFERRED[低] 安全: 输出根目录完全由请求决定，任意绝对路径都会被 mkdir 并写入 run-config/scene/manifest，也不校验 projectPath 是否为真实存在的 STREAM 工程；建议：校验工程文件存在且 kind 为 stream-image-project，或把输出根限制在工程目录/默认输出目录下
-    const root = projectPath
-      ? join(dirname(normalizeHostPath(projectPath)), 'output')
-      : normalizeHostPath(String(scene.outputRoot || data.outputRoot || defaultOutputRoot()).trim().replace(/^"|"$/g, ''))
+    // The workbench derives scene.outputRoot (<project folder>/output) before submitting; the former
+    // data.projectPath branch could never run (the client sends projectPath inside scene) and was removed.
+    // DEFERRED[低] 安全: 输出根目录完全由请求决定，任意绝对路径都会被 mkdir 并写入 run-config/scene/manifest；建议：把输出根限制在工程目录/默认输出目录下
+    const root = normalizeHostPath(String(scene.outputRoot || data.outputRoot || defaultOutputRoot()).trim().replace(/^"|"$/g, ''))
     if (!isAbsolute(root)) throw new Error('输出目录须为绝对路径')
     const name = String(scene.name || data.name || 'image').replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 64) || 'image'
     // Validate now so a bad form fails at submission rather than in the queue.

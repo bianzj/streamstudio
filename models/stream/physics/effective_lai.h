@@ -11,6 +11,8 @@ struct EffectiveLai {
 
 // Direction-specific effective LAI of homogeneous, crown or row canopies. A homogeneous
 // canopy (no crown or row structure) returns its own LAI for every direction.
+// FIX(2026-11-21 C9): NOT CALLED anywhere in this engine yet (kept for the later crown / row port); the runtime treats
+// every canopy as homogeneous and warns when crown / row parameters are configured (scene/classes.cpp, app/image.cpp).
 float directionalGap(const Canopy& canopy, const CropRows& rows, float zenithDeg, float azimuthDeg);
 float directionalLai(const Canopy& canopy, const CropRows& rows, float zenithDeg, float azimuthDeg);
 float hemisphericalLai(const Canopy& canopy, const CropRows& rows);

@@ -535,6 +535,11 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
     modelio->m_pAlloc->destroy(pixelBuffer);
 
     Angle angle = modelio->angles[kangle];
+    // Cruise (UAV) waypoints each have their own heading.  Geometry::updateSensorPos
+    // already writes it into angles.front(), but take it explicitly from the waypoint
+    // so the TIFF VAA metadata and sky-pixel zenith never fall back to the first heading.
+    if (kpos >= 0 && kpos < static_cast<int>(modelio->uavViewAzimuths.size()))
+        angle.vaa = modelio->uavViewAzimuths[static_cast<size_t>(kpos)];
     std::vector<float> waves = modelio->waves;
     glm::vec2 resolution = modelio->imageSize;
 
@@ -597,6 +602,12 @@ void Raytracing::outputAlbedo(std::shared_ptr<RaytracingIO>& modelio, std::share
     void *data = modelio->m_pAlloc->map(pixelBuffer);
     float *pData = reinterpret_cast<float *>(data);
 
+    // albedo.txt 口径（说明，未改算法）: per band, the mean of the raw top-of-canopy
+    // image over pixels with value > 0 — no atmosphere correction (unlike the TIFF
+    // products).  Zero pixels are excluded because a camera ray that misses the
+    // scene with the skybox off leaves 0 (offline.rgen), indistinguishable here
+    // from a genuinely black/shadowed sample; the mean is therefore an upper
+    // estimate when the view contains true zero-valued surfaces.
     std::vector<float> meanValues(static_cast<size_t>(n_wave), 0.0f);
     float *walker = pData;
     for (int kband = 0; kband < n_wave; kband++) {

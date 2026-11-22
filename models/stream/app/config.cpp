@@ -101,6 +101,9 @@ ImageConfig readImageConfig(const std::string& path)
         throw std::runtime_error("地表土壤亮度 soilBrightness 须为 0.05–1.0 或省略（使用 classes.json）");
     config.latitude = readField(surface, "latitude");
     config.longitude = readField(surface, "longitude");
+    // FIX(2026-11-21 C9): structure inputs that this engine does not simulate are reported instead of ignored silently.
+    for (const char* key : {"treeStand", "canopyHeight", "crownShape", "crown", "rows", "cropRows", "canopyStructure"})
+        if (surface.GetObj(key).IsValid()) config.ignoredStructureKeys.push_back(std::string("surface.") + key);
     const auto view = root.GetObj("view");
     config.vza = readField(view, "vza");
     config.vaa = readField(view, "vaa");
@@ -280,6 +283,17 @@ ImageConfig readImageConfig(const std::string& path)
         if (source != "era5" && source != "user") throw std::runtime_error("土壤水分来源须为 era5 或 user");
         config.soilMoistureFromEra5 = source == "era5";
         config.elevationCorrection = temperature.GetBool("elevationCorrection", true);
+        // FIX(2026-11-21 B10): configurable spin-up length (hours before the overpass). Default 24 h: TIRTEB runs whole
+        // days from the start of its meteorology and initialises with the first day's mean air temperature, and the
+        // surface heat history it keeps is 7 h; 24 h before the overpass covers a full diurnal cycle (night cooling
+        // included) for any longitude, which the former fixed 00 UTC start did not (≈2.5 h for East-Asian mornings).
+        const auto spinup = temperature.GetObj("spinupHours");
+        if (spinup.IsValid() && spinup.GetType() != CPLJSONObject::Type::Integer &&
+            spinup.GetType() != CPLJSONObject::Type::Long && spinup.GetType() != CPLJSONObject::Type::Double)
+            throw std::runtime_error("temperature.spinupHours 须为数值（小时）");
+        config.spinupHours = temperature.GetDouble("spinupHours", 24.0);
+        if (!std::isfinite(config.spinupHours) || config.spinupHours < 0.0 || config.spinupHours > 240.0)
+            throw std::runtime_error("temperature.spinupHours 须在 0–240 小时之间（缺省 24）");
         const auto energy = temperature.GetObj("energy");
         const auto scheme = energy.GetString("scheme", "tirt");
         if (scheme != "tirt" && scheme != "tirt-analytic") throw std::runtime_error("能量平衡方案须为 tirt");
@@ -302,7 +316,17 @@ ImageConfig readImageConfig(const std::string& path)
             const auto method = resistance.GetString("method", "constant");
             if (method != "constant" && method != "sellers") throw std::runtime_error("soilResistance.method 须为 constant 或 sellers");
             config.soilResistanceFromMoisture = method == "sellers";
+            // FIX(2026-11-21 B-S1): the value replaces fixedResistance of every soil class (image.cpp buildSurface),
+            // so it gets the class-table rule (> 0, classes.cpp) plus a type check and a physical upper bound; 0 or a
+            // negative value used to reach the latent-heat resistance unchecked.
+            const auto valueField = resistance.GetObj("value");
+            if (valueField.IsValid() && valueField.GetType() != CPLJSONObject::Type::Integer &&
+                valueField.GetType() != CPLJSONObject::Type::Long && valueField.GetType() != CPLJSONObject::Type::Double)
+                throw std::runtime_error("soilResistance.value 须为数值（s m⁻¹）");
             config.soilResistance = resistance.GetDouble("value", 200.0);
+            if (!std::isfinite(config.soilResistance) || !(config.soilResistance > 0.0) || config.soilResistance > 1.0e5)
+                throw std::runtime_error("soilResistance.value 须在 (0, 100000] s m⁻¹ 之间（土壤表面阻抗，TIRTEB 默认 200），当前为 " +
+                                         std::to_string(config.soilResistance));
         }
         config.stomatalG0 = energy.GetDouble("stomatalG0", 0.01);
         config.minWindSpeed = energy.GetDouble("minWindSpeed", 0.05);
@@ -315,20 +339,8 @@ ImageConfig readImageConfig(const std::string& path)
         if (!std::isfinite(config.maxAerodynamicResistance))
             throw std::runtime_error("maxAerodynamicResistance 须为数值（<=0 表示不限幅）");
         config.soilEmissivity = energy.GetDouble("soilEmissivity", 0.955);
-        // Negative selects the built-in dry-to-wet gain; otherwise it is the
-        // emissivity at saturation and must be a valid value above the dry one.
-        config.soilEmissivityWet = energy.GetDouble("soilEmissivityWet", -1.0);
+        config.soilEmissivitySet = energy.GetObj("soilEmissivity").IsValid();
         config.leafEmissivity = energy.GetDouble("leafEmissivity", 0.985);
-        const auto emissivityModel = energy.GetString("soilEmissivityModel", "hapke");
-        if (emissivityModel != "hapke" && emissivityModel != "constant")
-            throw std::runtime_error("soilEmissivityModel 须为 hapke 或 constant");
-        config.hapkeSoilEmissivity = emissivityModel == "hapke";
-        config.hapkeSoilK = energy.GetDouble("soilEmissivityK", 1.0);
-        if (!(config.hapkeSoilK > 0)) throw std::runtime_error("soilEmissivityK 须为正数");
-        const auto normalisation = energy.GetString("surfaceTemperatureNormalisation", "retrieval");
-        if (normalisation != "retrieval" && normalisation != "directional")
-            throw std::runtime_error("surfaceTemperatureNormalisation 须为 retrieval 或 directional");
-        config.referenceSurfaceTemperature = normalisation == "retrieval";
         config.soilConductivity = energy.GetDouble("soilConductivity", 1.55);
         config.soilVolumetricCapacity = energy.GetDouble("soilVolumetricCapacity", 1.298e6);
         const auto soilThermal = energy.GetString("soilThermal", "constant");
@@ -342,14 +354,9 @@ ImageConfig readImageConfig(const std::string& path)
         config.maxIterations = energy.GetInteger("maxIterations", 50);
         config.maxStabilityIterations = energy.GetInteger("maxStabilityIterations", 60);
         if (!(config.stomatalG0 > 0) || !(config.minWindSpeed >= 0) || !(config.referenceHeight > 0) ||
-            !(config.soilEmissivity > 0 && config.soilEmissivity <= 1) ||
-            (config.soilEmissivityWet >= 0 && !(config.soilEmissivityWet > 0 && config.soilEmissivityWet <= 1)) ||
             !(config.leafEmissivity > 0 && config.leafEmissivity <= 1) ||
             !(config.soilConductivity > 0) || !(config.soilVolumetricCapacity > 0) || config.maxIterations < 1 || config.maxStabilityIterations < 1)
             throw std::runtime_error("能量平衡参数超出有效范围");
-        // Wet soil cannot emit less than dry soil.
-        if (config.soilEmissivityWet >= 0 && config.soilEmissivityWet < config.soilEmissivity)
-            throw std::runtime_error("soilEmissivityWet 须不小于 soilEmissivity（饱和土壤发射率不能低于干土）");
     } else if (mode == "rt") {
         const auto components = temperature.GetObj("components");
         config.componentsFile = components.GetString("file", "");
@@ -358,6 +365,57 @@ ImageConfig readImageConfig(const std::string& path)
     } else {
         throw std::runtime_error("温度模式须为 rt 或 eb");
     }
+    // Thermal emission settings shared by EB and RT (2026-11-20: they used to be read only in EB mode, so RT imaging
+    // and RT-background retrievals silently ran with the defaults). They stay under temperature.energy.
+    {
+        const auto energy = temperature.GetObj("energy");
+        if (mode != "eb") {
+            config.soilEmissivity = energy.GetDouble("soilEmissivity", 0.955);
+            config.soilEmissivitySet = energy.GetObj("soilEmissivity").IsValid();
+        }
+        // Negative selects the built-in dry-to-wet gain; otherwise it is the
+        // emissivity at saturation and must be a valid value above the dry one.
+        config.soilEmissivityWet = energy.GetDouble("soilEmissivityWet", -1.0);
+        const auto emissivityModel = energy.GetString("soilEmissivityModel", "hapke");
+        if (emissivityModel != "hapke" && emissivityModel != "constant")
+            throw std::runtime_error("soilEmissivityModel 须为 hapke 或 constant");
+        config.hapkeSoilEmissivity = emissivityModel == "hapke";
+        config.hapkeSoilK = energy.GetDouble("soilEmissivityK", 1.0);
+        if (!(config.hapkeSoilK > 0)) throw std::runtime_error("soilEmissivityK 须为正数");
+        const auto normalisation = energy.GetString("surfaceTemperatureNormalisation", "retrieval");
+        if (normalisation != "retrieval" && normalisation != "directional")
+            throw std::runtime_error("surfaceTemperatureNormalisation 须为 retrieval 或 directional");
+        config.referenceSurfaceTemperature = normalisation == "retrieval";
+        if (!(config.soilEmissivity > 0 && config.soilEmissivity <= 1) ||
+            (config.soilEmissivityWet >= 0 && !(config.soilEmissivityWet > 0 && config.soilEmissivityWet <= 1)))
+            throw std::runtime_error("土壤发射率参数超出有效范围");
+        // Wet soil cannot emit less than dry soil.
+        if (config.soilEmissivityWet >= 0 && config.soilEmissivityWet < config.soilEmissivity)
+            throw std::runtime_error("soilEmissivityWet 须不小于 soilEmissivity（饱和土壤发射率不能低于干土）");
+    }
+    // Reflected sky of the thermal brightness temperature.
+    const auto sky = root.GetObj("skyLongwave");
+    if (sky.IsValid() && sky.GetType() == CPLJSONObject::Type::Object) {
+        const auto skyMode = sky.GetString("mode", "auto");
+        config.skyLongwave = readField(root, "skyLongwave");
+        if (skyMode == "none") config.skySource = ImageConfig::SkySource::None;
+        else if (config.skyLongwave.present()) config.skySource = ImageConfig::SkySource::Field;
+        else if (skyMode != "auto") throw std::runtime_error("skyLongwave.mode 须为 auto 或 none，或给出常数/栅格（W m⁻²）");
+        if (config.skySource == ImageConfig::SkySource::Field && !config.skyLongwave.fromFile() &&
+            !(config.skyLongwave.value >= 0.0 && config.skyLongwave.value <= 700.0))
+            throw std::runtime_error("skyLongwave 常数须在 0–700 W m⁻²（0 表示不计反射天空）");
+    }
+    // Constant geometry inputs: reject values outside the physical range instead of silently dropping every pixel.
+    const auto constantRange = [](const Field& field, double low, double high, bool includeHigh, const char* label) {
+        if (field.fromFile() || !std::isfinite(field.value)) return;
+        if (!(field.value >= low && (includeHigh ? field.value <= high : field.value < high)))
+            throw std::runtime_error(std::string(label) + "常数须在 " + std::to_string(static_cast<int>(low)) + "–" +
+                                     std::to_string(static_cast<int>(high)) + " 度之间");
+    };
+    constantRange(config.vza, 0.0, 90.0, false, "观测天顶角 VZA ");
+    constantRange(config.vaa, -360.0, 360.0, true, "观测方位角 VAA ");
+    constantRange(config.latitude, -90.0, 90.0, true, "纬度 ");
+    constantRange(config.longitude, -180.0, 360.0, true, "经度 ");
     config.threads = root.GetInteger("threads", 0);
     return config;
 }

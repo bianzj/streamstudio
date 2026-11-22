@@ -289,6 +289,13 @@ void configureCommon(FileIO& io, const ProjectJson& project, Mode mode) {
         io.m_pRaytracingXml->projectDir = output;
         io.m_pRaytracingXml->definedDir = defined;
         io.m_pRaytracingXml->settingxml = settings;
+        // Path tracing has its own scattering-order budget. The shared "depth"
+        // key sets the VoxelRT DDA step budget (depth x 128); reusing its
+        // default of 4 here truncated every path after four bounces and biased
+        // NIR canopy reflectance low. Russian roulette (from bounce 3) keeps
+        // deep paths cheap, so the default is 16 and the hard cap 64.
+        io.m_pRaytracingXml->settingxml.maxDepth = std::clamp(
+            ProjectJson::integer(control, "raytracingDepth", 16), 1, 64);
         io.m_pRaytracingXml->sensorxml = sensorData;
         io.m_pRaytracingXml->lightxml = lightData;
         io.m_pRaytracingXml->atmospherexml = atmosphere;

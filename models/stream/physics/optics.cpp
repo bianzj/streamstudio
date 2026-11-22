@@ -143,11 +143,9 @@ void bsm(const OptCoeff& coeff, const SoilOptics& soil, float moisture, std::vec
     reflectance.assign(count, 0.0f);
     for (size_t k = 0; k < count; k++) {
         const float rdry = coeff.gsv1[k] * f1 + coeff.gsv2[k] * f2 + coeff.gsv3[k] * f3;
-        const float tw = std::exp(-coeff.kw[k] * film);
         const float rbac = 1 - (1 - rdry) * (rdry * calctav(90, static_cast<float>(2.0 / coeff.nw[k])) / calctav(90, 2.0f) + 1 - rdry);
         const float p = 1 - calctav(90, coeff.nw[k]) / coeff.nw[k] / coeff.nw[k];
         const float Rw = 1 - calctav(40, coeff.nw[k]);
-        const float Radd = (1 - Rw) * (1 - p) * rbac / (1 - p * rbac);
         const float water = std::clamp(moisture, 0.05f, 0.55f);
         const float mu = static_cast<float>((water - 0.05) / SMCp);
         // SCOPE BSM: soil moisture at or below 5 % leaves the dry spectrum unchanged.
@@ -155,9 +153,18 @@ void bsm(const OptCoeff& coeff, const SoilOptics& soil, float moisture, std::vec
             reflectance[k] = rdry;
             continue;
         }
-        const float fdry = std::exp(-mu);
-        const float fmul = (std::exp(tw * mu) - 1) * fdry;
-        reflectance[k] = rdry * fdry + Rw * (1 - fdry) + Radd * fmul;
+        // SCOPE soilwat (2026-11-20, as TiRT base/soilopt.py _soilwat): Poisson mixture of k = 0..6 water films,
+        // tw = exp(-2 kw film k) is the two-way film transmittance and enters numerator and denominator of
+        // Rwet_k. The former closed form (single-pass tw, tw missing in Radd, no 6-film truncation) gave SWIR
+        // reflectances 10-20 % too high for wet soil.
+        double total = static_cast<double>(rdry) * std::exp(-static_cast<double>(mu));
+        for (int films = 1; films <= 6; ++films) {
+            const double weight = std::exp(-static_cast<double>(mu) + films * std::log(static_cast<double>(mu)) - std::lgamma(films + 1.0));
+            const double tw = std::exp(-2.0 * coeff.kw[k] * film * films);
+            const double wet = Rw + (1.0 - Rw) * (1.0 - p) * tw * rbac / (1.0 - p * tw * rbac);
+            total += weight * wet;
+        }
+        reflectance[k] = static_cast<float>(total);
     }
 }
 

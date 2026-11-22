@@ -548,8 +548,13 @@ function renderRunProgress(finalElapsed = null) {
   const percent = Math.max(0, Math.min(100, Math.round(Number(state.progress) || 0)))
   const elapsed = finalElapsed == null ? Date.now() - state.startedAt : finalElapsed
   $('#elapsed').textContent = `${state.running ? '已运行' : '耗时'} ${runElapsedText(elapsed)}`
+  // While running show the current stage and an ETA extrapolated from the
+  // engine's own progress (only once enough progress exists to be stable).
+  const eta = state.running && percent >= 5 && percent < 100 && elapsed > 3000
+    ? ` · 预计剩余 ${runElapsedText(elapsed * (100 - percent) / percent).replace(/\.\d$/, '')}` : ''
   $('#runProgressText').textContent = state.running
-    ? '运行中' : (percent >= 100 ? '已完成' : state.progressStage)
+    ? `${state.progressStage || '运行中'}${eta}` : (percent >= 100 ? '已完成' : state.progressStage)
+  $('#runProgressText').title = $('#runProgressText').textContent
   $('#runProgressPercent').textContent = `${percent}%`
   $$('#runProgress .run-progress-blocks i').forEach((block, index) => {
     const fill = Math.max(0, Math.min(100, (percent - index * 10) * 10))
@@ -2002,6 +2007,112 @@ function updateSun(config) {
 
 const thermalBaseColors = new WeakMap()
 
+// Approximate voxelization of the previewed scene objects at the configured
+// voxel size: triangles are sampled at half-voxel spacing and the occupied
+// cells drawn as translucent boxes. It shows the grid resolution and which
+// structures survive voxelization before running VoxelRT/VoxelEB. The engine
+// additionally applies the fill threshold, so counts are an upper estimate.
+// Very large cell counts are shown at a coarser display resolution.
+function buildVoxelPreview() {
+  const c = state.config
+  if (!c) return ''
+  const voxelMeters = Math.max(0.01, Number(c.scene?.voxel) || 1)
+  const scale = Number(world.userData.displayScale) || 1
+  if (voxelPreview) {
+    world.remove(voxelPreview)
+    disposeObject(voxelPreview)
+    voxelPreview = null
+  }
+  world.updateMatrixWorld(true)
+  const meshes = []
+  const helperRoots = new Set([grid, sceneBoundsGuide, cruiseVisualization].filter(Boolean))
+  const isHelper = (object) => {
+    for (let node = object; node && node !== world; node = node.parent) if (helperRoots.has(node)) return true
+    return false
+  }
+  world.traverse((child) => {
+    if (!child.isMesh || !child.visible || !child.geometry?.attributes?.position) return
+    const kind = child.userData.kind
+    if (kind === 'ground' || kind === 'sensor' || child.userData.previewHelper || isHelper(child)) return
+    if (child.material && !Array.isArray(child.material) && child.material.isSpriteMaterial) return
+    meshes.push(child)
+  })
+  if (!meshes.length) return ''
+  const maximumCells = 150000
+  const sampleBudget = 6e6
+  const inverseWorld = new THREE.Matrix4().copy(world.matrixWorld).invert()
+  const instanceMatrix = new THREE.Matrix4()
+  const transform = new THREE.Matrix4()
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), d = new THREE.Vector3()
+  let cellSize = voxelMeters * scale
+  let cells = null
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    cells = new Set()
+    let overflow = false
+    let samples = 0
+    for (const mesh of meshes) {
+      const position = mesh.geometry.attributes.position
+      const index = mesh.geometry.index
+      const triangleCount = Math.floor((index ? index.count : position.count) / 3)
+      const instances = mesh.isInstancedMesh ? mesh.count : 1
+      const stride = Math.max(1, Math.ceil(triangleCount * instances / 400000))
+      for (let instance = 0; instance < instances && !overflow; instance += 1) {
+        transform.copy(mesh.matrixWorld)
+        if (mesh.isInstancedMesh) { mesh.getMatrixAt(instance, instanceMatrix); transform.multiply(instanceMatrix) }
+        transform.premultiply(inverseWorld)
+        for (let triangle = 0; triangle < triangleCount; triangle += stride) {
+          const i0 = index ? index.getX(3 * triangle) : 3 * triangle
+          const i1 = index ? index.getX(3 * triangle + 1) : 3 * triangle + 1
+          const i2 = index ? index.getX(3 * triangle + 2) : 3 * triangle + 2
+          a.fromBufferAttribute(position, i0).applyMatrix4(transform)
+          b.fromBufferAttribute(position, i1).applyMatrix4(transform)
+          d.fromBufferAttribute(position, i2).applyMatrix4(transform)
+          const edge = Math.max(a.distanceTo(b), b.distanceTo(d), d.distanceTo(a))
+          const steps = Math.min(48, Math.max(1, Math.ceil(edge / (cellSize * 0.5))))
+          for (let u = 0; u <= steps; u += 1) {
+            for (let v = 0; v <= steps - u; v += 1) {
+              const s = u / steps, t = v / steps
+              const x = a.x + (b.x - a.x) * s + (d.x - a.x) * t
+              const y = a.y + (b.y - a.y) * s + (d.y - a.y) * t
+              const z = a.z + (b.z - a.z) * s + (d.z - a.z) * t
+              cells.add(`${Math.floor(x / cellSize)},${Math.floor(y / cellSize)},${Math.floor(z / cellSize)}`)
+            }
+          }
+          samples += (steps + 1) * (steps + 2) / 2
+          if (cells.size > maximumCells) { overflow = true; break }
+          if (samples > sampleBudget) break
+        }
+      }
+      if (overflow) break
+    }
+    if (!overflow) break
+    cellSize *= 2
+  }
+  if (!cells?.size) return ''
+  const box = new THREE.BoxGeometry(cellSize * 0.94, cellSize * 0.94, cellSize * 0.94)
+  const material = new THREE.MeshBasicMaterial({ color: 0x2f7fe0, transparent: true, opacity: 0.32, depthWrite: false })
+  const mesh = new THREE.InstancedMesh(box, material, cells.size)
+  mesh.userData.previewHelper = true
+  mesh.renderOrder = 20
+  const matrix = new THREE.Matrix4()
+  let n = 0
+  for (const key of cells) {
+    const [ix, iy, iz] = key.split(',').map(Number)
+    matrix.makeTranslation((ix + 0.5) * cellSize, (iy + 0.5) * cellSize, (iz + 0.5) * cellSize)
+    mesh.setMatrixAt(n, matrix)
+    n += 1
+  }
+  mesh.instanceMatrix.needsUpdate = true
+  voxelPreview = mesh
+  world.add(mesh)
+  const nx = Math.ceil((Number(c.scene?.x) || 0) / voxelMeters)
+  const ny = Math.ceil((Number(c.scene?.y) || 0) / voxelMeters)
+  const nz = Math.ceil((Number(c.scene?.height) || 0) / voxelMeters)
+  const shownMeters = cellSize / scale
+  const coarse = shownMeters > voxelMeters * 1.01
+  return `网格 ${nx}×${ny}×${nz}（体元 ${voxelMeters} m），对象占用约 ${coarse ? '（按 ' + Number(shownMeters.toFixed(2)) + ' m 粗化显示）' : ''}${cells.size.toLocaleString('zh-CN')} 个${coarse ? '显示单元' : '体元'}；引擎还会按填充阈值剔除低占比体元`
+}
+
 function applyViewStyle(style) {
   currentStyle = style
   world.traverse((child) => {
@@ -2308,7 +2419,7 @@ function renderInspector() {
   } else if (state.panel === 'meteorology') {
     html = `<div class="property-group"><h3>时间设置</h3>${field('开始节点', `<input class="input" id="meteoStart" type="number" min="0" step="1" value="${escapeHtml(c.meteo.start)}">`)}${field('结束节点', `<input class="input" id="meteoEnd" type="number" min="${Number(c.meteo.start) + 1}" step="1" value="${escapeHtml(c.meteo.end)}">`)}${field('时间步长 dTime', inputUnit('meteoDTime', c.meteo.dTime, 's', 'type="number" min="1" step="1"'))}<div class="notice">气象文件中的年积日按“场景输入 → 地理与时间”的年份与时区解释；节点索引以文件首行为 0。</div></div>
       <div class="property-group"><h3>站点参数</h3>${field('观测高度 z', inputUnit('meteoHeight', c.meteo.z, 'm', 'type="number" min="0" step="0.1"'))}<div class="notice">纬度和经度在“场景输入 → 地理与时间”中设置。</div></div>
-      <div class="property-group"><h3>初始状态</h3>${field('初始土壤温度 Tsold', inputUnit('meteoSoilTemperature', c.meteo.Tsold, 'K', 'type="number" min="150" max="400" step="0.1"'))}${field('饱和含水量 SatWater', inputUnit('meteoSatWater', c.meteo.SatWater, '0–1', 'type="number" min="0" max="1" step="0.01"'))}<div class="notice">当前能量平衡初温取首个气象节点，饱和含水量以“材质属性 → 物化属性”的土壤参数为准。</div></div>
+      <div class="property-group"><h3>初始状态</h3>${field('初始土壤温度 Tsold', inputUnit('meteoSoilTemperature', c.meteo.Tsold, 'K', 'type="number" min="150" max="400" step="0.1"'))}${field('饱和含水量 SatWater', inputUnit('meteoSatWater', c.meteo.SatWater, '0–1', 'type="number" min="0" max="1" step="0.01"'))}<div class="notice">FacetEB 与 VoxelEB 都以此值（K）作为土壤初温；工程 JSON 中未写 Tsold 时，FacetEB 取首个气象节点气温、VoxelEB 取 300 K。饱和含水量以“材质属性 → 物化属性”的土壤参数为准。</div></div>
       <div class="property-group"><h3>驱动文件</h3><div class="path-input"><span title="${escapeHtml(c.meteo.path)}">${escapeHtml(c.meteo.path)}</span></div><label class="button ghost" for="meteoFile" style="width:100%;justify-content:center;margin-top:9px"><svg><use href="#i-import"/></svg>导入本地 meteo 文件<input id="meteoFile" type="file" accept=".txt,.meteo,.dat,.csv,text/plain" hidden></label><div class="notice">文件将复制到当前工程的 meteorology 目录，并写入 project.json。</div></div>${builtinNotice()}`
   } else if (state.panel === 'fluid') {
     const fluid = c.fluid || (c.fluid = { enabled: false, voxelSize: Number(c.scene.voxel) || 1, timeStep: 5, pressureIterations: 20, windDirection: 0, buoyancy: 0.033, dragCoefficient: 0.3, thermalCoupling: 1, diffusivity: 0.1, smokeEmission: 0.02, maxVelocity: 30, outputWind: false, outputAirTemperature: false, outputHeight: 2 })
@@ -2345,13 +2456,31 @@ function renderInspector() {
       : '<div class="notice">辐射过程保存面元或体元辐射度，用于三维分析。</div>'
     const processOutputSwitches = switchRow('输出辐射过程', 'radiationProcessSwitch', c.sensor.radiationProcess) +
       (energyBalanceOutput ? switchRow('输出能量过程', 'energyProcessSwitch', c.sensor.energyProcess) : '')
-    const samplingControl = field('采样数目', `<input class="input" id="sampleCount" type="number" min="1" max="256" step="1" value="${escapeHtml(c.control.samples)}">`)
+    // Only show controls the selected engine actually reads (FacetRT/FacetEB
+    // use neither tracing depth nor pixel samples; VoxelRT reads "depth" as a
+    // DDA step budget; VoxelEB uses radiationMaxSteps instead; RayTracing has
+    // its own scattering-order budget).
+    const samplingControl = isFacetMode()
+      ? ''
+      : field(state.mode === 'eRaytracing' ? '每像元路径数' : '像元采样数（抗锯齿）', `<input class="input" id="sampleCount" type="number" min="1" max="1024" step="1" value="${escapeHtml(c.control.samples)}">`)
+    const depthControl = state.mode === 'eRaytracing'
+      ? `${field('最大散射次数', `<input class="input" id="raytracingDepth" type="number" min="1" max="64" step="1" value="${escapeHtml(c.control.raytracingDepth ?? 16)}">`)}<div class="notice">每条路径最多计算的散射次数（默认 16）。第 3 次散射起按俄罗斯轮盘赌无偏终止，深路径代价很小；设得过低会截断多次散射，使植被近红外反射率偏低。</div>`
+      : state.mode === 'eVoxelRT'
+        ? `${field('体元射线步数预算', `<input class="input" id="rayDepth" type="number" min="1" max="16" value="${escapeHtml(c.control.depth)}">`, '×128')}<div class="notice">每条体元射线最多穿越 数值×128 个体元面（128–2048），不是散射次数；散射阶数见下方“真实碰撞次数”。大场景或小体元时适当增大。</div>`
+        : state.mode === 'eVoxelEB'
+          ? `${field('体元射线步数上限', `<input class="input" id="radiationMaxSteps" type="number" min="16" max="4096" step="16" value="${escapeHtml(c.control.radiationMaxSteps ?? 64)}">`)}${field('短波散射阶数', `<select class="select" id="shortwaveScatteringOrders">${[[1, '1 阶（默认）'], [2, '2 阶'], [3, '3 阶']].map(([value, label]) => `<option value="${value}" ${Number(c.control.shortwaveScatteringOrders ?? 1) === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`)}<div class="notice">步数上限约束短波、长波和成像射线的最大体元穿越数；运行后“运行质量”中若出现步数截断，应增大该值。显式散射阶数之外的高阶散射用光谱不变理论补偿，增加阶数可提高浓密冠层近红外吸收精度。</div>`
+          : ''
     const configuredPeriodicCount = Math.max(0, Math.min(20, Math.round(
       Number.isFinite(Number(c.control.periodicTraversalCount))
         ? Number(c.control.periodicTraversalCount) : 0
     )))
     const effectivePeriodicCount = configuredPeriodicCount
-    const periodicBoundaryControl = `${field('周期穿透边界次数', `<input class="input" id="periodicTraversalCount" type="number" min="0" max="20" step="1" value="${effectivePeriodicCount}">`, '0=关闭')}${switchRow('典型天空盒', 'skyboxSwitch', Boolean(c.control.skyboxEnabled))}<div class="notice">不会复制邻域场景。0 为关闭；1–20 表示主视线离开一侧边界后，从对侧继续查询同一场景的最大次数。天空盒勾选后显示典型蓝天与云层；不勾选时保持默认 COS 天空响应。两项互相独立。</div>`
+    const periodicScopeNotice = isFacetMode()
+      ? '面元模式按实例复制邻块（向上取整为 4/8/12/20 块）；邻块越多，可见性栅格对中心块的有效分辨率越低。'
+      : state.mode === 'eRaytracing'
+        ? '不会复制邻域场景。1–20 表示主视线离开一侧边界后从对侧继续查询的最大次数；阴影和散射射线不跨边界，靠近边界的条带会缺少邻域阴影。'
+        : '不会复制邻域场景。1–20 表示成像射线离开一侧边界后从对侧继续查询的最大次数；体元太阳与漫射传输不跨边界。'
+    const periodicBoundaryControl = `${field('周期穿透边界次数', `<input class="input" id="periodicTraversalCount" type="number" min="0" max="20" step="1" value="${effectivePeriodicCount}">`, '0=关闭')}${switchRow('典型天空盒', 'skyboxSwitch', Boolean(c.control.skyboxEnabled))}<div class="notice">0 为关闭。${periodicScopeNotice}天空盒勾选后显示典型蓝天与云层；不勾选时保持默认 COS 天空响应。两项互相独立。</div>`
     const heterogeneousVoxelControl = (state.mode === 'eVoxelRT' || state.mode === 'eVoxelEB')
       ? `${switchRow('使用异质性体元', 'heterogeneousVoxelSwitch', Boolean(c.control.heterogeneousVoxel))}<div class="notice">开启后从 OBJ 面元计算每个体元的三轴聚集指数和体密度，并在 VoxelRT/VoxelEB 消光、散射及热辐射中使用；关闭时保持均匀体元算法。默认关闭。</div>`
       : ''
@@ -2367,11 +2496,14 @@ function renderInspector() {
     const couplingGeometry = state.mode === 'eFacetEB' ? '面元' : state.mode === 'eVoxelEB' ? '体元' : ''
     const spectralAcceleration = field('光谱加速宽度', inputUnit('spectralAccelerationWidth', c.control.spectralAccelerationWidth ?? 100, 'nm', 'type="number" min="1" max="1000" step="1"'))
     const couplingNotice = state.mode === 'eVoxelEB'
-      ? '默认100 nm。直射和漫射均在窗口内积分，并使用窗口中心光学属性计算一次。'
-      : '默认100 nm。短波净辐射按窗口分别积分直射和漫射，并使用窗口中心光学属性求解后累加；最终影像对传感器选定波段逐个独立求解，不进行输出波段插值。'
-    const coupling = couplingGeometry ? `<div class="property-group"><h3>${couplingGeometry} RT–EB 耦合</h3>${spectralAcceleration}${state.mode === 'eFacetEB' ? field('大气稳定度', `<select class="select" id="stabilityCorrection"><option value="1" ${c.control.stabilityCorrection !== false ? 'selected' : ''}>Monin–Obukhov 修正</option><option value="0" ${c.control.stabilityCorrection === false ? 'selected' : ''}>中性大气（兼容默认）</option></select>`) : ''}${field('最大耦合迭代', `<input class="input" id="couplingIterations" type="number" min="1" max="100" value="${escapeHtml(c.control.couplingIterations)}">`)}${field('温度收敛阈值', inputUnit('temperatureTolerance', c.control.temperatureTolerance, 'K', 'type="number" min="0.001" step="0.01"'))}${field('温度松弛系数', `<input class="input" id="temperatureRelaxation" type="number" min="0.05" max="1" step="0.05" value="${escapeHtml(c.control.temperatureRelaxation)}">`)}<div class="notice">${couplingNotice}场景几何和${couplingGeometry}辐射结构只初始化一次。</div></div>` : ''
+      ? '默认100 nm。直射逐波段积分，漫射与多次散射按窗口内辐照度加权的平均光学属性求解。温度迭代由引擎自动控制（最多 50 次，逐步减小步长），收敛判据为全部体元能量残差 < 2 W/m²。'
+      : '默认100 nm。短波净辐射按窗口分别积分直射和漫射，并使用窗口加权光学属性求解后累加；最终影像对传感器选定波段逐个独立求解，不进行输出波段插值。收敛判据：能量残差 ≥ 2 W/m² 的面元 < 0.1%，且任一面元的温度等效残差 ≤ 0.5 K；未收敛节点会在运行质量中标出。'
+    const facetCouplingControls = state.mode === 'eFacetEB'
+      ? `${field('大气稳定度', `<select class="select" id="stabilityCorrection"><option value="1" ${c.control.stabilityCorrection === true ? 'selected' : ''}>Monin–Obukhov 修正</option><option value="0" ${c.control.stabilityCorrection !== true ? 'selected' : ''}>中性大气（兼容默认）</option></select>`)}${field('最大耦合迭代', `<input class="input" id="couplingIterations" type="number" min="1" max="100" value="${escapeHtml(c.control.couplingIterations)}">`)}${field('温度松弛系数', `<input class="input" id="temperatureRelaxation" type="number" min="0.05" max="1" step="0.05" value="${escapeHtml(c.control.temperatureRelaxation)}">`)}`
+      : ''
+    const coupling = couplingGeometry ? `<div class="property-group"><h3>${couplingGeometry} RT–EB 耦合</h3>${spectralAcceleration}${facetCouplingControls}<div class="notice">${couplingNotice}场景几何和${couplingGeometry}辐射结构只初始化一次。${state.mode === 'eFacetEB' ? '松弛系数默认 0.8；出现振荡（运行质量中迭代用满）时再调小。' : ''}</div></div>` : ''
     const temperatureMethods = energyBalanceOutput ? `<div class="property-group"><h3>温度模拟方法</h3>${field('土壤温度', `<select class="select" id="soilTemperatureMethod"><option value="0" ${c.control.soilTemperatureMethod === 0 ? 'selected' : ''}>0 · 瞬时能量平衡</option><option value="1" ${c.control.soilTemperatureMethod === 1 ? 'selected' : ''}>1 · 热惯性动态模型</option><option value="2" ${c.control.soilTemperatureMethod === 2 ? 'selected' : ''}>2 · 温度廓线传导模型（默认）</option></select>`)}${field('植被温度', `<select class="select" id="vegetationTemperatureMethod"><option value="0" ${c.control.vegetationTemperatureMethod === 0 ? 'selected' : ''}>经验法 · Ball–Berry</option><option value="1" ${c.control.vegetationTemperatureMethod === 1 ? 'selected' : ''}>机制法 · Farquhar</option></select>`)}<div class="notice">初始温度只作为求解初值；能量平衡各时刻均由所选方法动态更新。土壤方法会同步应用到全部土壤物化属性。</div></div>` : ''
-    html = `<div class="property-group"><h3>模拟产出</h3>${switchRow(imageOutputLabel, 'imageSwitch', c.sensor.image)}${processOutputSwitches}${processOutputNotice}${switchRow('输出温度', 'temperatureSwitch', c.sensor.temperature)}${switchRow('输出反照率', 'albedoSwitch', c.sensor.albedo)}</div><div class="property-group"><h3>计算控制</h3>${field('追踪深度', `<input class="input" id="rayDepth" type="number" min="1" max="64" value="${escapeHtml(c.control.depth)}">`)}${samplingControl}${periodicBoundaryControl}${heterogeneousVoxelControl}${radiationSolverControl}${collisionOrdersControl}${backendNotice}</div>${temperatureMethods}${coupling}${builtinNotice()}`
+    html = `<div class="property-group"><h3>模拟产出</h3>${switchRow(imageOutputLabel, 'imageSwitch', c.sensor.image)}${processOutputSwitches}${processOutputNotice}${switchRow('输出温度', 'temperatureSwitch', c.sensor.temperature)}${switchRow('输出反照率', 'albedoSwitch', c.sensor.albedo)}</div><div class="property-group"><h3>计算控制</h3>${depthControl}${samplingControl}${periodicBoundaryControl}${heterogeneousVoxelControl}${radiationSolverControl}${collisionOrdersControl}${backendNotice}</div>${temperatureMethods}${coupling}${builtinNotice()}`
   }
   $('#inspectorContent').innerHTML = html
   bindInspector()
@@ -2455,8 +2587,11 @@ function bindInspector() {
     previewOnNextFrame('sceneBounds', () => { updateSceneBoundsGuide(c); updateSun(c) })
     scheduleProjectTextSync()
   })
-  bindValue('rayDepth', (v) => c.control.depth = v, 'Control rayTracingDepth')
-  bindValue('sampleCount', (v) => c.control.samples = Math.min(256, Math.max(1, Math.round(v))), 'Control sampleCount', (value) => Math.min(256, Math.max(1, Math.round(Number(value) || 32))))
+  bindValue('rayDepth', (v) => c.control.depth = Math.max(1, Math.min(16, Math.round(v))), 'Control rayTracingDepth', (value) => Math.max(1, Math.min(16, Math.round(Number(value) || 4))))
+  bindValue('raytracingDepth', (v) => c.control.raytracingDepth = v, 'Control raytracingDepth', (value) => Math.max(1, Math.min(64, Math.round(Number(value) || 16))))
+  bindValue('radiationMaxSteps', (v) => c.control.radiationMaxSteps = v, 'Control radiationMaxSteps', (value) => Math.max(16, Math.min(4096, Math.round(Number(value) || 64))))
+  bindValue('shortwaveScatteringOrders', (v) => c.control.shortwaveScatteringOrders = v, 'Control shortwaveScatteringOrders', (value) => Math.max(1, Math.min(3, Math.round(Number(value)) || 1)))
+  bindValue('sampleCount', (v) => c.control.samples = Math.min(1024, Math.max(1, Math.round(v))), 'Control sampleCount', (value) => Math.min(1024, Math.max(1, Math.round(Number(value) || 32))))
   bindValue('periodicTraversalCount', (count) => {
     c.control.periodicTraversalCount = count
   }, 'Control periodicNeighborCount', (value) => {
@@ -2844,7 +2979,7 @@ async function openExampleFromDialog(event) {
     appStorage.setItem('histreamExampleDirectory', directory)
     loadXml(result)
     hideExampleDialog()
-    addLog(`示例已复制并打开：${result.path}`, 'success')
+    addLog(result.overwritten ? `示例已覆盖同名副本并打开：${result.path}` : `示例已复制并打开：${result.path}`, 'success')
   } catch (error) {
     toast('无法打开示例', error.message, 'error')
     addLog(error.message, 'error')
@@ -4951,8 +5086,41 @@ async function runSimulation() {
   state.runPending = true
   try {
     if (state.xmlDirty && !(await saveXml())) return
+    if (!(await runPreflightCheck())) return
     await startSimulation()
   } finally { state.runPending = false }
+}
+
+function formatDuration(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0))
+  if (value < 90) return `${value} 秒`
+  if (value < 5400) return `${Math.round(value / 60)} 分钟`
+  return `${(value / 3600).toFixed(1)} 小时`
+}
+
+// Scale / memory / duration preflight before starting the engine. Risks
+// (timeout, facet limit, memory) ask for confirmation; otherwise the summary
+// only goes to the log. A failing preflight never blocks the run.
+async function runPreflightCheck() {
+  let report
+  try {
+    report = await api.preflight({ mode: state.mode, inputPath: state.inputPath })
+  } catch (error) {
+    addLog(`运行预检不可用：${error.message}`, 'warning')
+    return true
+  }
+  const parts = []
+  if (report.facet) parts.push(`面元约 ${report.facet.triangles.toLocaleString('zh-CN')} 个（上限 ${report.facet.limit.toLocaleString('zh-CN')}）`, `可见性栅格 ${report.facet.raster}²${report.facet.periodicTiles ? ` · 周期邻块 ${report.facet.periodicTiles}` : ''}`)
+  if (report.voxel) parts.push(`体元网格 ${report.voxel.grid.join('×')}（${report.voxel.size} m）`, `辐射场显存上限估计 ${report.voxel.radianceMiB >= 1024 ? (report.voxel.radianceMiB / 1024).toFixed(1) + ' GB' : report.voxel.radianceMiB + ' MB'}`)
+  if (report.nodes > 1) parts.push(`${report.nodes} 个时间节点`)
+  if (report.angles > 1) parts.push(`${report.angles} 个观测方向`)
+  parts.push(`${report.bands} 个波段`)
+  parts.push(report.estimateSeconds != null ? `预计约 ${formatDuration(report.estimateSeconds)}（${report.estimateBasis}）` : '暂无历史耗时可参考')
+  parts.push(`单次运行上限 ${formatDuration(report.timeoutSeconds)}`)
+  addLog(`运行预检 · ${parts.join(' · ')}`)
+  for (const warning of report.warnings || []) addLog(`运行预检提示：${warning}`, 'warning')
+  if (!report.warnings?.length) return true
+  return window.confirm(t(`运行预检发现以下风险：\n\n${report.warnings.map((item) => '• ' + item).join('\n')}\n\n仍要开始运行吗？`))
 }
 
 async function startSimulation() {
@@ -5031,12 +5199,74 @@ function normalizedEngineLog(text) {
     if (processResult) return [`过程结果 · ${processResult[1]}`]
     const primaryResult = line.match(/^RESULT\s+(.+)$/i)
     if (primaryResult) return [`主结果 · ${primaryResult[1]}`]
+    const quality = recordRunQualityLine(line)
+    if (quality !== null) return quality ? [quality] : []
     const observation = line.match(/^(?:OBSERVATION|Angle Info:)\s*(.*)$/i)
     if (observation) return [`观测角度 · ${observation[1].replaceAll('_', ' ').trim()}`]
     const time = line.match(/^Time Info:\s*t_?(.*)$/i)
     if (time) return time[1] ? [`时间节点 · ${time[1]}`] : []
     return [line]
   }).join('\n')
+}
+
+function emptyRunQuality() {
+  return { facet: [], timing: [], voxel: [], scattering: [] }
+}
+
+// Engine diagnostics lines -> structured run quality + a readable log line.
+// Returns null when the line is not a diagnostics line, '' to hide it.
+function recordRunQualityLine(line) {
+  const quality = state.runQuality || (state.runQuality = emptyRunQuality())
+  let match = line.match(/^FACET_CONVERGENCE\s+(\d+)\s+([01])\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)/)
+  if (match) {
+    const item = { node: Number(match[1]), converged: match[2] === '1', iterations: Number(match[3]),
+      temperatureDelta: Number(match[4]), residual: Number(match[5]), residualK: Number(match[6]) }
+    quality.facet.push(item)
+    return `收敛 · 节点 ${item.node + 1} ${item.converged ? '已收敛' : '未收敛'} · 迭代 ${item.iterations} · 最大残差 ${item.residual.toFixed(2)} W/m²（${item.residualK.toFixed(2)} K）`
+  }
+  if (/^FACET_STEP\t/.test(line)) return ''
+  match = line.match(/^FACET_TIMING\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)/)
+  if (match) {
+    quality.timing.push({ node: Number(match[1]), shortwave: Number(match[2]), coupling: Number(match[3]), output: Number(match[4]) })
+    return ''
+  }
+  match = line.match(/^ENERGY_BALANCE\s+node=(\d+)\s+iterations=(\d+).*?statesOutsideTolerance=(\d+)/)
+  if (match) {
+    const item = { node: Number(match[1]), iterations: Number(match[2]), outside: Number(match[3]) }
+    quality.voxel.push(item)
+    return `能量平衡 · 节点 ${item.node + 1} · 迭代 ${item.iterations}${item.outside ? ` · ${item.outside} 个状态未达容差` : ' · 已收敛'}`
+  }
+  match = line.match(/^SHORTWAVE_SCATTERING\s+node=(\d+).*?elapsedMs=([\d.]+)(?:.*?truncations=(\d+))?/)
+  if (match) {
+    quality.scattering.push({ node: Number(match[1]), milliseconds: Number(match[2]), truncations: Number(match[3] || 0) })
+    return `短波散射 · 节点 ${Number(match[1]) + 1} · ${(Number(match[2]) / 1000).toFixed(2)} s${Number(match[3]) ? ` · 步数截断 ${match[3]} 条射线` : ''}`
+  }
+  return null
+}
+
+// Summary of the run diagnostics, written to the log when a run closes.
+function runQualitySummary(quality) {
+  if (!quality) return []
+  const lines = []
+  if (quality.facet.length) {
+    const failed = quality.facet.filter((item) => !item.converged)
+    const worst = quality.facet.reduce((a, b) => (b.residualK > a.residualK ? b : a))
+    const maxIterations = Math.max(...quality.facet.map((item) => item.iterations))
+    lines.push({ kind: failed.length ? 'warning' : 'success', text: `运行质量 · ${quality.facet.length} 个节点，${failed.length ? `${failed.length} 个未收敛（节点 ${failed.map((item) => item.node + 1).join('、')}）` : '全部收敛'} · 最多迭代 ${maxIterations} · 最大温度等效残差 ${worst.residualK.toFixed(2)} K（节点 ${worst.node + 1}）` })
+    if (failed.length) lines.push({ kind: 'warning', text: '建议：提高“最大耦合迭代”，或在振荡时调小“温度松弛系数”。' })
+  }
+  if (quality.timing.length) {
+    const sum = quality.timing.reduce((total, item) => ({ shortwave: total.shortwave + item.shortwave, coupling: total.coupling + item.coupling, output: total.output + item.output }), { shortwave: 0, coupling: 0, output: 0 })
+    lines.push({ kind: '', text: `耗时构成 · 短波窗口 ${sum.shortwave.toFixed(1)} s · RT–EB 耦合 ${sum.coupling.toFixed(1)} s · 影像、产品与节点出图 ${sum.output.toFixed(1)} s` })
+  }
+  if (quality.voxel.length) {
+    const outside = quality.voxel.filter((item) => item.outside > 0)
+    const maxIterations = Math.max(...quality.voxel.map((item) => item.iterations))
+    lines.push({ kind: outside.length ? 'warning' : 'success', text: `运行质量 · ${quality.voxel.length} 个能量平衡节点，${outside.length ? `${outside.length} 个节点有状态未达容差` : '全部收敛'} · 最多迭代 ${maxIterations}/50` })
+  }
+  const truncations = quality.scattering.reduce((total, item) => total + item.truncations, 0)
+  if (truncations > 0) lines.push({ kind: 'warning', text: `运行质量 · 短波散射共有 ${truncations} 条射线达到步数上限，建议增大“体元射线步数上限”。` })
+  return lines
 }
 
 function handleSimulationEvent(event) {
@@ -5062,6 +5292,8 @@ function handleSimulationEvent(event) {
     if (!state.startedAt) state.startedAt = Date.now()
     state.progress = 1
     state.progressStage = '正在启动计算引擎'
+    state.runQuality = emptyRunQuality()
+    state.stdoutCarry = ''
     state.pid = event.pid; setRunning(true)
     addLog(t(`开始模拟 · ${t(simulationModeLabels[state.mode] || state.mode)} · PID ${event.pid}`), 'success')
     const methods = simulationMethodSummary()
@@ -5069,18 +5301,44 @@ function handleSimulationEvent(event) {
     addLog(`输出：图像=${state.config?.sensor?.image ? '是' : '否'}；辐射过程=${state.config?.sensor?.radiationProcess ? '是' : '否'}；能量过程=${state.config?.sensor?.energyProcess ? '是' : '否'}`)
   }
   else if (event.type === 'stdout') {
-    const message = normalizedEngineLog(event.text)
+    // Raw engine stdout (event.engine) arrives in arbitrary chunks: parse
+    // complete lines only, so a PROGRESS/diagnostics line split across two
+    // chunks is not lost. Server status messages are always whole lines.
+    let complete = String(event.text || '')
+    if (event.engine) {
+      const text = (state.stdoutCarry || '') + complete
+      const cut = text.lastIndexOf('\n')
+      state.stdoutCarry = cut >= 0 ? text.slice(cut + 1) : text
+      complete = cut >= 0 ? text.slice(0, cut) : ''
+    }
+    const message = normalizedEngineLog(complete)
     if (message) addLog(message)
   }
   else if (event.type === 'stderr' || event.type === 'error') addLog(event.text, 'error')
   else if (event.type === 'closed') {
     if (event.outputDir) state.outputDir = event.outputDir
+    if (state.stdoutCarry) {
+      const tail = normalizedEngineLog(state.stdoutCarry)
+      state.stdoutCarry = ''
+      if (tail) addLog(tail)
+    }
     const success = event.code === 0
     state.progress = success ? 100 : state.progress
     state.progressStage = success ? '模拟完成' : event.status === 'non_converged' ? '模拟未收敛，结果已保留' : '模拟异常结束'
     addLog(success ? `模拟完成，耗时 ${(event.elapsed / 1000).toFixed(2)} 秒` : `模拟已结束，退出码 ${event.code}${event.signal ? `，信号 ${event.signal}` : ''}`, success ? 'success' : 'error')
+    // Non-fatal output problems (e.g. ENVI results that could not be converted to TIFF).
+    for (const warning of event.warnings || []) addLog(`结果转换提示：${warning}`, 'warning')
+    if (success && event.warnings?.length) toast('模拟完成', `${event.warnings.length} 个结果文件未能转换为 TIFF，详见日志`, 'warning')
     // DEFERRED[低|可维护性]: 下一行 if (!success) 只作用于 toast，setRunning(false)/renderRunProgress 实际无条件执行，但写在同一行极易被误读或在后续修改时误改为条件执行；建议：拆成多行并为 if 加花括号 —— 行为本身正确，只是换行/加花括号的格式调整，本轮明确不做格式化
     if (!success) toast('模拟结束', event.status === 'non_converged' ? '部分节点未达到收敛容差，结果已保留' : '退出码：' + event.code, 'error'); setRunning(false); renderRunProgress(event.elapsed)
+    const qualityLines = runQualitySummary(state.runQuality)
+    for (const line of qualityLines) addLog(line.text, line.kind)
+    if (success && qualityLines.some((line) => line.kind === 'warning')) toast('模拟完成（有质量提示）', qualityLines.find((line) => line.kind === 'warning').text, 'warning')
+    // Results of a completed (or non-converged but retained) run open
+    // directly instead of waiting for "查看模拟结果".
+    if (success || event.status === 'non_converged') {
+      setTimeout(() => { showResults().catch((error) => addLog(`无法自动打开结果：${error.message}`, 'warning')) }, 300)
+    }
   }
 }
 
@@ -6965,7 +7223,22 @@ $('#refreshDevicesBtn').addEventListener('click', () => loadComputeDevices(true)
 $$('.tree-item').forEach((button) => button.addEventListener('click', () => { state.panel = button.dataset.panel; $$('.tree-item').forEach((item) => item.classList.toggle('active', item === button)); renderInspector() }))
 $$('#viewStyle button').forEach((button) => button.addEventListener('click', () => { $$('#viewStyle button').forEach((item) => item.classList.toggle('active', item === button)); applyViewStyle(button.dataset.style) }))
 $('#gridBtn').addEventListener('click', () => { if (!grid) return; grid.visible = !grid.visible; $('#gridBtn').classList.toggle('active', grid.visible) })
-$('#voxelBtn').addEventListener('click', () => { if (!voxelPreview) return; voxelPreview.visible = !voxelPreview.visible; $('#voxelBtn').classList.toggle('active', voxelPreview.visible) })
+$('#voxelBtn').addEventListener('click', () => {
+  if (voxelPreview?.visible) {
+    voxelPreview.visible = false
+    $('#voxelBtn').classList.remove('active')
+    return
+  }
+  try {
+    const summary = buildVoxelPreview()
+    if (!summary) { toast('体元预览', '场景中没有可体元化的对象', 'warning'); return }
+    $('#voxelBtn').classList.add('active')
+    toast('体元预览', summary)
+    addLog(`体元预览 · ${summary}`)
+  } catch (error) {
+    toast('体元预览失败', error.message, 'error')
+  }
+})
 $('#sceneObjectToolsBtn').addEventListener('click', (event) => {
   event.stopPropagation()
   const menu = $('#sceneObjectToolsMenu')

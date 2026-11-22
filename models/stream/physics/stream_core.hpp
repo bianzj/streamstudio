@@ -1,4 +1,9 @@
 #pragma once
+// FIX(2026-11-21 S-8): ORPHAN COPY — NOT USED BY THIS ENGINE. Nothing in models/stream includes this header (checked
+// 2026-11-21); it is a byte-identical copy of StreamEarth observation/stream_core/stream_core.hpp kept for reference.
+// The Studio thermal / optical observation operator is app/thermal_view.cpp + physics/canopy.cpp + physics/radiosity.cpp
+// (TiRT standard closure). This core differs from TiRT (two-layer index 0.83 - 0.04 floor(LAI/0.5), step-table FR97
+// alpha, no reflected sky; report C_inversion_obs.md E-2) and must not be used as a Studio retrieval operator.
 // STREAM observation core 1.0.0. Double precision, K/degree/um/GHz.
 // NumPy backend: kernel.py + microwave.py; verified with identical test vectors.
 #include <algorithm>
