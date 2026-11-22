@@ -28,6 +28,7 @@
 #include "../nanovdb_info.glsl"
 #include "../functions.glsl"
 #include "../background_hapke.glsl"
+#include "../mwir_solar.glsl"
 #include "../water_brdf.glsl"
 #include "../shade_state_voxel.glsl"
 
@@ -981,10 +982,16 @@ void main()
     for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset) {
       float wavelength = wave[kwave + bandOffset];
       bool thermalBand = isThermalWavelength(wavelength);
+      // Thermal bands: Planck sky plus, below 6 um, the absolute solar beam
+      // and scattered sky (mwir_solar.glsl); exactly 0 elsewhere.
+      vec2 thermalSolar = thermalBand
+          ? voxelRtThermalSolar(wavelength, lightSet.direct,
+                lightSet.diffuse, lightSet.direction)
+          : vec2(0.0);
       packetEsun[bandOffset] = thermalBand
-          ? 0.0 : lightSet.direct;
+          ? thermalSolar.x : lightSet.direct;
       packetEsky[bandOffset] = thermalBand
-          ? Planck(wavelength, lightSet.skyTemperature)
+          ? Planck(wavelength, lightSet.skyTemperature) + thermalSolar.y
           : lightSet.diffuse;
     }
 
@@ -1029,9 +1036,12 @@ void main()
           Esky = lightSet.diffuse;
           if(isThermalWavelength(wavelength)){
             // Longwave illumination comes from the configured sky and
-            // surrounding thermal emitters, not a 6000 K solar radiance.
-            Esun = 0.0;
-            Esky = Planck(wavelength, lightSet.skyTemperature);
+            // surrounding thermal emitters, not a 6000 K solar radiance;
+            // below 6 um the absolute solar beam and scattered sky are added.
+            vec2 thermalSolar = voxelRtThermalSolar(wavelength,
+                lightSet.direct, lightSet.diffuse, lightSet.direction);
+            Esun = thermalSolar.x;
+            Esky = Planck(wavelength, lightSet.skyTemperature) + thermalSolar.y;
           }
 
           bool surfaceReceiver0 = isSolidVoxel(int(bufferId0));

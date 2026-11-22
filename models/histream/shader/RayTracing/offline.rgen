@@ -27,6 +27,7 @@
 #include "../bsdf.glsl"
 #include "../background_hapke.glsl"
 #include "../specular_brdf.glsl"
+#include "../mwir_solar.glsl"
 #include "../shade_state.glsl"
 #include "../bindinglayout.h"
 #include "../periodic_walk.glsl"
@@ -215,6 +216,19 @@ bool AnyHit(Ray r, float maxDist)
   return false;
 }
 
+// Reflected sunlight in thermal bands (mwir_solar.glsl). The normalized
+// illumination has the horizontal reference direct*cos + 0.5*diffuse (the
+// HDRF denominator); this factor scales it to the clear-sky global shortwave
+// in W m-2, so scale*direct*shape is the beam-normal and scale*diffuse*shape
+// the sky value in W m-2 um-1, used exactly like lightSet.direct/diffuse.
+float ThermalSolarScale()
+{
+  float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
+  float reference = lightSet.direct * cosSolarZenith + lightSet.diffuse * 0.5;
+  return reference > EPSION
+    ? clearSkyGlobalShortwave(cosSolarZenith) / reference : 0.0;
+}
+
 // wi: in direction; wo: out direction; *World: direction in world coordinates.
 bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
 {
@@ -235,6 +249,9 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
   // Next-event estimation is evaluated at every path vertex.  Throughput
   // already contains the BRDF/PDF weights of all preceding bounces, so these
   // terms correctly include multiple scattering without double counting.
+  // Thermal bands below 6 um receive the absolute solar beam (same BRDF and
+  // shadow ray as the optical bands); elsewhere it is exactly zero.
+  float solarScale = ThermalSolarScale();
   if(!inLightShadow)
   {
     vec3 wi = emitterWi;
@@ -248,7 +265,9 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
       //int waveInd = sensorWaveInds[kBand].value;
       float wavelength = waveSets[kBand];
       if(wavelength > 50) wavelength = wavelength / 1000.0;
-      if(wavelength <= 2.5)
+      float beam = wavelength <= 2.5 ? lightSet.direct
+        : solarScale * lightSet.direct * mwirSolarShape(wavelength);
+      if(wavelength <= 2.5 || beam > 0.0)
       {
         if(!inSameSide)
         {
@@ -261,7 +280,7 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
             emitterWiWorld, woWorld, sstate.normal, angularStrength);
           bsdf = abs(bsdf0) * reflectance;
         }
-        Radiance[kBand] += Throughput[kBand] * lightSet.direct * bsdf * cosTheta;
+        Radiance[kBand] += Throughput[kBand] * beam * bsdf * cosTheta;
         // Radiance[kBand] += cosTheta;
       }
     }
@@ -326,14 +345,17 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
       {
         float wavelength = waveSets[kBand];
         if(wavelength > 50) wavelength = wavelength/1000.0;
-        if(wavelength <= 2.5)
+        float sky = wavelength <= 2.5 ? lightSet.diffuse
+          : solarScale * lightSet.diffuse * MWIR_SKY_SOLAR_RATIO
+            * mwirSolarShape(wavelength);
+        if(wavelength <= 2.5 || sky > 0.0)
         {
           float opticalCoefficient = inSameSide
             ? MaterialReflectance(
                 matIndex0 + kBand, kBand,
                 emitterWiWorld, woWorld, sstate.normal, angularStrength)
             : spectralMaterials[matIndex0 + kBand].transmittance;
-          Radiance[kBand] += Throughput[kBand] * lightSet.diffuse * 0.5
+          Radiance[kBand] += Throughput[kBand] * sky * 0.5
             * opticalCoefficient * M_1_OVER_PI;
         }
       }

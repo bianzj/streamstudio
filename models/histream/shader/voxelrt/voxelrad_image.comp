@@ -28,6 +28,7 @@
 #include "../bsdf.glsl"
 #include "../functions.glsl"
 #include "../background_hapke.glsl"
+#include "../mwir_solar.glsl"
 #include "../water_brdf.glsl"
 #include "../shade_state_voxel.glsl"
 #include "../random.glsl"
@@ -270,6 +271,15 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 						if(opticalMediumBand)
 							Radiance[kwave] += lightSet.direct * PI * alpha_toSolar
 								* scatteringFraction * scatteringPhase * alpha_toSensor;
+						else {
+							// Thermal fields are L: the solar beam below 6 um
+							// is E/pi (mwir_solar.glsl), so p*E here.
+							float thermalBeam = voxelRtThermalSolar(wavelength,
+								lightSet.direct, lightSet.diffuse, lightSet.direction).x;
+							if(thermalBeam > 0.0)
+								Radiance[kwave] += thermalBeam * PI * alpha_toSolar
+									* scatteringFraction * scatteringPhase * alpha_toSensor;
+						}
 					}
 				}
 				else
@@ -362,6 +372,15 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                         // Same hemispherical-average convention as the optical branch.
                         Radiance[kwave] += environmentRadiance * 0.5 *
                             (1 - alpha_voxel) * s * alpha_toSensor;
+                        // Below 6 um the solar beam is single-scattered exactly
+                        // as in the optical branch, in radiance units.
+                        float thermalBeam = voxelRtThermalSolar(wavelength,
+                            lightSet.direct, lightSet.diffuse, lightSet.direction).x;
+                        if(thermalBeam > 0.0) {
+                            float leafGamma = max(gamma.x * (refl + trans) + gamma.y * trans, 0.0);
+                            Radiance[kwave] += thermalBeam * leafGamma / max(G, 0.000001)
+                                * (1 - alpha_voxel) * hotspot;
+                        }
                     }
             // Radiance[0] += 3;
             // return true;
@@ -499,6 +518,22 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                                 angularStrength);
                         Radiance[kwave] +=
                             environmentRadiance * thermalReflectance * alpha_toSensor;
+                        // Below 6 um: sunlit and visible solar beam with the
+                        // optical branch's BRDF weight, in radiance units.
+                        float thermalBeam = voxelRtThermalSolar(wavelength,
+                            lightSet.direct, lightSet.diffuse, lightSet.direction).x;
+                        if(thermalBeam > 0.0) {
+                            float cosIncidence = max(dot(normalize(sstate.normal),
+                                normalize(lightSet.direction)), 0.0);
+                            float directWeight = typeId == TYPE_WATER
+                                ? waterCoxMunkWeight(meshLinks[meshId].bioId, refl,
+                                    lightSet.direction, -ray.direction, sstate.normal)
+                                : backgroundReflectanceWeight(
+                                    refl, lightSet.direction, -ray.direction,
+                                    sstate.normal, angularStrength);
+                            Radiance[kwave] += thermalBeam * cosIncidence *
+                                directWeight * hotspot;
+                        }
                     }
                     // Radiance[kwave] += Planck(wavelength, envTemp) * (1 - alpha_voxel) * (s) * alpha_toSensor;
 

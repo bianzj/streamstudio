@@ -40,6 +40,7 @@
 - **PROSPECT 指数积分 E1**：原 9.9 万步矩形积分丢掉了尾项（x = 0.01 时误差约 5%），改为级数加连分式（相对误差约 1e-15）。叶片近红外反射率变化约 1e-4。
 - **VoxelRT/VoxelEB 叶倾角分布、G 与 Γ 自洽**：此前消光只用常数 G，叶片散射相函数固定为球形闭式，Kuusk 热点写死 G = 0.5，`LIDFa/LIDFb` 不参与计算；G ≠ 0.5 时单次散射被放大/缩小 0.5/G 倍。现在主机端由 `LIDFa/LIDFb`（SAIL 13 区间）求叶倾角频率传入 GPU，消光、太阳可见性、视线截获、直射投影和热点都用对应方向的 G(Ω)，Γ 按 SAIL `volscatt` 精确积分并满足 (1/π)∫Γ dΩ = (ρ+τ)G；植被接收体的漫射入射按 G(Ω) 加权。刚体/介质、`LIDFa = LIDFb = 0` 或超出定义域时回退为常数 G，Γ 按 G/0.5 归一；`LIDFa > 1` 为精确球形（G = 0.5，与修正前一致，相对差 ≤ 5e-7）。冻结算例（默认 −0.35/−0.15）：vrt_forest 842 nm 0.19240→0.19190（−0.3%）、668 nm +0.2%、亮温 +0.01 K；veb_forest 842 nm −0.13%，植被温度 −0.09 K、植被 Rn −0.9%；城市算例 ≤ 0.03%。平面型 LIDF (1, 0) 的森林 842 nm 比修正前（LIDF 被忽略）高 11.9%、668 nm 低 7%；G = 0.3 回退算例 842 nm −3.2%、668 nm +3.4%、亮温 +0.38 K（原热点式按 G = 0.5 计算，阳照背景被低估）。FacetRT/FacetEB/RayTracing 逐位不变。
 - **周期边界覆盖全部传输射线**（RayTracing、VoxelRT、VoxelEB）：此前只有相机/成像射线跨边界，阴影、天空、散射射线和体元太阳/漫射/散射/长波传输在边界处直接逃逸，边界条带缺少邻域遮挡与多次散射。现在所有射线按射线顺序遍历域副本（每个副本只在射线位于其中的区间查询一次，命中点直接落在中心域坐标），每段自由程最多穿越 `periodicTraversalCount` 次，不占散射次数；RayTracing 阴影射线每个副本内仍首次命中即终止；体元浊介质出射积分按周期环绕取表。高于场景顶且不下行的射线直接逃逸，相机射线从场景顶开始计数，高处相机不再把穿越次数耗在空域里。验证（森林 25 m 规则格网算例，周期 8）：边缘格与中心格的差异 VoxelRT 2.1% → ≤ 0.05%，VoxelEB 冠层净辐射 −14.8% → +0.01%、冠层温度 −2.4 K → 0.00 K，RayTracing 0.96% → ≤ 0.14%（噪声水平）。开周期的示例变化：森林（周期 8）VoxelRT 668 nm −4.3%、VoxelEB 475 nm −4.3%、RayTracing 842 nm +0.45%；城市（周期 20）VoxelRT 星下点 −0.8%、VZA 75° 斜视 +17%，VoxelEB 亮温 +0.2 K，RayTracing ≤ 0.12%。未开周期的工程：VoxelRT/VoxelEB/Facet 逐位不变；RayTracing 约 3% 像元因着色器重新编译后的舍入差使路径分叉而不同，图像均值相对差 ≤ 5e-5（p99 ≤ 2.3e-4）。
+- **中波红外计入太阳反射**（RayTracing、VoxelRT、VoxelEB）：此前 > 2.5 µm 的热红外波段只计 Planck 发射与天空长波，白天 3–5 µm 亮温偏低。现在 2.5–6 µm 波段在发射之外加入太阳直射与天空散射短波的反射，写法与光学分支相同（同一太阳可见性/热点，植被 Γ/G、固体 BRDF、水体 Cox–Munk；RayTracing 每个路径顶点的下一事件估计，VoxelRT 进入漫射场与多次散射，VoxelEB 成像单次散射）。光谱形状取内置 `defined/Esun_.dat` 2500–6000 nm 段除以其 400–2400 nm 积分（3.8 µm 处 0.0113 µm⁻¹，自然含 2.7/4.3 µm 吸收带，6.3 µm 水汽带处为 0）；绝对量 VoxelEB 用气象 Rin × 直射比例，RayTracing/VoxelRT 用 Haurwitz 晴空总辐照（θs = 30° 时 890 W m⁻²，3.8 µm 法向直射约 9.0 W m⁻² µm⁻¹）；天空散射按 Esky_/Esun_ 在 2.3–2.4 µm 的比值 0.0847 外推（上界）。共享代码 `shader/mwir_solar.glsl`。冻结算例 3.8 µm 白天亮温均值升高：rt_urban +3.76 K、vrt_urban +3.30 K（受光混凝土/土壤 p95 +6.6–7.3 K）、vrt_forest +2.67 K、veb_forest +2.37–2.50 K、veb_urban +3.45–3.53 K；场景平均等效反射率 ΔL/(E·cosθs/π) 森林 0.026–0.029、城市 0.038–0.043，与叶片 TIR 反射率 0.025、城市材料 0.05–0.08（含阴影）一致。同一运行中的 10.5 µm 波段、夜间节点（Rin = 0）的 3.8 µm 波段、全部 22 个旧算例（可见/近红外/长波）逐字节不变；耗时不变。VoxelEB 能量平衡不变（太阳能量已在短波 Rin 中）。FacetRT/FacetEB 尚未计入（见尚存问题）。
 
 ### 性能（2026-11-22，不改物理）
 
@@ -89,13 +90,14 @@
 - 耦合小镇和机场全天所用的 FacetEB 集中参数热节点（`facetrt/lumpedthermal.h` 等）属于核心，保留；其解析夹具从 `tools/scene-animation/tests/lumped_thermal_fixture.cpp` 移为 `tools/test-facet-lumped-thermal.cpp`（目标 `histream_lumped_thermal_tests`）。
 - 三维工程 `schemaVersion = 6`、遥感工程 `schemaVersion = 2` 不变。STREAM IMAGING 运行时仍从本仓库导入 `project-schema.js` 和 `tools/runtime-scene.mjs`。
 - HiStream 退出码：64 为命令行用法错误（含不带工程路径运行，原先静默跑内置示例；内置示例须显式 `--builtin-example`），2 只表示 FacetEB 计算结束但有未收敛节点；1/3/4 为运行、资源创建、初始化失败。按旧退出码 2 判断用法错误的脚本需修改。
-- `voxelrt.json` 过程字段：2.5–5 µm 波段由 `illumination_<波长>` 改名为 `spectral_radiance_<波长>`（与 > 5 µm 波段一致，按 Planck 辐亮度计），读取这些字段的脚本需改名；`radiosity_<波长>` 别名不变。
+- `voxelrt.json` 过程字段：2.5–5 µm 波段由 `illumination_<波长>` 改名为 `spectral_radiance_<波长>`（与 > 5 µm 波段一致，按 Planck 辐亮度计），读取这些字段的脚本需改名；`radiosity_<波长>` 别名不变。2.5–6 µm 波段的 `spectral_radiance_<波长>`（环境场）自 MWIR 太阳反射修正起含太阳直射与天空散射的贡献（白天变大，夜间与 > 6 µm 不变），字段名不变。
+- 中波红外（2.5–6 µm）白天亮温随 MWIR 太阳反射修正升高（叶片约 3 K，受光土壤/建筑 5–10 K）；依赖旧 MWIR 数值的对比或反演需重跑。RayTracing/VoxelRT 的太阳绝对量由晴空模型给定，与工程里设置的组分温度无关，阴天场景的 MWIR 太阳项会偏大。
 - 2026-11-22 精度修正后，旧工程重新运行会有以下数值变化：VoxelEB 地面显热升高；RayTracing 近红外升高；反射率可大于 1；天空背景下物体边缘变亮；开周期边界的 Facet 工程更准但更慢。FacetEB 判据更严，已保存的低迭代上限（如 12 次）可能被报告为未收敛（退出码 2，结果保留）。VoxelRT/VoxelEB 的混沌介质改用 `LIDFa/LIDFb` 决定 G(Ω)：默认参数下变化 < 0.3%，非球形 LIDF 或 G ≠ 0.5 的工程变化可达 10% 量级；想保持旧的常数 G 行为可把 `LIDFa`、`LIDFb` 都设为 0（G = 0.5 时与旧结果相同，G ≠ 0.5 时单次散射按 G/0.5 修正）。`Canopy` GPU 结构体新增 `lidfValid/lidf[13]/diffuseG[32]`（244 字节），C++ 与着色器需同时更新。
 - 周期边界传输一致化后，开周期的工程边界条带变暗/变冷到与内部一致，整体均值随之变化（森林周期 8 约 −4%，城市斜视可达 +17%）。耗时（同机、预热后）：VoxelRT 周期 8 森林 6.4 → 7.6 s，VoxelEB 周期 8 森林 10.0 → 14.2 s、周期 20 城市 2.9 → 3.5 s；RayTracing 不变或略快（1.3 s）。未开周期的 VoxelEB 短波散射 pass 也慢了约 1/3（森林 9.9 → 12.0 s，结果逐位不变），原因未查明。`RayRTSetting` 新增 `sceneTop`（占用原对齐填充，仍为 80 字节），C++ 与 `settings.h` 需同时更新。
 - 工程新增 `control.raytracingDepth`（RayTracing 散射次数），旧工程缺省按 16 处理；`control.depth` 只对 VoxelRT 有意义（步数预算 ×128）。
 - 工程新增 `control.qualityPreset`（`fast`/`standard`/`high`/`custom`）与 `control.runTimeoutMinutes`。旧工程缺少这两项时按 `custom` 与 0（服务端默认上限）处理，已有参数不变；缺少 `voxelCollisionOrders`/`shortwaveScatteringOrders`/`radiationMaxSteps` 的旧工程仍按 2/1/64 运行，只有新工程才按标准档取 3/2/自动。旧版本打开新工程会忽略这两个字段。
 - 新增环境变量：`HISTREAM_FACET_RASTER_SIZE`（Facet 可见性栅格边长，用于生成高分辨率参考解）、`STREAM_STUDIO_FACET_STEP_RESIDENT_FACETS`（常驻出图线程的面元数阈值，默认 3,000,000）、`STREAM_STUDIO_RESULT_CACHE_MB`（结果读取缓存上限，默认 512）、`STREAM_STUDIO_RESULT_CACHE_DEBUG=1`（服务端打印缓存命中日志）。
-- 回归测试工具 `tools/regression/`：从内置示例生成 13 个冻结算例，用两版引擎运行并对比；`compare.py --tolerance` 可作为“纯性能改动不得改变结果”的门禁。
+- 回归测试工具 `tools/regression/`：从内置示例生成 13 个冻结算例，用两版引擎运行并对比；`compare.py --tolerance` 可作为“纯性能改动不得改变结果”的门禁。新增中波红外算例 `rt_urban_mwir`、`vrt_urban_mwir`、`vrt_forest_mwir`、`veb_forest_mwir`、`veb_urban_mwir`、`veb_urban_mwir_night`（波段 3800/10500 nm，输出亮温）。
 
 ## 已做的检查（2026-11-22）
 
@@ -108,6 +110,7 @@
 - 运行管线（服务端独立进程、结果缓存、二进制传输）：网页模式接口检查（示例列表、打开示例、RayTracing 运行、同一 TIFF 第二次读取 `X-Cache: hit`、touch 后失效）；二进制与 JSON 逐值一致；桌面模式 CDP 端到端（打开 urban_block → RayTracing → 结果自动打开），进程树确认服务在 utility 进程且 histream 为其子进程；运行中强杀服务进程后自动重启、页面重新载入、无遗留 histream；运行中关闭窗口后无遗留进程；asar 内 utilityProcess + Worker 可用。
 - 运行质量档位与单次运行上限：`tools/regression` 用基线引擎 `bin_v0` 对 `vrt_urban`、`veb_forest`、`feb_crop`、`rt_forest`（补充 `feb_urban`）各跑三档并以高精度为参考对比（标定表见用户手册 13.2.1）；网页模式（`STREAM_STUDIO_PORT=4199`，无头 Edge + CDP）实测：旧工程显示“自定义”且参数不变，三档切换后 `project.json` 写入对应参数，手动改采样数切为“自定义”，切换 FacetEB/RayTracing/VoxelRT 按档位写入新模式参数，修改体元大小时 VoxelEB 步数随之重算；工程上限设 1 分钟时预检返回 60 s（`timeoutSource=project`）与建议 10 分钟，选择“按当前上限运行”的 `veb_forest` 全天运行在 61 s 时被终止（`status=timeout`，“运行超过 1 分钟，已终止”），选择“调到建议值并运行”后工程写入 10 分钟并在 3 分 43 秒内完成。
 - 未验证：桌面（Electron）模式下的运行质量档位与上限流程。
+- 中波红外太阳反射：新增 6 个 MWIR 算例对比修正前引擎（`bin_periodic`），逐像元按 ΔL = B(T新) − B(T旧) 反推等效反射率与材质 TIR 反射率一致（数字见上）；10.5 µm 波段与夜间算例逐字节相同；22 个旧算例 86 个 TIFF 与 `periodic_final` 逐字节相同。未与 MODTRAN/DART 等外部模型对比。
 
 ## 已做的检查（2026-11-16）
 

@@ -14,6 +14,8 @@ const FOREST_LATTICE = {
   'positions/searsia_position.txt': lattice(8, 100),
 }
 const PERIODIC_8 = { 'configuration.control.periodicTraversalCount': 8 }
+const MWIR_BANDS = { 'configuration.sensor.bands': '3800,10500', 'configuration.sensor.continuousBands': false,
+  'configuration.sensor.temperature': true }
 
 export const CASES = {
   vrt_urban: { example: 'urban_block', mode: 'eVoxelRT' },
@@ -58,6 +60,16 @@ export const CASES = {
   rt_lattice_periodic: { example: 'forest', mode: 'eRaytracing', positions: FOREST_LATTICE, set: PERIODIC_8 },
   vrt_lattice_periodic: { example: 'forest', mode: 'eVoxelRT', positions: FOREST_LATTICE, set: PERIODIC_8 },
   veb_lattice_periodic: { example: 'forest', mode: 'eVoxelEB', meteo: [23, 25], positions: FOREST_LATTICE, set: PERIODIC_8 },
+  // Mid-wave infrared: reflected sunlight below 6 um (mwir_solar.glsl). The
+  // 3.8 um band must warm by about rho*E*cos/(pi*dB/dT) by day; the 10.5 um
+  // band in the same run must stay unchanged.
+  rt_urban_mwir: { example: 'urban_block', mode: 'eRaytracing', set: MWIR_BANDS },
+  vrt_urban_mwir: { example: 'urban_block', mode: 'eVoxelRT', set: MWIR_BANDS },
+  vrt_forest_mwir: { example: 'forest', mode: 'eVoxelRT', set: MWIR_BANDS },
+  veb_forest_mwir: { example: 'forest', mode: 'eVoxelEB', meteo: [23, 25], set: MWIR_BANDS },
+  veb_urban_mwir: { example: 'urban_block', mode: 'eVoxelEB', meteo: [23, 25], set: MWIR_BANDS },
+  // Night nodes (Rin = 0): the 3.8 um band must stay unchanged.
+  veb_urban_mwir_night: { example: 'urban_block', mode: 'eVoxelEB', meteo: [1, 3], set: MWIR_BANDS },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.

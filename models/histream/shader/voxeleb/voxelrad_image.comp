@@ -28,6 +28,7 @@
 #include "../bsdf.glsl"
 #include "../functions.glsl"
 #include "../surface_brdf.glsl"
+#include "../mwir_solar.glsl"
 #include "../shade_state_voxel.glsl"
 #include "../random.glsl"
 
@@ -98,6 +99,27 @@ float beamNormalScale()
 float referenceIrradiance(float wavelength)
 {
     return directSpectralIrradiance(wavelength) + diffuseSpectralIrradiance(wavelength);
+}
+
+// Thermal bands below 6 um (mwir_solar.glsl): horizontal solar spectral
+// irradiance in W m-2 um-1 from the measured Rin and the configured direct
+// fraction, split and cut off exactly like directSpectralIrradiance /
+// diffuseSpectralIrradiance. The image accumulates L in thermal bands, so the
+// optical pi*L terms are reused with these values divided by pi. Exactly 0
+// at night (Rin = 0) and outside 2.5-6 um.
+float thermalSolarDirect(float wavelength)
+{
+    if(!solarBeamActive()) return 0.0;
+    return max(ubom.meteo.Rin, 0.0) * clamp(lightSet.direct, 0.0, 1.0)
+        * mwirSolarShape(wavelength);
+}
+
+float thermalSolarDiffuse(float wavelength)
+{
+    float directFraction = clamp(lightSet.direct, 0.0, 1.0);
+    float share = (1.0 - directFraction) * MWIR_SKY_SOLAR_RATIO
+        + (solarBeamActive() ? 0.0 : directFraction);
+    return max(ubom.meteo.Rin, 0.0) * share * mwirSolarShape(wavelength);
 }
 
 // diffuseTrad stores the *absorbed* incident longwave (incident * (1-r-t) of
@@ -311,6 +333,12 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 								* canopy.emissionScale * Planck(wavelength, mediumTemperature);
 							Radiance[kwave] += alpha_toSensor * scatteringFraction
 								* Planck(wavelength, envTemp);
+							float solarDirect = thermalSolarDirect(wavelength);
+							float solarDiffuse = thermalSolarDiffuse(wavelength);
+							if(solarDirect > 0.0 || solarDiffuse > 0.0)
+								Radiance[kwave] += alpha_toSensor * scatteringFraction
+									* (solarDirect * beamNormalScale() * alpha_toSolar * scatteringPhase
+									+ solarDiffuse * voxelDirs[bufferId].skyDiffuse * 0.5 / PI);
 						}
 					}
 				}
@@ -412,6 +440,17 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                         Radiance[kwave] += thermalRadiance * a * (1.0 - alpha_voxel);
                         Radiance[kwave] += Planck(wavelength, envTemp)
                             * (1.0 - alpha_voxel) * s * alpha_toSensor;
+                        // Below 6 um: the optical branch's sky and beam single
+                        // scattering with the absolute solar irradiance, as L.
+                        float solarDirect = thermalSolarDirect(wavelength);
+                        float solarDiffuse = thermalSolarDiffuse(wavelength);
+                        if(solarDirect > 0.0 || solarDiffuse > 0.0) {
+                            float leafGamma = max(gamma.x * (refl + trans) + gamma.y * trans, 0.0);
+                            Radiance[kwave] += (alpha_toSensor * (1.0 - alpha_voxel) * s
+                                * solarDiffuse * voxelDirs[bufferId].skyDiffuse * 0.5
+                                + solarDirect * beamNormalScale() * leafGamma / safeG
+                                * (1.0 - alpha_voxel) * hotspot) / PI;
+                        }
                     }
                 }
                 vegTemperatureSum += shadedTemperature;
@@ -561,6 +600,24 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                         Radiance[kwave] += thermalRadiance * emissivity;
                         Radiance[kwave] += Planck(wavelength, envTemp)
                             * thermalReflectance * alpha_toSensor;
+                        // Below 6 um: the optical branch's sky and beam terms
+                        // (same BRDF weights) with the absolute solar irradiance, as L.
+                        float solarDirect = thermalSolarDirect(wavelength);
+                        float solarDiffuse = thermalSolarDiffuse(wavelength);
+                        if(solarDirect > 0.0 || solarDiffuse > 0.0) {
+                            float directWeight = surfaceReflectanceWeight(
+                                typeId, meshLinks[meshId].bioId, refl,
+                                solarDirection, viewDirection, sstate.normal,
+                                angularStrength);
+                            float diffuseWeight = surfaceReflectanceWeight(
+                                typeId, meshLinks[meshId].bioId, refl,
+                                sstate.normal, viewDirection, sstate.normal,
+                                angularStrength);
+                            Radiance[kwave] += (alpha_toSensor * diffuseWeight
+                                * solarDiffuse * voxelDirs[alignBufferId].skyDiffuse
+                                + directWeight * solarDirect * beamNormalScale()
+                                * cosIncidence * hotspot) / PI;
+                        }
                     }
                 }
                 return true;
