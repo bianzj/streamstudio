@@ -1,5 +1,32 @@
 # Stream Studio 尚存问题核查（2026-10-05）
 
+## 2026-11-22 更新
+
+依据 2026-11-22 两轮效率与精度改进（提交 `376c015`）。完整变更与兼容性见 `docs/release-next-draft.md`。
+
+已修正：
+- 反射率/HDRF 不再截断到 [0,1]（RayTracing、VoxelRT、VoxelEB、FacetRT、FacetEB）；下文“反射率输出截断在 [0,1]”不再成立。
+- RayTracing：独立 `raytracingDepth`（默认 16），俄罗斯轮盘赌从第 3 次散射开始，周期穿越不占散射次数；阴影射线首次命中终止、起点偏移 1 mm。
+- VoxelEB 地面自由对流（土壤/水体/建筑，不稳定时并联 0.0025·ΔT^(1/3) m/s）；正午土壤 G/Rn 0.87–0.92 → 0.76–0.84。
+- FacetEB 收敛判据加温度等效残差 ≤ 0.5 K。
+- 天空盒关闭时按场景覆盖率加权，不再丢弃射出场景的样本。
+- Facet 周期边界下可见性窗口收紧到中心块外接球，有效分辨率不再随邻块数下降。
+- VoxelEB 温度阻尼随迭代递减，迭代 29–35 → 16–20 次，结果差 ≤ 0.05 K。
+- FacetEB `auto` 后端在不支持 FP64 的设备上改为 GPU 辐射 + CPU 能量平衡，不再直接报错（2026-11-22 晚，未在无 FP64 设备上实测）。
+- 运行期间三维视口降到约 10 fps（交互时恢复），减少与引擎争用 GPU。
+
+仍未处理（按建议优先级）：
+- VoxelRT 中 G、Γ 与 LIDF 不自洽：Γ 用球形叶公式却除以用户 G，`Hotspot_Kuusk` 写死 GLEAF=0.5，LIDFa/b 不被任何 shader 使用；G≠0.5 时散射能量不守恒。
+- RayTracing 阴影、天空、散射射线不跨周期边界；VoxelRT/VoxelEB 传输 pass 不走周期边界。
+- 2.5–5 µm 中波红外不计太阳反射（RayTracing、VoxelRT、VoxelEB），白天 MWIR 亮温估计偏低数 K。
+- VoxelEB 无 MOST 稳定度迭代（自由对流只是下限修补），G/Rn 仍偏高。
+- 光照/阴影两态热历史不守恒（FacetEB、VoxelEB 土壤方法 1），阴影移动时热惯性丢失，量级未测。
+- FacetRT 启用 Hapke 背景时，天底方向的方向反射因子仍参与多次散射（能量平衡路径已改为守恒约定）。
+- 桌面版服务端仍在 Electron 主进程同步执行准备、出图和格式转换；结果读取无缓存。
+- 其余见 2026-11-20 更新“仍未处理”。
+
+部署状态（取代 2026-11-20 的哈希）：`models\bin_x64\Release\histream.exe` 于 2026-11-22 15:42 重建（含 FacetEB auto 回退），SHA256 `a78b58bbee5e4d6740821233ad14db06d44585002123b7f25f6b7ff528068b1b`；`build-manifest.json` 随后由 `tools/write-build-manifest.mjs` 重写。
+
 ## 2026-11-20 更新
 
 依据 2026-11-20 工作区代码修改（未提交）核对。方法细节见理论手册 4.2、5.2、7.x、9.2、11.1 节及 `models/stream/README.md`。
