@@ -22,6 +22,7 @@
 #include <sstream>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <gdal_priv.h>
@@ -1448,6 +1449,21 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
         modelio->sceneSize_XYZ.z / std::max(0.01f, modelio->stepsize_surface))));
     // DEFERRED[低] 数值: OBJ 体元化在竖直方向一律使用 stepsize_surface（高度上限、gridShift.y、地形高度），未检查 stepsize_height 是否相同；二者不等时 OBJ 体元的高度层与背景/基元体元的层号错位（异质路径才检查立方体元）；建议：入口处断言 stepsize_surface==stepsize_height 或分别按轴换算。
 
+    // Rotated or scaled placements fill world cells by inverse mapping, so
+    // the object's local proxy geometry (cube faces / mid planes of the local
+    // voxels) transformed by the instance matrix would not coincide with the
+    // cells that hold the data: rays could slip between a rotated proxy and
+    // the staircase of world cells (through walls) or hit two proxies in one
+    // cell. Their proxies are rebuilt from the filled world cells instead,
+    // one axis-aligned mesh per property mesh with a pure translation; the
+    // per-placement instances keep their ids for the voxel links but carry no
+    // geometry (meshId -1, skipped by the TLAS). Unrotated, unscaled
+    // placements keep the shared local mesh unchanged.
+    std::vector<std::unordered_set<ObjVoxelCoord, ObjVoxelCoordHash>> worldProxyCells(
+        propertyMeshCount);
+    std::vector<std::vector<glm::ivec3>> worldProxyOrder(propertyMeshCount);
+    size_t worldProxyPlacements = 0;
+
     for (size_t placementIndex = 0;
          placementIndex < entity.primDistributions.size(); ++placementIndex) {
         const glm::vec3 placement = entity.primDistributions[placementIndex];
@@ -1470,12 +1486,15 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
         const glm::mat4 objectTransform =
             glm::translate(unit, glm::vec3(gridShift - sceneHalf)) *
             rotation * scale;
+        const bool worldAlignedProxy = rotationValue != 0.0f || scaleValue != 1.0f;
+        if (worldAlignedProxy) ++worldProxyPlacements;
 
         std::vector<int> instanceIdByProperty(propertyMeshCount, -1);
         int addedInstanceCount = 0;
         for (const size_t meshIndex : activeMeshIndices) {
             Instance instance{};
-            instance.meshId = static_cast<uint32_t>(meshIdByProperty[meshIndex]);
+            instance.meshId = worldAlignedProxy
+                ? -1 : meshIdByProperty[meshIndex];
             instance.object2worldMatrix = objectTransform;
             instance.world2objectMatrix =
                 glm::transpose(glm::inverse(objectTransform));
@@ -1484,7 +1503,7 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             instanceio->instances.emplace_back(instance);
 
             InstanceLink instanceLink{};
-            instanceLink.meshId = instance.meshId;
+            instanceLink.meshId = static_cast<uint32_t>(meshIdByProperty[meshIndex]);
             instanceio->instanceLinks.emplace_back(instanceLink);
             ++addedInstanceCount;
         }
@@ -1514,19 +1533,84 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             }
             const glm::ivec3 cellLower(glm::floor(gridLower));
             const glm::ivec3 cellUpper(glm::ceil(gridUpper));
-            // DEFERRED[中] 物理: 逆映射只取世界格中心对应的单个局部体元；对非 90° 旋转或 scale<1 的实例，单体元厚的薄壳（叶片层、墙面）会因中心点落在相邻空格而出现孔洞/漏格，scale<1 时多个局部体元合并为一格也只计其中一个的叶面积；建议：对每个世界格做多点（如 2×2×2）超采样，或正向光栅化三角形到世界网格。
+            // DEFERRED[中] 物理: 植被（介质）逆映射只取世界格中心对应的单个局部体元；对非 90° 旋转或 scale<1 的实例，单体元厚的叶片层会因中心点落在相邻空格而出现漏格，scale<1 时多个局部体元合并为一格也只计其中一个的叶面积；建议：按叶面积守恒做多点超采样或正向光栅化三角形到世界网格。（不透明网格的对角缝已闭合，见下。）
+            auto findLocal = [&](const glm::vec3& gridPoint) {
+                const glm::vec3 localPoint(gridToLocal * glm::vec4(gridPoint, 1.0f));
+                return lookup.find(ObjVoxelCoord{
+                    static_cast<int>(std::floor(localPoint.x)),
+                    static_cast<int>(std::floor(localPoint.y)),
+                    static_cast<int>(std::floor(localPoint.z))});
+            };
+            // Centre test: the world cell takes the local voxel its centre
+            // maps into.
+            std::vector<std::pair<glm::ivec3, size_t>> picks;
             for (int cellY = cellLower.y; cellY < cellUpper.y; ++cellY)
             for (int cellZ = cellLower.z; cellZ < cellUpper.z; ++cellZ)
             for (int cellX = cellLower.x; cellX < cellUpper.x; ++cellX) {
                 const glm::ivec3 cell(cellX, cellY, cellZ);
-                const glm::vec3 localPoint(gridToLocal *
-                    glm::vec4(glm::vec3(cell) + glm::vec3(0.5f), 1.0f));
-                const auto found = lookup.find(ObjVoxelCoord{
-                    static_cast<int>(std::floor(localPoint.x)),
-                    static_cast<int>(std::floor(localPoint.y)),
-                    static_cast<int>(std::floor(localPoint.z))});
-                if (found == lookup.end()) continue;
-                const size_t localIndex = found->second;
+                const auto found = findLocal(glm::vec3(cell) + glm::vec3(0.5f));
+                if (found != lookup.end()) picks.emplace_back(cell, found->second);
+            }
+            // Opaque meshes (walls, roofs, wood, ground, water) of rotated or
+            // scaled placements: the centre test turns a one-voxel shell into
+            // a diagonal staircase whose cells touch only along an edge. A ray
+            // that hits a face near such an edge probes the cell 0.05 cell
+            // ahead (getVoxelIdSemi), finds the empty diagonal neighbour and
+            // passes through. Close each step with one of the two face cells
+            // between the pair (the one more of whose 2x2x2 sub-points lie in
+            // the object), so the shell stays face-connected and opaque, as
+            // the unrotated shell is. Unrotated, unscaled placements keep the
+            // centre test.
+            if (worldAlignedProxy && propertyOpaque[meshIndex] && !picks.empty()) {
+                std::unordered_map<ObjVoxelCoord, size_t, ObjVoxelCoordHash> picked;
+                picked.reserve(picks.size() * 2);
+                for (const auto& pick : picks)
+                    picked.emplace(ObjVoxelCoord{pick.first.x, pick.first.y, pick.first.z},
+                                   pick.second);
+                auto isPicked = [&picked](const glm::ivec3& c) {
+                    return picked.count(ObjVoxelCoord{c.x, c.y, c.z}) > 0;
+                };
+                auto subHits = [&](const glm::ivec3& c, size_t& localIndex) {
+                    int hits = 0;
+                    for (int sample = 0; sample < 8; ++sample) {
+                        const auto found = findLocal(glm::vec3(c) + glm::vec3(
+                            sample & 1 ? 0.75f : 0.25f,
+                            sample & 2 ? 0.75f : 0.25f,
+                            sample & 4 ? 0.75f : 0.25f));
+                        if (found == lookup.end()) continue;
+                        if (hits == 0) localIndex = found->second;
+                        ++hits;
+                    }
+                    return hits;
+                };
+                const size_t centrePicks = picks.size();
+                for (size_t index = 0; index < centrePicks; ++index) {
+                    const glm::ivec3 cell = picks[index].first;
+                    for (int a = 0; a < 3; ++a)
+                    for (int b = a + 1; b < 3; ++b)
+                    for (int signs = 0; signs < 4; ++signs) {
+                        glm::ivec3 stepA(0), stepB(0);
+                        stepA[a] = signs & 1 ? -1 : 1;
+                        stepB[b] = signs & 2 ? -1 : 1;
+                        const glm::ivec3 first = cell + stepA;
+                        const glm::ivec3 second = cell + stepB;
+                        if (!isPicked(cell + stepA + stepB)
+                            || isPicked(first) || isPicked(second)) continue;
+                        size_t firstLocal = picks[index].second;
+                        size_t secondLocal = picks[index].second;
+                        const int firstHits = subHits(first, firstLocal);
+                        const int secondHits = subHits(second, secondLocal);
+                        const bool useSecond = secondHits > firstHits;
+                        const glm::ivec3 add = useSecond ? second : first;
+                        const size_t addLocal = useSecond ? secondLocal : firstLocal;
+                        picked.emplace(ObjVoxelCoord{add.x, add.y, add.z}, addLocal);
+                        picks.emplace_back(add, addLocal);
+                    }
+                }
+            }
+            for (const auto& pick : picks) {
+                const glm::ivec3 cell = pick.first;
+                const size_t localIndex = pick.second;
                 const glm::vec3 localVoxel = propertyMeshes[meshIndex].voxelIds[localIndex];
                 // Instance scale k: a local voxel's facet area grows by k^2 and
                 // spreads over k^3 world cells.
@@ -1541,6 +1625,12 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
                     voxelId.z >= modelio->voxelSize_XZY.z) {
                     ++clippedForPlacement;
                     continue;
+                }
+
+                if (worldAlignedProxy) {
+                    const ObjVoxelCoord proxyCell{voxelId.x, voxelId.y, voxelId.z};
+                    if (worldProxyCells[meshIndex].insert(proxyCell).second)
+                        worldProxyOrder[meshIndex].push_back(voxelId);
                 }
 
                 const nanovdb::Coord coord(voxelId.x, voxelId.y, voxelId.z);
@@ -1600,6 +1690,63 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
                   << "m inserted=" << insertedForPlacement
                   << " mesh-overlap=" << overlappedForPlacement
                   << " clipped=" << clippedForPlacement << std::endl;
+    }
+
+    // World-aligned proxies of the rotated/scaled placements (see above).
+    // Vertices are world cell indices; the translation by -sceneHalf is the
+    // one every unrotated instance applies, so the faces lie exactly on the
+    // cell boundaries/mid planes used by getVoxelIdSemi and nanovdbGet.
+    for (const size_t meshIndex : activeMeshIndices) {
+        const auto& cells = worldProxyOrder[meshIndex];
+        if (cells.empty()) continue;
+        PrimMesh proxy = designer.createTriVoxels(cells, propertyOpaque[meshIndex]);
+        if (proxy.indices.empty()) continue;
+        {
+            // createTriVoxels writes three vertices per triangle; corners
+            // (integer or half-integer cell coordinates, exact in float) are
+            // shared here, keeping the triangle list and positions unchanged.
+            std::unordered_map<ObjVoxelCoord, uint32_t, ObjVoxelCoordHash> corner;
+            corner.reserve(proxy.vertices.size() / 3);
+            std::vector<VertexAttribute> shared;
+            shared.reserve(proxy.vertices.size() / 3);
+            for (uint32_t& index : proxy.indices) {
+                const glm::vec3 p = proxy.vertices[index].pos * 2.0f;
+                const ObjVoxelCoord key{static_cast<int>(std::lround(p.x)),
+                                        static_cast<int>(std::lround(p.y)),
+                                        static_cast<int>(std::lround(p.z))};
+                const auto inserted = corner.emplace(
+                    key, static_cast<uint32_t>(shared.size()));
+                if (inserted.second) shared.push_back(proxy.vertices[index]);
+                index = inserted.first->second;
+            }
+            proxy.vertices = std::move(shared);
+            proxy.nVertices = static_cast<uint32_t>(proxy.vertices.size());
+        }
+        const int proxyMeshId = modelMeshCount + addedMeshCount;
+        proxy.meshId = proxyMeshId;
+        const size_t triangles = proxy.indices.size() / 3;
+        const MeshLink proxyLink = meshio->meshLinks[meshIdByProperty[meshIndex]];
+        meshio->primMeshes.emplace_back(std::move(proxy));
+        meshio->meshLinks.emplace_back(proxyLink);
+        ++addedMeshCount;
+
+        const glm::mat4 proxyTransform = glm::translate(
+            glm::mat4(1.0f), -glm::vec3(sceneHalf));
+        Instance instance{};
+        instance.meshId = proxyMeshId;
+        instance.object2worldMatrix = proxyTransform;
+        instance.world2objectMatrix = glm::transpose(glm::inverse(proxyTransform));
+        instanceio->instances.emplace_back(instance);
+        InstanceLink instanceLink{};
+        instanceLink.meshId = static_cast<uint32_t>(proxyMeshId);
+        instanceio->instanceLinks.emplace_back(instanceLink);
+        ++instanceCount;
+        std::cout << "OBJ world-aligned proxy: mesh="
+                  << (separateMeshes ? entity.meshNames[meshIndex] : "all")
+                  << " placements=" << worldProxyPlacements
+                  << " cells=" << cells.size()
+                  << " triangles=" << triangles
+                  << " vertices=" << meshio->primMeshes.back().nVertices << std::endl;
     }
 
     modelMeshCount += addedMeshCount;

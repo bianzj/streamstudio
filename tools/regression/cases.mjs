@@ -45,6 +45,12 @@ const URBAN_WATER = {
   }]
 }
 
+// The urban_block buildings (one OBJ placement at the domain centre) rotated
+// by `angle` degrees: the voxel proxy geometry of a rotated instance must lie
+// on the world cells it fills, so ground cells enclosed by walls and roofs
+// receive no direct sun (sunlit_fraction 0, as without rotation).
+const URBAN_ROTATED = (angle) => ({ 'positions/urban_block_buildings_position.txt': [[150, 150, 0, 1, angle]] })
+
 export const CASES = {
   vrt_urban: { example: 'urban_block', mode: 'eVoxelRT' },
   vrt_urban_multiview: { example: 'urban_block', mode: 'eVoxelRT', set: { 'configuration.sensor.principalPlane': true } },
@@ -140,6 +146,12 @@ export const CASES = {
   vrt_urban_mwir_d02: { example: 'urban_block', mode: 'eVoxelRT', set: { ...MWIR_BANDS, 'configuration.light.direct': 0.2 } },
   vrt_urban_mwir_sw200: { example: 'urban_block', mode: 'eVoxelRT', set: { ...MWIR_BANDS, 'configuration.light.direct': 0.2, 'configuration.light.shortwaveIrradiance': 200 } },
   vrt_urban_mwir_sw400: { example: 'urban_block', mode: 'eVoxelRT', set: { ...MWIR_BANDS, 'configuration.light.direct': 0.2, 'configuration.light.shortwaveIrradiance': 400 } },
+  // Rotated instances (URBAN_ROTATED): VoxelRT at 30 and 45 degrees, VoxelEB
+  // at 30 degrees, and RayTracing (exact rotated triangles) for reference.
+  vrt_urban_rot30: { example: 'urban_block', mode: 'eVoxelRT', positions: URBAN_ROTATED(30) },
+  vrt_urban_rot45: { example: 'urban_block', mode: 'eVoxelRT', positions: URBAN_ROTATED(45) },
+  veb_urban_rot30: { example: 'urban_block', mode: 'eVoxelEB', meteo: [23, 25], positions: URBAN_ROTATED(30) },
+  rt_urban_rot30: { example: 'urban_block', mode: 'eRaytracing', positions: URBAN_ROTATED(30) },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.

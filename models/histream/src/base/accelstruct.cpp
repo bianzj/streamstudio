@@ -81,12 +81,16 @@ bool AccelStruct::createAccelStruct(VkDevice device, std::shared_ptr<MeshIO> &me
     allTlas.reserve(instanceio->instances.size());
     for (int i = 0; i < static_cast<int>(instanceio->instances.size()); i++)
     {
+        const int meshId = instanceio->instances[i].meshId;
+        // meshId -1: an instance that only carries ids (voxel links) and no
+        // geometry of its own, e.g. a rotated OBJ placement whose proxies are
+        // in a world-aligned mesh (scene.cpp). instanceCustomIndex stays i.
+        if (meshId == -1) continue;
         VkGeometryInstanceFlagsKHR flags{};
         flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
         VkAccelerationStructureInstanceKHR rayInst{};
         rayInst.transform = nvvk::toTransformMatrixKHR(instanceio->instances[i].object2worldMatrix);  // Position of the instance
         rayInst.instanceCustomIndex = i;                       // gl_InstanceCustomIndexEXT
-        const int meshId = instanceio->instances[i].meshId;
         if (meshId < 0 || static_cast<std::size_t>(meshId) >= meshio->m_bufferMeshes.size()) {
             throw std::runtime_error("Instance " + std::to_string(i) + " references invalid meshId "
                 + std::to_string(meshId) + " (mesh count "
