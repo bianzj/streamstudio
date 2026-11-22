@@ -27,7 +27,7 @@
 - FacetRT/FacetEB 的 2.5–6 µm 波段仍不计太阳反射（CPU 光谱、GPU `spectral.comp`、状态光谱与 CPU/GPU 一致性检查四处都把热红外直射置 0，需同时修改）。
 - 示例土壤（√(λC) ≈ 2200）使 VoxelEB 正午 G/Rn 仍 0.77–0.84（MOST 与自由对流都不改变），需核对示例土壤热物性。
 - FacetRT 启用 Hapke 背景时，天底方向的方向反射因子仍参与多次散射（能量平衡路径已改为守恒约定）。
-- 桌面版服务端仍在 Electron 主进程同步执行准备、出图和格式转换；结果读取无缓存。
+- 服务端进程内仍有同步重活（读 OBJ、FacetRT 出图、ENVI 转换、解析大面元 JSON）：桌面版已移到独立进程（2026-11-22），不再冻结窗口，但执行期间其他请求排队。
 - 其余见 2026-11-20 更新“仍未处理”。
 
 部署状态（取代 2026-11-20 的哈希）：`models\bin_x64\Release\histream.exe` 于 2026-11-22 17:11 重建（含 LIDF/G/Γ 自洽与周期边界传输一致化；着色器 18:00 更新，MWIR 太阳反射着色器 18:20 更新，exe 未变），SHA256 `330cb85675a5d1f038a43552a42d0ebfd64e7fc998b5980780cf8cf03ed1de9f`；`build-manifest.json` 随后由 `tools/write-build-manifest.mjs` 重写。
