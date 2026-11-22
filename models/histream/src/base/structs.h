@@ -268,6 +268,9 @@ struct LightXml {
     float diffuse;
     float skyTemperature{250};
     float solarTemperature{6000};
+    // Horizontal global shortwave irradiance (W m-2) for the absolute 2.5-6 um
+    // solar term of RayTracing/VoxelRT; <= 0 = clear-sky (Haurwitz) default.
+    float shortwaveIrradiance{0};
 };
 
 struct AtmosphereXml

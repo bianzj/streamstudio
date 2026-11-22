@@ -986,7 +986,7 @@ void main()
       // and scattered sky (mwir_solar.glsl); exactly 0 elsewhere.
       vec2 thermalSolar = thermalBand
           ? voxelRtThermalSolar(wavelength, lightSet.direct,
-                lightSet.diffuse, lightSet.direction)
+                lightSet.diffuse, lightSet.direction, lightSet.Rin)
           : vec2(0.0);
       packetEsun[bandOffset] = thermalBand
           ? thermalSolar.x : lightSet.direct;
@@ -1039,7 +1039,7 @@ void main()
             // surrounding thermal emitters, not a 6000 K solar radiance;
             // below 6 um the absolute solar beam and scattered sky are added.
             vec2 thermalSolar = voxelRtThermalSolar(wavelength,
-                lightSet.direct, lightSet.diffuse, lightSet.direction);
+                lightSet.direct, lightSet.diffuse, lightSet.direction, lightSet.Rin);
             Esun = thermalSolar.x;
             Esky = Planck(wavelength, lightSet.skyTemperature) + thermalSolar.y;
           }

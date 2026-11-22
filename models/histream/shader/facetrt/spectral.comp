@@ -85,8 +85,10 @@ void main() {
         float lit=clamp(F[f+6]+F[f+7],0.0,1.0);
         precise float mixed=lit*emission[s].x+(1.0-lit)*emission[s].y;
         o.emission=thermal?mixed:0.0;
+        // Thermal bands: pc.beam is the 2.5-6 um solar beam (radiance units,
+        // facetRtThermalSolar), exactly 0 above 6 um and at night.
         precise float direct=F[f+6u+(s&1u)]*max(0.0,(s&1u)==0u?cosine:-cosine)*pc.beam;
-        o.directIrradiance=thermal?0.0:direct;
+        o.directIrradiance=direct;
         optics[s]=o;
     } else if(pc.phase==4u) {
         optics[s].directIrradiance=0.0;

@@ -1977,8 +1977,10 @@ SolveResult FacetrtVulkan::solveSpectralBand(uint32_t band, bool thermal, float 
         throw std::invalid_argument("Invalid GPU spectral band solve");
     auto push = m_spectralPush;
     // Per-band beam-normal irradiance (beam < 0: the value from beginSpectral).
-    const float bandBeam = beam >= 0.0f ? beam : m_spectralPush.beam;
-    push.band = band; push.thermal = thermal; push.beam = thermal ? 0.0f : bandBeam; push.scale = scale;
+    // Thermal bands pass their 2.5-6 um solar beam in radiance units (0 above
+    // 6 um), so the shader applies it exactly like the optical beam.
+    const float bandBeam = beam >= 0.0f ? beam : (thermal ? 0.0f : m_spectralPush.beam);
+    push.band = band; push.thermal = thermal; push.beam = bandBeam; push.scale = scale;
     push.phase = diffuse ? 4U : 0U;
     auto cmd = beginCommands();
     recordSpectral(cmd, push);

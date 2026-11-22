@@ -218,15 +218,16 @@ bool AnyHit(Ray r, float maxDist)
 
 // Reflected sunlight in thermal bands (mwir_solar.glsl). The normalized
 // illumination has the horizontal reference direct*cos + 0.5*diffuse (the
-// HDRF denominator); this factor scales it to the clear-sky global shortwave
-// in W m-2, so scale*direct*shape is the beam-normal and scale*diffuse*shape
+// HDRF denominator); this factor scales it to the global shortwave in W m-2
+// (light.shortwaveIrradiance in lightSet.Rin, else clear sky), so
+// scale*direct*shape is the beam-normal and scale*diffuse*shape
 // the sky value in W m-2 um-1, used exactly like lightSet.direct/diffuse.
 float ThermalSolarScale()
 {
   float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
   float reference = lightSet.direct * cosSolarZenith + lightSet.diffuse * 0.5;
   return reference > EPSION
-    ? clearSkyGlobalShortwave(cosSolarZenith) / reference : 0.0;
+    ? thermalSolarGlobal(cosSolarZenith, lightSet.Rin) / reference : 0.0;
 }
 
 // wi: in direction; wo: out direction; *World: direction in world coordinates.

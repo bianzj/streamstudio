@@ -21,7 +21,7 @@ public:
 
 
     SensorMatrix createSensor(glm::vec3 size, glm::vec3 origin, float vza, float vaa, float ratio = 1.0);
-    LightSet createLight(float sza, float saa, float direct, float diffuse,float,float);
+    LightSet createLight(float sza, float saa, float direct, float diffuse,float,float, float shortwave = 0.0f);
     SensorMatrix createSensor(glm::vec3 sensorPos_XZY, glm::vec3 center_XZY,
                               glm::vec3 sceneSize_XZY, float fovDegrees = 0.0f,
                               glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f));

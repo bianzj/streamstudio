@@ -1115,6 +1115,12 @@ LightXml FileIO::readLightXML(TiXmlNode *geometryNode, Mode mode){
         }
 
         lightxml.skyTemperature = stof(pEle->FirstChildElement("skyTemperature")->GetText());
+        lightxml.shortwaveIrradiance = 0.0f;
+        if (sonExists("shortwaveIrradiance", pEle->ToElement())) {
+            const char* text = pEle->FirstChildElement("shortwaveIrradiance")->GetText();
+            if (text) lightxml.shortwaveIrradiance = std::clamp(
+                static_cast<float>(std::atof(text)), 0.0f, 2000.0f);
+        }
         if (sonExists("directScatteringRatio", pEle->ToElement())){
             if (m_mode == Mode::eVoxelEB) {
                 m_pVoxelebXml->atomcondxml.rinfile = pEle->FirstChildElement("esunFileName")->GetText();

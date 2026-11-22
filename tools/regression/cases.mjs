@@ -86,6 +86,24 @@ export const CASES = {
   feb_urban_shadow: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27] },
   feb_urban_shadow_m1: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], set: SOIL_METHOD_1 },
   veb_urban_shadow_m1: { example: 'urban_block', mode: 'eVoxelEB', meteo: [17, 27], set: SOIL_METHOD_1 },
+  // Mid-wave infrared in FacetRT/FacetEB (facetRtThermalSolar and the FacetEB
+  // state spectra): 3.8 um warms by about rho*E*cos/pi by day, 10.5 um and
+  // night nodes stay unchanged.
+  frt_crop_mwir: { example: 'crop_gpp_npp', mode: 'eFacetRT', set: MWIR_BANDS },
+  frt_urban_mwir: { example: 'urban_block', mode: 'eFacetRT', set: MWIR_BANDS },
+  feb_urban_mwir: { example: 'urban_block', mode: 'eFacetEB', meteo: [23, 24], set: MWIR_BANDS },
+  feb_urban_mwir_night: { example: 'urban_block', mode: 'eFacetEB', meteo: [1, 2], set: MWIR_BANDS },
+  // light.shortwaveIrradiance (RayTracing/VoxelRT absolute 2.5-6 um solar
+  // term) with an overcast direct fraction of 0.2: _d02 keeps the clear-sky
+  // default (must equal the old engine); _sw200/_sw400 set 200/400 W m-2, so
+  // the 3.8 um solar part scales linearly with the total
+  // ((L_d02 - L_sw400) / (L_sw400 - L_sw200) = (E_clear - 400) / 200).
+  rt_urban_mwir_d02: { example: 'urban_block', mode: 'eRaytracing', set: { ...MWIR_BANDS, 'configuration.light.direct': 0.2 } },
+  rt_urban_mwir_sw200: { example: 'urban_block', mode: 'eRaytracing', set: { ...MWIR_BANDS, 'configuration.light.direct': 0.2, 'configuration.light.shortwaveIrradiance': 200 } },
+  rt_urban_mwir_sw400: { example: 'urban_block', mode: 'eRaytracing', set: { ...MWIR_BANDS, 'configuration.light.direct': 0.2, 'configuration.light.shortwaveIrradiance': 400 } },
+  vrt_urban_mwir_d02: { example: 'urban_block', mode: 'eVoxelRT', set: { ...MWIR_BANDS, 'configuration.light.direct': 0.2 } },
+  vrt_urban_mwir_sw200: { example: 'urban_block', mode: 'eVoxelRT', set: { ...MWIR_BANDS, 'configuration.light.direct': 0.2, 'configuration.light.shortwaveIrradiance': 200 } },
+  vrt_urban_mwir_sw400: { example: 'urban_block', mode: 'eVoxelRT', set: { ...MWIR_BANDS, 'configuration.light.direct': 0.2, 'configuration.light.shortwaveIrradiance': 400 } },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.

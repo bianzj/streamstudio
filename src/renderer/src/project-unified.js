@@ -159,7 +159,8 @@ export function normalizeUnified(value = {}) {
         azimuth: cleanNumber(sky.azimuth, configuration.light.azimuth),
         direct: cleanNumber(sky.direct, configuration.light.direct),
         diffuse: cleanNumber(sky.diffuse, configuration.light.diffuse),
-        skyTemperature: cleanNumber(sky.skyTemperature, configuration.light.skyTemperature)
+        skyTemperature: cleanNumber(sky.skyTemperature, configuration.light.skyTemperature),
+        shortwaveIrradiance: cleanNumber(sky.shortwaveIrradiance, configuration.light.shortwaveIrradiance ?? 0)
       },
       atmosphere: { ...configuration.atmosphere, ...object(shared.atmosphere) },
       observation: {
@@ -281,7 +282,8 @@ function sharedFromHistream(project, previous = {}) {
       azimuth: cleanNumber(light.azimuth, 135),
       direct: cleanNumber(light.direct, 0.8),
       diffuse: cleanNumber(light.diffuse, 0.2),
-      skyTemperature: cleanNumber(light.skyTemperature, 250)
+      skyTemperature: cleanNumber(light.skyTemperature, 250),
+      shortwaveIrradiance: cleanNumber(light.shortwaveIrradiance, 0)
     },
     atmosphere: { ...object(configuration.atmosphere) },
     observation: {
@@ -356,7 +358,8 @@ export function unifiedToHistreamProject(unified) {
         azimuth: shared.sky.azimuth,
         direct: shared.sky.direct,
         diffuse: shared.sky.diffuse,
-        skyTemperature: shared.sky.skyTemperature
+        skyTemperature: shared.sky.skyTemperature,
+        shortwaveIrradiance: shared.sky.shortwaveIrradiance ?? 0
       },
       sensor: { ...engine.sensor, vza: shared.observation.vza, vaa: shared.observation.vaa },
       control: {

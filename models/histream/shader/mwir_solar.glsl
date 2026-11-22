@@ -48,23 +48,35 @@ float mwirSolarShape(float wavelength)
 }
 
 // Clear-sky global horizontal shortwave irradiance (Haurwitz 1945), W m-2:
-// the absolute scale for RayTracing/VoxelRT, which have no meteorology
-// (about 890 W m-2 at 30 deg zenith).
+// the default absolute scale for RayTracing/VoxelRT, which have no
+// meteorology (about 890 W m-2 at 30 deg zenith).
 float clearSkyGlobalShortwave(float cosSolarZenith)
 {
     return cosSolarZenith > 0.0
         ? 1098.0 * cosSolarZenith * exp(-0.057 / cosSolarZenith) : 0.0;
 }
 
+// Horizontal global shortwave (W m-2) for RayTracing/VoxelRT: the project's
+// light.shortwaveIrradiance (carried in lightSet.Rin) when > 0, otherwise
+// the clear-sky value; 0 with the sun at or below the horizon. The
+// direct/diffuse split stays with the light settings (direct fraction), so
+// an overcast setting (low total, low direct fraction) lowers both.
+float thermalSolarGlobal(float cosSolarZenith, float configuredShortwave)
+{
+    if(!(cosSolarZenith > 0.0)) return 0.0;
+    return configuredShortwave > 0.0 ? configuredShortwave
+        : clearSkyGlobalShortwave(cosSolarZenith);
+}
+
 // VoxelRT thermal-band solar sources, divided by pi because its thermal
 // fields are radiance L while the optical fields are pi*L. The normalized
 // illumination (direct beam-normal, diffuse = horizontal sky irradiance,
 // reference direct*cos + diffuse with the beam only above y = 0.01, see
-// referenceIrradianceRT) is scaled to the clear-sky global shortwave.
+// referenceIrradianceRT) is scaled to the global shortwave above.
 // x: beam (used like lightSet.direct), y: scattered sky (added to the
 // Planck sky like lightSet.diffuse). Both are exactly 0 outside 2.5-6 um.
 vec2 voxelRtThermalSolar(float wavelength, float direct, float diffuse,
-                         vec3 sunDirection)
+                         vec3 sunDirection, float configuredShortwave)
 {
     float shape = mwirSolarShape(wavelength);
     if(!(shape > 0.0)) return vec2(0.0);
@@ -72,7 +84,7 @@ vec2 voxelRtThermalSolar(float wavelength, float direct, float diffuse,
     float beam = cosSolarZenith >= 0.01 ? direct : 0.0;
     float reference = beam * cosSolarZenith + diffuse;
     if(!(reference > 1.0e-6)) return vec2(0.0);
-    float scale = clearSkyGlobalShortwave(cosSolarZenith) / reference
+    float scale = thermalSolarGlobal(cosSolarZenith, configuredShortwave) / reference
         * shape * 0.318309886;
     return vec2(scale * beam, scale * diffuse * MWIR_SKY_SOLAR_RATIO);
 }

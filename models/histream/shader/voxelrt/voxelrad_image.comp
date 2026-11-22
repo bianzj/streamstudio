@@ -275,7 +275,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 							// Thermal fields are L: the solar beam below 6 um
 							// is E/pi (mwir_solar.glsl), so p*E here.
 							float thermalBeam = voxelRtThermalSolar(wavelength,
-								lightSet.direct, lightSet.diffuse, lightSet.direction).x;
+								lightSet.direct, lightSet.diffuse, lightSet.direction, lightSet.Rin).x;
 							if(thermalBeam > 0.0)
 								Radiance[kwave] += thermalBeam * PI * alpha_toSolar
 									* scatteringFraction * scatteringPhase * alpha_toSensor;
@@ -375,7 +375,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                         // Below 6 um the solar beam is single-scattered exactly
                         // as in the optical branch, in radiance units.
                         float thermalBeam = voxelRtThermalSolar(wavelength,
-                            lightSet.direct, lightSet.diffuse, lightSet.direction).x;
+                            lightSet.direct, lightSet.diffuse, lightSet.direction, lightSet.Rin).x;
                         if(thermalBeam > 0.0) {
                             float leafGamma = max(gamma.x * (refl + trans) + gamma.y * trans, 0.0);
                             Radiance[kwave] += thermalBeam * leafGamma / max(G, 0.000001)
@@ -521,7 +521,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                         // Below 6 um: sunlit and visible solar beam with the
                         // optical branch's BRDF weight, in radiance units.
                         float thermalBeam = voxelRtThermalSolar(wavelength,
-                            lightSet.direct, lightSet.diffuse, lightSet.direction).x;
+                            lightSet.direct, lightSet.diffuse, lightSet.direction, lightSet.Rin).x;
                         if(thermalBeam > 0.0) {
                             float cosIncidence = max(dot(normalize(sstate.normal),
                                 normalize(lightSet.direction)), 0.0);

@@ -120,7 +120,7 @@ void solveNadirMapping(float imageWidth, float imageHeight,
 } // namespace
 
 
-LightSet Geometry::createLight(float sza, float saa, float direct, float diffuse,float solarT,float skyT)
+LightSet Geometry::createLight(float sza, float saa, float direct, float diffuse,float solarT,float skyT, float shortwave)
 {
     LightSet light;
     // DEFERRED[低] 数值: 用浮点精确相等判断 0°/45°，44.9999 之类的值不会被偏移；下方 saa 修正用 int() 向零截断，负方位角（如 -45°）时取到错误的 45° 倍数；且这些修正会静默改变用户给的太阳角；建议：改用 std::fabs(sza-45)<eps 与 std::floor/fmod 处理方位角，并在注释中说明修正原因（避开体元面对齐的退化方向）。
@@ -146,6 +146,11 @@ LightSet Geometry::createLight(float sza, float saa, float direct, float diffuse
     light.diffuse = diffuse;
     light.skyTemperature = skyT;
     light.solarTemperature = solarT;
+    // RayTracing/VoxelRT carry the configured horizontal global shortwave in
+    // Rin (thermal 2.5-6 um solar term, mwir_solar.glsl; 0 = clear sky).
+    // VoxelEB uses the meteorological ubom.meteo values, not these fields.
+    light.Rin = std::max(0.0f, shortwave);
+    light.Rli = 0.0f;
 
     return light;
 }
@@ -400,7 +405,8 @@ bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<R
 
     modelio->light = createLight(sza, saa, fileio->m_pRaytracingXml->lightxml.direct, fileio->m_pRaytracingXml->lightxml.diffuse,
                                       fileio->m_pRaytracingXml->lightxml.solarTemperature,
-                                      fileio->m_pRaytracingXml->lightxml.skyTemperature);
+                                      fileio->m_pRaytracingXml->lightxml.skyTemperature,
+                                      fileio->m_pRaytracingXml->lightxml.shortwaveIrradiance);
 
 
 
@@ -423,7 +429,7 @@ void Geometry::updateAngle(std::shared_ptr<RaytracingIO> &modelio, int kangle){
 
     LightSet lightSet = createLight(angle.sza, angle.saa,modelio->light.direct,
                                     modelio->light.diffuse,modelio->light.solarTemperature,
-                                    modelio->light.skyTemperature);
+                                    modelio->light.skyTemperature, modelio->light.Rin);
     updateLight(modelio,lightSet);
 
 }
@@ -623,7 +629,7 @@ void Geometry::updateAngle(std::shared_ptr<VoxelebIO> &modelio, int kangle){
     // if (angle.sza >= 85) angle.sza = 85;
     LightSet lightSet = createLight(angle.sza, angle.saa,modelio->light.direct,
                                     modelio->light.diffuse,modelio->light.solarTemperature,
-                                    modelio->light.skyTemperature);
+                                    modelio->light.skyTemperature, modelio->light.Rin);
     updateLight(modelio,lightSet);
 
 }
@@ -844,7 +850,8 @@ bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<V
     modelio->light = createLight(sza, saa, fileio->m_pVoxelrtXml->lightxml.direct,
                                  fileio->m_pVoxelrtXml->lightxml.diffuse,
                                  fileio->m_pVoxelrtXml->lightxml.solarTemperature,
-                                 fileio->m_pVoxelrtXml->lightxml.skyTemperature);
+                                 fileio->m_pVoxelrtXml->lightxml.skyTemperature,
+                                 fileio->m_pVoxelrtXml->lightxml.shortwaveIrradiance);
 
 
 
@@ -874,7 +881,7 @@ void Geometry::updateAngle(std::shared_ptr<VoxelrtIO> &modelio, int kangle){
 
     LightSet lightSet = createLight(angle.sza, angle.saa,modelio->light.direct,
                                     modelio->light.diffuse,modelio->light.solarTemperature,
-                                    modelio->light.skyTemperature);
+                                    modelio->light.skyTemperature, modelio->light.Rin);
     updateLight(modelio,lightSet);
 
 }
@@ -890,7 +897,7 @@ void Geometry::updateSensorPos(std::shared_ptr<VoxelrtIO> &modelio, int kpos){
 
     LightSet lightSet = createLight(angle.sza, angle.saa,modelio->light.direct,
                                     modelio->light.diffuse,modelio->light.solarTemperature,
-                                    modelio->light.skyTemperature);
+                                    modelio->light.skyTemperature, modelio->light.Rin);
     updateLight(modelio,lightSet);
 
 }

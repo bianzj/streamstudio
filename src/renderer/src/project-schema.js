@@ -553,7 +553,7 @@ export function createDefaultProject(options = {}) {
           heterogeneityEnabled: false, angularEffectStrength: 0.5
         }
       },
-      light: { zenith: 30, azimuth: 135, direct: 0.8, diffuse: 0.2, skyTemperature: 250 },
+      light: { zenith: 30, azimuth: 135, direct: 0.8, diffuse: 0.2, skyTemperature: 250, shortwaveIrradiance: 0 },
       sensor: {
         x: 512, y: 512, bands: DEFAULT_SENSOR_BANDS.join(' '), projection: 'parallel',
         vza: 0, vaa: 0,
@@ -826,7 +826,10 @@ export function normalizeProject(value = {}) {
           )))
         }
       },
-      light: { ...defaults.configuration.light, ...sourceLight, direct: directFraction, diffuse: 1 - directFraction },
+      // shortwaveIrradiance: horizontal global shortwave (W m-2) scaling the
+      // 2.5-6 um solar term of RayTracing/VoxelRT/FacetRT; 0 = model default.
+      light: { ...defaults.configuration.light, ...sourceLight, direct: directFraction, diffuse: 1 - directFraction,
+        shortwaveIrradiance: Math.max(0, Math.min(2000, number(sourceLight.shortwaveIrradiance, 0))) },
       sensor: {
         ...defaults.configuration.sensor,
         ...sourceSensor,
@@ -1241,6 +1244,7 @@ export function projectToXml(value, paths = {}) {
         <lightAngle><lightAngle>${number(c.light.zenith, 30)},${number(c.light.azimuth, 135)}</lightAngle></lightAngle>
         <skyTemperature>${number(c.light.skyTemperature, 250)}</skyTemperature>
         <directScatteringRatio>${number(c.light.direct, 0.8)}</directScatteringRatio>
+        <shortwaveIrradiance>${Math.max(0, number(c.light.shortwaveIrradiance, 0))}</shortwaveIrradiance>
         <esunFileName>${xmlEscape(definedFile('Esun_.dat'))}</esunFileName>
         <eskyFileName>${xmlEscape(definedFile('Esky_.dat'))}</eskyFileName>
       </light>

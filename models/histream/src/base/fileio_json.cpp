@@ -282,6 +282,8 @@ void configureCommon(FileIO& io, const ProjectJson& project, Mode mode) {
     lightData.diffuse = 1.0f - lightData.direct;
     lightData.skyTemperature = ProjectJson::number(light, "skyTemperature", 250.0f);
     lightData.solarTemperature = 6000.0f;
+    lightData.shortwaveIrradiance = std::clamp(
+        ProjectJson::number(light, "shortwaveIrradiance", 0.0f), 0.0f, 2000.0f);
     const AtmosphereXml atmosphere = readAtmosphere(project);
 
     const std::string output = project.outputDirectory().string();

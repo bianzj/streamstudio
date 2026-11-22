@@ -352,7 +352,8 @@ function parseXml(content, mode = state.mode) {
       zenith: lightPair[0], azimuth: lightPair[1],
       direct: directFraction,
       diffuse: 1 - directFraction,
-      skyTemperature: Number(xmlValue(doc, 'Geometry Light light skyTemperature', base.light.skyTemperature))
+      skyTemperature: Number(xmlValue(doc, 'Geometry Light light skyTemperature', base.light.skyTemperature)),
+      shortwaveIrradiance: Math.max(0, Number(xmlValue(doc, 'Geometry Light light shortwaveIrradiance', base.light.shortwaveIrradiance ?? 0)) || 0)
     },
     sensor: {
       x: Number(xmlValue(doc, 'Geometry Sensor sensor pixelResolutionX', base.sensor.x)),
@@ -2380,7 +2381,7 @@ function renderInspector() {
     html = `<div class="property-group"><h3>空间范围</h3>${field('X 尺寸（南北）', inputUnit('sceneX', c.scene.x, 'm', 'type="number" min="1"'))}${field('Z 尺寸（东西）', inputUnit('sceneY', c.scene.y, 'm', 'type="number" min="1"'))}${field('Y 最大高度', inputUnit('sceneHeight', c.scene.height, 'm', 'type="number" min="0.1"'))}${field('体元大小', inputUnit('voxelSize', c.scene.voxel, 'm', 'type="number" min="0.1" step="0.1"'))}${field('OBJ填充阈值', inputUnit('voxelFillThreshold', c.scene.voxelFillThreshold, '0–1', 'type="number" min="0" max="1" step="0.01"'))}<div class="notice">统一方向：+X 向北、−X 向南；+Y 向上；+Z 向东、−Z 向西。OBJ、Three.js 与计算引擎采用同一约定；方位角 0° 向北、90° 向东；平行投影固定上北、右东，中心投影保持天空向上和地平线水平。</div></div><div class="property-group"><h3>计算域偏移</h3>${field('X 偏移（北向）', inputUnit('sceneOffsetX', sceneOffsetX, 'm', 'type="number" step="any"'))}${field('Y 偏移（高度）', inputUnit('sceneOffsetY', sceneOffsetY, 'm', 'type="number" step="any"'))}${field('Z 偏移（东向）', inputUnit('sceneOffsetZ', sceneOffsetZ, 'm', 'type="number" step="any"'))}<div class="notice">${domainNotice}</div></div>${backgroundPanel}${builtinNotice()}`
   } else if (state.panel === 'light') {
     html = `<div class="property-group"><h3>太阳位置</h3>${field('太阳天顶角', inputUnit('sunZenith', c.light.zenith, '°', 'type="number" min="0" max="90"'))}${field('太阳方位角', inputUnit('sunAzimuth', c.light.azimuth, '°', 'type="number" min="0" max="360"'))}</div>
-      <div class="property-group"><h3>辐照条件</h3>${field('直射比例', `<div class="range-wrap"><input class="range" id="directLight" type="range" min="0" max="1" step="0.01" value="${c.light.direct}"><span class="range-value" id="directValue">${c.light.direct.toFixed(2)}</span></div>`)}${field('漫射比例', `<div class="range-wrap"><input class="range" id="diffuseLight" type="range" min="0" max="1" step="0.01" value="${c.light.diffuse}"><span class="range-value" id="diffuseValue">${c.light.diffuse.toFixed(2)}</span></div>`)}${field('天空温度', inputUnit('skyTemperature', c.light.skyTemperature, 'K', 'type="number"'))}<div class="notice">HiStream 自动令漫射比例 = 1 − 直射比例。</div></div>${builtinNotice()}`
+      <div class="property-group"><h3>辐照条件</h3>${field('直射比例', `<div class="range-wrap"><input class="range" id="directLight" type="range" min="0" max="1" step="0.01" value="${c.light.direct}"><span class="range-value" id="directValue">${c.light.direct.toFixed(2)}</span></div>`)}${field('漫射比例', `<div class="range-wrap"><input class="range" id="diffuseLight" type="range" min="0" max="1" step="0.01" value="${c.light.diffuse}"><span class="range-value" id="diffuseValue">${c.light.diffuse.toFixed(2)}</span></div>`)}${field('天空温度', inputUnit('skyTemperature', c.light.skyTemperature, 'K', 'type="number"'))}<div class="notice">HiStream 自动令漫射比例 = 1 − 直射比例。</div>${['eRaytracing', 'eVoxelRT', 'eFacetRT'].includes(state.mode) ? `${field('地表水平短波总辐照', inputUnit('shortwaveIrradiance', c.light.shortwaveIrradiance ?? 0, 'W/m²', 'type="number" min="0" max="2000" step="10"'))}<div class="notice">只用于 2.5–6 µm 热红外波段的太阳反射绝对量（按上面的直射/漫射比例拆分）；0 = 默认（${state.mode === 'eFacetRT' ? '700·cosθs + 50 W/m²' : '晴空 Haurwitz 公式'}）。可见光–短波红外输出是归一化反射率，不受影响。</div>` : ''}</div>${builtinNotice()}`
   } else if (state.panel === 'sensor') {
     const perspective = c.sensor.projection === 'perspective'
     updateCruiseVisualization(c)
@@ -2849,6 +2850,7 @@ function bindInspector() {
   }
   bindLightFraction('directLight', 'direct'); bindLightFraction('diffuseLight', 'diffuse')
   bindValue('skyTemperature', (v) => c.light.skyTemperature = v, 'Geometry Light light skyTemperature')
+  bindValue('shortwaveIrradiance', (v) => c.light.shortwaveIrradiance = Math.max(0, Math.min(2000, v)), 'Geometry Light light shortwaveIrradiance')
   bindValue('sensorX', (v) => c.sensor.x = v, 'Geometry Sensor sensor pixelResolutionX'); bindValue('sensorY', (v) => c.sensor.y = v, 'Geometry Sensor sensor pixelResolutionY')
   $('#sensorBands')?.addEventListener('change', (event) => { c.sensor.bands = event.target.value; syncSensorSamplingXml(); renderInspector() })
   const bindSensorNumber = (id, key, minimum = -Infinity) => $(`#${id}`)?.addEventListener('change', (event) => {

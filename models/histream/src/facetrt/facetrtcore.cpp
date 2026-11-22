@@ -132,6 +132,33 @@ constexpr float kBeamNormalIrradiance = 700.0f;
 constexpr float kSkyDiffuseIrradiance = 100.0f;
 constexpr float kStefanBoltzmann = 5.670374419e-8f;
 
+// Reflected sunlight in thermal bands between 2.5 and 6 um: the same table
+// and sky ratio as shader/mwir_solar.glsl (keep both identical). The table is
+// the bundled Esun_.dat on its 2500-6000 nm, 100 nm grid divided by its
+// 400-2400 nm integral in um, so (shortwave total, W m-2) x shape is the
+// spectral irradiance in W m-2 um-1. Exactly 0 at <= 2.5 um and >= 6 um.
+constexpr std::array<float, 36> kMwirSolarShape = {
+    1.7800e-02f, 1.3376e-03f, 6.2215e-09f, 3.8114e-04f, 2.7788e-03f, 4.6614e-03f,
+    6.4018e-03f, 6.2056e-03f, 7.0701e-03f, 1.1103e-02f, 1.3684e-02f, 1.3498e-02f,
+    1.2362e-02f, 1.1301e-02f, 1.0473e-02f, 9.0935e-03f, 6.4206e-03f, 3.2183e-03f,
+    1.2786e-04f, 1.4780e-04f, 1.0580e-03f, 2.4357e-03f, 3.0036e-03f, 2.3447e-03f,
+    1.7338e-03f, 1.3681e-03f, 7.3824e-04f, 2.0866e-04f, 6.5639e-05f, 1.2040e-05f,
+    1.1073e-06f, 3.5406e-08f, 9.0807e-14f, 0.0f, 0.0f, 0.0f};
+constexpr float kMwirSkySolarRatio = 0.0847f;
+
+float mwirSolarShape(float wavelength)
+{
+    const float um = wavelength > 50.0f ? wavelength * 0.001f : wavelength;
+    if (!(um > 2.5f) || !(um < 6.0f)) return 0.0f;
+    const float x = (um - 2.5f) * 10.0f;
+    const int index = std::clamp(static_cast<int>(std::floor(x)), 0,
+                                 static_cast<int>(kMwirSolarShape.size()) - 2);
+    const float t = std::clamp(x - static_cast<float>(index), 0.0f, 1.0f);
+    return std::max(kMwirSolarShape[index] +
+                        (kMwirSolarShape[index + 1] - kMwirSolarShape[index]) * t,
+                    0.0f);
+}
+
 using facetbio::LeafBiochemistry;
 
 struct SurfaceParameters {
@@ -196,6 +223,9 @@ struct Scene {
     // replaces them from the project light settings when present.
     float beamNormalIrradiance{kBeamNormalIrradiance};
     float skyDiffuseIrradiance{kSkyDiffuseIrradiance * 0.5f};
+    // Configured horizontal global shortwave (light.shortwaveIrradiance,
+    // W m-2) for the FacetRT 2.5-6 um solar term; 0 = 700 cos + 50 W m-2.
+    float shortwaveIrradiance{};
     uint32_t visibilityRasterSize{kRasterSize};
     uint32_t visibilityRasterLayers{kRasterLayers};
     uint32_t periodicNeighborCount{};
@@ -582,6 +612,30 @@ facetvk::Direction sunDirection(const Scene& scene)
     // SPA azimuth is clockwise from north: +X is north and +Z is east.
     return {std::sin(zenith) * std::cos(azimuth), std::cos(zenith),
             std::sin(zenith) * std::sin(azimuth)};
+}
+
+// FacetRT thermal-band solar sources in the thermal solver's radiance units
+// (W m-2 sr-1 um-1, i.e. irradiance / pi): [0] beam normal to the sun, used
+// like the optical beam (sunlit part x cos), [1] scattered sky added to the
+// Planck sky. The FacetRT illumination split (beamNormalIrradiance,
+// skyDiffuseIrradiance, from the light settings or the historical defaults)
+// is scaled to the horizontal shortwave total: light.shortwaveIrradiance when
+// set, otherwise the historical 700 cos + 50 W m-2. Exactly 0 outside
+// 2.5-6 um and with the sun at or below the horizon.
+std::array<float, 2> facetRtThermalSolar(const Scene& scene, float wavelength)
+{
+    const float shape = mwirSolarShape(wavelength);
+    const float cosine = sunDirection(scene).y;
+    if (!(shape > 0.0f) || !(cosine > 0.0f)) return {0.0f, 0.0f};
+    const float total = scene.shortwaveIrradiance > 0.0f
+        ? scene.shortwaveIrradiance
+        : kBeamNormalIrradiance * cosine + kSkyDiffuseIrradiance * 0.5f;
+    const float reference =
+        scene.beamNormalIrradiance * cosine + scene.skyDiffuseIrradiance;
+    if (!(reference > 1.0e-6f)) return {0.0f, 0.0f};
+    const float scale = total / reference * shape / kPi;
+    return {scale * scene.beamNormalIrradiance,
+            scale * scene.skyDiffuseIrradiance * kMwirSkySolarRatio};
 }
 
 std::vector<facetvk::SurfaceOptics> makeOptics(const Scene& scene,
@@ -1376,6 +1430,9 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
     const bool thermal = wavelength > 2500.0f;
     const facetvk::Direction direction = sunDirection(scene);
     const Vec3 sun{direction.x, direction.y, direction.z};
+    // Thermal bands below 6 um also reflect the absolute solar beam (radiance
+    // units, see facetRtThermalSolar); 0 elsewhere.
+    const float thermalBeam = thermal ? facetRtThermalSolar(scene, wavelength)[0] : 0.0f;
     std::vector<facetvk::SurfaceOptics> optics(scene.facetCount() * 2U);
     if (stateEmission) stateEmission->assign(optics.size(), {0.0f, 0.0f});
     for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
@@ -1430,7 +1487,8 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
                     emissivity * planckRadiance(wavelength, surface.shadedTemperature);
                 optics[side].emission = facetIlluminated * sunlitEmission +
                     (1.0f - facetIlluminated) * shadedEmission;
-                optics[side].directIrradiance = 0.0f;
+                optics[side].directIrradiance =
+                    sunlit[side] * std::max(0.0f, dot(sideNormal, sun)) * thermalBeam;
                 if (stateEmission) (*stateEmission)[side] = {sunlitEmission, shadedEmission};
             } else {
                 optics[side].directIrradiance =
@@ -1607,12 +1665,13 @@ std::vector<facetvk::SurfaceOptics> makeStateSpectralOptics(
             optics[side].reflectance = reflectance;
             optics[side].transmittance = std::min(
                 transmittance, 1.0f - reflectance);
-            if (optical) {
-                optics[side].directIrradiance =
-                    std::clamp(sunlit[side], 0.0f, 1.0f) *
-                    std::max(0.0f, dot(sideNormal, sun)) *
-                    directNormalIrradiance;
-            } else {
+            // Optical bands: the normalized-to-W m-2 nm-1 beam; thermal bands:
+            // the 2.5-6 um solar beam in radiance units (0 elsewhere).
+            optics[side].directIrradiance =
+                std::clamp(sunlit[side], 0.0f, 1.0f) *
+                std::max(0.0f, dot(sideNormal, sun)) *
+                directNormalIrradiance;
+            if (!optical) {
                 const auto stateRadiance = [&](int state) {
                     return emissivity * planckRadiance(
                         wavelength,
@@ -2249,12 +2308,16 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
         const bool thermal = !isOpticalWavelength(wavelength);
         const bool warm = parameters.acceleratedSolver && band > 0 && previousThermal == thermal;
         allThermal = allThermal && thermal; anyThermal = anyThermal || thermal;
-        // Per-band light from the project settings (configureFacetRTLight).
-        const float beam = thermal ? 0.0f : bandBeamIrradiance(scene, parameters, band);
+        // Per-band light from the project settings (configureFacetRTLight);
+        // thermal bands below 6 um: the absolute solar beam and sky (radiance).
+        const std::array<float, 2> thermalSolar = thermal
+            ? facetRtThermalSolar(scene, wavelength) : std::array<float, 2>{0.0f, 0.0f};
+        const float beam = thermal ? thermalSolar[0] : bandBeamIrradiance(scene, parameters, band);
         const float reference = beam * cosineSolarZenith + bandSkyIrradiance(scene, parameters, band);
         const float scale = thermal || reference <= 1e-8f ? 1.0f : 1.0f / reference;
-        const float sky = thermal ? planckRadiance(wavelength, parameters.skyTemperature)
-                                  : bandSkyIrradiance(scene, parameters, band);
+        const float sky = thermal
+            ? planckRadiance(wavelength, parameters.skyTemperature) + thermalSolar[1]
+            : bandSkyIrradiance(scene, parameters, band);
         progress(82 + static_cast<int>(15U * band / parameters.wavelengths.size()),
                  "GPU resident spectral solve " + std::to_string(band + 1U) + "/" + std::to_string(parameters.wavelengths.size()));
         const auto stats = model.solveSpectralBand(static_cast<uint32_t>(band), thermal, sky, scale,
@@ -2395,7 +2458,10 @@ RunResult runGpu(const Scene& scene,
             const float wavelength = spectralParameters->wavelengths[band];
             const bool thermal = !isOpticalWavelength(wavelength);
             // Per-band light, identical to runGpuSpectral.
-            const float bandBeam = thermal ? 0.0f
+            const std::array<float, 2> thermalSolar = thermal
+                ? facetRtThermalSolar(scene, wavelength)
+                : std::array<float, 2>{0.0f, 0.0f};
+            const float bandBeam = thermal ? thermalSolar[0]
                 : bandBeamIrradiance(scene, *spectralParameters, band);
             const float opticalReferenceIrradiance = bandBeam * cosineSolarZenith +
                 bandSkyIrradiance(scene, *spectralParameters, band);
@@ -2414,7 +2480,7 @@ RunResult runGpu(const Scene& scene,
                                    *spectralParameters, band, &stateEmission);
             const float skyRadiance = thermal
                 ? planckRadiance(wavelength,
-                                 spectralParameters->skyTemperature)
+                                 spectralParameters->skyTemperature) + thermalSolar[1]
                 : bandSkyIrradiance(scene, *spectralParameters, band);
             const std::vector<float>* initialRadiosity =
                 spectralParameters->acceleratedSolver && hasPreviousBand &&
@@ -2670,6 +2736,8 @@ std::string facetInputView(const std::string& path)
         << ',' << ProjectJson::number(light, "azimuth", 135.0f) << "</viewAngles></lightAngle>"
         << "<skyTemperature>" << ProjectJson::number(light, "skyTemperature", 250.0f) << "</skyTemperature>"
         << "<directScatteringRatio>" << ProjectJson::number(light, "direct", 0.8f) << "</directScatteringRatio>"
+        << "<shortwaveIrradiance>" << std::clamp(ProjectJson::number(light, "shortwaveIrradiance", 0.0f), 0.0f, 2000.0f)
+        << "</shortwaveIrradiance>"
         << "<esunFileName>" << xmlEscaped((defined / "Esun_.dat").string()) << "</esunFileName>"
         << "<eskyFileName>" << xmlEscaped((defined / "Esky_.dat").string()) << "</eskyFileName>"
         << "</light></Light><Sensor><sensor name=\"MainSensor\">"
@@ -3419,6 +3487,10 @@ void configureFacetRTLight(const std::string& xml, const std::filesystem::path& 
 {
     parameters.bandBeamNormal.clear();
     parameters.bandSkyDiffuse.clear();
+    // Absolute shortwave for the 2.5-6 um solar term (facetRtThermalSolar);
+    // optical outputs are normalized and do not depend on it.
+    scene.shortwaveIrradiance = xml.empty() ? 0.0f : std::clamp(
+        xmlFloat(xml, "shortwaveIrradiance", 0.0f), 0.0f, 2000.0f);
     if (xml.empty()) return;
     const bool hasRatio = !trim(firstXmlTag(xml, "directScatteringRatio")).empty();
     const bool hasSpectra = !trim(firstXmlTag(xml, "esunFileName")).empty() &&
@@ -5778,8 +5850,21 @@ try {
             // Same illumination as the energy solve: horizontal direct
             // irradiance converted to the beam-normal value, sky diffuse plus
             // any direct share dropped by that conversion.
-            const float directNormalSpectralIrradiance =
-                directSpectralIrradiance * directNormalFactor;
+            // Thermal bands below 6 um reflect the same meteorological
+            // shortwave (Rin x direct share, mwirSolarShape spectral shape,
+            // as VoxelEB), in radiance units (/pi); exactly 0 above 6 um and
+            // at night. The energy balance already holds this energy in Rin.
+            const float mwirShape = optical ? 0.0f : mwirSolarShape(wavelength);
+            const float mwirDirect = totalShortwave *
+                std::clamp(directSpectrumIntegral, 0.0f, 1.0f) * mwirShape;
+            const float mwirSky = mwirShape > 0.0f
+                ? (totalShortwave * (1.0f - std::clamp(directSpectrumIntegral, 0.0f, 1.0f)) *
+                       kMwirSkySolarRatio * mwirShape +
+                   mwirDirect * lostDirectFraction) / kPi
+                : 0.0f;
+            const float directNormalSpectralIrradiance = optical
+                ? directSpectralIrradiance * directNormalFactor
+                : mwirDirect * directNormalFactor / kPi;
             std::vector<std::array<float, 2>> stateEmission;
             const std::vector<facetvk::SurfaceOptics> spectralOptics =
                 makeStateSpectralOptics(
@@ -5789,7 +5874,7 @@ try {
             const float skySpectralRadiance = optical
                 ? diffuseSpectralIrradiance
                 // DEFERRED[低] 物理: 热红外图像的天空辐射用固定 skyTemperature 的普朗克辐射，而能量平衡用的是气象驱动 meteo.longwave（Rli）；两者不一致会使热红外图像与求得的温度场不自洽；建议：由 Rli 反推等效天空亮温 (Rli/σ)^(1/4) 用于光谱天空辐射。
-                : planckRadiance(wavelength, skyTemperature);
+                : planckRadiance(wavelength, skyTemperature) + mwirSky;
             // Same residual-based early exit as the shortwave windows, scaled
             // by the band's illumination (optical) or by the Planck radiance
             // at air temperature (thermal; r+t is small there).
@@ -5813,7 +5898,7 @@ try {
             } else {
                 appendSurfaceStates(
                     scene, spectralOptics, stateEmission, spectralSolution.radiosity,
-                    0.0f, 1.0f, false, spectralStates[band]);
+                    directNormalSpectralIrradiance, 1.0f, false, spectralStates[band]);
             }
         }
 
