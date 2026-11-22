@@ -10,6 +10,7 @@
 #include <sstream>
 #include "fileio.h"
 #include "radiation_spectrum.h"
+#include "shortwave_split.h"
 #pragma once
 //#include "tinyxml.h"
 #include "structs.h"
@@ -1121,6 +1122,12 @@ LightXml FileIO::readLightXML(TiXmlNode *geometryNode, Mode mode){
             if (text) lightxml.shortwaveIrradiance = std::clamp(
                 static_cast<float>(std::atof(text)), 0.0f, 2000.0f);
         }
+        // Missing element = legacy fixed split (old projects stay unchanged).
+        lightxml.diffuseFractionMode = shortwave_split::kModeFixed;
+        if (sonExists("diffuseFractionMode", pEle->ToElement())) {
+            const char* text = pEle->FirstChildElement("diffuseFractionMode")->GetText();
+            if (text) lightxml.diffuseFractionMode = shortwave_split::parseMode(text);
+        }
         if (sonExists("directScatteringRatio", pEle->ToElement())){
             if (m_mode == Mode::eVoxelEB) {
                 m_pVoxelebXml->atomcondxml.rinfile = pEle->FirstChildElement("esunFileName")->GetText();
@@ -1746,6 +1753,7 @@ void FileIO::readMeteo(std::shared_ptr<DefinedIO> &defineio,int & n_node,
     }
     meteos.clear();
     meteos.reserve(static_cast<size_t>(fileNodeCount));
+    m_meteoMeasuredSplit.clear();
 
     int meteoNum = 0;
     float z = m_meteoXml.meta.z;//15;
@@ -1784,6 +1792,20 @@ void FileIO::readMeteo(std::shared_ptr<DefinedIO> &defineio,int & n_node,
         mi.Ca = Ca;
         mi.Oa = Oa;
         mi.dTime = dTime;
+
+        // Optional columns 8-9: horizontal direct and diffuse shortwave
+        // (W m-2), read only by light.diffuseFractionMode = erbs.
+        {
+            float measuredDirect = 0.0f, measuredDiffuse = 0.0f;
+            std::array<float, 2> measured{std::numeric_limits<float>::quiet_NaN(),
+                                          std::numeric_limits<float>::quiet_NaN()};
+            if (row >> measuredDirect >> measuredDiffuse &&
+                std::isfinite(measuredDirect) && std::isfinite(measuredDiffuse) &&
+                measuredDirect >= 0.0f && measuredDiffuse >= 0.0f) {
+                measured = {measuredDirect, measuredDiffuse};
+            }
+            m_meteoMeasuredSplit.push_back(measured);
+        }
 
         meteos.emplace_back(mi);
         ++rowIndex;
@@ -1837,11 +1859,16 @@ void FileIO::readMeteo(std::shared_ptr<DefinedIO> &defineio,int & n_node,
     // Rin is total shortwave irradiance. Each retained spectral shape receives
     // its configured fraction, including the pure-direct/pure-diffuse limits.
     const float directFraction = m_pVoxelebXml->lightxml.direct;
+    m_unitShortwaveShapes.assign(b1, AtomCond{});
     for (int i = 0; i < b1; i++)
     {
         const float endpointWeight = i == 0 || i == b1 - 1 ? 0.5f : 1.0f;
         fesky_[i] = endpointWeight * normalizedShortwaveCoefficient(esky_[i], TsEsky, 1.0f - directFraction);
         fesun_[i] = endpointWeight * normalizedShortwaveCoefficient(esun_[i], TsEsun, directFraction);
+        // Fraction-1 shapes for a per-node split (light.diffuseFractionMode).
+        m_unitShortwaveShapes[i].wavelength = wavesets[i].wavelength;
+        m_unitShortwaveShapes[i].direct = endpointWeight * normalizedShortwaveCoefficient(esun_[i], TsEsun, 1.0f);
+        m_unitShortwaveShapes[i].diffuse = endpointWeight * normalizedShortwaveCoefficient(esky_[i], TsEsky, 1.0f);
     }
     // ����
     for (int j = b1; j < b2 - 1; j++)

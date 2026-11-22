@@ -160,7 +160,8 @@ export function normalizeUnified(value = {}) {
         direct: cleanNumber(sky.direct, configuration.light.direct),
         diffuse: cleanNumber(sky.diffuse, configuration.light.diffuse),
         skyTemperature: cleanNumber(sky.skyTemperature, configuration.light.skyTemperature),
-        shortwaveIrradiance: cleanNumber(sky.shortwaveIrradiance, configuration.light.shortwaveIrradiance ?? 0)
+        shortwaveIrradiance: cleanNumber(sky.shortwaveIrradiance, configuration.light.shortwaveIrradiance ?? 0),
+        diffuseFractionMode: (sky.diffuseFractionMode ?? configuration.light.diffuseFractionMode) === 'erbs' ? 'erbs' : 'fixed'
       },
       atmosphere: { ...configuration.atmosphere, ...object(shared.atmosphere) },
       observation: {
@@ -283,7 +284,8 @@ function sharedFromHistream(project, previous = {}) {
       direct: cleanNumber(light.direct, 0.8),
       diffuse: cleanNumber(light.diffuse, 0.2),
       skyTemperature: cleanNumber(light.skyTemperature, 250),
-      shortwaveIrradiance: cleanNumber(light.shortwaveIrradiance, 0)
+      shortwaveIrradiance: cleanNumber(light.shortwaveIrradiance, 0),
+      diffuseFractionMode: light.diffuseFractionMode === 'erbs' ? 'erbs' : 'fixed'
     },
     atmosphere: { ...object(configuration.atmosphere) },
     observation: {
@@ -359,7 +361,8 @@ export function unifiedToHistreamProject(unified) {
         direct: shared.sky.direct,
         diffuse: shared.sky.diffuse,
         skyTemperature: shared.sky.skyTemperature,
-        shortwaveIrradiance: shared.sky.shortwaveIrradiance ?? 0
+        shortwaveIrradiance: shared.sky.shortwaveIrradiance ?? 0,
+        diffuseFractionMode: shared.sky.diffuseFractionMode === 'erbs' ? 'erbs' : 'fixed'
       },
       sensor: { ...engine.sensor, vza: shared.observation.vza, vaa: shared.observation.vaa },
       control: {

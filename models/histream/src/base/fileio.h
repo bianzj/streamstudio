@@ -9,6 +9,7 @@
 #include "src/thirdparty/tinyxml.h"
 #include "gdal.h"
 #include <iostream>
+#include <array>
 #include <string>
 #include <fstream>
 #include <memory>
@@ -55,6 +56,12 @@ public:
     bool sonExists(std::string sonName, TiXmlElement* parentEle);
     void readDefined(std::shared_ptr<DefinedIO> & defineio);
     void readMeteo(std::shared_ptr<DefinedIO> &defineio,int & n_node, std::vector<Meteo> &meteos, std::vector<AtomCond> &wavesets);
+    // Filled by readMeteo for light.diffuseFractionMode = erbs: optional
+    // columns 8-9 (horizontal direct, diffuse W m-2; NaN when absent) per row,
+    // and the VNIR Esun/Esky coefficients normalized to fraction 1 (direct in
+    // .direct, diffuse in .diffuse) that a node's split scales.
+    std::vector<std::array<float, 2>> m_meteoMeasuredSplit;
+    std::vector<AtomCond> m_unitShortwaveShapes;
     void writeENVIdata(std::string projectDir,float * pData, int width, int height, int band, Angle &angle, float t = -1);
     void writeENVIdata(std::string projectDir,float * pData, int width, int height, int band, Angle &angle, float t = -1,int k = -1);
     bool writeTIFData(const std::string& projectDir, const float* pData, int width, int height,

@@ -145,6 +145,14 @@ VoxelebIO(){
     // dimensionless transmittance residuals into W/m2 bounds.
     SolarVisibilityStats solarStats{};
     double solarBeamIrradiance{0.0};
+    // light.diffuseFractionMode (shortwave_split.h): 0 fixed, 1 erbs. The
+    // per-node split rescales the VNIR atomconds from the fraction-1 shapes
+    // and updates LightSet.direct/diffuse; fixed mode never touches them.
+    int diffuseFractionMode{0};
+    float fixedDirectFraction{0.8f};
+    float nodeDirectFraction{0.8f};
+    std::vector<std::array<float, 2>> meteoMeasuredSplit;
+    std::vector<AtomCond> unitShortwaveShapes;
     FluidXml fluid;
     glm::ivec3 fluidGridSize{1, 1, 1};
     uint64_t fluidCellCount{1};

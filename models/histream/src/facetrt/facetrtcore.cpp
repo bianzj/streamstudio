@@ -8,6 +8,7 @@
 #include "../base/soil_tir_emissivity.h"
 #include "../base/reflectance_texture.h"
 #include "../base/utils.h"
+#include "../base/shortwave_split.h"
 #include "../thirdparty/spa.h"
 
 #include <algorithm>
@@ -2738,6 +2739,8 @@ std::string facetInputView(const std::string& path)
         << "<directScatteringRatio>" << ProjectJson::number(light, "direct", 0.8f) << "</directScatteringRatio>"
         << "<shortwaveIrradiance>" << std::clamp(ProjectJson::number(light, "shortwaveIrradiance", 0.0f), 0.0f, 2000.0f)
         << "</shortwaveIrradiance>"
+        << "<diffuseFractionMode>" << xmlEscaped(ProjectJson::string(light, "diffuseFractionMode", "fixed"))
+        << "</diffuseFractionMode>"
         << "<esunFileName>" << xmlEscaped((defined / "Esun_.dat").string()) << "</esunFileName>"
         << "<eskyFileName>" << xmlEscaped((defined / "Esky_.dat").string()) << "</eskyFileName>"
         << "</light></Light><Sensor><sensor name=\"MainSensor\">"
@@ -4246,6 +4249,9 @@ try {
         float windSpeed{1.0f};
         float shortwave{};
         float longwave{320.0f};
+        // Optional columns 8-9: horizontal direct/diffuse W m-2 (NaN = absent).
+        float measuredDirect{std::numeric_limits<float>::quiet_NaN()};
+        float measuredDiffuse{std::numeric_limits<float>::quiet_NaN()};
     };
 
     const std::filesystem::path input(inputPath);
@@ -4328,8 +4334,17 @@ try {
         xmlFloat(xml, "directScatteringRatio", 0.8f), 0.0f, 1.0f);
     const FacetRTParameters radiativeParameters =
         facetRTParametersFromInput(xml, input);
-    const ShortwaveSpectrum shortwaveSpectrum = loadShortwaveSpectrum(
+    const ShortwaveSpectrum configuredShortwaveSpectrum = loadShortwaveSpectrum(
         xml, input, directShortwaveFraction);
+    // light.diffuseFractionMode: fixed keeps the spectrum above for every
+    // node; erbs rescales fraction-1 shapes per node (shortwave_split.h).
+    const int diffuseFractionMode = shortwave_split::parseMode(
+        trim(firstXmlTag(xml, "diffuseFractionMode")));
+    ShortwaveSpectrum unitDirectSpectrum, unitDiffuseSpectrum;
+    if (diffuseFractionMode == shortwave_split::kModeErbs) {
+        unitDirectSpectrum = loadShortwaveSpectrum(xml, input, 1.0f);
+        unitDiffuseSpectrum = loadShortwaveSpectrum(xml, input, 0.0f);
+    }
 
     std::vector<MeteoStep> meteorology;
     const std::string meteoName = trim(firstXmlTag(xml, "filePath"));
@@ -4359,6 +4374,13 @@ try {
                 !std::isfinite(step.shortwave) || !std::isfinite(step.longwave)) {
                 throw std::runtime_error("FacetEB non-finite meteorology values at " +
                     meteoName + ":" + std::to_string(row + 1));
+            }
+            float measuredDirect = 0.0f, measuredDiffuse = 0.0f;
+            if (values >> measuredDirect >> measuredDiffuse &&
+                std::isfinite(measuredDirect) && std::isfinite(measuredDiffuse) &&
+                measuredDirect >= 0.0f && measuredDiffuse >= 0.0f) {
+                step.measuredDirect = measuredDirect;
+                step.measuredDiffuse = measuredDiffuse;
             }
             meteorology.push_back(step);
         }
@@ -4912,6 +4934,27 @@ try {
         const float totalShortwave = std::max(0.0f, meteo.shortwave);
         const float cosineSolarZenith =
             std::max(0.0f, sunDirection(scene).y);
+        // Direct/diffuse split of this node's Rin (light.diffuseFractionMode).
+        const shortwave_split::Split shortwaveSplit = shortwave_split::split(
+            diffuseFractionMode, directShortwaveFraction, meteo.shortwave,
+            static_cast<float>(std::acos(std::clamp(sunDirection(scene).y, -1.0f, 1.0f)) * 180.0 / kPi),
+            static_cast<int>(std::floor(meteo.julianTime)), meteo.measuredDirect, meteo.measuredDiffuse);
+        ShortwaveSpectrum nodeShortwaveSpectrum;
+        if (diffuseFractionMode == shortwave_split::kModeErbs) {
+            nodeShortwaveSpectrum.direct = unitDirectSpectrum.direct;
+            nodeShortwaveSpectrum.diffuse = unitDiffuseSpectrum.diffuse;
+            for (float& value : nodeShortwaveSpectrum.direct) value *= shortwaveSplit.directFraction;
+            for (float& value : nodeShortwaveSpectrum.diffuse) value *= 1.0f - shortwaveSplit.directFraction;
+        }
+        const ShortwaveSpectrum& shortwaveSpectrum =
+            diffuseFractionMode == shortwave_split::kModeErbs ? nodeShortwaveSpectrum
+                                                              : configuredShortwaveSpectrum;
+        std::cout << "SHORTWAVE_SPLIT\tnode=" << node
+                  << "\tmode=" << (diffuseFractionMode == shortwave_split::kModeErbs ? "erbs" : "fixed")
+                  << "\tsource=" << shortwaveSplit.source
+                  << "\trin=" << meteo.shortwave
+                  << "\tkt=" << shortwaveSplit.clearnessIndex
+                  << "\tdirectFraction=" << shortwaveSplit.directFraction << std::endl;
         std::vector<float> absorbedShortwave(surfaceCount, 0.0f);
         // Direct-beam parts of the side-mean fluxes; a sunlit point receives
         // them divided by the side's sunlit part, a shaded point none.

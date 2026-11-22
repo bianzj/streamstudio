@@ -1,5 +1,6 @@
 #include "projectjson.h"
 #include "fileio.h"
+#include "shortwave_split.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -284,6 +285,9 @@ void configureCommon(FileIO& io, const ProjectJson& project, Mode mode) {
     lightData.solarTemperature = 6000.0f;
     lightData.shortwaveIrradiance = std::clamp(
         ProjectJson::number(light, "shortwaveIrradiance", 0.0f), 0.0f, 2000.0f);
+    // Missing field = legacy fixed split; new projects save "erbs".
+    lightData.diffuseFractionMode = shortwave_split::parseMode(
+        ProjectJson::string(light, "diffuseFractionMode", "fixed"));
     const AtmosphereXml atmosphere = readAtmosphere(project);
 
     const std::string output = project.outputDirectory().string();

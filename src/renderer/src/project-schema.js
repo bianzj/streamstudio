@@ -553,7 +553,9 @@ export function createDefaultProject(options = {}) {
           heterogeneityEnabled: false, angularEffectStrength: 0.5
         }
       },
-      light: { zenith: 30, azimuth: 135, direct: 0.8, diffuse: 0.2, skyTemperature: 250, shortwaveIrradiance: 0 },
+      // diffuseFractionMode：VoxelEB/FacetEB 气象短波的直散拆分。新工程默认 'erbs'（逐节点按实测直射/散射列或
+      // Erbs 晴空指数模型）；旧工程缺字段在 normalizeProject 中按 'fixed'（全时段直射比例）处理，结果不变。
+      light: { zenith: 30, azimuth: 135, direct: 0.8, diffuse: 0.2, skyTemperature: 250, shortwaveIrradiance: 0, diffuseFractionMode: 'erbs' },
       sensor: {
         x: 512, y: 512, bands: DEFAULT_SENSOR_BANDS.join(' '), projection: 'parallel',
         vza: 0, vaa: 0,
@@ -829,7 +831,8 @@ export function normalizeProject(value = {}) {
       // shortwaveIrradiance: horizontal global shortwave (W m-2) scaling the
       // 2.5-6 um solar term of RayTracing/VoxelRT/FacetRT; 0 = model default.
       light: { ...defaults.configuration.light, ...sourceLight, direct: directFraction, diffuse: 1 - directFraction,
-        shortwaveIrradiance: Math.max(0, Math.min(2000, number(sourceLight.shortwaveIrradiance, 0))) },
+        shortwaveIrradiance: Math.max(0, Math.min(2000, number(sourceLight.shortwaveIrradiance, 0))),
+        diffuseFractionMode: sourceLight.diffuseFractionMode === 'erbs' ? 'erbs' : 'fixed' },
       sensor: {
         ...defaults.configuration.sensor,
         ...sourceSensor,
@@ -1245,6 +1248,7 @@ export function projectToXml(value, paths = {}) {
         <skyTemperature>${number(c.light.skyTemperature, 250)}</skyTemperature>
         <directScatteringRatio>${number(c.light.direct, 0.8)}</directScatteringRatio>
         <shortwaveIrradiance>${Math.max(0, number(c.light.shortwaveIrradiance, 0))}</shortwaveIrradiance>
+        <diffuseFractionMode>${c.light.diffuseFractionMode === 'erbs' ? 'erbs' : 'fixed'}</diffuseFractionMode>
         <esunFileName>${xmlEscape(definedFile('Esun_.dat'))}</esunFileName>
         <eskyFileName>${xmlEscape(definedFile('Esky_.dat'))}</eskyFileName>
       </light>

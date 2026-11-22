@@ -16,6 +16,7 @@
 #include "voxeleb.h"
 #include "src/base/atmosphere_lut.h"
 #include "src/base/energy_output.h"
+#include "src/base/shortwave_split.h"
 
 namespace {
 
@@ -163,6 +164,9 @@ bool Voxeleb::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
     modelio->shortwaveScatteringOrders =
         fileio->m_pVoxelebXml->settingxml.shortwaveScatteringOrders;
     modelio->setting.maxStep = fileio->m_pVoxelebXml->settingxml.radiationMaxSteps;
+    modelio->diffuseFractionMode = fileio->m_pVoxelebXml->lightxml.diffuseFractionMode;
+    modelio->fixedDirectFraction = std::clamp(fileio->m_pVoxelebXml->lightxml.direct, 0.0f, 1.0f);
+    modelio->nodeDirectFraction = modelio->fixedDirectFraction;
     modelio->fluid = fileio->m_pVoxelebXml->fluidxml;
     // The local-exchange closure replaces the surface-layer profile by a
     // local-wind bulk formula, so it has no scene surface layer to correct.
@@ -215,6 +219,8 @@ bool  Voxeleb::uploadMeteo(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Voxe
        modelio->initialSoilTemperature = initialSoilTemperature;
    }
    fileio->readMeteo(modelio->m_defined,modelio->n_node,modelio->meteos,modelio->atomconds);
+   modelio->meteoMeasuredSplit = fileio->m_meteoMeasuredSplit;
+   modelio->unitShortwaveShapes = fileio->m_unitShortwaveShapes;
    m_stableMeteos = modelio->meteos;
    return true;
 }
@@ -277,6 +283,56 @@ bool Voxeleb::updateMeteo(std::shared_ptr<VoxelebIO> &modelio, int knode){
     cmdBufGet.submitAndWait(cmdBuf);
 
     return true;
+}
+
+void Voxeleb::applyShortwaveSplit(std::shared_ptr<VoxelebIO> &modelio, int knode)
+{
+    const float zenith = modelio->angles.empty() ? 180.0f : modelio->angles.front().sza;
+    const int dayOfYear = static_cast<int>(std::floor(modelio->meteo.t));
+    std::array<float, 2> measured{std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN()};
+    if (knode >= 0 && knode < static_cast<int>(modelio->meteoMeasuredSplit.size()))
+        measured = modelio->meteoMeasuredSplit[static_cast<size_t>(knode)];
+    const shortwave_split::Split split = shortwave_split::split(
+        modelio->diffuseFractionMode, modelio->fixedDirectFraction, modelio->meteo.Rin,
+        zenith, dayOfYear, measured[0], measured[1]);
+    std::cout << "SHORTWAVE_SPLIT\tnode=" << knode
+              << "\tmode=" << (modelio->diffuseFractionMode == shortwave_split::kModeErbs ? "erbs" : "fixed")
+              << "\tsource=" << split.source
+              << "\trin=" << modelio->meteo.Rin
+              << "\tsza=" << zenith
+              << "\tkt=" << split.clearnessIndex
+              << "\tdirectFraction=" << split.directFraction << std::endl;
+    if (modelio->diffuseFractionMode != shortwave_split::kModeErbs) return;
+    modelio->nodeDirectFraction = split.directFraction;
+    if (modelio->unitShortwaveShapes.empty() || !modelio->m_pBufferAtomcond) {
+        throw std::runtime_error("VoxelEB per-node shortwave split needs the incident spectrum shapes");
+    }
+    // Light: shaders read LightSet.direct/diffuse (MWIR solar, low-sun merge).
+    modelio->light.direct = split.directFraction;
+    modelio->light.diffuse = 1.0f - split.directFraction;
+    if (!modelio->angles.empty()) m_pGeometry->updateAngle(modelio, 0);
+    // VNIR coefficients: fraction-1 shapes times this node's split.
+    const size_t count = std::min(modelio->unitShortwaveShapes.size(), modelio->atomconds.size());
+    for (size_t i = 0; i < count; ++i) {
+        modelio->atomconds[i].direct = modelio->unitShortwaveShapes[i].direct * split.directFraction;
+        modelio->atomconds[i].diffuse = modelio->unitShortwaveShapes[i].diffuse * (1.0f - split.directFraction);
+    }
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(count * sizeof(AtomCond));
+    nvvk::CommandPool pool(modelio->m_device, modelio->m_queueIndex);
+    vk::CommandBuffer command = pool.createCommandBuffer();
+    // vkCmdUpdateBuffer accepts at most 65536 bytes per call.
+    for (VkDeviceSize offset = 0; offset < bytes; offset += 65536) {
+        const VkDeviceSize chunk = std::min<VkDeviceSize>(65536, bytes - offset);
+        vkCmdUpdateBuffer(command, modelio->m_pBufferAtomcond->buffer, offset, chunk,
+                          reinterpret_cast<const char*>(modelio->atomconds.data()) + offset);
+    }
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    pool.submitAndWait(command);
 }
 
 bool Voxeleb::uploadDefined(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &modelio)
@@ -368,6 +424,7 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
         if (!modelio->angles.empty()) {
             m_pGeometry->updateAngle(modelio, 0);
         }
+        applyShortwaveSplit(modelio, knode);
 
         // Explicit staggered coupling: advance the atmospheric field with the
         // latest surface temperatures, then use that wind/air state in the

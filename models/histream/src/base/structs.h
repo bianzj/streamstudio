@@ -271,6 +271,11 @@ struct LightXml {
     // Horizontal global shortwave irradiance (W m-2) for the absolute 2.5-6 um
     // solar term of RayTracing/VoxelRT; <= 0 = clear-sky (Haurwitz) default.
     float shortwaveIrradiance{0};
+    // VoxelEB/FacetEB direct/diffuse split of the meteorological shortwave
+    // (light.diffuseFractionMode): 0 = fixed directScatteringRatio for every
+    // node (legacy default), 1 = per node from measured direct/diffuse
+    // columns or else the Erbs (1982) clearness-index model.
+    int diffuseFractionMode{0};
 };
 
 struct AtmosphereXml

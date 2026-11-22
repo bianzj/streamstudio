@@ -56,6 +56,9 @@ public:
 
     bool uploadMeteo(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &modelio);
     bool updateMeteo(std::shared_ptr<VoxelebIO> &modelio, int knode);
+    // Per-node direct/diffuse split of Rin (light.diffuseFractionMode); logs
+    // SHORTWAVE_SPLIT and, in erbs mode, re-uploads LightSet and atomconds.
+    void applyShortwaveSplit(std::shared_ptr<VoxelebIO> &modelio, int knode);
 
     void output(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &fileio, int knode, int kangle, int kpos = -1);
     void outputTxt(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &fileio, int kangle);
