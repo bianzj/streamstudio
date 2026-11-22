@@ -306,6 +306,8 @@ struct SettingXml
     int radiationMaxSteps{64};
     // 0: Ball-Berry empirical coupling; 1: Farquhar mechanistic coupling.
     int vegetationTemperatureMethod{0};
+    // VoxelEB Monin-Obukhov stability iteration (control.stabilityCorrection).
+    bool stabilityCorrection{false};
 
 
 

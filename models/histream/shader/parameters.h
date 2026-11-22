@@ -299,10 +299,26 @@ struct VoxelTlast
 	float shaded;
 };
 
+// Integer (fixed-point) accumulators keep the MOST reductions deterministic:
+// float atomics would make 1/L depend on the thread completion order.
+// Keep in sync with EBState in src/base/structs_cg.h. The neutral VoxelEB
+// pipelines only address the leading count (pre-MOST declaration).
+#define EB_STATE_BINS 128
+#ifdef VOXELEB_MOST
+struct EBState
+{
+	int count;
+	int groundCount;                 // ground columns that reported u*
+	int sensible[EB_STATE_BINS];     // sum of H per cell footprint, 0.1 W m-2
+	int ustar[EB_STATE_BINS];        // sum of ground-column u*, 1e-4 m s-1
+	int height[EB_STATE_BINS];       // sum of z - d, 0.01 m
+};
+#else
 struct EBState
 {
 	int count;
 };
+#endif
 
 struct FluidCellMeta
 {
@@ -324,7 +340,7 @@ struct FluidParameters
     // FluidParameters in src/base/structs_cg.h.
     vec4 couplingSpacing; // xyz spacing, w terrain soil enabled
     vec4 heightProfile; // enabled, K/m lapse, reference height [m], vapor scale [m]
-    vec4 localExchange; // x enables local leaf/soil exchange, yzw reserved
+    vec4 localExchange; // x enables local leaf/soil exchange, yzw reserved (VoxelEB MOST: y on, z scene 1/L)
 };
 
 

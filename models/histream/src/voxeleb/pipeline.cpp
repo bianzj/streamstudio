@@ -44,17 +44,20 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelebIO> &modelio)
 
 
     std::string baseDirectory = modelio->definedDir;
+    // control.stabilityCorrection selects the Monin-Obukhov builds of the
+    // exchange shaders (-DVOXELEB_MOST); the neutral modules are unchanged.
+    const std::string most = modelio->stabilityCorrection ? "_most" : "";
     std::map<VoxelEBStage, std::string> VoxellstPaths{
             {VoxelEBStage::gap,         baseDirectory + "/shader/voxeleb/voxelrad_solar.comp.spv"},
             {VoxelEBStage::directVNIR,  baseDirectory + "/shader/voxeleb/voxelrad_direct_VNIR.comp.spv"},
             {VoxelEBStage::directTIR,   baseDirectory + "/shader/voxeleb/voxelrad_direct_TIR.comp.spv"},
             {VoxelEBStage::scatteringVNIR, baseDirectory + "/shader/voxeleb/voxelrad_scattering_VNIR.comp.spv"},
             {VoxelEBStage::diffuseTIR,  baseDirectory + "/shader/voxeleb/voxelrad_diffuse_TIR_single.comp.spv"},
-            {VoxelEBStage::budget,      baseDirectory + "/shader/voxeleb/budget.comp.spv"},
-            {VoxelEBStage::evapo,       baseDirectory + "/shader/voxeleb/evapo.comp.spv"},
+            {VoxelEBStage::budget,      baseDirectory + "/shader/voxeleb/budget" + most + ".comp.spv"},
+            {VoxelEBStage::evapo,       baseDirectory + "/shader/voxeleb/evapo" + most + ".comp.spv"},
             {VoxelEBStage::updateTp,    baseDirectory + "/shader/voxeleb/updateTp.comp.spv"},
             {VoxelEBStage::updateL,     baseDirectory + "/shader/voxeleb/updateL.comp.spv"},
-            {VoxelEBStage::aero,        baseDirectory + "/shader/voxeleb/aeresist.comp.spv"},
+            {VoxelEBStage::aero,        baseDirectory + "/shader/voxeleb/aeresist" + most + ".comp.spv"},
              {VoxelEBStage::bio,         baseDirectory + (modelio->vegetationTemperatureMethod == 0
                  ? "/shader/voxeleb/biochemical.comp.spv"
                  : "/shader/voxeleb/biochemical_m12.comp.spv")},

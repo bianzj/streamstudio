@@ -33,7 +33,7 @@
 - **反射率不再截断到 1**：RayTracing、VoxelRT、VoxelEB 成像，FacetRT 的 GPU/CPU 光谱输出和 FacetEB 状态输出只剔除 NaN/Inf 与负值。朝阳坡面、热点、白墙、水面镜面等 BRF > 1 的像元不再被压低；星下点常规场景数值不变。显示拉伸不受影响。
 - **RayTracing 散射深度**：新增独立参数 `control.raytracingDepth`（默认 16，范围 1–64），不再与 VoxelRT 的步数参数 `depth` 共用；第 3 次散射起按俄罗斯轮盘赌无偏终止（存活概率 = clamp(最大通量, 0.05, 1)）；周期边界穿越不再占用散射次数。原先实际截断在 4 阶，植被 842/860 nm 均值升高约 0.4%–1.5%，p99 升高 1.4%–5.7%，可见光基本不变。
 - **RayTracing 阴影射线**：首次命中即终止，起点偏移由 11 mm 降为 1 mm，近距离遮挡不再漏光。
-- **VoxelEB 地面自由对流**：土壤、水体、建筑表面温度高于气温时，并联加入 Kondo–Ishida/TSEB 自由对流导度 ≈ 0.0025·ΔT^(1/3) m/s。forest/urban 示例正午土壤显热由 7–14 W/m² 升到 30–66 W/m²，G/Rn 由 0.87–0.92 降到 0.76–0.84。完整 Monin–Obukhov 稳定度迭代仍未实现。
+- **VoxelEB 地面自由对流**：土壤、水体、建筑表面温度高于气温时，并联加入 Kondo–Ishida/TSEB 自由对流导度 ≈ 0.0025·ΔT^(1/3) m/s。forest/urban 示例正午土壤显热由 7–14 W/m² 升到 30–66 W/m²，G/Rn 由 0.87–0.92 降到 0.76–0.84。完整 Monin–Obukhov 稳定度迭代见下条（可选）。
 - **FacetEB 收敛判据更严**：在“残差 ≥ 2 W/m² 的面元 < 0.1%”之外，要求任一面元侧的温度等效残差 |R|/(dR/dT) ≤ 0.5 K。此前作物示例有节点在最大残差 43.8 W/m² 时被判为收敛，现在如实标为未收敛。
 - **天空盒关闭时的场景边缘**（RayTracing、VoxelRT、VoxelEB）：射出场景的样本不再被整体丢弃或按 0 计入，像元值按“场景覆盖率”加权平均；完全无覆盖的像元仍由主机端填天空值。街景透视示例内部像元不变，500–630 个边缘像元变亮（VoxelRT 边缘 860 nm 均值 0.053→0.246）。
 - **Facet 周期边界下的可见性分辨率**：投影窗口 x/y 收紧到中心块外接球（深度方向仍覆盖全部副本），GPU/CPU 后端一致。周期 8 的作物示例辐射度偏差由 +16% 降到约 +2%，反射率 > 1 的伪像元由 36 个降到 0；代价是可见性边数增加约 5 倍，周期 20 的城市 FacetEB 单节点 8.7 s → 11.8 s。
@@ -41,6 +41,7 @@
 - **VoxelRT/VoxelEB 叶倾角分布、G 与 Γ 自洽**：此前消光只用常数 G，叶片散射相函数固定为球形闭式，Kuusk 热点写死 G = 0.5，`LIDFa/LIDFb` 不参与计算；G ≠ 0.5 时单次散射被放大/缩小 0.5/G 倍。现在主机端由 `LIDFa/LIDFb`（SAIL 13 区间）求叶倾角频率传入 GPU，消光、太阳可见性、视线截获、直射投影和热点都用对应方向的 G(Ω)，Γ 按 SAIL `volscatt` 精确积分并满足 (1/π)∫Γ dΩ = (ρ+τ)G；植被接收体的漫射入射按 G(Ω) 加权。刚体/介质、`LIDFa = LIDFb = 0` 或超出定义域时回退为常数 G，Γ 按 G/0.5 归一；`LIDFa > 1` 为精确球形（G = 0.5，与修正前一致，相对差 ≤ 5e-7）。冻结算例（默认 −0.35/−0.15）：vrt_forest 842 nm 0.19240→0.19190（−0.3%）、668 nm +0.2%、亮温 +0.01 K；veb_forest 842 nm −0.13%，植被温度 −0.09 K、植被 Rn −0.9%；城市算例 ≤ 0.03%。平面型 LIDF (1, 0) 的森林 842 nm 比修正前（LIDF 被忽略）高 11.9%、668 nm 低 7%；G = 0.3 回退算例 842 nm −3.2%、668 nm +3.4%、亮温 +0.38 K（原热点式按 G = 0.5 计算，阳照背景被低估）。FacetRT/FacetEB/RayTracing 逐位不变。
 - **周期边界覆盖全部传输射线**（RayTracing、VoxelRT、VoxelEB）：此前只有相机/成像射线跨边界，阴影、天空、散射射线和体元太阳/漫射/散射/长波传输在边界处直接逃逸，边界条带缺少邻域遮挡与多次散射。现在所有射线按射线顺序遍历域副本（每个副本只在射线位于其中的区间查询一次，命中点直接落在中心域坐标），每段自由程最多穿越 `periodicTraversalCount` 次，不占散射次数；RayTracing 阴影射线每个副本内仍首次命中即终止；体元浊介质出射积分按周期环绕取表。高于场景顶且不下行的射线直接逃逸，相机射线从场景顶开始计数，高处相机不再把穿越次数耗在空域里。验证（森林 25 m 规则格网算例，周期 8）：边缘格与中心格的差异 VoxelRT 2.1% → ≤ 0.05%，VoxelEB 冠层净辐射 −14.8% → +0.01%、冠层温度 −2.4 K → 0.00 K，RayTracing 0.96% → ≤ 0.14%（噪声水平）。开周期的示例变化：森林（周期 8）VoxelRT 668 nm −4.3%、VoxelEB 475 nm −4.3%、RayTracing 842 nm +0.45%；城市（周期 20）VoxelRT 星下点 −0.8%、VZA 75° 斜视 +17%，VoxelEB 亮温 +0.2 K，RayTracing ≤ 0.12%。未开周期的工程：VoxelRT/VoxelEB/Facet 逐位不变；RayTracing 约 3% 像元因着色器重新编译后的舍入差使路径分叉而不同，图像均值相对差 ≤ 5e-5（p99 ≤ 2.3e-4）。
 - **中波红外计入太阳反射**（RayTracing、VoxelRT、VoxelEB）：此前 > 2.5 µm 的热红外波段只计 Planck 发射与天空长波，白天 3–5 µm 亮温偏低。现在 2.5–6 µm 波段在发射之外加入太阳直射与天空散射短波的反射，写法与光学分支相同（同一太阳可见性/热点，植被 Γ/G、固体 BRDF、水体 Cox–Munk；RayTracing 每个路径顶点的下一事件估计，VoxelRT 进入漫射场与多次散射，VoxelEB 成像单次散射）。光谱形状取内置 `defined/Esun_.dat` 2500–6000 nm 段除以其 400–2400 nm 积分（3.8 µm 处 0.0113 µm⁻¹，自然含 2.7/4.3 µm 吸收带，6.3 µm 水汽带处为 0）；绝对量 VoxelEB 用气象 Rin × 直射比例，RayTracing/VoxelRT 用 Haurwitz 晴空总辐照（θs = 30° 时 890 W m⁻²，3.8 µm 法向直射约 9.0 W m⁻² µm⁻¹）；天空散射按 Esky_/Esun_ 在 2.3–2.4 µm 的比值 0.0847 外推（上界）。共享代码 `shader/mwir_solar.glsl`。冻结算例 3.8 µm 白天亮温均值升高：rt_urban +3.76 K、vrt_urban +3.30 K（受光混凝土/土壤 p95 +6.6–7.3 K）、vrt_forest +2.67 K、veb_forest +2.37–2.50 K、veb_urban +3.45–3.53 K；场景平均等效反射率 ΔL/(E·cosθs/π) 森林 0.026–0.029、城市 0.038–0.043，与叶片 TIR 反射率 0.025、城市材料 0.05–0.08（含阴影）一致。同一运行中的 10.5 µm 波段、夜间节点（Rin = 0）的 3.8 µm 波段、全部 22 个旧算例（可见/近红外/长波）逐字节不变；耗时不变。VoxelEB 能量平衡不变（太阳能量已在短波 Rin 中）。FacetRT/FacetEB 尚未计入（见尚存问题）。
+- **VoxelEB Monin–Obukhov 稳定度迭代**（`control.stabilityCorrection`，与 FacetEB 共用开关）：此前 VoxelEB 的气动阻抗固定按中性层结（JSON 路径 L = 0，aeresist 从不更新 L）。开启后，能量平衡迭代中按场景平均显热（budget 定点整数累加，每地面面积）与地面柱平均 u*（aeresist 累加）松弛（0.5）更新一个场景 1/L，限幅 −5 ≤ (z−d)/L ≤ 1，相似函数移植自 FacetEB `energyphysics.h`（Paulson/线性）；1/L 每变化一次即重算全部气动阻抗（u*、惯性/粗糙子层、冠层内 K_h 与林下阻抗），节点退出另要求 |Δ(z/L)| ≤ 0.02 + 0.02|z/L|。开启时地面自由对流与 MOST 导度取大而非并联，避免重复计入浮力。关闭时使用与旧版逐字节相同的中性着色器（`aeresist/budget/evapo_most.comp.spv` 由 `-DVOXELEB_MOST` 单独编译），结果逐位不变。冻结算例（开/关）：正午 z/L 收敛到 −4.9（u = 0.43–0.50 m/s，u* 0.04–0.07 m/s），叶温下降 2.7–6.2 K（veb_forest 305.4 → 300.2 K，气温 299.7 K）、叶片 LE +33–69%；土壤 H 与 G/Rn 基本不变（forest 0.84/0.77，urban 0.81/0.77）；夜间（新增 `veb_forest_night`、`veb_urban_night`，01:50/02:20，初始地温 10 °C）z/L 收敛到 +1，u* 降至 0.007–0.04 m/s，土壤/叶片显热绝对值降约 3 倍；迭代 7–27 次、全部节点残差达标、1/L 单调收敛无振荡；耗时 −10% ~ +6%；重复运行逐位一致。`ENERGY_BALANCE` 日志行与 `energy_balance_node=*.json` 新增 1/L、z/L、u*、场景 H、阻抗重算次数，运行记录显示 z/L 与 u*。
 
 ### 性能（2026-11-22，不改物理）
 
@@ -58,6 +59,7 @@
 - VoxelRT 辐射求解方法默认“光谱批处理加速”（与传统方法均值相同，快 1.1–1.6×）。
 - FacetEB 温度松弛系数默认 0.8（原 0.5；作物/城市收敛所需迭代 16–19 → 9–12）。
 - 已有工程中显式保存的 `radiationSolver=traditional`、`temperatureRelaxation=0.5` 保持不变。
+- **新建 VoxelEB 工程默认开启大气稳定度修正**（`control.stabilityCorrection = true`，界面“RT–EB 耦合 → 大气稳定度”，VoxelEB 现在也显示该下拉框）；FacetEB 与其他模式新工程仍为中性。旧工程缺该字段按中性处理，显示与写出均以 `=== true` 判断；内置示例显式保存为 `false`，结果不变。
 - **新工程按“标准”运行质量档**（`control.qualityPreset = 'standard'`），与此前 schema 默认值不同的三项以标准档为准：VoxelRT 真实碰撞次数 2 → 3；VoxelEB 短波散射阶数 1 → 2；VoxelEB 体元射线步数上限 64 → 按场景对角线体元数 × 1.5 自动取值（16 的倍数，64–4096；默认 60×60×15 m / 1 m 场景为 144）。采样数 32、RayTracing 散射次数 16、FacetEB 耦合迭代 60 与原默认相同。标定见用户手册 13.2.1：VoxelEB 2 阶比 1 阶植被吸收误差 4% → 1%、耗时约 +50%。
 
 ### 运行质量档位与单次运行上限（2026-11-22）
@@ -96,6 +98,7 @@
 - 周期边界传输一致化后，开周期的工程边界条带变暗/变冷到与内部一致，整体均值随之变化（森林周期 8 约 −4%，城市斜视可达 +17%）。耗时（同机、预热后）：VoxelRT 周期 8 森林 6.4 → 7.6 s，VoxelEB 周期 8 森林 10.0 → 14.2 s、周期 20 城市 2.9 → 3.5 s；RayTracing 不变或略快（1.3 s）。未开周期的 VoxelEB 短波散射 pass 也慢了约 1/3（森林 9.9 → 12.0 s，结果逐位不变），原因未查明。`RayRTSetting` 新增 `sceneTop`（占用原对齐填充，仍为 80 字节），C++ 与 `settings.h` 需同时更新。
 - 工程新增 `control.raytracingDepth`（RayTracing 散射次数），旧工程缺省按 16 处理；`control.depth` 只对 VoxelRT 有意义（步数预算 ×128）。
 - 工程新增 `control.qualityPreset`（`fast`/`standard`/`high`/`custom`）与 `control.runTimeoutMinutes`。旧工程缺少这两项时按 `custom` 与 0（服务端默认上限）处理，已有参数不变；缺少 `voxelCollisionOrders`/`shortwaveScatteringOrders`/`radiationMaxSteps` 的旧工程仍按 2/1/64 运行，只有新工程才按标准档取 3/2/自动。旧版本打开新工程会忽略这两个字段。
+- VoxelEB 稳定度迭代：GPU `EBState` 由 4 字节扩为 1544 字节（地面柱计数与 3×128 个定点累加槽，`structs_cg.h` 与 `parameters.h` 的 `VOXELEB_MOST` 分支同步），`FluidParameters.localExchange` 的保留分量 y/z 用于稳定度开关与场景 1/L；新增 3 个 `*_most.comp.spv`（构建清单已登记）。旧 XML 工程中 `<Aerodynamics><L>` 在中性管线中照旧使用；开启稳定度修正时由迭代得到的场景 L 取代。
 - 新增环境变量：`HISTREAM_FACET_RASTER_SIZE`（Facet 可见性栅格边长，用于生成高分辨率参考解）、`STREAM_STUDIO_FACET_STEP_RESIDENT_FACETS`（常驻出图线程的面元数阈值，默认 3,000,000）、`STREAM_STUDIO_RESULT_CACHE_MB`（结果读取缓存上限，默认 512）、`STREAM_STUDIO_RESULT_CACHE_DEBUG=1`（服务端打印缓存命中日志）。
 - 回归测试工具 `tools/regression/`：从内置示例生成 13 个冻结算例，用两版引擎运行并对比；`compare.py --tolerance` 可作为“纯性能改动不得改变结果”的门禁。新增中波红外算例 `rt_urban_mwir`、`vrt_urban_mwir`、`vrt_forest_mwir`、`veb_forest_mwir`、`veb_urban_mwir`、`veb_urban_mwir_night`（波段 3800/10500 nm，输出亮温）。
 
@@ -111,6 +114,7 @@
 - 运行质量档位与单次运行上限：`tools/regression` 用基线引擎 `bin_v0` 对 `vrt_urban`、`veb_forest`、`feb_crop`、`rt_forest`（补充 `feb_urban`）各跑三档并以高精度为参考对比（标定表见用户手册 13.2.1）；网页模式（`STREAM_STUDIO_PORT=4199`，无头 Edge + CDP）实测：旧工程显示“自定义”且参数不变，三档切换后 `project.json` 写入对应参数，手动改采样数切为“自定义”，切换 FacetEB/RayTracing/VoxelRT 按档位写入新模式参数，修改体元大小时 VoxelEB 步数随之重算；工程上限设 1 分钟时预检返回 60 s（`timeoutSource=project`）与建议 10 分钟，选择“按当前上限运行”的 `veb_forest` 全天运行在 61 s 时被终止（`status=timeout`，“运行超过 1 分钟，已终止”），选择“调到建议值并运行”后工程写入 10 分钟并在 3 分 43 秒内完成。
 - 未验证：桌面（Electron）模式下的运行质量档位与上限流程。
 - 中波红外太阳反射：新增 6 个 MWIR 算例对比修正前引擎（`bin_periodic`），逐像元按 ΔL = B(T新) − B(T旧) 反推等效反射率与材质 TIR 反射率一致（数字见上）；10.5 µm 波段与夜间算例逐字节相同；22 个旧算例 86 个 TIFF 与 `periodic_final` 逐字节相同。未与 MODTRAN/DART 等外部模型对比。
+- VoxelEB 稳定度迭代：中性管线的 `aeresist/budget/evapo.comp.spv` 与修正前引擎（`bin_mwir`）逐字节相同；9 个 VoxelEB 算例（含新增 2 个夜间算例）关闭稳定度时 TIFF/诊断二进制与 `mwir_final` 逐字节相同；开启时逐算例对比能量项与迭代（数字见上），`veb_urban`、`veb_forest_night` 重复运行逐字节相同；`project-schema.js` 检查新建 VoxelEB 为 true、FacetEB/VoxelRT 为 false、旧工程缺字段为 false、XML 写出一致。未在界面中实测下拉框；未做 SCOPE 对比。
 
 ## 已做的检查（2026-11-16）
 

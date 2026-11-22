@@ -156,15 +156,23 @@ float localWindSpeed(uint sparseIndex)
 }
 
 // Effective aerodynamic resistance of a ground-type surface (soil, water,
-// building) including free convection. aeresist.comp provides only the
-// neutral, wind-driven resistance (L is never updated), which collapses
-// exchange at low wind and left sunlit soil with G/Rn ~ 0.9. Under unstable
-// conditions (surface warmer than air) the windless conductance of Kondo &
-// Ishida (1997), as used in TSEB (Kustas & Norman 1999), is added in
+// building) including free convection. With the neutral wind-driven
+// resistance (control.stabilityCorrection off) exchange collapses at low
+// wind and left sunlit soil with G/Rn ~ 0.9. Under unstable conditions
+// (surface warmer than air) the windless conductance of Kondo & Ishida
+// (1997), as used in TSEB (Kustas & Norman 1999), is then added in
 // parallel: g_free ~ 0.0025 (Ts - Ta)^(1/3) m/s. The form
 // 0.0025 x (x^2 + 1)^(-1/3) keeps that asymptote but has a finite slope at
 // x = 0, so the Newton update in budget.comp does not oscillate around
 // Ts = Ta. Stable or neutral cases and vegetation are unchanged.
+//
+// With the Monin-Obukhov correction on (the *_most.comp.spv pipelines,
+// compiled with -DVOXELEB_MOST), 1/raa already contains the buoyant
+// enhancement of the scene surface layer; adding g_free in parallel would
+// count buoyancy twice. The larger of the two conductances is used
+// instead: MOST governs forced/mixed convection, the free-convection floor
+// only takes over in the windless limit. The neutral pipelines keep the
+// pre-MOST code token for token (bit-identical results).
 bool groundFreeConvectionApplies(uint typeId)
 {
     return typeId == TYPE_SOIL || typeId == TYPE_WATER || typeId == TYPE_BUILDING;
@@ -187,6 +195,60 @@ float groundFreeConductanceExtraSlope(float excess)
     return x * dg;
 }
 
+#ifdef VOXELEB_MOST
+// y lane: MOST active for this node (cleared when the scene has no ground
+// column to define a surface layer); z lane: scene 1/L [m-1].
+bool stabilityCorrectionEnabled()
+{
+    return fluidParameters.localExchange.y > 0.5;
+}
+
+float groundExchangeRaa(float raa, float surfaceTemperatureK,
+                        float airTemperatureC, uint typeId)
+{
+    raa = max(raa, 1.0);
+    if (!groundFreeConvectionApplies(typeId)) return raa;
+    float excess = surfaceTemperatureK - 273.15 - airTemperatureC;
+    if (!(excess > 0.0)) return raa;
+    if (stabilityCorrectionEnabled())
+        return 1.0 / max(1.0 / raa, groundFreeConductance(excess));
+    return 1.0 / (1.0 / raa + groundFreeConductance(excess));
+}
+
+// Extra Newton slope of the free-convection branch actually in use.
+float groundFreeExchangeExtraSlope(float raa, float surfaceTemperatureK,
+                                   float airTemperatureC)
+{
+    float excess = surfaceTemperatureK - 273.15 - airTemperatureC;
+    if (stabilityCorrectionEnabled() &&
+        !(groundFreeConductance(excess) > 1.0 / max(raa, 1.0))) return 0.0;
+    return groundFreeConductanceExtraSlope(excess);
+}
+
+// Monin-Obukhov similarity functions, the GLSL port of
+// src/facetrt/energyphysics.h (Paulson unstable / linear stable, valid
+// for -5 <= zeta = z/L <= 1).
+float mostPsiM(float zeta)
+{
+    zeta = clamp(zeta, -5.0, 1.0);
+    if (zeta >= 0.0) return -5.0 * zeta;
+    float x = pow(1.0 - 16.0 * zeta, 0.25);
+    return 2.0 * log((1.0 + x) / 2.0) + log((1.0 + x * x) / 2.0)
+        - 2.0 * atan(x) + 1.5707963267948966;
+}
+
+float mostPsiH(float zeta)
+{
+    zeta = clamp(zeta, -5.0, 1.0);
+    return zeta >= 0.0 ? -5.0 * zeta : 2.0 * log((1.0 + sqrt(1.0 - 16.0 * zeta)) / 2.0);
+}
+
+float mostPhiH(float zeta)
+{
+    zeta = clamp(zeta, -5.0, 1.0);
+    return zeta >= 0.0 ? 1.0 + 5.0 * zeta : 1.0 / sqrt(1.0 - 16.0 * zeta);
+}
+#else
 float groundExchangeRaa(float raa, float surfaceTemperatureK,
                         float airTemperatureC, uint typeId)
 {
@@ -196,5 +258,6 @@ float groundExchangeRaa(float raa, float surfaceTemperatureK,
     if (!(excess > 0.0)) return raa;
     return 1.0 / (1.0 / raa + groundFreeConductance(excess));
 }
+#endif
 
 #endif

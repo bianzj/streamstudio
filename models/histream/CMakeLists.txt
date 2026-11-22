@@ -281,6 +281,29 @@ foreach (VOXELEB_SHADER_SOURCE IN LISTS HISTREAM_VOXELEB_SHADER_FILES)
                     "${CMAKE_CURRENT_SOURCE_DIR}/shader/voxeleb/fluid_coupling.glsl"
             VERBATIM)
     list(APPEND HISTREAM_VOXELEB_SHADER_OUTPUTS "${VOXELEB_SHADER_OUTPUT}")
+    # Monin-Obukhov variants (control.stabilityCorrection): the same source
+    # compiled with -DVOXELEB_MOST, so the neutral modules stay unchanged.
+    if (VOXELEB_SHADER_FILE MATCHES "^(aeresist|budget|evapo)\\.comp$")
+        string(REPLACE ".comp" "_most.comp.spv" VOXELEB_MOST_OUTPUT_NAME "${VOXELEB_SHADER_FILE}")
+        set(VOXELEB_MOST_OUTPUT "${HISTREAM_VOXELEB_SHADER_BINARY_DIR}/${VOXELEB_MOST_OUTPUT_NAME}")
+        add_custom_command(
+                OUTPUT "${VOXELEB_MOST_OUTPUT}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory
+                        "${HISTREAM_VOXELEB_SHADER_BINARY_DIR}"
+                COMMAND "${HISTREAM_GLSLC}" --target-env=vulkan1.2 -DVOXELEB_MOST=1
+                        "${VOXELEB_SHADER_SOURCE}"
+                        -o "${VOXELEB_MOST_OUTPUT}"
+                DEPENDS "${VOXELEB_SHADER_SOURCE}"
+                        ${HISTREAM_SHARED_SHADER_DEPENDENCIES}
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/parameters.h"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/bindingLayout.h"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/settings.h"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/global.glsl"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/functions.glsl"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/voxeleb/fluid_coupling.glsl"
+                VERBATIM)
+        list(APPEND HISTREAM_VOXELEB_SHADER_OUTPUTS "${VOXELEB_MOST_OUTPUT}")
+    endif()
 endforeach()
 add_custom_target(histream_voxeleb_shaders ALL
         DEPENDS ${HISTREAM_VOXELEB_SHADER_OUTPUTS})

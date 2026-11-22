@@ -127,6 +127,18 @@ VoxelebIO(){
     int energyIterations{0};
     uint32_t energyFinalUnconvergedStateCount{0};
     bool energyFinalized{false};
+    // Monin-Obukhov stability iteration (control.stabilityCorrection) and
+    // its per-node diagnostics: scene 1/L [m-1], ground-column mean u*
+    // [m/s] and z-d [m], scene sensible heat per ground area [W/m2],
+    // number of aerodynamic evaluations and the last |delta(z/L)|.
+    bool stabilityCorrection{false};
+    bool stabilityAvailable{false};
+    double inverseObukhov{0.0};
+    double frictionVelocity{0.0};
+    double stabilityHeight{0.0};
+    double stabilitySensibleHeat{0.0};
+    int stabilityAeroUpdates{0};
+    double stabilityChange{0.0};
     std::shared_ptr<nvvk::Buffer> m_pScatteringStats;
     FluidXml fluid;
     glm::ivec3 fluidGridSize{1, 1, 1};

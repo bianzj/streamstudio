@@ -601,7 +601,9 @@ export function createDefaultProject(options = {}) {
         // in 9-12 coupling iterations at 0.8 versus 16-19 at the former 0.5;
         // 1.0 is faster still but takes multi-kelvin steps on dense canopies.
         couplingIterations: options.mode === 'eFacetEB' ? 60 : 20, temperatureTolerance: 0.05, temperatureRelaxation: 0.8,
-        stabilityCorrection: false,
+        // 新建 VoxelEB 工程默认开启 Monin–Obukhov 稳定度迭代（回归：收敛稳定、耗时 +0–10%）；
+        // FacetEB 仍默认中性。旧工程缺字段按 false（中性）处理，见 normalizeProject。
+        stabilityCorrection: options.mode === 'eVoxelEB',
         soilTemperatureMethod: 2,
         vegetationTemperatureMethod: 0
       },

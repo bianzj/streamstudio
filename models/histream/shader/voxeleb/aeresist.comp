@@ -30,6 +30,34 @@
 
 layout(local_size_x = GROUP_SIZEX) in;
 
+#ifdef VOXELEB_MOST
+// aeresist_most.comp.spv (compiled with -DVOXELEB_MOST, control.stabilityCorrection).
+// Stability functions: mostPsiM/mostPsiH/mostPhiH in fluid_coupling.glsl
+// (port of src/facetrt/energyphysics.h). The scene inverse Obukhov length
+// comes from the MOST iteration in command.cpp (control.stabilityCorrection);
+// otherwise a legacy XML <L> with |L| < 500 m is honoured, else neutral.
+float sceneInverseObukhov(float legacyL)
+{
+    if (stabilityCorrectionEnabled()) return fluidParameters.localExchange.z;
+    return (legacyL != 0.0 && abs(legacyL) < 500.0) ? 1.0 / legacyL : 0.0;
+}
+
+// Ground-column statistics for the scene 1/L update (fixed point).
+void reportGroundColumn(uint bufferId, float ustar, float effectiveHeight)
+{
+    if (!stabilityCorrectionEnabled()) return;
+    if (isnan(ustar) || isinf(ustar) || isnan(effectiveHeight) || isinf(effectiveHeight)) return;
+    uint bin = bufferId & uint(EB_STATE_BINS - 1);
+    atomicAdd(ebState.groundCount, 1, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+    atomicAdd(ebState.ustar[bin], int(round(1.0e4 * clamp(ustar, 0.0, 20.0))),
+              gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+    atomicAdd(ebState.height[bin], int(round(100.0 * clamp(effectiveHeight, 0.0, 2000.0))),
+              gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+}
+
+#else
+// Neutral pipeline: kept token-identical to the pre-MOST shader so that runs
+// without stability correction reproduce earlier results bit for bit.
 // The integrated stability correction to eddy diffusivity 
 // for momentum at height zr - d
 float psim(float z,float L)
@@ -95,6 +123,8 @@ float phstar(float z,float zr,float d,float L)
     return phs;
 }
 
+
+#endif
 
 // from 2D to 1D 
 
@@ -196,7 +226,11 @@ void main()
 
 
         aerotype = aeroConds[aeroId].type;
+#ifdef VOXELEB_MOST
+        float invL = sceneInverseObukhov(aeroConds[aeroId].L);
+#else
         L = aeroConds[aeroId].L;
+#endif
         canopy = canopies[canopyId];
         // A positive aerodynamic entry overrides the canopy; otherwise use the
         // canopy's own height, LAI and leaf width (zero LAI would create an
@@ -281,10 +315,16 @@ void main()
             d = hcmax * 2.0 / 3.0;
             z0m = max(hcmax / 10.0, 0.01);
             zr = hcmax * 2.0;
+#ifdef VOXELEB_MOST
+            pm_z = mostPsiM((z - d) * invL) - mostPsiM(z0m * invL);
+            ph_z = mostPsiH((z - d) * invL);
+            ph_zr = mostPsiH(z0m * invL);
+#else
             pm_z = psim(z-d,L);
             ph_z = psih(z-d,L);
             ph_zr = psih(zr-d,L);
             if(z < zr) ph_zr = ph_z; /// attention !!!
+#endif
             float logz = log((z - d) / z0m);
             // friction wind speed
             ustar = max(0.001, kappa*u / (logz - pm_z));
@@ -295,6 +335,10 @@ void main()
                 ustar = max(0.001, kappa * u / logz);
                 raa = max(1.0, logz / (kappa * ustar));
             }
+#ifdef VOXELEB_MOST
+            if(typeId == TYPE_SOIL || typeId == TYPE_WATER)
+                reportGroundColumn(bufferId0, ustar, z - d);
+#endif
 
             aeroConds[aeroId].ustar = ustar;
             voxelRaas[bufferId0].raa = raa;
@@ -323,6 +367,18 @@ void main()
             z0m = 0.01;                 // roughtness length for momentum for the soil
             zr = 0.01;                  // top of roughness sublayer
             // stability correction functions, friction velocity and Kh=Km=Kv
+#ifdef VOXELEB_MOST
+            pm_z = mostPsiM((z - d) * invL) - mostPsiM(z0m * invL);
+            ph_z = mostPsiH((z - d) * invL);
+            ph_zr = mostPsiH(z0m * invL);
+            //--------------------------
+            // Point: Friction velocity   
+            //--------------------------
+            ustar = max(0.001, kappa * u / max(log((z-d)/z0m) - pm_z, 0.1));
+            aeroConds[aeroId].ustar = ustar;
+            if(typeId == TYPE_SOIL || typeId == TYPE_WATER)
+                reportGroundColumn(bufferId0, ustar, z - d);
+#else
             pm_z = psim(z - d, L);
             ph_z = psih(z - d, L);
             ph_zr = phstar(zr, zr, d, L);
@@ -333,6 +389,7 @@ void main()
             //surfLs[surf1DId].ustar = ustar;
             // aerodynamic resistance
             aeroConds[aeroId].ustar = ustar;
+#endif
             raa = (1.0 / (kappa * ustar)*(log((z-d)/z0m)-ph_z + ph_zr));
             if(isnan(raa) || isinf(raa) || raa < 1.0) raa = 50;
             voxelRaas[bufferId0].raa = raa;
@@ -351,6 +408,41 @@ void main()
             g1 = max(3.3, sqrt(CSSOIL + CD * laimax /2.0));
             d = hcmax*(1 - (1 - exp(-sq))/sq);
             z0m = (hcmax - d) * exp(-kappa * g1 + PSICOR);
+#ifdef VOXELEB_MOST
+           // stability correction functions, friction velocity and Kh=Km=Kv
+            pm_z = mostPsiM((z - d) * invL) - mostPsiM(z0m * invL);
+            ph_z = mostPsiH((z - d) * invL);
+            pm_h = mostPsiM((hcmax - d) * invL) - mostPsiM(z0m * invL);
+            ph_zr = mostPsiH((zr - d) * invL);
+            if(z < zr) ph_zr = ph_z; /// attention !!! 
+            // Roughness-sublayer heat correction: mean phi_H over [h, min(z, zr)]
+            // (8-point midpoint rule, as FacetEB energyphysics.h).
+            float top = min(z, zr);
+            float roughnessPhi = 0.0;
+            for (int k = 0; k < 8; ++k)
+                roughnessPhi += mostPhiH((hcmax + (top - hcmax) * (float(k) + 0.5) / 8.0 - d) * invL) / 8.0;
+            // friction wind speed
+            ustar = max(0.001, kappa*u / max(log((z - d) / z0m) - pm_z, 0.1));
+            aeroConds[aeroId].ustar = ustar;
+            if(typeId == TYPE_SOIL || typeId == TYPE_WATER)
+                reportGroundColumn(bufferId0, ustar, z - d);
+            // initial and roughness layers; the stability factor of the
+            // roughness sublayer belongs inside 1/(kappa u*).
+            if (z > zr)
+            {
+                rai = (1.0 / (kappa*ustar)*(log((z - d) / (zr - d)) - ph_z + ph_zr));
+                rar = 1.0 / (kappa*ustar)*((zr - hcmax) / (zr - d) * roughnessPhi);
+            }
+            else
+            {
+                rai = 0;
+                rar = 1.0 / (kappa*ustar)*((z - hcmax) / (z - d) * roughnessPhi);
+            }
+            kh0 = kappa*ustar*(zr - d);    //Diffusivity for heat
+            // Stability-corrected canopy-top diffusivity (FacetEB form).
+            kh = kh0 / mostPhiH((hcmax - d) * invL);
+#define CANOPY_KH kh
+#else
            // stability correction functions, friction velocity and Kh=Km=Kv
             pm_z = psim(z-d,L);
             ph_z = psih(z-d,L);
@@ -383,11 +475,13 @@ void main()
             if (L < 0 && L > -500) kh = kappa*ustar*(zr - d) * sqrt(1 - 16 * (hcmax - d) / L);
             // stable correction 
             if (L > 0 && L < 500) kh = kappa*ustar*(zr - d) / (1 + 5 * (hcmax - d) / L);
+#define CANOPY_KH kh0
+#endif
             //  wind speed at height h and z0m
             uh = max(ustar / kappa*(log((hcmax - d) / z0m) - pm_h), 0.01);  
             uz0 = uh*exp(n*((z0m + d) / hcmax - 1));               
             // aerodynamic resistance within the mixed canopy
-            rac = hcmax*sinh(n) / (n*kh0);
+            rac = hcmax*sinh(n) / (n*CANOPY_KH);
             rac = rac *(log((exp(n) - 1) / (exp(n) + 1)) - 
                 log((exp(n*(z0m + d) / hcmax) - 1) / (exp(n*(z0m + d) / hcmax) + 1)));     
             rbc = 70 / laimax *sqrt(leafwidth/uz0);
@@ -413,7 +507,7 @@ void main()
             {
                 // for soil under overstory vegetation 
                 y2 = 0.01;
-                rwcs = hcmax*sinh(n) / (n*kh0) * 
+                rwcs = hcmax*sinh(n) / (n*CANOPY_KH) * 
                         (log((exp(n*(y1) / hcmax) - 1) / (exp(n*(y1) / hcmax) + 1)) -
                         log((exp(n*(y2) / hcmax) - 1) / (exp(n*(y2) / hcmax) + 1))); 
                 // SCOPE: the canopy-scale resistance is shared by LAI leaf
@@ -472,7 +566,7 @@ void main()
                 dtemp= max(hctemp*(1 - (1 - exp(-sqtemp)) / sqtemp),0.01);   //
                 z0mtemp = max((hctemp - dtemp)*exp(-kappa*g1temp + PSICOR),0.01); //
                 y2 = dtemp + z0mtemp;
-                rwcs = hcmax*sinh(n) / (n*kh0) * 
+                rwcs = hcmax*sinh(n) / (n*CANOPY_KH) * 
                     (log((exp(n*(y1) / hcmax) - 1) / (exp(n*(y1) / hcmax) + 1)) -
                     log((exp(n*(y2) / hcmax) - 1) / (exp(n*(y2) / hcmax) + 1))); 
                 

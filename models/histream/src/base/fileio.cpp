@@ -1172,6 +1172,10 @@ SettingXml FileIO::readSettingXML(TiXmlNode *controlNode, Mode mode){
         settingxml.spectralAccelerationWidth = std::clamp(
             stoi(controlNode->FirstChildElement("spectralAccelerationWidth")->GetText()), 1, 1000);
     }
+    if (sonExists("stabilityCorrection", controlNode->ToElement())) {
+        const char* text = controlNode->FirstChildElement("stabilityCorrection")->GetText();
+        settingxml.stabilityCorrection = text != nullptr && std::atof(text) > 0.5;
+    }
     if (sonExists("vegetationTemperatureMethod", controlNode->ToElement())) {
         settingxml.vegetationTemperatureMethod = std::clamp(
             stoi(controlNode->FirstChildElement("vegetationTemperatureMethod")->GetText()), 0, 1);

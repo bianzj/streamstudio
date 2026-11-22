@@ -211,6 +211,8 @@ void configureCommon(FileIO& io, const ProjectJson& project, Mode mode) {
     settings.spectralAccelerationWidth = std::clamp(
         ProjectJson::integer(control, "spectralAccelerationWidth", 100), 1, 1000);
     settings.vegetationTemperatureMethod = std::clamp(ProjectJson::integer(control, "vegetationTemperatureMethod", 0), 0, 1);
+    // Missing field = neutral (same compatibility rule as FacetEB).
+    settings.stabilityCorrection = ProjectJson::boolean(control, "stabilityCorrection", false);
     settings.shortwaveScatteringOrders = ProjectJson::integer(control, "shortwaveScatteringOrders", 1);
     if (settings.shortwaveScatteringOrders < 1 || settings.shortwaveScatteringOrders > 3)
         throw std::runtime_error("control.shortwaveScatteringOrders must be 1, 2 or 3");
@@ -650,6 +652,8 @@ bool FileIO::readJson(const std::string& path, Mode mode) {
         };
         m_meteoXml = m_pVoxelebXml->meteoxml;
         // Zero height/leaf width: aeresist uses each canopy's own parameters.
+        // L=0 is the neutral default; control.stabilityCorrection replaces it
+        // by the scene 1/L of the Monin-Obukhov iteration (command.cpp).
         m_pVoxelebXml->aerocondxml = {AeroType::ONE,{0,0,.3f,0,1,0,0,0},"",1000};
     }
     return true;

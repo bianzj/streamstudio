@@ -164,6 +164,13 @@ bool Voxeleb::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
         fileio->m_pVoxelebXml->settingxml.shortwaveScatteringOrders;
     modelio->setting.maxStep = fileio->m_pVoxelebXml->settingxml.radiationMaxSteps;
     modelio->fluid = fileio->m_pVoxelebXml->fluidxml;
+    // The local-exchange closure replaces the surface-layer profile by a
+    // local-wind bulk formula, so it has no scene surface layer to correct.
+    modelio->stabilityCorrection = fileio->m_pVoxelebXml->settingxml.stabilityCorrection;
+    if (modelio->stabilityCorrection && modelio->fluid.localExchange) {
+        std::cout << "STABILITY_CORRECTION\tdisabled\treason=fluid.localExchange uses a local-wind bulk closure" << std::endl;
+        modelio->stabilityCorrection = false;
+    }
     modelio->terrainEnvironment = fileio->m_pVoxelebXml->scenexml.background.terrainEnvironment;
 
     return true;
@@ -959,6 +966,19 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
             << ",\"temperatureIterations\":" << modelio->energyIterations
             << ",\"budgetResidualToleranceWm2\":2"
             << ",\"budgetStatesOutsideTolerance\":" << modelio->energyFinalUnconvergedStateCount
+            << ",\"stabilityCorrection\":" << (modelio->stabilityCorrection ? "true" : "false");
+        if (modelio->stabilityCorrection) {
+            balanceDiagnostic << ",\"stability\":{\"available\":" << (modelio->stabilityAvailable ? "true" : "false")
+                << ",\"inverseObukhovLength\":" << modelio->inverseObukhov
+                << ",\"zOverL\":" << modelio->inverseObukhov * modelio->stabilityHeight
+                << ",\"effectiveHeight\":" << modelio->stabilityHeight
+                << ",\"frictionVelocity\":" << modelio->frictionVelocity
+                << ",\"sceneSensibleHeat\":" << modelio->stabilitySensibleHeat
+                << ",\"aerodynamicUpdates\":" << modelio->stabilityAeroUpdates
+                << ",\"lastZOverLChange\":" << modelio->stabilityChange
+                << ",\"basis\":\"scene 1/L from domain-mean H (per ground area) and ground-column mean u*; Paulson/linear MOST, -5<=z/L<=1\"}";
+        }
+        balanceDiagnostic
             << ",\"budgetResidualWithinTolerance\":"
             << (modelio->energyFinalized && modelio->energyFinalUnconvergedStateCount == 0 ? "true" : "false")
             << ",\"budgetStateCountBasis\":\"sunlit/shaded conditional states; water uses the shared mixed-state residual; not voxel count\""
@@ -987,8 +1007,19 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
         std::cout << "ENERGY_BALANCE\tnode=" << modelio->k_node
             << "\titerations=" << modelio->energyIterations
             << "\tfinalStateRefreshed=" << modelio->energyFinalized
-            << "\tstatesOutsideTolerance=" << modelio->energyFinalUnconvergedStateCount
-            << "\tdiagnostics=" << path.string() << std::endl;
+            << "\tstatesOutsideTolerance=" << modelio->energyFinalUnconvergedStateCount;
+        if (modelio->stabilityCorrection) {
+            std::cout << "\tstability=" << (modelio->stabilityAvailable ? "most" : "unavailable")
+                << "\tinverseObukhov=" << modelio->inverseObukhov
+                << "\tzOverL=" << modelio->inverseObukhov * modelio->stabilityHeight
+                << "\tustar=" << modelio->frictionVelocity
+                << "\tsceneH=" << modelio->stabilitySensibleHeat
+                << "\taeroUpdates=" << modelio->stabilityAeroUpdates
+                << "\tstabilityChange=" << modelio->stabilityChange;
+        } else {
+            std::cout << "\tstability=neutral";
+        }
+        std::cout << "\tdiagnostics=" << path.string() << std::endl;
     }
 
     if (!modelio->isRadiationProcess && !modelio->isEnergyProcess) return;

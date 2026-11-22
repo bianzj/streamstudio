@@ -384,10 +384,17 @@ struct TLAST
     float shaded;   // shaded temperature
 };
 
+// Layout must match EBState in shader/parameters.h (MOST fixed-point sums).
+constexpr int kEnergyStateBins = 128;
 struct EBState
 {
     uint32_t count;
+    int32_t groundCount;
+    int32_t sensible[kEnergyStateBins]; // 0.1 W m-2 per cell footprint
+    int32_t ustar[kEnergyStateBins];    // 1e-4 m s-1
+    int32_t height[kEnergyStateBins];   // 0.01 m
 };
+static_assert(sizeof(EBState) == 8 + 3 * 4 * kEnergyStateBins);
 
 struct alignas(16) FluidCellMeta
 {
@@ -406,7 +413,10 @@ struct alignas(16) FluidParameters
     glm::vec4 sources{0.02f, 0.12f, 30.0f, 1.0f}; // smoke, lattice cap, speed cap, velocity scale
     glm::vec4 couplingSpacing{1.0f, 1.0f, 1.0f, 0.0f}; // xyz spacing, w terrain soil enabled
     glm::vec4 heightProfile{0.0f, 0.0065f, 2.0f, 2000.0f}; // enabled, lapse, reference height, vapor scale
-    glm::vec4 localExchange{0.0f}; // x enables local leaf/soil exchange, yzw reserved
+    // x enables local leaf/soil exchange; y enables VoxelEB MOST stability
+    // correction (control.stabilityCorrection); z is the current scene 1/L
+    // [m-1] used by aeresist.comp; w reserved.
+    glm::vec4 localExchange{0.0f};
 };
 static_assert(sizeof(FluidParameters) == 128);
 static_assert(offsetof(FluidParameters, heightProfile) == 96);

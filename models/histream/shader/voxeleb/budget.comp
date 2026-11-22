@@ -213,10 +213,17 @@ void main()
     float sensibleDerivativeSunlit = (RHOA * CP) / raaSunlit;
     float sensibleDerivativeShaded = (RHOA * CP) / raaShaded;
     if (groundFreeConvectionApplies(typeId)) {
+#ifdef VOXELEB_MOST
+        sensibleDerivativeSunlit += RHOA * CP *
+            groundFreeExchangeExtraSlope(raa, TsunlitOld, Ta);
+        sensibleDerivativeShaded += RHOA * CP *
+            groundFreeExchangeExtraSlope(raa, TshadedOld, Ta);
+#else
         sensibleDerivativeSunlit += RHOA * CP *
             groundFreeConductanceExtraSlope(TsunlitOld - 273.15 - Ta);
         sensibleDerivativeShaded += RHOA * CP *
             groundFreeConductanceExtraSlope(TshadedOld - 273.15 - Ta);
+#endif
     }
     float latentDerivativeSunlit = RHOA * lambdas_sunlit * e_to_q *
         max(s_sunlit, 0.0) / max(raaSunlit + max(rss_sunlit, 0.0), 1.0);
@@ -341,6 +348,28 @@ void main()
                     abs(diffSunlitRad) > RAD_THRESHOLD) +
                 int(isnan(diffShadedRad) || isinf(diffShadedRad) ||
                     abs(diffShadedRad) > RAD_THRESHOLD);
+
+    // Scene sensible-heat flux for the Monin-Obukhov update (command.cpp):
+    // the exchange fluxes of this pass, expressed per cell footprint
+    // (scale^2) and summed in fixed point. Leaves: 2 faces x LAD x scale^3
+    // of leaf area; solid/water states: one scale^2 surface element.
+#ifdef VOXELEB_MOST
+    if (stabilityCorrectionEnabled() && setting.energyFinalize == 0)
+    {
+        float sunlitFraction = clamp(voxelDirs[bufferId].solar, 0.0, 1.0);
+        float sensible = mix(voxelHeatFlux[bufferId].Hshaded,
+                             voxelHeatFlux[bufferId].Hsunlit, sunlitFraction);
+        if (typeId == TYPE_VEGETATION)
+            sensible *= 2.0 * ResolveTurbidDensity(int(bufferId), canopyId,
+                voxelLinks[bufferId].voxelId, voxelRes) * setting.scale;
+        if (!(isnan(sensible) || isinf(sensible)))
+        {
+            int fixedSensible = int(round(10.0 * clamp(sensible, -20000.0, 20000.0)));
+            atomicAdd(ebState.sensible[bufferId & uint(EB_STATE_BINS - 1)], fixedSensible,
+                      gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+        }
+    }
+#endif
 
     if(setting.energyFinalize != 0)
     {

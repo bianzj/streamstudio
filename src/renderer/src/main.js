@@ -2534,10 +2534,14 @@ function renderInspector() {
     const couplingGeometry = state.mode === 'eFacetEB' ? '面元' : state.mode === 'eVoxelEB' ? '体元' : ''
     const spectralAcceleration = field('光谱加速宽度', inputUnit('spectralAccelerationWidth', c.control.spectralAccelerationWidth ?? 100, 'nm', 'type="number" min="1" max="1000" step="1"'))
     const couplingNotice = state.mode === 'eVoxelEB'
-      ? '默认100 nm。直射逐波段积分，漫射与多次散射按窗口内辐照度加权的平均光学属性求解。温度迭代由引擎自动控制（最多 50 次，逐步减小步长），收敛判据为全部体元能量残差 < 2 W/m²。'
+      ? '默认100 nm。直射逐波段积分，漫射与多次散射按窗口内辐照度加权的平均光学属性求解。温度迭代由引擎自动控制（最多 50 次，逐步减小步长），收敛判据为全部体元能量残差 < 2 W/m²。大气稳定度选 Monin–Obukhov 时，按场景显热与地面柱 u* 在迭代中更新 Obukhov 长度（-5 ≤ z/L ≤ 1）并重算气动阻抗，同时要求 z/L 收敛；中性大气与旧版逐位一致。'
       : '默认100 nm。短波净辐射按窗口分别积分直射和漫射，并使用窗口加权光学属性求解后累加；最终影像对传感器选定波段逐个独立求解，不进行输出波段插值。收敛判据：能量残差 ≥ 2 W/m² 的面元 < 0.1%，且任一面元的温度等效残差 ≤ 0.5 K；未收敛节点会在运行质量中标出。'
-    const facetCouplingControls = state.mode === 'eFacetEB'
-      ? `${field('大气稳定度', `<select class="select" id="stabilityCorrection"><option value="1" ${c.control.stabilityCorrection === true ? 'selected' : ''}>Monin–Obukhov 修正</option><option value="0" ${c.control.stabilityCorrection !== true ? 'selected' : ''}>中性大气（兼容默认）</option></select>`)}${field('最大耦合迭代', `<input class="input" id="couplingIterations" type="number" min="1" max="100" value="${escapeHtml(c.control.couplingIterations)}">`)}${field('温度松弛系数', `<input class="input" id="temperatureRelaxation" type="number" min="0.05" max="1" step="0.05" value="${escapeHtml(c.control.temperatureRelaxation)}">`)}`
+    // FacetEB 与 VoxelEB 共用 control.stabilityCorrection；字段缺失 = 中性（旧工程兼容）。
+    const stabilityControl = field('大气稳定度', `<select class="select" id="stabilityCorrection"><option value="1" ${c.control.stabilityCorrection === true ? 'selected' : ''}>Monin–Obukhov 修正</option><option value="0" ${c.control.stabilityCorrection !== true ? 'selected' : ''}>中性大气（旧工程兼容）</option></select>`)
+    const facetCouplingControls = state.mode === 'eVoxelEB'
+      ? stabilityControl
+      : state.mode === 'eFacetEB'
+      ? `${stabilityControl}${field('最大耦合迭代', `<input class="input" id="couplingIterations" type="number" min="1" max="100" value="${escapeHtml(c.control.couplingIterations)}">`)}${field('温度松弛系数', `<input class="input" id="temperatureRelaxation" type="number" min="0.05" max="1" step="0.05" value="${escapeHtml(c.control.temperatureRelaxation)}">`)}`
       : ''
     const coupling = couplingGeometry ? `<div class="property-group"><h3>${couplingGeometry} RT–EB 耦合</h3>${spectralAcceleration}${facetCouplingControls}<div class="notice">${couplingNotice}场景几何和${couplingGeometry}辐射结构只初始化一次。${state.mode === 'eFacetEB' ? '松弛系数默认 0.8；出现振荡（运行质量中迭代用满）时再调小。' : ''}</div></div>` : ''
     const temperatureMethods = energyBalanceOutput ? `<div class="property-group"><h3>温度模拟方法</h3>${field('土壤温度', `<select class="select" id="soilTemperatureMethod"><option value="0" ${c.control.soilTemperatureMethod === 0 ? 'selected' : ''}>0 · 瞬时能量平衡</option><option value="1" ${c.control.soilTemperatureMethod === 1 ? 'selected' : ''}>1 · 热惯性动态模型</option><option value="2" ${c.control.soilTemperatureMethod === 2 ? 'selected' : ''}>2 · 温度廓线传导模型（默认）</option></select>`)}${field('植被温度', `<select class="select" id="vegetationTemperatureMethod"><option value="0" ${c.control.vegetationTemperatureMethod === 0 ? 'selected' : ''}>经验法 · Ball–Berry</option><option value="1" ${c.control.vegetationTemperatureMethod === 1 ? 'selected' : ''}>机制法 · Farquhar</option></select>`)}<div class="notice">初始温度只作为求解初值；能量平衡各时刻均由所选方法动态更新。土壤方法会同步应用到全部土壤物化属性。</div></div>` : ''
@@ -5414,8 +5418,11 @@ function recordRunQualityLine(line) {
   match = line.match(/^ENERGY_BALANCE\s+node=(\d+)\s+iterations=(\d+).*?statesOutsideTolerance=(\d+)/)
   if (match) {
     const item = { node: Number(match[1]), iterations: Number(match[2]), outside: Number(match[3]) }
+    // VoxelEB Monin–Obukhov 诊断（control.stabilityCorrection 开启时才有）。
+    const stability = line.match(/\sstability=most\b.*?\szOverL=(\S+)\s+ustar=(\S+)\s+sceneH=(\S+)\s+aeroUpdates=(\d+)/)
+    if (stability) Object.assign(item, { zOverL: Number(stability[1]), ustar: Number(stability[2]), sensibleHeat: Number(stability[3]), aeroUpdates: Number(stability[4]) })
     quality.voxel.push(item)
-    return `能量平衡 · 节点 ${item.node + 1} · 迭代 ${item.iterations}${item.outside ? ` · ${item.outside} 个状态未达容差` : ' · 已收敛'}`
+    return `能量平衡 · 节点 ${item.node + 1} · 迭代 ${item.iterations}${item.outside ? ` · ${item.outside} 个状态未达容差` : ' · 已收敛'}${stability ? ` · z/L ${item.zOverL.toFixed(2)} · u* ${item.ustar.toFixed(3)} m/s · 场景 H ${item.sensibleHeat.toFixed(1)} W/m²` : ''}`
   }
   match = line.match(/^SHORTWAVE_SCATTERING\s+node=(\d+).*?elapsedMs=([\d.]+)(?:.*?truncations=(\d+))?/)
   if (match) {

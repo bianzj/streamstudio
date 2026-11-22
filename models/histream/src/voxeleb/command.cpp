@@ -65,7 +65,7 @@ void clearEnergyState(const std::shared_ptr<VoxelebIO>& modelio)
 }
 
 uint32_t readEnergyState(const std::shared_ptr<VoxelebIO>& modelio,
-                         const nvvk::Buffer& readback)
+                         const nvvk::Buffer& readback, EBState* full = nullptr)
 {
     nvvk::CommandPool commandPool(modelio->m_device, modelio->m_queueIndex);
     vk::CommandBuffer command = commandPool.createCommandBuffer();
@@ -86,8 +86,41 @@ uint32_t readEnergyState(const std::shared_ptr<VoxelebIO>& modelio,
 
     const void* mapped = modelio->m_pAlloc->map(readback);
     const uint32_t count = *static_cast<const uint32_t*>(mapped);
+    if (full != nullptr) std::memcpy(full, mapped, sizeof(EBState));
     modelio->m_pAlloc->unmap(readback);
     return count;
+}
+
+// Publish the MOST switch and the current scene 1/L to the shaders through
+// the reserved localExchange.y/z lanes of FluidParameters.
+void uploadStability(const std::shared_ptr<VoxelebIO>& modelio, bool enabled, double inverseL)
+{
+    modelio->fluidParameters.localExchange.y = enabled ? 1.0f : 0.0f;
+    modelio->fluidParameters.localExchange.z = enabled ? static_cast<float>(inverseL) : 0.0f;
+    if (!modelio->m_pFluidParameters)
+        throw std::runtime_error("VoxelEB stability correction needs the FluidParameters buffer");
+    nvvk::CommandPool commandPool(modelio->m_device, modelio->m_queueIndex);
+    vk::CommandBuffer command = commandPool.createCommandBuffer();
+    vkCmdUpdateBuffer(command, modelio->m_pFluidParameters->buffer, 0,
+                      sizeof(FluidParameters), &modelio->fluidParameters);
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    commandPool.submitAndWait(command);
+}
+
+// Desired scene 1/L from H (W m-2 per ground area) and u*, clamped to the
+// MOST applicability range -5 <= (z-d)/L <= 1 (energyphysics.h form;
+// rho and cp as in shader/global.glsl).
+double desiredInverseObukhov(double sensibleHeat, double ustar, double airTemperatureK, double height)
+{
+    constexpr double rho = 1.2047, cp = 1004.0, kappa = 0.4, gravity = 9.81;
+    const double u = std::max(ustar, 0.001);
+    const double raw = -kappa * gravity * sensibleHeat / (rho * cp * airTemperatureK * u * u * u);
+    const double z = std::max(height, 0.1);
+    return std::clamp(raw * z, -5.0, 1.0) / z;
 }
 
 void resetScatteringStats(const std::shared_ptr<VoxelebIO>& modelio)
@@ -348,12 +381,52 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     // Stomatal state reacts to leaf-surface humidity outside the temperature
     // Newton step; later iterations solve temperature with physiology frozen.
     constexpr int physiologyIterations = 25;
-    // Aerodynamic resistances depend on meteorology, canopy structure and the
-    // (frozen during EB) flow field only, never on surface temperature: the
-    // free-convection term is applied per state in evapo/budget. Evaluate
-    // them once per node instead of on every iteration.
-    submit(modelio, VoxelEBStage::aero, voxelSize1D, std::nullopt, std::nullopt);
-    waitFence(modelio);
+    // Aerodynamic resistances depend on meteorology, canopy structure, the
+    // (frozen during EB) flow field and - with control.stabilityCorrection -
+    // the scene Obukhov length, never on surface temperature directly: the
+    // free-convection term is applied per state in evapo/budget. Neutral
+    // runs evaluate them once per node; the MOST iteration re-evaluates
+    // them whenever it moves 1/L.
+    const bool stability = modelio->stabilityCorrection;
+    const int domainColumns = std::max(1, modelio->setting.voxelSize.x * modelio->setting.voxelSize.z);
+    const double airTemperatureK = modelio->meteo.Ta + 273.15;
+    double inverseL = 0.0; // each node starts neutral (reproducible per node)
+    modelio->stabilityAvailable = false;
+    modelio->stabilityAeroUpdates = 0;
+    modelio->stabilityChange = 0.0;
+    modelio->stabilitySensibleHeat = 0.0;
+    const auto evaluateAerodynamics = [&]() {
+        if (stability) {
+            uploadStability(modelio, true, inverseL);
+            clearEnergyState(modelio);
+        }
+        submit(modelio, VoxelEBStage::aero, voxelSize1D, std::nullopt, std::nullopt);
+        waitFence(modelio);
+        if (!stability) return;
+        ++modelio->stabilityAeroUpdates;
+        EBState state{};
+        readEnergyState(modelio, stateReadback, &state);
+        int64_t ustarSum = 0, heightSum = 0;
+        for (int bin = 0; bin < kEnergyStateBins; ++bin) {
+            ustarSum += state.ustar[bin];
+            heightSum += state.height[bin];
+        }
+        modelio->stabilityAvailable = state.groundCount > 0;
+        if (modelio->stabilityAvailable) {
+            modelio->frictionVelocity = 1.0e-4 * double(ustarSum) / state.groundCount;
+            modelio->stabilityHeight = 0.01 * double(heightSum) / state.groundCount;
+        } else {
+            // No soil/water column to define a surface layer: run this node
+            // exactly as the neutral model.
+            uploadStability(modelio, false, 0.0);
+            submit(modelio, VoxelEBStage::aero, voxelSize1D, std::nullopt, std::nullopt);
+            waitFence(modelio);
+        }
+    };
+    evaluateAerodynamics();
+    modelio->inverseObukhov = inverseL;
+    // |delta(z/L)| below which 1/L counts as converged.
+    const auto stabilityTolerance = [](double zeta) { return 0.02 + 0.02 * std::abs(zeta); };
     // DEFERRED[中] 数值: 能量平衡迭代上限 50 写死且前 25 次才更新生理；未收敛时只记录 energyFinalUnconvergedStateCount，后续仍 updateTp 推进时间节点，若调用方不检查该计数，未收敛（甚至振荡）的温度会被当作正常结果传播到下一时间步；建议：将上限与生理冻结轮数做成配置项，并在未收敛计数>0 时输出警告/在结果元数据中标记。
     for(int kiter = 0;kiter < 50; kiter++) {
         // Also read by budget.comp for its damping schedule; the biochemical
@@ -384,7 +457,28 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
         submit(modelio, VoxelEBStage::budget, voxelSize1D, std::nullopt, std::nullopt);
         waitFence(modelio);
         modelio->energyIterations = kiter + 1;
-        if(kiter >= 2 && readEnergyState(modelio, stateReadback) == 0U) {
+        if (stability && modelio->stabilityAvailable) {
+            // Fluxes of this pass (evapo at the pre-update temperatures).
+            EBState state{};
+            const uint32_t outside = readEnergyState(modelio, stateReadback, &state);
+            int64_t sensibleSum = 0;
+            for (int bin = 0; bin < kEnergyStateBins; ++bin) sensibleSum += state.sensible[bin];
+            const double sensible = 0.1 * double(sensibleSum) / domainColumns;
+            const double desired = desiredInverseObukhov(sensible, modelio->frictionVelocity,
+                                                         airTemperatureK, modelio->stabilityHeight);
+            const double height = modelio->stabilityHeight;
+            modelio->stabilitySensibleHeat = sensible;
+            modelio->stabilityChange = std::abs(desired - inverseL) * height;
+            const bool stabilityConverged =
+                modelio->stabilityChange <= stabilityTolerance(desired * height);
+            if (kiter >= 2 && outside == 0U && stabilityConverged) break;
+            if (!stabilityConverged) {
+                // Under-relaxed fixed point (FacetEB uses the same 0.5).
+                inverseL += 0.5 * (desired - inverseL);
+                modelio->inverseObukhov = inverseL;
+                evaluateAerodynamics();
+            }
+        } else if(kiter >= 2 && readEnergyState(modelio, stateReadback) == 0U) {
             break;
         }
 

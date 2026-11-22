@@ -70,6 +70,12 @@ export const CASES = {
   veb_urban_mwir: { example: 'urban_block', mode: 'eVoxelEB', meteo: [23, 25], set: MWIR_BANDS },
   // Night nodes (Rin = 0): the 3.8 um band must stay unchanged.
   veb_urban_mwir_night: { example: 'urban_block', mode: 'eVoxelEB', meteo: [1, 3], set: MWIR_BANDS },
+  // Night nodes 01:50 and 02:20 (stable stratification): Monin-Obukhov
+  // stability correction (control.stabilityCorrection) must reduce exchange.
+  // A run that starts at night has no radiatively cooled history, so the
+  // initial soil/structure temperature is set below the air (~14 C).
+  veb_forest_night: { example: 'forest', mode: 'eVoxelEB', meteo: [3, 5], set: { 'configuration.meteo.Tsold': 283.15 } },
+  veb_urban_night: { example: 'urban_block', mode: 'eVoxelEB', meteo: [3, 5], set: { 'configuration.meteo.Tsold': 283.15 } },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.
