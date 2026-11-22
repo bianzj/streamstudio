@@ -60,13 +60,18 @@ def voxeleb(v, case):
     res = {}
     for meta in sorted(glob.glob(os.path.join(base, 'process', 'voxeleb_T=*.json'))):
         tok = re.search(r'T=(.*)\.json', meta).group(1)
-        eb = np.fromfile(os.path.join(base, 'process', f'voxeleb_T={tok}.bin'), dtype='<f4').reshape(-1, 18)
+        # Record width depends on the soil method (method 2 appends the
+        # layer temperatures); read it and the temperature offset from metadata.
+        info = json.load(open(meta, encoding='utf-8'))
+        width = int(info.get('recordFloats', 18))
+        tcol = next((f['offset'] for f in info.get('fields', []) if f.get('id') == 'temperature'), width - 1)
+        eb = np.fromfile(os.path.join(base, 'process', f'voxeleb_T={tok}.bin'), dtype='<f4').reshape(-1, width)
         rt = np.fromfile(os.path.join(base, 'process', f'voxelrt_T={tok}.bin'), dtype='<f4').reshape(-1, 8)
         node = {}
         for tid in sorted(set(typ.tolist())):
             m = typ == tid
             row = {k: float(np.nanmean(a[m, col])) for k, a, col in
-                   (('T', eb, 17), ('H', eb, 4), ('LE', eb, 3), ('G', eb, 5), ('SW', rt, 3), ('Rn', rt, 5))}
+                   (('T', eb, tcol), ('H', eb, 4), ('LE', eb, 3), ('G', eb, 5), ('SW', rt, 3), ('Rn', rt, 5))}
             row['G/Rn'] = row['G'] / row['Rn'] if abs(row['Rn']) > 1 else None
             node[TYPE_NAMES.get(tid, str(tid))] = row
         diag = glob.glob(os.path.join(base, 'diagnostics', f'energy_balance_node=*_T={tok}.json'))

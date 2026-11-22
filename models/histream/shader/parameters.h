@@ -219,6 +219,10 @@ struct VoxelTempe
 {
     float sunlit;
     float shaded;
+    // Sunlit fraction at which the stored soil-method-1 histories were last
+    // written (updateTp); < 0 before the first node. Keep in sync with
+    // src/base/structs_cg.h.
+    float solarFraction;
 };
 
 // radiance

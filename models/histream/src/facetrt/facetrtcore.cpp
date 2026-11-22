@@ -4596,6 +4596,18 @@ try {
         lumpedConductanceDensity[f]=b.p.conductanceWPerK*surfaceForFacet(scene,f).lumpedWeight/b.weightedArea;
     }
     if(hasLumpedThermal)runIndex.value["execution"]["lumpedThermal"]="CPU implicit internal nodes + surface EB; GPU coupled radiation";
+    // Sunlit/shaded thermal history across nodes. "remap" (default) moves the
+    // area whose state changed together with its stored heat; "legacy" keeps
+    // each state's own history (the old behaviour, heat not conserved when the
+    // sunlit part changes); "mixed" collapses both states to one area-weighted
+    // history at every node (diagnostic reference, loses the sunlit/shaded
+    // contrast of the stored heat).
+    const char* thermalHistoryEnvironment = std::getenv("HISTREAM_THERMAL_HISTORY");
+    const std::string thermalHistoryMode = thermalHistoryEnvironment && *thermalHistoryEnvironment
+        ? std::string(thermalHistoryEnvironment) : std::string("remap");
+    if (thermalHistoryMode != "remap" && thermalHistoryMode != "legacy" && thermalHistoryMode != "mixed")
+        throw std::runtime_error("HISTREAM_THERMAL_HISTORY must be remap, legacy or mixed");
+    runIndex.value["thermalHistory"] = thermalHistoryMode;
     runIndex.write();
     const size_t firstGroundSide = static_cast<size_t>(scene.leafFacetCount) * 2U;
     const size_t groundSides = surfaceCount - firstGroundSide;
@@ -4609,6 +4621,19 @@ try {
     std::array<std::vector<float>, 2> soilHistory{
         std::vector<float>(surfaceCount * kSoilHistory, 0.0f),
         std::vector<float>(surfaceCount * kSoilHistory, 0.0f)};
+    // Sunlit part of every side at the preceding node (the area weights of the
+    // stored states) and the stored heat of each object facet / method-2 soil
+    // side at the end of that node, for the conservation diagnostics.
+    std::vector<float> previousSunlitPart;
+    std::vector<double> previousObjectHeat(scene.leafFacetCount, 0.0);
+    std::vector<double> previousSoilHeat(groundSides, 0.0);
+    const auto soilColumnHeat = [&](const SurfaceParameters& soil, const facetphysics::SoilProfile& profile) {
+        double heat = 0;
+        for (size_t layer = 0; layer < facetphysics::soilLayers; ++layer)
+            heat += soil.specificHeat * soil.density *
+                (facetphysics::soilEdges[layer + 1] - facetphysics::soilEdges[layer]) * profile[layer];
+        return heat;
+    };
 
     RunResult latest;
     latest.backend = useCpuBackend
@@ -4724,6 +4749,65 @@ try {
             } else {
                 sunlitPart[side0] = std::clamp(sunlit[side0], 0.0f, 1.0f);
                 sunlitPart[side0 + 1U] = std::clamp(sunlit[side0 + 1U], 0.0f, 1.0f);
+            }
+        }
+        // Conservative sunlit/shaded transfer before the stored states become
+        // this node's previous states. Every stored quantity of a side (skin
+        // temperature, method-1 surface history, method-2 profile) moves with
+        // the same area weights, so sum(p*C*T) is that of the preceding node.
+        // A side whose sunlit part is unchanged is not touched (bitwise).
+        size_t historyChangedSides = 0;
+        double legacyObjectJump = 0, legacyObjectJumpAbs = 0, legacySoilJump = 0, legacySoilJumpAbs = 0;
+        double historyMaximumGap = 0;
+        if (node != startNode && previousSunlitPart.size() == surfaceCount) {
+            const bool legacy = thermalHistoryMode == "legacy";
+            const bool mixed = thermalHistoryMode == "mixed";
+            for (size_t side = 0; side < surfaceCount; ++side) {
+                const double pOld = std::clamp(static_cast<double>(previousSunlitPart[side]), 0.0, 1.0);
+                const double pNew = std::clamp(static_cast<double>(sunlitPart[side]), 0.0, 1.0);
+                const facetphysics::SunlitStateTransfer transfer =
+                    facetphysics::sunlitStateTransfer(previousSunlitPart[side], sunlitPart[side]);
+                if (transfer.target < 0 && !mixed) continue;
+                const uint32_t facet = static_cast<uint32_t>(side / 2U);
+                const bool groundSide = side >= firstGroundSide;
+                const auto& surface = surfaceForFacet(scene, facet);
+                const bool profileSide = groundSide && surface.soilTemperatureMethod == 2;
+                if (transfer.target >= 0) {
+                    ++historyChangedSides;
+                    historyMaximumGap = std::max(historyMaximumGap,
+                        std::abs(static_cast<double>(stateTemperature[0][side]) - stateTemperature[1][side]));
+                    // Object facets store one heat content per facet (side 0).
+                    double gap = 0, area = facetAreas[facet];
+                    if (!groundSide && side % 2U == 0U)
+                        gap = std::max(0.0f, surface.heatCapacityPerArea) *
+                            (static_cast<double>(stateTemperature[0][side]) - stateTemperature[1][side]);
+                    else if (profileSide)
+                        gap = soilColumnHeat(surface, soilProfiles[0][side - firstGroundSide]) -
+                            soilColumnHeat(surface, soilProfiles[1][side - firstGroundSide]);
+                    const double jump = (pNew - pOld) * gap * area;
+                    (groundSide ? legacySoilJump : legacyObjectJump) += jump;
+                    (groundSide ? legacySoilJumpAbs : legacyObjectJumpAbs) += std::abs(jump);
+                }
+                if (legacy) continue;
+                const auto move = [&](auto& sunlitValue, auto& shadedValue) {
+                    if (mixed) {
+                        using V = std::decay_t<decltype(sunlitValue)>;
+                        const V mean = static_cast<V>(pOld * static_cast<double>(sunlitValue) +
+                            (1.0 - pOld) * static_cast<double>(shadedValue));
+                        sunlitValue = shadedValue = mean;
+                    } else {
+                        facetphysics::applySunlitStateTransfer(transfer, sunlitValue, shadedValue);
+                    }
+                };
+                move(stateTemperature[0][side], stateTemperature[1][side]);
+                float* sunlitHistory = soilHistory[0].data() + side * kSoilHistory;
+                float* shadedHistory = soilHistory[1].data() + side * kSoilHistory;
+                for (size_t k = 0; k < kSoilHistory; ++k) move(sunlitHistory[k], shadedHistory[k]);
+                if (profileSide) {
+                    const size_t g = side - firstGroundSide;
+                    for (size_t layer = 0; layer < facetphysics::soilLayers; ++layer)
+                        move(soilProfiles[0][g][layer], soilProfiles[1][g][layer]);
+                }
             }
         }
         const std::array<std::vector<float>, 2> previousStateTemperature = stateTemperature;
@@ -5559,15 +5643,27 @@ try {
             if (saveEnergyProcess) diagnostic["columns"].push_back({{"index", i}, {"inverseObukhovLength_m-1", columnInverseL[i]},
                 {"leafResistance_s_m", columnAerodynamics[i].leafResistance}, {"soilResistance_s_m", columnAerodynamics[i].soilResistance}});
         double maxSoilClosure = 0;
+        // Heat-content closure across nodes (W m-2): change of the stored heat
+        // of the whole surface, sum over states of p*C*T, from the end of the
+        // preceding node minus the conducted/storage flux of this node. Zero
+        // when the sunlit/shaded transfer conserves heat; equal to the legacy
+        // jump / dt otherwise.
+        double soilClosureArea = 0, soilClosureSum = 0, soilClosureAbs = 0, soilClosureMax = 0;
+        double objectClosureArea = 0, objectClosureSum = 0, objectClosureAbs = 0, objectClosureMax = 0;
+        const bool closureAvailable = node != startNode;
         for (size_t g = 0; g < groundSides; ++g) {
             const size_t side = firstGroundSide + g;
             const auto& soil = surfaceForFacet(scene, static_cast<uint32_t>(side / 2));
             if (soil.soilTemperatureMethod != 2) continue;
+            double conducted = 0, heat = 0;
             for (int state = 0; state < 2; ++state) {
+                const double weight = state == 0 ? sunlitPart[side] : 1.0 - sunlitPart[side];
                 const auto next = soilResponses[state][g].profile(stateTemperature[state][side]);
                 const double topFlux = soilResponses[state][g].flux(stateTemperature[state][side]);
                 const double bottomFlux = soil.thermalConductivity * (next.back() - soilBottomTemperature[g]) /
                     (.5 * (facetphysics::soilEdges.back() - facetphysics::soilEdges[facetphysics::soilLayers - 1]));
+                conducted += weight * (topFlux - bottomFlux);
+                heat += weight * soilColumnHeat(soil, next);
                 double storage = 0;
                 for (size_t layer = 0; layer < facetphysics::soilLayers; ++layer)
                     storage += soil.specificHeat * soil.density * (facetphysics::soilEdges[layer + 1] - facetphysics::soilEdges[layer]) *
@@ -5579,8 +5675,45 @@ try {
                     {"bottomFlux_W_m2", bottomFlux}, {"storage_W_m2", storage}});
                 soilProfiles[state][g] = next;
             }
+            if (closureAvailable) {
+                const double area = facetAreas[side / 2];
+                const double residual = (heat - previousSoilHeat[g]) / dTime - conducted;
+                soilClosureArea += area; soilClosureSum += area * residual; soilClosureAbs += area * std::abs(residual);
+                soilClosureMax = std::max(soilClosureMax, std::abs(residual));
+            }
+            previousSoilHeat[g] = heat;
         }
         diagnostic["maximumSoilClosure_W_m2"] = maxSoilClosure;
+        for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet) {
+            const size_t side = static_cast<size_t>(facet) * 2U;
+            const double capacity = std::max(0.0f, surfaceForFacet(scene, facet).heatCapacityPerArea);
+            const double heat = capacity * (sunlitPart[side] * static_cast<double>(stateTemperature[0][side]) +
+                (1.0 - sunlitPart[side]) * static_cast<double>(stateTemperature[1][side]));
+            if (closureAvailable && capacity > 0) {
+                const double area = facetAreas[facet];
+                const double residual = (heat - previousObjectHeat[facet]) / dTime - storageHeat[side];
+                objectClosureArea += area; objectClosureSum += area * residual; objectClosureAbs += area * std::abs(residual);
+                objectClosureMax = std::max(objectClosureMax, std::abs(residual));
+            }
+            previousObjectHeat[facet] = heat;
+        }
+        {
+            const auto perArea = [](double value, double area) { return area > 0 ? value / area : 0.0; };
+            diagnostic["thermalHistory"] = {
+                {"mode", thermalHistoryMode}, {"changedSides", historyChangedSides},
+                {"maximumStateGapOfChangedSides_K", historyMaximumGap},
+                {"legacyObjectHeatJump_J", legacyObjectJump}, {"legacyObjectHeatJumpAbs_J", legacyObjectJumpAbs},
+                {"legacySoilHeatJump_J", legacySoilJump}, {"legacySoilHeatJumpAbs_J", legacySoilJumpAbs},
+                {"objectHeatClosureArea_m2", objectClosureArea},
+                {"objectHeatClosureMean_W_m2", perArea(objectClosureSum, objectClosureArea)},
+                {"objectHeatClosureMeanAbs_W_m2", perArea(objectClosureAbs, objectClosureArea)},
+                {"objectHeatClosureMaxAbs_W_m2", objectClosureMax},
+                {"soilHeatClosureArea_m2", soilClosureArea},
+                {"soilHeatClosureMean_W_m2", perArea(soilClosureSum, soilClosureArea)},
+                {"soilHeatClosureMeanAbs_W_m2", perArea(soilClosureAbs, soilClosureArea)},
+                {"soilHeatClosureMaxAbs_W_m2", soilClosureMax}};
+        }
+        previousSunlitPart = sunlitPart;
         diagnostic["timeStepSeconds"]=dTime;
         diagnostic["elapsedSeconds"]=lumpedElapsedSeconds;
         diagnostic["lumpedThermal"]=ProjectJson::Json::array();

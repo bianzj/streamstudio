@@ -43,6 +43,35 @@ struct SoilResponse {
     }
 };
 
+// Area-conserving transfer between the sunlit (0) and shaded (1) thermal
+// states of one surface when its sunlit part changes from pOld to pNew. The
+// area that changes state carries its own history: if p falls, the share
+// pOld-pNew leaves the sunlit state and is merged into the shaded state
+// (area-weighted mean), otherwise pNew-pOld moves from shaded to sunlit. The
+// donor state keeps its values, so sum(p * C * T) is unchanged. `target` < 0
+// means nothing moves (p unchanged); then no value may be touched.
+struct SunlitStateTransfer { int target{-1}; double keep{1}, take{0}; };
+inline SunlitStateTransfer sunlitStateTransfer(double pOld, double pNew) {
+    SunlitStateTransfer t;
+    if (!(pOld != pNew) || !std::isfinite(pOld) || !std::isfinite(pNew)) return t;
+    pOld = std::clamp(pOld, 0.0, 1.0); pNew = std::clamp(pNew, 0.0, 1.0);
+    if (pOld == pNew) return t;
+    const bool toShade = pNew < pOld;
+    const double moved = std::abs(pOld - pNew);
+    const double resident = toShade ? 1.0 - pOld : pOld;
+    t.target = toShade ? 1 : 0;
+    t.keep = resident / (resident + moved);
+    t.take = moved / (resident + moved);
+    return t;
+}
+template <class T>
+inline void applySunlitStateTransfer(const SunlitStateTransfer& t, T& sunlit, T& shaded) {
+    if (t.target < 0) return;
+    T& target = t.target == 0 ? sunlit : shaded;
+    const T& source = t.target == 0 ? shaded : sunlit;
+    target = static_cast<T>(t.keep * static_cast<double>(target) + t.take * static_cast<double>(source));
+}
+
 // Backward Euler: C_i (T_i-new - T_i-old)/dt = q_upper - q_lower.
 // Eliminate the tridiagonal interior once per node, not once per EB iteration.
 inline SoilResponse soilResponse(const SoilProfile& previous, double bottomTemperature,

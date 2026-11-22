@@ -197,28 +197,59 @@ void main()
                 float rhos = soilSets[bioId].rhos;
                 float lamb = soilSets[bioId].lambdas ;
                 GAM = thermal_inertial(cs,rhos,lamb);
-                // soil case
-                for(int ktime = 0;ktime <TLASTNUM;ktime++)
+                // Stored histories belong to the sunlit fraction of the node
+                // they were written at; the area that changed state since
+                // then carries its own history (updateTp commits the same
+                // transfer at the end of this node). An unchanged fraction
+                // keeps the original summation verbatim (bitwise results).
+                float storedSolar = voxelTempes[bufferId].solarFraction;
+                float currentSolar = clamp(voxelDirs[bufferId].solar, 0.0, 1.0);
+                if(!(storedSolar >= 0.0) || storedSolar == currentSolar)
                 {
-                    if(issunlit==1)
+                    for(int ktime = 0;ktime <TLASTNUM;ktime++)
                     {
-                        if(ktime==0) {
-                            ssum = ssum + (Tc-273.15-voxelTlasts[TlastId+ktime].sunlit)/dtime *
-                            (sqrt(dtime_[ktime]) - sqrt(dtime_[ktime]-dtime));
+                        if(issunlit==1)
+                        {
+                            if(ktime==0) {
+                                ssum = ssum + (Tc-273.15-voxelTlasts[TlastId+ktime].sunlit)/dtime *
+                                (sqrt(dtime_[ktime]) - sqrt(dtime_[ktime]-dtime));
+                            }
+                            else {
+                                ssum = ssum + (voxelTlasts[TlastId+ktime-1].sunlit - voxelTlasts[TlastId+ktime].sunlit)/dtime *
+                                (sqrt(dtime_[ktime])-sqrt(dtime_[ktime]-dtime));
+                            }
                         }
-                        else {
-                            ssum = ssum + (voxelTlasts[TlastId+ktime-1].sunlit - voxelTlasts[TlastId+ktime].sunlit)/dtime *
-                            (sqrt(dtime_[ktime])-sqrt(dtime_[ktime]-dtime));
+                        else
+                        {
+                            if(ktime==0) {
+                                ssum = ssum + (Tc-273.15-voxelTlasts[TlastId+ktime].shaded)/dtime *
+                                (sqrt(dtime_[ktime]) - sqrt(dtime_[ktime]-dtime));
+                            }
+                            else {
+                                ssum = ssum + (voxelTlasts[TlastId+ktime-1].shaded - voxelTlasts[TlastId+ktime].shaded)/dtime *
+                                (sqrt(dtime_[ktime])-sqrt(dtime_[ktime]-dtime));
+                            }
                         }
                     }
-                    else
+                }
+                else
+                {
+                    float history[TLASTNUM];
+                    for(int ktime = 0; ktime < TLASTNUM; ktime++)
+                    {
+                        vec2 stored = sunlitStateTransfer(
+                            vec2(voxelTlasts[TlastId+ktime].sunlit, voxelTlasts[TlastId+ktime].shaded),
+                            storedSolar, currentSolar);
+                        history[ktime] = issunlit == 1 ? stored.x : stored.y;
+                    }
+                    for(int ktime = 0;ktime <TLASTNUM;ktime++)
                     {
                         if(ktime==0) {
-                            ssum = ssum + (Tc-273.15-voxelTlasts[TlastId+ktime].shaded)/dtime *
+                            ssum = ssum + (Tc-273.15-history[ktime])/dtime *
                             (sqrt(dtime_[ktime]) - sqrt(dtime_[ktime]-dtime));
                         }
                         else {
-                            ssum = ssum + (voxelTlasts[TlastId+ktime-1].shaded - voxelTlasts[TlastId+ktime].shaded)/dtime *
+                            ssum = ssum + (history[ktime-1] - history[ktime])/dtime *
                             (sqrt(dtime_[ktime])-sqrt(dtime_[ktime]-dtime));
                         }
                     }

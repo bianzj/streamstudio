@@ -95,6 +95,19 @@ void main()
 
         if(abs(soilSets[bioId].method-1)<0.1)
         {
+            // Commit the sunlit/shaded area transfer evapo.comp applied to
+            // the stored history during this node, then append this node.
+            float storedSolar = voxelTempes[bufferId].solarFraction;
+            float currentSolar = clamp(voxelDirs[bufferId].solar, 0.0, 1.0);
+            for(int i = 0; i < TLASTNUM && storedSolar >= 0.0 && storedSolar != currentSolar; i++)
+            {
+                vec2 stored = sunlitStateTransfer(
+                    vec2(voxelTlasts[TlastId+i].sunlit, voxelTlasts[TlastId+i].shaded),
+                    storedSolar, currentSolar);
+                voxelTlasts[TlastId+i].sunlit = stored.x;
+                voxelTlasts[TlastId+i].shaded = stored.y;
+            }
+            voxelTempes[bufferId].solarFraction = currentSolar;
             for(int i =TLASTNUM-1; i>0; i--)
             {   
                 voxelTlasts[TlastId+i].sunlit = voxelTlasts[TlastId+i-1].sunlit;

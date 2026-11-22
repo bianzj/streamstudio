@@ -1405,6 +1405,30 @@ float soilMoistureFraction(float moisture, float saturatedWater)
     return clamp(fraction, 0.0, clamp(saturatedWater, 0.0, 1.0));
 }
 
+// Area-conserving sunlit/shaded transfer of one stored history value
+// (x = sunlit, y = shaded) when the sunlit fraction changes from pOld (the
+// node the values were stored at; < 0 = none) to pNew. If p falls, the share
+// pOld-pNew leaves the sunlit state and is merged into the shaded state, and
+// vice versa; the donor keeps its value, so p*T_sunlit + (1-p)*T_shaded is
+// conserved. Keep in step with facetrt/energyphysics.h sunlitStateTransfer.
+// Unchanged p returns the values untouched (bitwise).
+vec2 sunlitStateTransfer(vec2 values, float pOld, float pNew)
+{
+    if (!(pOld >= 0.0) || pOld == pNew) return values;
+    float oldPart = clamp(pOld, 0.0, 1.0);
+    float newPart = clamp(pNew, 0.0, 1.0);
+    if (oldPart == newPart) return values;
+    float moved = abs(oldPart - newPart);
+    if (newPart < oldPart) {
+        float resident = 1.0 - oldPart;
+        values.y = (resident * values.y + moved * values.x) / (resident + moved);
+    } else {
+        float resident = oldPart;
+        values.x = (resident * values.x + moved * values.y) / (resident + moved);
+    }
+    return values;
+}
+
 // Implicit, conservative finite-volume conduction on a nonuniform nodal grid.
 // Temperatures are Celsius; G is positive downward [W m-2].  cs [J kg-1 K-1]
 // and rhos [kg m-3] give dry volumetric capacity; pore water adds its capacity.

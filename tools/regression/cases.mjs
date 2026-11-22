@@ -16,6 +16,8 @@ const FOREST_LATTICE = {
 const PERIODIC_8 = { 'configuration.control.periodicTraversalCount': 8 }
 const MWIR_BANDS = { 'configuration.sensor.bands': '3800,10500', 'configuration.sensor.continuousBands': false,
   'configuration.sensor.temperature': true }
+// Every soil set on soil method 1 (the control value overrides the material).
+const SOIL_METHOD_1 = { 'configuration.control.soilTemperatureMethod': 1 }
 
 export const CASES = {
   vrt_urban: { example: 'urban_block', mode: 'eVoxelRT' },
@@ -76,6 +78,14 @@ export const CASES = {
   // initial soil/structure temperature is set below the air (~14 C).
   veb_forest_night: { example: 'forest', mode: 'eVoxelEB', meteo: [3, 5], set: { 'configuration.meteo.Tsold': 283.15 } },
   veb_urban_night: { example: 'urban_block', mode: 'eVoxelEB', meteo: [3, 5], set: { 'configuration.meteo.Tsold': 283.15 } },
+  // Moving shadows, 08:50-13:20 (10 nodes of 30 min): building and tree
+  // shadows sweep streets, walls and roofs, so sunlit parts change between
+  // nodes. Sunlit/shaded thermal states must exchange area together with
+  // their stored heat (FacetEB thermalHistory diagnostics, heat closure).
+  // _m1 switches the soil sets to the thermal-inertia history (method 1).
+  feb_urban_shadow: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27] },
+  feb_urban_shadow_m1: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], set: SOIL_METHOD_1 },
+  veb_urban_shadow_m1: { example: 'urban_block', mode: 'eVoxelEB', meteo: [17, 27], set: SOIL_METHOD_1 },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.

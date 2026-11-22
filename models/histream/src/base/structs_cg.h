@@ -315,7 +315,11 @@ struct VoxelTempe
 {
     float sunlit;
     float shaded;
+    // Sunlit fraction of the stored soil-method-1 histories (VoxelEB
+    // updateTp); negative until the first node has been committed.
+    float solarFraction = -1.0f;
 };
+static_assert(sizeof(VoxelTempe) == 12, "VoxelTempe must match GLSL std430 stride");
 
 struct VoxelNetRad
 {
