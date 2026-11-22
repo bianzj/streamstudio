@@ -38,6 +38,60 @@ export const normalizeCpuThreads = (value) => {
   return Number.isFinite(threads) && threads >= 1 ? Math.min(1024, threads) : DEFAULT_CPU_THREADS
 }
 
+// 运行质量三档预设（control.qualityPreset）。每档只管理所选模式实际读取的参数：
+//   RayTracing: samples + raytracingDepth；VoxelRT: samples + voxelCollisionOrders；
+//   VoxelEB: samples + shortwaveScatteringOrders + radiationMaxSteps；FacetEB: couplingIterations；
+//   FacetRT 没有受档位管理的参数。'custom' 表示用户手动改过受管参数（旧工程缺省也是 custom）。
+// 数值由 tools/regression 冻结算例标定（以“高精度”为参考，标定表见用户手册 13.2）：
+//   - VoxelEB 的像元采样数几乎不增加耗时（8→128 约 +0.3 s），而 16 次采样时影像边角像元可能全部落在
+//     计算域外而输出 0，因此快速档 VoxelEB 也用 32；耗时主要随短波散射阶数增加（每阶约 +50%）。
+//   - FacetEB 的耦合迭代是上限，收敛即停止：标定算例 16–19 次（松弛 0.5）或约 11 次（松弛 0.8）收敛。
+export const QUALITY_PRESETS = ['fast', 'standard', 'high', 'custom']
+export const QUALITY_PRESET_LABELS = { fast: '快速预览', standard: '标准', high: '高精度', custom: '自定义' }
+const QUALITY_PRESET_VALUES = {
+  fast: { samples: 16, raytracingDepth: 8, voxelCollisionOrders: 2, shortwaveScatteringOrders: 1, radiationMaxSteps: () => 64, couplingIterations: 20 },
+  standard: { samples: 32, raytracingDepth: 16, voxelCollisionOrders: 3, shortwaveScatteringOrders: 2, radiationMaxSteps: (scene) => autoRadiationMaxSteps(scene), couplingIterations: 60 },
+  high: { samples: 128, raytracingDepth: 32, voxelCollisionOrders: 5, shortwaveScatteringOrders: 3, radiationMaxSteps: (scene) => Math.max(512, autoRadiationMaxSteps(scene, 3)), couplingIterations: 100 }
+}
+// 个别模式与通用档位值不同的参数。
+const QUALITY_PRESET_MODE_VALUES = {
+  fast: { eVoxelEB: { samples: 32 } }
+}
+const QUALITY_PRESET_FIELDS = {
+  eRaytracing: ['samples', 'raytracingDepth'],
+  eVoxelRT: ['samples', 'voxelCollisionOrders'],
+  eVoxelEB: ['samples', 'shortwaveScatteringOrders', 'radiationMaxSteps'],
+  eFacetEB: ['couplingIterations'],
+  eFacetRT: []
+}
+export const qualityPresetFields = (mode) => QUALITY_PRESET_FIELDS[mode] || []
+
+// VoxelEB 体元射线步数：场景对角线穿过的体元数 × factor，取 16 的倍数，限制在 64–4096。
+export function autoRadiationMaxSteps(scene = {}, factor = 1.5) {
+  const voxel = Math.max(0.01, number(scene.voxel, 1))
+  const diagonal = Math.hypot(number(scene.x, 60), number(scene.y, 60), number(scene.height, 15)) / voxel
+  return Math.max(64, Math.min(4096, Math.ceil(diagonal * factor / 16) * 16))
+}
+
+// 某档在指定模式下应写入的参数（只含该模式读取的字段）。
+export function qualityPresetValues(preset, mode, scene = {}) {
+  const values = QUALITY_PRESET_VALUES[preset]
+  if (!values) return {}
+  const merged = { ...values, ...(QUALITY_PRESET_MODE_VALUES[preset]?.[mode] || {}) }
+  return Object.fromEntries(qualityPresetFields(mode).map((key) => [key, typeof merged[key] === 'function' ? merged[key](scene) : merged[key]]))
+}
+
+export function qualityPresetMatches(preset, mode, control = {}, scene = {}) {
+  if (!QUALITY_PRESET_VALUES[preset]) return false
+  return Object.entries(qualityPresetValues(preset, mode, scene)).every(([key, value]) => Number(control[key]) === value)
+}
+
+// 工程级单次运行上限（分钟）：0 / 空 = 使用服务端默认；否则 1–1440。
+export function normalizeRunTimeoutMinutes(value) {
+  const minutes = Math.round(number(value, 0))
+  return minutes >= 1 ? Math.min(1440, minutes) : 0
+}
+
 const cleanNumber = (value) => Number(Number(value).toFixed(6))
 const normalizedAzimuth = (value) => ((Number(value) % 360) + 360) % 360
 
@@ -535,9 +589,14 @@ export function createDefaultProject(options = {}) {
         // 1.1-1.6x faster; 'traditional' stays selectable for verification.
         radiationSolver: 'accelerated',
         spectralAccelerationWidth: 100,
-        shortwaveScatteringOrders: 1,
-        voxelCollisionOrders: 2,
-        radiationMaxSteps: 64,
+        // 新工程按“标准”档：VoxelRT 3 次真实碰撞、VoxelEB 2 阶短波散射与按场景对角线的步数上限、
+        // FacetEB 最多 60 次耦合迭代。缺这些字段的旧工程在 normalizeProject 中仍按旧值
+        // （碰撞 2 次 / 散射 1 阶 / 步数 64）处理，档位记为 custom，不改动已有参数。
+        qualityPreset: 'standard',
+        runTimeoutMinutes: 0,
+        shortwaveScatteringOrders: 2,
+        voxelCollisionOrders: 3,
+        radiationMaxSteps: autoRadiationMaxSteps({ x: options.sceneX, y: options.sceneY, height: options.sceneHeight, voxel: options.voxelSize }),
         // FacetEB temperature step damping. Smoke cases (crop/urban) converge
         // in 9-12 coupling iterations at 0.8 versus 16-19 at the former 0.5;
         // 1.0 is faster still but takes multi-kelvin steps on dense canopies.
@@ -796,6 +855,10 @@ export function normalizeProject(value = {}) {
         ...defaults.configuration.control,
         ...(configuration.control || {}),
         heterogeneousVoxel: Boolean(configuration.control?.heterogeneousVoxel),
+        // 旧工程没有档位记录：视为自定义，不改动其已有参数。
+        qualityPreset: QUALITY_PRESETS.includes(configuration.control?.qualityPreset)
+          ? configuration.control.qualityPreset : 'custom',
+        runTimeoutMinutes: normalizeRunTimeoutMinutes(configuration.control?.runTimeoutMinutes),
         // RayTracing scattering-order budget, separate from "depth" (which
         // VoxelRT uses as its DDA step budget). Russian roulette from bounce 3.
         raytracingDepth: Math.max(1, Math.min(64, Math.round(number(

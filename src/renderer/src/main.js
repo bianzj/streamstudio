@@ -2,7 +2,7 @@ import { webApi } from './web-api.js'
 import { appStorage } from './storage.js'
 import { getLocale, startLocalization, t } from './i18n.js'
 import { invalidateImageTextures, loadXmlScene, updateSceneDynamics } from './scene-loader.js'
-import { createDefaultProject, createMaterialPresets, DEFAULT_CPU_THREADS, groundedPlacementHeight, MAX_SENSOR_BANDS, normalizeCpuThreads, normalizeTerrainEnvironment, normalizeProject, parseProjectJson, sensorBandValues, sensorCruisePositions, sensorViewAngles, simplifySolarSpectra, stringifyProject } from './project-schema.js'
+import { autoRadiationMaxSteps, createDefaultProject, createMaterialPresets, DEFAULT_CPU_THREADS, groundedPlacementHeight, MAX_SENSOR_BANDS, normalizeCpuThreads, normalizeRunTimeoutMinutes, normalizeTerrainEnvironment, normalizeProject, parseProjectJson, QUALITY_PRESET_LABELS, QUALITY_PRESETS, qualityPresetFields, qualityPresetMatches, qualityPresetValues, sensorBandValues, sensorCruisePositions, sensorViewAngles, simplifySolarSpectra, stringifyProject } from './project-schema.js'
 import { createStreamWorkspace } from './stream/workspace.js'
 import { createMenubar } from './menubar.js'
 import * as THREE from 'three'
@@ -2476,11 +2476,11 @@ function renderInspector() {
       ? ''
       : field(state.mode === 'eRaytracing' ? '每像元路径数' : '像元采样数（抗锯齿）', `<input class="input" id="sampleCount" type="number" min="1" max="1024" step="1" value="${escapeHtml(c.control.samples)}">`)
     const depthControl = state.mode === 'eRaytracing'
-      ? `${field('最大散射次数', `<input class="input" id="raytracingDepth" type="number" min="1" max="64" step="1" value="${escapeHtml(c.control.raytracingDepth ?? 16)}">`)}<div class="notice">每条路径最多计算的散射次数（默认 16）。第 3 次散射起按俄罗斯轮盘赌无偏终止，深路径代价很小；设得过低会截断多次散射，使植被近红外反射率偏低。</div>`
+      ? `${field('最大散射次数', `<input class="input" id="raytracingDepth" type="number" min="1" max="64" step="1" value="${escapeHtml(c.control.raytracingDepth ?? 16)}">`)}<div class="notice">每条路径最多计算的散射次数（标准档 16）。第 3 次散射起按俄罗斯轮盘赌无偏终止，深路径代价很小；设得过低会截断多次散射，使植被近红外反射率偏低。</div>`
       : state.mode === 'eVoxelRT'
         ? `${field('体元射线步数预算', `<input class="input" id="rayDepth" type="number" min="1" max="16" value="${escapeHtml(c.control.depth)}">`, '×128')}<div class="notice">每条体元射线最多穿越 数值×128 个体元面（128–2048），不是散射次数；散射阶数见下方“真实碰撞次数”。大场景或小体元时适当增大。</div>`
         : state.mode === 'eVoxelEB'
-          ? `${field('体元射线步数上限', `<input class="input" id="radiationMaxSteps" type="number" min="16" max="4096" step="16" value="${escapeHtml(c.control.radiationMaxSteps ?? 64)}">`)}${field('短波散射阶数', `<select class="select" id="shortwaveScatteringOrders">${[[1, '1 阶（默认）'], [2, '2 阶'], [3, '3 阶']].map(([value, label]) => `<option value="${value}" ${Number(c.control.shortwaveScatteringOrders ?? 1) === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`)}<div class="notice">步数上限约束短波、长波和成像射线的最大体元穿越数；运行后“运行质量”中若出现步数截断，应增大该值。显式散射阶数之外的高阶散射用光谱不变理论补偿，增加阶数可提高浓密冠层近红外吸收精度。</div>`
+          ? `${field('体元射线步数上限', `<input class="input" id="radiationMaxSteps" type="number" min="16" max="4096" step="16" value="${escapeHtml(c.control.radiationMaxSteps ?? 64)}">`)}${field('短波散射阶数', `<select class="select" id="shortwaveScatteringOrders">${[[1, '1 阶（快速档）'], [2, '2 阶（标准档）'], [3, '3 阶（高精度档）']].map(([value, label]) => `<option value="${value}" ${Number(c.control.shortwaveScatteringOrders ?? 1) === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`)}<div class="notice">步数上限约束短波、长波和成像射线的最大体元穿越数；运行后“运行质量”中若出现步数截断，应增大该值。显式散射阶数之外的高阶散射用光谱不变理论补偿，增加阶数可提高浓密冠层近红外吸收精度。</div>`
           : ''
     const configuredPeriodicCount = Math.max(0, Math.min(20, Math.round(
       Number.isFinite(Number(c.control.periodicTraversalCount))
@@ -2500,7 +2500,7 @@ function renderInspector() {
       ? `${field('辐射求解方法', `<select class="select" id="radiationSolver"><option value="traditional" ${c.control.radiationSolver !== 'accelerated' ? 'selected' : ''}>传统稳健方法</option><option value="accelerated" ${c.control.radiationSolver === 'accelerated' ? 'selected' : ''}>${state.mode === 'eVoxelRT' ? '光谱批处理加速' : '光谱复用加速'}</option></select>`)}<div class="notice">${state.mode === 'eVoxelRT' ? '传统方法逐波段提交并等待 GPU；加速方法每次同时求解最多 4 个相邻波段，共享同一轮几何射线遍历，保留全部射线、光谱参数和物理公式，不进行波段插值。' : '传统方法每个波段从零开始固定迭代；加速方法复用相邻同类型波段的辐射度，并按残差提前收敛。两者使用相同几何、采样和输出定义。'}</div>`
       : ''
     const collisionOrdersControl = state.mode === 'eVoxelRT'
-      ? `${field('真实碰撞次数', `<select class="select" id="voxelCollisionOrders">${[[2, '2 次（默认）'], [3, '3 次'], [4, '4 次'], [5, '5 次']].map(([value, label]) => `<option value="${value}" ${Number(c.control.voxelCollisionOrders ?? 2) === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`)}<div class="notice">体元之间的散射逐次显式追踪，其余高阶散射用光谱不变（回碰）理论补偿。与完全收敛的多次散射相比：2 次约 5% 以内，3 次约 2%，4 次约 1%，5 次基本收敛；误差主要出现在近红外等叶片反照率高的密冠层，可见光几乎不受影响。每增加一次多一轮漫射遍历。</div>`
+      ? `${field('真实碰撞次数', `<select class="select" id="voxelCollisionOrders">${[[2, '2 次（快速档）'], [3, '3 次（标准档）'], [4, '4 次'], [5, '5 次（高精度档）']].map(([value, label]) => `<option value="${value}" ${Number(c.control.voxelCollisionOrders ?? 2) === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`)}<div class="notice">体元之间的散射逐次显式追踪，其余高阶散射用光谱不变（回碰）理论补偿。与完全收敛的多次散射相比：2 次约 5% 以内，3 次约 2%，4 次约 1%，5 次基本收敛；误差主要出现在近红外等叶片反照率高的密冠层，可见光几乎不受影响。每增加一次多一轮漫射遍历。</div>`
       : ''
     const backendNotice = `<div class="notice">${isFacetMode()
       ? 'GPU / CPU / 自动及 CPU 线程数在左侧“计算设备”中选择。面元 CPU 版为原生多线程软件栅格可见性、CSR 邻接图和 Jacobi 辐射度迭代；FacetEB 在该辐射解上继续多线程计算温度与能量通量，通常比 GPU 慢。'
@@ -2515,7 +2515,7 @@ function renderInspector() {
       : ''
     const coupling = couplingGeometry ? `<div class="property-group"><h3>${couplingGeometry} RT–EB 耦合</h3>${spectralAcceleration}${facetCouplingControls}<div class="notice">${couplingNotice}场景几何和${couplingGeometry}辐射结构只初始化一次。${state.mode === 'eFacetEB' ? '松弛系数默认 0.8；出现振荡（运行质量中迭代用满）时再调小。' : ''}</div></div>` : ''
     const temperatureMethods = energyBalanceOutput ? `<div class="property-group"><h3>温度模拟方法</h3>${field('土壤温度', `<select class="select" id="soilTemperatureMethod"><option value="0" ${c.control.soilTemperatureMethod === 0 ? 'selected' : ''}>0 · 瞬时能量平衡</option><option value="1" ${c.control.soilTemperatureMethod === 1 ? 'selected' : ''}>1 · 热惯性动态模型</option><option value="2" ${c.control.soilTemperatureMethod === 2 ? 'selected' : ''}>2 · 温度廓线传导模型（默认）</option></select>`)}${field('植被温度', `<select class="select" id="vegetationTemperatureMethod"><option value="0" ${c.control.vegetationTemperatureMethod === 0 ? 'selected' : ''}>经验法 · Ball–Berry</option><option value="1" ${c.control.vegetationTemperatureMethod === 1 ? 'selected' : ''}>机制法 · Farquhar</option></select>`)}<div class="notice">初始温度只作为求解初值；能量平衡各时刻均由所选方法动态更新。土壤方法会同步应用到全部土壤物化属性。</div></div>` : ''
-    html = `<div class="property-group"><h3>模拟产出</h3>${switchRow(imageOutputLabel, 'imageSwitch', c.sensor.image)}${processOutputSwitches}${processOutputNotice}${switchRow('输出温度', 'temperatureSwitch', c.sensor.temperature)}${switchRow('输出反照率', 'albedoSwitch', c.sensor.albedo)}</div><div class="property-group"><h3>计算控制</h3>${depthControl}${samplingControl}${periodicBoundaryControl}${heterogeneousVoxelControl}${radiationSolverControl}${collisionOrdersControl}${backendNotice}</div>${temperatureMethods}${coupling}${builtinNotice()}`
+    html = `<div class="property-group"><h3>运行质量与时限</h3>${qualityPresetControl(c)}${runTimeoutControl(c)}</div><div class="property-group"><h3>模拟产出</h3>${switchRow(imageOutputLabel, 'imageSwitch', c.sensor.image)}${processOutputSwitches}${processOutputNotice}${switchRow('输出温度', 'temperatureSwitch', c.sensor.temperature)}${switchRow('输出反照率', 'albedoSwitch', c.sensor.albedo)}</div><div class="property-group"><h3>计算控制</h3>${depthControl}${samplingControl}${periodicBoundaryControl}${heterogeneousVoxelControl}${radiationSolverControl}${collisionOrdersControl}${backendNotice}</div>${temperatureMethods}${coupling}${builtinNotice()}`
   }
   $('#inspectorContent').innerHTML = html
   bindInspector()
@@ -2523,6 +2523,85 @@ function renderInspector() {
 
 function restoreActualScene() {
   loadActualScene(state.config).catch((error) => addLog(`恢复场景对象失败：${error.message}`, 'error'))
+}
+
+// 运行质量档位：按当前模式显示该档会写入的参数；档位与当前模式参数不一致时显示为“自定义”。
+const QUALITY_FIELD_LABELS = {
+  samples: () => state.mode === 'eRaytracing' ? '路径数' : '采样数', raytracingDepth: () => '散射次数',
+  voxelCollisionOrders: () => '碰撞次数', shortwaveScatteringOrders: () => '短波阶数',
+  radiationMaxSteps: () => '步数上限', couplingIterations: () => '耦合迭代'
+}
+
+function storedQualityPreset(c) {
+  return QUALITY_PRESETS.includes(c.control?.qualityPreset) ? c.control.qualityPreset : 'custom'
+}
+
+function qualityPresetControl(c) {
+  const fields = qualityPresetFields(state.mode)
+  if (!fields.length) return `<div class="notice">运行质量档位：当前模式（面元辐射传输）没有受档位管理的参数，切换到其他模式时按工程记录的档位写入。</div>`
+  const stored = storedQualityPreset(c)
+  const shown = stored !== 'custom' && !qualityPresetMatches(stored, state.mode, c.control, c.scene) ? 'custom' : stored
+  const options = QUALITY_PRESETS.map((preset) => `<option value="${preset}" ${preset === shown ? 'selected' : ''} ${preset === 'custom' ? 'disabled' : ''}>${t(QUALITY_PRESET_LABELS[preset])}</option>`).join('')
+  const summary = ['fast', 'standard', 'high'].map((preset) => `${t(QUALITY_PRESET_LABELS[preset])}：${Object.entries(qualityPresetValues(preset, state.mode, c.scene)).map(([key, value]) => `${t(QUALITY_FIELD_LABELS[key]())} ${value}`).join('、')}`).join('；')
+  const mismatch = shown !== stored
+    ? `<div class="notice warning">工程记录的档位为“${t(QUALITY_PRESET_LABELS[stored])}”，但当前模式的参数与该档不一致（档位按模式分别写入），重新选择档位即可套用。</div>` : ''
+  return `${field('运行质量', `<select class="select" id="qualityPreset">${options}</select>`)}<div class="notice">${summary}。选择档位只改写当前模式实际读取的参数；手动修改其中任一参数后显示为“自定义”。${state.mode === 'eVoxelEB' ? '标准档步数上限 = 场景对角线体元数 × 1.5，高精度档 = max(512, × 3)，取 16 的倍数；修改场景尺寸或体元大小时随之更新。' : ''}</div>${mismatch}`
+}
+
+function runTimeoutControl(c) {
+  const minutes = normalizeRunTimeoutMinutes(c.control?.runTimeoutMinutes)
+  const serverDefault = state.serverRunTimeoutSeconds ? formatDuration(state.serverRunTimeoutSeconds) : '15 分钟'
+  return `${field('单次运行上限', inputUnit('runTimeoutMinutes', minutes || '', '分钟', `type="number" min="0" max="1440" step="1" placeholder="默认 ${escapeHtml(serverDefault)}"`))}<div class="notice">只计引擎执行时间，超过后终止运行并记为超时。留空或 0 使用服务端默认（当前 ${escapeHtml(serverDefault)}，可用环境变量 STREAM_STUDIO_RUN_TIMEOUT_MS 设置）；工程内可设 1–1440 分钟。</div>`
+}
+
+function applyQualityPreset(preset) {
+  const c = state.config
+  if (!c || !['fast', 'standard', 'high'].includes(preset)) return
+  const values = qualityPresetValues(preset, state.mode, c.scene)
+  Object.assign(c.control, values)
+  c.control.qualityPreset = preset
+  addLog(`运行质量已切换为“${QUALITY_PRESET_LABELS[preset]}”：${Object.entries(values).map(([key, value]) => `${key}=${value}`).join('，') || '当前模式无受管参数'}`)
+  syncProjectText()
+  renderInspector()
+}
+
+// 用户手动修改受档位管理的参数后切到“自定义”（改回与档位相同的值则保持原档位）。
+function markQualityCustom(key) {
+  const c = state.config
+  if (!c?.control || !qualityPresetFields(state.mode).includes(key)) return
+  const stored = storedQualityPreset(c)
+  if (stored === 'custom' || qualityPresetMatches(stored, state.mode, c.control, c.scene)) return
+  c.control.qualityPreset = 'custom'
+  const select = $('#qualityPreset')
+  if (select) select.value = 'custom'
+  addLog(`已手动修改受档位管理的参数（${key}），运行质量记为“自定义”`)
+}
+
+// 场景尺寸或体元大小改变时，若 VoxelEB 参数正按某档取值，按新场景重算步数上限。手动改过受管参数的
+// 工程已记为“自定义”，因此档位非自定义且其余受管参数与该档一致即视为在用该档（高度输入框的实时预览
+// 会先写入场景，不能依赖改动前的场景判断步数是否一致）。
+function followQualityPresetScene(mutate) {
+  mutate()
+  const c = state.config
+  const stored = c ? storedQualityPreset(c) : 'custom'
+  if (stored === 'custom' || state.mode !== 'eVoxelEB') return
+  const values = qualityPresetValues(stored, state.mode, c.scene)
+  const following = Object.entries(values).every(([key, value]) => key === 'radiationMaxSteps' || Number(c.control[key]) === value)
+  if (following && values.radiationMaxSteps !== c.control.radiationMaxSteps) {
+    c.control.radiationMaxSteps = values.radiationMaxSteps
+    addLog(`场景尺寸变化，按“${QUALITY_PRESET_LABELS[stored]}”档重算体元射线步数上限为 ${values.radiationMaxSteps}`)
+  }
+}
+
+// 切换计算模式后，若工程记录了某个档位，把该档写入新模式实际读取的参数。
+function followQualityPresetMode() {
+  const c = state.config
+  const stored = c ? storedQualityPreset(c) : 'custom'
+  if (stored === 'custom' || qualityPresetMatches(stored, state.mode, c.control, c.scene)) return
+  const values = qualityPresetValues(stored, state.mode, c.scene)
+  Object.assign(c.control, values)
+  addLog(`按工程运行质量“${QUALITY_PRESET_LABELS[stored]}”写入新模式参数：${Object.entries(values).map(([key, value]) => `${key}=${value}`).join('，')}`)
+  syncProjectText()
 }
 
 // Blank or non-numeric entries in a number field restore the previous value
@@ -2569,8 +2648,8 @@ function bindInspector() {
   const c = state.config
   if (!c) return
   // DEFERRED[中|Bug]: sceneX/sceneY/sceneHeight/voxelSize/rayDepth/couplingIterations/sensorX/sensorY 等只校验“有限数”，不校验 min（HTML min 属性不阻止 change 提交），0 或负值会写进 project.json 交给引擎（体元 0 m、分辨率 0、尺寸负数）；预览侧 generateWorld 用 Math.max 兜底掩盖了问题；建议：为这些字段传入带下限/取整的 converter，与 project-schema 的 normalize 规则保持一致 —— bindValue 已能拦住空串/非有限值（回退原值），但“下限”需要为每个字段新增数值约束并与服务端 normalize 对齐，本轮禁止新增/修改数值常量
-  bindValue('sceneX', (v) => c.scene.x = v, 'Scene sceneSizeX', Number, true); bindValue('sceneY', (v) => c.scene.y = v, 'Scene sceneSizeY', Number, true)
-  bindValue('sceneHeight', (v) => c.scene.height = v, 'Scene Height', Number, true); bindValue('voxelSize', (v) => c.scene.voxel = v, 'Scene voxelSize'); bindValue('voxelFillThreshold', (v) => c.scene.voxelFillThreshold = Math.min(1, Math.max(0, v)), 'Scene voxelFillThreshold')
+  bindValue('sceneX', (v) => followQualityPresetScene(() => c.scene.x = v), 'Scene sceneSizeX', Number, true); bindValue('sceneY', (v) => followQualityPresetScene(() => c.scene.y = v), 'Scene sceneSizeY', Number, true)
+  bindValue('sceneHeight', (v) => followQualityPresetScene(() => c.scene.height = v), 'Scene Height', Number, true); bindValue('voxelSize', (v) => followQualityPresetScene(() => c.scene.voxel = v), 'Scene voxelSize'); bindValue('voxelFillThreshold', (v) => c.scene.voxelFillThreshold = Math.min(1, Math.max(0, v)), 'Scene voxelFillThreshold')
   for (const [id, key] of [['sceneOffsetX', 'offsetX'], ['sceneOffsetY', 'offsetY'], ['sceneOffsetZ', 'offsetZ']]) {
     bindValue(id, (value) => c.scene[key] = value, `Scene ${key}`, Number, true)
     $(`#${id}`)?.addEventListener('input', (event) => {
@@ -2600,10 +2679,10 @@ function bindInspector() {
     scheduleProjectTextSync()
   })
   bindValue('rayDepth', (v) => c.control.depth = Math.max(1, Math.min(16, Math.round(v))), 'Control rayTracingDepth', (value) => Math.max(1, Math.min(16, Math.round(Number(value) || 4))))
-  bindValue('raytracingDepth', (v) => c.control.raytracingDepth = v, 'Control raytracingDepth', (value) => Math.max(1, Math.min(64, Math.round(Number(value) || 16))))
-  bindValue('radiationMaxSteps', (v) => c.control.radiationMaxSteps = v, 'Control radiationMaxSteps', (value) => Math.max(16, Math.min(4096, Math.round(Number(value) || 64))))
-  bindValue('shortwaveScatteringOrders', (v) => c.control.shortwaveScatteringOrders = v, 'Control shortwaveScatteringOrders', (value) => Math.max(1, Math.min(3, Math.round(Number(value)) || 1)))
-  bindValue('sampleCount', (v) => c.control.samples = Math.min(1024, Math.max(1, Math.round(v))), 'Control sampleCount', (value) => Math.min(1024, Math.max(1, Math.round(Number(value) || 32))))
+  bindValue('raytracingDepth', (v) => { c.control.raytracingDepth = v; markQualityCustom('raytracingDepth') }, 'Control raytracingDepth', (value) => Math.max(1, Math.min(64, Math.round(Number(value) || 16))))
+  bindValue('radiationMaxSteps', (v) => { c.control.radiationMaxSteps = v; markQualityCustom('radiationMaxSteps') }, 'Control radiationMaxSteps', (value) => Math.max(16, Math.min(4096, Math.round(Number(value) || 64))))
+  bindValue('shortwaveScatteringOrders', (v) => { c.control.shortwaveScatteringOrders = v; markQualityCustom('shortwaveScatteringOrders') }, 'Control shortwaveScatteringOrders', (value) => Math.max(1, Math.min(3, Math.round(Number(value)) || 1)))
+  bindValue('sampleCount', (v) => { c.control.samples = Math.min(1024, Math.max(1, Math.round(v))); markQualityCustom('samples') }, 'Control sampleCount', (value) => Math.min(1024, Math.max(1, Math.round(Number(value) || 32))))
   bindValue('periodicTraversalCount', (count) => {
     c.control.periodicTraversalCount = count
   }, 'Control periodicNeighborCount', (value) => {
@@ -2615,9 +2694,20 @@ function bindInspector() {
     updateSceneSkybox(c)
   }, 'Control skyboxEnabled')
   bindSwitch('heterogeneousVoxelSwitch', () => Boolean(c.control.heterogeneousVoxel), (v) => c.control.heterogeneousVoxel = v, 'Control heterogeneousVoxel')
-  bindValue('voxelCollisionOrders', (v) => c.control.voxelCollisionOrders = v, 'Control voxelCollisionOrders', (value) => Math.max(2, Math.min(5, Math.round(Number(value)) || 2)))
+  bindValue('voxelCollisionOrders', (v) => { c.control.voxelCollisionOrders = v; markQualityCustom('voxelCollisionOrders') }, 'Control voxelCollisionOrders', (value) => Math.max(2, Math.min(5, Math.round(Number(value)) || 2)))
   bindValue('radiationSolver', (v) => c.control.radiationSolver = v, 'Control radiationSolver', (value) => value === 'accelerated' ? 'accelerated' : 'traditional')
-  bindValue('couplingIterations', (v) => c.control.couplingIterations = v, 'Control couplingIterations')
+  bindValue('couplingIterations', (v) => { c.control.couplingIterations = v; markQualityCustom('couplingIterations') }, 'Control couplingIterations')
+  $('#qualityPreset')?.addEventListener('change', (event) => applyQualityPreset(event.target.value))
+  // 留空或 0 = 服务端默认；其他值取整并限制在 1–1440 分钟。
+  $('#runTimeoutMinutes')?.addEventListener('change', (event) => {
+    const raw = String(event.target.value ?? '').trim()
+    const minutes = raw === '' ? 0 : normalizeRunTimeoutMinutes(raw)
+    if (raw !== '' && !Number.isFinite(Number(raw))) { event.target.value = c.control.runTimeoutMinutes || ''; return }
+    c.control.runTimeoutMinutes = minutes
+    event.target.value = minutes || ''
+    syncProjectText()
+    addLog(minutes ? `单次运行上限设为 ${minutes} 分钟` : '单次运行上限恢复为服务端默认')
+  })
   bindValue('spectralAccelerationWidth', (v) => c.control.spectralAccelerationWidth = Math.max(1, Math.min(1000, v)), 'Control spectralAccelerationWidth', (value) => Math.max(1, Math.min(1000, Number(value) || 100)))
   bindValue('temperatureTolerance', (v) => c.control.temperatureTolerance = v, 'Control temperatureTolerance')
   bindValue('temperatureRelaxation', (v) => c.control.temperatureRelaxation = v, 'Control temperatureRelaxation')
@@ -5128,11 +5218,51 @@ async function runPreflightCheck() {
   if (report.angles > 1) parts.push(`${report.angles} 个观测方向`)
   parts.push(`${report.bands} 个波段`)
   parts.push(report.estimateSeconds != null ? `预计约 ${formatDuration(report.estimateSeconds)}（${report.estimateBasis}）` : '暂无历史耗时可参考')
-  parts.push(`单次运行上限 ${formatDuration(report.timeoutSeconds)}`)
+  parts.push(`单次运行上限 ${formatDuration(report.timeoutSeconds)}${report.timeoutSource === 'project' ? '（工程设置）' : '（服务端默认）'}`)
   addLog(`运行预检 · ${parts.join(' · ')}`)
   for (const warning of report.warnings || []) addLog(`运行预检提示：${warning}`, 'warning')
   if (!report.warnings?.length) return true
-  return window.confirm(t(`运行预检发现以下风险：\n\n${report.warnings.map((item) => '• ' + item).join('\n')}\n\n仍要开始运行吗？`))
+  const riskText = `运行预检发现以下风险：\n\n${report.warnings.map((item) => '• ' + item).join('\n')}`
+  const suggested = Number(report.suggestedTimeoutMinutes) || 0
+  if (!suggested) return window.confirm(t(`${riskText}\n\n仍要开始运行吗？`))
+  // 预计耗时超过上限：提供把工程上限调到建议值（预计 × 1.5，向上取整到分钟）后再运行。
+  const choice = await chooseDialog({
+    title: '预计耗时超过单次运行上限', message: riskText,
+    actions: [
+      { id: 'raise', label: `把上限调到 ${suggested} 分钟并运行`, primary: true },
+      { id: 'run', label: '按当前上限运行' },
+      { id: 'cancel', label: '取消' }
+    ]
+  })
+  if (choice === 'cancel') return false
+  if (choice === 'raise') {
+    state.config.control.runTimeoutMinutes = suggested
+    ensureProjectState().configuration = state.config
+    syncProjectText()
+    if (!(await saveXml())) return false
+    addLog(`单次运行上限已调到 ${suggested} 分钟（工程设置）`, 'success')
+    if ($('#runTimeoutMinutes')) renderInspector()
+  }
+  return true
+}
+
+// 小型多按钮确认框（window.confirm 只有确定/取消两项）。Esc 或点遮罩视为 'cancel'。
+function chooseDialog({ title, message, actions }) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div')
+    backdrop.className = 'drawer-backdrop'
+    backdrop.innerHTML = `<section class="project-dialog choice-dialog" role="dialog" aria-modal="true" style="grid-template-rows:auto auto auto"><header style="min-height:56px"><h2>${escapeHtml(t(title))}</h2></header><div class="notice" style="margin:16px 18px;white-space:pre-wrap;font-size:12px;line-height:1.6">${escapeHtml(t(message))}</div><footer style="justify-content:flex-end;gap:8px;min-height:58px">${actions.map((action) => `<button class="button ${action.primary ? 'primary' : 'ghost'}" type="button" data-choice="${escapeHtml(action.id)}">${escapeHtml(t(action.label))}</button>`).join('')}</footer></section>`
+    const finish = (value) => { document.removeEventListener('keydown', onKey, true); backdrop.remove(); resolve(value) }
+    const onKey = (event) => { if (event.key === 'Escape') { event.preventDefault(); finish('cancel') } }
+    backdrop.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-choice]')
+      if (button) finish(button.dataset.choice)
+      else if (event.target === backdrop) finish('cancel')
+    })
+    document.addEventListener('keydown', onKey, true)
+    document.body.appendChild(backdrop)
+    backdrop.querySelector('.button.primary')?.focus()
+  })
 }
 
 async function startSimulation() {
@@ -7006,6 +7136,7 @@ function selectMode(mode, announce = false) {
     if (state.project) { markXmlDirty(); $('#unsavedMark').hidden = false }
     addLog(converted ? `面元场景已接入${button.querySelector('span').textContent}，体元大小 ${Number(state.config?.scene?.voxel) || 1} m` : `计算模式切换为 ${button.querySelector('span').textContent}`)
     if (converted) toast('面元 → 体元通道已启用', 'OBJ、材质和位置保持不变，运行时生成稀疏体元')
+    if (state.project) followQualityPresetMode()
     renderInspector()
   }
 }
@@ -7568,6 +7699,7 @@ async function init() {
     defaults = await api.defaults()
     state.executable = defaults.executable; state.executableExists = defaults.executableExists
     state.defaultExecutable = defaults.executable; state.defaultExecutableExists = defaults.executableExists
+    state.serverRunTimeoutSeconds = Number(defaults.runTimeoutSeconds) || 0
     $('#openHistreamProxyBtn').hidden = !defaults.histreamProxyConfigured
     setRunning(false)
     addLog(`GPU Radiosity：${defaults.radiosityExecutable}`, defaults.radiosityExecutableExists ? 'success' : 'error')

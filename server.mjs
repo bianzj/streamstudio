@@ -9,7 +9,7 @@ import { inflateSync } from 'node:zlib'
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { createDefaultProject, DEFAULT_SCENE_MODEL, normalizeProject, PROJECT_MODES, sensorBandValues, sensorViewAngles, stringifyProject, validateProject } from './src/renderer/src/project-schema.js'
+import { createDefaultProject, DEFAULT_SCENE_MODEL, normalizeProject, normalizeRunTimeoutMinutes, PROJECT_MODES, sensorBandValues, sensorViewAngles, stringifyProject, validateProject } from './src/renderer/src/project-schema.js'
 import { applyHistreamToUnified, histreamProjectToUnified, isUnifiedProject, normalizeUnified, stringifyUnifiedProject, unifiedToHistreamProject } from './src/renderer/src/project-unified.js'
 import { prepareRuntimeSceneProject } from './tools/runtime-scene.mjs'
 import { generateTarpCover } from './tools/tarp-cover.mjs'
@@ -44,9 +44,14 @@ const MAX_FACET_TRIANGLES = 5_000_000
 // 单次三维运行的硬上限：超时即终止整棵进程树；结果体积超过上限则跳过读取与结果处理。
 const RUN_TIMEOUT_MS = Number(process.env.STREAM_STUDIO_RUN_TIMEOUT_MS) || 15 * 60 * 1000
 const MAX_RESULT_BYTES = Number(process.env.STREAM_STUDIO_MAX_RESULT_BYTES) || 8 * 1024 * 1024 * 1024
-const runTimeoutLabel = () => (RUN_TIMEOUT_MS >= 60000
-  ? `${Math.round(RUN_TIMEOUT_MS / 60000)} 分钟`
-  : `${Math.max(1, Math.round(RUN_TIMEOUT_MS / 1000))} 秒`)
+// 工程可用 control.runTimeoutMinutes（1–1440 分钟）覆盖；0/缺省用上面的服务端默认。
+const projectRunTimeoutMs = (project) => {
+  const minutes = normalizeRunTimeoutMinutes(project?.configuration?.control?.runTimeoutMinutes)
+  return minutes ? minutes * 60000 : RUN_TIMEOUT_MS
+}
+const runTimeoutLabel = (ms = RUN_TIMEOUT_MS) => (ms >= 60000
+  ? `${Math.round(ms / 60000)} 分钟`
+  : `${Math.max(1, Math.round(ms / 1000))} 秒`)
 // histream.exe exit codes (see models/histream/src/main.cpp).  Only FacetEB uses
 // 2 = "finished, some nodes non-converged, results kept"; usage errors moved to 64
 // so they are no longer mistaken for a non-converged run.
@@ -858,7 +863,7 @@ const atmosphereLutCache = new Map()
 // latest three), so they reflect this scene on this machine.
 function durationLabel(seconds) {
   const value = Math.max(0, Math.round(Number(seconds) || 0))
-  return value < 90 ? ` 秒` : value < 5400 ? ` 分钟` : ` 小时`
+  return value < 90 ? `${value} 秒` : value < 5400 ? `${Math.round(value / 60)} 分钟` : `${(value / 3600).toFixed(1)} 小时`
 }
 
 function runPreflight(input, project, mode) {
@@ -872,7 +877,10 @@ function runPreflight(input, project, mode) {
   const perspective = ['perspective', 'central', 'center'].includes(String(c.sensor?.projection))
   const angles = perspective ? 1 : Math.max(1, sensorViewAngles(c.sensor, c.light?.azimuth).length)
   const bands = Math.max(1, sensorBandValues(c.sensor).length)
-  const result = { mode, nodes, angles, bands, timeoutSeconds: Math.round(RUN_TIMEOUT_MS / 1000), warnings }
+  const timeoutMs = projectRunTimeoutMs(project)
+  const result = { mode, nodes, angles, bands, timeoutSeconds: Math.round(timeoutMs / 1000),
+    timeoutSource: normalizeRunTimeoutMinutes(c.control?.runTimeoutMinutes) ? 'project' : 'server',
+    serverTimeoutSeconds: Math.round(RUN_TIMEOUT_MS / 1000), warnings }
   if (mode === 'eFacetRT' || mode === 'eFacetEB') {
     const estimate = estimateFacetTriangles(project, baseDir)
     const raster = Math.max(Number(c.scene?.x) || 0, Number(c.scene?.y) || 0) >= 1000 ? 2048 : 1024
@@ -918,10 +926,13 @@ function runPreflight(input, project, mode) {
     const perUnit = recent[recent.length >> 1]
     result.estimateSeconds = Math.round(perUnit * (energy ? nodes : angles))
     result.estimateBasis = `${recent.length} 次同模式历史运行，约 ${perUnit.toFixed(1)} s/${energy ? '节点' : '观测'}`
-    if (result.estimateSeconds > RUN_TIMEOUT_MS / 1000) warnings.push(`预计约 ${durationLabel(result.estimateSeconds)}，超过单次运行上限 ${runTimeoutLabel()}，将被中途终止；请减少节点/观测数，或设置 STREAM_STUDIO_RUN_TIMEOUT_MS`)
-    else if (result.estimateSeconds > 0.8 * RUN_TIMEOUT_MS / 1000) warnings.push(`预计约 ${durationLabel(result.estimateSeconds)}，接近单次运行上限 ${runTimeoutLabel()}`)
+    if (result.estimateSeconds > timeoutMs / 1000) {
+      // 建议上限 = 预计耗时 × 1.5，向上取整到分钟（不超过工程允许的 1440 分钟）。
+      result.suggestedTimeoutMinutes = Math.min(1440, Math.max(1, Math.ceil(result.estimateSeconds * 1.5 / 60)))
+      warnings.push(`预计约 ${durationLabel(result.estimateSeconds)}，超过单次运行上限 ${runTimeoutLabel(timeoutMs)}，将被中途终止；请减少节点/观测数，或在仿真控制中把“单次运行上限”调到 ${result.suggestedTimeoutMinutes} 分钟`)
+    } else if (result.estimateSeconds > 0.8 * timeoutMs / 1000) warnings.push(`预计约 ${durationLabel(result.estimateSeconds)}，接近单次运行上限 ${runTimeoutLabel(timeoutMs)}`)
   } else if (energy && nodes > 24) {
-    warnings.push(`本次 ${nodes} 个时间节点且无历史耗时可参考；单次运行上限为 ${runTimeoutLabel()}，建议先用少量节点试算`)
+    warnings.push(`本次 ${nodes} 个时间节点且无历史耗时可参考；单次运行上限为 ${runTimeoutLabel(timeoutMs)}，建议先用少量节点试算`)
   }
   return result
 }
@@ -4067,7 +4078,7 @@ async function api(request, response, url) {
   }
   if (request.method === 'GET' && url.pathname === '/api/defaults') {
     const path = executable()
-    return json(response, 200, { executable: windowsPath(path), executableExists: existsSync(path), radiosityExecutable: windowsPath(path), radiosityExecutableExists: existsSync(path), projectFile: windowsPath(projectFile), platform: process.platform, histreamProxyConfigured: Boolean(String(envSetting('STREAM_STUDIO_PROXY_MANIFEST', 'HISTREAM_STUDIO_PROXY_MANIFEST') || '').trim()), appVersion: APP_VERSION, streamExecutable: streamService.executable(), versions: { node: process.versions.node, three: '0.185.1' } })
+    return json(response, 200, { executable: windowsPath(path), executableExists: existsSync(path), radiosityExecutable: windowsPath(path), radiosityExecutableExists: existsSync(path), projectFile: windowsPath(projectFile), platform: process.platform, histreamProxyConfigured: Boolean(String(envSetting('STREAM_STUDIO_PROXY_MANIFEST', 'HISTREAM_STUDIO_PROXY_MANIFEST') || '').trim()), runTimeoutSeconds: Math.round(RUN_TIMEOUT_MS / 1000), appVersion: APP_VERSION, streamExecutable: streamService.executable(), versions: { node: process.versions.node, three: '0.185.1' } })
   }
   if (request.method === 'POST' && url.pathname === '/api/help/open') {
     try {
@@ -4500,12 +4511,13 @@ async function api(request, response, url) {
       // 单次运行硬超时：到点终止整棵进程树，并按超时结束（结果不完整）。
       // 只计引擎执行时间：FacetEB 逐节点出图期间引擎阻塞等待 FACET_ACK，
       // 这段结果后处理时间暂停计时（与用户手册“结果后处理不计入”一致）。
-      let runTimer = null, runTimerStartedAt = 0, runTimeRemaining = RUN_TIMEOUT_MS
+      const runTimeoutMs = projectRunTimeoutMs(project)
+      let runTimer = null, runTimerStartedAt = 0, runTimeRemaining = runTimeoutMs
       const onRunTimeout = () => {
         runTimer = null
         if (running.histreamTimedOut) return
         running.histreamTimedOut = true
-        emit({ type: 'error', text: `运行超过 ${runTimeoutLabel()}，已终止` })
+        emit({ type: 'error', text: `运行超过 ${runTimeoutLabel(runTimeoutMs)}，已终止` })
         try { spawn('taskkill', ['/pid', String(running.pid), '/T', '/F'], { windowsHide: true }).on('error', () => running.kill('SIGKILL')) }
         catch { try { running.kill('SIGKILL') } catch {} }
       }
@@ -4643,7 +4655,7 @@ async function api(request, response, url) {
         const nonConverged = data.mode === 'eFacetEB' && finalCode === HISTREAM_EXIT.facetNonConverged
         const status = running.histreamTimedOut ? 'timeout' : running.histreamStopped ? 'stopped' : nonConverged ? 'non_converged' : finalCode === 0 ? 'completed' : 'failed'
         writeRunManifest(run, { status, finishedAt: new Date().toISOString(), exitCode: finalCode, signal,
-          ...(running.histreamTimedOut ? { error: `运行超过 ${runTimeoutLabel()}，已终止` } : {}),
+          ...(running.histreamTimedOut ? { error: `运行超过 ${runTimeoutLabel(runTimeoutMs)}，已终止` } : {}),
           ...(conversionWarnings.length ? { warnings: conversionWarnings } : {}),
           ...(stepOutputError ? { error: stepOutputError.message } : {}), completed: { ...run.manifest.completed, products: runProductPaths(run.outputDir) } })
         emit({ type: 'closed', code: finalCode, signal, status, runId: run.runId, outputDir: windowsPath(run.outputDir), elapsed: Date.now() - startedAt,
