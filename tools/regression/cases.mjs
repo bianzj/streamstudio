@@ -18,6 +18,9 @@ const MWIR_BANDS = { 'configuration.sensor.bands': '3800,10500', 'configuration.
   'configuration.sensor.temperature': true }
 // Every soil set on soil method 1 (the control value overrides the material).
 const SOIL_METHOD_1 = { 'configuration.control.soilTemperatureMethod': 1 }
+const SOIL_METHOD_2 = { 'configuration.control.soilTemperatureMethod': 2 }
+// No per-node process products (energy-process diagnostics are tens of MB per node).
+const NO_PROCESS = { 'configuration.sensor.energyProcess': false, 'configuration.sensor.radiationProcess': false }
 // Method 1 with the complete heat history (8 nodes + exponential modes).
 const SOIL_HISTORY_FULL = { 'configuration.control.soilInertiaHistory': 'full' }
 const soilThermal = (cs, rhos, lambdas) => (index) => ({ [`configuration.materials.${index}.params.cs`]: cs,
@@ -168,7 +171,7 @@ export const CASES = {
     'configuration.materials.8.params.mixingDepth': 2, 'configuration.materials.8.params.initialTemperatureMode': 'dailyMeanAir' } },
   feb_urban_wall_layered: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], set: {
     'configuration.materials.5.params.wallMode': 'wall', 'configuration.materials.5.params.layers': WALL_LAYERS,
-    'configuration.materials.9': { name: 'building_roof', label: '建筑屋顶', type: 'Building', params: {
+    'configuration.materials.9': { name: 'building_roof', label: '寤虹瓚灞嬮《', type: 'Building', params: {
       method: 2, rss: 1000000000, cs: 880, rhos: 2300, lambdas: 1.4, Tsoil: 25, SMC: 0, Satwater: 0, wallMode: 'wall',
       thickness: 0.3, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, layers: ROOF_LAYERS } },
     'configuration.objects.items.0.meshes.1.materialName': 'building_roof' } },
@@ -241,6 +244,16 @@ export const CASES = {
   feb_urban_soil_m1_2d: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 96], set: { ...SOIL_LOAM(4), ...SOIL_METHOD_1 } },
   feb_urban_soil_m1_2d_full: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 96], set: {
     ...SOIL_LOAM(4), ...SOIL_METHOD_1, ...SOIL_HISTORY_FULL } },
+  // Soil method 2 column over three days (nodes 0-144, 30 min) on the new loam (2026-11-23):
+  // the multi-day G, Ts, column heat and bottom flux are compared with method 1 + full
+  // history (the infinite half-space) on the same material and meteorology. Process output
+  // is off (the energy-process diagnostics are tens of MB per node).
+  veb_urban_soil_m2_3d: { example: 'urban_block', mode: 'eVoxelEB', meteo: [0, 144], set: { ...SOIL_LOAM(4), ...SOIL_METHOD_2 } },
+  veb_urban_soil_m1_3d_full: { example: 'urban_block', mode: 'eVoxelEB', meteo: [0, 144], set: {
+    ...SOIL_LOAM(4), ...SOIL_METHOD_1, ...SOIL_HISTORY_FULL } },
+  feb_urban_soil_m2_3d: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 144], set: { ...SOIL_LOAM(4), ...SOIL_METHOD_2, ...NO_PROCESS } },
+  feb_urban_soil_m1_3d_full: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 144], set: {
+    ...SOIL_LOAM(4), ...SOIL_METHOD_1, ...SOIL_HISTORY_FULL, ...NO_PROCESS } },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.

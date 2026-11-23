@@ -6570,6 +6570,12 @@ try {
         // when the sunlit/shaded transfer conserves heat; equal to the legacy
         // jump / dt otherwise.
         double soilClosureArea = 0, soilClosureSum = 0, soilClosureAbs = 0, soilClosureMax = 0;
+        // Area-weighted soil-column summary (method 2, upward side of the ground): conducted
+        // flux into the column at the surface and out of it at the bottom, column heat, and
+        // the bottom-layer temperature, for the multi-day drift/closure check.
+        double columnArea = 0, columnTop = 0, columnBottom = 0, columnHeat = 0, columnCapacity = 0,
+            columnLastLayer = 0, columnSurface = 0;
+        ProjectJson::Json soilColumnSummary;
         double objectClosureArea = 0, objectClosureSum = 0, objectClosureAbs = 0, objectClosureMax = 0;
         const bool closureAvailable = node != startNode;
         for (size_t g = 0; g < groundSides; ++g) {
@@ -6577,7 +6583,7 @@ try {
             const auto& soil = surfaceForFacet(scene, static_cast<uint32_t>(side / 2));
             if (soil.soilTemperatureMethod != 2) continue;
             if (side % 2U == groundDownSide(static_cast<uint32_t>(side / 2))) continue;
-            double conducted = 0, heat = 0;
+            double conducted = 0, heat = 0, topSum = 0, bottomSum = 0, lastSum = 0, surfaceSum = 0;
             for (int state = 0; state < 2; ++state) {
                 const double weight = state == 0 ? sunlitPart[side] : 1.0 - sunlitPart[side];
                 const auto next = soilResponses[state][g].profile(stateTemperature[state][side]);
@@ -6586,6 +6592,8 @@ try {
                     (.5 * (facetphysics::soilEdges.back() - facetphysics::soilEdges[facetphysics::soilLayers - 1]));
                 conducted += weight * (topFlux - bottomFlux);
                 heat += weight * soilColumnHeat(soil, next);
+                topSum += weight * topFlux; bottomSum += weight * bottomFlux;
+                lastSum += weight * next.back(); surfaceSum += weight * stateTemperature[state][side];
                 double storage = 0;
                 for (size_t layer = 0; layer < facetphysics::soilLayers; ++layer)
                     storage += soil.specificHeat * soil.density * (facetphysics::soilEdges[layer + 1] - facetphysics::soilEdges[layer]) *
@@ -6604,7 +6612,19 @@ try {
                 soilClosureMax = std::max(soilClosureMax, std::abs(residual));
             }
             previousSoilHeat[g] = heat;
+            {
+                const double area = facetAreas[side / 2];
+                columnArea += area; columnTop += area * topSum; columnBottom += area * bottomSum;
+                columnHeat += area * heat; columnLastLayer += area * lastSum; columnSurface += area * surfaceSum;
+                columnCapacity += area * soil.specificHeat * soil.density * facetphysics::soilEdges.back();
+            }
         }
+        if (columnArea > 0) soilColumnSummary = {{"area_m2", columnArea},
+            {"meanSurfaceTemperature_K", columnSurface / columnArea},
+            {"meanSurfaceFlux_W_m2", columnTop / columnArea}, {"meanBottomFlux_W_m2", columnBottom / columnArea},
+            {"meanColumnHeat_J_m2", columnHeat / columnArea},
+            {"meanColumnTemperature_K", columnHeat / columnCapacity},
+            {"meanBottomLayerTemperature_K", columnLastLayer / columnArea}};
         diagnostic["maximumSoilClosure_W_m2"] = maxSoilClosure;
         for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet) {
             if (wallIndex[facet] >= 0) continue; // slab heat: buildingWalls closure below
@@ -6970,6 +6990,7 @@ try {
             {"energyResidual", maximumEnergyResidual}, {"energyResidualUnits", "W m-2"},
             {"energyResidualTemperatureEquivalent", maximumEnergyResidualEquivalent}
         });
+        if (!soilColumnSummary.is_null()) runIndex.value["completed"].back()["soilColumn"] = soilColumnSummary;
         runIndex.write();
 
         if (node == endNode - 1) {
