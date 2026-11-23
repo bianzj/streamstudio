@@ -201,6 +201,15 @@ struct SurfaceParameters {
     // Building wall/roof slab (wallMode "wall"); false keeps the thin shell.
     bool wall{false};
     facetphysics::WallSlab wallSlab;
+    // Ship hull (material type Ship): speed through the air (m/s) added to the
+    // wind for forced convection, u_rel = sqrt(u^2 + speed^2); facets whose
+    // centre lies below waterlineHeight (world y) exchange heat with the water
+    // (coefficient waterCoefficient, temperature waterK or the scene water).
+    float shipSpeed{0.0f};
+    bool waterline{false};
+    float waterlineHeight{0.0f};
+    float waterCoefficient{500.0f};
+    float waterK{-1.0f};
     float leafWidth{0.1f};
     LeafBiochemistry leaf;
     uint8_t outputComponent{0}; // 0 unknown, 1 soil/background, 2 vegetation, 3 building, 4 PV, 5 water
@@ -2937,6 +2946,19 @@ std::string facetInputView(const std::string& path)
                 xml << "<wallLayers>" << layers.str() << "</wallLayers>";
             }
         }
+        // Ship hull: relative wind (speed > 0) and waterline contact; absent
+        // fields write nothing, so other materials keep the old XML.
+        if (!pv && !leaf && !water && ProjectJson::string(item,"type")=="Ship") {
+            if (ProjectJson::number(p,"speed",0) > 0)
+                xml << "<shipSpeed>" << ProjectJson::number(p,"speed",0) << "</shipSpeed>";
+            if (p.contains("waterlineHeight") && p["waterlineHeight"].is_number()) {
+                xml << "<waterlineHeight>" << ProjectJson::number(p,"waterlineHeight",0) << "</waterlineHeight>"
+                    << "<waterHeatTransferCoefficient>" << ProjectJson::number(p,"waterHeatTransferCoefficient",500)
+                    << "</waterHeatTransferCoefficient>";
+                if (p.contains("waterTemperature") && p["waterTemperature"].is_number())
+                    xml << "<waterTemperature>" << ProjectJson::number(p,"waterTemperature",20) << "</waterTemperature>";
+            }
+        }
         if (leaf) {
             std::string tparam = p.contains("Tparam") && p["Tparam"].is_string()
                 ? p["Tparam"].get<std::string>() : std::string("0.2,0.3,288,313,328");
@@ -4171,6 +4193,23 @@ Scene loadProjectScene(const std::string& inputFile)
                     slab.validate();
                     material.wall = true;
                 }
+                // Ship hull options (same block as the wall tags).
+                if (!material.vegetation && !material.photovoltaic && !material.water) {
+                    material.shipSpeed = xmlFloat(wallBlock, "shipSpeed", 0);
+                    if (!std::isfinite(material.shipSpeed) || material.shipSpeed < 0 || material.shipSpeed > 100)
+                        throw std::runtime_error("Ship speed must be 0-100 m/s: " + physicalName);
+                    if (!trim(firstXmlTag(wallBlock, "waterlineHeight")).empty()) {
+                        material.waterline = true;
+                        material.waterlineHeight = xmlFloat(wallBlock, "waterlineHeight", 0);
+                        material.waterCoefficient = xmlFloat(wallBlock, "waterHeatTransferCoefficient", 500);
+                        if (!trim(firstXmlTag(wallBlock, "waterTemperature")).empty())
+                            material.waterK = xmlFloat(wallBlock, "waterTemperature", 20) + 273.15f;
+                        if (!std::isfinite(material.waterlineHeight) || !(material.waterCoefficient > 0) ||
+                            !std::isfinite(material.waterCoefficient) ||
+                            (material.waterK >= 0 && !(material.waterK > 250 && material.waterK < 340)))
+                            throw std::runtime_error("Invalid ship waterline parameters: " + physicalName);
+                    }
+                }
             }
             const uint32_t materialIndex =
                 static_cast<uint32_t>(scene.materials.size());
@@ -4900,6 +4939,25 @@ try {
                 {"maximumIndoorSideSkyView", maximumIndoorView}, {"layers", facetphysics::wallCellsPerLayer}};
         }
     }
+    // Ship hulls: facets whose centre lies below the material waterline exchange
+    // heat with the water instead of the air on their outer face (wall slab) or
+    // on one of their two faces (thin shell); no latent heat either way.
+    std::vector<uint8_t> submergedFacet;
+    bool anyShipSpeed = false;
+    {
+        uint32_t submergedCount = 0;
+        double submergedArea = 0;
+        for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
+            const auto& s = surfaceForFacet(scene, f);
+            anyShipSpeed = anyShipSpeed || s.shipSpeed > 0;
+            if (!s.waterline || !(facetHeight[f] < s.waterlineHeight)) continue;
+            if (submergedFacet.empty()) submergedFacet.assign(scene.leafFacetCount, 0);
+            submergedFacet[f] = 1;
+            ++submergedCount;
+            submergedArea += facetAreas[f];
+        }
+        if (submergedCount) runIndex.value["shipWaterline"] = {{"facets", submergedCount}, {"area_m2", submergedArea}};
+    }
     runIndex.write();
     const size_t firstGroundSide = static_cast<size_t>(scene.leafFacetCount) * 2U;
     const size_t groundSides = surfaceCount - firstGroundSide;
@@ -5008,6 +5066,24 @@ try {
         geometry.close();
         if (!geometry) throw std::runtime_error("FacetEB cannot write shared geometry");
     }
+    // Ship waterline contact: the water temperature is the area-mean temperature
+    // of the scene water facets at the start of each node; a material
+    // waterTemperature overrides it; without scene water the first-node air.
+    const auto sceneWaterTemperature = [&]() {
+        double sum = 0, area = 0;
+        for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
+            const auto& s = surfaceForFacet(scene, f);
+            if (!s.water || s.vegetation) continue;
+            sum += facetAreas[f] * temperature[size_t(f) * 2U];
+            area += facetAreas[f];
+        }
+        return area > 0 ? static_cast<float>(sum / area) : -1.0f;
+    };
+    const float shipFirstAirK = meteorology.empty() ? 293.15f
+        : std::clamp(meteorology[size_t(startNode)].airTemperature + 273.15f, 220.0f, 340.0f);
+    const auto shipWaterK = [&](const SurfaceParameters& s, float sceneWaterK) {
+        return s.waterK >= 0 ? s.waterK : sceneWaterK >= 0 ? sceneWaterK : shipFirstAirK;
+    };
     const auto totalBegin = Clock::now();
     double lumpedElapsedSeconds=0;
     for (int node = startNode; node < endNode; ++node) {
@@ -5055,8 +5131,17 @@ try {
                 const float start = surface.waterInitialMode == 1 ? dailyMeanAirK : surface.waterInitialK;
                 temperature[size_t(facet) * 2U] = temperature[size_t(facet) * 2U + 1U] = start;
             }
+            // Submerged hull facets start at the water temperature.
+            if (!submergedFacet.empty()) {
+                const float startWaterK = sceneWaterTemperature();
+                for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet)
+                    if (submergedFacet[facet])
+                        temperature[size_t(facet) * 2U] = temperature[size_t(facet) * 2U + 1U] =
+                            shipWaterK(surfaceForFacet(scene, facet), startWaterK);
+            }
             stateTemperature = {temperature, temperature};
         }
+        const float nodeWaterK = submergedFacet.empty() ? -1.0f : sceneWaterTemperature();
         // Illuminated part of each side. A thin object facet has one sunlit
         // part shared by both faces (sunlit when either face is), as in FacetRT.
         std::vector<float> sunlitPart(surfaceCount);
@@ -5342,6 +5427,27 @@ try {
             (287.05f * airTemperature);
         const float aerodynamicResistance = airDensity * 1005.0f /
             std::max(0.1f, aerodynamicConductance);
+        // Ship hulls (energy.comp P[3]): the forced-convection coefficient at the
+        // relative wind sqrt(u^2 + speed^2) as a multiplier of the material
+        // convective scale; speed 0 keeps the material value.
+        const auto objectConvectiveScale = [&](const SurfaceParameters& s) {
+            if (!(s.shipSpeed > 0)) return s.convectiveScale;
+            const float relative = std::sqrt(meteo.windSpeed * meteo.windSpeed + s.shipSpeed * s.shipSpeed);
+            return s.convectiveScale * (5.8f + 4.1f * std::sqrt(std::max(0.1f, relative))) / aerodynamicConductance;
+        };
+        // Submerged hull facet (energy.comp P[30], P[31]): total sensible
+        // conductance and its reference temperature; {0, air} = air exchange.
+        // A wall slab's outer face touches the water; a thin shell has one face
+        // on the water and the other in the air.
+        const auto waterContact = [&](uint32_t facet, const SurfaceParameters& s) -> std::array<float, 2> {
+            if (submergedFacet.empty() || facet >= scene.leafFacetCount || !submergedFacet[facet])
+                return {0.0f, airTemperature};
+            const float waterK = shipWaterK(s, nodeWaterK);
+            if (wallIndex[facet] >= 0) return {s.waterCoefficient, waterK};
+            const float air = aerodynamicConductance * objectConvectiveScale(s);
+            const float total = s.waterCoefficient + air;
+            return {total, (s.waterCoefficient * waterK + air * airTemperature) / total};
+        };
         for (size_t index = 0; index < columns.size(); ++index) {
             columnAerodynamics[index] = aerodynamics(
                 referenceHeight, meteo.windSpeed, columns[index].height,
@@ -5477,12 +5583,15 @@ try {
                             const bool waterSurface = surface.water && !leafExchange;
                             const CanopyAerodynamics& aerodynamics =
                                 columnAerodynamics[facetColumn[facet]];
+                            const std::array<float, 2> contact = leafExchange
+                                ? std::array<float, 2>{0.0f, airTemperature} : waterContact(facet, surface);
                             const float facetSensibleConductance = leafExchange
                                 ? airDensity * 1005.0f * surface.convectiveScale /
                                     aerodynamics.leafResistance
-                                : (waterSurface || wall >= 0 ? 1.0f : 2.0f) * aerodynamicConductance * surface.convectiveScale;
+                                : contact[0] > 0.0f ? contact[0]
+                                : (waterSurface || wall >= 0 ? 1.0f : 2.0f) * aerodynamicConductance * objectConvectiveScale(surface);
                             const float facetSensibleHeat = facetSensibleConductance *
-                                (T[side0] - airTemperature);
+                                (T[side0] - contact[1]);
                             const CanopyColumn& column = columns[facetColumn[facet]];
                             const float relativeDepth = column.height > 0.0f
                                 ? -(column.top - facetHeight[facet]) / column.height : 0.0f;
@@ -5743,7 +5852,7 @@ try {
                 data[0] = mat.vegetation ? 1.0f : 0.0f;
                 data[1] = mat.photovoltaic ? 1.0f : 0.0f;
                 data[2] = mat.heatCapacityPerArea;
-                data[3] = mat.convectiveScale;
+                data[3] = mat.vegetation ? mat.convectiveScale : objectConvectiveScale(mat);
                 data[4] = mat.pvEta25;
                 data[5] = mat.pvGamma;
                 data[6] = mat.pvBifaciality;
@@ -5779,6 +5888,12 @@ try {
                 data[28] = wallFacet ? 2.0f : waterFacet ? 1.0f : 0.0f;
                 data[29] = wallFacet ? float(wallOuter[size_t(wallIndex[facet])])
                     : waterFacet ? mat.evaporationCoefficient : 0.0f;
+                // P[30] > 0: submerged ship-hull facet, total sensible conductance
+                // P[30] towards the reference temperature P[31].
+                if (!mat.vegetation) {
+                    const auto contact = waterContact(facet, mat);
+                    if (contact[0] > 0.0f) { data[30] = contact[0]; data[31] = contact[1]; }
+                }
             }
             for (int state = 0; state < 2; ++state)
                 for (size_t side = 0; side < surfaceCount; ++side)

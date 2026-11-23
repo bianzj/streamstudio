@@ -56,6 +56,22 @@ const WALL_LAYERS = [{ thickness: 0.1, lambda: 1.74, rho: 2500, cp: 920 }, { thi
   { thickness: 0.02, lambda: 0.87, rho: 1700, cp: 1050 }]
 const ROOF_LAYERS = [{ thickness: 0.05, lambda: 1.51, rho: 2300, cp: 920 }, { thickness: 0.1, lambda: 0.03, rho: 35, cp: 1380 },
   { thickness: 0.15, lambda: 1.74, rho: 2500, cp: 920 }]
+// The library bulk carrier at 0.15 scale (28.5 m x 4.2 m, hull 0-1.5 m, superstructure
+// to 5.1 m) floating 2 cm above the URBAN_WATER pond, material ship_material (index 7).
+// SHIP_NEW is the new-project ship_material (one 12 mm steel plate, 22 C interior).
+const SHIP_GROUPS = ['hull', 'weather_deck', 'cargo_hatches', 'deck_cranes', 'crane_booms', 'superstructure', 'bridge', 'funnel']
+const URBAN_SHIP = {
+  files: { ...URBAN_WATER.files, 'positions/regression_ship_position.txt': '280 65 0.02 0.15 0\n' },
+  addObjects: [...URBAN_WATER.addObjects, {
+    name: 'regression_ship', type: 'Ship', materialName: 'ship_material', canopyName: 'rigid_body',
+    fileName: 'assets/obj-library/ship/typical/modern_bulk_carrier.obj', positionFile: 'positions/regression_ship_position.txt',
+    shape: 'cube', dimensions: [4.2, 5.1, 28.5], instanceCount: 1,
+    meshes: SHIP_GROUPS.map((name) => ({ name, spectralName: 'ship_surface', thermalName: 'ship_temperature',
+      materialName: 'ship_material', canopyName: 'rigid_body' }))
+  }]
+}
+const SHIP_NEW = { method: 1, rss: 4000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 30, SMC: 0, Satwater: 0, wallMode: 'wall',
+  thickness: 0.012, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, layers: [{ thickness: 0.012, lambda: 50, rho: 7850, cp: 460 }], speed: 0 }
 
 export const CASES = {
   vrt_urban: { example: 'urban_block', mode: 'eVoxelRT' },
@@ -171,6 +187,17 @@ export const CASES = {
   vrt_urban_rot45: { example: 'urban_block', mode: 'eVoxelRT', positions: URBAN_ROTATED(45) },
   veb_urban_rot30: { example: 'urban_block', mode: 'eVoxelEB', meteo: [23, 25], positions: URBAN_ROTATED(30) },
   rt_urban_rot30: { example: 'urban_block', mode: 'eRaytracing', positions: URBAN_ROTATED(30) },
+  // FacetEB ship hull on the URBAN_WATER pond over one day (nodes 0-48): _shell is the
+  // example's old ship_material (thin shell), the others the new 12 mm steel-plate default;
+  // _speed8 sails at 8 m/s (relative wind), _waterline puts the hull below 0.9 m (world y)
+  // in contact with the pond water (500 W m-2 K-1).
+  feb_urban_ship_shell: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP },
+  feb_urban_ship: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP, set: {
+    'configuration.materials.7.params': SHIP_NEW } },
+  feb_urban_ship_speed8: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP, set: {
+    'configuration.materials.7.params': { ...SHIP_NEW, speed: 8 } } },
+  feb_urban_ship_waterline: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP, set: {
+    'configuration.materials.7.params': { ...SHIP_NEW, waterlineHeight: 0.9, waterHeatTransferCoefficient: 500 } } },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.

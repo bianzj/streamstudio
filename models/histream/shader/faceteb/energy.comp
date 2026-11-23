@@ -63,7 +63,11 @@ void main() {
             bool water=!leaf&&P[p+28u]>0.5&&P[p+28u]<1.5,wall=!leaf&&P[p+28u]>1.5;
             if(wall) rn=net[uint(P[p+29u]+0.5)];
             float conductance=leaf?pc.rho*1005.0*P[p+3u]/rb:(water||wall?1.0:2.0)*(5.8+4.1*sqrt(max(.1,pc.reserved)))*P[p+3u];
-            float h=conductance*(temp-pc.air),ss=wall?I[b+7u]:max(0.0,P[p+2u])/pc.dt;
+            // P[30] > 0: ship-hull facet below the waterline, total sensible
+            // conductance P[30] towards the reference temperature P[31] (host).
+            bool submerged=!leaf&&P[p+30u]>0.0;
+            if(submerged) conductance=P[p+30u];
+            float h=conductance*(temp-(submerged?P[p+31u]:pc.air)),ss=wall?I[b+7u]:max(0.0,P[p+2u])/pc.dt;
             float storage=wall?ss*(temp-previous)+I[b+8u]:ss*(temp-previous);
             float inc=I[b+3u]+P[p+6u]*I[b+15u],available=I[b+1u]+I[b+13u];
             float raw=P[p+4u]*(1.0+P[p+5u]*(temp-298.15))*inc;

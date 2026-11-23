@@ -522,7 +522,13 @@ export function createMaterialPresets() {
       { name: 'soil_dry', label: '干燥土壤', type: 'Soil', params: { method: 2, rss: 4000, cs: 1000, rhos: 1600, lambdas: 0.8, Tsoil: 30, SMC: 10, Satwater: 0.38 } },
       { name: 'soil_wet', label: '湿润土壤', type: 'Soil', params: { method: 2, rss: 800, cs: 1400, rhos: 1900, lambdas: 2.0, Tsoil: 22, SMC: 35, Satwater: 0.50 } },
       { name: 'vehicle_material', label: '载具车身物化', type: 'Building', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0 } },
-      { name: 'ship_material', label: '船舶表面物化', type: 'Ship', params: { method: 1, rss: 4000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 30, SMC: 0, Satwater: 0 } },
+      // FacetEB hull: one 12 mm shipbuilding steel plate (λ 50, ρ 7850, cp 460: typical mild/hull
+      // steel, e.g. EN 1993-1-2 / ISO 10456 steel) with a 22 °C interior; speed (m/s) adds the
+      // ship's own motion to the wind (relative wind); waterlineHeight (world y, m; absent = off)
+      // puts the hull facets below it in contact with the water. method/lambdas/rhos/cs stay the
+      // VoxelEB (semi-infinite solid) values.
+      { name: 'ship_material', label: '船舶表面物化', type: 'Ship', params: { method: 1, rss: 4000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 30, SMC: 0, Satwater: 0,
+        wallMode: 'wall', thickness: 0.012, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, layers: [{ thickness: 0.012, lambda: 50, rho: 7850, cp: 460 }], speed: 0 } },
       // mixingDepth 2 m and a start temperature at the mean air temperature of the first 24 h:
       // new-project defaults (engine fallbacks for absent fields stay 0.5 m / first-node air).
       { name: 'water_set', label: '水体物化参数', type: 'Water', params: { rss: 0, heatCapacity: 4186000, mixingDepth: 2, evaporationCoefficient: 1, brdfModel: 1, refractiveIndex: 1.333, slopeVariance: 0, diffuseFraction: 0.02, initialTemperatureMode: 'dailyMeanAir' } }
@@ -1090,6 +1096,14 @@ export function validateProject(value) {
         errors.push('墙体构造层无效（1–6 层，每层厚度、λ、ρ、cp 大于 0，总厚度 ≤ 5 m）：' + m.name)
     }
   }
+  for (const m of c.materials.filter((item) => item.type === 'Ship' && !item.energyModel)) {
+    const p = m.params || {}
+    const given = (value) => value !== undefined && value !== null && value !== ''
+    if (given(p.speed) && !(Number(p.speed) >= 0 && Number(p.speed) <= 100)) errors.push('船舶航速无效（0–100 m/s）：' + m.name)
+    if (given(p.waterlineHeight) && (!Number.isFinite(Number(p.waterlineHeight)) || !(Number(p.waterHeatTransferCoefficient ?? 500) > 0) ||
+      (given(p.waterTemperature) && !(Number(p.waterTemperature) > -20 && Number(p.waterTemperature) < 60))))
+      errors.push('船舶水线参数无效（水线高度为有限数，水侧换热系数大于 0，水温 -20–60 ℃）：' + m.name)
+  }
   for (const m of c.materials.filter((item) => item.type === 'Water' && item.params?.initialTemperatureMode !== undefined)) {
     const p = m.params
     if (!['firstAir', 'dailyMeanAir', 'fixed'].includes(p.initialTemperatureMode) || (p.initialTemperatureMode === 'fixed' && !(Number(p.initialTemperature ?? 20) > -50 && Number(p.initialTemperature ?? 20) < 100)))
@@ -1209,7 +1223,12 @@ function materialXml(item) {
   const wall = params.wallMode === 'wall' && !item.energyModel
     ? `<wallMode>wall</wallMode><thickness>${number(params.thickness, 0.2)}</thickness><indoorTemperature>${number(params.indoorTemperature, 22)}</indoorTemperature><indoorHeatTransferCoefficient>${number(params.indoorHeatTransferCoefficient, 8)}</indoorHeatTransferCoefficient>${wallLayersXml(params.layers)}`
     : ''
-  return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 0.25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${wall}</soilSet></property>`
+  // FacetEB ship hull: relative wind (speed > 0) and waterline contact; absent = off.
+  const hasNumber = (value) => value !== undefined && value !== null && value !== '' && Number.isFinite(Number(value))
+  const ship = item.type === 'Ship' && !item.energyModel
+    ? `${Number(params.speed) > 0 ? `<shipSpeed>${number(params.speed, 0)}</shipSpeed>` : ''}${hasNumber(params.waterlineHeight) ? `<waterlineHeight>${number(params.waterlineHeight, 0)}</waterlineHeight><waterHeatTransferCoefficient>${number(params.waterHeatTransferCoefficient, 500)}</waterHeatTransferCoefficient>${hasNumber(params.waterTemperature) ? `<waterTemperature>${number(params.waterTemperature, 20)}</waterTemperature>` : ''}` : ''}`
+    : ''
+  return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 0.25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${wall}${ship}</soilSet></property>`
 }
 
 export function projectToXml(value, paths = {}) {

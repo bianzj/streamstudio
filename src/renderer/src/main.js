@@ -221,6 +221,13 @@ function parseMaterialNode(node) {
       indoorHeatTransferCoefficient: Number(xmlValue(node, 'indoorHeatTransferCoefficient', 8))
     })
     if (params.wallMode === 'wall' && xmlValue(node, 'wallLayers', '').trim()) params.layers = parseWallLayers(xmlValue(node, 'wallLayers', ''))
+    // FacetEB ship hull options (soilSet of a Ship material).
+    if (xmlValue(node, 'shipSpeed', '').trim()) params.speed = Number(xmlValue(node, 'shipSpeed', 0))
+    if (xmlValue(node, 'waterlineHeight', '').trim()) {
+      params.waterlineHeight = Number(xmlValue(node, 'waterlineHeight', 0))
+      params.waterHeatTransferCoefficient = Number(xmlValue(node, 'waterHeatTransferCoefficient', 500))
+      if (xmlValue(node, 'waterTemperature', '').trim()) params.waterTemperature = Number(xmlValue(node, 'waterTemperature', 20))
+    }
   }
   return { name: node.getAttribute('name') || 'material', type, params }
 }
@@ -2215,8 +2222,12 @@ function physicalValues(item) {
   if (item.type === 'Vegetation') return [['Vcmax', p.Vcmax], ['BallBerry', p.BallBerry], ['kV', p.kV], ['Rd', p.Rdparam], ['Tyear', p.Tyear], ['胁迫', p.stressfactor]]
   if (item.type === 'Water') return [['辐射模型', Number(p.brdfModel) === 1 ? 'Cox–Munk' : 'Lambert'], ['折射率', p.refractiveIndex], ['坡度方差', Number(p.slopeVariance) > 0 ? p.slopeVariance : '随风速'], ['漫反射比例', p.diffuseFraction], ['rss', p.rss], ['热容', p.heatCapacity], ['混合深度', p.mixingDepth], ['蒸发系数', p.evaporationCoefficient], ['初始水温', p.initialTemperatureMode === 'dailyMeanAir' ? '首日平均气温' : p.initialTemperatureMode === 'fixed' ? `${p.initialTemperature ?? 20} ℃` : '首节点气温']]
   return [['rss', p.rss], ['热容', p.cs], ['密度', p.rhos], ['导热率', p.lambdas], ['SMC', p.SMC], ['饱和量', p.Satwater],
-    ...(p.wallMode === 'wall' ? [['墙体模式', `${Array.isArray(p.layers) && p.layers.length ? `${p.layers.length} 层构造 ${p.layers.reduce((sum, layer) => sum + Number(layer.thickness || 0), 0).toFixed(3)} m` : `墙体 ${p.thickness ?? 0.2} m`}，室内 ${p.indoorTemperature ?? 22} ℃，h=${p.indoorHeatTransferCoefficient ?? 8}`]] : [])]
+    ...(p.wallMode === 'wall' ? [['墙体模式', `${Array.isArray(p.layers) && p.layers.length ? `${p.layers.length} 层构造 ${p.layers.reduce((sum, layer) => sum + Number(layer.thickness || 0), 0).toFixed(3)} m` : `墙体 ${p.thickness ?? 0.2} m`}，室内 ${p.indoorTemperature ?? 22} ℃，h=${p.indoorHeatTransferCoefficient ?? 8}`]] : []),
+    ...(item.type === 'Ship' && Number(p.speed) > 0 ? [['航速', `${p.speed} m/s`]] : []),
+    ...(item.type === 'Ship' && shipValueGiven(p.waterlineHeight) ? [['水线', `${p.waterlineHeight} m，水侧 h=${p.waterHeatTransferCoefficient ?? 500}，水温 ${shipValueGiven(p.waterTemperature) ? `${p.waterTemperature} ℃` : '场景水体'}`]] : [])]
 }
+
+function shipValueGiven(value) { return value !== undefined && value !== null && value !== '' && Number.isFinite(Number(value)) }
 
 // Mirrors withLeafAngles in models/histream/src/base/compo.cpp: how VoxelRT /
 // VoxelEB obtain the leaf projection G of a canopy.
@@ -3613,6 +3624,11 @@ function wallModeFields(defaults = {}) {
   return `<label class="dialog-field"><span>墙体模式（FacetEB 对象面元）</span><select class="select" name="wallMode"><option value="shell" ${wall ? '' : 'selected'}>薄壳（两面室外，旧算法）</option><option value="wall" ${wall ? 'selected' : ''}>墙体/屋顶（厚度导热 + 恒温室内）</option></select></label>${physicalInput('墙体厚度（m，无构造层时使用）', 'wallThickness', defaults.thickness ?? 0.2, 0.01)}${physicalInput('室内温度（℃）', 'indoorTemperature', defaults.indoorTemperature ?? 22, 0.1)}${physicalInput('室内换热系数（W·m⁻²·K⁻¹）', 'indoorHeatTransferCoefficient', defaults.indoorHeatTransferCoefficient ?? 8, 0.1)}<label class="dialog-field" style="grid-column:1 / -1"><span>构造层（由外到内，每行：厚度 m, λ W·m⁻¹·K⁻¹, ρ kg·m⁻³, cp J·kg⁻¹·K⁻¹；最多 6 层；留空 = 用上面的厚度与 λ/ρ/cs 单层均质）</span><textarea class="input" name="wallLayers" rows="3">${escapeHtml(wallLayersText(defaults.layers))}</textarea></label>`
 }
 
+// FacetEB ship hull options (Ship materials): relative wind and waterline contact.
+function shipFields(defaults = {}) {
+  return `${physicalInput('航速（m/s，相对风 √(u²+v²)；0 = 停泊）', 'shipSpeed', defaults.speed ?? 0, 0.1)}${physicalInput('水线高度（m，世界高度；留空 = 不计水线）', 'shipWaterlineHeight', defaults.waterlineHeight ?? '', 0.01)}${physicalInput('水侧换热系数（W·m⁻²·K⁻¹）', 'shipWaterHeatTransferCoefficient', defaults.waterHeatTransferCoefficient ?? 500, 1)}${physicalInput('水温（℃，留空 = 场景水体平均温度，无水体时首节点气温）', 'shipWaterTemperature', defaults.waterTemperature ?? '', 0.1)}`
+}
+
 // FacetEB wall layers as text: one layer per line "thickness, λ, ρ, cp" (outer to inner).
 function wallLayersText(layers) {
   return Array.isArray(layers) ? layers.map((layer) => [layer.thickness, layer.lambda, layer.rho, layer.cp].join(', ')).join('\n') : ''
@@ -4004,7 +4020,7 @@ function renderPhysicalParameters() {
       physicalInput('比热容 cs', 'soilCs', defaults.cs, 1), physicalInput('密度 rhos', 'soilRhos', defaults.rhos, 1),
       physicalInput('导热率 λ', 'soilLambdas', defaults.lambdas, 0.01), physicalInput('初始温度', 'soilTsoil', defaults.Tsoil, 0.1),
       physicalInput('土壤含水量 SMC', 'soilSMC', defaults.SMC, 0.1), physicalInput('饱和含水量', 'soilSatwater', defaults.Satwater, 0.01),
-      wallModeFields(defaults)
+      wallModeFields(defaults), type === 'Ship' ? shipFields(defaults) : ''
     ].join('')
   }
 }
@@ -4549,6 +4565,14 @@ function physicalFromForm(values, type) {
     })
     else if (values.wallMode === 'shell') params.wallMode = 'shell'
     if (values.wallMode === 'wall' && String(values.wallLayers || '').trim()) params.layers = parseWallLayers(values.wallLayers)
+    if (type === 'Ship') {
+      if (values.shipSpeed !== undefined) params.speed = Math.max(0, Number(values.shipSpeed) || 0)
+      if (String(values.shipWaterlineHeight ?? '').trim() !== '') {
+        params.waterlineHeight = Number(values.shipWaterlineHeight)
+        params.waterHeatTransferCoefficient = Number(values.shipWaterHeatTransferCoefficient)
+        if (String(values.shipWaterTemperature ?? '').trim() !== '') params.waterTemperature = Number(values.shipWaterTemperature)
+      }
+    }
   }
   // FIXED 配套：过滤掉 NaN/Infinity，避免“缺失”被写成 NaN（JSON 里是 null）
   params = Object.fromEntries(Object.entries(params).filter(([, value]) => typeof value !== 'number' || Number.isFinite(value)))
@@ -4704,7 +4728,7 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
   } else if (state.presetPhysicalType === 'Wood') {
     parameters = `${physicalInput('比热容 cs（J·kg⁻¹·K⁻¹）', 'soilCs', defaults.cs, 1)}${physicalInput('密度 rhos（kg·m⁻³）', 'soilRhos', defaults.rhos, 1)}${physicalInput('导热率 λ（W·m⁻¹·K⁻¹）', 'soilLambdas', defaults.lambdas, 0.01)}${physicalInput('对流换热倍率', 'woodConvectiveScale', defaults.convectiveScale ?? 1, 0.1)}${physicalInput('初始温度（℃）', 'soilTsoil', defaults.Tsoil, 0.1)}<div class="notice">木质固体不计算光合作用和蒸腾，温度由辐射、对流、导热与热储存共同求解。</div>`
   } else {
-    parameters = `${physicalInput('方法', 'soilMethod', defaults.method, 1)}${physicalInput('表面阻力 rss', 'soilRss', defaults.rss, 1)}${physicalInput('比热容 cs', 'soilCs', defaults.cs, 1)}${physicalInput('密度 rhos', 'soilRhos', defaults.rhos, 1)}${physicalInput('导热率 λ', 'soilLambdas', defaults.lambdas, 0.01)}${physicalInput('初始温度', 'soilTsoil', defaults.Tsoil, 0.1)}${physicalInput('土壤含水量 SMC', 'soilSMC', defaults.SMC, 0.1)}${physicalInput('饱和含水量', 'soilSatwater', defaults.Satwater, 0.01)}${wallModeFields(defaults)}`
+    parameters = `${physicalInput('方法', 'soilMethod', defaults.method, 1)}${physicalInput('表面阻力 rss', 'soilRss', defaults.rss, 1)}${physicalInput('比热容 cs', 'soilCs', defaults.cs, 1)}${physicalInput('密度 rhos', 'soilRhos', defaults.rhos, 1)}${physicalInput('导热率 λ', 'soilLambdas', defaults.lambdas, 0.01)}${physicalInput('初始温度', 'soilTsoil', defaults.Tsoil, 0.1)}${physicalInput('土壤含水量 SMC', 'soilSMC', defaults.SMC, 0.1)}${physicalInput('饱和含水量', 'soilSatwater', defaults.Satwater, 0.01)}${wallModeFields(defaults)}${state.presetPhysicalType === 'Ship' ? shipFields(defaults) : ''}`
   }
   target.innerHTML = `${presetSelect('物化类型', 'presetPhysicalType', 'physicalType', typeOptions)}${parameters}`
   $('#presetPhysicalType').addEventListener('change', (event) => {
