@@ -67,6 +67,7 @@ bool Descriptor::createDescriptor(std::shared_ptr<VoxelebIO> &modelio){
     bindings.addBinding(VoxelebbindingInd::fluidMeta, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags);
     bindings.addBinding(VoxelebbindingInd::fluidParameters, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, flags);
     bindings.addBinding(VoxelebbindingInd::hex, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags);
+    bindings.addBinding(VoxelebbindingInd::soilMemory, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags);
 
 
     m_descSetLayout = bindings.createLayout(m_device);
@@ -199,6 +200,8 @@ bool Descriptor::createDescriptor(std::shared_ptr<VoxelebIO> &modelio){
     updates.emplace_back(bindings.makeWrite(m_descSet, VoxelebbindingInd::fluidMeta, &dbiFluidMeta));
     updates.emplace_back(bindings.makeWrite(m_descSet, VoxelebbindingInd::fluidParameters, &dbiFluidParameters));
     updates.emplace_back(bindings.makeWrite(m_descSet, VoxelebbindingInd::hex, &dbiHex));
+    VkDescriptorBufferInfo dbiSoilMemory{voxelio->m_pSoilMemoryBuffer->buffer, 0, VK_WHOLE_SIZE};
+    updates.emplace_back(bindings.makeWrite(m_descSet, VoxelebbindingInd::soilMemory, &dbiSoilMemory));
 
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(updates.size()), updates.data(), 0, nullptr);
     return true;

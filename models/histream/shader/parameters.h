@@ -388,6 +388,7 @@ struct SoilSet
     float hapkeG;
     int thermalClass;
     float convectiveScale;
+    int inertiaHistory;   // method 1: 0 = 8 nodes (legacy), 1 = + sum-of-exponentials tail
 
     //BSMParam bsm;
 };

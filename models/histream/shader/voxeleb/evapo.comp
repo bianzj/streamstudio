@@ -254,6 +254,21 @@ void main()
                         }
                     }
                 }
+                // History older than TLASTNUM nodes (control.soilInertiaHistory
+                // = "full"): sum-of-exponentials modes, transferred between the
+                // sunlit and shaded states like the stored temperatures.
+                if(soilSets[bioId].inertiaHistory == 1)
+                {
+                    uint memoryId = bufferId * SOIL_MEMORY_MODES;
+                    for(int j = 0; j < SOIL_MEMORY_MODES; j++)
+                    {
+                        vec2 memory = sunlitStateTransfer(
+                            soilMemories[memoryId + j], storedSolar, currentSolar);
+                        float weight, decay;
+                        soilMemoryMode(j, dtime, weight, decay);
+                        ssum = ssum + (issunlit == 1 ? memory.x : memory.y) * weight / dtime;
+                    }
+                }
                 Gst = GAM /sqrt(PI)* 2 * ssum;
             }else{
                 float ToldProfile[TLASTNUM],Mprofile[TLASTNUM],TnewProfile[TLASTNUM];

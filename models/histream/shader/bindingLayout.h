@@ -85,7 +85,9 @@ layout(push_constant) uniform _RtxState
 #define B_FLUID_META 38
 #define B_FLUID_PARAMETERS 39
 #define B_HEX 40
-
+// Soil method-1 sum-of-exponentials history: SOIL_MEMORY_MODES (sunlit, shaded)
+// pairs per voxel; a single element unless some soil set uses it.
+#define B_SOILMEMORY 41
 
 // 1-5
 layout(binding = B_SPECTRAL) buffer _bufferOPTICAL { SpectralMaterial specMaterials[]; }; // --
@@ -138,6 +140,7 @@ layout(binding = B_FLUID_DENSITY) buffer FLUIDRHO{float fluidDensity[];};
 layout(binding = B_FLUID_META) buffer FLUIDMETA{FluidCellMeta fluidMeta[];};
 layout(binding = B_FLUID_PARAMETERS) uniform FLUIDPARAMS{FluidParameters fluidParameters;};
 layout(binding = B_HEX) buffer _bufferHex { VoxelHex voxelHexs[]; };
+layout(binding = B_SOILMEMORY) buffer _bufferSoilMemory { vec2 soilMemories[]; };
 
 layout(buffer_reference, scalar) buffer Vertices { VertexAttribute v[]; };
 layout(buffer_reference, scalar) buffer Indices { uvec3 i[]; };

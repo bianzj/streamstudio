@@ -612,6 +612,12 @@ bool FileIO::readJson(const std::string& path, Mode mode) {
             if (value.type != Type::BUILDING) value.type = Type::SOIL;
             // DEFERRED[低] 物理: 土壤/建筑的 Tsoil 默认 25（摄氏）且原样传入，而上面的木材分支对 >150 的值自动做 K→°C 转换；用户按开尔文填写 Tsoil=300 时土壤初温变为 300 °C；SMC 默认 25（百分比）与 Satwater 0.45（体积分数）单位也不一致；建议：与木材分支统一温度单位处理，并统一含水量为体积分数。
             value.soilset = {std::clamp(ProjectJson::integer(project.control(),"soilTemperatureMethod",ProjectJson::integer(params,"method",1)),0,2),ProjectJson::number(params,"rss",2000),ProjectJson::number(params,"cs",1180),ProjectJson::number(params,"rhos",1800),ProjectJson::number(params,"lambdas",1.55f),ProjectJson::number(params,"Tsoil",25),ProjectJson::number(params,"SMC",25),ProjectJson::number(params,"Satwater",.45f)};
+            // Method 1 (semi-infinite conduction): "full" adds the history older
+            // than TLASTNUM nodes as exponential modes; absent/"truncated" keeps
+            // the legacy 8-node Duhamel sum (bitwise).  Wood (thermalClass 1,
+            // finite branches) always keeps the 8-node sum.
+            value.soilset.inertiaHistory =
+                ProjectJson::string(project.control(), "soilInertiaHistory", "truncated") == "full" ? 1 : 0;
         }
         properties.push_back(std::move(value));
     }

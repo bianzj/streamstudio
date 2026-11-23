@@ -486,6 +486,10 @@ struct SoilSet
     float hapkeG{0.0f};           // Henyey-Greenstein asymmetry
     int thermalClass{0};          // 0: ground/building surface, 1: woody solid
     float convectiveScale{1.0f};  // small branches exchange heat faster than broad surfaces
+    // Method 1 history: 0 keeps the last TLASTNUM nodes only (legacy, truncated
+    // Duhamel sum), 1 adds the older history as SOIL_MEMORY_MODES exponential
+    // modes (control.soilInertiaHistory = "full").
+    int inertiaHistory{0};
     //BSMParam bsm;
 };
 

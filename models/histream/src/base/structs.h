@@ -26,6 +26,9 @@
 #define GROUP_SIZEXY 8 // Same group size as in compute shader
 #define GROUP_SIZEX 64
 #define TLASTNUM 8
+// Sum-of-exponentials modes of the soil method-1 history beyond TLASTNUM nodes
+// (SoilSet.inertiaHistory = 1); keep equal to shader/global.glsl.
+#define SOIL_MEMORY_MODES 12
 #define SENSOR_HEIGHT 3000
 #define SENSOR_FOV    0.5
 #define ANGLE_COR 0.1

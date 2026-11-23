@@ -343,6 +343,13 @@ std::vector<PropertyXml> FileIO::readPropertyXML(TiXmlNode *node, Mode mode) {
                 if (value->GetText() != nullptr) propertyXml2.soilset.hapkeH = stof(value->GetText());
             if (TiXmlElement* value = soilNode->FirstChildElement("hapkeG"))
                 if (value->GetText() != nullptr) propertyXml2.soilset.hapkeG = stof(value->GetText());
+            // Method-1 history beyond TLASTNUM nodes: <inertiaHistory>full</inertiaHistory>
+            // (or 1); absent keeps the legacy 8-node sum.
+            if (TiXmlElement* value = soilNode->FirstChildElement("inertiaHistory")) {
+                const char* historyText = value->GetText();
+                const std::string history = historyText != nullptr ? historyText : std::string();
+                propertyXml2.soilset.inertiaHistory = (history == "full" || history == "1") ? 1 : 0;
+            }
             propxmls.push_back(propertyXml2);
 ////            continue;
 //

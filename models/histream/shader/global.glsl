@@ -51,6 +51,9 @@ const float InvPI = 0.318309886183790671538;
 
 #define PID2 1.557963
 #define TLASTNUM 8
+// Sum-of-exponentials modes of the soil method-1 history beyond TLASTNUM nodes
+// (SoilSet.inertiaHistory = 1); keep equal to structs.h.
+#define SOIL_MEMORY_MODES 12
 #define MAXSTEP 8
 #define DIFFUSE_ANGLE_NUM 64
 #define BANDNUM 2162

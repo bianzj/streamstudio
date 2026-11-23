@@ -107,6 +107,23 @@ void main()
                 voxelTlasts[TlastId+i].sunlit = stored.x;
                 voxelTlasts[TlastId+i].shaded = stored.y;
             }
+            // Older history (control.soilInertiaHistory = "full"): commit the
+            // same transfer, then let the change between the two oldest
+            // stored nodes (T_{n-7} - T_{n-8}) enter the exponential modes.
+            if(soilSets[bioId].inertiaHistory == 1)
+            {
+                uint memoryId = bufferId * SOIL_MEMORY_MODES;
+                vec2 leaving = vec2(
+                    voxelTlasts[TlastId+TLASTNUM-2].sunlit - voxelTlasts[TlastId+TLASTNUM-1].sunlit,
+                    voxelTlasts[TlastId+TLASTNUM-2].shaded - voxelTlasts[TlastId+TLASTNUM-1].shaded);
+                for(int j = 0; j < SOIL_MEMORY_MODES; j++)
+                {
+                    float weight, decay;
+                    soilMemoryMode(j, dtime, weight, decay);
+                    soilMemories[memoryId + j] = decay * sunlitStateTransfer(
+                        soilMemories[memoryId + j], storedSolar, currentSolar) + leaving;
+                }
+            }
             voxelTempes[bufferId].solarFraction = currentSolar;
             for(int i =TLASTNUM-1; i>0; i--)
             {   

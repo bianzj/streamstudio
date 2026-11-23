@@ -52,6 +52,8 @@ public:
 
     std::shared_ptr<nvvk::Buffer> m_pFluxBuffer;    // Evapo
     std::shared_ptr<nvvk::Buffer> m_pTLASTBuffer;
+    // Soil method-1 history modes (vec2 per voxel and mode); one element when unused.
+    std::shared_ptr<nvvk::Buffer> m_pSoilMemoryBuffer;
 
 
     std::shared_ptr<nvvk::Buffer> m_pStateBuffer;   // budget

@@ -1527,6 +1527,33 @@ float soilHeatFluxSurfaceDerivative(in float Mprofile[TLASTNUM], float dtime,
     return derivative;
 }
 
+// Soil method 1 (semi-infinite conduction, SCOPE discretisation) beyond the
+// TLASTNUM explicit nodes.  The kernel tau^-1/2 = pi^-1/2 int s^-1/2 e^(-s tau) ds
+// is a trapezoid sum over SOIL_MEMORY_MODES rates s_j, geometric from
+// 1/(10 years) to 30/(TLASTNUM dt), with half weights at both ends and the
+// part below s_min lumped into the slowest mode.  Mode j keeps
+// S_j = sum_{k > TLASTNUM} dT_k exp(-s_j (k - TLASTNUM - 1) dt), dT_k the
+// change over the k-th interval back, so S_j <- decay_j S_j + (T_{n-7} - T_{n-8})
+// after each node; a constant temperature leaves every S_j at zero.  weight_j
+// times S_j adds to sum_k dT_k (sqrt(k dt) - sqrt((k-1) dt)) (the exact
+// interval integrals of 1/2 tau^-1/2 dtau).  Relative error of the interval
+// weights <= 0.5 % up to 30 days back, 1 % up to 120 days (FacetEB
+// soilMemoryModes uses the same formula in double precision).
+void soilMemoryMode(int j, float dtime, out float weight, out float decay)
+{
+    float dt = max(dtime, 1.0);
+    float logMin = -log(3.15e8);
+    float logMax = log(30.0 / (float(TLASTNUM) * dt));
+    float h = (logMax - logMin) / float(SOIL_MEMORY_MODES - 1);
+    float s = exp(logMin + h * float(j));
+    float coefficient = j == 0 ? 0.5 * h + 2.0
+                      : (j == SOIL_MEMORY_MODES - 1 ? 0.5 * h : h);
+    float x = s * dt;
+    float oneMinusDecay = x < 1.0e-3 ? x * (1.0 - x * (0.5 - x / 6.0)) : 1.0 - exp(-x);
+    decay = exp(-x);
+    weight = coefficient * 0.5 / sqrt(PI * s) * oneMinusDecay * exp(-float(TLASTNUM) * x);
+}
+
 
 
 

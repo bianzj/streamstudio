@@ -636,6 +636,9 @@ export function createDefaultProject(options = {}) {
         // FacetEB 仍默认中性。旧工程缺字段按 false（中性）处理，见 normalizeProject。
         stabilityCorrection: options.mode === 'eVoxelEB',
         soilTemperatureMethod: 2,
+        // 土壤方法 1 热历史：新建工程 'full'（8 个显式节点 + 指数模态远期历史）；
+        // 旧工程缺字段按 'truncated'（原 8 节点截断，逐字节不变），见 normalizeProject。
+        soilInertiaHistory: 'full',
         vegetationTemperatureMethod: 0
       },
       fluid: {
@@ -936,6 +939,7 @@ export function normalizeProject(value = {}) {
           configuration.control?.soilTemperatureMethod,
           configuration.materials?.find((item) => item.type === 'Soil')?.params?.method ?? 2
         )))),
+        soilInertiaHistory: configuration.control?.soilInertiaHistory === 'full' ? 'full' : 'truncated',
         vegetationTemperatureMethod: Math.max(0, Math.min(1, Math.round(number(
           configuration.control?.vegetationTemperatureMethod, 0
         ))))
@@ -1233,7 +1237,9 @@ function materialXml(item) {
   const ship = item.type === 'Ship' && !item.energyModel
     ? `${Number(params.speed) > 0 ? `<shipSpeed>${number(params.speed, 0)}</shipSpeed>` : ''}${hasNumber(params.waterlineHeight) ? `<waterlineHeight>${number(params.waterlineHeight, 0)}</waterlineHeight><waterHeatTransferCoefficient>${number(params.waterHeatTransferCoefficient, 500)}</waterHeatTransferCoefficient>${hasNumber(params.waterTemperature) ? `<waterTemperature>${number(params.waterTemperature, 20)}</waterTemperature>` : ''}` : ''}`
     : ''
-  return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 0.25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${wall}${ship}</soilSet></property>`
+  // 土壤方法 1 远期热历史（control.soilInertiaHistory = 'full'）；缺省不写，旧 XML 不变。
+  const inertia = params.inertiaHistory === 'full' ? '<inertiaHistory>full</inertiaHistory>' : ''
+  return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 0.25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${inertia}${wall}${ship}</soilSet></property>`
 }
 
 export function projectToXml(value, paths = {}) {
@@ -1256,7 +1262,7 @@ export function projectToXml(value, paths = {}) {
   const thermals = c.thermals.map(thermalXml).join('\n      ')
   const materials = c.materials.map((item) => materialXml(item.type === 'Soil' ? {
     ...item,
-    params: { ...(item.params || {}), method: c.control.soilTemperatureMethod }
+    params: { ...(item.params || {}), method: c.control.soilTemperatureMethod, inertiaHistory: c.control.soilInertiaHistory }
   } : item)).join('\n      ')
   const background = c.scene.background || {}
   const backgroundMaterial = c.materials.find((item) => item.name === background.materialName)
@@ -1300,7 +1306,7 @@ export function projectToXml(value, paths = {}) {
     <temperatureTolerance>${number(c.control.temperatureTolerance, 0.05)}</temperatureTolerance>
     <stabilityCorrection>${c.control.stabilityCorrection === true ? 1 : 0}</stabilityCorrection>
     <temperatureRelaxation>${number(c.control.temperatureRelaxation, 0.8)}</temperatureRelaxation>
-    <soilTemperatureMethod>${Math.max(0, Math.min(2, Math.round(number(c.control.soilTemperatureMethod, 2))))}</soilTemperatureMethod>
+    <soilTemperatureMethod>${Math.max(0, Math.min(2, Math.round(number(c.control.soilTemperatureMethod, 2))))}</soilTemperatureMethod>${c.control.soilInertiaHistory === 'full' ? '\n    <soilInertiaHistory>1</soilInertiaHistory>' : ''}
     <shortwaveScatteringOrders>${c.control.shortwaveScatteringOrders}</shortwaveScatteringOrders>
     <voxelCollisionOrders>${c.control.voxelCollisionOrders}</voxelCollisionOrders>
     <radiationMaxSteps>${c.control.radiationMaxSteps}</radiationMaxSteps>

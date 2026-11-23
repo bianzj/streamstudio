@@ -1398,6 +1398,37 @@ float soilStorageCoefficient(const SurfaceParameters& surface, float dTime)
         std::sqrt(kPi * std::max(1.0f, dTime));
 }
 
+// Soil method 1 history older than the explicit nodes (control.soilInertiaHistory
+// = "full"), the double-precision twin of soilMemoryMode in shader/functions.glsl:
+// tau^-1/2 = pi^-1/2 int s^-1/2 e^(-s tau) ds as a trapezoid sum over
+// kSoilMemoryModes rates, geometric from 1/(10 years) to 30/(nodes dt), half
+// weights at both ends, the part below s_min lumped into the slowest mode.
+// Mode j keeps S_j = sum_{k > nodes} dT_k exp(-s_j (k - nodes - 1) dt) and is
+// updated S_j <- decay_j S_j + (T_{n-7} - T_{n-8}); weight_j S_j adds to the
+// normalised sum sum_k dT_k (sqrt(k) - sqrt(k-1)) of the flux evaluation.
+constexpr size_t kSoilMemoryModes = 12U;
+struct SoilMemoryModes {
+    std::array<double, kSoilMemoryModes> weight{};
+    std::array<double, kSoilMemoryModes> decay{};
+};
+SoilMemoryModes soilMemoryModes(float dTime, size_t explicitNodes)
+{
+    SoilMemoryModes modes;
+    const double dt = std::max(1.0, static_cast<double>(dTime));
+    const double logMin = -std::log(3.15e8);
+    const double logMax = std::log(30.0 / (static_cast<double>(explicitNodes) * dt));
+    const double h = (logMax - logMin) / static_cast<double>(kSoilMemoryModes - 1U);
+    for (size_t j = 0; j < kSoilMemoryModes; ++j) {
+        const double s = std::exp(logMin + h * static_cast<double>(j));
+        const double coefficient = j == 0 ? 0.5 * h + 2.0 : (j == kSoilMemoryModes - 1U ? 0.5 * h : h);
+        const double x = s * dt;
+        modes.decay[j] = std::exp(-x);
+        modes.weight[j] = coefficient * 0.5 / std::sqrt(kPi * s) * -std::expm1(-x) *
+            std::exp(-static_cast<double>(explicitNodes) * x) / std::sqrt(dt);
+    }
+    return modes;
+}
+
 float shortwaveWeightedBandValue(
     const std::vector<float>& values, float fallback)
 {
@@ -3092,6 +3123,7 @@ std::string facetInputView(const std::string& path)
         << "<spectralAccelerationWidth>" << ProjectJson::number(control, "spectralAccelerationWidth", 100.0f) << "</spectralAccelerationWidth>"
         << "<radiationSolver>" << xmlEscaped(ProjectJson::string(control, "radiationSolver", "traditional")) << "</radiationSolver>"
         << "<vegetationTemperatureMethod>" << ProjectJson::integer(control, "vegetationTemperatureMethod", 0) << "</vegetationTemperatureMethod>"
+        << "<soilInertiaHistory>" << (ProjectJson::string(control, "soilInertiaHistory", "truncated") == "full" ? 1 : 0) << "</soilInertiaHistory>"
         << "<isDEM>" << (ProjectJson::boolean(scene, "terrain", false) ? 1 : 0) << "</isDEM>"
         << "<isProcess>" << (ProjectJson::boolean(sensor, "process", false) ? 1 : 0) << "</isProcess>"
         << "<isRadiationProcess>" << (ProjectJson::boolean(sensor, "radiationProcess", false) ? 1 : 0) << "</isRadiationProcess>"
@@ -4820,6 +4852,9 @@ try {
     const int vegetationTemperatureMethod = std::clamp(
         static_cast<int>(std::lround(xmlFloat(
             xml, "vegetationTemperatureMethod", 0.0f))), 0, 1);
+    // Soil method 1: 1 adds the history older than the 8 stored nodes as
+    // exponential modes (control.soilInertiaHistory = "full"); 0 legacy.
+    const bool soilFullHistory = xmlFloat(xml, "soilInertiaHistory", 0.0f) > 0.5f;
     const float latitude = std::clamp(xmlFloat(xml, "Latitude", 40.0f), -90.0f, 90.0f);
     const float longitude = std::clamp(xmlFloat(xml, "Longitude", 116.0f), -180.0f, 180.0f);
     const int calendarYear = std::clamp(static_cast<int>(std::lround(xmlFloat(xml, "Year", 2019.0f))), -2000, 6000);
@@ -5276,6 +5311,23 @@ try {
     std::array<std::vector<float>, 2> soilHistory{
         std::vector<float>(surfaceCount * kSoilHistory, 0.0f),
         std::vector<float>(surfaceCount * kSoilHistory, 0.0f)};
+    // Older history as soilMemoryModes (ground sides only, both states; zero
+    // for the uniform start history). Allocated only for soilInertiaHistory=full.
+    bool soilMemoryUsed = false;
+    if (soilFullHistory)
+        for (uint32_t facet = scene.leafFacetCount; facet < scene.facetCount() && !soilMemoryUsed; ++facet)
+            soilMemoryUsed = surfaceForFacet(scene, facet).soilTemperatureMethod == 1;
+    std::array<std::vector<double>, 2> soilMemory;
+    if (soilMemoryUsed)
+        for (auto& memory : soilMemory) memory.assign(groundSides * kSoilMemoryModes, 0.0);
+    if (soilMemoryUsed) runIndex.value["soilInertiaHistory"] = "full";
+    const auto soilMemoryChange = [&](int state, size_t side, const SoilMemoryModes& modes) {
+        if (!soilMemoryUsed || side < firstGroundSide) return 0.0;
+        const double* memory = soilMemory[size_t(state)].data() + (side - firstGroundSide) * kSoilMemoryModes;
+        double change = 0.0;
+        for (size_t j = 0; j < kSoilMemoryModes; ++j) change += modes.weight[j] * memory[j];
+        return change;
+    };
     // Sunlit part of every side at the preceding node (the area weights of the
     // stored states) and the stored heat of each object facet / method-2 soil
     // side at the end of that node, for the conservation diagnostics.
@@ -5512,6 +5564,11 @@ try {
                 float* sunlitHistory = soilHistory[0].data() + side * kSoilHistory;
                 float* shadedHistory = soilHistory[1].data() + side * kSoilHistory;
                 for (size_t k = 0; k < kSoilHistory; ++k) move(sunlitHistory[k], shadedHistory[k]);
+                if (soilMemoryUsed && groundSide) {
+                    double* sunlitMemory = soilMemory[0].data() + (side - firstGroundSide) * kSoilMemoryModes;
+                    double* shadedMemory = soilMemory[1].data() + (side - firstGroundSide) * kSoilMemoryModes;
+                    for (size_t j = 0; j < kSoilMemoryModes; ++j) move(sunlitMemory[j], shadedMemory[j]);
+                }
                 if (profileSide) {
                     const size_t g = side - firstGroundSide;
                     for (size_t layer = 0; layer < facetphysics::soilLayers; ++layer)
@@ -5523,12 +5580,21 @@ try {
             }
         }
         const std::array<std::vector<float>, 2> previousStateTemperature = stateTemperature;
+        const SoilMemoryModes soilModes = soilMemoryModes(dTime, kSoilHistory);
         for (int state = 0; state < 2; ++state) {
             for (size_t side = 0; side < surfaceCount; ++side) {
                 float* history = soilHistory[state].data() + side * kSoilHistory;
                 if (node == startNode) {
                     std::fill(history, history + kSoilHistory, previousStateTemperature[state][side]);
                 } else {
+                    // The change between the two oldest stored nodes leaves the
+                    // explicit sum and enters the exponential modes.
+                    if (soilMemoryUsed && side >= firstGroundSide) {
+                        double* memory = soilMemory[size_t(state)].data() + (side - firstGroundSide) * kSoilMemoryModes;
+                        const double leaving = static_cast<double>(history[kSoilHistory - 2U]) - history[kSoilHistory - 1U];
+                        for (size_t j = 0; j < kSoilMemoryModes; ++j)
+                            memory[j] = soilModes.decay[j] * memory[j] + leaving;
+                    }
                     std::copy_backward(history, history + kSoilHistory - 1U, history + kSoilHistory);
                     history[0] = previousStateTemperature[state][side];
                 }
@@ -6049,6 +6115,7 @@ try {
                                             (std::sqrt(static_cast<double>(step + 1)) -
                                              std::sqrt(static_cast<double>(step)));
                                     }
+                                    if (soilMemoryUsed) weightedChange += soilMemoryChange(state, side, soilModes);
                                     flux.storage[side] = flux.storageSlope[side] *
                                         static_cast<float>(weightedChange);
                                 } else {
@@ -6222,6 +6289,7 @@ try {
                         double offset = -history[0];
                         for (size_t k = 1; k < kSoilHistory; ++k)
                             offset += (history[k - 1] - history[k]) * (std::sqrt(double(k + 1)) - std::sqrt(double(k)));
+                        if (soilMemoryUsed) offset += soilMemoryChange(state, side, soilModes);
                         data[8] = data[7] * static_cast<float>(offset);
                     }
                     else if (facet >= scene.leafFacetCount && mat.soilTemperatureMethod == 2)

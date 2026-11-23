@@ -778,6 +778,26 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
                                                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufEvapo);
 
+    // Soil method-1 history beyond the TLASTNUM nodes (soilMemoryMode in
+    // functions.glsl): SOIL_MEMORY_MODES (sunlit, shaded) pairs per voxel, all
+    // zero (the uniform start history has no temperature changes).  Only
+    // allocated when a method-1 soil set enables it (control.soilInertiaHistory).
+    {
+        bool soilMemoryUsed = false;
+        for (const SoilSet& soil : meshio->soilsets)
+            soilMemoryUsed = soilMemoryUsed || (soil.method == 1 && soil.inertiaHistory == 1);
+        const size_t memoryElements = soilMemoryUsed
+            ? static_cast<size_t>(n_voxel) * static_cast<size_t>(SOIL_MEMORY_MODES) : 1U;
+        std::vector<glm::vec2> soilMemory(memoryElements, glm::vec2(0.0f));
+        auto cmdBufSoilMemory = cmdGen.createCommandBuffer();
+        voxelio->m_pSoilMemoryBuffer = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(
+            cmdBufSoilMemory, soilMemory, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+        cmdGen.submitAndWait(cmdBufSoilMemory);
+        if (soilMemoryUsed)
+            std::cout << "SOIL_INERTIA_HISTORY modes=" << SOIL_MEMORY_MODES << " explicitNodes=" << TLASTNUM
+                      << " bytes=" << memoryElements * sizeof(glm::vec2) << std::endl;
+    }
+
     // state
     auto cmdBufState = cmdGen.createCommandBuffer();
     size = sizeof(EBState);
@@ -899,6 +919,7 @@ void Buffer::destroy(std::shared_ptr<VoxelebIO> &voxellstio){
 
     m_pAlloc->destroy(*(voxelio->m_pFluxBuffer));
     m_pAlloc->destroy(*(voxelio->m_pTLASTBuffer));
+    if (voxelio->m_pSoilMemoryBuffer) m_pAlloc->destroy(*(voxelio->m_pSoilMemoryBuffer));
     m_pAlloc->destroy(*(voxelio->m_pStateBuffer));
 
     m_pAlloc->destroy(*voxellstio->m_pFluidVelocityA);

@@ -18,6 +18,8 @@ const MWIR_BANDS = { 'configuration.sensor.bands': '3800,10500', 'configuration.
   'configuration.sensor.temperature': true }
 // Every soil set on soil method 1 (the control value overrides the material).
 const SOIL_METHOD_1 = { 'configuration.control.soilTemperatureMethod': 1 }
+// Method 1 with the complete heat history (8 nodes + exponential modes).
+const SOIL_HISTORY_FULL = { 'configuration.control.soilInertiaHistory': 'full' }
 const soilThermal = (cs, rhos, lambdas) => (index) => ({ [`configuration.materials.${index}.params.cs`]: cs,
   [`configuration.materials.${index}.params.rhos`]: rhos, [`configuration.materials.${index}.params.lambdas`]: lambdas })
 const SOIL_SCOPE = soilThermal(1180, 1800, 1.55)
@@ -229,6 +231,16 @@ export const CASES = {
   frt_crop_hapke: { example: 'crop_gpp_npp', mode: 'eFacetRT', set: HAPKE_FULL },
   frt_crop_hapke_hot: { example: 'crop_gpp_npp', mode: 'eFacetRT', set: { ...HAPKE_FULL, 'configuration.light.zenith': 0 } },
   feb_crop_hapke: { example: 'crop_gpp_npp', mode: 'eFacetEB', meteo: [23, 25], set: HAPKE_FULL },
+  // Soil method 1 heat history (2026-11-23) over two days (nodes 0-96) on the new loam:
+  // _m1_2d keeps the legacy 8-node Duhamel sum (control.soilInertiaHistory absent =
+  // "truncated"), _full adds the older history as exponential modes (new-project default).
+  // Day 2 noon G, Ts and G/Rn and the diurnal ranges of G and Ts are the comparison.
+  veb_urban_soil_m1_2d: { example: 'urban_block', mode: 'eVoxelEB', meteo: [0, 96], set: { ...SOIL_LOAM(4), ...SOIL_METHOD_1 } },
+  veb_urban_soil_m1_2d_full: { example: 'urban_block', mode: 'eVoxelEB', meteo: [0, 96], set: {
+    ...SOIL_LOAM(4), ...SOIL_METHOD_1, ...SOIL_HISTORY_FULL } },
+  feb_urban_soil_m1_2d: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 96], set: { ...SOIL_LOAM(4), ...SOIL_METHOD_1 } },
+  feb_urban_soil_m1_2d_full: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 96], set: {
+    ...SOIL_LOAM(4), ...SOIL_METHOD_1, ...SOIL_HISTORY_FULL } },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.

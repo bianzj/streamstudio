@@ -53,6 +53,7 @@ public:
         fluidMeta,
         fluidParameters,
         hex,
+        soilMemory,
     };
 
 
