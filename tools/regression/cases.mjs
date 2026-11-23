@@ -212,6 +212,11 @@ export const CASES = {
   veb_forest_soil: { example: 'forest', mode: 'eVoxelEB', meteo: [23, 25], set: SOIL_LOAM(11) },
   feb_urban_day: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], set: SOIL_SCOPE(4) },
   feb_urban_soil_day: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], set: SOIL_LOAM(4) },
+  // Ground free convection (2026-11-23) with the Monin-Obukhov correction on: the
+  // larger of the MOST and free-convection conductances (feb_urban_soil_day: neutral,
+  // free convection in parallel).
+  feb_urban_soil_day_most: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], set: {
+    ...SOIL_LOAM(4), 'configuration.control.stabilityCorrection': true } },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.

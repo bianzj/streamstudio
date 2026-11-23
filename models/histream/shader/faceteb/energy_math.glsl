@@ -166,3 +166,21 @@ double thermal(float initial,double rs,float rb,float net,double eps,float condu
     }
     return t;
 }
+// Ground free convection, facetphysics::groundExchange (energyphysics.h) and
+// VoxelEB fluid_coupling.glsl: g_free = 0.0025 x (x^2 + 1)^(-1/3) m/s for a
+// side warmer than the air; mode 1 adds it in parallel to 1/r, mode 2 (MOST)
+// takes the larger conductance. Returns the effective resistance; `extra` is
+// the additional sensible-heat slope [m/s].
+float groundFreeConductance(float excess) {
+    float x=clamp(excess,0.0,60.0);
+    return 0.0025*x*pow(x*x+1.0,-1.0/3.0);
+}
+float groundExchange(float resistance,float excess,float mode,out float extra) {
+    extra=0.0;
+    float g=groundFreeConductance(excess);
+    if(!(g>0.0)) return resistance;
+    if(mode>1.5&&!(g>1.0/resistance)) return resistance;
+    float x=excess,s=x*x+1.0;
+    if(excess<60.0) extra=x*0.0025*(pow(s,-1.0/3.0)-(2.0/3.0)*x*x*pow(s,-4.0/3.0));
+    return mode>1.5?1.0/g:1.0/(1.0/resistance+g);
+}

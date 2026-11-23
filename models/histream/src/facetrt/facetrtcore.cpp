@@ -5697,10 +5697,10 @@ try {
                             }
                         } else {
                             // Ground under vegetation is sheltered by its column's
-                            // canopy, (LAI+1)*(raa+rws+rbs); open ground uses raa.
-                            const float groundResistance =
+                            // canopy, (LAI+1)*(raa+rws+rbs); open ground uses raa;
+                            // both add free convection (facetphysics::groundExchange).
+                            const float columnResistance =
                                 columnAerodynamics[facetColumn[facet]].soilResistance;
-                            const float groundConductance = airDensity * 1005.0f / groundResistance;
                             for (uint32_t localSide = 0;
                                  localSide < 2U; ++localSide) {
                                 const size_t side = side0 + localSide;
@@ -5712,10 +5712,18 @@ try {
                                         (flux.*field)[side] = 0.0f;
                                     continue;
                                 }
+                                // Free convection when the side is warmer than the
+                                // air (energy.comp: same rule, P[28] = 1 + MOST).
+                                const auto exchange = facetphysics::groundExchange(
+                                    columnResistance, T[side] - airTemperature, stabilityCorrection);
+                                const float groundResistance = exchange.resistance;
+                                const float groundConductance = airDensity * 1005.0f / groundResistance;
                                 flux.net[side] = radiativeNet[side];
                                 flux.sensible[side] =
                                     groundConductance * (T[side] - airTemperature);
-                                flux.sensibleSlope[side] = groundConductance;
+                                flux.sensibleSlope[side] = exchange.extraSlope > 0.0f
+                                    ? groundConductance + airDensity * 1005.0f * exchange.extraSlope
+                                    : groundConductance;
                                 const bool drySoil =
                                     surface.soilMoisture < 0.03f;
                                 flux.latent[side] = drySoil ? 0.0f :
@@ -5883,9 +5891,12 @@ try {
                 // energy.comp P[28]: 0 thin shell, 1 water mixed layer (one exchanging
                 // face, open-water LE; P[29] evaporation coefficient), 2 wall slab
                 // (outdoor face only; P[29] its local side, conduction from I[7], I[8]).
+                // Ground facets: P[28] = 1 neutral (free convection in parallel),
+                // 2 MOST (larger of the two conductances), as groundExchange().
                 const bool waterFacet = facet < scene.leafFacetCount && mat.water && !mat.vegetation;
                 const bool wallFacet = facet < scene.leafFacetCount && wallIndex[facet] >= 0;
-                data[28] = wallFacet ? 2.0f : waterFacet ? 1.0f : 0.0f;
+                data[28] = facet >= scene.leafFacetCount ? (stabilityCorrection ? 2.0f : 1.0f)
+                    : wallFacet ? 2.0f : waterFacet ? 1.0f : 0.0f;
                 data[29] = wallFacet ? float(wallOuter[size_t(wallIndex[facet])])
                     : waterFacet ? mat.evaporationCoefficient : 0.0f;
                 // P[30] > 0: submerged ship-hull facet, total sensible conductance

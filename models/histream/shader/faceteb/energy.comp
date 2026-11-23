@@ -111,8 +111,10 @@ void main() {
             for(uint side=0u;side<2u;++side) {
                 // Back side of a ground facet: no fluxes (zeroed above).
                 if(P[p+27u]>0.5&&side==uint(P[p+27u]+0.5)-1u) continue;
-                uint k=index+side,j=k*12u;float temp=T[k],rb=I[j+5u],conductance=pc.rho*1005.0/rb;
-                F[j]=net[side]; F[j+1u]=conductance*(temp-pc.air); F[j+2u]=conductance;
+                uint k=index+side,j=k*12u;float temp=T[k],extra;
+                // Free convection of a side warmer than the air (P[28]: 1 neutral, 2 MOST).
+                float rb=groundExchange(I[j+5u],temp-pc.air,P[p+28u],extra),conductance=pc.rho*1005.0/rb;
+                F[j]=net[side]; F[j+1u]=conductance*(temp-pc.air); F[j+2u]=extra>0.0?conductance+pc.rho*1005.0*extra:conductance;
                 F[j+3u]=P[p+8u]>.5?0.0:latent(temp,rb,P[p+7u]);
                 F[j+4u]=P[p+8u]>.5?0.0:latentSlope(temp,rb,P[p+7u]);
                 F[j+6u]=I[j+7u]; F[j+5u]=P[p+9u]<.5?.35*net[side]:I[j+7u]*temp+I[j+8u];

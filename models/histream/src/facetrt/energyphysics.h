@@ -315,6 +315,41 @@ inline Aerodynamics aerodynamics(double referenceHeight, double wind, double hei
     }
     return {static_cast<float>(leaf), static_cast<float>(soil), ustar, z - d};
 }
+// Free convection of ground facets (soil, roads: every non-object facet), the
+// same term as VoxelEB (shader/voxeleb/fluid_coupling.glsl). The bare-ground
+// branch above is a log profile from z0 = 0.01 m to the reference height; at
+// noon in light wind (u 0.43 m/s at 15 m, Ts - Ta 12 K, bulk Richardson
+// number ~30) it gives r_a ~ 770 s/m, i.e. 1.3 W m-2 K-1, outside the range
+// of any neutral or MOST (zeta >= -5) formula. When the surface is warmer than
+// the air the windless conductance of Kondo & Ishida (1997), as used in TSEB
+// (Kustas & Norman 1999), g_free ~ 0.0025 (Ts - Ta)^(1/3) m/s, is added in
+// parallel; 0.0025 x (x^2 + 1)^(-1/3) keeps the asymptote with a finite slope
+// at x = 0. With the MOST correction the larger of the two conductances is
+// used (buoyancy is then already in 1/r_a). Stable/neutral sides keep r_a.
+inline float groundFreeConductance(float excess) {
+    const float x = std::clamp(excess, 0.0f, 60.0f);
+    return 0.0025f * x * std::pow(x * x + 1.0f, -1.0f / 3.0f);
+}
+// d(g_free * excess)/d(excess) - g_free: extra sensible-heat slope.
+inline float groundFreeConductanceExtraSlope(float excess) {
+    if (!(excess > 0.0f) || excess >= 60.0f) return 0.0f;
+    const float x = excess, s = x * x + 1.0f;
+    const float dg = 0.0025f * (std::pow(s, -1.0f / 3.0f) - (2.0f / 3.0f) * x * x * std::pow(s, -4.0f / 3.0f));
+    return x * dg;
+}
+struct GroundExchange { float resistance, extraSlope; };
+// Effective ground resistance [s/m] and the extra slope [m/s] of the free
+// convection branch in use. An unchanged resistance is returned bit for bit.
+inline GroundExchange groundExchange(float resistance, float excess, bool stabilityCorrection) {
+    const float free = groundFreeConductance(excess);
+    if (!(free > 0.0f)) return {resistance, 0.0f};
+    if (stabilityCorrection) {
+        if (!(free > 1.0f / resistance)) return {resistance, 0.0f};
+        return {1.0f / free, groundFreeConductanceExtraSlope(excess)};
+    }
+    return {1.0f / (1.0f / resistance + free), groundFreeConductanceExtraSlope(excess)};
+}
+
 inline double inverseObukhov(double sensibleHeat, double rho, double temperature, const Aerodynamics& a) {
     const double raw = -.4 * 9.81 * sensibleHeat /
         (rho * 1005 * temperature * std::pow(a.frictionVelocity, 3));
