@@ -50,6 +50,75 @@ float finish(float value) {
     // Must match appendSurfaceStates() in facetrtcore.cpp (CPU parity).
     return max(0.0,value*pc.scale);
 }
+// Hapke tables after the facet records (HapkeAlbedoTable::append): directional
+// albedo A[base][mu] (101 x 65), bihemispherical A_bh[base] (101), thermal
+// hemispherical mean of the emission shape [emissivity] (101). Present only
+// when pc.strength > 0. Bilinear sampling as on the CPU.
+const uint HAPKE_BASES=101u,HAPKE_MUS=65u;
+float hapkeTable(uint index) { return F[pc.facets*12u+index]; }
+float sampleDirectional(float base,float mu0) {
+    precise float x=clamp(base/0.999,0.0,1.0)*float(HAPKE_BASES-1u);
+    precise float y=clamp(mu0,0.0,1.0)*float(HAPKE_MUS-1u);
+    int b0=min(int(x),int(HAPKE_BASES)-2),m0=min(int(y),int(HAPKE_MUS)-2);
+    precise float fx=x-float(b0),fy=y-float(m0);
+    uint i=uint(b0)*HAPKE_MUS+uint(m0);
+    float a00=hapkeTable(i),a01=hapkeTable(i+1u),a10=hapkeTable(i+HAPKE_MUS),a11=hapkeTable(i+HAPKE_MUS+1u);
+    precise float value=(1.0-fx)*((1.0-fy)*a00+fy*a01)+fx*((1.0-fy)*a10+fy*a11);
+    return value;
+}
+float sampleBihemispherical(float base) {
+    precise float x=clamp(base/0.999,0.0,1.0)*float(HAPKE_BASES-1u);
+    int b0=min(int(x),int(HAPKE_BASES)-2);
+    precise float fx=x-float(b0);
+    uint o=HAPKE_BASES*HAPKE_MUS+uint(b0);
+    precise float value=(1.0-fx)*hapkeTable(o)+fx*hapkeTable(o+1u);
+    return value;
+}
+float sampleThermal(float emissivity) {
+    precise float x=clamp(emissivity,0.0,1.0)*float(HAPKE_BASES-1u);
+    int b0=min(int(x),int(HAPKE_BASES)-2);
+    precise float fx=x-float(b0);
+    uint o=HAPKE_BASES*HAPKE_MUS+HAPKE_BASES+uint(b0);
+    precise float value=(1.0-fx)*hapkeTable(o)+fx*hapkeTable(o+1u);
+    return value;
+}
+// Conserving Hapke background (backgroundHapkeSpectral on the CPU):
+// x = white-sky albedo for the solve (Lambert base), y = beam albedo
+// base*A(mu0)/A_bh, z = image BRF of the beam factor*base/A_bh, w = image
+// reflectance for diffuse light base*A(mu)/A_bh; all blended by strength.
+vec4 backgroundHapke(float value,uint f) {
+    const float pi=3.14159265358979323846;
+    float base=clamp(value,0.0,0.999);
+    float s=clamp(pc.strength,0.0,1.0);
+    float w=clamp(4.0*base/((1.0+base)*(1.0+base)),1e-5,0.999);
+    float mu0=F[f+8],mu=F[f+11],opposition=F[f+9];
+    precise float multiple=hapkeH(mu0,w)*hapkeH(mu,w)-1.0;
+    precise float directional=w/(4.0*pi)*mu0/max(mu0+mu,1e-5)*(1.0+opposition+multiple);
+    float h=hapkeH(1.0,w);
+    precise float reference=w/(8.0*pi)*h*h;
+    float factor=clamp(base*directional/mu0/max(reference,1e-6),0.0,1.0);
+    float bihemispherical=max(sampleBihemispherical(base),1e-6);
+    float beamAlbedo=clamp(base*sampleDirectional(base,mu0)/bihemispherical,0.0,0.999);
+    precise float beam=base+(beamAlbedo-base)*s;
+    precise float imageBeam=base+(factor*base/bihemispherical-base)*s;
+    precise float imageDiffuse=base+(base*sampleDirectional(base,mu)/bihemispherical-base)*s;
+    return vec4(base,beam,imageBeam,imageDiffuse);
+}
+// Image emissivity toward the zenith view, normalized to the hemispherical
+// mean of the shape (infraredHapkeImageEmissivity on the CPU).
+float imageEmissivity(float value,uint f) {
+    float base=clamp(value,0.0,1.0);
+    float hapke=clamp(base*directionalEmission(base,clamp(F[f+10],1e-4,1.0))/max(sampleThermal(base),1e-6),0.0,1.0);
+    precise float result=base+(hapke-base)*clamp(pc.strength,0.0,1.0);
+    return result;
+}
+// Material reflectance/transmittance of side s before the background model.
+vec2 materialOptics(uint f,bool thermal) {
+    vec4 material=M[pc.band*pc.materials+uint(F[f+4])];
+    float r=clamp(material.x*(thermal?1.0:F[f+3]),0.0,1.0);
+    float t=clamp(material.y,0.0,1.0-r);
+    return vec2(r,t);
+}
 void main() {
     uint s=gl_GlobalInvocationID.x,n=2u*pc.facets;
     if(pc.phase==5u || pc.phase==6u) {
@@ -75,23 +144,34 @@ void main() {
         float r=clamp(material.x*(thermal?1.0:F[f+3]),0.0,1.0);
         float t=clamp(material.y,0.0,1.0-r);
         float e=max(0.0,1.0-r-t);
-        if(!object) {
-            if(thermal){e=backgroundEmissivity(e,f);r=clamp(1.0-t-e,0.0,1.0);}
+        bool hapke=!object&&pc.strength>0.0;
+        float eImage=e,beamReflectance=-1.0;
+        if(hapke) {
+            // Conserving solve (hemispherical albedo/emissivity); the
+            // zenith-view shape only enters the image states (phase 2).
+            if(thermal){r=clamp(1.0-t-e,0.0,1.0);eImage=imageEmissivity(e,f);}
+            else{vec4 h=backgroundHapke(r,f);r=h.x;beamReflectance=h.y;}
+        } else if(!object) {
+            if(thermal){e=backgroundEmissivity(e,f);r=clamp(1.0-t-e,0.0,1.0);eImage=e;}
             else r=backgroundReflectance(r,f);
         }
         SurfaceOptics o;
         o.reflectance=r;o.transmittance=min(t,1.0-r);
-        emission[s]=thermal?vec2(e*material.z,e*material.w):vec2(0.0);
+        emission[s]=thermal?vec2(eImage*material.z,eImage*material.w):vec2(0.0);
         float lit=clamp(F[f+6]+F[f+7],0.0,1.0);
-        precise float mixed=lit*emission[s].x+(1.0-lit)*emission[s].y;
-        o.emission=thermal?mixed:0.0;
+        precise float mixed=lit*(e*material.z)+(1.0-lit)*(e*material.w);
         // Thermal bands: pc.beam is the 2.5-6 um solar beam (radiance units,
         // facetRtThermalSolar), exactly 0 above 6 um and at night.
         precise float direct=F[f+6u+(s&1u)]*max(0.0,(s&1u)==0u?cosine:-cosine)*pc.beam;
         o.directIrradiance=direct;
+        // Hapke optical: the beam is reflected with its own albedo, added as
+        // the source (beam - diffuse) * E (optical emission is otherwise 0).
+        precise float beamExtra=(beamReflectance-r)*direct;
+        o.emission=thermal?mixed:(beamReflectance>=0.0?beamExtra:0.0);
         optics[s]=o;
     } else if(pc.phase==4u) {
         optics[s].directIrradiance=0.0;
+        if(pc.thermal==0u) optics[s].emission=0.0; // Hapke beam term
     } else {
         float raw=pc.ping==0u?A[s]:B[s];
         if(pc.phase==2u) {
@@ -101,10 +181,31 @@ void main() {
             precise float diffuseShared=raw-o.reflectance*o.directIrradiance-o.transmittance*optics[other].directIrradiance-o.emission;
             float own=max(0.0,(s&1u)==0u?cosine:-cosine)*pc.beam;
             float opposite=max(0.0,(s&1u)==0u?-cosine:cosine)*pc.beam;
-            precise float lit=diffuseShared+o.reflectance*own+o.transmittance*opposite+emission[s].x;
-            precise float shade=diffuseShared+emission[s].y;
             uint k=pc.bands*n+2u*(pc.band*n+s);
-            outputData[k]=finish(lit);outputData[k+1u]=finish(shade);
+            if(F[f+5]==0.0&&pc.strength>0.0) {
+                // Hapke background image: zenith-view reflection of the solved
+                // diffuse field and of the beam (appendSurfaceStates, CPU).
+                bool thermal=pc.thermal!=0u;
+                vec2 rt=materialOptics(f,thermal);
+                float imageBeam,diffuseScale;
+                if(thermal) {
+                    float e=max(0.0,1.0-rt.x-rt.y);
+                    imageBeam=clamp(1.0-rt.y-imageEmissivity(e,f),0.0,1.0);
+                    diffuseScale=o.reflectance>0.0?imageBeam/o.reflectance:1.0;
+                } else {
+                    vec4 h=backgroundHapke(rt.x,f);
+                    imageBeam=h.z;
+                    diffuseScale=h.x>0.0?h.w/h.x:1.0;
+                }
+                precise float diffuse=diffuseShared*diffuseScale;
+                precise float litImage=diffuse+imageBeam*own+o.transmittance*opposite+emission[s].x;
+                precise float shadeImage=diffuse+emission[s].y;
+                outputData[k]=finish(litImage);outputData[k+1u]=finish(shadeImage);
+            } else {
+                precise float lit=diffuseShared+o.reflectance*own+o.transmittance*opposite+emission[s].x;
+                precise float shade=diffuseShared+emission[s].y;
+                outputData[k]=finish(lit);outputData[k+1u]=finish(shade);
+            }
         } else if(pc.phase==3u) {
             outputData[3u*pc.bands*n+s]=max(0.0,outputData[s]-finish(raw));
         }

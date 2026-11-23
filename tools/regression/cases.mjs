@@ -22,6 +22,9 @@ const soilThermal = (cs, rhos, lambdas) => (index) => ({ [`configuration.materia
   [`configuration.materials.${index}.params.rhos`]: rhos, [`configuration.materials.${index}.params.lambdas`]: lambdas })
 const SOIL_SCOPE = soilThermal(1180, 1800, 1.55)
 const SOIL_LOAM = soilThermal(1300, 1600, 1.0)
+// Heterogeneous (Hapke) background at full angular strength.
+const HAPKE_FULL = { 'configuration.scene.background.heterogeneityEnabled': true,
+  'configuration.scene.background.angularEffectStrength': 1 }
 // A flat size x size water sheet (n x n cells, upward normal) as the bundled
 // water generator writes it (main.js waterSurfaceObj), 1 cm above the ground.
 const waterSheetObj = (name, size, n) => {
@@ -217,6 +220,15 @@ export const CASES = {
   // free convection in parallel).
   feb_urban_soil_day_most: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], set: {
     ...SOIL_LOAM(4), 'configuration.control.stabilityCorrection': true } },
+  // Hapke background (2026-11-23) at full strength on the maize field (flat ground + one
+  // simple canopy). The radiosity solve must re-emit the conserving hemispherical albedo
+  // (beam base*A(mu0)/A_bh, diffuse base); the zenith-view BRF only shapes the image.
+  // _hot puts the sun at the zenith (image view in the hotspot); HISTREAM_FACET_HAPKE_AUDIT=1
+  // prints the ground energy closure (HAPKE_ENERGY lines). feb_crop_hapke: FacetEB state
+  // spectra (energy balance and temperatures must not change).
+  frt_crop_hapke: { example: 'crop_gpp_npp', mode: 'eFacetRT', set: HAPKE_FULL },
+  frt_crop_hapke_hot: { example: 'crop_gpp_npp', mode: 'eFacetRT', set: { ...HAPKE_FULL, 'configuration.light.zenith': 0 } },
+  feb_crop_hapke: { example: 'crop_gpp_npp', mode: 'eFacetEB', meteo: [23, 25], set: HAPKE_FULL },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.

@@ -1517,10 +1517,16 @@ void FacetrtVulkan::validateOptics(const std::vector<SurfaceOptics>& optics) con
         throw std::invalid_argument("Optics array must contain exactly two sides per facet");
     }
     for (const SurfaceOptics& value : optics) {
+        // A Hapke background reflects the beam with its own albedo, carried as
+        // the source (beam - diffuse albedo) * E, which may be negative; the
+        // reflected beam reflectance * E + emission must not be.
         if (!std::isfinite(value.reflectance) || !std::isfinite(value.transmittance) ||
             !std::isfinite(value.emission) || !std::isfinite(value.directIrradiance) ||
             value.reflectance < 0.0f || value.transmittance < 0.0f ||
-            value.emission < 0.0f || value.directIrradiance < 0.0f ||
+            (value.emission < 0.0f &&
+             value.emission + value.reflectance * value.directIrradiance < -1.0e-6f *
+                 std::max(1.0f, value.directIrradiance)) ||
+            value.directIrradiance < 0.0f ||
             value.reflectance + value.transmittance > 1.0001f) {
             throw std::invalid_argument(
                 "Optical values must be finite, non-negative, and reflectance+transmittance<=1");
@@ -2016,7 +2022,8 @@ void FacetrtVulkan::beginSpectral(const std::vector<float>& facets, const std::v
                                  uint32_t bands, uint32_t materials, const Direction& sun, float backgroundStrength,
                                  float beamIrradiance)
 {
-    if (m_solvePipeline == VK_NULL_HANDLE || facets.size() != size_t(m_facetCount) * 12U || bands == 0 ||
+    // Facet records (12 floats each), optionally followed by the Hapke tables.
+    if (m_solvePipeline == VK_NULL_HANDLE || facets.size() < size_t(m_facetCount) * 12U || bands == 0 ||
         materials == 0 || materialBands.size() != size_t(bands) * materials * 4U)
         throw std::invalid_argument("Invalid spectral facet/material layout");
     for (float v : facets) if (!std::isfinite(v)) throw std::invalid_argument("Non-finite spectral facet");

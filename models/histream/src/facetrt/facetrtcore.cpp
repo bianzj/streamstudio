@@ -787,9 +787,20 @@ float hapkeClampedFactor(float base, float mu0, float mu, float phaseAngle)
         base * directional / mu0 / std::max(reference, 1.0e-6f), 0.0f, 1.0f);
 }
 
-// Directional reflectance factor for one illumination and one viewing
-// direction. Image products use it (viewing direction: zenith, see
-// kImageViewDirection); the energy balance uses the hemispherical albedo below.
+// Raw (unclamped, unnormalized) Hapke directional emission shape of the
+// thermal background, emission angle cosine mu; see Emissivity_Hapke.
+float infraredHapkeShape(float base, float mu)
+{
+    const float singleScatteringAlbedo = std::clamp(
+        1.0f - base * base, 1.0e-5f, 0.999f);
+    const float root = std::sqrt(1.0f - singleScatteringAlbedo);
+    return root * (1.0f + 2.0f * mu / 1.5f) /
+        (1.0f + 2.0f * mu / 1.5f * root);
+}
+
+// Former image factor, normalized at nadir. Its hemispherical albedo exceeds
+// the Lambert value; it is kept only for Hapke-off bitwise compatibility of
+// the radiosity solve (strength 0) and documents the former convention.
 float backgroundHapkeReflectance(float reflectance, Vec3 incoming, Vec3 outgoing,
                                  const Vec3& surfaceNormal, float strength)
 {
@@ -809,6 +820,8 @@ float backgroundHapkeReflectance(float reflectance, Vec3 incoming, Vec3 outgoing
 // Image products observe the background from the zenith (nadir sensor): the
 // optical reflectance factor and the thermal directional emissivity both use
 // this viewing direction, folded into the hemisphere of the receiving side.
+// The engine receives no sensor direction; for oblique or perspective sensors
+// the zenith-view value is an approximation.
 const Vec3 kImageViewDirection{0.0f, 1.0f, 0.0f};
 
 // 16-point Gauss-Legendre rule on [0,1], used for the hemispherical integrals.
@@ -852,6 +865,9 @@ struct HapkeAlbedoTable {
     static constexpr int kAzimuthCount = 32;
     std::vector<float> directional;
     std::vector<float> bihemispherical;
+    // Thermal: hemispherical mean 2 Int shape(e, mu) mu dmu of the directional
+    // emission shape, tabulated at e = i / (kBaseCount - 1).
+    std::vector<float> thermalHemispherical;
 
     static float baseAt(int index) { return 0.999f * index / (kBaseCount - 1); }
 
@@ -881,7 +897,8 @@ struct HapkeAlbedoTable {
     }
 
     HapkeAlbedoTable()
-        : directional(size_t(kBaseCount) * kMuCount), bihemispherical(kBaseCount)
+        : directional(size_t(kBaseCount) * kMuCount), bihemispherical(kBaseCount),
+          thermalHemispherical(kBaseCount)
     {
         const auto& rule = unitGaussLegendre();
         for (int b = 0; b < kBaseCount; ++b) {
@@ -893,7 +910,31 @@ struct HapkeAlbedoTable {
             for (size_t m = 0; m < rule.node.size(); ++m)
                 sum += rule.weight[m] * rule.node[m] * albedo(baseAt(b), rule.node[m]);
             bihemispherical[size_t(b)] = static_cast<float>(2.0 * sum);
+            double thermal = 0.0;
+            const float emissivity = float(b) / float(kBaseCount - 1);
+            for (size_t m = 0; m < rule.node.size(); ++m)
+                thermal += rule.weight[m] * rule.node[m] *
+                    infraredHapkeShape(emissivity, static_cast<float>(rule.node[m]));
+            thermalHemispherical[size_t(b)] = static_cast<float>(2.0 * thermal);
         }
+    }
+
+    // GPU copy (spectral.comp, appended after the facet records): directional
+    // [base][mu], bihemispherical [base], thermal hemispherical [emissivity].
+    void append(std::vector<float>& out) const
+    {
+        out.insert(out.end(), directional.begin(), directional.end());
+        out.insert(out.end(), bihemispherical.begin(), bihemispherical.end());
+        out.insert(out.end(), thermalHemispherical.begin(), thermalHemispherical.end());
+    }
+
+    float sampleThermal(float emissivity) const
+    {
+        const float x = std::clamp(emissivity, 0.0f, 1.0f) * (kBaseCount - 1);
+        const int b0 = std::min(static_cast<int>(x), kBaseCount - 2);
+        const float fx = x - b0;
+        return (1.0f - fx) * thermalHemispherical[size_t(b0)] +
+            fx * thermalHemispherical[size_t(b0) + 1U];
     }
 
     float sampleDirectional(float base, float mu0) const
@@ -971,6 +1012,80 @@ float infraredHapkeEmissivity(float baseEmissivity, float cosine,
     const float base = std::clamp(baseEmissivity, 0.0f, 1.0f);
     const float hapke = infraredHapkeDirectionalFactor(base, cosine);
     return base + (hapke - base) * std::clamp(strength, 0.0f, 1.0f);
+}
+
+// Spectral (image) optics of a Hapke background side, strength > 0. The
+// radiosity solve is hemispherical and follows the energy-balance convention:
+// diffuse light (sky and every scene reflection) sees the white-sky albedo
+// `diffuse` = Lambert base, the beam the directional-hemispherical albedo
+// `beam` = base*A(mu0)/A_bh. The image (zenith view) uses the BRF normalized
+// to the same albedo: beam factor*base/A_bh (its hemispherical integral is
+// `beam`), diffuse light base*A(mu)/A_bh (the reflectance for isotropic
+// incidence, by reciprocity; its hemispherical integral is base).
+// spectral.comp backgroundHapke() mirrors this function.
+struct BackgroundHapkeOptics {
+    float diffuse{}, beam{}, imageBeam{}, imageDiffuse{};
+};
+
+BackgroundHapkeOptics backgroundHapkeSpectral(float reflectance, float mu0, float mu,
+                                              float phaseAngle, float strength)
+{
+    const HapkeAlbedoTable& table = hapkeAlbedoTable();
+    const float base = std::clamp(reflectance, 0.0f, 0.999f);
+    const float s = std::clamp(strength, 0.0f, 1.0f);
+    const float factor = hapkeClampedFactor(base, mu0, mu, phaseAngle);
+    const float bihemispherical = std::max(table.sampleBihemispherical(base), 1.0e-6f);
+    const float beamAlbedo = std::clamp(
+        base * table.sampleDirectional(base, mu0) / bihemispherical, 0.0f, 0.999f);
+    BackgroundHapkeOptics optics;
+    optics.diffuse = base;
+    optics.beam = base + (beamAlbedo - base) * s;
+    optics.imageBeam = base + (factor * base / bihemispherical - base) * s;
+    optics.imageDiffuse = base +
+        (base * table.sampleDirectional(base, mu) / bihemispherical - base) * s;
+    return optics;
+}
+
+// Image emissivity of a thermal Hapke background toward the zenith view: the
+// directional shape normalized to its hemispherical mean, so the hemispherical
+// emissivity stays the Lambert value used by the solve (formerly normalized at
+// nadir, which lowered the hemispherical emissivity on every slope).
+float infraredHapkeImageEmissivity(float baseEmissivity, float cosine, float strength)
+{
+    const float base = std::clamp(baseEmissivity, 0.0f, 1.0f);
+    const float hapke = std::clamp(
+        base * infraredHapkeShape(base, std::clamp(cosine, 1.0e-4f, 1.0f)) /
+            std::max(hapkeAlbedoTable().sampleThermal(base), 1.0e-6f),
+        0.0f, 1.0f);
+    return base + (hapke - base) * std::clamp(strength, 0.0f, 1.0f);
+}
+
+// Image reflection of one side for the sunlit/shaded image states: the
+// reflectance applied to the beam, and the factor applied to the solved
+// diffuse part (reflected scene + sky light). beam < 0: same as the solve.
+struct ImageReflection {
+    float beam{-1.0f};
+    float diffuseScale{1.0f};
+};
+
+// Geometry shared with prepareGpuSpectral(): the sun and the zenith view
+// folded into the hemisphere of the facet normal.
+struct BackgroundViewGeometry {
+    float mu0{}, mu{}, phase{};
+};
+
+BackgroundViewGeometry backgroundViewGeometry(const Vec3& rawNormal, const Vec3& sun)
+{
+    const Vec3 normal = normalized(rawNormal);
+    Vec3 incoming = normalized(sun);
+    if (dot(incoming, normal) < 0.0f) incoming = multiply(incoming, -1.0f);
+    Vec3 outgoing = kImageViewDirection;
+    if (dot(outgoing, normal) < 0.0f) outgoing = multiply(outgoing, -1.0f);
+    BackgroundViewGeometry geometry;
+    geometry.mu0 = std::max(dot(normal, incoming), 1.0e-4f);
+    geometry.mu = std::max(dot(normal, outgoing), 1.0e-4f);
+    geometry.phase = std::acos(std::clamp(dot(incoming, outgoing), -1.0f, 1.0f));
+    return geometry;
 }
 
 const SurfaceParameters& surfaceForFacet(const Scene& scene, uint32_t facet)
@@ -1470,7 +1585,8 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
     const std::vector<float>& sunlit,
     const FacetRTParameters& parameters,
     size_t band,
-    std::vector<std::array<float, 2>>* stateEmission = nullptr)
+    std::vector<std::array<float, 2>>* stateEmission = nullptr,
+    std::vector<ImageReflection>* image = nullptr)
 {
     const float wavelength = parameters.wavelengths[band];
     const bool thermal = wavelength > 2500.0f;
@@ -1479,8 +1595,10 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
     // Thermal bands below 6 um also reflect the absolute solar beam (radiance
     // units, see facetRtThermalSolar); 0 elsewhere.
     const float thermalBeam = thermal ? facetRtThermalSolar(scene, wavelength)[0] : 0.0f;
+    const bool hapke = scene.backgroundAngularStrength > 0.0f;
     std::vector<facetvk::SurfaceOptics> optics(scene.facetCount() * 2U);
     if (stateEmission) stateEmission->assign(optics.size(), {0.0f, 0.0f});
+    if (image) image->assign(optics.size(), ImageReflection{});
     for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
         const bool object = facet < scene.leafFacetCount;
         // A thin facet has one temperature: it is sunlit when either face is.
@@ -1512,10 +1630,37 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
             const float sign = localSide == 0U ? 1.0f : -1.0f;
             const Vec3 sideNormal = multiply(normal, sign);
             float emissivity = std::max(0.0f, 1.0f - reflectance - transmittance);
-            if (!object && thermal) {
+            // Hapke on: the solve keeps the hemispherical (Lambert) emissivity
+            // and the conserving albedos; the zenith-view shape only enters the
+            // image states (imageEmissivity, ImageReflection).
+            float imageEmissivity = emissivity;
+            float beamReflectance = -1.0f;
+            ImageReflection sideImage;
+            if (!object && hapke && thermal) {
+                reflectance = std::clamp(
+                    1.0f - transmittance - emissivity, 0.0f, 1.0f);
+                imageEmissivity = infraredHapkeImageEmissivity(
+                    emissivity, std::abs(sideNormal[1]),
+                    scene.backgroundAngularStrength);
+                sideImage.beam = std::clamp(
+                    1.0f - transmittance - imageEmissivity, 0.0f, 1.0f);
+                sideImage.diffuseScale = reflectance > 0.0f
+                    ? sideImage.beam / reflectance : 1.0f;
+            } else if (!object && hapke) {
+                const BackgroundViewGeometry geometry = backgroundViewGeometry(normal, sun);
+                const BackgroundHapkeOptics h = backgroundHapkeSpectral(
+                    reflectance, geometry.mu0, geometry.mu, geometry.phase,
+                    scene.backgroundAngularStrength);
+                reflectance = h.diffuse;
+                beamReflectance = h.beam;
+                sideImage.beam = h.imageBeam;
+                sideImage.diffuseScale = h.diffuse > 0.0f
+                    ? h.imageDiffuse / h.diffuse : 1.0f;
+            } else if (!object && thermal) {
                 emissivity = infraredHapkeEmissivity(
                     emissivity, std::abs(sideNormal[1]),
                     scene.backgroundAngularStrength);
+                imageEmissivity = emissivity;
                 reflectance = std::clamp(
                     1.0f - transmittance - emissivity, 0.0f, 1.0f);
             } else if (!object) {
@@ -1523,23 +1668,31 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
                     reflectance, sun, kImageViewDirection, sideNormal,
                     scene.backgroundAngularStrength);
             }
+            if (image) (*image)[side] = sideImage;
             optics[side].reflectance = reflectance;
             optics[side].transmittance = std::min(
                 transmittance, 1.0f - reflectance);
             if (thermal) {
-                const float sunlitEmission =
-                    emissivity * planckRadiance(wavelength, surface.sunlitTemperature);
-                const float shadedEmission =
-                    emissivity * planckRadiance(wavelength, surface.shadedTemperature);
+                const float sunlitBlackbody = planckRadiance(wavelength, surface.sunlitTemperature);
+                const float shadedBlackbody = planckRadiance(wavelength, surface.shadedTemperature);
+                const float sunlitEmission = emissivity * sunlitBlackbody;
+                const float shadedEmission = emissivity * shadedBlackbody;
                 optics[side].emission = facetIlluminated * sunlitEmission +
                     (1.0f - facetIlluminated) * shadedEmission;
                 optics[side].directIrradiance =
                     sunlit[side] * std::max(0.0f, dot(sideNormal, sun)) * thermalBeam;
-                if (stateEmission) (*stateEmission)[side] = {sunlitEmission, shadedEmission};
+                if (stateEmission) (*stateEmission)[side] = {
+                    imageEmissivity * sunlitBlackbody, imageEmissivity * shadedBlackbody};
             } else {
                 optics[side].directIrradiance =
                     sunlit[side] * std::max(0.0f, dot(sideNormal, sun)) *
                     bandBeamIrradiance(scene, parameters, band);
+                // Beam reflected with its own albedo: the solve adds
+                // (beam - diffuse) * E as a source term (optical emission is
+                // otherwise 0; spectral diffuse baselines remove it).
+                if (beamReflectance >= 0.0f)
+                    optics[side].emission =
+                        (beamReflectance - reflectance) * optics[side].directIrradiance;
             }
         }
     }
@@ -1560,7 +1713,8 @@ void appendSurfaceStates(const Scene& scene,
                          float beamIrradiance,
                          float outputScale,
                          bool clampUnit,
-                         std::vector<float>& states)
+                         std::vector<float>& states,
+                         const std::vector<ImageReflection>* image = nullptr)
 {
     const facetvk::Direction direction = sunDirection(scene);
     const Vec3 sun{direction.x, direction.y, direction.z};
@@ -1586,6 +1740,18 @@ void appendSurfaceStates(const Scene& scene,
                 - surface.emission;
             const float ownDirect = localSide == 0U ? frontDirect : backDirect;
             const float otherDirect = localSide == 0U ? backDirect : frontDirect;
+            if (image && (*image)[side].beam >= 0.0f) {
+                // Hapke background: the image sees the zenith-view reflection
+                // of the solved diffuse field and of the beam (spectral.comp).
+                const ImageReflection& view = (*image)[side];
+                const float diffuse = shared * view.diffuseScale;
+                const float lit = diffuse + view.beam * ownDirect
+                    + surface.transmittance * otherDirect + stateEmission[side][0];
+                const float shaded = diffuse + stateEmission[side][1];
+                states.push_back(finish(lit));
+                states.push_back(finish(shaded));
+                continue;
+            }
             const float lit = shared + surface.reflectance * ownDirect
                 + surface.transmittance * otherDirect + stateEmission[side][0];
             const float shaded = shared + stateEmission[side][1];
@@ -1635,6 +1801,9 @@ void prepareGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const
         p[10] = std::abs(rawNormal[1]);
         p[11] = std::max(dot(normal, outgoing), 1.0e-4f);
     }
+    // Hapke background: the albedo tables follow the facet records (see
+    // HapkeAlbedoTable::append and spectral.comp); not built otherwise.
+    if (scene.backgroundAngularStrength > 0.0f) hapkeAlbedoTable().append(facets);
     // Spectral tables and blackbody radiance are material properties: evaluate
     // once per material/band instead of repeating expm1 for every oriented side.
     std::vector<float> materialBands(parameters.wavelengths.size() * materials * 4U);
@@ -1665,14 +1834,17 @@ std::vector<facetvk::SurfaceOptics> makeStateSpectralOptics(
     const std::array<std::vector<float>, 2>& stateTemperature,
     const std::vector<float>& sunlitPart,
     float directNormalIrradiance,
-    std::vector<std::array<float, 2>>& stateEmission)
+    std::vector<std::array<float, 2>>& stateEmission,
+    std::vector<ImageReflection>* image = nullptr)
 {
     const float wavelength = parameters.wavelengths[band];
     const bool optical = isOpticalWavelength(wavelength);
     const facetvk::Direction direction = sunDirection(scene);
     const Vec3 sun{direction.x, direction.y, direction.z};
+    const bool hapke = scene.backgroundAngularStrength > 0.0f;
     std::vector<facetvk::SurfaceOptics> optics(scene.facetCount() * 2U);
     stateEmission.assign(optics.size(), {0.0f, 0.0f});
+    if (image) image->assign(optics.size(), ImageReflection{});
     for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
         const bool object = facet < scene.leafFacetCount;
         const SurfaceParameters& surface = surfaceForFacet(scene, facet);
@@ -1697,7 +1869,32 @@ std::vector<facetvk::SurfaceOptics> makeStateSpectralOptics(
             const float sign = localSide == 0U ? 1.0f : -1.0f;
             const Vec3 sideNormal = multiply(normal, sign);
             float emissivity = std::max(0.0f, 1.0f - reflectance - transmittance);
-            if (!object && optical) {
+            // Hapke on: same split as makeSpectralOptics (conserving solve,
+            // zenith-view shape only in the image states).
+            float imageEmissivity = emissivity;
+            float beamReflectance = -1.0f;
+            ImageReflection sideImage;
+            if (!object && hapke && optical) {
+                const BackgroundViewGeometry geometry = backgroundViewGeometry(normal, sun);
+                const BackgroundHapkeOptics h = backgroundHapkeSpectral(
+                    reflectance, geometry.mu0, geometry.mu, geometry.phase,
+                    scene.backgroundAngularStrength);
+                reflectance = h.diffuse;
+                beamReflectance = h.beam;
+                sideImage.beam = h.imageBeam;
+                sideImage.diffuseScale = h.diffuse > 0.0f
+                    ? h.imageDiffuse / h.diffuse : 1.0f;
+            } else if (!object && hapke) {
+                reflectance = std::clamp(
+                    1.0f - transmittance - emissivity, 0.0f, 1.0f);
+                imageEmissivity = infraredHapkeImageEmissivity(
+                    emissivity, std::abs(sideNormal[1]),
+                    scene.backgroundAngularStrength);
+                sideImage.beam = std::clamp(
+                    1.0f - transmittance - imageEmissivity, 0.0f, 1.0f);
+                sideImage.diffuseScale = reflectance > 0.0f
+                    ? sideImage.beam / reflectance : 1.0f;
+            } else if (!object && optical) {
                 reflectance = backgroundHapkeReflectance(
                     reflectance, sun, kImageViewDirection, sideNormal,
                     scene.backgroundAngularStrength);
@@ -1705,9 +1902,11 @@ std::vector<facetvk::SurfaceOptics> makeStateSpectralOptics(
                 emissivity = infraredHapkeEmissivity(
                     emissivity, std::abs(sideNormal[1]),
                     scene.backgroundAngularStrength);
+                imageEmissivity = emissivity;
                 reflectance = std::clamp(
                     1.0f - transmittance - emissivity, 0.0f, 1.0f);
             }
+            if (image) (*image)[side] = sideImage;
             optics[side].reflectance = reflectance;
             optics[side].transmittance = std::min(
                 transmittance, 1.0f - reflectance);
@@ -1717,15 +1916,21 @@ std::vector<facetvk::SurfaceOptics> makeStateSpectralOptics(
                 std::clamp(sunlit[side], 0.0f, 1.0f) *
                 std::max(0.0f, dot(sideNormal, sun)) *
                 directNormalIrradiance;
+            if (optical && beamReflectance >= 0.0f) {
+                optics[side].emission =
+                    (beamReflectance - reflectance) * optics[side].directIrradiance;
+            }
             if (!optical) {
-                const auto stateRadiance = [&](int state) {
-                    return emissivity * planckRadiance(
+                const auto blackbody = [&](int state) {
+                    return planckRadiance(
                         wavelength,
                         std::clamp(stateTemperature[state][side], 1.0f, 2000.0f));
                 };
-                stateEmission[side] = {stateRadiance(0), stateRadiance(1)};
-                optics[side].emission = sunlitPart[side] * stateEmission[side][0] +
-                    (1.0f - sunlitPart[side]) * stateEmission[side][1];
+                const float sunlitBlackbody = blackbody(0), shadedBlackbody = blackbody(1);
+                optics[side].emission = sunlitPart[side] * (emissivity * sunlitBlackbody) +
+                    (1.0f - sunlitPart[side]) * (emissivity * shadedBlackbody);
+                stateEmission[side] = {imageEmissivity * sunlitBlackbody,
+                                       imageEmissivity * shadedBlackbody};
             }
         }
     }
@@ -2306,6 +2511,19 @@ std::vector<facetvk::SurfaceOptics> withoutDirectLight(
     return diffuse;
 }
 
+// Optical spectral optics without the beam: the emission of an optical band
+// only carries the Hapke beam-albedo term (makeSpectralOptics), so it goes too.
+std::vector<facetvk::SurfaceOptics> withoutOpticalDirectLight(
+    const std::vector<facetvk::SurfaceOptics>& optics)
+{
+    std::vector<facetvk::SurfaceOptics> diffuse = optics;
+    for (facetvk::SurfaceOptics& surface : diffuse) {
+        surface.directIrradiance = 0.0f;
+        surface.emission = 0.0f;
+    }
+    return diffuse;
+}
+
 std::vector<float> lightEnhancement(
     const std::vector<float>& illuminated,
     const std::vector<float>& diffuseOnly)
@@ -2359,6 +2577,80 @@ RunResult runCpu(const Scene& scene, const Progress& progress)
     return result;
 }
 
+// Diagnostic (HISTREAM_FACET_HAPKE_AUDIT=1, Hapke background only): ground
+// energy closure of the optical spectral radiosity solve. On every upward
+// background side the solved incident field is split into the beam E and the
+// diffuse part H (sky + scene; the soil-facing back side receives nothing).
+// The conserving convention reflects base*A(mu0)/A_bh * E + base * H; the
+// ground absorbs the rest. Reported per band, area weighted and normalized by
+// the band reference irradiance (scene incident = 1 per unit domain area):
+// ground incident, the solve's re-emitted flux, the conserving flux, the
+// closure residual (solve - conserving) / ground incident and per unit domain
+// area, and the residual of the FacetEB energy-balance mixture (one flux-
+// weighted albedo for beam and sky, also applied to scene reflections).
+void reportHapkeEnergyClosure(const Scene& scene, const FacetRTParameters& parameters,
+                              const std::vector<float>& sunlit, const std::vector<float>& output)
+{
+    const char* flag = std::getenv("HISTREAM_FACET_HAPKE_AUDIT");
+    if (!flag || std::string(flag) != "1" || !(scene.backgroundAngularStrength > 0.0f)) return;
+    const facetvk::Direction direction = sunDirection(scene);
+    const Vec3 sun{direction.x, direction.y, direction.z};
+    const float cosineSolarZenith = std::max(0.0f, sun[1]);
+    const size_t n = size_t(scene.facetCount()) * 2U;
+    for (size_t band = 0; band < parameters.wavelengths.size(); ++band) {
+        if (!isOpticalWavelength(parameters.wavelengths[band])) continue;
+        const float beam = bandBeamIrradiance(scene, parameters, band);
+        const float sky = bandSkyIrradiance(scene, parameters, band);
+        const float reference = beam * cosineSolarZenith + sky;
+        if (!(reference > 1.0e-8f) || output.size() < (band + 1U) * n) continue;
+        const std::vector<facetvk::SurfaceOptics> optics =
+            makeSpectralOptics(scene, sunlit, parameters, band);
+        double area = 0.0, incident = 0.0, beamSum = 0.0, solved = 0.0;
+        double conserving = 0.0, mixture = 0.0, litArea = 0.0;
+        for (uint32_t facet = scene.leafFacetCount; facet < scene.facetCount(); ++facet) {
+            const facetvk::Vertex& vertex = scene.vertices[facet * 3U];
+            const Vec3 normal{vertex.normal[0], vertex.normal[1], vertex.normal[2]};
+            const uint32_t localSide = normal[1] >= 0.0f ? 0U : 1U;
+            const uint32_t side = facet * 2U + localSide;
+            const Vec3 sideNormal = multiply(normal, localSide == 0U ? 1.0f : -1.0f);
+            const facetvk::SurfaceOptics& o = optics[side];
+            const float a = facetArea(scene, facet);
+            const SurfaceParameters& surface = surfaceForFacet(scene, facet);
+            const float lambert = std::clamp(
+                bandValue(surface.reflectance, band, 0.20f) * reflectanceTextureFactor(scene, facet),
+                0.0f, 1.0f);
+            const float base = std::clamp(lambert, 0.0f, 0.999f);
+            const double scale = 1.0 / reference;
+            const double raw = double(output[band * n + side]) / scale;
+            const double e = o.directIrradiance;
+            const double h = o.reflectance > 0.0f
+                ? (raw - o.reflectance * e - o.emission) / o.reflectance : 0.0;
+            const float cosine = std::max(0.0f, dot(normalized(sideNormal), sun));
+            const double beamAlbedo = backgroundHapkeEnergyReflectance(
+                lambert, cosine, 1.0f, 0.0f, scene.backgroundAngularStrength);
+            const double mixAlbedo = backgroundHapkeEnergyReflectance(
+                lambert, cosine, float(e), sky, scene.backgroundAngularStrength);
+            area += a;
+            incident += a * (e + h) * scale;
+            beamSum += a * e * scale;
+            solved += a * raw * scale;
+            conserving += a * (beamAlbedo * e + base * h) * scale;
+            mixture += a * mixAlbedo * (e + h) * scale;
+            if (sunlit[side] > 0.5f) litArea += a;
+        }
+        if (!(area > 0.0) || !(incident > 0.0)) continue;
+        std::ostringstream line;
+        line << std::setprecision(6) << "HAPKE_ENERGY band=" << parameters.wavelengths[band]
+             << " groundArea=" << area << " litFraction=" << litArea / area
+             << " groundIncident=" << incident / area << " groundBeam=" << beamSum / area
+             << " reflectedSolve=" << solved / area << " reflectedConserving=" << conserving / area
+             << " closureResidual=" << (solved - conserving) / incident
+             << " sceneResidual=" << (solved - conserving) / area
+             << " energyBalanceMixtureResidual=" << (mixture - conserving) / incident;
+        std::cout << line.str() << std::endl;
+    }
+}
+
 void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const FacetRTParameters& parameters,
                     const Progress& progress, RunResult& result)
 {
@@ -2396,7 +2688,8 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
         if (auditEnabled) {
             const auto audit = model.readSpectralAudit(static_cast<uint32_t>(band));
             std::vector<std::array<float, 2>> emission;
-            const auto optics = makeSpectralOptics(scene, result.sunlit, parameters, band, &emission);
+            std::vector<ImageReflection> image;
+            const auto optics = makeSpectralOptics(scene, result.sunlit, parameters, band, &emission, &image);
             const auto check = [](float gpu, float cpu, float& maximum) {
                 const float error = std::abs(gpu - cpu);
                 maximum = std::max(maximum, error);
@@ -2422,7 +2715,7 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
                                                             : referenceSolve.iterations - stats.iterations);
             std::vector<float> states;
             appendSurfaceStates(scene, optics, emission, referenceSolve.radiosity,
-                                beam, scale, !thermal, states);
+                                beam, scale, !thermal, states, &image);
             for (size_t side = 0; side < optics.size(); ++side) {
                 check(audit.raw[side], referenceSolve.radiosity[side], result.spectralRawError);
                 const float value = thermal ? referenceSolve.radiosity[side]
@@ -2440,6 +2733,7 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
         previousThermal = thermal;
     }
     const auto output = model.readSpectralOutput();
+    reportHapkeEnergyClosure(scene, parameters, result.sunlit, output);
     const size_t n = size_t(scene.facetCount()) * 2U, bandValues = n * parameters.wavelengths.size();
     result.solution.radiosity.assign(output.begin(), output.begin() + n);
     if (parameters.wavelengths.size() > 1)
@@ -2544,9 +2838,10 @@ RunResult runGpu(const Scene& scene,
                 std::to_string(band + 1U) + "/" +
                 std::to_string(spectralParameters->wavelengths.size()));
             std::vector<std::array<float, 2>> stateEmission;
+            std::vector<ImageReflection> image;
             const std::vector<facetvk::SurfaceOptics> optics =
                 makeSpectralOptics(scene, result.sunlit,
-                                   *spectralParameters, band, &stateEmission);
+                                   *spectralParameters, band, &stateEmission, &image);
             const float skyRadiance = thermal
                 ? planckRadiance(wavelength,
                                  spectralParameters->skyTemperature) + thermalSolar[1]
@@ -2573,7 +2868,7 @@ RunResult runGpu(const Scene& scene,
                                 bandBeam,
                                 thermal || opticalReferenceIrradiance <= 1.0e-8f
                                     ? 1.0f : 1.0f / opticalReferenceIrradiance,
-                                !thermal, result.bandStates);
+                                !thermal, result.bandStates, &image);
             // The optical solver returns outgoing radiosity.  Image products
             // require dimensionless apparent reflectance, referenced to the
             // same direct and diffuse illumination used by this solve.
@@ -2594,10 +2889,10 @@ RunResult runGpu(const Scene& scene,
                     facetvk::SolveResult diffuseSolution =
                         spectralParameters->acceleratedSolver
                             ? model.solveAccelerated(
-                                  withoutDirectLight(optics), skyRadiance,
+                                  withoutOpticalDirectLight(optics), skyRadiance,
                                   nullptr, kIterations, 8U, 1.0e-4f, 1.0f)
                             : model.solve(
-                                  withoutDirectLight(optics), skyRadiance,
+                                  withoutOpticalDirectLight(optics), skyRadiance,
                                   kIterations, 1.0f);
                     if (opticalReferenceIrradiance > 1.0e-8f) {
                         for (float& value : diffuseSolution.radiosity) {
@@ -6390,11 +6685,12 @@ try {
                 ? directSpectralIrradiance * directNormalFactor
                 : mwirDirect * directNormalFactor / kPi;
             std::vector<std::array<float, 2>> stateEmission;
+            std::vector<ImageReflection> spectralImage;
             const std::vector<facetvk::SurfaceOptics> spectralOptics =
                 makeStateSpectralOptics(
                     scene, sunlit, radiativeParameters, band,
                     stateTemperature, sunlitPart,
-                    directNormalSpectralIrradiance, stateEmission);
+                    directNormalSpectralIrradiance, stateEmission, &spectralImage);
             const float skySpectralRadiance = optical
                 ? diffuseSpectralIrradiance
                 // DEFERRED[低] 物理: 热红外图像的天空辐射用固定 skyTemperature 的普朗克辐射，而能量平衡用的是气象驱动 meteo.longwave（Rli）；两者不一致会使热红外图像与求得的温度场不自洽；建议：由 Rli 反推等效天空亮温 (Rli/σ)^(1/4) 用于光谱天空辐射。
@@ -6418,11 +6714,11 @@ try {
                     scene, spectralOptics, stateEmission, spectralSolution.radiosity,
                     directNormalSpectralIrradiance,
                     referenceIrradiance > 1.0e-8f ? 1.0f / referenceIrradiance : 0.0f,
-                    true, spectralStates[band]);
+                    true, spectralStates[band], &spectralImage);
             } else {
                 appendSurfaceStates(
                     scene, spectralOptics, stateEmission, spectralSolution.radiosity,
-                    directNormalSpectralIrradiance, 1.0f, false, spectralStates[band]);
+                    directNormalSpectralIrradiance, 1.0f, false, spectralStates[band], &spectralImage);
             }
         }
 
