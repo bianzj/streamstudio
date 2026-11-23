@@ -518,7 +518,12 @@ export function createMaterialPresets() {
         name: 'tree_trunk_wood', label: '树干木质部', type: 'Vegetation', energyModel: 'wood',
         params: { method: 1, rss: 1000000000, cs: 1700, rhos: 650, lambdas: 0.16, Tsoil: 25, SMC: 0, Satwater: 0, convectiveScale: 1.2 }
       },
-      { name: 'soilset', label: '典型壤土', type: 'Soil', params: { method: 2, rss: 2000, cs: 1180, rhos: 1800, lambdas: 1.55, Tsoil: 25, SMC: 25, Satwater: 0.45 } },
+      // Moist loam at SMC 25 %: cs/rhos are the bulk values at that moisture (dry bulk density
+      // 1350 kg m⁻³ + 250 kg m⁻³ water, C = 2.08e6 J m⁻³ K⁻¹ = 1.1e6 dry + 1.05e6 water) and
+      // λ 1.0 W m⁻¹ K⁻¹ (Johansen 1975 / Campbell & Norman 1998 loam at θ 0.25); thermal inertia
+      // √(λC) ≈ 1440 J m⁻² K⁻¹ s⁻½ (Murray & Verhoef 2007 ≈ 1380). The former SCOPE values
+      // (1180, 1800, 1.55 → 1814) remain the engine fallback for missing fields.
+      { name: 'soilset', label: '典型壤土', type: 'Soil', params: { method: 2, rss: 2000, cs: 1300, rhos: 1600, lambdas: 1.0, Tsoil: 25, SMC: 25, Satwater: 0.45 } },
       { name: 'soil_dry', label: '干燥土壤', type: 'Soil', params: { method: 2, rss: 4000, cs: 1000, rhos: 1600, lambdas: 0.8, Tsoil: 30, SMC: 10, Satwater: 0.38 } },
       { name: 'soil_wet', label: '湿润土壤', type: 'Soil', params: { method: 2, rss: 800, cs: 1400, rhos: 1900, lambdas: 2.0, Tsoil: 22, SMC: 35, Satwater: 0.50 } },
       { name: 'vehicle_material', label: '载具车身物化', type: 'Building', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0 } },

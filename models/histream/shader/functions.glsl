@@ -1444,22 +1444,30 @@ vec2 sunlitStateTransfer(vec2 values, float pOld, float pNew)
 
 // Implicit, conservative finite-volume conduction on a nonuniform nodal grid.
 // Temperatures are Celsius; G is positive downward [W m-2].  cs [J kg-1 K-1]
-// and rhos [kg m-3] give dry volumetric capacity; pore water adds its capacity.
+// and rhos [kg m-3] give the bulk volumetric capacity of the soil at the
+// material's own moisture SMC (referenceMoisture), as in FacetEB, VoxelEB
+// method 1 and SCOPE (GAM = sqrt(cs rhos lambdas)); only a local moisture that
+// differs from SMC (terrain soil water) adds/removes pore-water capacity, the
+// same reference convention as the local rss scaling.  Until 2026-11-23 the
+// whole SMC was added on top of cs*rhos, double counting the water (built-in
+// loam: C 2.12e6 -> 3.17e6 J m-3 K-1).
 void Soilheatflux(in float Tprofile[TLASTNUM], in float Mprofile[TLASTNUM], float Tsi,
                   float lowerBoundaryTemperature, inout float G,
                   inout float T[TLASTNUM], float dtime,
-                  float cs, float rhos, float lambdas, float saturatedWater)
+                  float cs, float rhos, float lambdas, float saturatedWater,
+                  float referenceMoisture)
 {
     float depth[] = {0.0, 0.02, 0.04, 0.10, 0.20, 0.40, 0.60, 1.0};
     float timestep = max(dtime, 1.0);
     float conductivity = max(lambdas, 0.0);
-    float dryCapacity = max(cs, 0.0) * max(rhos, 0.0);
+    float bulkCapacity = max(cs, 0.0) * max(rhos, 0.0);
+    float referenceWater = soilMoistureFraction(referenceMoisture, saturatedWater);
     float capacity[TLASTNUM];
     float TA[TLASTNUM], TB[TLASTNUM], TC[TLASTNUM], TD[TLASTNUM];
     for(int i = 0; i < TLASTNUM; ++i)
     {
-        capacity[i] = max(dryCapacity + 4.195e6 *
-            soilMoistureFraction(Mprofile[i], saturatedWater), 1.0);
+        capacity[i] = max(bulkCapacity + 4.195e6 *
+            (soilMoistureFraction(Mprofile[i], saturatedWater) - referenceWater), 1.0);
     }
     for(int k = 0; k < TLASTNUM; ++k)
     {
@@ -1509,13 +1517,13 @@ void Soilheatflux(in float Tprofile[TLASTNUM], in float Mprofile[TLASTNUM], floa
 // uses exactly the same capacities, grid and timestep as the flux evaluation.
 float soilHeatFluxSurfaceDerivative(in float Mprofile[TLASTNUM], float dtime,
                                    float cs, float rhos, float lambdas,
-                                   float saturatedWater)
+                                   float saturatedWater, float referenceMoisture)
 {
     float previous[TLASTNUM], response[TLASTNUM];
     for(int i = 0; i < TLASTNUM; ++i) previous[i] = 0.0;
     float derivative = 0.0;
     Soilheatflux(previous, Mprofile, 1.0, 0.0, derivative, response, dtime,
-                 cs, rhos, lambdas, saturatedWater);
+                 cs, rhos, lambdas, saturatedWater, referenceMoisture);
     return derivative;
 }
 

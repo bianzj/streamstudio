@@ -154,7 +154,8 @@ void main()
                          soilSets[bioId].Tsoil,
                          Gst, TnewProfile, dtime,
                          soilSets[bioId].cs, soilSets[bioId].rhos,
-                         soilSets[bioId].lambdas, soilSets[bioId].SatWater);
+                         soilSets[bioId].lambdas, soilSets[bioId].SatWater,
+                         soilSets[bioId].SMC);
 
             for(int kdepth = 0; kdepth < TLASTNUM; kdepth++){
                 voxelTlasts[TlastId + kdepth].sunlit = TnewProfile[kdepth];

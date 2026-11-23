@@ -1168,9 +1168,9 @@
         "params": {
           "method": 2,
           "rss": 2000,
-          "cs": 1180,
-          "rhos": 1800,
-          "lambdas": 1.55,
+          "cs": 1300,
+          "rhos": 1600,
+          "lambdas": 1,
           "Tsoil": 25,
           "SMC": 25,
           "Satwater": 0.45

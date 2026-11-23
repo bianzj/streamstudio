@@ -268,7 +268,7 @@ void main()
             storageDerivative = soilHeatFluxSurfaceDerivative(
                 Mprofile, ubom.meteo.dtime, soilSets[bioId].cs,
                 soilSets[bioId].rhos, soilSets[bioId].lambdas,
-                soilSets[bioId].SatWater);
+                soilSets[bioId].SatWater, soilSets[bioId].SMC);
         }
     }
     // if(setting.theIteration>5) wc = 0.3;

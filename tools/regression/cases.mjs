@@ -18,6 +18,10 @@ const MWIR_BANDS = { 'configuration.sensor.bands': '3800,10500', 'configuration.
   'configuration.sensor.temperature': true }
 // Every soil set on soil method 1 (the control value overrides the material).
 const SOIL_METHOD_1 = { 'configuration.control.soilTemperatureMethod': 1 }
+const soilThermal = (cs, rhos, lambdas) => (index) => ({ [`configuration.materials.${index}.params.cs`]: cs,
+  [`configuration.materials.${index}.params.rhos`]: rhos, [`configuration.materials.${index}.params.lambdas`]: lambdas })
+const SOIL_SCOPE = soilThermal(1180, 1800, 1.55)
+const SOIL_LOAM = soilThermal(1300, 1600, 1.0)
 // A flat size x size water sheet (n x n cells, upward normal) as the bundled
 // water generator writes it (main.js waterSurfaceObj), 1 cm above the ground.
 const waterSheetObj = (name, size, n) => {
@@ -198,6 +202,16 @@ export const CASES = {
     'configuration.materials.7.params': { ...SHIP_NEW, speed: 8 } } },
   feb_urban_ship_waterline: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP, set: {
     'configuration.materials.7.params': { ...SHIP_NEW, waterlineHeight: 0.9, waterHeatTransferCoefficient: 500 } } },
+  // Soil thermal properties (2026-11-23) on the background loam (soilset: urban index 4,
+  // forest index 11). SOIL_SCOPE = the former built-in loam (SCOPE cs 1180, rhos 1800,
+  // lambdas 1.55; still the engine fallback), SOIL_LOAM = the new built-in loam (cs 1300,
+  // rhos 1600, lambdas 1.0, sqrt(lambda C) = 1440). Both are written explicitly so the
+  // cases do not depend on the example. _day runs one day (nodes 0-48) for diurnal ranges.
+  veb_urban_day: { example: 'urban_block', mode: 'eVoxelEB', meteo: [0, 48], set: SOIL_SCOPE(4) },
+  veb_urban_soil_day: { example: 'urban_block', mode: 'eVoxelEB', meteo: [0, 48], set: SOIL_LOAM(4) },
+  veb_forest_soil: { example: 'forest', mode: 'eVoxelEB', meteo: [23, 25], set: SOIL_LOAM(11) },
+  feb_urban_day: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], set: SOIL_SCOPE(4) },
+  feb_urban_soil_day: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], set: SOIL_LOAM(4) },
 }
 
 // Facet modes take an explicit result JSON path as the third CLI argument.
