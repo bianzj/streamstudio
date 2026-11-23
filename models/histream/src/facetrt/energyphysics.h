@@ -204,7 +204,9 @@ struct WallResponse {
     }
 };
 // Backward Euler, as soilResponse, with the indoor Robin boundary.
-inline WallResponse wallResponse(const WallProfile& previous, const WallSlab& slab, double dt) {
+// innerSource (W m-2 of wall area, default 0): internal heat released in the
+// innermost cell (machinery behind a ship plate); 0 leaves the old arithmetic.
+inline WallResponse wallResponse(const WallProfile& previous, const WallSlab& slab, double dt, double innerSource = 0) {
     slab.validate();
     if (!(dt > 0)) throw std::runtime_error("Invalid FacetEB wall time step");
     const size_t n = slab.cells();
@@ -218,6 +220,7 @@ inline WallResponse wallResponse(const WallProfile& previous, const WallSlab& sl
         diagonal[i] = storage + up + down;
         upper[i] = i + 1 < n ? -down : 0;
         rhs[i] = storage * previous[i] + (i + 1 == n ? down * slab.indoorK : 0);
+        if (i + 1 == n && innerSource != 0) rhs[i] += innerSource;
         boundary[i] = i == 0 ? up : 0;
         if (i) {
             const double factor = -up / diagonal[i - 1];

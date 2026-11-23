@@ -37,7 +37,7 @@ void main() {
         if(pc.phase==1u) {
             for(uint side=0u;side<(object?1u:2u);++side) {
                 uint k=index+side,j=k*12u; float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
-                float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0);
+                float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0)+(object?F[j+11u]:0.0);
                 float response=faces*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
                 float candidate=clamp(temp+clamp(residual/max(1.0,response),-5.0,5.0),220.0,360.0);
                 float next=temp+(leaf?F[j+9u]:pc.relax*(candidate-temp));
@@ -62,6 +62,12 @@ void main() {
             // air), 2 wall slab (outdoor face P[29] only, conduction I[7], I[8]).
             bool water=!leaf&&P[p+28u]>0.5&&P[p+28u]<1.5,wall=!leaf&&P[p+28u]>1.5;
             if(wall) rn=net[uint(P[p+29u]+0.5)];
+            // P[24] (non-leaf objects): factor of the net radiation, < 1 for a
+            // shielded (waterShielding) hull below the water surface; P[23]: heat
+            // source of the facet balance (thin shell / water facet; walls get
+            // their internal heat through the slab I[7], I[8]).
+            float source=0.0;
+            if(!leaf) { rn*=P[p+24u]; source=wall?0.0:P[p+23u]; }
             float conductance=leaf?pc.rho*1005.0*P[p+3u]/rb:(water||wall?1.0:2.0)*(5.8+4.1*sqrt(max(.1,pc.reserved)))*P[p+3u];
             // P[30] > 0: ship-hull facet below the waterline, total sensible
             // conductance P[30] towards the reference temperature P[31] (host).
@@ -105,7 +111,7 @@ void main() {
             for(uint side=0u;side<2u;++side) {
                 uint j=(index+side)*12u;
                 F[j]=rn;F[j+1u]=h;F[j+2u]=conductance;F[j+3u]=le;F[j+4u]=ls;
-                F[j+5u]=storage;F[j+6u]=ss;F[j+7u]=power;F[j+8u]=ps;F[j+9u]=step;F[j+10u]=mismatch;
+                F[j+5u]=storage;F[j+6u]=ss;F[j+7u]=power;F[j+8u]=ps;F[j+9u]=step;F[j+10u]=mismatch;F[j+11u]=source;
             }
         } else {
             for(uint side=0u;side<2u;++side) {
@@ -122,7 +128,7 @@ void main() {
         }
         for(uint side=0u;side<(object?1u:2u);++side) {
             uint k=index+side,j=k*12u;float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
-            float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0);
+            float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0)+(object?F[j+11u]:0.0);
             float response=faces*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
             maximum(0u,abs(residual));maximum(1u,abs(residual)/max(1.0,response));
             energyViolation=energyViolation||abs(residual)>=2.0;

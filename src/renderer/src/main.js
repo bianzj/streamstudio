@@ -227,7 +227,20 @@ function parseMaterialNode(node) {
       params.waterlineHeight = Number(xmlValue(node, 'waterlineHeight', 0))
       params.waterHeatTransferCoefficient = Number(xmlValue(node, 'waterHeatTransferCoefficient', 500))
       if (xmlValue(node, 'waterTemperature', '').trim()) params.waterTemperature = Number(xmlValue(node, 'waterTemperature', 20))
+    } else if (xmlValue(node, 'waterlineSource', '').trim() === 'water') {
+      params.waterlineSource = 'water'
+      params.waterlineOffset = Number(xmlValue(node, 'waterlineOffset', 0))
+      params.waterHeatTransferCoefficient = Number(xmlValue(node, 'waterHeatTransferCoefficient', 500))
+      if (xmlValue(node, 'waterTemperature', '').trim()) params.waterTemperature = Number(xmlValue(node, 'waterTemperature', 20))
     }
+    if (xmlValue(node, 'shipHeading', '').trim() && xmlValue(node, 'shipWindDirection', '').trim()) {
+      params.heading = Number(xmlValue(node, 'shipHeading', 0))
+      params.windDirection = Number(xmlValue(node, 'shipWindDirection', 0))
+    }
+    if (xmlValue(node, 'waterShielding', '').trim() === '1') params.waterShielding = true
+    if (xmlValue(node, 'waterFeedback', '').trim() === '1') params.waterFeedback = true
+    if (xmlValue(node, 'internalHeatFlux', '').trim()) params.internalHeatFlux = Number(xmlValue(node, 'internalHeatFlux', 0))
+    if (xmlValue(node, 'internalHeatPower', '').trim()) params.internalHeatPower = Number(xmlValue(node, 'internalHeatPower', 0))
   }
   return { name: node.getAttribute('name') || 'material', type, params }
 }
@@ -2226,7 +2239,11 @@ function physicalValues(item) {
   return [['rss', p.rss], ['热容', p.cs], ['密度', p.rhos], ['导热率', p.lambdas], ['SMC', p.SMC], ['饱和量', p.Satwater],
     ...(p.wallMode === 'wall' ? [['墙体模式', `${Array.isArray(p.layers) && p.layers.length ? `${p.layers.length} 层构造 ${p.layers.reduce((sum, layer) => sum + Number(layer.thickness || 0), 0).toFixed(3)} m` : `墙体 ${p.thickness ?? 0.2} m`}，室内 ${p.indoorTemperature ?? 22} ℃，h=${p.indoorHeatTransferCoefficient ?? 8}`]] : []),
     ...(item.type === 'Ship' && Number(p.speed) > 0 ? [['航速', `${p.speed} m/s`]] : []),
-    ...(item.type === 'Ship' && shipValueGiven(p.waterlineHeight) ? [['水线', `${p.waterlineHeight} m，水侧 h=${p.waterHeatTransferCoefficient ?? 500}，水温 ${shipValueGiven(p.waterTemperature) ? `${p.waterTemperature} ℃` : '场景水体'}`]] : [])]
+    ...(item.type === 'Ship' && shipValueGiven(p.waterlineHeight) ? [['水线', `${p.waterlineHeight} m，水侧 h=${p.waterHeatTransferCoefficient ?? 500}，水温 ${shipValueGiven(p.waterTemperature) ? `${p.waterTemperature} ℃` : '场景水体'}`]] : []),
+    ...(item.type === 'Ship' && !shipValueGiven(p.waterlineHeight) && p.waterlineSource === 'water' ? [['水线', `场景水面${Number(p.waterlineOffset) ? ` ${p.waterlineOffset > 0 ? '+' : ''}${p.waterlineOffset} m` : ''}（吃水），水侧 h=${p.waterHeatTransferCoefficient ?? 500}`]] : []),
+    ...(item.type === 'Ship' && shipValueGiven(p.heading) && shipValueGiven(p.windDirection) ? [['航向/风来向', `${p.heading}° / ${p.windDirection}°`]] : []),
+    ...(item.type === 'Ship' && (p.waterShielding || p.waterFeedback) ? [['水体耦合', [p.waterShielding ? '水下遮蔽' : '', p.waterFeedback ? '反馈水温' : ''].filter(Boolean).join('、')]] : []),
+    ...(item.type === 'Ship' && (Number(p.internalHeatFlux) || Number(p.internalHeatPower)) ? [['内热源', [Number(p.internalHeatFlux) ? `${p.internalHeatFlux} W/m²` : '', Number(p.internalHeatPower) ? `${p.internalHeatPower} W` : ''].filter(Boolean).join(' + ')]] : [])]
 }
 
 function shipValueGiven(value) { return value !== undefined && value !== null && value !== '' && Number.isFinite(Number(value)) }
@@ -3629,7 +3646,9 @@ function wallModeFields(defaults = {}) {
 
 // FacetEB ship hull options (Ship materials): relative wind and waterline contact.
 function shipFields(defaults = {}) {
-  return `${physicalInput('航速（m/s，相对风 √(u²+v²)；0 = 停泊）', 'shipSpeed', defaults.speed ?? 0, 0.1)}${physicalInput('水线高度（m，世界高度；留空 = 不计水线）', 'shipWaterlineHeight', defaults.waterlineHeight ?? '', 0.01)}${physicalInput('水侧换热系数（W·m⁻²·K⁻¹）', 'shipWaterHeatTransferCoefficient', defaults.waterHeatTransferCoefficient ?? 500, 1)}${physicalInput('水温（℃，留空 = 场景水体平均温度，无水体时首节点气温）', 'shipWaterTemperature', defaults.waterTemperature ?? '', 0.1)}`
+  const fromWater = defaults.waterlineSource === 'water' && !shipValueGiven(defaults.waterlineHeight)
+  const yesNo = (name, label, on) => `<label class="dialog-field"><span>${label}</span><select class="select" name="${name}"><option value="0" ${on ? '' : 'selected'}>关闭</option><option value="1" ${on ? 'selected' : ''}>开启</option></select></label>`
+  return `${physicalInput('航速（m/s；0 = 停泊）。无航向/风向时相对风 √(u²+v²)，有则 |u风−v船|', 'shipSpeed', defaults.speed ?? 0, 0.1)}${physicalInput('航向（°，船首朝向，罗经方位：北 0°顺时针；与风向同时给出，留空 = 按垂直取模）', 'shipHeading', defaults.heading ?? '', 1)}${physicalInput('风来向（°，风吹来的方向，罗经方位：北 0°顺时针；留空同上）', 'shipWindDirection', defaults.windDirection ?? '', 1)}${physicalInput('水线高度（m，世界高度；留空 = 不计水线，或用下面的水面吃水）', 'shipWaterlineHeight', defaults.waterlineHeight ?? '', 0.01)}<label class="dialog-field"><span>水线来源（水线高度留空时）</span><select class="select" name="shipWaterlineSource"><option value="height" ${fromWater ? '' : 'selected'}>固定高度（上面的水线高度）</option><option value="water" ${fromWater ? 'selected' : ''}>场景水面（真实吃水，按面元浸湿比例）</option></select></label>${physicalInput('水面吃水偏移（m，正值抬高水线）', 'shipWaterlineOffset', defaults.waterlineOffset ?? 0, 0.01)}${physicalInput('水侧换热系数（W·m⁻²·K⁻¹）', 'shipWaterHeatTransferCoefficient', defaults.waterHeatTransferCoefficient ?? 500, 1)}${physicalInput('水温（℃，留空 = 场景水体平均温度，无水体时首节点气温）', 'shipWaterTemperature', defaults.waterTemperature ?? '', 0.1)}${yesNo('shipWaterShielding', '水线下面元遮蔽（不接收短波/长波）', defaults.waterShielding)}${yesNo('shipWaterFeedback', '船体热量反馈场景水温（需场景水体，不能同时给固定水温）', defaults.waterFeedback)}${physicalInput('内热源面功率（W·m⁻²，面元面积均摊；缺省 0）', 'shipInternalHeatFlux', defaults.internalHeatFlux ?? 0, 1)}${physicalInput('内热源总功率（W，按该网格组面元面积均摊；烟囱/机舱请单独建物化；缺省 0）', 'shipInternalHeatPower', defaults.internalHeatPower ?? 0, 100)}`
 }
 
 // FacetEB wall layers as text: one layer per line "thickness, λ, ρ, cp" (outer to inner).
@@ -4570,11 +4589,25 @@ function physicalFromForm(values, type) {
     if (values.wallMode === 'wall' && String(values.wallLayers || '').trim()) params.layers = parseWallLayers(values.wallLayers)
     if (type === 'Ship') {
       if (values.shipSpeed !== undefined) params.speed = Math.max(0, Number(values.shipSpeed) || 0)
-      if (String(values.shipWaterlineHeight ?? '').trim() !== '') {
+      const given = (key) => String(values[key] ?? '').trim() !== ''
+      if (given('shipWaterlineHeight')) {
         params.waterlineHeight = Number(values.shipWaterlineHeight)
         params.waterHeatTransferCoefficient = Number(values.shipWaterHeatTransferCoefficient)
-        if (String(values.shipWaterTemperature ?? '').trim() !== '') params.waterTemperature = Number(values.shipWaterTemperature)
+        if (given('shipWaterTemperature')) params.waterTemperature = Number(values.shipWaterTemperature)
+      } else if (values.shipWaterlineSource === 'water') {
+        params.waterlineSource = 'water'
+        params.waterlineOffset = Number(values.shipWaterlineOffset) || 0
+        params.waterHeatTransferCoefficient = Number(values.shipWaterHeatTransferCoefficient)
+        if (given('shipWaterTemperature')) params.waterTemperature = Number(values.shipWaterTemperature)
       }
+      if (given('shipHeading') && given('shipWindDirection')) {
+        params.heading = Number(values.shipHeading)
+        params.windDirection = Number(values.shipWindDirection)
+      }
+      if (values.shipWaterShielding === '1') params.waterShielding = true
+      if (values.shipWaterFeedback === '1') params.waterFeedback = true
+      if (Number(values.shipInternalHeatFlux)) params.internalHeatFlux = Number(values.shipInternalHeatFlux)
+      if (Number(values.shipInternalHeatPower)) params.internalHeatPower = Number(values.shipInternalHeatPower)
     }
   }
   // FIXED 配套：过滤掉 NaN/Infinity，避免“缺失”被写成 NaN（JSON 里是 null）

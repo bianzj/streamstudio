@@ -1112,6 +1112,19 @@ export function validateProject(value) {
     if (given(p.waterlineHeight) && (!Number.isFinite(Number(p.waterlineHeight)) || !(Number(p.waterHeatTransferCoefficient ?? 500) > 0) ||
       (given(p.waterTemperature) && !(Number(p.waterTemperature) > -20 && Number(p.waterTemperature) < 60))))
       errors.push('船舶水线参数无效（水线高度为有限数，水侧换热系数大于 0，水温 -20–60 ℃）：' + m.name)
+    // Real draft: waterline = the scene water surface (+ offset); wetted fraction per facet.
+    const fromWater = !given(p.waterlineHeight) && p.waterlineSource === 'water'
+    if (given(p.waterlineSource) && !['height', 'water'].includes(p.waterlineSource)) errors.push('船舶水线来源无效（height / water）：' + m.name)
+    if (fromWater && (!Number.isFinite(Number(p.waterlineOffset ?? 0)) || !(Number(p.waterHeatTransferCoefficient ?? 500) > 0) ||
+      (given(p.waterTemperature) && !(Number(p.waterTemperature) > -20 && Number(p.waterTemperature) < 60))))
+      errors.push('船舶吃水（水面）参数无效（水线偏移为有限数，水侧换热系数大于 0，水温 -20–60 ℃）：' + m.name)
+    if ((p.waterShielding || p.waterFeedback) && !given(p.waterlineHeight) && !fromWater) errors.push('船舶水体遮蔽/水温反馈需要水线（水线高度或水面吃水）：' + m.name)
+    if (p.waterFeedback && given(p.waterTemperature)) errors.push('船舶水温反馈使用场景水体温度，不能同时给定固定水温：' + m.name)
+    if (given(p.heading) !== given(p.windDirection)) errors.push('船舶航向与风向需同时给出：' + m.name)
+    if (given(p.heading) && !(Number(p.heading) >= 0 && Number(p.heading) <= 360 && Number(p.windDirection) >= 0 && Number(p.windDirection) <= 360))
+      errors.push('船舶航向/风向无效（0–360°，航向与风来向均为罗经方位：北 0°，顺时针）：' + m.name)
+    if (given(p.internalHeatFlux) && !(Math.abs(Number(p.internalHeatFlux)) <= 1e5)) errors.push('船舶内热源面功率无效（|q| ≤ 1e5 W/m²）：' + m.name)
+    if (given(p.internalHeatPower) && !(Math.abs(Number(p.internalHeatPower)) <= 1e9)) errors.push('船舶内热源总功率无效（|P| ≤ 1e9 W）：' + m.name)
   }
   for (const m of c.materials.filter((item) => item.type === 'Water' && item.params?.initialTemperatureMode !== undefined)) {
     const p = m.params
@@ -1235,7 +1248,19 @@ function materialXml(item) {
   // FacetEB ship hull: relative wind (speed > 0) and waterline contact; absent = off.
   const hasNumber = (value) => value !== undefined && value !== null && value !== '' && Number.isFinite(Number(value))
   const ship = item.type === 'Ship' && !item.energyModel
-    ? `${Number(params.speed) > 0 ? `<shipSpeed>${number(params.speed, 0)}</shipSpeed>` : ''}${hasNumber(params.waterlineHeight) ? `<waterlineHeight>${number(params.waterlineHeight, 0)}</waterlineHeight><waterHeatTransferCoefficient>${number(params.waterHeatTransferCoefficient, 500)}</waterHeatTransferCoefficient>${hasNumber(params.waterTemperature) ? `<waterTemperature>${number(params.waterTemperature, 20)}</waterTemperature>` : ''}` : ''}`
+    ? [
+        Number(params.speed) > 0 ? `<shipSpeed>${number(params.speed, 0)}</shipSpeed>` : '',
+        hasNumber(params.waterlineHeight)
+          ? `<waterlineHeight>${number(params.waterlineHeight, 0)}</waterlineHeight><waterHeatTransferCoefficient>${number(params.waterHeatTransferCoefficient, 500)}</waterHeatTransferCoefficient>${hasNumber(params.waterTemperature) ? `<waterTemperature>${number(params.waterTemperature, 20)}</waterTemperature>` : ''}`
+          : params.waterlineSource === 'water'
+            ? `<waterlineSource>water</waterlineSource><waterlineOffset>${number(params.waterlineOffset, 0)}</waterlineOffset><waterHeatTransferCoefficient>${number(params.waterHeatTransferCoefficient, 500)}</waterHeatTransferCoefficient>${hasNumber(params.waterTemperature) ? `<waterTemperature>${number(params.waterTemperature, 20)}</waterTemperature>` : ''}`
+            : '',
+        hasNumber(params.heading) && hasNumber(params.windDirection) ? `<shipHeading>${number(params.heading, 0)}</shipHeading><shipWindDirection>${number(params.windDirection, 0)}</shipWindDirection>` : '',
+        params.waterShielding ? '<waterShielding>1</waterShielding>' : '',
+        params.waterFeedback ? '<waterFeedback>1</waterFeedback>' : '',
+        Number(params.internalHeatFlux) ? `<internalHeatFlux>${number(params.internalHeatFlux, 0)}</internalHeatFlux>` : '',
+        Number(params.internalHeatPower) ? `<internalHeatPower>${number(params.internalHeatPower, 0)}</internalHeatPower>` : ''
+      ].join('')
     : ''
   // 土壤方法 1 远期热历史（control.soilInertiaHistory = 'full'）；缺省不写，旧 XML 不变。
   const inertia = params.inertiaHistory === 'full' ? '<inertiaHistory>full</inertiaHistory>' : ''

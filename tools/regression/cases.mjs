@@ -72,16 +72,23 @@ const ROOF_LAYERS = [{ thickness: 0.05, lambda: 1.51, rho: 2300, cp: 920 }, { th
 // to 5.1 m) floating 2 cm above the URBAN_WATER pond, material ship_material (index 7).
 // SHIP_NEW is the new-project ship_material (one 12 mm steel plate, 22 C interior).
 const SHIP_GROUPS = ['hull', 'weather_deck', 'cargo_hatches', 'deck_cranes', 'crane_booms', 'superstructure', 'bridge', 'funnel']
-const URBAN_SHIP = {
-  files: { ...URBAN_WATER.files, 'positions/regression_ship_position.txt': '280 65 0.02 0.15 0\n' },
+// urbanShip(funnelMaterial, position): the funnel group may take its own material
+// (internal heat source of the funnel only); position rows x y z scale rotation.
+const urbanShip = (funnelMaterial = 'ship_material', position = '280 65 0.02 0.15 0', waterRow = '280 65 0.01 1 0') => ({
+  files: { ...URBAN_WATER.files, 'positions/regression_water_position.txt': waterRow + '\n',
+    'positions/regression_ship_position.txt': position + '\n' },
   addObjects: [...URBAN_WATER.addObjects, {
     name: 'regression_ship', type: 'Ship', materialName: 'ship_material', canopyName: 'rigid_body',
     fileName: 'assets/obj-library/ship/typical/modern_bulk_carrier.obj', positionFile: 'positions/regression_ship_position.txt',
     shape: 'cube', dimensions: [4.2, 5.1, 28.5], instanceCount: 1,
     meshes: SHIP_GROUPS.map((name) => ({ name, spectralName: 'ship_surface', thermalName: 'ship_temperature',
-      materialName: 'ship_material', canopyName: 'rigid_body' }))
+      materialName: name === 'funnel' ? funnelMaterial : 'ship_material', canopyName: 'rigid_body' }))
   }]
-}
+})
+const URBAN_SHIP = urbanShip()
+// The same ship floating in a pond whose surface is 0.65 m above the ground (the keel stays
+// 0.02 m above y = 0, where the scene domain is clipped): draft 0.63 m of the 1.5 m hull.
+const URBAN_SHIP_DRAFT = urbanShip('ship_material', '280 65 0.02 0.15 0', '280 65 0.65 1 0')
 const SHIP_NEW = { method: 1, rss: 4000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 30, SMC: 0, Satwater: 0, wallMode: 'wall',
   thickness: 0.012, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, layers: [{ thickness: 0.012, lambda: 50, rho: 7850, cp: 460 }], speed: 0 }
 
@@ -210,6 +217,30 @@ export const CASES = {
     'configuration.materials.7.params': { ...SHIP_NEW, speed: 8 } } },
   feb_urban_ship_waterline: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP, set: {
     'configuration.materials.7.params': { ...SHIP_NEW, waterlineHeight: 0.9, waterHeatTransferCoefficient: 500 } } },
+  // Ship relative wind with the course (0 = north, clockwise) and the wind-from direction:
+  // _head sails into the wind (|u - v| = u + 8), _tail runs before it (|u - 8|); _speed8 above is
+  // the course-less quadrature sum.
+  feb_urban_ship_head: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP, set: {
+    'configuration.materials.7.params': { ...SHIP_NEW, speed: 8, heading: 0, windDirection: 0 } } },
+  feb_urban_ship_tail: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP, set: {
+    'configuration.materials.7.params': { ...SHIP_NEW, speed: 8, heading: 0, windDirection: 180 } } },
+  // Internal heat: 60 W m-2 on every hull facet (steel wall slab / the old thin shell), and
+  // 20 kW spread over the funnel group only (own material ship_funnel, index 8).
+  feb_urban_ship_internal: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP, set: {
+    'configuration.materials.7.params': { ...SHIP_NEW, internalHeatFlux: 60 } } },
+  feb_urban_ship_internal_shell: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP, set: {
+    'configuration.materials.7.params.internalHeatFlux': 60 } },
+  feb_urban_ship_funnel: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...urbanShip('ship_funnel'), set: {
+    'configuration.materials.7.params': SHIP_NEW,
+    'configuration.materials.8': { name: 'ship_funnel', label: '烟囱', type: 'Ship', params: { ...SHIP_NEW, internalHeatPower: 20000 } } } },
+  // Real draft (pond surface 0.65 m, draft 0.63 m): the waterline is the water surface and every
+  // facet is wetted by its exact part below it; _shield also keeps the wetted hull out of the sun
+  // and sky and feeds the hull-water heat back to the pond temperature.
+  feb_urban_ship_draft: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP_DRAFT, set: {
+    'configuration.materials.7.params': { ...SHIP_NEW, waterlineSource: 'water', waterHeatTransferCoefficient: 500 } } },
+  feb_urban_ship_draft_shield: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP_DRAFT, set: {
+    'configuration.materials.7.params': { ...SHIP_NEW, waterlineSource: 'water', waterHeatTransferCoefficient: 500,
+      waterShielding: true, waterFeedback: true } } },
   // Soil thermal properties (2026-11-23) on the background loam (soilset: urban index 4,
   // forest index 11). SOIL_SCOPE = the former built-in loam (SCOPE cs 1180, rhos 1800,
   // lambdas 1.55; still the engine fallback), SOIL_LOAM = the new built-in loam (cs 1300,

@@ -210,6 +210,22 @@ struct SurfaceParameters {
     float waterlineHeight{0.0f};
     float waterCoefficient{500.0f};
     float waterK{-1.0f};
+    // Ship hull extras (all default off). shipWindCosine: cosine of the angle
+    // between the ship course and the direction the wind blows from, so the
+    // relative wind is |u_wind - v_ship|^2 = u^2 + v^2 + 2 u v cos (0 = old
+    // quadrature sum). waterlineFromWater: the waterline is the scene water
+    // surface (+ waterlineOffset) and the wetted fraction of every facet is the
+    // exact triangle part below it. waterShield: submerged facets receive no sun
+    // or sky radiation. waterFeedback: the hull heat flux warms/cools the scene
+    // water. internalFlux (W m-2 facet area) and internalPower (W, spread over
+    // the area of the material's facets): internal heat sources.
+    float shipWindCosine{0.0f};
+    bool waterlineFromWater{false};
+    float waterlineOffset{0.0f};
+    bool waterShield{false};
+    bool waterFeedback{false};
+    float internalFlux{0.0f};
+    float internalPower{0.0f};
     float leafWidth{0.1f};
     LeafBiochemistry leaf;
     uint8_t outputComponent{0}; // 0 unknown, 1 soil/background, 2 vegetation, 3 building, 4 PV, 5 water
@@ -3284,7 +3300,23 @@ std::string facetInputView(const std::string& path)
                     << "</waterHeatTransferCoefficient>";
                 if (p.contains("waterTemperature") && p["waterTemperature"].is_number())
                     xml << "<waterTemperature>" << ProjectJson::number(p,"waterTemperature",20) << "</waterTemperature>";
+            } else if (ProjectJson::string(p,"waterlineSource") == "water") {
+                // Waterline = the scene water surface (+ offset): real draft.
+                xml << "<waterlineSource>water</waterlineSource><waterlineOffset>" << ProjectJson::number(p,"waterlineOffset",0)
+                    << "</waterlineOffset><waterHeatTransferCoefficient>" << ProjectJson::number(p,"waterHeatTransferCoefficient",500)
+                    << "</waterHeatTransferCoefficient>";
+                if (p.contains("waterTemperature") && p["waterTemperature"].is_number())
+                    xml << "<waterTemperature>" << ProjectJson::number(p,"waterTemperature",20) << "</waterTemperature>";
             }
+            if (ProjectJson::number(p,"heading",-1) >= 0 && ProjectJson::number(p,"windDirection",-1) >= 0)
+                xml << "<shipHeading>" << ProjectJson::number(p,"heading",0) << "</shipHeading><shipWindDirection>"
+                    << ProjectJson::number(p,"windDirection",0) << "</shipWindDirection>";
+            if (ProjectJson::boolean(p,"waterShielding",false)) xml << "<waterShielding>1</waterShielding>";
+            if (ProjectJson::boolean(p,"waterFeedback",false)) xml << "<waterFeedback>1</waterFeedback>";
+            if (ProjectJson::number(p,"internalHeatFlux",0) != 0)
+                xml << "<internalHeatFlux>" << ProjectJson::number(p,"internalHeatFlux",0) << "</internalHeatFlux>";
+            if (ProjectJson::number(p,"internalHeatPower",0) != 0)
+                xml << "<internalHeatPower>" << ProjectJson::number(p,"internalHeatPower",0) << "</internalHeatPower>";
         }
         if (leaf) {
             std::string tparam = p.contains("Tparam") && p["Tparam"].is_string()
@@ -4525,17 +4557,36 @@ Scene loadProjectScene(const std::string& inputFile)
                     material.shipSpeed = xmlFloat(wallBlock, "shipSpeed", 0);
                     if (!std::isfinite(material.shipSpeed) || material.shipSpeed < 0 || material.shipSpeed > 100)
                         throw std::runtime_error("Ship speed must be 0-100 m/s: " + physicalName);
-                    if (!trim(firstXmlTag(wallBlock, "waterlineHeight")).empty()) {
+                    const bool fixedWaterline = !trim(firstXmlTag(wallBlock, "waterlineHeight")).empty();
+                    material.waterlineFromWater = !fixedWaterline && trim(firstXmlTag(wallBlock, "waterlineSource")) == "water";
+                    if (fixedWaterline || material.waterlineFromWater) {
                         material.waterline = true;
-                        material.waterlineHeight = xmlFloat(wallBlock, "waterlineHeight", 0);
+                        material.waterlineHeight = fixedWaterline ? xmlFloat(wallBlock, "waterlineHeight", 0) : 0.0f;
+                        material.waterlineOffset = material.waterlineFromWater ? xmlFloat(wallBlock, "waterlineOffset", 0) : 0.0f;
                         material.waterCoefficient = xmlFloat(wallBlock, "waterHeatTransferCoefficient", 500);
                         if (!trim(firstXmlTag(wallBlock, "waterTemperature")).empty())
                             material.waterK = xmlFloat(wallBlock, "waterTemperature", 20) + 273.15f;
-                        if (!std::isfinite(material.waterlineHeight) || !(material.waterCoefficient > 0) ||
+                        if (!std::isfinite(material.waterlineHeight) || !std::isfinite(material.waterlineOffset) ||
+                            !(material.waterCoefficient > 0) ||
                             !std::isfinite(material.waterCoefficient) ||
                             (material.waterK >= 0 && !(material.waterK > 250 && material.waterK < 340)))
                             throw std::runtime_error("Invalid ship waterline parameters: " + physicalName);
+                        material.waterShield = trim(firstXmlTag(wallBlock, "waterShielding")) == "1";
+                        material.waterFeedback = trim(firstXmlTag(wallBlock, "waterFeedback")) == "1";
+                        if (material.waterFeedback && material.waterK >= 0)
+                            throw std::runtime_error("waterFeedback needs the scene water temperature (no waterTemperature): " + physicalName);
                     }
+                    if (!trim(firstXmlTag(wallBlock, "shipHeading")).empty() && !trim(firstXmlTag(wallBlock, "shipWindDirection")).empty()) {
+                        const float heading = xmlFloat(wallBlock, "shipHeading", 0), windFrom = xmlFloat(wallBlock, "shipWindDirection", 0);
+                        if (!std::isfinite(heading) || !std::isfinite(windFrom) || heading < 0 || heading > 360 || windFrom < 0 || windFrom > 360)
+                            throw std::runtime_error("Ship heading and wind direction must be 0-360 degrees: " + physicalName);
+                        material.shipWindCosine = static_cast<float>(std::cos((double(heading) - double(windFrom)) * kPi / 180.0));
+                    }
+                    material.internalFlux = xmlFloat(wallBlock, "internalHeatFlux", 0);
+                    material.internalPower = xmlFloat(wallBlock, "internalHeatPower", 0);
+                    if (!std::isfinite(material.internalFlux) || !std::isfinite(material.internalPower) ||
+                        std::abs(material.internalFlux) > 1.0e5f || std::abs(material.internalPower) > 1.0e9f)
+                        throw std::runtime_error("Invalid internal heat source (|flux| <= 1e5 W/m2, |power| <= 1e9 W): " + physicalName);
                 }
             }
             const uint32_t materialIndex =
@@ -5273,20 +5324,87 @@ try {
     // heat with the water instead of the air on their outer face (wall slab) or
     // on one of their two faces (thin shell); no latent heat either way.
     std::vector<uint8_t> submergedFacet;
-    bool anyShipSpeed = false;
+    // Wetted fraction of a ship-hull facet (1 for a fixed waterline facet below it).
+    std::vector<float> wetFraction;
+    bool anyShipSpeed = false, anyWaterFeedback = false, anyFromWater = false;
+    // Real draft: the scene water surface is the area-weighted mean height of the
+    // water facets; hull facets below it (exact triangle part) are wetted.
+    double waterSurfaceHeight = 0, sceneWaterArea = 0;
+    {
+        double heightSum = 0;
+        for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
+            const auto& s = surfaceForFacet(scene, f);
+            if (!s.water || s.vegetation) continue;
+            heightSum += facetAreas[f] * facetHeight[f];
+            sceneWaterArea += facetAreas[f];
+        }
+        if (sceneWaterArea > 0) waterSurfaceHeight = heightSum / sceneWaterArea;
+    }
     {
         uint32_t submergedCount = 0;
-        double submergedArea = 0;
+        double submergedArea = 0, wettedArea = 0;
         for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
             const auto& s = surfaceForFacet(scene, f);
             anyShipSpeed = anyShipSpeed || s.shipSpeed > 0;
-            if (!s.waterline || !(facetHeight[f] < s.waterlineHeight)) continue;
-            if (submergedFacet.empty()) submergedFacet.assign(scene.leafFacetCount, 0);
+            anyWaterFeedback = anyWaterFeedback || s.waterFeedback;
+            anyFromWater = anyFromWater || s.waterlineFromWater;
+            if (!s.waterline) continue;
+            float wet = 0.0f;
+            if (s.waterlineFromWater) {
+                if (!(sceneWaterArea > 0))
+                    throw std::runtime_error("Ship waterlineSource water needs a water surface in the scene");
+                const float level = static_cast<float>(waterSurfaceHeight) + s.waterlineOffset;
+                std::array<float, 3> h{};
+                for (uint32_t corner = 0; corner < 3U; ++corner) h[corner] = scene.vertices[f * 3U + corner].position[1];
+                std::sort(h.begin(), h.end());
+                if (level <= h[0]) wet = 0.0f;
+                else if (level >= h[2]) wet = 1.0f;
+                else if (level < h[1]) wet = (level - h[0]) * (level - h[0]) / ((h[1] - h[0]) * (h[2] - h[0]));
+                else wet = 1.0f - (h[2] - level) * (h[2] - level) / ((h[2] - h[0]) * (h[2] - h[1]));
+            } else if (facetHeight[f] < s.waterlineHeight) {
+                wet = 1.0f;
+            }
+            if (!(wet > 0.0f)) continue;
+            if (submergedFacet.empty()) {
+                submergedFacet.assign(scene.leafFacetCount, 0);
+                wetFraction.assign(scene.leafFacetCount, 0.0f);
+            }
             submergedFacet[f] = 1;
+            wetFraction[f] = wet;
             ++submergedCount;
             submergedArea += facetAreas[f];
+            wettedArea += facetAreas[f] * wet;
         }
+        if (anyWaterFeedback && !(sceneWaterArea > 0))
+            throw std::runtime_error("Ship waterFeedback needs a water surface in the scene");
         if (submergedCount) runIndex.value["shipWaterline"] = {{"facets", submergedCount}, {"area_m2", submergedArea}};
+        if (submergedCount && anyFromWater) {
+            runIndex.value["shipWaterline"]["wettedArea_m2"] = wettedArea;
+            runIndex.value["shipWaterline"]["waterSurfaceHeight_m"] = waterSurfaceHeight;
+        }
+    }
+    // Internal heat sources (Ship material internalHeatFlux W m-2 plus
+    // internalHeatPower W spread over the area of the facets of the same scene
+    // material), W m-2 of facet area. A wall slab receives it in its innermost
+    // cell (wallResponse), a thin shell as a source term of the facet balance.
+    std::vector<float> internalHeat;
+    {
+        std::vector<double> materialArea(scene.materials.size(), 0.0);
+        for (uint32_t f = 0; f < scene.leafFacetCount; ++f)
+            if (f < scene.materialIndices.size() && scene.materialIndices[f] < materialArea.size())
+                materialArea[scene.materialIndices[f]] += facetAreas[f];
+        double power = 0, area = 0;
+        for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
+            const auto& s = surfaceForFacet(scene, f);
+            if (s.internalFlux == 0.0f && s.internalPower == 0.0f) continue;
+            if (internalHeat.empty()) internalHeat.assign(scene.leafFacetCount, 0.0f);
+            const double perArea = double(s.internalFlux) +
+                (s.internalPower != 0.0f ? double(s.internalPower) / materialArea[scene.materialIndices[f]] : 0.0);
+            internalHeat[f] = static_cast<float>(perArea);
+            power += perArea * facetAreas[f];
+            area += facetAreas[f];
+        }
+        if (!internalHeat.empty()) runIndex.value["internalHeat"] = {{"area_m2", area}, {"power_W", power}};
     }
     runIndex.write();
     const size_t firstGroundSide = static_cast<size_t>(scene.leafFacetCount) * 2U;
@@ -5431,6 +5549,15 @@ try {
     const auto shipWaterK = [&](const SurfaceParameters& s, float sceneWaterK) {
         return s.waterK >= 0 ? s.waterK : sceneWaterK >= 0 ? sceneWaterK : shipFirstAirK;
     };
+    // Submerged facets with waterShielding receive no sun or sky radiation on
+    // their wetted part: the net radiation is scaled by 1 - wetted fraction.
+    const auto shieldFraction = [&](uint32_t facet) {
+        if (wetFraction.empty() || facet >= scene.leafFacetCount || !surfaceForFacet(scene, facet).waterShield) return 1.0f;
+        return 1.0f - wetFraction[facet];
+    };
+    // Hull-to-water heat of the preceding node (W m-2 of scene water area) that
+    // warms the water facets of the next node (Ship waterFeedback).
+    float waterFeedbackSource = 0.0f;
     const auto totalBegin = Clock::now();
     double lumpedElapsedSeconds=0;
     for (int node = startNode; node < endNode; ++node) {
@@ -5482,9 +5609,13 @@ try {
             if (!submergedFacet.empty()) {
                 const float startWaterK = sceneWaterTemperature();
                 for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet)
-                    if (submergedFacet[facet])
-                        temperature[size_t(facet) * 2U] = temperature[size_t(facet) * 2U + 1U] =
-                            shipWaterK(surfaceForFacet(scene, facet), startWaterK);
+                    if (submergedFacet[facet]) {
+                        const float waterK = shipWaterK(surfaceForFacet(scene, facet), startWaterK);
+                        const float wet = wetFraction[facet];
+                        const float start = wet >= 1.0f ? waterK
+                            : wet * waterK + (1.0f - wet) * temperature[size_t(facet) * 2U];
+                        temperature[size_t(facet) * 2U] = temperature[size_t(facet) * 2U + 1U] = start;
+                    }
             }
             stateTemperature = {temperature, temperature};
         }
@@ -5626,7 +5757,8 @@ try {
                     wallProfiles[state][w] = slab.steadyProfile(previousStateTemperature[state][side0]);
                     if (state == 0) previousWallHeat[w] = slab.heat(wallProfiles[0][w]);
                 }
-                wallResponses[state][w] = facetphysics::wallResponse(wallProfiles[state][w], slab, dTime);
+                wallResponses[state][w] = facetphysics::wallResponse(wallProfiles[state][w], slab, dTime,
+                    internalHeat.empty() ? 0.0 : double(internalHeat[wallFacets[w]]));
             }
         }
 
@@ -5789,25 +5921,41 @@ try {
         const float aerodynamicResistance = airDensity * 1005.0f /
             std::max(0.1f, aerodynamicConductance);
         // Ship hulls (energy.comp P[3]): the forced-convection coefficient at the
-        // relative wind sqrt(u^2 + speed^2) as a multiplier of the material
-        // convective scale; speed 0 keeps the material value.
+        // relative wind |u_wind - v_ship| as a multiplier of the material
+        // convective scale; speed 0 keeps the material value. Without a heading
+        // and wind direction the wind is taken perpendicular to the course,
+        // sqrt(u^2 + v^2); with them u^2 + v^2 + 2 u v cos(heading - wind from).
         const auto objectConvectiveScale = [&](const SurfaceParameters& s) {
             if (!(s.shipSpeed > 0)) return s.convectiveScale;
-            const float relative = std::sqrt(meteo.windSpeed * meteo.windSpeed + s.shipSpeed * s.shipSpeed);
+            const float squared = s.shipWindCosine == 0.0f ? meteo.windSpeed * meteo.windSpeed + s.shipSpeed * s.shipSpeed
+                : meteo.windSpeed * meteo.windSpeed + s.shipSpeed * s.shipSpeed +
+                    2.0f * meteo.windSpeed * s.shipSpeed * s.shipWindCosine;
+            const float relative = std::sqrt(std::max(0.0f, squared));
             return s.convectiveScale * (5.8f + 4.1f * std::sqrt(std::max(0.1f, relative))) / aerodynamicConductance;
         };
         // Submerged hull facet (energy.comp P[30], P[31]): total sensible
         // conductance and its reference temperature; {0, air} = air exchange.
         // A wall slab's outer face touches the water; a thin shell has one face
-        // on the water and the other in the air.
+        // on the water and the other in the air. A partly wetted facet (draft
+        // from the water surface) mixes the water and air conductances by the
+        // wetted fraction; a fully wetted one keeps the original expressions.
         const auto waterContact = [&](uint32_t facet, const SurfaceParameters& s) -> std::array<float, 2> {
             if (submergedFacet.empty() || facet >= scene.leafFacetCount || !submergedFacet[facet])
                 return {0.0f, airTemperature};
             const float waterK = shipWaterK(s, nodeWaterK);
-            if (wallIndex[facet] >= 0) return {s.waterCoefficient, waterK};
+            const float wet = wetFraction[facet];
             const float air = aerodynamicConductance * objectConvectiveScale(s);
-            const float total = s.waterCoefficient + air;
-            return {total, (s.waterCoefficient * waterK + air * airTemperature) / total};
+            if (wallIndex[facet] >= 0) {
+                if (wet >= 1.0f) return {s.waterCoefficient, waterK};
+                const float water = wet * s.waterCoefficient, dry = (1.0f - wet) * air, total = water + dry;
+                return {total, (water * waterK + dry * airTemperature) / total};
+            }
+            if (wet >= 1.0f) {
+                const float total = s.waterCoefficient + air;
+                return {total, (s.waterCoefficient * waterK + air * airTemperature) / total};
+            }
+            const float water = wet * s.waterCoefficient, dry = (2.0f - wet) * air, total = water + dry;
+            return {total, (water * waterK + dry * airTemperature) / total};
         };
         for (size_t index = 0; index < columns.size(); ++index) {
             columnAerodynamics[index] = aerodynamics(
@@ -5827,13 +5975,26 @@ try {
 
         struct StateFluxes {
             std::vector<float> net, sensible, sensibleSlope, latent, latentSlope,
-                storage, storageSlope, photovoltaic, photovoltaicSlope, temperatureStep, stomatalMismatch,internal,internalSlope;
+                storage, storageSlope, photovoltaic, photovoltaicSlope, temperatureStep, stomatalMismatch,internal,internalSlope,source;
         };
         const auto makeStateFluxes = [&]() {
             const std::vector<float> zero(surfaceCount, 0.0f);
-            return StateFluxes{zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,zero,zero};
+            return StateFluxes{zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,zero,zero,zero};
         };
         std::array<StateFluxes, 2> stateFlux{makeStateFluxes(), makeStateFluxes()};
+        // Heat source of the facet balance (W m-2 facet area; energy.comp F[11]):
+        // ship internal heat of a thin shell and, on the scene water facets, the
+        // hull heat of the preceding node (waterFeedback). Wall slabs take their
+        // internal heat in the slab (wallResponse) instead.
+        if (!internalHeat.empty() || waterFeedbackSource != 0.0f)
+            for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet) {
+                if (wallIndex[facet] >= 0) continue;
+                const auto& surface = surfaceForFacet(scene, facet);
+                float source = internalHeat.empty() ? 0.0f : internalHeat[facet];
+                if (waterFeedbackSource != 0.0f && surface.water && !surface.vegetation) source += waterFeedbackSource;
+                for (int state = 0; state < 2; ++state)
+                    stateFlux[state].source[size_t(facet) * 2U] = stateFlux[state].source[size_t(facet) * 2U + 1U] = source;
+            }
         float maximumStabilityChange = 0.0f;
         float maximumStomatalMismatch = 0.0f, maximumLeafEnergyResidual = 0.0f;
         uint32_t failingEnergyFacets = 0;
@@ -5859,7 +6020,7 @@ try {
                     const auto& flux = stateFlux[state];
                     const size_t first = size_t(facet) * 2U;
                     for (size_t side = first; side < first + (object ? 1U : 2U); ++side) {
-                        const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] -
+                        const float residual = flux.net[side] + flux.internal[side] + flux.source[side] - flux.sensible[side] - flux.latent[side] -
                             flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
                         failing = failing || facetphysics::facetEnergyViolation(residual);
                     }
@@ -5931,10 +6092,10 @@ try {
                             // Wall slab: only the outdoor face is in the outdoor energy
                             // balance; the indoor face conducts through the slab to the room.
                             const int32_t wall = wallIndex[facet];
-                            const float facetNetRadiation = wall >= 0
+                            const float facetNetRadiation = shieldFraction(facet) * (wall >= 0
                                 ? radiativeNet[side0 + wallOuter[size_t(wall)]]
                                 : radiativeNet[side0] +
-                                radiativeNet[side0 + 1U];
+                                radiativeNet[side0 + 1U]);
                             // Leaves exchange whole-leaf fluxes through the SCOPE canopy
                             // resistance of their ground column; other objects keep the
                             // two-face forced-convection coefficient.
@@ -6183,7 +6344,7 @@ try {
                     const size_t first = static_cast<size_t>(facet) * 2U;
                     for (size_t side = first; side < first + (object ? 1U : 2U); ++side) {
                         const float emissivity = std::clamp(1.0f - optics[side].reflectance - optics[side].transmittance, 0.0f, 1.0f);
-                        const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] - flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
+                        const float residual = flux.net[side] + flux.internal[side] + flux.source[side] - flux.sensible[side] - flux.latent[side] - flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
                         if (object && surfaceForFacet(scene, facet).vegetation) {
                             maximumStomatalMismatch = std::max(maximumStomatalMismatch, flux.stomatalMismatch[side]);
                             maximumLeafEnergyResidual = std::max(maximumLeafEnergyResidual, std::abs(residual));
@@ -6266,6 +6427,17 @@ try {
                 if (!mat.vegetation) {
                     const auto contact = waterContact(facet, mat);
                     if (contact[0] > 0.0f) { data[30] = contact[0]; data[31] = contact[1]; }
+                }
+                // Non-leaf objects (their leaf-only slots 23, 24 are free):
+                // P[23] heat source of the facet balance (W m-2), P[24] factor of the
+                // net radiation (1 - wetted fraction of a shielded hull, else 1).
+                if (facet < scene.leafFacetCount && !mat.vegetation) {
+                    data[23] = 0.0f;
+                    if (!wallFacet) {
+                        data[23] = internalHeat.empty() ? 0.0f : internalHeat[facet];
+                        if (waterFeedbackSource != 0.0f && mat.water) data[23] += waterFeedbackSource;
+                    }
+                    data[24] = shieldFraction(facet);
                 }
             }
             for (int state = 0; state < 2; ++state)
@@ -6404,7 +6576,7 @@ try {
                             }
                             const float t = stateTemperature[state][side];
                             const float e = std::clamp(1.0f - audit.optics[side].reflectance - audit.optics[side].transmittance, 0.0f, 1.0f);
-                            const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] - flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
+                            const float residual = flux.net[side] + flux.internal[side] + flux.source[side] - flux.sensible[side] - flux.latent[side] - flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
                             const float response = radiatingFaces(facet) * e * kStefanBoltzmann * std::pow(t, 3.0f) +
                                 flux.sensibleSlope[side] + flux.latentSlope[side] + flux.storageSlope[side] + flux.internalSlope[side] + (object ? flux.photovoltaicSlope[side] : 0.0f);
                             const float candidate = std::clamp(t + std::clamp(residual / std::max(1.0f, response), -5.0f, 5.0f), 220.0f, 360.0f);
@@ -6508,7 +6680,7 @@ try {
                             const float emissivity =
                                 std::clamp(1.0f - longwaveOptics[side].reflectance - longwaveOptics[side].transmittance,
                                            0.0f, 1.0f);
-                            const float residual = flux.net[side] + flux.internal[side] - flux.sensible[side] - flux.latent[side] -
+                            const float residual = flux.net[side] + flux.internal[side] + flux.source[side] - flux.sensible[side] - flux.latent[side] -
                                                    flux.storage[side] - (object ? flux.photovoltaic[side] : 0.0f);
                             const float derivative =
                                 radiatingFaces(facet) * emissivity * kStefanBoltzmann * std::pow(T[side], 3.0f) +
@@ -6661,7 +6833,8 @@ try {
                     heat += weight * slab.heat(next);
                     wallProfiles[state][w] = next;
                 }
-                const double residual = (heat - previousWallHeat[w]) / dTime - (conducted - indoor);
+                const double residual = (heat - previousWallHeat[w]) / dTime - (conducted - indoor) -
+                    (internalHeat.empty() ? 0.0 : double(internalHeat[facet]));
                 previousWallHeat[w] = heat;
                 area += facetAreas[facet];
                 indoorSum += facetAreas[facet] * indoor;
@@ -6675,6 +6848,23 @@ try {
                 {"meanIndoorFlux_W_m2", indoorSum / area},
                 {"heatClosureMean_W_m2", closureAvailable ? closureSum / area : 0.0},
                 {"heatClosureMaxAbs_W_m2", closureAvailable ? closureMax : 0.0}};
+        }
+        if (anyWaterFeedback && nodeWaterK >= 0) {
+            // Heat the wetted hull gives the water this node (W): area-weighted
+            // water-side flux of the solved surface temperatures, spread over the
+            // water facets as the source of the next node (lagged one node).
+            double heatToWater = 0;
+            for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet) {
+                if (!submergedFacet[facet]) continue;
+                const auto& surface = surfaceForFacet(scene, facet);
+                if (!surface.waterFeedback) continue;
+                const size_t side = size_t(facet) * 2U;
+                const double surfaceK = sunlitPart[side] * double(stateTemperature[0][side]) +
+                    (1.0 - sunlitPart[side]) * double(stateTemperature[1][side]);
+                heatToWater += facetAreas[facet] * wetFraction[facet] * surface.waterCoefficient * (surfaceK - nodeWaterK);
+            }
+            waterFeedbackSource = static_cast<float>(heatToWater / sceneWaterArea);
+            diagnostic["shipWater"] = {{"heatToWater_W", heatToWater}, {"waterSource_W_m2", heatToWater / sceneWaterArea}};
         }
         {
             const auto perArea = [](double value, double area) { return area > 0 ? value / area : 0.0; };
