@@ -11,7 +11,7 @@ import { createRasterTools } from './rasters.mjs'
 const PROGRESS = /^STREAM\tprogress\t([\d.]+)\t(.*)$/
 const PRODUCT_FILE = /\.(tif|json)$/i
 
-export function createStreamService({ resourceRoot, modelRoot, json, body, readTiff, normalizeHostPath, windowsPath }) {
+export function createStreamService({ resourceRoot, modelRoot, json, body, readTiff, normalizeHostPath, windowsPath, runTask = null }) {
   const candidates = [
     join(resourceRoot, 'engine', 'stream.exe'),
     join(modelRoot, 'bin_x64', 'Release', 'stream.exe'),
@@ -322,13 +322,18 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     'POST /api/stream/run': (data) => submitRun(data),
     'POST /api/stream/stop': (data) => stop(data.id),
     'POST /api/stream/inspect': (data) => ({ rasters: rasters.inspectRasters(data.paths) }),
-    // DEFERRED[中] 性能: raster 与 class-stats 在请求处理中同步执行 readTiff（readFileSync 整个文件 + 全幅 Float64 解码），大影像会阻塞事件循环数秒，期间 SSE 进度与其它 API 全部停顿，还可能内存溢出；建议：放到 worker_threads 执行，并对像元总数设上限/按抽样行列读取
-    'POST /api/stream/raster': (data) => rasters.rasterBand(data.path, Number(data.band) || 0),
+    // raster 与 class-stats 的整幅 readTiff 解码由 runTask 放到后台计算线程（server.mjs 提供）；未提供时在本线程同步执行。
+    'POST /api/stream/raster': (data) => runTask
+      ? runTask('stream-raster', { path: data.path, band: Number(data.band) || 0 }, { key: String(data.path || '') })
+      : rasters.rasterBand(data.path, Number(data.band) || 0),
     'POST /api/stream/runs': (data) => ({ runs: listRuns(data.outputRoot) }),
     'POST /api/stream/run-info': (data) => readRun(data.outputDir),
     'POST /api/stream/class-stats': (data) => {
       const run = readRun(data.outputDir)
-      return rasters.classStatistics(resolve(normalizeHostPath(run.outputDir)), run.typeFile, run.typeBand)
+      const outputDir = resolve(normalizeHostPath(run.outputDir))
+      return runTask
+        ? runTask('stream-class-stats', { outputDir, typeFile: run.typeFile, typeBand: run.typeBand }, { key: String(run.typeFile || '') })
+        : rasters.classStatistics(outputDir, run.typeFile, run.typeBand)
     },
     'POST /api/stream/project/open': (data) => {
       const project = projects.readProjectFile(data.path)

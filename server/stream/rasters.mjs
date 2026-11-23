@@ -132,7 +132,7 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
     for (const file of ['optical_reflectance.tif', 'tir_brightness_temperature.tif', 'tir_surface_temperature.tif', 'components.tif', 'eb_forcing.tif', 'eb_fluxes.tif', 'lst.tif', 'lsct.tif']) {
       const path = join(outputDir, file)
       if (!existsSync(path)) continue
-      // DEFERRED[中] 性能: readTiff 每次都 readFileSync 整个文件并解码全幅像元（includeValues=false 时也照样逐像元循环），这里对每个波段各调用一次，eb_fluxes 这类 20 多个波段的产品会重复读取解码整个文件 20 多次，在请求线程中同步阻塞事件循环；建议：一次读入、解码后按波段分别取值（或交给引擎写出统计），并放到 worker 中执行
+      // DEFERRED[中] 性能: readTiff 每次都 readFileSync 整个文件并解码全幅像元（includeValues=false 时也照样逐像元循环），这里对每个波段各调用一次，eb_fluxes 这类 20 多个波段的产品会重复解码整个文件 20 多次（原始文件读盘由结果缓存共用；2026-11-23 起整体在后台计算线程执行，不再阻塞服务事件循环，但仍慢）；建议：一次解码后按波段分别取值（或交给引擎写出统计）
       const first = readTiff(path, 0, false)
       if (first.width !== type.width || first.height !== type.height) continue
       const bands = []

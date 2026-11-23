@@ -11,3 +11,5 @@
 Stream Studio 开发入口：C:/work/streamstudio。用户交付入口：D:/releases/streamstudio/2.0.1。2026-11-12 起的开发版变更仍在测试阶段（本仓库只保留 HiStream 通用扩展接口）：版本号保持 2.0.1，不构建正式安装包、不创建新的交付目录；变更草稿见 [下一版本更新说明（草稿）](release-next-draft.md)。将来发布时可用 `tools/prepare_user_release.py` 生成交付目录（尚未实际使用）。
 
 详见 [案例验收记录](testing/user-release-cases-20261101.md)。
+
+服务端开发约定（2026-11-23 起）：HTTP 服务线程只做请求调度与小文件读写。会整读大文件、解析大 JSON、解码/编码 TIFF/ENVI、整读 OBJ 或遍历结果目录的新接口，应作为任务加入 `server.mjs` 的 `HEAVY_TASKS`，经 `heavyTasks.run(...)`（常驻线程池，`server/task-pool.mjs`）或 `runPostprocessTask`（一次性线程，用于运行结束后的出图/转换）执行；返回 JSON 的任务在线程内序列化成 `bytes`，以 Transferable ArrayBuffer 传回，由 `json()` 原样发送。线程入口是 `server.mjs` 本身（按 `workerData.kind` 分支，与 FacetEB 出图线程相同），打包时无需额外文件；线程无法启动时自动退回服务线程同步执行。`STREAM_STUDIO_TASK_WORKERS=0` 可整体关闭，用于对比排查。服务端改动的响应一致性与并发延迟可用临时脚本对比（不进仓库）。

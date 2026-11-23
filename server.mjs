@@ -2,7 +2,7 @@ import { createServer } from 'node:http'
 import { execFile, spawn, spawnSync } from 'node:child_process'
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads'
 import { createInterface } from 'node:readline'
-import { closeSync, copyFileSync, cpSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { closeSync, copyFileSync, cpSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { copyFile as copyFileAsync, cp as cpAsync } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { inflateSync } from 'node:zlib'
@@ -18,6 +18,8 @@ import { buildProjectFromUsd } from './tools/usd-import.mjs'
 import { createStreamService } from './server/stream/index.mjs'
 import { mapStreamScenePaths } from './server/stream/config.mjs'
 import { BINARY_RESULT_TYPE, ByteLru, encodeBinaryResult, fileStamp, resultCacheLimitBytes } from './server/result-cache.mjs'
+import { createRasterTools } from './server/stream/rasters.mjs'
+import { createTaskPool, ownedBytes, receivedBytes, runTaskOnce, serveTaskOnce, serveTasks } from './server/task-pool.mjs'
 
 const PROJECT_ROOT = dirname(fileURLToPath(import.meta.url))
 const APP_VERSION = (() => { try { return JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')).version || '' } catch { return '' } })()
@@ -77,11 +79,40 @@ let projectFile = ''
 let projectDir = ''
 let projectFileChooser = null
 const clients = new Set()
-// 结果读取缓存（原始 TIFF/ENVI 数据 + 已解码分块 + 已编码的接口响应），总字节上限默认 512 MB，
-// STREAM_STUDIO_RESULT_CACHE_MB 调整，设为 0 关闭。键含 (路径, mtime, size)，文件被覆盖即失效。
+// 结果读取缓存。服务线程中缓存已编码的接口响应；后台计算线程各自缓存原始 TIFF/ENVI 数据与已解码分块
+// （上限为总设置按线程数均分）。总字节上限默认 512 MB，STREAM_STUDIO_RESULT_CACHE_MB 调整，设为 0 关闭。
+// 键含 (路径, mtime, size)，文件被覆盖即失效。
 const resultCache = new ByteLru(resultCacheLimitBytes())
+// 后台计算线程数：STREAM_STUDIO_TASK_WORKERS，默认 2；0 表示与旧版相同，在服务线程内同步执行。
+const TASK_WORKERS = (() => {
+  const raw = process.env.STREAM_STUDIO_TASK_WORKERS
+  const count = raw === undefined || raw === '' ? 2 : Math.floor(Number(raw))
+  return Number.isFinite(count) ? Math.max(0, Math.min(8, count)) : 2
+})()
+const heavyTasks = createTaskPool({
+  size: TASK_WORKERS,
+  createWorker: () => new Worker(new URL(import.meta.url), facetStepWorkerOptions('task-service', {
+    cacheBytes: TASK_WORKERS ? Math.floor(resultCacheLimitBytes() / TASK_WORKERS) : 0
+  })),
+  runInline: (task, args) => runHeavyTaskInline(task, args)
+})
+// 运行结束后的出图/ENVI 转换：一次性线程，结束后释放全部内存；“停止”可终止它。
+function runPostprocessTask(running, task, args) {
+  const inline = () => runHeavyTaskInline(task, args)
+  if (!TASK_WORKERS) return Promise.resolve().then(inline)
+  let current = null
+  return runTaskOnce({
+    task, args, runInline: (name, values) => runHeavyTaskInline(name, values),
+    createWorker: () => new Worker(new URL(import.meta.url), facetStepWorkerOptions('task-once', { task, args, cacheBytes: 0 })),
+    onWorker: (worker) => {
+      if (worker) { current = worker; running.facetWorker = worker }
+      else if (running.facetWorker === current) running.facetWorker = null
+    }
+  })
+}
 // STREAM remote-sensing image simulation: an independent module with its own API, queue and events.
-const streamService = createStreamService({ resourceRoot: RESOURCE_ROOT, modelRoot: MODEL_ROOT, json, body, readTiff, normalizeHostPath, windowsPath })
+const streamService = createStreamService({ resourceRoot: RESOURCE_ROOT, modelRoot: MODEL_ROOT, json, body, readTiff, normalizeHostPath, windowsPath,
+  runTask: (task, args, options) => heavyTasks.run(task, args, options).then(toJsonBytes) })
 
 function executable() {
   return histreamCandidates.find(existsSync) || histreamCandidates[0]
@@ -269,7 +300,8 @@ async function resetSimulationProcesses() {
   if (resettingProcesses) throw new Error('模拟环境正在重置')
   resettingProcesses = true
   const running = child
-  const runningPid = running?.pid || 0
+  // 引擎已退出、只在做结果后处理时不按 PID 结束进程（PID 可能已被系统复用）。
+  const runningPid = running && !running.histreamFinished ? running.pid || 0 : 0
   if (running) running.histreamReset = true
   const results = []
   try {
@@ -298,28 +330,67 @@ async function resetSimulationProcesses() {
 
 const FRAME_HEADERS = { 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "frame-ancestors 'none'" }
 
+// 后台线程已序列化好的 JSON 响应体（UTF-8 字节），json() 原样发送，与 JSON.stringify 结果逐字节相同。
+class JsonBytes {
+  constructor(bytes) { this.bytes = bytes }
+}
+
 function json(response, status, value) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...FRAME_HEADERS })
-  response.end(JSON.stringify(value))
+  response.end(value instanceof JsonBytes ? value.bytes : JSON.stringify(value))
 }
+
+// 编码结果读取响应：二进制块（客户端声明支持且有大数组时）或 JSON。在后台线程中执行。
+function encodeResultPayload(result, binary) {
+  const encoded = binary ? encodeBinaryResult(result) : null
+  return encoded
+    ? { bytes: encoded, contentType: BINARY_RESULT_TYPE }
+    : { bytes: Buffer.from(JSON.stringify(result), 'utf8'), contentType: 'application/json; charset=utf-8' }
+}
+
+function produceResult(kind, path, band) {
+  if (kind === 'envi') return readEnvi(path, band)
+  if (kind === 'wind') return readWindTiff(path)
+  if (kind === 'tiff') return readTiff(path, band)
+  if (kind === 'facet') {
+    const result = sampleRadiosityResult(path)
+    return { ...result, path: windowsPath(result.path) }
+  }
+  if (kind === 'process') {
+    const result = readProcessResult(path)
+    return { ...result, path: windowsPath(result.path) }
+  }
+  throw new Error(`未知的结果类型：${kind}`)
+}
+
+// 正在计算的同一响应（同一缓存键）只算一次，后到的请求等待同一结果。
+const resultInFlight = new Map()
 
 // 结果读取接口：已编码的响应按依赖文件的 (路径, mtime, size) + 变体缓存，X-Cache 标明命中与否。
 // 请求头 Accept 含 BINARY_RESULT_TYPE 时，大数值数组（几何、逐面元/体元指标）以二进制块回传；
-// 否则保持原来的 JSON。
-function sendCachedResult(request, response, dependencies, variant, produce) {
+// 否则保持原来的 JSON。读取、解析与编码在后台线程执行（job = { kind, path, band }）。
+async function sendCachedResult(request, response, dependencies, variant, job) {
   const binary = String(request.headers.accept || '').includes(BINARY_RESULT_TYPE)
   const stamps = dependencies.map((path) => fileStamp(path))
   const key = stamps.every(Boolean) ? `result:${variant}|${binary ? 'binary' : 'json'}|${stamps.map((stamp) => stamp.key).join('|')}` : ''
   let cached = key ? resultCache.get(key) : undefined
   const hit = Boolean(cached)
   if (!cached) {
-    const result = produce()
-    const encoded = binary ? encodeBinaryResult(result) : null
-    cached = encoded
-      ? { payload: encoded, contentType: BINARY_RESULT_TYPE }
-      : { payload: Buffer.from(JSON.stringify(result), 'utf8'), contentType: 'application/json; charset=utf-8' }
-    // 读取期间文件被改写（引擎仍在写出）时不缓存，下次重新读取。
-    if (key && dependencies.every((path, index) => fileStamp(path)?.key === stamps[index].key)) resultCache.set(key, cached, cached.payload.length, stamps)
+    let pending = key ? resultInFlight.get(key) : undefined
+    if (!pending) {
+      pending = heavyTasks.run('result-read', { ...job, binary }, { key: job.path }).then(({ bytes, contentType }) => {
+        const produced = { payload: receivedBytes(bytes), contentType }
+        // 读取期间文件被改写（引擎仍在写出）时不缓存，下次重新读取。
+        if (key && dependencies.every((path, index) => fileStamp(path)?.key === stamps[index].key)) resultCache.set(key, produced, produced.payload.length, stamps)
+        return produced
+      })
+      if (key) {
+        resultInFlight.set(key, pending)
+        const forget = () => { if (resultInFlight.get(key) === pending) resultInFlight.delete(key) }
+        pending.then(forget, forget)
+      }
+    }
+    cached = await pending
   }
   const { payload, contentType } = cached
   if (process.env.STREAM_STUDIO_RESULT_CACHE_DEBUG === '1') {
@@ -548,6 +619,7 @@ function emit(payload) {
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]'])
 // Largest legitimate payload is a 64 MB DEM sent as base64 inside JSON.
 const MAX_REQUEST_BYTES = 160 * 1024 * 1024
+const LARGE_REQUEST_BYTES = 4 * 1024 * 1024
 
 function isLoopbackHostname(value) {
   try { return LOOPBACK_HOSTNAMES.has(new URL(value).hostname) } catch { return false }
@@ -574,7 +646,10 @@ async function body(request) {
     if (size > MAX_REQUEST_BYTES) throw new Error(`请求体超过 ${MAX_REQUEST_BYTES / 1024 / 1024}MB`)
     chunks.push(chunk)
   }
-  const data = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+  // 大请求体（导入 OBJ/DEM/纹理的 Base64 或文本内容）在后台线程解析，避免长时间 JSON.parse 阻塞。
+  const data = size > LARGE_REQUEST_BYTES
+    ? await heavyTasks.run('parse-json', { bytes: ownedBytes(Buffer.concat(chunks)) }, { transfer: true })
+    : JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
   if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('请求体须为 JSON 对象')
   return data
 }
@@ -2479,7 +2554,7 @@ function exportProjectUsdFiles(projectPath, project) {
     outputPath,
     assetsDirectory: join(directory, 'usd'),
     resolveAssetPath: (value) => projectAssetPath(value, directory),
-    heightAt: demHeightSampler(project.configuration),
+    heightAt: demHeightSampler(project.configuration, directory),
     sourceProjectFile: projectPath
   })
   recordUsdSync(directory, outputPath, fileSha256(outputPath))
@@ -4159,7 +4234,7 @@ async function api(request, response, url) {
       projectFile = result.path
       projectDir = result.projectDir
       let usd
-      try { usd = exportProjectUsdFiles(result.path, result.project) } catch (error) { usd = { error: error.message } }
+      try { usd = await exportProjectUsdInWorker(result.path, result.project) } catch (error) { usd = { error: error.message } }
       return json(response, 201, { ...result, path: windowsPath(result.path), projectDir: windowsPath(result.projectDir), projectPath: windowsPath(result.projectPath), usd })
     } catch (error) {
       return json(response, 400, { error: error.message })
@@ -4173,11 +4248,8 @@ async function api(request, response, url) {
       if (extname(target).toLowerCase() !== '.obj' || !existsSync(target)) throw new Error(`找不到目标 OBJ：${data.fileName}`)
       const name = basename(String(data.name || '').trim())
       if (!/^[\p{L}\p{N}_\-.]+$/u.test(name)) throw new Error('篷布名称包含无效字符')
-      const cover = generateTarpCover(readFileSync(target, 'utf8'), { lift: data.lift, drape: data.drape })
-      const modelsDir = join(projectDir, 'models')
-      mkdirSync(modelsDir, { recursive: true })
-      writeFileSync(join(modelsDir, `${name}.obj`), cover.obj, 'utf8')
-      const { obj, ...summary } = cover
+      // 读取目标 OBJ、生成篷布并写出在后台线程执行。
+      const summary = await heavyTasks.run('tarp-cover', { target, outputPath: join(projectDir, 'models', `${name}.obj`), lift: data.lift, drape: data.drape })
       return json(response, 201, { ...summary, relativePath: `models/${name}.obj` })
     } catch (error) { return json(response, 400, { error: error.message }) }
   }
@@ -4188,21 +4260,8 @@ async function api(request, response, url) {
       const sourceName = basename(String(data.name || '').trim())
       const extension = extname(sourceName).toLowerCase()
       if (!sourceName || extension !== '.obj') throw new Error('只能导入 OBJ 文件')
-      const content = sanitizeObjContent(data.content)
-      if (!content.trim()) throw new Error('OBJ 文件为空')
-      if (Buffer.byteLength(content, 'utf8') > 80 * 1024 * 1024) throw new Error('OBJ 文件超过 80MB，请使用简化模型')
-      const modelsDir = join(projectDir, 'models')
-      mkdirSync(modelsDir, { recursive: true })
-      const stem = sourceName.slice(0, -extension.length).replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '') || 'object'
-      let name = `${stem}${extension}`
-      for (let suffix = 2; existsSync(join(modelsDir, name)); suffix += 1) name = `${stem}_${suffix}${extension}`
-      const path = join(modelsDir, name)
-      const positionsDir = join(projectDir, 'positions')
-      mkdirSync(positionsDir, { recursive: true })
-      const positionPath = join(positionsDir, `${name.slice(0, -4)}_position.txt`)
-      writeFileSync(path, content, 'utf8')
-      if (!existsSync(positionPath)) writeFileSync(positionPath, '0 0 0 1 0\n', 'utf8')
-      return json(response, 201, { path: windowsPath(path), name, positionPath: windowsPath(positionPath), relativePath: join('models', name).replaceAll('\\', '/') })
+      // 清理与写出（可达 80 MB）在后台线程执行；同一工程固定到同一线程，命名与写入不会交错。
+      return json(response, 201, await heavyTasks.run('import-obj', { projectDir, sourceName, extension, content: data.content }, { key: projectDir }))
     } catch (error) { return json(response, 400, { error: error.message }) }
   }
   if (request.method === 'POST' && url.pathname === '/api/project/import-meteo') {
@@ -4248,7 +4307,7 @@ async function api(request, response, url) {
       for (let suffix = 2; existsSync(join(terrainDir, name)); suffix += 1) name = `${stem}_${suffix}${extension}`
       importedPath = join(terrainDir, name)
       writeFileSync(importedPath, content)
-      const metadata = inspectDemFile(importedPath, extension)
+      const metadata = await heavyTasks.run('dem-inspect', { path: importedPath, extension })
       const warnings = []
       if (metadata.coordinateType === '经纬度坐标') warnings.push('源文件为经纬度坐标；建议重投影到米制坐标后再模拟')
       if (!metadata.georeferenced) warnings.push('文件未包含完整地理参考；HiStream 仍会把整幅栅格映射到场景范围')
@@ -4275,7 +4334,7 @@ async function api(request, response, url) {
       if (!new Set(['.tif', '.tiff', '.asc']).has(extension))
         throw new Error('DEM 仅支持 TIF、TIFF 或 ASC')
       if (!existsSync(demPath) || !statSync(demPath).isFile()) throw new Error(`找不到 DEM：${demPath}`)
-      return json(response, 200, { path: windowsPath(demPath), metadata: inspectDemFile(demPath, extension) })
+      return json(response, 200, toJsonBytes(await heavyTasks.run('dem-info', { path: demPath, extension }, { key: demPath })))
     } catch (error) {
       return json(response, 400, { error: error.message })
     }
@@ -4369,7 +4428,8 @@ async function api(request, response, url) {
       if (!((projectDir && realPathWithin(projectDir, path)) || realPathWithin(join(RESOURCE_ROOT, 'assets'), path)))
         throw new Error('只能读取当前工程或 Stream Studio assets 目录中的资源')
       if (statSync(path).size > 80 * 1024 * 1024) throw new Error('预览资源超过 80MB，请使用简化模型')
-      return json(response, 200, { path: windowsPath(path), content: readFileSync(path, 'utf8') })
+      // 读文件与 JSON 序列化（OBJ 可达 80 MB）在后台线程执行。
+      return json(response, 200, toJsonBytes(await heavyTasks.run('project-read', { path })))
     } catch (error) {
       return json(response, 400, { error: error.message })
     }
@@ -4392,7 +4452,7 @@ async function api(request, response, url) {
       projectFile = path
       projectDir = dirname(path)
       let usd
-      try { usd = exportProjectUsdFiles(path, project) } catch (error) { usd = { error: error.message } }
+      try { usd = await exportProjectUsdInWorker(path, project) } catch (error) { usd = { error: error.message } }
       return json(response, 200, { path: windowsPath(path), content, project, projectPath: windowsPath(path), usd })
     } catch (error) {
       return json(response, 400, { error: error.message })
@@ -4406,7 +4466,8 @@ async function api(request, response, url) {
       const stored = readProject(input)
       const project = stored.project ? normalizeStoredProjectPaths(stored.project, dirname(input)) : null
       if (!project) throw new Error('无法读取工程配置')
-      json(response, 200, runPreflight(input, project, data.mode))
+      // 三角面统计要整读 OBJ，历史耗时要遍历 runs/：在后台线程执行。
+      json(response, 200, toJsonBytes(await heavyTasks.run('run-preflight', { input, project, mode: data.mode })))
     } catch (error) {
       json(response, 400, { error: error.message })
     }
@@ -4438,10 +4499,8 @@ async function api(request, response, url) {
       const runProject = structuredClone(project)
       runProject.configuration.outDir = run.outputDir
       if (run.manifest.meteorology) runProject.configuration.meteo.path = run.meteoPath
-      runtimeScene = prepareRuntimeSceneProject(input, runProject, {
-        resolveAssetPath: (value) => projectAssetPath(value, projectDir),
-        terrainHeight: demHeightSampler(runProject.configuration)
-      })
+      // 读 OBJ、实例筛选与预裁切、DEM 高程在后台线程执行（暂存目录由线程写出，cleanup 在本线程删除）。
+      runtimeScene = await prepareRuntimeSceneInWorker(input, runProject, projectDir)
       // Preserve generated placements and clipped OBJ files with the input;
       // cleanup removes only the temporary staging directory.
       const inputDirectory = join(run.outputDir, 'input')
@@ -4471,9 +4530,9 @@ async function api(request, response, url) {
       const facetMode = data.mode === 'eFacetRT' || data.mode === 'eFacetEB'
       for (const line of runtimeScene.textureSummary || []) emit({ type: 'stdout', text: `表面分类/开孔率纹理：${line}` })
       if (facetMode) {
-        const estimate = assertFacetScale(runtimeScene.project, inputDirectory, data.mode)
+        // 统计三角面数与面元/像元比需要整读 OBJ，在后台线程执行。
+        const { estimate, pixelNote } = await heavyTasks.run('facet-scale', { project: runtimeScene.project, inputDirectory, mode: data.mode })
         emit({ type: 'stdout', text: `面元规模预检：约 ${estimate.total.toLocaleString('zh-CN')} 个三角面` })
-        const pixelNote = facetPixelRatioNote(runtimeScene.project, inputDirectory)
         if (pixelNote) emit({ type: 'stdout', text: pixelNote })
       }
       const projectSource = stringifyProject(project)
@@ -4594,17 +4653,17 @@ async function api(request, response, url) {
         if (!running.histreamReset) emit({ type: 'error', text: error.message })
         if (!running.pid && child === running) { child = null; childExecutable = '' }
       })
-      const completeHistreamRun = (code, signal) => {
+      const completeHistreamRun = async (code, signal) => {
         running.histreamFinished = true
         pauseRunTimer()
         if (running.facetWorker) void running.facetWorker.terminate()
-        if (running.histreamReset) {
+        const finishReset = () => {
           writeRunManifest(run, { status: 'stopped', finishedAt: new Date().toISOString(), completed: { ...run.manifest.completed, products: runProductPaths(run.outputDir) } })
           runtimeScene?.cleanup()
           if (child === running) child = null
           if (!child) childExecutable = ''
-          return
         }
+        if (running.histreamReset) return finishReset()
         let finalCode = stepOutputError ? 1 : code
         if (running.histreamTimedOut && (finalCode === null || finalCode === undefined)) finalCode = 1
         // Codes that still carry results: 0, plus 2 for FacetEB only (non-converged).
@@ -4616,7 +4675,8 @@ async function api(request, response, url) {
         if (resultCodes.includes(code) && radiosityJsonPath && !streamedSteps && !stepOutputError) {
           try {
             verifyFrozenRunInputs(run.manifest, runInput)
-            const tif = writeRadiosityTiff(radiosityJsonPath, runInput, data.mode)
+            // 读面元 JSON 与出图在一次性后台线程中执行，期间其他请求照常响应；“停止”会终止该线程。
+            const tif = await runPostprocessTask(running, 'facet-tiff', { jsonPath: radiosityJsonPath, inputPath: runInput, mode: data.mode })
             if (tif.tifPaths.length) {
               const timing = isEnergyBalanceMode(data.mode) ? ' 个逐时间 TIFF' : ' 个 TIFF'
               emit({ type: 'stdout', text: '已生成 ' + tif.tifPaths.length + timing + '（' + tif.width + ' × ' + tif.height + '，' + tif.bands + ' 波段）' })
@@ -4625,11 +4685,12 @@ async function api(request, response, url) {
           } catch (error) {
             finalCode = 1
             // 结果处理失败也要写进清单，否则运行只显示 failed 而没有原因。
-            stepOutputError = error
-            emit({ type: 'error', text: `结果影像生成失败：${error.message}` })
+            stepOutputError = running.histreamStopped ? new Error('结果影像生成已被停止') : error
+            if (!running.histreamReset) emit({ type: 'error', text: running.histreamStopped ? stepOutputError.message : `结果影像生成失败：${stepOutputError.message}` })
           } finally {
             if (!keepThreeDimensionalResults && existsSync(radiosityJsonPath)) unlinkSync(radiosityJsonPath)
           }
+          if (running.histreamReset) return finishReset()
         }
         if (streamedSteps && resultCodes.includes(code) && !keepThreeDimensionalResults && existsSync(radiosityJsonPath)) unlinkSync(radiosityJsonPath)
         let conversionWarnings = []
@@ -4637,14 +4698,16 @@ async function api(request, response, url) {
           try {
             // ENVI→TIFF failures are reported per file instead of being dropped
             // silently; the run keeps its status unless no image converted at all.
-            const conversion = convertEnviResults(run.outputDir, data.mode)
+            // 转换在一次性后台线程中执行。
+            const conversion = await runPostprocessTask(running, 'envi-convert', { directory: run.outputDir, mode: data.mode })
             conversionWarnings = conversion.failures.map(({ file, reason }) => `${file}：${reason}`)
             for (const warning of conversionWarnings) emit({ type: 'error', text: `ENVI 结果转换 TIFF 失败（原始文件已保留）：${warning}` })
             if (conversion.failures.length && !conversion.converted.length) {
               throw new Error(`全部 ${conversion.failures.length} 个 ENVI 结果均未能转换为 TIFF`)
             }
           }
-          catch (error) { finalCode = 1; stepOutputError = error }
+          catch (error) { finalCode = 1; stepOutputError = running.histreamStopped ? new Error('ENVI 结果转换已被停止') : error }
+          if (running.histreamReset) return finishReset()
         }
         let nativeRun = {}
         try { nativeRun = JSON.parse(readFileSync(join(run.outputDir, 'faceteb_run.json'), 'utf8')) } catch {}
@@ -4664,9 +4727,10 @@ async function api(request, response, url) {
         if (child === running) { child = null; childExecutable = '' }
       }
       running.on('close', (code, signal) => {
-        try { completeHistreamRun(code, signal) }
-        catch (error) { try { emit({ type: 'error', text: `结果处理失败：${error.message}` }) } catch {} }
-        finally { if (child === running) { child = null; childExecutable = '' } }
+        // 结果后处理在后台线程中进行；完成前 child 仍指向本次运行（界面显示运行中，拒绝新的运行与删除结果）。
+        completeHistreamRun(code, signal)
+          .catch((error) => { try { emit({ type: 'error', text: `结果处理失败：${error.message}` }) } catch {} })
+          .finally(() => { if (child === running) { child = null; childExecutable = '' } })
       })
       return json(response, 200, { pid: running.pid, inputPath: windowsPath(input), runId: run.runId, outputDir: windowsPath(run.outputDir) })
     } catch (error) {
@@ -4689,6 +4753,8 @@ async function api(request, response, url) {
     child.histreamStopped = true
     if (child.facetWorker) void child.facetWorker.terminate()
     const stopping = child
+    // 引擎已退出、只剩后台结果处理：终止处理线程即可，不再按（可能已被复用的）PID 结束进程。
+    if (stopping.histreamFinished) return json(response, 200, { stopped: true })
     if (process.platform === 'win32') {
       spawn('taskkill', ['/pid', String(stopping.pid), '/T', '/F'], { windowsHide: true })
         .on('error', () => stopping.kill())
@@ -4707,6 +4773,7 @@ async function api(request, response, url) {
     try {
       if (child) throw new Error('模拟运行中，不能删除结果')
       resultCache.clear()
+      heavyTasks.broadcast({ type: 'clear' })
       const data = await body(request)
       return json(response, 200, data.kind === "3d" ? deleteThreeDimensionalResults(data.path) : deleteTiffResults(data.path))
     } catch (error) {
@@ -4717,12 +4784,13 @@ async function api(request, response, url) {
   if (request.method === 'POST' && url.pathname === '/api/results/list') {
     try {
       const data = await body(request)
-      return json(response, 200, listResults(data.path))
+      // 递归遍历 runs/ 并读取每个结果文件头，在后台线程执行。
+      return json(response, 200, toJsonBytes(await heavyTasks.run('results-list', { path: resolveAsset(data.path) })))
     } catch (error) {
       return json(response, 400, { error: error.message })
     }
   }
-  // DEFERRED[中] 安全: resolveAsset 接受任意绝对路径，这里（以及 /api/results/change）能读取磁盘上任何 .txt/.csv/.json/.log/.dat/图像/TIFF，不像 /api/project/read 那样用 realPathWithin 限制范围；而且大面元 JSON/TIFF 会在主线程整读整解析，阻塞所有请求；建议：限制在 projectDir 或 resultDirectoryAllowed 认可的目录内，大文件解析放到 Worker。
+  // DEFERRED[中] 安全: resolveAsset 接受任意绝对路径，这里（以及 /api/results/change）能读取磁盘上任何 .txt/.csv/.json/.log/.dat/图像/TIFF，不像 /api/project/read 那样用 realPathWithin 限制范围；建议：限制在 projectDir 或 resultDirectoryAllowed 认可的目录内。（大面元 JSON/TIFF 的读取解析已于 2026-11-23 移到后台计算线程。）
   if (request.method === 'POST' && url.pathname === '/api/results/read') {
     try {
       const data = await body(request)
@@ -4731,28 +4799,22 @@ async function api(request, response, url) {
       const extension = extname(path).toLowerCase()
       const band = Math.max(0, Math.floor(Number(data.band) || 0))
       if (extension === '.hdr') {
-        return sendCachedResult(request, response, [path, path.slice(0, -extension.length) + '.img'], `envi:${band}`, () => readEnvi(path, band))
+        return await sendCachedResult(request, response, [path, path.slice(0, -extension.length) + '.img'], `envi:${band}`, { kind: 'envi', path, band })
       }
       if (extension === '.tif' || extension === '.tiff') {
         const wind = /^fluid_wind_/i.test(basename(path))
-        return sendCachedResult(request, response, [path], wind ? 'wind' : `tiff:${band}`, () => wind ? readWindTiff(path) : readTiff(path, band))
+        return await sendCachedResult(request, response, [path], wind ? 'wind' : `tiff:${band}`, { kind: wind ? 'wind' : 'tiff', path, band })
       }
       if (extension === '.json' && isRadiosityResultFile(path)) {
-        return sendCachedResult(request, response, [path], 'facet', () => {
-          const result = sampleRadiosityResult(path)
-          return { ...result, path: windowsPath(result.path) }
-        })
+        return await sendCachedResult(request, response, [path], 'facet', { kind: 'facet', path, band })
       }
       const processMetadata = extension === '.json' ? processResultMetadata(path) : null
       if (processMetadata) {
-        return sendCachedResult(request, response, processResultDependencies(path, processMetadata), 'process', () => {
-          const result = readProcessResult(path)
-          return { ...result, path: windowsPath(result.path) }
-        })
+        return await sendCachedResult(request, response, processResultDependencies(path, processMetadata), 'process', { kind: 'process', path, band })
       }
       if (resultImageMime[extension]) {
         if (statSync(path).size > 32 * 1024 * 1024) throw new Error('图像结果超过 32MB，请在资源管理器中打开')
-        return json(response, 200, { kind: 'image', path: windowsPath(path), mimeType: resultImageMime[extension], data: readFileSync(path).toString('base64') })
+        return json(response, 200, toJsonBytes(await heavyTasks.run('result-image', { path, mimeType: resultImageMime[extension] })))
       }
       if (['.txt', '.csv', '.dat', '.log', '.json'].includes(extension)) {
         if (statSync(path).size > 4 * 1024 * 1024) throw new Error('文本结果超过 4MB，请在外部程序中打开')
@@ -4774,7 +4836,8 @@ async function api(request, response, url) {
         if (!existsSync(path) || !statSync(path).isFile()) throw new Error(`找不到模拟结果：${path}`)
         if (!['.tif', '.tiff'].includes(extname(path).toLowerCase())) throw new Error('变化分析目前仅支持 TIFF 图像')
       }
-      return json(response, 200, compareTiffResults(firstPath, secondPath, data.band, data.maxScatterPoints))
+      return json(response, 200, toJsonBytes(await heavyTasks.run('results-change',
+        { firstPath, secondPath, band: data.band, maxScatterPoints: data.maxScatterPoints }, { key: firstPath })))
     } catch (error) {
       return json(response, 400, { error: error.message })
     }
@@ -4790,6 +4853,96 @@ async function api(request, response, url) {
     return json(response, 200, { ok: true, path: windowsPath(path) })
   }
   return false
+}
+
+// ---------- 后台计算任务（在线程池/一次性线程中执行；线程不可用时在服务线程内同步执行） ----------
+function jsonPayload(value) {
+  return { bytes: Buffer.from(JSON.stringify(value), 'utf8') }
+}
+
+function toJsonBytes(value) {
+  return new JsonBytes(receivedBytes(value?.bytes))
+}
+
+let workerRasterTools = null
+const rasterTools = () => (workerRasterTools ||= createRasterTools({ readTiff, normalizeHostPath, windowsPath }))
+
+const HEAVY_TASKS = {
+  'parse-json': ({ bytes }) => JSON.parse(receivedBytes(bytes).toString('utf8') || '{}'),
+  'result-read': ({ kind, path, band, binary }) => encodeResultPayload(produceResult(kind, path, band), binary),
+  'result-image': ({ path, mimeType }) => jsonPayload({ kind: 'image', path: windowsPath(path), mimeType, data: readFileSync(path).toString('base64') }),
+  'results-change': ({ firstPath, secondPath, band, maxScatterPoints }) => jsonPayload(compareTiffResults(firstPath, secondPath, band, maxScatterPoints)),
+  'project-read': ({ path }) => jsonPayload({ path: windowsPath(path), content: readFileSync(path, 'utf8') }),
+  'dem-info': ({ path, extension }) => jsonPayload({ path: windowsPath(path), metadata: inspectDemFile(path, extension) }),
+  'dem-inspect': ({ path, extension }) => inspectDemFile(path, extension),
+  'tarp-cover': ({ target, outputPath, lift, drape }) => {
+    const cover = generateTarpCover(readFileSync(target, 'utf8'), { lift, drape })
+    mkdirSync(dirname(outputPath), { recursive: true })
+    writeFileSync(outputPath, cover.obj, 'utf8')
+    const { obj, ...summary } = cover
+    return summary
+  },
+  'facet-tiff': ({ jsonPath, inputPath, mode }) => writeRadiosityTiff(jsonPath, inputPath, mode),
+  'envi-convert': ({ directory, mode }) => convertEnviResults(directory, mode),
+  'stream-raster': ({ path, band }) => jsonPayload(rasterTools().rasterBand(path, band)),
+  'stream-class-stats': ({ outputDir, typeFile, typeBand }) => jsonPayload(rasterTools().classStatistics(outputDir, typeFile, typeBand)),
+  'run-preflight': ({ input, project, mode }) => jsonPayload(runPreflight(input, project, mode)),
+  'results-list': ({ path }) => jsonPayload(listResults(path)),
+  'runtime-scene': ({ input, project, baseDir }) => {
+    const { cleanup, ...prepared } = prepareRuntimeSceneProject(input, project, {
+      resolveAssetPath: (value) => projectAssetPath(value, baseDir),
+      terrainHeight: demHeightSampler(project.configuration, baseDir)
+    })
+    return prepared
+  },
+  'facet-scale': ({ project, inputDirectory, mode }) => ({
+    estimate: assertFacetScale(project, inputDirectory, mode),
+    pixelNote: facetPixelRatioNote(project, inputDirectory)
+  }),
+  'usd-export': ({ path, project }) => exportProjectUsdFiles(path, project),
+  'import-obj': ({ projectDir: directory, sourceName, extension, content: source }) => {
+    const content = sanitizeObjContent(source)
+    if (!content.trim()) throw new Error('OBJ 文件为空')
+    if (Buffer.byteLength(content, 'utf8') > 80 * 1024 * 1024) throw new Error('OBJ 文件超过 80MB，请使用简化模型')
+    const modelsDir = join(directory, 'models')
+    mkdirSync(modelsDir, { recursive: true })
+    const stem = sourceName.slice(0, -extension.length).replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '') || 'object'
+    let name = `${stem}${extension}`
+    for (let suffix = 2; existsSync(join(modelsDir, name)); suffix += 1) name = `${stem}_${suffix}${extension}`
+    const path = join(modelsDir, name)
+    const positionsDir = join(directory, 'positions')
+    mkdirSync(positionsDir, { recursive: true })
+    const positionPath = join(positionsDir, `${name.slice(0, -4)}_position.txt`)
+    writeFileSync(path, content, 'utf8')
+    if (!existsSync(positionPath)) writeFileSync(positionPath, '0 0 0 1 0\n', 'utf8')
+    return { path: windowsPath(path), name, positionPath: windowsPath(positionPath), relativePath: join('models', name).replaceAll('\\', '/') }
+  }
+}
+
+// 运行暂存目录由后台线程写出；cleanup 删除其中文件与目录本身（与 prepareRuntimeSceneProject 的 cleanup 相同）。
+async function prepareRuntimeSceneInWorker(input, project, baseDir) {
+  const prepared = await heavyTasks.run('runtime-scene', { input, project, baseDir }, { key: input })
+  const runtimeDirectory = dirname(prepared.inputPath)
+  const cleanup = () => {
+    if (!basename(runtimeDirectory).startsWith('.histream-runtime-')) return
+    try {
+      for (const entry of readdirSync(runtimeDirectory, { withFileTypes: true })) {
+        if (entry.isFile()) { try { unlinkSync(join(runtimeDirectory, entry.name)) } catch {} }
+      }
+    } catch {}
+    try { if (existsSync(runtimeDirectory)) rmdirSync(runtimeDirectory) } catch {}
+  }
+  return { ...prepared, cleanup }
+}
+
+// project.usd 导出（首次需整读并解析每个 OBJ）；同一工程目录固定到同一线程，保证先后保存按顺序写出。
+function exportProjectUsdInWorker(path, project) {
+  return heavyTasks.run('usd-export', { path, project }, { key: dirname(path) })
+}
+
+function runHeavyTaskInline(task, args) {
+  if (!Object.hasOwn(HEAVY_TASKS, task)) throw new Error(`未知的后台任务：${task}`)
+  return HEAVY_TASKS[task](args || {})
 }
 
 const server = createServer(async (request, response) => {
@@ -4846,12 +4999,21 @@ else if (workerData?.kind === 'facet-step-service') {
     }
   })
 }
+else if (workerData?.kind === 'task-service') {
+  resultCache.limit = Math.max(0, Number(workerData.cacheBytes) || 0)
+  serveTasks(parentPort, HEAVY_TASKS, { onClear: () => resultCache.clear() })
+}
+else if (workerData?.kind === 'task-once') {
+  resultCache.limit = 0
+  void serveTaskOnce(parentPort, HEAVY_TASKS, workerData)
+}
 
 export { server, stopEngines }
 
 function stopEngines() {
   if (child?.facetWorker) void child.facetWorker.terminate()
-  if (child) {
+  heavyTasks.terminate()
+  if (child && !child.histreamFinished) {
     child.histreamStopped = true
     if (process.platform === 'win32') {
       try { spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }) } catch { child.kill('SIGTERM') }
