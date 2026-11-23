@@ -2,7 +2,7 @@
 
 Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两个相互独立的引擎：STREAM 影像级引擎（`stream.exe`）和 STREAM 的高分辨率三维扩展 HiStream（`histream.exe`）。源码、编译结果和运行文件均集中在本项目目录。
 
-当前版本 **2.0.1**，发布内容与验证范围见 [2.0.1 发布说明](docs/release-2.0.1.md)。开发版尚未发布的变更（含 2026-11-16 场景动画剥离到 STREAM IMAGING、HiStream 通用扩展接口）见 [下一版本更新说明（草稿）](docs/release-next-draft.md)。
+当前版本 **2.0.1**，发布内容与验证范围见 [2.0.1 发布说明](docs/release-2.0.1.md)。开发版尚未发布的变更（含 HiStream 通用扩展接口）见 [下一版本更新说明（草稿）](docs/release-next-draft.md)。
 
 下载：[Windows 安装程序、手册与案例包](https://github.com/bianzj/streamstudio/releases/tag/v2.0.1)。
 
@@ -19,7 +19,6 @@ Stream Studio 是 STREAM 系列模型的统一桌面与 Web 平台，集成两�
 | 研究案例与导航 | D:/cases/streamstudio；原 D:/examples 已于 2026-11-04 并入发布目录 |
 | 新增研究案例：玉米、雨林、城市街区、延庆山地、光伏草场 | [在线图文案例库](docs/cases/README.md)；含图文报告；001–004附工程输入，005为宣传材料 |
 | 测试脚本和验收摘要 | tools/check-user-release-cases.mjs、[本次验收范围](docs/testing/user-release-cases-20261101.md) |
-| 场景动画（撞击、火球、机场全天等研究功能） | 2026-11-16 已剥离到 STREAM IMAGING（`C:/work/streamimaging`：工具链 `animation/`、引擎扩展 `engine/scene-animation`）；本仓库只保留 HiStream 通用扩展接口（`models/histream/src/base/extension.h`、CMake `HISTREAM_EXTENSION_DIRS`），产品引擎不含该模式 |
 
 随附四例为 MODIS-ERA5、Landsat-ERA5、MODIS-LSCT、Landsat-LSCT；默认 4×4 区域已通过影像引擎检查。请先将案例文件夹复制到全英文可写路径，再在软件中打开 project.json；当前 ERA5 读取不能保证支持中文路径。LSCT 条目读取已有组分温度用于正向模拟，不做温度反演。
 

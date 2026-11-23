@@ -28,7 +28,7 @@ D:/releases/streamstudio/2.0.1 将安装器、用户手册和随附案例放在�
 
 ## 项目内部
 
-assets/examples 提供五个精选内置案例：玉米、森林、城市、MODIS 能量平衡、Landsat 能量平衡。唯一内置索引为 assets/examples/catalog.json，条目都以 `project` 指向工程文件；玉米曲面光伏技术演示已撤下。原场景动画研究示例 `impact_v1_building` 已随场景动画于 2026-11-16 移到 STREAM IMAGING（`C:/work/streamimaging/animation/examples`），catalog.json 不再支持 `eSceneAnimation` 条目。
+assets/examples 提供五个精选内置案例：玉米、森林、城市、MODIS 能量平衡、Landsat 能量平衡。唯一内置索引为 assets/examples/catalog.json，条目都以 `project` 指向工程文件；玉米曲面光伏技术演示已撤下。
 
 ## 研究与维护
 

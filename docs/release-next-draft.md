@@ -4,15 +4,7 @@
 
 ## 变更内容
 
-**场景动画剥离到 STREAM IMAGING（2026-11-16）。** 场景动画研究功能（HiStream `eSceneAnimation`：撞击 impact-v1、火球/烟尘输运、刚体碎片、相机观测、耦合小镇与机场全天等）不再属于 Stream Studio，整体迁到 `C:/work/streamimaging`：
-
-- 引擎代码（`models/histream/src/animation`、`shader/animation`、`cmake/scene-animation.cmake`、C++ 夹具）改为 STREAM IMAGING 的 HiStream 外挂扩展 `engine/scene-animation`，由其 `scripts/build-animation-engine.ps1` 编进本仓库的 HiStream 核心，输出到 STREAM IMAGING 自己的构建目录，不覆盖 `models/bin_x64`。
-- 工具链 `tools/scene-animation`、示例 `assets/examples/impact_v1_building`、开发文档与研究计划、用户手册第 18 章与理论手册第 17 章随之迁出。
-- 已隐藏的桌面面板、`/api/scene-animation/*` 服务、schema 中的场景动画导出、示例目录的 `eSceneAnimation` 条目、相关翻译和桌面设置键均已删除；代码存档在 STREAM IMAGING 的 `animation/studio-panel/`。
-
-**HiStream 通用扩展接口。** 核心不再知道任何具体扩展：`src/base/extension.h` 提供模式注册表，CMake 选项 `HISTREAM_EXTENSION_DIRS` 列出外部扩展目录（各含 `histream-extension.cmake`），配置时生成注册函数。产品构建不带扩展，`histream.exe eSceneAnimation …` 返回用法提示（退出码 64；2026-11-20 起用法错误与 FacetEB 未收敛的退出码 2 分开）。`HISTREAM_ENABLE_SCENE_ANIMATION` 选项已删除。
-
-**之前的草稿内容**（场景动画面板、impact-v1、渲染提速选项、内置示例）随功能迁出，原文存档在 STREAM IMAGING `docs/scene-animation/history/streamstudio-release-draft-20261112.md`。
+**HiStream 通用扩展接口。** 核心不再知道任何具体扩展：`src/base/extension.h` 提供模式注册表，CMake 选项 `HISTREAM_EXTENSION_DIRS` 列出外部扩展目录（各含 `histream-extension.cmake`），配置时生成注册函数。产品构建不带扩展；未注册的外部模式返回用法提示（退出码 64；2026-11-20 起用法错误与 FacetEB 未收敛的退出码 2 分开）。
 
 ### 模型修正（2026-11-20）
 
@@ -104,8 +96,8 @@
 
 ## 兼容性
 
-- `tools/build-engine.ps1` 构建的产品引擎只含核心（显式清空 `HISTREAM_EXTENSION_DIRS`），不再含场景动画与 Bullet 碰撞模块，也不再需要本地 Bullet 源码；三维 RT/EB 与 STREAM 遥感工作流的代码路径不变。
-- 耦合小镇和机场全天所用的 FacetEB 集中参数热节点（`facetrt/lumpedthermal.h` 等）属于核心，保留；其解析夹具从 `tools/scene-animation/tests/lumped_thermal_fixture.cpp` 移为 `tools/test-facet-lumped-thermal.cpp`（目标 `histream_lumped_thermal_tests`）。
+- `tools/build-engine.ps1` 构建的产品引擎只含核心（显式清空 `HISTREAM_EXTENSION_DIRS`），不再含外部扩展与 Bullet 碰撞模块，也不再需要本地 Bullet 源码；三维 RT/EB 与 STREAM 遥感工作流的代码路径不变。
+- 耦合小镇和机场全天所用的 FacetEB 集中参数热节点（`facetrt/lumpedthermal.h` 等）属于核心，保留；其解析夹具为 `tools/test-facet-lumped-thermal.cpp`（目标 `histream_lumped_thermal_tests`）。
 - 三维工程 `schemaVersion = 6`、遥感工程 `schemaVersion = 2` 不变。STREAM IMAGING 运行时仍从本仓库导入 `project-schema.js` 和 `tools/runtime-scene.mjs`。
 - HiStream 退出码：64 为命令行用法错误（含不带工程路径运行，原先静默跑内置示例；内置示例须显式 `--builtin-example`），2 只表示 FacetEB 计算结束但有未收敛节点；1/3/4 为运行、资源创建、初始化失败。按旧退出码 2 判断用法错误的脚本需修改。
 - `voxelrt.json` 过程字段：2.5–5 µm 波段由 `illumination_<波长>` 改名为 `spectral_radiance_<波长>`（与 > 5 µm 波段一致，按 Planck 辐亮度计），读取这些字段的脚本需改名；`radiosity_<波长>` 别名不变。2.5–6 µm 波段的 `spectral_radiance_<波长>`（环境场）自 MWIR 太阳反射修正起含太阳直射与天空散射的贡献（白天变大，夜间与 > 6 µm 不变），字段名不变。
@@ -151,9 +143,8 @@
 
 ## 已做的检查（2026-11-16）
 
-- 产品引擎重建通过；`eSceneAnimation` 被拒绝（退出码 2）、`--list-devices` 正常；`histream_lumped_thermal_tests` 9 项通过；核心 eFacetEB 集中参数场景（`test_lumped_scene.py`）6 项通过。
-- STREAM IMAGING 动画引擎（核心 + 扩展）构建通过；impact-v1 公式夹具 157/157；`test_animation.py`、`test_mesh.py`、`test_sensor.py` 与统一入口最小网格样例在 GPU 上通过。
-- 界面重建（`npm run build`）通过；新服务示例列表为 5 个精选案例，`/api/scene-animation/*` 返回 404，“解决方案”菜单只含三维与解析两组。
+- 产品引擎重建通过；`--list-devices` 正常；`histream_lumped_thermal_tests` 9 项通过；核心 eFacetEB 集中参数场景（`test_lumped_scene.py`）6 项通过。
+- 界面重建（`npm run build`）通过；新服务示例列表为 5 个精选案例，“解决方案”菜单只含三维与解析两组。
 
 ## 发布前仍需
 
