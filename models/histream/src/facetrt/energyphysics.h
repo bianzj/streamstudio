@@ -106,40 +106,87 @@ inline SoilResponse soilResponse(const SoilProfile& previous, double bottomTempe
     return response;
 }
 
-// Building wall/roof slab (FacetEB material wallMode "wall"): one homogeneous
-// layer of the given thickness in cell-centred finite volumes refined towards
-// both faces. The outer face carries the solved surface temperature; the inner
-// face exchanges with the indoor air (combined convection + radiation h_in)
-// through the half-cell conduction: q_in = (T_last - T_in) / (w/2k + 1/h_in).
+// Building wall/roof construction (FacetEB material wallMode "wall"): up to
+// maxWallLayers layers from the outer to the inner face. Every layer is split
+// into the same cell-centred finite volumes refined towards both of its faces.
+// The outer face carries the solved surface temperature; the inner face
+// exchanges with the indoor air (combined convection + radiation h_in) through
+// the half-cell conduction: q_in = (T_last - T_in) / (w/2k + 1/h_in). Two
+// cells of one layer are coupled by k / ((w_a + w_b)/2); cells on either side
+// of a layer interface by the series resistance w_a/2k_a + w_b/2k_b (the
+// width-weighted harmonic mean). One layer is the original homogeneous slab,
+// operation for operation.
 inline constexpr std::array<double, 11> wallEdgeFractions{0, .025, .07, .15, .3, .5, .7, .85, .93, .975, 1};
-inline constexpr size_t wallLayers = wallEdgeFractions.size() - 1;
-using WallProfile = std::array<double, wallLayers>;
+inline constexpr size_t wallCellsPerLayer = wallEdgeFractions.size() - 1;
+inline constexpr size_t maxWallLayers = 6;
+inline constexpr size_t maxWallCells = wallCellsPerLayer * maxWallLayers;
+using WallProfile = std::array<double, maxWallCells>;
+struct WallLayer {
+    double thickness{.2}, conductivity{1.4}, volumetricCapacity{2.024e6};
+};
 struct WallSlab {
-    double thickness{.2}, conductivity{1.4}, volumetricCapacity{2.024e6}, indoorK{295.15}, indoorCoefficient{8};
+    std::array<WallLayer, maxWallLayers> layers{};
+    size_t layerCount{1};
+    double indoorK{295.15}, indoorCoefficient{8};
     void validate() const {
-        if (!(thickness > 0 && thickness <= 5 && conductivity > 0 && volumetricCapacity > 0 &&
-              indoorCoefficient > 0 && indoorK > 200 && indoorK < 400) ||
-            !std::isfinite(thickness + conductivity + volumetricCapacity + indoorK + indoorCoefficient))
-            throw std::runtime_error("Invalid FacetEB wall parameters (thickness, lambdas, rhos, cs, indoor)");
+        double total = 0;
+        bool valid = layerCount >= 1 && layerCount <= maxWallLayers && indoorCoefficient > 0 &&
+                     indoorK > 200 && indoorK < 400 && std::isfinite(indoorK + indoorCoefficient);
+        for (size_t l = 0; valid && l < layerCount; ++l) {
+            const auto& layer = layers[l];
+            valid = layer.thickness > 0 && layer.thickness <= 5 && layer.conductivity > 0 &&
+                    layer.volumetricCapacity > 0 &&
+                    std::isfinite(layer.thickness + layer.conductivity + layer.volumetricCapacity);
+            total += layer.thickness;
+        }
+        if (!valid || !(total <= 5))
+            throw std::runtime_error("Invalid FacetEB wall parameters (layers/thickness, lambdas, rhos, cs, indoor)");
     }
-    double width(size_t i) const { return thickness * (wallEdgeFractions[i + 1] - wallEdgeFractions[i]); }
+    size_t cells() const { return layerCount * wallCellsPerLayer; }
+    const WallLayer& layerOf(size_t i) const { return layers[i / wallCellsPerLayer]; }
+    double thickness() const {
+        double sum = 0;
+        for (size_t l = 0; l < layerCount; ++l) sum += layers[l].thickness;
+        return sum;
+    }
+    double width(size_t i) const {
+        const size_t j = i % wallCellsPerLayer;
+        return layerOf(i).thickness * (wallEdgeFractions[j + 1] - wallEdgeFractions[j]);
+    }
+    double conductivity(size_t i) const { return layerOf(i).conductivity; }
+    double capacity(size_t i) const { return layerOf(i).volumetricCapacity; }
+    // Conductance between cells i - 1 and i (0 < i < cells()).
+    double innerConductance(size_t i) const {
+        if (i % wallCellsPerLayer) return conductivity(i) / (.5 * (width(i) + width(i - 1)));
+        return 1.0 / (.5 * width(i - 1) / conductivity(i - 1) + .5 * width(i) / conductivity(i));
+    }
+    // Conductance between the outer surface and the first cell centre.
+    double surfaceConductance() const { return conductivity(0) / (.5 * width(0)); }
     double indoorConductance() const {
-        return 1.0 / (.5 * width(wallLayers - 1) / conductivity + 1.0 / indoorCoefficient);
+        const size_t last = cells() - 1;
+        return 1.0 / (.5 * width(last) / conductivity(last) + 1.0 / indoorCoefficient);
     }
-    double indoorFlux(const WallProfile& p) const { return indoorConductance() * (p.back() - indoorK); }
+    double indoorFlux(const WallProfile& p) const { return indoorConductance() * (p[cells() - 1] - indoorK); }
     double innerSurfaceK(const WallProfile& p) const { return indoorK + indoorFlux(p) / indoorCoefficient; }
     double heat(const WallProfile& p) const {
         double sum = 0;
-        for (size_t i = 0; i < wallLayers; ++i) sum += volumetricCapacity * width(i) * p[i];
+        for (size_t i = 0; i < cells(); ++i) sum += capacity(i) * width(i) * p[i];
         return sum;
     }
-    // Steady conduction between the surface and the indoor air.
+    // Steady conduction between the surface and the indoor air (series
+    // resistances of the layers and 1/h_in).
     WallProfile steadyProfile(double surfaceK) const {
-        const double total = thickness / conductivity + 1.0 / indoorCoefficient;
+        double resistance = 0;
+        for (size_t l = 0; l < layerCount; ++l) resistance += layers[l].thickness / layers[l].conductivity;
+        const double total = resistance + 1.0 / indoorCoefficient;
         WallProfile p{};
-        for (size_t i = 0; i < wallLayers; ++i) {
-            const double depth = thickness * .5 * (wallEdgeFractions[i] + wallEdgeFractions[i + 1]);
-            p[i] = surfaceK + (indoorK - surfaceK) * (depth / conductivity) / total;
+        double before = 0;
+        for (size_t i = 0; i < cells(); ++i) {
+            const size_t j = i % wallCellsPerLayer;
+            const auto& layer = layerOf(i);
+            if (i && !j) before += layers[i / wallCellsPerLayer - 1].thickness / layers[i / wallCellsPerLayer - 1].conductivity;
+            const double depth = layer.thickness * .5 * (wallEdgeFractions[j] + wallEdgeFractions[j + 1]);
+            p[i] = surfaceK + (indoorK - surfaceK) * (before + depth / layer.conductivity) / total;
         }
         return p;
     }
@@ -147,11 +194,12 @@ struct WallSlab {
 struct WallResponse {
     WallProfile offset{}, slope{}; // T_i(new) = offset_i + slope_i * T_surface(new)
     double conductance{};
+    size_t cells{};
     double fluxSlope() const { return conductance * (1 - slope[0]); }
     double flux(double surface) const { return conductance * ((1 - slope[0]) * surface - offset[0]); }
     WallProfile profile(double surface) const {
         WallProfile result{};
-        for (size_t i = 0; i < wallLayers; ++i) result[i] = offset[i] + slope[i] * surface;
+        for (size_t i = 0; i < cells; ++i) result[i] = offset[i] + slope[i] * surface;
         return result;
     }
 };
@@ -159,17 +207,17 @@ struct WallResponse {
 inline WallResponse wallResponse(const WallProfile& previous, const WallSlab& slab, double dt) {
     slab.validate();
     if (!(dt > 0)) throw std::runtime_error("Invalid FacetEB wall time step");
+    const size_t n = slab.cells();
     WallProfile upper{}, diagonal{}, rhs{}, boundary{};
-    for (size_t i = 0; i < wallLayers; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(previous[i])) throw std::runtime_error("Nonfinite wall profile");
         const double width = slab.width(i);
-        const double up = slab.conductivity / (i ? .5 * (width + slab.width(i - 1)) : .5 * width);
-        const double down = i + 1 < wallLayers ? slab.conductivity / (.5 * (width + slab.width(i + 1)))
-                                               : slab.indoorConductance();
-        const double storage = slab.volumetricCapacity * width / dt;
+        const double up = i ? slab.innerConductance(i) : slab.surfaceConductance();
+        const double down = i + 1 < n ? slab.innerConductance(i + 1) : slab.indoorConductance();
+        const double storage = slab.capacity(i) * width / dt;
         diagonal[i] = storage + up + down;
-        upper[i] = i + 1 < wallLayers ? -down : 0;
-        rhs[i] = storage * previous[i] + (i + 1 == wallLayers ? down * slab.indoorK : 0);
+        upper[i] = i + 1 < n ? -down : 0;
+        rhs[i] = storage * previous[i] + (i + 1 == n ? down * slab.indoorK : 0);
         boundary[i] = i == 0 ? up : 0;
         if (i) {
             const double factor = -up / diagonal[i - 1];
@@ -179,10 +227,11 @@ inline WallResponse wallResponse(const WallProfile& previous, const WallSlab& sl
         }
     }
     WallResponse response;
-    response.conductance = slab.conductivity / (.5 * slab.width(0));
-    for (size_t i = wallLayers; i-- > 0;) {
-        response.offset[i] = (rhs[i] - (i + 1 < wallLayers ? upper[i] * response.offset[i + 1] : 0)) / diagonal[i];
-        response.slope[i] = (boundary[i] - (i + 1 < wallLayers ? upper[i] * response.slope[i + 1] : 0)) / diagonal[i];
+    response.cells = n;
+    response.conductance = slab.surfaceConductance();
+    for (size_t i = n; i-- > 0;) {
+        response.offset[i] = (rhs[i] - (i + 1 < n ? upper[i] * response.offset[i + 1] : 0)) / diagonal[i];
+        response.slope[i] = (boundary[i] - (i + 1 < n ? upper[i] * response.slope[i + 1] : 0)) / diagonal[i];
     }
     return response;
 }

@@ -50,6 +50,12 @@ const URBAN_WATER = {
 // on the world cells it fills, so ground cells enclosed by walls and roofs
 // receive no direct sun (sunlit_fraction 0, as without rotation).
 const URBAN_ROTATED = (angle) => ({ 'positions/urban_block_buildings_position.txt': [[150, 150, 0, 1, angle]] })
+// Default layered constructions of new projects (outer to inner; see
+// project-schema.js building_surface / building_roof).
+const WALL_LAYERS = [{ thickness: 0.1, lambda: 1.74, rho: 2500, cp: 920 }, { thickness: 0.08, lambda: 0.04, rho: 20, cp: 1380 },
+  { thickness: 0.02, lambda: 0.87, rho: 1700, cp: 1050 }]
+const ROOF_LAYERS = [{ thickness: 0.05, lambda: 1.51, rho: 2300, cp: 920 }, { thickness: 0.1, lambda: 0.03, rho: 35, cp: 1380 },
+  { thickness: 0.15, lambda: 1.74, rho: 2500, cp: 920 }]
 
 export const CASES = {
   vrt_urban: { example: 'urban_block', mode: 'eVoxelRT' },
@@ -128,6 +134,19 @@ export const CASES = {
   // with a 22 C interior (wallMode "wall"); feb_urban_shadow is the thin shell.
   feb_urban_shadow_wall: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], set: {
     'configuration.materials.5.params.wallMode': 'wall', 'configuration.materials.5.params.thickness': 0.2 } },
+  // New-project defaults (project-schema createMaterialPresets): water_set with
+  // a 2 m mixed layer starting at the mean air temperature of the first 24 h,
+  // and the buildings as the layered insulated wall (wall mesh, building_surface)
+  // and roof (roof mesh, building_roof). For diurnal ranges run them over two
+  // days: REGRESSION_SET='configuration.meteo.start=0;configuration.meteo.end=96'.
+  feb_urban_water_newdefault: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], ...URBAN_WATER, set: {
+    'configuration.materials.8.params.mixingDepth': 2, 'configuration.materials.8.params.initialTemperatureMode': 'dailyMeanAir' } },
+  feb_urban_wall_layered: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], set: {
+    'configuration.materials.5.params.wallMode': 'wall', 'configuration.materials.5.params.layers': WALL_LAYERS,
+    'configuration.materials.9': { name: 'building_roof', label: '建筑屋顶', type: 'Building', params: {
+      method: 2, rss: 1000000000, cs: 880, rhos: 2300, lambdas: 1.4, Tsoil: 25, SMC: 0, Satwater: 0, wallMode: 'wall',
+      thickness: 0.3, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, layers: ROOF_LAYERS } },
+    'configuration.objects.items.0.meshes.1.materialName': 'building_roof' } },
   // Mid-wave infrared in FacetRT/FacetEB (facetRtThermalSolar and the FacetEB
   // state spectra): 3.8 um warms by about rho*E*cos/pi by day, 10.5 um and
   // night nodes stay unchanged.

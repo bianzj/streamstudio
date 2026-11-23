@@ -205,6 +205,9 @@ function parseMaterialNode(node) {
       refractiveIndex: Number(xmlValue(node, 'refractiveIndex', 1.333)), slopeVariance: Number(xmlValue(node, 'slopeVariance', 0)),
       diffuseFraction: Number(xmlValue(node, 'diffuseFraction', 0.02))
     }
+    const waterInitial = xmlValue(node, 'waterInitialMode', '')
+    if (waterInitial === 'dailyMeanAir' || waterInitial === 'fixed') params.initialTemperatureMode = waterInitial
+    if (waterInitial === 'fixed') params.initialTemperature = Number(xmlValue(node, 'waterInitialTemperature', 20))
   } else {
     params = {
       method: Number(xmlValue(node, 'method', 2)), rss: Number(xmlValue(node, 'rss', 2000)),
@@ -217,6 +220,7 @@ function parseMaterialNode(node) {
       indoorTemperature: Number(xmlValue(node, 'indoorTemperature', 22)),
       indoorHeatTransferCoefficient: Number(xmlValue(node, 'indoorHeatTransferCoefficient', 8))
     })
+    if (params.wallMode === 'wall' && xmlValue(node, 'wallLayers', '').trim()) params.layers = parseWallLayers(xmlValue(node, 'wallLayers', ''))
   }
   return { name: node.getAttribute('name') || 'material', type, params }
 }
@@ -2209,9 +2213,9 @@ function physicalValues(item) {
   if (item.energyModel === 'wood') return [['模型', '木质固体'], ['比热容', p.cs], ['密度', p.rhos], ['导热率', p.lambdas], ['对流倍率', p.convectiveScale], ['初温', `${p.Tsoil} ℃`], ['蒸腾', '关闭']]
   if (item.energyModel === 'membrane') return [['模型', '双面薄膜'], ['面热容', p.heatCapacityPerArea], ['对流倍率', p.convectiveScale], ['蒸腾', '关闭']]
   if (item.type === 'Vegetation') return [['Vcmax', p.Vcmax], ['BallBerry', p.BallBerry], ['kV', p.kV], ['Rd', p.Rdparam], ['Tyear', p.Tyear], ['胁迫', p.stressfactor]]
-  if (item.type === 'Water') return [['辐射模型', Number(p.brdfModel) === 1 ? 'Cox–Munk' : 'Lambert'], ['折射率', p.refractiveIndex], ['坡度方差', Number(p.slopeVariance) > 0 ? p.slopeVariance : '随风速'], ['漫反射比例', p.diffuseFraction], ['rss', p.rss], ['热容', p.heatCapacity], ['混合深度', p.mixingDepth], ['蒸发系数', p.evaporationCoefficient]]
+  if (item.type === 'Water') return [['辐射模型', Number(p.brdfModel) === 1 ? 'Cox–Munk' : 'Lambert'], ['折射率', p.refractiveIndex], ['坡度方差', Number(p.slopeVariance) > 0 ? p.slopeVariance : '随风速'], ['漫反射比例', p.diffuseFraction], ['rss', p.rss], ['热容', p.heatCapacity], ['混合深度', p.mixingDepth], ['蒸发系数', p.evaporationCoefficient], ['初始水温', p.initialTemperatureMode === 'dailyMeanAir' ? '首日平均气温' : p.initialTemperatureMode === 'fixed' ? `${p.initialTemperature ?? 20} ℃` : '首节点气温']]
   return [['rss', p.rss], ['热容', p.cs], ['密度', p.rhos], ['导热率', p.lambdas], ['SMC', p.SMC], ['饱和量', p.Satwater],
-    ...(p.wallMode === 'wall' ? [['墙体模式', `墙体 ${p.thickness ?? 0.2} m，室内 ${p.indoorTemperature ?? 22} ℃，h=${p.indoorHeatTransferCoefficient ?? 8}`]] : [])]
+    ...(p.wallMode === 'wall' ? [['墙体模式', `${Array.isArray(p.layers) && p.layers.length ? `${p.layers.length} 层构造 ${p.layers.reduce((sum, layer) => sum + Number(layer.thickness || 0), 0).toFixed(3)} m` : `墙体 ${p.thickness ?? 0.2} m`}，室内 ${p.indoorTemperature ?? 22} ℃，h=${p.indoorHeatTransferCoefficient ?? 8}`]] : [])]
 }
 
 // Mirrors withLeafAngles in models/histream/src/base/compo.cpp: how VoxelRT /
@@ -3606,7 +3610,26 @@ function physicalInput(label, name, value, step = 'any') {
 // FacetEB building wall/roof mode for solid (Building/Soil/Ship) materials on scene objects.
 function wallModeFields(defaults = {}) {
   const wall = defaults.wallMode === 'wall'
-  return `<label class="dialog-field"><span>墙体模式（FacetEB 对象面元）</span><select class="select" name="wallMode"><option value="shell" ${wall ? '' : 'selected'}>薄壳（两面室外，旧算法）</option><option value="wall" ${wall ? 'selected' : ''}>墙体/屋顶（厚度导热 + 恒温室内）</option></select></label>${physicalInput('墙体厚度（m）', 'wallThickness', defaults.thickness ?? 0.2, 0.01)}${physicalInput('室内温度（℃）', 'indoorTemperature', defaults.indoorTemperature ?? 22, 0.1)}${physicalInput('室内换热系数（W·m⁻²·K⁻¹）', 'indoorHeatTransferCoefficient', defaults.indoorHeatTransferCoefficient ?? 8, 0.1)}`
+  return `<label class="dialog-field"><span>墙体模式（FacetEB 对象面元）</span><select class="select" name="wallMode"><option value="shell" ${wall ? '' : 'selected'}>薄壳（两面室外，旧算法）</option><option value="wall" ${wall ? 'selected' : ''}>墙体/屋顶（厚度导热 + 恒温室内）</option></select></label>${physicalInput('墙体厚度（m，无构造层时使用）', 'wallThickness', defaults.thickness ?? 0.2, 0.01)}${physicalInput('室内温度（℃）', 'indoorTemperature', defaults.indoorTemperature ?? 22, 0.1)}${physicalInput('室内换热系数（W·m⁻²·K⁻¹）', 'indoorHeatTransferCoefficient', defaults.indoorHeatTransferCoefficient ?? 8, 0.1)}<label class="dialog-field" style="grid-column:1 / -1"><span>构造层（由外到内，每行：厚度 m, λ W·m⁻¹·K⁻¹, ρ kg·m⁻³, cp J·kg⁻¹·K⁻¹；最多 6 层；留空 = 用上面的厚度与 λ/ρ/cs 单层均质）</span><textarea class="input" name="wallLayers" rows="3">${escapeHtml(wallLayersText(defaults.layers))}</textarea></label>`
+}
+
+// FacetEB wall layers as text: one layer per line "thickness, λ, ρ, cp" (outer to inner).
+function wallLayersText(layers) {
+  return Array.isArray(layers) ? layers.map((layer) => [layer.thickness, layer.lambda, layer.rho, layer.cp].join(', ')).join('\n') : ''
+}
+
+function parseWallLayers(text) {
+  return String(text || '').split(/[\n;]+/).map((row) => row.trim()).filter(Boolean).map((row) => {
+    const [thickness, lambda, rho, cp] = row.split(/[\s,，]+/).filter(Boolean).map(Number)
+    return { thickness, lambda, rho, cp }
+  })
+}
+
+// FacetEB water start temperature (absent = first-node air temperature, the old behaviour).
+function waterInitialFields(defaults = {}) {
+  const mode = defaults.initialTemperatureMode || 'firstAir'
+  const option = (value, label) => `<option value="${value}" ${mode === value ? 'selected' : ''}>${label}</option>`
+  return `<label class="dialog-field"><span>初始水温（FacetEB）</span><select class="select" name="waterInitialMode">${option('firstAir', '首节点气温（旧行为）')}${option('dailyMeanAir', '起始 24 h 平均气温')}${option('fixed', '指定温度')}</select></label>${physicalInput('指定初始水温（℃）', 'waterInitialTemperature', defaults.initialTemperature ?? 20, 0.1)}`
 }
 
 function spectrumFileImportFields(prefix, fileName = '') {
@@ -3972,7 +3995,8 @@ function renderPhysicalParameters() {
       physicalInput('表面阻力 rss', 'waterRss', defaults.rss, 1), physicalInput('体积热容', 'waterHeatCapacity', defaults.heatCapacity, 1),
       physicalInput('混合深度', 'waterMixingDepth', defaults.mixingDepth, 0.1), physicalInput('蒸发系数', 'waterEvaporationCoefficient', defaults.evaporationCoefficient, 0.1),
       physicalInput('辐射模型（0 Lambert / 1 Cox–Munk）', 'waterBrdfModel', defaults.brdfModel, 1), physicalInput('水体折射率', 'waterRefractiveIndex', defaults.refractiveIndex, 0.001),
-      physicalInput('水面坡度方差（0 随风速）', 'waterSlopeVariance', defaults.slopeVariance, 0.001), physicalInput('漫反射比例', 'waterDiffuseFraction', defaults.diffuseFraction, 0.01)
+      physicalInput('水面坡度方差（0 随风速）', 'waterSlopeVariance', defaults.slopeVariance, 0.001), physicalInput('漫反射比例', 'waterDiffuseFraction', defaults.diffuseFraction, 0.01),
+      waterInitialFields(defaults)
     ].join('')
   } else {
     $('#physicalParameterFields').innerHTML = [
@@ -4512,6 +4536,8 @@ function physicalFromForm(values, type) {
       brdfModel: Number(values.waterBrdfModel) === 1 ? 1 : 0, refractiveIndex: Math.max(1, Number(values.waterRefractiveIndex)),
       slopeVariance: Math.max(0, Number(values.waterSlopeVariance)), diffuseFraction: Math.max(0, Math.min(1, Number(values.waterDiffuseFraction)))
     }
+    if (values.waterInitialMode === 'dailyMeanAir' || values.waterInitialMode === 'fixed') params.initialTemperatureMode = values.waterInitialMode
+    if (values.waterInitialMode === 'fixed') params.initialTemperature = Number(values.waterInitialTemperature)
   } else {
     params = {
       method: Number(values.soilMethod), rss: Number(values.soilRss), cs: Number(values.soilCs), rhos: Number(values.soilRhos),
@@ -4522,6 +4548,7 @@ function physicalFromForm(values, type) {
       indoorHeatTransferCoefficient: Number(values.indoorHeatTransferCoefficient)
     })
     else if (values.wallMode === 'shell') params.wallMode = 'shell'
+    if (values.wallMode === 'wall' && String(values.wallLayers || '').trim()) params.layers = parseWallLayers(values.wallLayers)
   }
   // FIXED 配套：过滤掉 NaN/Infinity，避免“缺失”被写成 NaN（JSON 里是 null）
   params = Object.fromEntries(Object.entries(params).filter(([, value]) => typeof value !== 'number' || Number.isFinite(value)))
@@ -4647,6 +4674,16 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
   const typeOptions = [['Building', '建筑表面'], ['Photovoltaic', '光伏板热电耦合'], ['Membrane', '篷布/织物薄膜（FacetEB）'], ['Vegetation', '植被生理生化'], ['Wood', '木质固体热平衡'], ['Soil', '土壤表面物化'], ['Water', '水体物性'], ['Ship', '船舶表面物化']].map(([value, label]) => `<option value="${value}" ${value === state.presetPhysicalType ? 'selected' : ''}>${label}</option>`).join('')
   const baseDefaults = createMaterialPresets().materials.find((entry) => state.presetPhysicalType === 'Photovoltaic' ? entry.energyModel === 'photovoltaic' : state.presetPhysicalType === 'Membrane' ? entry.energyModel === 'membrane' : state.presetPhysicalType === 'Wood' ? entry.energyModel === 'wood' : entry.type === state.presetPhysicalType && !entry.energyModel)?.params || {}
   const defaults = { ...baseDefaults, ...(item?.params || {}) }
+  // An existing material keeps its own (possibly absent) fields whose engine
+  // fallbacks differ from the new-material defaults, so editing it cannot
+  // silently switch an old wall to the layered construction or an old water
+  // body to the new mixing depth / start temperature.
+  if (item) {
+    if (!item.params?.wallMode) delete defaults.wallMode
+    if (!Array.isArray(item.params?.layers)) delete defaults.layers
+    if (!item.params?.initialTemperatureMode) delete defaults.initialTemperatureMode
+    if (state.presetPhysicalType === 'Water' && item.params?.mixingDepth === undefined) defaults.mixingDepth = 0.5
+  }
   let parameters
   if (state.presetPhysicalType === 'Membrane') {
     parameters = `${physicalInput('面热容（J·m⁻²·K⁻¹）', 'membraneHeatCapacityPerArea', defaults.heatCapacityPerArea, 10)}${physicalInput('对流换热倍率', 'membraneConvectiveScale', defaults.convectiveScale, 0.1)}<div class="notice" style="grid-column:1 / -1">单层薄板：两面共用一个温度，两面同时吸收/发射辐射并与空气对流换热，不计蒸腾。面热容 = 面密度 × 比热容，例如 PVC 涂层帆布 0.6 kg·m⁻² × 1300 ≈ 800；PE 篷布 0.15 × 1900 ≈ 300；HDPE 遮阳网（含孔）约 100–300。仅 FacetEB 使用，VoxelEB 不支持。</div>`
@@ -4663,7 +4700,7 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
       physicalInput('温度校正', 'bioTcor', defaults.Tcor, 1)
     ].join('')
   } else if (state.presetPhysicalType === 'Water') {
-    parameters = `${physicalInput('表面阻力 rss', 'waterRss', defaults.rss, 1)}${physicalInput('体积热容', 'waterHeatCapacity', defaults.heatCapacity, 1)}${physicalInput('混合深度', 'waterMixingDepth', defaults.mixingDepth, 0.1)}${physicalInput('蒸发系数', 'waterEvaporationCoefficient', defaults.evaporationCoefficient, 0.1)}${physicalInput('辐射模型（0 Lambert / 1 Cox–Munk）', 'waterBrdfModel', defaults.brdfModel, 1)}${physicalInput('水体折射率', 'waterRefractiveIndex', defaults.refractiveIndex, 0.001)}${physicalInput('水面坡度方差（0 随风速）', 'waterSlopeVariance', defaults.slopeVariance, 0.001)}${physicalInput('漫反射比例', 'waterDiffuseFraction', defaults.diffuseFraction, 0.01)}`
+    parameters = `${physicalInput('表面阻力 rss', 'waterRss', defaults.rss, 1)}${physicalInput('体积热容', 'waterHeatCapacity', defaults.heatCapacity, 1)}${physicalInput('混合深度', 'waterMixingDepth', defaults.mixingDepth, 0.1)}${physicalInput('蒸发系数', 'waterEvaporationCoefficient', defaults.evaporationCoefficient, 0.1)}${physicalInput('辐射模型（0 Lambert / 1 Cox–Munk）', 'waterBrdfModel', defaults.brdfModel, 1)}${physicalInput('水体折射率', 'waterRefractiveIndex', defaults.refractiveIndex, 0.001)}${physicalInput('水面坡度方差（0 随风速）', 'waterSlopeVariance', defaults.slopeVariance, 0.001)}${physicalInput('漫反射比例', 'waterDiffuseFraction', defaults.diffuseFraction, 0.01)}${waterInitialFields(defaults)}`
   } else if (state.presetPhysicalType === 'Wood') {
     parameters = `${physicalInput('比热容 cs（J·kg⁻¹·K⁻¹）', 'soilCs', defaults.cs, 1)}${physicalInput('密度 rhos（kg·m⁻³）', 'soilRhos', defaults.rhos, 1)}${physicalInput('导热率 λ（W·m⁻¹·K⁻¹）', 'soilLambdas', defaults.lambdas, 0.01)}${physicalInput('对流换热倍率', 'woodConvectiveScale', defaults.convectiveScale ?? 1, 0.1)}${physicalInput('初始温度（℃）', 'soilTsoil', defaults.Tsoil, 0.1)}<div class="notice">木质固体不计算光合作用和蒸腾，温度由辐射、对流、导热与热储存共同求解。</div>`
   } else {

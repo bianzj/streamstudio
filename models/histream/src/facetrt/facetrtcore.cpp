@@ -194,6 +194,10 @@ struct SurfaceParameters {
     // rho_w c_w h_mix, one face exchanges with the air, LE uses surfaceResistance.
     bool water{false};
     float evaporationCoefficient{1.0f};
+    // Water start temperature: 0 first-node air (default), 1 mean air
+    // temperature of the first 24 h from the start node, 2 waterInitialK.
+    int waterInitialMode{0};
+    float waterInitialK{293.15f};
     // Building wall/roof slab (wallMode "wall"); false keeps the thin shell.
     bool wall{false};
     facetphysics::WallSlab wallSlab;
@@ -2906,15 +2910,33 @@ std::string facetInputView(const std::string& path)
             xml << "<water>1</water><waterRss>" << std::max(0.0f,ProjectJson::number(p,"rss",0)) << "</waterRss>"
                 << "<evaporationCoefficient>" << std::clamp(ProjectJson::number(p,"evaporationCoefficient",1),0.0f,1.0f)
                 << "</evaporationCoefficient>";
+        // Optional water start temperature; absent = first-node air temperature.
+        if (water && ProjectJson::string(p,"initialTemperatureMode")=="dailyMeanAir")
+            xml << "<waterInitialMode>dailyMeanAir</waterInitialMode>";
+        else if (water && ProjectJson::string(p,"initialTemperatureMode")=="fixed")
+            xml << "<waterInitialMode>fixed</waterInitialMode><waterInitialTemperature>"
+                << ProjectJson::number(p,"initialTemperature",20) << "</waterInitialTemperature>";
         // Building wall/roof slab: only written for wallMode "wall" (shell = old thin facet).
         if (!pv && !leaf && !water && ProjectJson::string(item,"energyModel")!="membrane" &&
-            ProjectJson::string(p,"wallMode","shell")=="wall")
+            ProjectJson::string(p,"wallMode","shell")=="wall") {
             xml << "<wallMode>wall</wallMode><thickness>" << ProjectJson::number(p,"thickness",.2f) << "</thickness>"
                 << "<lambdas>" << ProjectJson::number(p,"lambdas",1.4f) << "</lambdas>"
                 << "<rhos>" << ProjectJson::number(p,"rhos",2300) << "</rhos><cs>" << ProjectJson::number(p,"cs",880) << "</cs>"
                 << "<indoorTemperature>" << ProjectJson::number(p,"indoorTemperature",22) << "</indoorTemperature>"
                 << "<indoorHeatTransferCoefficient>" << ProjectJson::number(p,"indoorHeatTransferCoefficient",8)
                 << "</indoorHeatTransferCoefficient>";
+            // Layered construction (outer to inner): "t k rho cp;" per layer.
+            if (p.contains("layers") && p["layers"].is_array() && !p["layers"].empty()) {
+                std::ostringstream layers;
+                layers.precision(12);
+                for (const auto& layer : p["layers"]) {
+                    if (!layer.is_object()) throw std::runtime_error("FacetEB wall layers must be objects");
+                    layers << layer.value("thickness", 0.0) << ' ' << layer.value("lambda", 0.0)
+                           << ' ' << layer.value("rho", 0.0) << ' ' << layer.value("cp", 0.0) << ';';
+                }
+                xml << "<wallLayers>" << layers.str() << "</wallLayers>";
+            }
+        }
         if (leaf) {
             std::string tparam = p.contains("Tparam") && p["Tparam"].is_string()
                 ? p["Tparam"].get<std::string>() : std::string("0.2,0.3,288,313,328");
@@ -3923,6 +3945,20 @@ void appendProjectGround(Scene& scene,
     }
 }
 
+// Optional water start temperature (waterSet or surfaceEnergy block).
+void readWaterInitial(const std::string& block, SurfaceParameters& material)
+{
+    const std::string mode = trim(firstXmlTag(block, "waterInitialMode"));
+    if (mode == "dailyMeanAir") material.waterInitialMode = 1;
+    else if (mode == "fixed") {
+        material.waterInitialMode = 2;
+        material.waterInitialK = xmlFloat(block, "waterInitialTemperature", 20.0f) + 273.15f;
+        if (!(material.waterInitialK > 223.0f && material.waterInitialK < 373.0f))
+            throw std::runtime_error("Invalid FacetEB water initial temperature");
+    } else if (!mode.empty() && mode != "firstAir")
+        throw std::runtime_error("waterInitialMode must be firstAir, dailyMeanAir or fixed");
+}
+
 Scene loadProjectScene(const std::string& inputFile)
 {
     const std::filesystem::path inputPath(inputFile);
@@ -4043,6 +4079,7 @@ Scene loadProjectScene(const std::string& inputFile)
                         std::max(0.01f, xmlFloat(waterBlock, "mixingDepth", 0.5f));
                     material.surfaceResistance = std::max(0.0f, xmlFloat(waterBlock, "rss", 0.0f));
                     material.evaporationCoefficient = std::clamp(xmlFloat(waterBlock, "evaporationCoefficient", 1.0f), 0.0f, 1.0f);
+                    readWaterInitial(waterBlock, material);
                 }
             }
             if(!physical.empty()) {
@@ -4057,6 +4094,7 @@ Scene loadProjectScene(const std::string& inputFile)
                 if(material.water) {
                     material.surfaceResistance=std::max(0.0f,xmlFloat(physical,"waterRss",0));
                     material.evaporationCoefficient=std::clamp(xmlFloat(physical,"evaporationCoefficient",1),0.0f,1.0f);
+                    readWaterInitial(physical, material);
                 }
                 material.lumpedGroup=trim(firstXmlTag(physical,"lumpedThermalGroup"));
                 if(!material.lumpedGroup.empty()) {
@@ -4106,9 +4144,28 @@ Scene loadProjectScene(const std::string& inputFile)
                     if (!material.lumpedGroup.empty())
                         throw std::runtime_error("wallMode wall cannot be combined with lumpedThermal: " + physicalName);
                     auto& slab = material.wallSlab;
-                    slab.thickness = xmlFloat(wallBlock, "thickness", .2f);
-                    slab.conductivity = xmlFloat(wallBlock, "lambdas", 1.4f);
-                    slab.volumetricCapacity = double(xmlFloat(wallBlock, "rhos", 2300)) * xmlFloat(wallBlock, "cs", 880);
+                    // Layered construction "t k rho c; ..." (outer to inner);
+                    // absent = one homogeneous layer from thickness/lambdas/rhos/cs.
+                    const std::string layerText = trim(firstXmlTag(wallBlock, "wallLayers"));
+                    if (!layerText.empty()) {
+                        std::istringstream rows(layerText);
+                        std::string row;
+                        slab.layerCount = 0;
+                        while (std::getline(rows, row, ';')) {
+                            if (trim(row).empty()) continue;
+                            if (slab.layerCount == facetphysics::maxWallLayers)
+                                throw std::runtime_error("FacetEB wall has more than 6 layers: " + physicalName);
+                            std::istringstream values(row);
+                            double thickness = 0, conductivity = 0, density = 0, specificHeat = 0;
+                            if (!(values >> thickness >> conductivity >> density >> specificHeat))
+                                throw std::runtime_error("Invalid FacetEB wall layer (thickness lambda rho cp): " + physicalName);
+                            slab.layers[slab.layerCount++] = {thickness, conductivity, density * specificHeat};
+                        }
+                    } else {
+                        slab.layers[0].thickness = xmlFloat(wallBlock, "thickness", .2f);
+                        slab.layers[0].conductivity = xmlFloat(wallBlock, "lambdas", 1.4f);
+                        slab.layers[0].volumetricCapacity = double(xmlFloat(wallBlock, "rhos", 2300)) * xmlFloat(wallBlock, "cs", 880);
+                    }
                     slab.indoorK = double(xmlFloat(wallBlock, "indoorTemperature", 22)) + 273.15;
                     slab.indoorCoefficient = xmlFloat(wallBlock, "indoorHeatTransferCoefficient", 8);
                     slab.validate();
@@ -4840,7 +4897,7 @@ try {
             }
             runIndex.value["buildingWalls"] = {{"facets", wallFacets.size()}, {"area_m2", wallArea},
                 {"shellFallbackFacets", shellFallback}, {"indoorSkyViewThreshold", kIndoorSkyView},
-                {"maximumIndoorSideSkyView", maximumIndoorView}, {"layers", facetphysics::wallLayers}};
+                {"maximumIndoorSideSkyView", maximumIndoorView}, {"layers", facetphysics::wallCellsPerLayer}};
         }
     }
     runIndex.write();
@@ -4981,6 +5038,23 @@ try {
                 std::fill(temperature.begin() + static_cast<size_t>(scene.leafFacetCount) * 2U,
                           temperature.end(), configuredSoilTemperature);
             }
+            // Water bodies with an explicit start temperature (material
+            // initialTemperatureMode): the mean air temperature of the first
+            // 24 h from the start node, or a fixed value.
+            double dailyAirSum = 0;
+            int dailyAirNodes = 0;
+            for (size_t n = static_cast<size_t>(startNode); n < meteorology.size() &&
+                 meteorology[n].julianTime < meteorology[static_cast<size_t>(startNode)].julianTime + 1.0f - 1e-4f; ++n) {
+                dailyAirSum += meteorology[n].airTemperature;
+                ++dailyAirNodes;
+            }
+            const float dailyMeanAirK = std::clamp(static_cast<float>(dailyAirSum / std::max(1, dailyAirNodes)) + 273.15f, 220.0f, 340.0f);
+            for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet) {
+                const auto& surface = surfaceForFacet(scene, facet);
+                if (!surface.water || surface.waterInitialMode == 0) continue;
+                const float start = surface.waterInitialMode == 1 ? dailyMeanAirK : surface.waterInitialK;
+                temperature[size_t(facet) * 2U] = temperature[size_t(facet) * 2U + 1U] = start;
+            }
             stateTemperature = {temperature, temperature};
         }
         // Illuminated part of each side. A thin object facet has one sunlit
@@ -5064,8 +5138,8 @@ try {
                         move(soilProfiles[0][g][layer], soilProfiles[1][g][layer]);
                 }
                 if (wallSide >= 0)
-                    for (size_t layer = 0; layer < facetphysics::wallLayers; ++layer)
-                        move(wallProfiles[0][size_t(wallSide)][layer], wallProfiles[1][size_t(wallSide)][layer]);
+                    for (size_t cell = 0; cell < surface.wallSlab.cells(); ++cell)
+                        move(wallProfiles[0][size_t(wallSide)][cell], wallProfiles[1][size_t(wallSide)][cell]);
             }
         }
         const std::array<std::vector<float>, 2> previousStateTemperature = stateTemperature;

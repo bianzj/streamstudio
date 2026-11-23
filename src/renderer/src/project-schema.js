@@ -478,8 +478,23 @@ export function createMaterialPresets() {
     ],
     materials: [
       // Representative dry concrete surface; users can edit these thermal properties.
-      // wallMode 'wall': FacetEB solves a 0.2 m slab with a 22 °C interior ('shell' = thin two-sided facet).
-      { name: 'building_surface', label: '建筑表面', type: 'Building', params: { method: 2, rss: 1000000000, cs: 880, rhos: 2300, lambdas: 1.4, Tsoil: 25, SMC: 0, Satwater: 0, wallMode: 'wall', thickness: 0.2, indoorTemperature: 22, indoorHeatTransferCoefficient: 8 } },
+      // wallMode 'wall': FacetEB solves the layered wall (params.layers, outer to inner) with a 22 °C
+      // interior ('shell' = thin two-sided facet). New-project construction, typical values of
+      // GB 50176-2016 Appendix B / ISO 10456: 0.10 m reinforced concrete (λ 1.74, ρ 2500, cp 920),
+      // 0.08 m EPS insulation (λ 0.04, ρ 20, cp 1380), 0.02 m lime-cement plaster (λ 0.87, ρ 1700,
+      // cp 1050); U ≈ 0.44 W m⁻² K⁻¹. cs/rhos/lambdas stay the VoxelEB (semi-infinite solid) values.
+      { name: 'building_surface', label: '建筑表面', type: 'Building', params: { method: 2, rss: 1000000000, cs: 880, rhos: 2300, lambdas: 1.4, Tsoil: 25, SMC: 0, Satwater: 0, wallMode: 'wall', thickness: 0.2, indoorTemperature: 22, indoorHeatTransferCoefficient: 8,
+        layers: [{ thickness: 0.1, lambda: 1.74, rho: 2500, cp: 920 }, { thickness: 0.08, lambda: 0.04, rho: 20, cp: 1380 }, { thickness: 0.02, lambda: 0.87, rho: 1700, cp: 1050 }] } },
+      // Flat roof: 0.05 m fine-aggregate concrete protection over the membrane (λ 1.51, ρ 2300, cp 920),
+      // 0.10 m XPS (λ 0.030, ρ 35, cp 1380), 0.15 m reinforced concrete slab (λ 1.74, ρ 2500, cp 920);
+      // U ≈ 0.28 W m⁻² K⁻¹ (GB 50176-2016 Appendix B typical values).
+      { name: 'building_roof', label: '建筑屋顶', type: 'Building', params: { method: 2, rss: 1000000000, cs: 880, rhos: 2300, lambdas: 1.4, Tsoil: 25, SMC: 0, Satwater: 0, wallMode: 'wall', thickness: 0.3, indoorTemperature: 22, indoorHeatTransferCoefficient: 8,
+        layers: [{ thickness: 0.05, lambda: 1.51, rho: 2300, cp: 920 }, { thickness: 0.1, lambda: 0.03, rho: 35, cp: 1380 }, { thickness: 0.15, lambda: 1.74, rho: 2500, cp: 920 }] } },
+      // External thermal insulation composite system (ETICS, JGJ 144): 5 mm polymer render (λ 0.93,
+      // ρ 1800, cp 1050), 0.08 m EPS, 0.20 m reinforced concrete, 0.02 m plaster; U ≈ 0.43 W m⁻² K⁻¹.
+      // The light render over insulation gives the largest outer-surface daily range.
+      { name: 'building_wall_etics', label: '建筑外墙（外保温薄抹灰）', type: 'Building', params: { method: 2, rss: 1000000000, cs: 880, rhos: 2300, lambdas: 1.4, Tsoil: 25, SMC: 0, Satwater: 0, wallMode: 'wall', thickness: 0.305, indoorTemperature: 22, indoorHeatTransferCoefficient: 8,
+        layers: [{ thickness: 0.005, lambda: 0.93, rho: 1800, cp: 1050 }, { thickness: 0.08, lambda: 0.04, rho: 20, cp: 1380 }, { thickness: 0.2, lambda: 1.74, rho: 2500, cp: 920 }, { thickness: 0.02, lambda: 0.87, rho: 1700, cp: 1050 }] } },
       { name: 'pv_panel', label: '通用太阳能板（FacetEB）', type: 'Building', energyModel: 'photovoltaic', params: { eta25: 0.21, gamma: -0.0035, bifaciality: 0, heatCapacityPerArea: 12000, convectiveScale: 1 } },
       { name: 'pv_panel_mono', label: '单晶硅太阳能板（FacetEB）', type: 'Building', energyModel: 'photovoltaic', params: { eta25: 0.22, gamma: -0.0034, bifaciality: 0, heatCapacityPerArea: 12000, convectiveScale: 1 } },
       { name: 'pv_panel_poly', label: '多晶硅太阳能板（FacetEB）', type: 'Building', energyModel: 'photovoltaic', params: { eta25: 0.19, gamma: -0.0038, bifaciality: 0, heatCapacityPerArea: 12500, convectiveScale: 1 } },
@@ -508,7 +523,9 @@ export function createMaterialPresets() {
       { name: 'soil_wet', label: '湿润土壤', type: 'Soil', params: { method: 2, rss: 800, cs: 1400, rhos: 1900, lambdas: 2.0, Tsoil: 22, SMC: 35, Satwater: 0.50 } },
       { name: 'vehicle_material', label: '载具车身物化', type: 'Building', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0 } },
       { name: 'ship_material', label: '船舶表面物化', type: 'Ship', params: { method: 1, rss: 4000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 30, SMC: 0, Satwater: 0 } },
-      { name: 'water_set', label: '水体物化参数', type: 'Water', params: { rss: 0, heatCapacity: 4186000, mixingDepth: 0.5, evaporationCoefficient: 1, brdfModel: 1, refractiveIndex: 1.333, slopeVariance: 0, diffuseFraction: 0.02 } }
+      // mixingDepth 2 m and a start temperature at the mean air temperature of the first 24 h:
+      // new-project defaults (engine fallbacks for absent fields stay 0.5 m / first-node air).
+      { name: 'water_set', label: '水体物化参数', type: 'Water', params: { rss: 0, heatCapacity: 4186000, mixingDepth: 2, evaporationCoefficient: 1, brdfModel: 1, refractiveIndex: 1.333, slopeVariance: 0, diffuseFraction: 0.02, initialTemperatureMode: 'dailyMeanAir' } }
     ]
   }
 }
@@ -1066,6 +1083,17 @@ export function validateProject(value) {
     const thickness = Number(p.thickness ?? 0.2), indoor = Number(p.indoorTemperature ?? 22), h = Number(p.indoorHeatTransferCoefficient ?? 8)
     if (!(thickness > 0 && thickness <= 5) || !(indoor > -70 && indoor < 120) || !(h > 0) || !(Number(p.lambdas ?? 1.4) > 0) || !(Number(p.rhos ?? 2300) > 0) || !(Number(p.cs ?? 880) > 0))
       errors.push('墙体模式参数无效（0 < 厚度 ≤ 5 m，室内换热系数、导热率、密度、比热容大于 0）：' + m.name)
+    if (p.layers !== undefined) {
+      const layers = Array.isArray(p.layers) ? p.layers : []
+      const total = layers.reduce((sum, layer) => sum + Number(layer?.thickness), 0)
+      if (!layers.length || layers.length > 6 || !(total <= 5) || layers.some((layer) => !(Number(layer?.thickness) > 0) || !(Number(layer?.lambda) > 0) || !(Number(layer?.rho) > 0) || !(Number(layer?.cp) > 0)))
+        errors.push('墙体构造层无效（1–6 层，每层厚度、λ、ρ、cp 大于 0，总厚度 ≤ 5 m）：' + m.name)
+    }
+  }
+  for (const m of c.materials.filter((item) => item.type === 'Water' && item.params?.initialTemperatureMode !== undefined)) {
+    const p = m.params
+    if (!['firstAir', 'dailyMeanAir', 'fixed'].includes(p.initialTemperatureMode) || (p.initialTemperatureMode === 'fixed' && !(Number(p.initialTemperature ?? 20) > -50 && Number(p.initialTemperature ?? 20) < 100)))
+      errors.push('初始水温设置无效（首节点气温 / 起始 24 h 平均气温 / -50–100 ℃ 指定值）：' + m.name)
   }
   for (const s of c.spectra) {
     if (surfaceOpenness(s) > 0 && (s.model === 'Prospect' || s.model === 'BSM')) errors.push('开孔率仅支持自定义或导入 TXT 光谱：' + s.name)
@@ -1157,17 +1185,29 @@ function thermalXml(item, index) {
   return `<thermal id="${index + 1}" name="${xmlEscape(item.name)}"><sunlitTemperature>${number(item.sunlitTemperature, 305)}</sunlitTemperature><shadedTemperature>${number(item.shadedTemperature, 295)}</shadedTemperature></thermal>`
 }
 
+// FacetEB optional tags; absent fields write nothing, so old XML stays unchanged.
+function waterInitialXml(params) {
+  if (params.initialTemperatureMode === 'dailyMeanAir') return '<waterInitialMode>dailyMeanAir</waterInitialMode>'
+  if (params.initialTemperatureMode === 'fixed') return `<waterInitialMode>fixed</waterInitialMode><waterInitialTemperature>${number(params.initialTemperature, 20)}</waterInitialTemperature>`
+  return ''
+}
+
+function wallLayersXml(layers) {
+  if (!Array.isArray(layers) || !layers.length) return ''
+  return `<wallLayers>${layers.map((layer) => [layer?.thickness, layer?.lambda, layer?.rho, layer?.cp].map((value) => number(value, 0)).join(' ')).join(';')}</wallLayers>`
+}
+
 function materialXml(item) {
   const params = item.params || {}
   const name = xmlEscape(item.name)
   // DEFERRED[低] 数据一致性: energyModel 为 wood（type 已被归一化为 Vegetation）的材质在此走 leafBio 分支，导出为叶片参数（cs/rhos/lambdas 不出现在 XML）；membrane 落到 soilSet 分支。FacetEB 引擎从 project.json 自行生成 surfaceEnergy（facetrtcore.cpp:2469 已区分 wood），但凡直接读取本 XML 的路径（如 VoxelEB 的 fileio.cpp 的 leafBio 解析）会把木质部当成叶片；未修复：需先确认 VoxelEB 是否消费此 XML，属跨引擎数据源决策
   if (item.energyModel === 'photovoltaic') return '<property><surfaceEnergy name="'+name+'"><photovoltaic>1</photovoltaic><vegetation>0</vegetation>'+Object.entries(params).filter(([k])=>typeof k === 'string' && /^[A-Za-z_][\w.-]*$/.test(k)).map(([k,v])=>'<'+k+'>'+xmlEscape(v)+'</'+k+'>').join('')+'</surfaceEnergy></property>'
   if (item.type === 'Vegetation') return `<property><leafBio name="${name}"><Vcmax>${number(params.Vcmax, 80)}</Vcmax><m>${number(params.m, 9)}</m><BallBerry>${number(params.BallBerry, 0.01)}</BallBerry><Type>${number(params.Type, 3)}</Type><kV>${number(params.kV, 0.6396)}</kV><Rdparam>${number(params.Rdparam, 0.015)}</Rdparam><Tparam>${xmlEscape(params.Tparam || '0.2,0.3,288,313,328')}</Tparam><Tyear>${number(params.Tyear, 25)}</Tyear><beta>${number(params.beta, 0.507)}</beta><kNPQs>${number(params.kNPQs, 0)}</kNPQs><qLs>${number(params.qLs, 1)}</qLs><stressfactor>${number(params.stressfactor, 1)}</stressfactor><Tcor>${number(params.Tcor, 0)}</Tcor></leafBio></property>`
-  if (item.type === 'Water') return `<property><waterSet name="${name}"><rss>${number(params.rss, 0)}</rss><heatCapacity>${number(params.heatCapacity, 4186000)}</heatCapacity><mixingDepth>${number(params.mixingDepth, 0.5)}</mixingDepth><evaporationCoefficient>${number(params.evaporationCoefficient, 1)}</evaporationCoefficient><brdfModel>${number(params.brdfModel, 1) ? 'CoxMunk' : 'Lambert'}</brdfModel><refractiveIndex>${number(params.refractiveIndex, 1.333)}</refractiveIndex><slopeVariance>${Math.max(0, number(params.slopeVariance, 0))}</slopeVariance><diffuseFraction>${Math.max(0, Math.min(1, number(params.diffuseFraction, 0.02)))}</diffuseFraction></waterSet></property>`
+  if (item.type === 'Water') return `<property><waterSet name="${name}"><rss>${number(params.rss, 0)}</rss><heatCapacity>${number(params.heatCapacity, 4186000)}</heatCapacity><mixingDepth>${number(params.mixingDepth, 0.5)}</mixingDepth><evaporationCoefficient>${number(params.evaporationCoefficient, 1)}</evaporationCoefficient><brdfModel>${number(params.brdfModel, 1) ? 'CoxMunk' : 'Lambert'}</brdfModel><refractiveIndex>${number(params.refractiveIndex, 1.333)}</refractiveIndex><slopeVariance>${Math.max(0, number(params.slopeVariance, 0))}</slopeVariance><diffuseFraction>${Math.max(0, Math.min(1, number(params.diffuseFraction, 0.02)))}</diffuseFraction>${waterInitialXml(params)}</waterSet></property>`
   // DEFERRED[低] Bug: Tsoil 缺省值写成 0.25，其余位置（预设材质）均为 25 ℃，缺字段时初温相差两个数量级；未修复：默认数值常量属禁止修改项，需产品确认单位后统一
   // FacetEB wall/roof slab (wallMode 'wall'); absent = thin shell, so old XML stays unchanged.
   const wall = params.wallMode === 'wall' && !item.energyModel
-    ? `<wallMode>wall</wallMode><thickness>${number(params.thickness, 0.2)}</thickness><indoorTemperature>${number(params.indoorTemperature, 22)}</indoorTemperature><indoorHeatTransferCoefficient>${number(params.indoorHeatTransferCoefficient, 8)}</indoorHeatTransferCoefficient>`
+    ? `<wallMode>wall</wallMode><thickness>${number(params.thickness, 0.2)}</thickness><indoorTemperature>${number(params.indoorTemperature, 22)}</indoorTemperature><indoorHeatTransferCoefficient>${number(params.indoorHeatTransferCoefficient, 8)}</indoorHeatTransferCoefficient>${wallLayersXml(params.layers)}`
     : ''
   return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 0.25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${wall}</soilSet></property>`
 }
