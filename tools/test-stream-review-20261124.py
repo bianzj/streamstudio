@@ -154,3 +154,30 @@ def test_unconverged_pixels_are_reported(tmp_path):
     assert 'warning' in temperature and 'did not converge' in temperature['warning']
     assert '未收敛' in ret.stdout and '警告' in ret.stdout
     assert 'temperatureLimitedPixels' in temperature
+
+
+# ---------- C1 / C2 / C3: configuration values are validated, never silently turned into 0 ----------
+@pytest.mark.parametrize('key,value', [('diffuseFraction', 'abc'), ('minWindSpeed', 'x'), ('maxAerodynamicResistance', True),
+                                       ('maxIterations', 'many'), ('maxIterations', 2.5), ('stomatalG0', {})])
+def test_non_numeric_energy_fields_are_rejected(tmp_path, key, value):
+    ret, _ = run(tmp_path, 'c2', eb_config(**{key: value}))
+    assert ret.returncode != 0, ret.stdout
+    assert key in ret.stderr and ('须为数值' in ret.stderr or '须为整数' in ret.stderr), ret.stderr
+
+
+def test_sky_longwave_number_and_string_value_are_rejected(tmp_path):
+    for sky in (300, 'auto', dict(value='abc')):
+        config = eb_config()
+        config['skyLongwave'] = sky
+        ret, _ = run(tmp_path, f'sky{abs(hash(str(sky)))}', config)
+        assert ret.returncode != 0, sky
+        assert 'skyLongwave' in ret.stderr, ret.stderr
+
+
+def test_unknown_terrain_mode_lists_every_mode(tmp_path):
+    config = eb_config()
+    config['surface']['terrain'] = dict(mode='bogus')
+    ret, _ = run(tmp_path, 'terrain', config)
+    assert ret.returncode != 0
+    for mode in ('none', 'single', 'facet', 'composite', 'hill', 'ridge'):
+        assert mode in ret.stderr

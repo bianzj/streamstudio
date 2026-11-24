@@ -71,6 +71,8 @@ Field readField(const CPLJSONObject& parent, const std::string& key)
     if (value.IsValid() && (value.GetType() == CPLJSONObject::Type::Integer || value.GetType() == CPLJSONObject::Type::Long ||
                             value.GetType() == CPLJSONObject::Type::Double))
         field.value = value.ToDouble();
+    else if (value.IsValid() && value.GetType() != CPLJSONObject::Type::Null)  // FIX(2026-11-24 C3): no silent "absent"
+        throw std::runtime_error(key + ".value 须为数值（JSON 数字），当前为 " + value.ToString());
     field.band = object.GetInteger("band", 0);
     return field;
 }
@@ -181,6 +183,11 @@ void writeTiff(const std::filesystem::path& path, const Grid& grid, const std::v
         if (band->RasterIO(GF_Write, 0, 0, grid.width, grid.height, const_cast<float*>(bands[index].data()), grid.width, grid.height, GDT_Float32, 0, 0) != CE_None)
             throw std::runtime_error("写入结果失败：" + utf8FromPath(path));
     }
+    // FIX(2026-11-24 R5): flushing and closing can fail (disk full, truncated file) after every RasterIO succeeded.
+    CPLErrorReset();
+    const CPLErr closed = dataset->Close();
+    if (closed != CE_None || CPLGetLastErrorType() == CE_Failure)
+        throw std::runtime_error("写入结果失败（刷盘或关闭文件出错，磁盘空间不足？）：" + utf8FromPath(path));
 }
 
 CPLJSONObject bandStatistics(const std::string& name, const std::vector<float>& values)

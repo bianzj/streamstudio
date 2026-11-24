@@ -1,4 +1,5 @@
 #include "inversion.h"
+#include "parallel_error.h"
 #include "../physics/brightness.h"
 #include "../physics/radiosity.h"
 #include "../physics/soil_emissivity.h"
@@ -154,8 +155,11 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
     std::vector<unsigned> flags(regionPixels, 0);
     std::vector<char> usable(regionPixels, 0);
     long long outOfRangeValues = 0;
+    ParallelError errorsPrepare;
     #pragma omp parallel for schedule(dynamic, 4) reduction(+:outOfRangeValues)
     for (int row = in.startRow; row < in.endRow; ++row) {
+        if (errorsPrepare.failed()) continue;
+        try {
         for (int column = in.startColumn; column < in.endColumn; ++column) {
             const size_t pixel = static_cast<size_t>(row) * grid.width + column;
             const size_t local = static_cast<size_t>(row - in.startRow) * width + (column - in.startColumn);
@@ -229,7 +233,9 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
             if (valid) usable[local] = 1;
             else flags[local] |= kQaInputInvalid;
         }
+        } catch (...) { errorsPrepare.capture(); }
     }
+    errorsPrepare.rethrow("反演输入准备");
     if (outOfRangeValues) log("警告：" + std::to_string(outOfRangeValues) + " 个观测值不在 150–400 K（单位须为 K），已剔除");
 
     // ---------- retrieval ----------
@@ -243,8 +249,11 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
     if (!lsct) {
         std::vector<float> lst(grid.size(), kNaN), sd(grid.size(), kNaN), qa(grid.size(), kNaN), residual(grid.size(), kNaN),
             used(grid.size(), kNaN), emissivity(grid.size(), kNaN);
+        ParallelError errorsLst;
         #pragma omp parallel for schedule(dynamic, 4) reduction(+:retrieved, failed, notConverged, outOfRange, residualSum)
         for (int row = in.startRow; row < in.endRow; ++row) {
+            if (errorsLst.failed()) continue;
+            try {
             for (int column = in.startColumn; column < in.endColumn; ++column) {
                 const size_t pixel = static_cast<size_t>(row) * grid.width + column;
                 const size_t local = static_cast<size_t>(row - in.startRow) * width + (column - in.startColumn);
@@ -320,7 +329,9 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
             const int done = ++rowsDone;
             if (isMainThread() && done % std::max(1, height / 20) == 0)
                 progress(in.progressStart + span * (0.1 + 0.85 * done / height), "地表温度反演");
+            } catch (...) { errorsLst.capture(); }
         }
+        errorsLst.rethrow("地表温度反演");
         const fs::path& dir = config.outputDir;
         writeTiff(dir / "lst.tif", grid, {lst}, {"LST (K)"});
         writeTiff(dir / "lst_uncertainty.tif", grid, {sd}, {"LST uncertainty 1-sigma (K)"});
@@ -348,8 +359,11 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         for (auto& band : shares) band.assign(grid.size(), kNaN);
         for (auto& band : radianceShares) band.assign(grid.size(), kNaN);
         const int half = inv.window / 2;
+        ParallelError errorsLsct;
         #pragma omp parallel for schedule(dynamic, 2) reduction(+:retrieved, failed, notConverged, lowSupport, outOfRange, illConditioned, dfsSum, residualSum, stopConverged, stopStalled, stopNotUpdated)
         for (int row = in.startRow; row < in.endRow; ++row) {
+            if (errorsLsct.failed()) continue;
+            try {
             std::vector<const Sample*> set;
             for (int column = in.startColumn; column < in.endColumn; ++column) {
                 const size_t pixel = static_cast<size_t>(row) * grid.width + column;
@@ -526,7 +540,9 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
             const int done = ++rowsDone;
             if (isMainThread() && done % std::max(1, height / 20) == 0)
                 progress(in.progressStart + span * (0.1 + 0.85 * done / height), "组分温度反演");
+            } catch (...) { errorsLsct.capture(); }
         }
+        errorsLsct.rethrow("组分温度反演");
         const fs::path& dir = config.outputDir;
         const std::vector<std::string> names{"Tss sunlit soil temperature (K)", "Tsh shaded soil temperature (K)",
                                              "Tcs sunlit leaf temperature (K)", "Tch shaded leaf temperature (K)"};

@@ -1,4 +1,5 @@
 #include "assimilation.h"
+#include "parallel_error.h"
 #include "inversion.h"  // QA bit constants shared with the LST/LSCT retrieval
 #include "../forcing/utc.h"  // FIX(2026-11-21 C7): overpass day of year
 #include "../physics/canopy.h"
@@ -202,8 +203,11 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
     std::atomic<int> rowsDone{0};
     const int rowCount = in.endRow - in.startRow;
 
+    ParallelError errorsAssimilation;
     #pragma omp parallel for schedule(dynamic, 2) reduction(+:analysed, noObservation, failed, notConverged, illConditioned, lowSupport, observationsUsed, sumOmb, sumOma, sumDfs, thermalPixels, stopConverged, stopStalled, stopNotUpdated, stopIterationLimit, stopSingular, stopStepFailed)
     for (int row = in.startRow; row < in.endRow; ++row) {
+        if (errorsAssimilation.failed()) continue;
+        try {
         for (int column = in.startColumn; column < in.endColumn; ++column) {
             const size_t pixel = static_cast<size_t>(row) * grid.width + column;
             const auto* entry = in.classes.find(in.type[pixel]);
@@ -617,7 +621,9 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
         const int done = ++rowsDone;
         if (isMainThread() && done % std::max(1, rowCount / 40) == 0)
             progress(in.progressStart + in.progressSpan * done / rowCount, "同化分析");
+        } catch (...) { errorsAssimilation.capture(); }
     }
+    errorsAssimilation.rethrow("同化");
 
     // ---- outputs ----
     const auto& dir = config.outputDir;

@@ -9,6 +9,30 @@
 #include <stdexcept>
 #include <set>
 
+namespace {
+
+// FIX(2026-11-24 C2/C3): GDAL's CPLJSONObject::GetDouble/GetInteger turn a string, bool or object into 0 without a word
+// (diffuseFraction "abc" became 0, minWindSpeed "x" became 0). Numeric configuration fields must be JSON numbers.
+double numberOr(const CPLJSONObject& parent, const std::string& key, double fallback, const std::string& path)
+{
+    const auto value = parent.GetObj(key);
+    if (!value.IsValid() || value.GetType() == CPLJSONObject::Type::Null) return fallback;
+    const auto type = value.GetType();
+    if (type != CPLJSONObject::Type::Integer && type != CPLJSONObject::Type::Long && type != CPLJSONObject::Type::Double)
+        throw std::runtime_error(path + " 须为数值（JSON 数字），当前为 " + value.ToString());
+    return value.ToDouble();
+}
+
+int integerOr(const CPLJSONObject& parent, const std::string& key, int fallback, const std::string& path)
+{
+    const double value = numberOr(parent, key, fallback, path);
+    if (!std::isfinite(value) || value != std::floor(value) || std::abs(value) > 1.0e9)
+        throw std::runtime_error(path + " 须为整数，当前为 " + std::to_string(value));
+    return static_cast<int>(value);
+}
+
+}  // namespace
+
 namespace stream {
 namespace {
 
@@ -94,7 +118,7 @@ ImageConfig readImageConfig(const std::string& path)
             if (!(config.terrainEndFraction >= 0.0 && config.terrainEndFraction <= 0.5))
                 throw std::runtime_error("山脊端面比例 endFraction 须在 0–0.5 之间");
         } else if (terrainMode != "none") {
-            throw std::runtime_error("地形辐射模式须为 none、single 或 composite");
+            throw std::runtime_error("地形辐射模式须为 none、single、facet、composite、hill 或 ridge");
         }
     }
     config.soilBrightness = surface.GetDouble("soilBrightness", -1.0);
@@ -333,7 +357,7 @@ ImageConfig readImageConfig(const std::string& path)
         if (temperatureMethod != "robust" && temperatureMethod != "direct")
             throw std::runtime_error("temperatureMethod 须为 robust 或 direct");
         config.robustTemperature = temperatureMethod == "robust";
-        config.diffuseFraction = energy.GetDouble("diffuseFraction", 0.2);
+        config.diffuseFraction = numberOr(energy, "diffuseFraction", 0.2, "temperature.energy.diffuseFraction");
         if (!std::isfinite(config.diffuseFraction) ||
             !(config.diffuseFraction == -1.0 || (config.diffuseFraction >= 0.0 && config.diffuseFraction <= 1.0)))
             throw std::runtime_error("diffuseFraction 须为 -1（Erbs）或 0 到 1 之间的数");
@@ -350,36 +374,36 @@ ImageConfig readImageConfig(const std::string& path)
             if (valueField.IsValid() && valueField.GetType() != CPLJSONObject::Type::Integer &&
                 valueField.GetType() != CPLJSONObject::Type::Long && valueField.GetType() != CPLJSONObject::Type::Double)
                 throw std::runtime_error("soilResistance.value 须为数值（s m⁻¹）");
-            config.soilResistance = resistance.GetDouble("value", 200.0);
+            config.soilResistance = numberOr(resistance, "value", 200.0, "soilResistance.value");
             if (!std::isfinite(config.soilResistance) || !(config.soilResistance > 0.0) || config.soilResistance > 1.0e5)
                 throw std::runtime_error("soilResistance.value 须在 (0, 100000] s m⁻¹ 之间（土壤表面阻抗，TIRTEB 默认 200），当前为 " +
                                          std::to_string(config.soilResistance));
         }
-        config.stomatalG0 = energy.GetDouble("stomatalG0", 0.01);
-        config.minWindSpeed = energy.GetDouble("minWindSpeed", 0.05);
-        config.maxAerodynamicResistance = energy.GetDouble("maxAerodynamicResistance", 400.0);
-        config.referenceHeight = energy.GetDouble("referenceHeight", 15.0);
-        config.heatRoughnessKb = energy.GetDouble("heatRoughnessKb", -1.0);
+        config.stomatalG0 = numberOr(energy, "stomatalG0", 0.01, "temperature.energy.stomatalG0");
+        config.minWindSpeed = numberOr(energy, "minWindSpeed", 0.05, "temperature.energy.minWindSpeed");
+        config.maxAerodynamicResistance = numberOr(energy, "maxAerodynamicResistance", 400.0, "temperature.energy.maxAerodynamicResistance");
+        config.referenceHeight = numberOr(energy, "referenceHeight", 15.0, "temperature.energy.referenceHeight");
+        config.heatRoughnessKb = numberOr(energy, "heatRoughnessKb", -1.0, "temperature.energy.heatRoughnessKb");
         if (!std::isfinite(config.heatRoughnessKb) || config.heatRoughnessKb > 20)
             throw std::runtime_error("heatRoughnessKb 须在 0–20 之间（<=0 表示按地类）");
         // maxAerodynamicResistance <= 0 deliberately means "no cap" (energy.cpp resistanceCap).
         if (!std::isfinite(config.maxAerodynamicResistance))
             throw std::runtime_error("maxAerodynamicResistance 须为数值（<=0 表示不限幅）");
-        config.soilEmissivity = energy.GetDouble("soilEmissivity", 0.955);
+        config.soilEmissivity = numberOr(energy, "soilEmissivity", 0.955, "temperature.energy.soilEmissivity");
         config.soilEmissivitySet = energy.GetObj("soilEmissivity").IsValid();
-        config.leafEmissivity = energy.GetDouble("leafEmissivity", 0.985);
-        config.soilConductivity = energy.GetDouble("soilConductivity", 1.55);
-        config.soilVolumetricCapacity = energy.GetDouble("soilVolumetricCapacity", 1.298e6);
+        config.leafEmissivity = numberOr(energy, "leafEmissivity", 0.985, "temperature.energy.leafEmissivity");
+        config.soilConductivity = numberOr(energy, "soilConductivity", 1.55, "temperature.energy.soilConductivity");
+        config.soilVolumetricCapacity = numberOr(energy, "soilVolumetricCapacity", 1.298e6, "temperature.energy.soilVolumetricCapacity");
         const auto soilThermal = energy.GetString("soilThermal", "constant");
         if (soilThermal != "constant" && soilThermal != "moisture") throw std::runtime_error("soilThermal 须为 constant 或 moisture");
         config.soilThermalFromMoisture = soilThermal == "moisture";
-        config.soilHeatFraction = energy.GetDouble("soilHeatFraction", 0.25);
+        config.soilHeatFraction = numberOr(energy, "soilHeatFraction", 0.25, "temperature.energy.soilHeatFraction");
         if (!(config.soilHeatFraction >= 0.0 && config.soilHeatFraction <= 1.0))
             throw std::runtime_error("soilHeatFraction 须在 0 与 1 之间");
-        config.solarBinWidth = energy.GetInteger("spectralBinNm", 50);
+        config.solarBinWidth = integerOr(energy, "spectralBinNm", 50, "temperature.energy.spectralBinNm");
         if (config.solarBinWidth < 1 || config.solarBinWidth > 100) throw std::runtime_error("spectralBinNm 须在 1–100 nm 之间");
-        config.maxIterations = energy.GetInteger("maxIterations", 50);
-        config.maxStabilityIterations = energy.GetInteger("maxStabilityIterations", 60);
+        config.maxIterations = integerOr(energy, "maxIterations", 50, "temperature.energy.maxIterations");
+        config.maxStabilityIterations = integerOr(energy, "maxStabilityIterations", 60, "temperature.energy.maxStabilityIterations");
         if (!(config.stomatalG0 > 0) || !(config.minWindSpeed >= 0) || !(config.referenceHeight > 0) ||
             !(config.leafEmissivity > 0 && config.leafEmissivity <= 1) ||
             !(config.soilConductivity > 0) || !(config.soilVolumetricCapacity > 0) || config.maxIterations < 1 || config.maxStabilityIterations < 1)
@@ -397,17 +421,17 @@ ImageConfig readImageConfig(const std::string& path)
     {
         const auto energy = temperature.GetObj("energy");
         if (mode != "eb") {
-            config.soilEmissivity = energy.GetDouble("soilEmissivity", 0.955);
+            config.soilEmissivity = numberOr(energy, "soilEmissivity", 0.955, "temperature.energy.soilEmissivity");
             config.soilEmissivitySet = energy.GetObj("soilEmissivity").IsValid();
         }
         // Negative selects the built-in dry-to-wet gain; otherwise it is the
         // emissivity at saturation and must be a valid value above the dry one.
-        config.soilEmissivityWet = energy.GetDouble("soilEmissivityWet", -1.0);
+        config.soilEmissivityWet = numberOr(energy, "soilEmissivityWet", -1.0, "temperature.energy.soilEmissivityWet");
         const auto emissivityModel = energy.GetString("soilEmissivityModel", "hapke");
         if (emissivityModel != "hapke" && emissivityModel != "constant")
             throw std::runtime_error("soilEmissivityModel 须为 hapke 或 constant");
         config.hapkeSoilEmissivity = emissivityModel == "hapke";
-        config.hapkeSoilK = energy.GetDouble("soilEmissivityK", 1.0);
+        config.hapkeSoilK = numberOr(energy, "soilEmissivityK", 1.0, "temperature.energy.soilEmissivityK");
         if (!(config.hapkeSoilK > 0)) throw std::runtime_error("soilEmissivityK 须为正数");
         const auto normalisation = energy.GetString("surfaceTemperatureNormalisation", "retrieval");
         if (normalisation != "retrieval" && normalisation != "directional")
@@ -422,6 +446,8 @@ ImageConfig readImageConfig(const std::string& path)
     }
     // Reflected sky of the thermal brightness temperature.
     const auto sky = root.GetObj("skyLongwave");
+    if (sky.IsValid() && sky.GetType() != CPLJSONObject::Type::Null && sky.GetType() != CPLJSONObject::Type::Object)
+        throw std::runtime_error("skyLongwave 须为对象，如 {\"value\": 300}、{\"file\": ...} 或 {\"mode\": \"none\"}，当前为 " + sky.ToString());
     if (sky.IsValid() && sky.GetType() == CPLJSONObject::Type::Object) {
         const auto skyMode = sky.GetString("mode", "auto");
         config.skyLongwave = readField(root, "skyLongwave");

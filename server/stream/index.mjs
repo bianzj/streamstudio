@@ -15,6 +15,29 @@ const PACK_KINDS = ['stream-era5-pack', 'stream-forcing-pack']
 const FORCING_CHECK_TIMEOUT_MS = 60_000
 const FORCING_QUICK_TIMEOUT_MS = 15_000
 
+// FIX(2026-11-24 E4): netCDF opens files through the ANSI code page, so the engine reaches a non-ASCII ERA5 file only via its
+// 8.3 short name (forcing/era5.cpp) and fails when the volume has none. Check that at submission instead of in the queue.
+// Returns the offending file path, or '' when every data file of the pack can be opened.
+export function unreachableNonAsciiPackFile(packPath, { shortName = windowsShortName } = {}) {
+  let index
+  try { index = JSON.parse(readFileSync(packPath, 'utf8')) } catch { return '' }  // the engine reports unreadable indexes itself
+  const folder = dirname(packPath)
+  for (const item of Array.isArray(index?.files) ? index.files : []) {
+    if (typeof item?.path !== 'string') continue
+    const file = isAbsolute(item.path) ? item.path : join(folder, item.path)
+    if (!/[^\x00-\x7f]/.test(file) || !existsSync(file)) continue
+    const short = shortName(file)
+    if (!short || /[^\x00-\x7f]/.test(short)) return file
+  }
+  return ''
+}
+
+function windowsShortName(file) {
+  if (process.platform !== 'win32') return file  // other platforms open UTF-8 paths directly
+  const result = spawnSync('cmd.exe', ['/d', '/c', `for %I in ("${file.replace(/"/g, '')}") do @echo %~sI`], { encoding: 'utf8', windowsHide: true })
+  return result.status === 0 ? String(result.stdout || '').split(/\r?\n/)[0].trim() : ''
+}
+
 export function createStreamService({ resourceRoot, modelRoot, json, body, readTiff, normalizeHostPath, windowsPath, runTask = null, documentsRoot = null }) {
   const candidates = [
     join(resourceRoot, 'engine', 'stream.exe'),
@@ -175,14 +198,20 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     if (!isAbsolute(root)) throw new Error('输出目录须为绝对路径')
     const name = String(scene.name || data.name || 'image').replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 64) || 'image'
     // Validate now so a bad form fails at submission rather than in the queue.
-    projects.buildEngineConfig(scene, { outputDir: root, dataDir: dataDir() })
+    const probe = projects.buildEngineConfig(scene, { outputDir: root, dataDir: dataDir() })
+    const pack = probe?.temperature?.era5?.pack
+    if (typeof pack === 'string' && pack) {
+      const bad = unreachableNonAsciiPackFile(resolve(normalizeHostPath(pack)))
+      if (bad) throw new Error(`气象强迫数据文件路径含非 ASCII 字符且系统没有短文件名，引擎无法打开：${windowsPath(bad)}。请把数据包移到纯英文路径下后重新登记`)
+    }
     const job = {
       kind: 'image', label: name, successCodes: [0],
       start() {
         const runId = new Date().toISOString().replace(/[:.]/g, '-')
         job.outputDir = join(resolve(root), `${name}_${runId}`)
-        mkdirSync(job.outputDir, { recursive: true })
+        // FIX(2026-11-24 S5): build (= validate) the configuration first, so a failure leaves no empty output folder behind.
         const config = projects.buildEngineConfig(scene, { outputDir: job.outputDir, dataDir: dataDir() })
+        mkdirSync(job.outputDir, { recursive: true })
         const configPath = join(job.outputDir, 'run-config.json')
         writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8')
         writeFileSync(join(job.outputDir, 'scene.json'), JSON.stringify(scene, null, 2) + '\n', 'utf8')

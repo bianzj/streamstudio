@@ -14,6 +14,7 @@ const OVERPASS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?Z$/
 function validUtcParts(match) {
   const [year, month, day, hour, minute] = match.slice(1, 6).map(Number)
   const second = match[6] === undefined ? 0 : Number(match[6])
+  if (year < 1900 || year > 2200) return false  // the engine (forcing/utc.cpp) accepts 1900–2200 only
   if (hour > 23 || minute > 59 || second > 59 || month < 1 || month > 12 || day < 1) return false
   const date = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
   date.setUTCFullYear(year)  // years 0–99 are mapped to 1900+ by Date.UTC
@@ -25,6 +26,12 @@ function spinupNodes(value) {
   const number = Number(value)
   if (!Number.isFinite(number) || number < 0 || number > 240) throw new Error('起转节点数（temperature.spinupHours）须在 0–240 之间，缺省 7')
   return Math.ceil(number - 1e-9)
+}
+
+function iterationCount(value) {
+  const number = Number(value)
+  if (!Number.isInteger(number) || number < 1 || number > 10000) throw new Error('能量平衡迭代次数 maxIterations 须为 1–10000 的整数')
+  return number
 }
 
 // Local date + clock + UTC offset (v1 projects) -> ISO UTC overpass.
@@ -298,7 +305,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     if (!scene) throw new Error('缺少影像模拟配置')
     const overpass = String(scene.overpass || '').trim()
     const match = OVERPASS.exec(overpass)
-    if (!match || !validUtcParts(match)) throw new Error('过境时刻须为存在的 UTC 日期时间，格式 YYYY-MM-DDTHH:MM:SSZ（不接受 2019-02-30、T24:00 等）')
+    if (!match || !validUtcParts(match)) throw new Error('过境时刻须为存在的 UTC 日期时间，格式 YYYY-MM-DDTHH:MM:SSZ，年份 1900–2200（不接受 2019-02-30、T24:00 等）')
     const opticalEnabled = Boolean(scene.optical?.enabled)
     const thermalEnabled = Boolean(scene.thermal?.enabled)
     const assimilation = assimilationKind(scene)
@@ -350,9 +357,11 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
       }
     }
     // Optional BSM soil brightness of the scene; omitted keeps classes.json (0.25).
-    const brightness = Number(surfaceInput.soilBrightness?.value ?? surfaceInput.soilBrightness)
-    if (Number.isFinite(brightness) && brightness > 0) {
-      if (brightness < 0.05 || brightness > 1) throw new Error('地表土壤亮度须在 0.05–1 之间')
+    // FIX(2026-11-24 S3): a given value must be valid; 0 / negative / non-numeric used to be dropped silently (default 0.25).
+    const brightnessInput = surfaceInput.soilBrightness?.value ?? surfaceInput.soilBrightness
+    if (brightnessInput !== undefined && brightnessInput !== null && String(brightnessInput).trim() !== '') {
+      const brightness = Number(brightnessInput)
+      if (!Number.isFinite(brightness) || brightness < 0.05 || brightness > 1) throw new Error('地表土壤亮度 soilBrightness 须为 0.05–1 之间的数（省略则用默认 0.25）')
       surface.soilBrightness = brightness
     }
     // Constant view geometry and location must be physical (the engine checks the same ranges; rasters are
@@ -408,8 +417,9 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
             ? { referenceHeight: Number(temperatureInput.energy.referenceHeight) } : {}),
           ...(hasNumber(temperatureInput.energy?.maxAerodynamicResistance)
             ? { maxAerodynamicResistance: Number(temperatureInput.energy.maxAerodynamicResistance) } : {}),
-          ...(Number.isInteger(Number(temperatureInput.energy?.maxIterations)) && Number(temperatureInput.energy.maxIterations) > 0
-            ? { maxIterations: Number(temperatureInput.energy.maxIterations) } : {}),
+          // FIX(2026-11-24 S4): an invalid maxIterations is an error, not silently the engine default.
+          ...(temperatureInput.energy?.maxIterations !== undefined && temperatureInput.energy?.maxIterations !== null && String(temperatureInput.energy.maxIterations).trim() !== ''
+            ? { maxIterations: iterationCount(temperatureInput.energy.maxIterations) } : {}),
           soilResistance: {
             method: temperatureInput.energy?.soilResistance?.method === 'sellers' ? 'sellers' : 'constant',
             value: hasNumber(temperatureInput.energy?.soilResistance?.value) ? Number(temperatureInput.energy.soilResistance.value) : 200

@@ -1,4 +1,5 @@
 #include "image.h"
+#include "parallel_error.h"
 #include "assimilation.h"
 #include "config.h"
 #include "inversion.h"
@@ -164,8 +165,8 @@ int runImage(const std::string& configPath)
     const double overpass = config.overpass;
     // FIX(2026-11-21 B10, 2026-11-24): the march start is resolved from temperature.spinupHours = number of whole-hour
     // ERA5 nodes before the overpass (default 7, see config.h); counted backwards from the overpass, never from a fixed
-    // clock time. marchStart (below) replaces the former dayStart (00 UTC of the overpass day). Original note kept:
-    // DEFERRED[中] 物理: EB 起算点固定为过境当天 00 UTC，不考虑经度。对东亚/澳洲（UTC+8..+10）约 02:30 UTC 的过境，只积分当地上午 0.5–2.5 h，热历史默认 00 UTC 之前等温（无日变化记忆），G 与 Tss 偏差大；过境恰为 00:00 UTC 时只有 1 个时次，完全没有起转；建议：起转改为过境前固定时长（如 ≥24 h），或从按经度换算的当地午夜开始，并相应扩大 ERA5 读取时段
+    // clock time. marchStart (below) replaces the former dayStart (00 UTC of the overpass day).
+    // (FIX 2026-11-24 L1: the old "fixed 00 UTC start" DEFERRED note was removed; it is resolved.)
     const double dayStart = std::floor(overpass / 86400.0) * 86400.0;
     double marchStart = dayStart;        // first EB node (set from spinupHours and the pack coverage)
     double spinupUsedHours = 0.0;        // overpass - marchStart, hours
@@ -361,8 +362,11 @@ int runImage(const std::string& configPath)
     long long moistureFallback = 0;
     if (eb && config.soilMoistureFromEra5) {
         soilMoisture.assign(grid.size(), kNaN);
+        ParallelError errorsMoisture;
         #pragma omp parallel for schedule(dynamic, 16) reduction(+:moistureFallback)
-        for (int row = startRow; row < endRow; ++row)
+        for (int row = startRow; row < endRow; ++row) {
+            if (errorsMoisture.failed()) continue;
+            try {
             for (int column = startColumn; column < endColumn; ++column) {
                 const size_t pixel = static_cast<size_t>(row) * grid.width + column;
                 if (!validLocation(pixel)) continue;
@@ -371,6 +375,9 @@ int runImage(const std::string& configPath)
                 if (std::isfinite(value)) soilMoisture[pixel] = static_cast<float>(std::clamp(value, 0.0, 1.0));
                 else { soilMoisture[pixel] = classes.defaultSoilMoisture; ++moistureFallback; }
             }
+            } catch (...) { errorsMoisture.capture(); }
+        }
+        errorsMoisture.rethrow("土壤水分读取");
         log("土壤水分取气象强迫 swvl1（过境时刻）" + (moistureFallback ? "，" + std::to_string(moistureFallback) + " 个像元无强迫陆面值，使用默认值" : std::string()));
     } else {
         soilMoisture = fieldRaster(config.soilMoisture, grid, "土壤水分 SM", classes.defaultSoilMoisture, false);
@@ -424,11 +431,16 @@ int runImage(const std::string& configPath)
         for (int code = 0; code < 256; ++code)
             if (typeUsed[code] && classes.classes[code].surface == SurfaceKind::Vegetation) leafTypes.push_back(code);
         for (const int code : leafTypes) { leafReflectance[code]; leafTransmittance[code]; }
+        ParallelError errorsProspect;
         #pragma omp parallel for schedule(dynamic, 1)
         for (int item = 0; item < static_cast<int>(leafTypes.size()); ++item) {
+            if (errorsProspect.failed()) continue;
+            try {
             const int code = leafTypes[item];
             prospect(coeff, classes.classes[code].leaf, leafReflectance.at(code), leafTransmittance.at(code));
+            } catch (...) { errorsProspect.capture(); }
         }
+        errorsProspect.rethrow("PROSPECT 叶片光谱");
         for (const int code : leafTypes) {
             if (config.opticalEnabled) {
                 auto& reflectance = leafBandReflectance[code];
@@ -457,8 +469,11 @@ int runImage(const std::string& configPath)
             }
         // The analysis can move soil moisture anywhere and needs neighbouring steps for dρ/dθ: build every step.
         if (config.assimilation.enabled()) std::fill(moistureUsed.begin(), moistureUsed.end(), 1);
+        ParallelError errorsBsm;
         #pragma omp parallel for schedule(dynamic, 8)
         for (int step = 0; step <= kMoistureSteps; ++step) {
+            if (errorsBsm.failed()) continue;
+            try {
             if (!moistureUsed[step]) continue;
             std::vector<float> spectrum;
             bsm(coeff, classes.soilOptics, static_cast<float>(step) / kMoistureSteps, spectrum);
@@ -468,7 +483,9 @@ int runImage(const std::string& configPath)
                 soilBandReflectance[step] = std::move(reflectance);
             }
             if (eb) soilBins[step] = binSpectrum(solarBins, spectrum);
+            } catch (...) { errorsBsm.capture(); }
         }
+        errorsBsm.rethrow("BSM 土壤光谱");
         for (const int code : leafTypes)
             if (classes.classes[code].groundKind == GroundKind::Flat)
                 flatGroundBins[code] = std::vector<float>(solarBins.size(), classes.classes[code].groundReflectance);
@@ -876,8 +893,11 @@ int runImage(const std::string& configPath)
         fluxOut.assign(kFluxBands, std::vector<float>(pixels, kNaN));
         std::atomic<int> rowsDone{0};
         const int rowCount = endRow - startRow;
+        ParallelError errorsEb;
         #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing, ebClamped)
         for (int row = startRow; row < endRow; ++row) {
+            if (errorsEb.failed()) continue;
+            try {
             for (int column = startColumn; column < endColumn; ++column) {
                 const size_t pixel = static_cast<size_t>(row) * grid.width + column;
                 const auto* entry = classes.find(type[pixel]);
@@ -945,7 +965,9 @@ int runImage(const std::string& configPath)
             }
             const int done = ++rowsDone;
             if (isMainThread() && done % std::max(1, rowCount / 40) == 0) progress(10 + 60.0 * done / rowCount, "能量平衡求解");
+            } catch (...) { errorsEb.capture(); }
         }
+        errorsEb.rethrow("能量平衡求解");
         log("能量平衡：" + std::to_string(ebPixels) + " 个像元，过境时刻收敛 " + std::to_string(ebConverged) + " 个（稳定度迭代收敛 " +
             std::to_string(ebStable) + " 个），水体取" + (waterSkinMissing ? " 2 m 气温（数据包无 skt）" : " 气象强迫表皮温度") + " " +
             std::to_string(ebWaterPixels) + " 个" + (ebFailed ? "，未能求解 " + std::to_string(ebFailed) + " 个" : "") +
@@ -1104,8 +1126,11 @@ int runImage(const std::string& configPath)
                             : inversionSpan > 0 ? inversionStart + inversionSpan : (eb ? 70 : 25);
     const double imageSpan = 90 - imageStart;
     progress(imageStart, "逐像元成像");
+    ParallelError errorsImaging;
     #pragma omp parallel for schedule(dynamic, 4) reduction(+:invalidInput, invalidType, waterPixels, nightPixels, opticalPixels, thermalPixels, thermalFailed, solarFailed)
     for (int row = startRow; row < endRow; ++row) {
+        if (errorsImaging.failed()) continue;
+        try {
         for (int column = startColumn; column < endColumn; ++column) {
             const size_t pixel = static_cast<size_t>(row) * grid.width + column;
             const auto* entry = classes.find(type[pixel]);
@@ -1187,7 +1212,9 @@ int runImage(const std::string& configPath)
         }
         const int done = ++rowsDone;
         if (isMainThread() && done % std::max(1, rowCount / 40) == 0) progress(imageStart + imageSpan * done / rowCount, "逐像元成像");
+        } catch (...) { errorsImaging.capture(); }
     }
+    errorsImaging.rethrow("逐像元成像");
 
     // ---------------- outputs ----------------
     progress(92, "写出结果影像");
@@ -1362,7 +1389,7 @@ int runImage(const std::string& configPath)
                                                std::to_string(static_cast<int>(kComponentTemperatureMin)) + "-" + std::to_string(static_cast<int>(kComponentTemperatureMax)) + " K limit");
         temperatureInfo.Add("componentTemperatureLimitsK", std::to_string(static_cast<int>(kComponentTemperatureMin)) + "-" + std::to_string(static_cast<int>(kComponentTemperatureMax)));
         temperatureInfo.Add("stabilityConvergedPixels", static_cast<GInt64>(ebStable));
-        temperatureInfo.Add("stability", "Monin-Obukhov coupled solve: 1/L fixed-point relaxation 0.5, H-only buoyancy; iteration tolerance 1e-4 + 0.02|target| (m-1), final acceptance 2x iteration tolerance");
+        temperatureInfo.Add("stability", "Monin-Obukhov coupled solve: 1/L fixed-point iteration with adaptive relaxation 0.02-0.5 (halved on a sign change of the error, grown by 1.1 otherwise), H-only buoyancy; iteration tolerance 1e-4 + 0.02|target| (m-1), final acceptance 2x iteration tolerance");
         temperatureInfo.Add("energyScheme", "tirt");
         temperatureInfo.Add("soilHeatMethod", config.soilHeatMethod == SoilHeatMethod::Depth ? "depth" :
                                                config.soilHeatMethod == SoilHeatMethod::Surface ? "surface" : "direct");
