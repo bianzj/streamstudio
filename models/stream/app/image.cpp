@@ -603,6 +603,14 @@ int runImage(const std::string& configPath)
                 }
             }
             log("地形辐射：面元法，逐像元坡度/坡向（DEM）" + (invalid ? "，无效像元 " + std::to_string(invalid) : ""));
+            // FIX(2026-11-24 L5): the 3 x 3 Sobel stencil needs eight neighbours, so the outermost ring of the grid keeps
+            // slope 0 (flat). It used to be silent; it is now counted and reported.
+            long long ring = 0;   // ring pixels inside the processed region
+            for (int row = startRow; row < endRow; ++row)
+                for (int column = startColumn; column < endColumn; ++column)
+                    if (row == 0 || column == 0 || row == grid.height - 1 || column == grid.width - 1) ++ring;
+            if (ring) log("警告：面元法需要 8 邻域，栅格最外一圈的坡度保持 0（按平地处理），处理区域内有 " + std::to_string(ring) +
+                          " 个这样的像元；如需地形，请让 DEM 比研究区大一圈");
         }
     }
     // ---- EB pixel machinery: one implementation for the forward solve and the assimilation re-solve ----
@@ -738,6 +746,11 @@ int runImage(const std::string& configPath)
             const double time = nodes[node];
             const Sun sun = solarPosition(time, latitude[pixel], longitude[pixel], dem[pixel]);
             if (!sun.ok) return false;
+            // FIX(2026-11-24 L4): each node uses its own day of year (E0 in Erbs / the clear-sky DNI limit); with a spin-up
+            // that crosses 00 UTC the earlier nodes used to take the overpass day. The overpass node itself is unchanged.
+            const UtcTime nodeTime = utcFromSeconds(time);
+            const int dayOfYear = static_cast<int>(daysFromCivil(nodeTime.year, nodeTime.month, nodeTime.day) -
+                                                   daysFromCivil(nodeTime.year, 1, 1)) + 1;
             Forcing meteo = forcing.at(time);
             if (!validForcing(meteo)) return false;
             // Receiving-surface shortwave (2026-11-20). Terrain: split the horizontal flux (DNI limit at the true

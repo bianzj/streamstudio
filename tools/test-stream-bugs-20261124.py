@@ -100,3 +100,33 @@ def test_lsct_counts_split_bit9_stops(tmp_path):
     counts = summary(out)['inversion']['counts']
     assert counts['notConvergedPixels'] == counts['iterationLimitPixels'] + counts['stepEvaluationFailedPixels']
     assert counts['convergedPixels'] + counts['lineSearchStalledPixels'] + counts['notUpdatedPixels'] + counts['notConvergedPixels'] == 1
+
+# ---------- L5: the facet-method border ring is reported ----------
+def geo_raster(path, array):
+    array = np.asarray(array, np.float32)
+    ds = gdal.GetDriverByName('GTiff').Create(str(path), array.shape[1], array.shape[0], 1, gdal.GDT_Float32)
+    ds.SetGeoTransform((116.0, 0.001, 0.0, 40.0, 0.0, -0.001))
+    srs = __import__('osgeo.osr', fromlist=['osr']).SpatialReference()
+    srs.ImportFromEPSG(4326)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.GetRasterBand(1).WriteArray(array)
+    ds = None
+    return str(path)
+
+
+def test_facet_border_ring_is_reported(tmp_path):
+    config = rt_config(tmp_path, 'facet', terrain=dict(mode='facet'))
+    rows = np.arange(5, dtype=np.float32)[:, None] * 30.0 + np.zeros((5, 5), np.float32)   # a 30 m per pixel ramp
+    config['surface']['type'] = dict(file=geo_raster(tmp_path / 'type5.tif', np.full((5, 5), 10)))
+    config['surface']['dem'] = dict(file=geo_raster(tmp_path / 'dem5.tif', rows))
+    config['surface'].pop('latitude'), config['surface'].pop('longitude')
+    ret, out = run(tmp_path, 'facet', config)
+    assert ret.returncode == 0, ret.stderr + ret.stdout
+    assert '最外一圈' in ret.stdout and '16 个' in ret.stdout, ret.stdout
+    # a region that excludes the ring produces no warning
+    config['region'] = dict(startRow=1, endRow=4, startColumn=1, endColumn=4)
+    sub = tmp_path / 'inner'
+    sub.mkdir()
+    ret2, _ = run(sub, 'facet', config)
+    assert ret2.returncode == 0, ret2.stderr + ret2.stdout
+    assert '最外一圈' not in ret2.stdout
