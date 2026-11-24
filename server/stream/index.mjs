@@ -1,23 +1,31 @@
 // STREAM remote-sensing image simulation service: its own API (/api/stream/*), serial job queue
 // and event channel. It shares nothing with the HiStream run machinery.
 import { execFile, spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { createProjectStore } from './config.mjs'
+import { FORCING_METADATA_FILE, FORCING_PRESETS, createForcingRules, isPlainObject, isPresetName } from './forcing.mjs'
 import { createRasterTools } from './rasters.mjs'
 
 const PROGRESS = /^STREAM\tprogress\t([\d.]+)\t(.*)$/
 const PRODUCT_FILE = /\.(tif|json)$/i
+const PACK_KINDS = ['stream-era5-pack', 'stream-forcing-pack']
+const FORCING_CHECK_TIMEOUT_MS = 60_000
+const FORCING_QUICK_TIMEOUT_MS = 15_000
 
-export function createStreamService({ resourceRoot, modelRoot, json, body, readTiff, normalizeHostPath, windowsPath, runTask = null }) {
+export function createStreamService({ resourceRoot, modelRoot, json, body, readTiff, normalizeHostPath, windowsPath, runTask = null, documentsRoot = null }) {
   const candidates = [
     join(resourceRoot, 'engine', 'stream.exe'),
     join(modelRoot, 'bin_x64', 'Release', 'stream.exe'),
     join(modelRoot, 'bin_x64', 'Debug', 'stream.exe')
   ]
-  const projects = createProjectStore({ normalizeHostPath, windowsPath })
+  const documents = documentsRoot || join(homedir(), 'Documents', 'Stream Studio')
+  const era5Directory = () => join(documents, 'era5-packs')
+  const forcingMetadataDirectory = () => join(documents, 'forcing-metadata')
+  const projects = createProjectStore({ normalizeHostPath, windowsPath, forcingDirectories: () => [forcingMetadataDirectory(), era5Directory()] })
+  const forcingRules = createForcingRules({ normalizeHostPath, windowsPath })
   const rasters = createRasterTools({ readTiff, normalizeHostPath, windowsPath })
   const clients = new Set()
   const queue = []
@@ -26,9 +34,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
 
   const engine = () => candidates.find(existsSync) || candidates[0]
   const dataDir = () => join(dirname(engine()), 'stream-defined')
-  const documents = join(homedir(), 'Documents', 'Stream Studio')
   const defaultOutputRoot = () => windowsPath(join(documents, 'stream'))
-  const era5Directory = () => join(documents, 'era5-packs')
 
   function emit(payload) {
     const line = `data: ${JSON.stringify(payload)}\n\n`
@@ -43,7 +49,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return {
       executable: windowsPath(executable), executableExists: existsSync(executable),
       dataReady: ['classes.json', 'optipar_new.csv', 'Esun_.dat', 'Esky_.dat'].every((name) => existsSync(join(dataDir(), name))),
-      defaultOutputRoot: defaultOutputRoot(), era5Directory: windowsPath(era5Directory()),
+      defaultOutputRoot: defaultOutputRoot(), era5Directory: windowsPath(era5Directory()), forcingMetadataDirectory: windowsPath(forcingMetadataDirectory()),
       running: summary(active), queue: queue.map(summary)
     }
   }
@@ -59,6 +65,10 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     Object.assign(job.manifest, patch, { updatedAt: new Date().toISOString() })
     writeFileSync(join(job.outputDir, 'run-manifest.json'), JSON.stringify(job.manifest, null, 2) + '\n', 'utf8')
   }
+
+  // 2026-11-24 (审核 S6): a run that did not complete (engine killed / crashed / failed) can leave a half-written
+  // .tif behind, so only completed runs list products.
+  const runProducts = (directory, status) => status === 'completed' ? products(directory) : []
 
   const products = (directory) => existsSync(directory)
     ? readdirSync(directory).filter((name) => PRODUCT_FILE.test(name) && !['run-manifest.json', 'run-config.json', 'scene.json', 'scene_summary.json'].includes(name)).map((name) => windowsPath(join(directory, name)))
@@ -92,7 +102,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     job.finished = true
     job.status = status
     if (job.manifest) {
-      try { writeManifest(job, { status, exitCode: code, finishedAt: new Date().toISOString(), products: products(job.outputDir).map((path) => basename(path)), ...(error ? { error } : {}) }) } catch {}
+      try { writeManifest(job, { status, exitCode: code, finishedAt: new Date().toISOString(), products: runProducts(job.outputDir, status).map((path) => basename(path)), ...(error ? { error } : {}) }) } catch {}
     }
     let result = null
     try { result = job.collect?.(status) ?? null } catch (collectError) { error = error || collectError.message }
@@ -181,10 +191,10 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
         writeManifest(job, {})
         launch(job, ['run', configPath])
       },
-      collect() {
+      collect(status) {
         let result = null
         try { result = JSON.parse(readFileSync(join(job.outputDir, 'scene_summary.json'), 'utf8')) } catch {}
-        return { products: products(job.outputDir), summary: result }
+        return { products: runProducts(job.outputDir, status), summary: result }
       }
     }
     return enqueue(job)
@@ -215,7 +225,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
       // Shipped reference runs store the land-type path relative to the run folder so they survive being copied.
       typeFile: typeFile && !isAbsolute(typeFile) ? windowsPath(resolve(outputDir, typeFile)) : typeFile,
       typeBand,
-      products: products(outputDir), summary: result, config }
+      products: runProducts(outputDir, manifest.status), summary: result, config }
   }
 
   function listRuns(root) {
@@ -236,7 +246,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   // ---------- ERA5 packs ----------
   function packSummary(path) {
     const pack = JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, ''))
-    if (pack.kind !== 'stream-era5-pack') return null
+    if (!PACK_KINDS.includes(pack.kind)) return null
     // Indexes registered before time-period packs only ever completed for a whole calendar year.
     const fullYear = pack.fullYear ?? Boolean(pack.complete)
     const period = pack.period || (fullYear ? { start: `${pack.year}-01-01T00:00:00Z`, end: `${pack.year}-12-31T23:00:00Z` } : null)
@@ -249,7 +259,9 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
       ((pack.missingVariables || []).length + (pack.incompleteVariables || []).length) > 0)
     return { path: windowsPath(path), label: pack.label || `${String(pack.product || 'era5').toUpperCase()} ${period ? period.start.slice(0, 10) : pack.year}`, product: pack.product,
       year: pack.year, period, fullYear, complete, files: (pack.files || []).length, variables: pack.variables || {},
-      missingVariables, incompleteVariables, grid: pack.grid, createdAt: pack.createdAt }
+      missingVariables, incompleteVariables, grid: pack.grid, createdAt: pack.createdAt || pack.created,
+      // stream-forcing-pack (non-ERA5 gridded sources) carries the metadata it was registered with and its record step.
+      kind: pack.kind, metadata: typeof pack.metadata === 'string' ? pack.metadata : null, stepHours: Number(pack.stepHours) || 1 }
   }
 
   // Registered packs plus any pack a project points at elsewhere (for example one shipped inside the project).
@@ -263,22 +275,43 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     }).filter(Boolean).sort((a, b) => Number(a.external) - Number(b.external) || String(b.period?.start || b.year).localeCompare(String(a.period?.start || a.year)) || String(a.label).localeCompare(String(b.label)))
   }
 
+  // ERA5 / ERA5-Land go through era5-register (unchanged); any other gridded source goes through forcing-register
+  // with its metadata (a preset name, an inline object stored beside the index, or a metadata file).
   function registerPack(data) {
     assertEngine()
     const files = (Array.isArray(data.files) ? data.files : []).map((value) => resolve(normalizeHostPath(String(value || '').trim().replace(/^"|"$/g, ''))))
     if (!files.length) throw new Error('请选择逐时气象强迫 NetCDF 文件')
+    if (files.length > 4096) throw new Error('气象强迫文件过多（上限 4096）')
     for (const file of files) if (!existsSync(file) || !statSync(file).isFile()) throw new Error(`气象强迫文件不存在：${windowsPath(file)}`)
-    const product = ['era5', 'era5-land'].includes(data.product) ? data.product : 'auto'
+    const rawMetadata = data.metadata === undefined || data.metadata === null || data.metadata === '' ? data.product : data.metadata
+    const generic = rawMetadata !== undefined && rawMetadata !== null && rawMetadata !== '' && !['era5', 'era5-land', 'auto'].includes(rawMetadata)
+    const product = ['era5', 'era5-land'].includes(rawMetadata) ? rawMetadata : 'auto'
     const label = String(data.label || '').trim().slice(0, 64)
     mkdirSync(era5Directory(), { recursive: true })
-    const index = join(era5Directory(), `pack-${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const index = join(era5Directory(), `pack-${stamp}.json`)
+    let args, metadataCopy = null
+    if (generic) {
+      if (typeof rawMetadata === 'string' && rawMetadata.trim().toLowerCase() === 'station-csv') throw new Error('气象站点 CSV 无需登记，请直接在气象强迫面板中选择 CSV 文件')
+      const resolved = forcingRules.resolveMetadata(rawMetadata, { projectPath: data.projectPath, directories: [era5Directory(), forcingMetadataDirectory()] })
+      if (resolved.form === 'station') throw new Error('站点形态的气象强迫元数据无需登记数据包')
+      let argument = resolved.metadata
+      if (isPlainObject(resolved.metadata)) {
+        metadataCopy = join(era5Directory(), 'metadata', `pack-${stamp}.metadata.json`)
+        mkdirSync(dirname(metadataCopy), { recursive: true })
+        writeFileSync(metadataCopy, JSON.stringify({ kind: 'stream-forcing-metadata', schemaVersion: 1, ...resolved.metadata }, null, 2) + '\n', 'utf8')
+        argument = metadataCopy
+      }
+      args = ['forcing-register', index, '--metadata', String(argument), ...files.map(windowsPath)]
+    } else args = ['era5-register', index, '--product', product, ...files.map(windowsPath)]
     const job = {
       kind: 'era5', label: label || '气象数据包', successCodes: [0, 3],
       // DEFERRED[中] Bug: 所有 NetCDF 路径直接作为命令行参数，Windows CreateProcess 命令行上限约 32767 字符，按天下载的一年数据（数百个长路径）会让 spawn 失败（ENAMETOOLONG），并落入 launch 中 error 后不一定触发 close 的问题；建议：把文件列表写入临时清单文件，用 --files-from <list> 之类的参数传给引擎
-      start() { launch(job, ['era5-register', index, '--product', product, ...files.map(windowsPath)]) },
+      start() { launch(job, args) },
       collect(status) {
         if (status !== 'completed') {
           try { if (existsSync(index)) unlinkSync(index) } catch {}
+          try { if (metadataCopy && existsSync(metadataCopy)) unlinkSync(metadataCopy) } catch {}
           return null
         }
         if (!existsSync(index)) return null
@@ -294,8 +327,114 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     const path = resolve(normalizeHostPath(String(value || '').trim()))
     if (dirname(path).toLowerCase() !== resolve(era5Directory()).toLowerCase() || !existsSync(path)) throw new Error('只能移除登记目录中的气象数据包索引')
     if (!packSummary(path)) throw new Error('不是气象数据包索引')
+    // A generic pack may own a metadata copy stored under <packs>/metadata/.
+    try {
+      const metadata = JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')).metadata
+      if (typeof metadata === 'string' && /\.json$/i.test(metadata)) {
+        const owned = resolve(dirname(path), metadata)
+        if (dirname(owned).toLowerCase() === join(resolve(era5Directory()), 'metadata').toLowerCase() && existsSync(owned)) unlinkSync(owned)
+      }
+    } catch {}
     unlinkSync(path)
     return { removed: true, path: windowsPath(path) }
+  }
+
+  // ---------- forcing metadata ----------
+  // Short engine calls (preset listing, forcing-check) run to completion outside the job queue, under a timeout.
+  function runEngine(args, timeoutMs) {
+    const executable = assertEngine()
+    return new Promise((resolveRun, reject) => {
+      execFile(executable, args, { cwd: dirname(executable), windowsHide: true, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+        if (error && error.killed) return reject(new Error(`STREAM 引擎调用超时（${Math.round(timeoutMs / 1000)} s）：${args[0]}`))
+        if (error && typeof error.code !== 'number') return reject(new Error(`无法运行 STREAM 引擎：${error.message}`))
+        resolveRun({ code: error ? error.code : 0, stdout: String(stdout || ''), stderr: String(stderr || '') })
+      })
+    })
+  }
+
+  const presetCache = new Map()
+  async function listPresets() {
+    const result = await runEngine(['forcing-preset'], FORCING_QUICK_TIMEOUT_MS)
+    const names = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => isPresetName(line))
+    if (result.code !== 0 || !names.length) throw new Error(`stream forcing-preset 失败（退出码 ${result.code}）：${result.stderr.trim().slice(-300) || result.stdout.trim().slice(0, 300)}`)
+    return { presets: names, builtin: FORCING_PRESETS }
+  }
+
+  async function getPreset(name) {
+    const text = String(name ?? '').trim()
+    if (!isPresetName(text)) throw new Error(`未知的气象强迫预设 "${text}"；可用：${FORCING_PRESETS.join('、')}`)
+    if (!presetCache.has(text)) {
+      const result = await runEngine(['forcing-preset', text], FORCING_QUICK_TIMEOUT_MS)
+      let preset
+      try { preset = JSON.parse(result.stdout) } catch { preset = null }
+      if (result.code !== 0 || !isPlainObject(preset)) throw new Error(`stream forcing-preset ${text} 失败（退出码 ${result.code}）：${result.stderr.trim().slice(-300)}`)
+      presetCache.set(text, preset)
+    }
+    return { name: text, metadata: structuredClone(presetCache.get(text)) }
+  }
+
+  // metadata (preset name | object | file path) + optional data (pack index | station CSV files) -> engine forcing-check JSON.
+  async function checkForcing(data) {
+    const raw = data.metadata
+    if (raw === undefined || raw === null || raw === '') throw new Error('请提供要校验的气象强迫元数据（预设名、元数据对象或文件路径）')
+    const resolved = forcingRules.resolveMetadata(raw, { projectPath: data.projectPath, directories: [era5Directory(), forcingMetadataDirectory()] })
+    const packText = String(data.pack ?? '').trim()
+    const files = forcingRules.stationFiles(data.files)
+    const dataArguments = []
+    if (packText) dataArguments.push(windowsPath(forcingRules.packFile(packText)))
+    dataArguments.push(...files)
+    const scratch = mkdtempSync(join(tmpdir(), 'stream-forcing-'))
+    try {
+      let argument = resolved.metadata
+      if (isPlainObject(argument)) {
+        argument = join(scratch, 'metadata.json')
+        writeFileSync(argument, JSON.stringify({ kind: 'stream-forcing-metadata', schemaVersion: 1, ...resolved.metadata }), 'utf8')
+      }
+      const args = ['forcing-check', String(argument), ...(dataArguments.length ? ['--data', ...dataArguments] : []), '--json']
+      const result = await runEngine(args, FORCING_CHECK_TIMEOUT_MS)
+      if (![0, 3].includes(result.code)) throw new Error(`stream forcing-check 异常结束（退出码 ${result.code}）：${(result.stderr.trim() || result.stdout.trim()).slice(-400)}`)
+      let report
+      try { report = JSON.parse(result.stdout) } catch { throw new Error(`stream forcing-check 输出无法解析：${result.stdout.trim().slice(0, 300)}`) }
+      return { ok: report.ok === true, errors: report.errors || [], warnings: report.warnings || [], notes: report.notes || [], resolved: report.resolved || null, form: resolved.form }
+    } finally { try { rmSync(scratch, { recursive: true, force: true }) } catch {} }
+  }
+
+  const metadataFileName = (value) => {
+    const name = String(value || FORCING_METADATA_FILE).trim()
+    if (!/^forcing-metadata[\w.-]*\.json$/.test(name)) throw new Error(`元数据文件名须形如 ${FORCING_METADATA_FILE}`)
+    return name
+  }
+
+  function projectDirectory(value) {
+    const text = String(value || '').trim()
+    if (!text) throw new Error('请先保存工程，再保存工程元数据')
+    const path = resolve(normalizeHostPath(text.replace(/^"|"$/g, '')))
+    if (!isAbsolute(path) || !/\.json$/i.test(path) || !existsSync(path) || !statSync(path).isFile()) throw new Error('请先保存工程，再保存工程元数据')
+    return dirname(path)
+  }
+
+  function saveProjectMetadata(data) {
+    const directory = projectDirectory(data.projectPath)
+    const metadata = data.metadata
+    if (!isPlainObject(metadata)) throw new Error('气象强迫元数据须为对象')
+    forcingRules.assertInlineSize(metadata)
+    const document = { kind: 'stream-forcing-metadata', schemaVersion: 1, ...metadata }
+    forcingRules.checkDocument(document, '气象强迫元数据')
+    const target = join(directory, metadataFileName(data.fileName))
+    const text = JSON.stringify(document, null, 2) + '\n'
+    const temporary = `${target}.${process.pid}.tmp`
+    writeFileSync(temporary, text, 'utf8')
+    renameSync(temporary, target)
+    return { path: windowsPath(target), bytes: Buffer.byteLength(text, 'utf8') }
+  }
+
+  function readProjectMetadata(data) {
+    const directory = projectDirectory(data.projectPath)
+    const target = data.path ? String(data.path) : join(directory, metadataFileName(data.fileName))
+    const absolute = resolve(normalizeHostPath(target))
+    if (!existsSync(absolute)) return { exists: false, path: windowsPath(absolute) }
+    const { path, document } = forcingRules.readMetadataFile(absolute, [directory, era5Directory(), forcingMetadataDirectory()])
+    return { exists: true, path: windowsPath(path), metadata: document }
   }
 
   // ---------- dialogs ----------
@@ -304,7 +443,9 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     const filters = {
       file: ['选择栅格文件', '栅格 (*.tif;*.tiff;*.img;*.dat;*.nc;*.h5;*.hdf)|*.tif;*.tiff;*.img;*.dat;*.nc;*.h5;*.hdf|所有文件 (*.*)|*.*', false],
       project: ['打开遥感影像模拟工程', 'STREAM 工程 (*.json)|*.json|所有文件 (*.*)|*.*', false],
-      era5: ['选择逐小时气象强迫 NetCDF 文件（可多选，覆盖一天到一年均可；ERA5 / ERA5-Land 为用例）', 'NetCDF (*.nc;*.nc4)|*.nc;*.nc4|所有文件 (*.*)|*.*', true]
+      era5: ['选择逐小时气象强迫 NetCDF 文件（可多选，覆盖一天到一年均可；ERA5 / ERA5-Land 为用例）', 'NetCDF (*.nc;*.nc4)|*.nc;*.nc4|所有文件 (*.*)|*.*', true],
+      station: ['选择气象站点 CSV 文件（可多选）', 'CSV (*.csv;*.txt;*.dat)|*.csv;*.txt;*.dat|所有文件 (*.*)|*.*', true],
+      metadata: ['选择气象强迫元数据文件', '元数据 (*.json)|*.json|所有文件 (*.*)|*.*', false]
     }
     const script = kind === 'folder' ? [
       "$ErrorActionPreference = 'Stop'", 'Add-Type -AssemblyName System.Windows.Forms',
@@ -358,8 +499,14 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     'POST /api/stream/era5/list': (data) => ({ packs: listPacks(data.include), directory: windowsPath(era5Directory()) }),
     'POST /api/stream/era5/register': (data) => registerPack(data),
     'POST /api/stream/era5/remove': (data) => removePack(data.path),
+    'GET /api/stream/forcing/presets': () => listPresets(),
+    'POST /api/stream/forcing/preset': (data) => getPreset(data.name),
+    'POST /api/stream/forcing/check': (data) => checkForcing(data),
+    'POST /api/stream/forcing/register': (data) => registerPack(data),
+    'POST /api/stream/forcing/metadata/save': (data) => saveProjectMetadata(data),
+    'POST /api/stream/forcing/metadata/read': (data) => readProjectMetadata(data),
     'POST /api/stream/pick': async (data) => {
-      const kind = ['folder', 'project', 'era5'].includes(data.kind) ? data.kind : 'file'
+      const kind = ['folder', 'project', 'era5', 'station', 'metadata'].includes(data.kind) ? data.kind : 'file'
       const paths = await pick(kind)
       return paths.length ? { path: paths[0], paths } : { cancelled: true }
     }
@@ -388,7 +535,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     if (!job?.child) return
     job.stopped = true
     if (job.manifest) {
-      try { writeManifest(job, { status: 'stopped', exitCode: null, finishedAt: new Date().toISOString(), products: products(job.outputDir).map((path) => basename(path)) }) } catch {}
+      try { writeManifest(job, { status: 'stopped', exitCode: null, finishedAt: new Date().toISOString(), products: [] }) } catch {}
     }
     if (process.platform === 'win32') {
       try { spawnSync('taskkill', ['/pid', String(job.child.pid), '/T', '/F'], { windowsHide: true }) } catch { job.child.kill('SIGTERM') }

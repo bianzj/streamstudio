@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { isUnifiedProject } from '../../src/renderer/src/project-unified.js'
+import { createForcingRules, looksLikeMetadataPath } from './forcing.mjs'
 
 export const PROJECT_FILE = 'stream-project.json'
 const COMPONENT_KEYS = ['soilSunlit', 'soilShaded', 'leafSunlit', 'leafShaded']
@@ -72,6 +73,13 @@ export function mapStreamScenePaths(scene, convert) {
   if (components && String(components.file || '').trim()) components.file = convert(components.file)
   const era5 = scene.temperature?.era5
   if (era5 && String(era5.pack || '').trim()) era5.pack = convert(era5.pack)
+  const forcing = scene.temperature?.forcing
+  if (forcing && typeof forcing === 'object') {
+    if (String(forcing.pack || '').trim()) forcing.pack = convert(forcing.pack)
+    if (Array.isArray(forcing.files)) forcing.files = forcing.files.map((file) => String(file || '').trim() ? convert(file) : file)
+    if (looksLikeMetadataPath(forcing.metadata)) forcing.metadata = convert(forcing.metadata)
+  }
+  if (looksLikeMetadataPath(scene.temperature?.forcingMetadata)) scene.temperature.forcingMetadata = convert(scene.temperature.forcingMetadata)
   const assimilation = scene.assimilation
   if (assimilation && typeof assimilation === 'object') {
     for (const key of ['data', 'optical', 'uncertainty', 'covariance', 'qa', 'opticalUncertainty', 'opticalQa'])
@@ -84,7 +92,8 @@ export function mapStreamScenePaths(scene, convert) {
   return scene
 }
 
-export function createProjectStore({ normalizeHostPath, windowsPath }) {
+export function createProjectStore({ normalizeHostPath, windowsPath, forcingDirectories = () => [] }) {
+  const forcingRules = createForcingRules({ normalizeHostPath, windowsPath })
   const readDocument = (path) => {
     try { return JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')) } catch { return null }
   }
@@ -372,7 +381,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     if (mode === 'eb') {
       const source = temperatureInput.soilMoisture?.source === 'user' ? 'user' : 'era5'
       // DEFERRED[低] 错误处理: 这里的校验比引擎 config.cpp 宽松：soilHeatMethod/temperatureMethod 原样透传任意字符串，diffuseFraction 不限 [-1,1]，spectralBinNm 不限 1–100 的整数，heatRoughnessKb 不限 ≤20，soilEmissivityK 允许 ≤0；这些错误要等任务出队、建好输出目录后才由引擎报出；建议：在提交时按引擎相同规则校验（白名单 + 范围）
-      temperature = { mode: 'eb', era5: { pack: existingFile(temperatureInput.era5?.pack, '气象数据包') }, soilMoisture: { source },
+      temperature = { mode: 'eb', ...forcingRules.buildForcing(temperatureInput, { projectPath: input.projectPath, directories: forcingDirectories() }), soilMoisture: { source },
         elevationCorrection: temperatureInput.elevationCorrection !== false,
         // EB spin-up = number of whole-hour ERA5 nodes before the overpass (engine default 7 when omitted; 0–240; the
         // engine rounds non-integers up).
