@@ -668,7 +668,7 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
     summary.Add("observation", kind == AssimilationObservation::Brightness ? "brightness" : kind == AssimilationObservation::Lst ? "lst" : "components");
     summary.Add("background", eb ? "eb" : "rt");
     summary.Add("method", "MAP Gauss-Newton per pixel; Dual-number observation Jacobian; tabulated optical moisture slopes are local approximations" +
-                std::string(eb ? "; implicit overpass EB derivative conditional on history and stability (not a full trajectory derivative)" : ""));
+                std::string(eb ? "; implicit overpass EB derivative conditional on history, 1/L and convective gust (all frozen at the converged state, so quasi-Newton; the aerodynamic resistances ARE differentiated w.r.t. LAI since 2026-11-24 M3; not a full trajectory derivative)" : ""));
     summary.Add("observationLevel", as.observationLevel);
     summary.Add("uncertaintyRaster", as.uncertainty);
     summary.Add("covarianceRaster", as.covariance);

@@ -1,5 +1,15 @@
 # Stream Studio 尚存问题核查（2026-10-05）
 
+## 2026-11-24 STREAM 引擎与同化审核（streamfix2）
+
+依据 2026-11-24 对 STREAM 引擎/同化/服务端的审核（M1–M4、A1–A5、E1、R5、C1–C3、L1/L2、S2–S5、E4）。本节随各块提交追加；已修正项的关键数字与测试见下，剩余项写明原因。
+
+### A5 评估：雅可比对 1/L 与阵风冻结（准牛顿）与联合隐函数求导（块 4）
+
+- 现状：同化的 EB 雅可比是过境节点的隐式导数 dT/dx = −(∂R/∂T)⁻¹ ∂R/∂x，其中 1/L 与对流阵风热通量（sceneSensible）作为已收敛的常量冻结；真实的稳态解还满足 1/L = f(T, x)、sceneSensible = H(T, 1/L, x)，x 变化会经 1/L 与阵风反馈到 T。因此这是准牛顿（拟牛顿）雅可比：方向近似、不保证是 MAP 代价的下降方向。已在 `models/stream/README.md`、`scene_summary.json` 的 `assimilation.method` 写明。
+- 影响（合成场景，中午强辐射，`models/stream/tests/jacobian_check.cpp`/streamreview 的 jac.cpp）：M3 修正后，LAI 的 ∂R/∂LAI 与有限差分逐项一致，剩余与“全非线性有限差分（每个扰动重新解 T 与 1/L）”的差全部来自冻结的 1/L 与阵风：作物 LAI 3，叶光照 dT/dLAI 1.86 vs 全 FD 1.33（+40 %；M3 之前 2.43，+82 %）；Vcmax25（默认控制量）叶光照 dT/dVcmax −0.054 vs −0.035 K/(μmol m⁻² s⁻¹)（约 +55 %），土壤光照的符号可以相反。EB 同化样例中表现为“线搜索停滞”比例高（北京 100×100 窗口，EB+热红外+光学，LAI 背景 ×1.25：converged 6007 / lineSearchStalled 3965 → M3 后 4822 / 5150，O−A 均方根 0.0212 → 0.0211 K，LAI 均方根误差 0.0358 → 0.0353），即更正确的 ∂R/∂LAI 并没有使 GN 步长更快收敛，主要偏差仍是冻结项。
+- 联合隐函数求导方案：把 (1/L, sceneSensible) 并入未知量，6×6 系统 [∂R/∂T ∂R/∂(1/L) ∂R/∂S; ∂g₁/∂T … ; ∂g₂/∂T …] dz = −∂(R, g₁, g₂)/∂x，其中 g₁ = 1/L − c·S_out/u*³（Monin–Obukhov 目标），g₂ = S − S_out（阵风自洽）。需要：① `Similarity`（psim/psih/phstar、stableInverse 限幅 min(1/L, 1/z)）对 1/L 模板化；② 把 u*、S_out（四组分按光照/阴影分数加权的显热）作为 Ad 量返回，当前 u*、分数在 `fluxes()` 里是 double；③ `ebSolver`（image.cpp）里的 4×4 高斯消元扩成 6×6，并处理 1/L 限幅 ±5 m⁻¹ 与 `stabilityLimited`（限幅时 g₁ 无效，须退回冻结）；④ 梯度回归测试（对全非线性 FD，Vcmax 偏差 +55 % → 预期 <10 %）；⑤ 性能：Ad 的 6 个附加自变量不增加 seed 数（仍 ≤8），每像元每次迭代多一次 6×6 消元，估计 EB 同化 +5–10 %。
+- 估计：工作量约 1–2 个工作日（不是半天），风险中等：稳定条件分段（不稳定/稳定/限幅）使导数在边界处不连续，限幅像元与 `lineSearchStalled` 的关系未证实，改动会使所有 EB 同化结果变化，需要重新验证；故**本轮不实现**，仅文档化。建议：先用 `jacobian_check` 对比，再单独立项；在此之前，EB 同化的 Vcmax 增量当作“方向近似”，以 MAP 代价下降（线搜索）为准，不要把 `lineSearchStalled`（位 10）视为失败。
 ## 2026-11-22 更新
 
 依据 2026-11-22 两轮效率与精度改进（提交 `376c015`）。完整变更与兼容性见 `docs/release-next-draft.md`。
