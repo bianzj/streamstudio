@@ -246,10 +246,10 @@ struct SurfaceParameters {
     std::string meshName;                       // OBJ group of this material (per-window output)
     bool interiorMulti{false};                  // dashboard / seat / wheel / lining nodes
     std::array<double, 4> intShare{0.3, 0.35, 0.05, 0.3}, intCapacity{10000, 40000, 2000, 60000},
-        intHcA{4, 10, 1, 28}, intRadArea{1, 3, 0.25, 8};
+        intHcA{8, 24, 2, 40}, intRadArea{1, 3, 0.25, 8};
     double shellRadFraction{0.45}, seatEffusivity{300};
     bool engineMulti{false}, engineWarm{false};
-    double engineWarmC{90}, engineBlockCapacity{80000}, engineBayCapacity{15000}, engineBlockBay{40}, bayVent0{0.04}, bayVentK{0.004}, firewallG{2};
+    double engineWarmC{90}, engineBlockCapacity{70000}, engineBayCapacity{15000}, engineBlockBay{40}, bayVent0{0.04}, bayVentK{0.004}, firewallG{2};
     std::array<double, 3> engineSplit{0.5, 0.3, 0.2}; // radiator -> bay air, block, exhaust -> underbody
     float leafWidth{0.1f};
     LeafBiochemistry leaf;
@@ -3380,7 +3380,7 @@ std::string facetInputView(const std::string& path)
                     xml << "<vcEngModel>1</vcEngModel>"
                         << "<vcEngWarm>" << (ProjectJson::boolean(en,"warm",false) ? 1 : 0) << "</vcEngWarm>"
                         << "<vcEngWarmTemp>" << ProjectJson::number(en,"warmTemperature",90) << "</vcEngWarmTemp>"
-                        << "<vcEngCaps>" << ProjectJson::number(en,"blockCapacity",80000) << "," << ProjectJson::number(en,"bayCapacity",15000) << "</vcEngCaps>"
+                        << "<vcEngCaps>" << ProjectJson::number(en,"blockCapacity",70000) << "," << ProjectJson::number(en,"bayCapacity",15000) << "</vcEngCaps>"
                         << "<vcEngBlockBay>" << ProjectJson::number(en,"blockToBay",40) << "</vcEngBlockBay>"
                         << "<vcEngBayVent>" << ProjectJson::number(en,"bayVent0",0.04f) << "," << ProjectJson::number(en,"bayVentK",0.004f) << "</vcEngBayVent>"
                         << "<vcEngSplit>" << ProjectJson::number(en,"radiatorShare",0.5f) << "," << ProjectJson::number(en,"blockShare",0.3f) << ","
@@ -7520,7 +7520,7 @@ try {
                         }
                         nodes.push_back(std::move(node));
                     }
-                    const double airResidual = airStore - (-convection + (1.0 - c.phi) * qw + c.qOcc + firewall - ventilation - c.qAc);
+                    const double airResidual = airStore - (convection + (1.0 - c.phi) * qw + c.qOcc + firewall - ventilation - c.qAc);
                     const double residual = airResidual + intResidual;
                     const double scale = std::max({nodeScale, std::abs(qw), std::abs(c.qOcc), std::abs(ventilation), std::abs(c.qAc), std::abs(airStore), std::abs(firewall)});
                     v.maxClosure = std::max(v.maxClosure, std::abs(residual) / scale);

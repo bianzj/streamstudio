@@ -456,19 +456,19 @@ export const VEHICLE_SPECTRA = [
 ]
 // Interior nodes of the cabin (dashboard, seat, steering wheel, roof lining + door panels): share of the absorbed
 // transmitted sun (dashboard 0.3 = most strongly lit, absorptance ~0.9; seats 0.35; wheel 0.05; lining/doors 0.3),
-// thermal capacity (J/K), convective hA to the cabin air (W/K), radiating area (m2, weights of the exchange with the
-// shell inner surface). Seat: fabric / leather differ in capacity and contact effusivity (J m-2 K-1 s-0.5).
+// thermal capacity (J/K), effective hA to the cabin air (W/K, (h_conv + h_rad) A with h ~ 8 W m-2 K-1), radiating area (m2,
+// weights of the exchange with the shell inner surface through the wall boundary). Seat: fabric / leather differ in capacity and contact effusivity (J m-2 K-1 s-0.5).
 export const VEHICLE_SEAT_TYPES = { fabric: { capacity: 35000, effusivity: 200 }, leather: { capacity: 50000, effusivity: 450 } }
 export function vehicleInteriorDefaults(seatType = 'fabric') {
   const seat = VEHICLE_SEAT_TYPES[seatType] || VEHICLE_SEAT_TYPES.fabric
   return { enabled: true, seatType: VEHICLE_SEAT_TYPES[seatType] ? seatType : 'fabric', shellRadFraction: 0.45, seatEffusivity: seat.effusivity,
-    dashboard: { share: 0.30, capacity: 10000, hcA: 4, radArea: 1 }, seat: { share: 0.35, capacity: seat.capacity, hcA: 10, radArea: 3 },
-    wheel: { share: 0.05, capacity: 2000, hcA: 1, radArea: 0.25 }, lining: { share: 0.30, capacity: 60000, hcA: 28, radArea: 8 } }
+    dashboard: { share: 0.30, capacity: 10000, hcA: 8, radArea: 1 }, seat: { share: 0.35, capacity: seat.capacity, hcA: 24, radArea: 3 },
+    wheel: { share: 0.05, capacity: 2000, hcA: 2, radArea: 0.25 }, lining: { share: 0.30, capacity: 60000, hcA: 40, radArea: 8 } }
 }
 // Engine block + engine-bay air: Q_eng = enginePower x engineShare split into radiator (to the bay air stream),
 // block and exhaust (underbody shell); firewallG = bulkhead conductance bay -> cabin (W/K).
 export function vehicleEngineDefaults() {
-  return { enabled: true, warm: false, warmTemperature: 90, blockCapacity: 80000, bayCapacity: 15000, blockToBay: 40, bayVent0: 0.04, bayVentK: 0.004,
+  return { enabled: true, warm: false, warmTemperature: 90, blockCapacity: 70000, bayCapacity: 15000, blockToBay: 40, bayVent0: 0.04, bayVentK: 0.004,
     radiatorShare: 0.5, blockShare: 0.3, exhaustShare: 0.2, firewallG: 2 }
 }
 // Auto-binding table: OBJ group name -> material family. First matching rule wins. `spectral` / `material` are
@@ -1350,7 +1350,7 @@ export function validateProject(value) {
       if (k.engine?.enabled) {
         const en = k.engine
         const split = (Number(en.radiatorShare ?? 0.5)) + (Number(en.blockShare ?? 0.3)) + (Number(en.exhaustShare ?? 0.2))
-        if (!inRange(en.warmTemperature, -20, 200, 90) || !inRange(en.blockCapacity, 100, 1e9, 80000) || !inRange(en.bayCapacity, 10, 1e9, 15000) ||
+        if (!inRange(en.warmTemperature, -20, 200, 90) || !inRange(en.blockCapacity, 100, 1e9, 70000) || !inRange(en.bayCapacity, 10, 1e9, 15000) ||
             !inRange(en.blockToBay, 0.01, 1e5, 40) || !inRange(en.bayVent0, 0, 100, 0.04) || !inRange(en.bayVentK, 0, 100, 0.004) ||
             !inRange(en.firewallG, 0, 1000, 2) || Math.abs(split - 1) > 1e-3 || !(Number(en.bayVent0 ?? 0.04) + Number(en.bayVentK ?? 0.004) > 0))
           errors.push('车辆发动机/发动机舱参数无效（散热器+机体+排气份额之和 = 1，热容与换热 > 0）：' + m.name)
@@ -1531,7 +1531,7 @@ function materialXml(item) {
     ? `<vcIntModel>1</vcIntModel><vcIntShares>${csv(it, 'share', ['dashboard', 'seat', 'wheel', 'lining'], 0.25)}</vcIntShares><vcIntCapacities>${csv(it, 'capacity', ['dashboard', 'seat', 'wheel', 'lining'], 10000)}</vcIntCapacities><vcIntHcA>${csv(it, 'hcA', ['dashboard', 'seat', 'wheel', 'lining'], 4)}</vcIntHcA><vcIntRadArea>${csv(it, 'radArea', ['dashboard', 'seat', 'wheel', 'lining'], 1)}</vcIntRadArea><vcShellRadFraction>${number(it.shellRadFraction, 0.45)}</vcShellRadFraction><vcSeatEffusivity>${number(it.seatEffusivity, 300)}</vcSeatEffusivity>`
     : ''
   const engineXml = (en) => en && en.enabled
-    ? `<vcEngModel>1</vcEngModel><vcEngWarm>${en.warm ? 1 : 0}</vcEngWarm><vcEngWarmTemp>${number(en.warmTemperature, 90)}</vcEngWarmTemp><vcEngCaps>${number(en.blockCapacity, 80000)},${number(en.bayCapacity, 15000)}</vcEngCaps><vcEngBlockBay>${number(en.blockToBay, 40)}</vcEngBlockBay><vcEngBayVent>${number(en.bayVent0, 0.04)},${number(en.bayVentK, 0.004)}</vcEngBayVent><vcEngSplit>${number(en.radiatorShare, 0.5)},${number(en.blockShare, 0.3)},${number(en.exhaustShare, 0.2)}</vcEngSplit><vcFirewallG>${number(en.firewallG, 2)}</vcFirewallG>`
+    ? `<vcEngModel>1</vcEngModel><vcEngWarm>${en.warm ? 1 : 0}</vcEngWarm><vcEngWarmTemp>${number(en.warmTemperature, 90)}</vcEngWarmTemp><vcEngCaps>${number(en.blockCapacity, 70000)},${number(en.bayCapacity, 15000)}</vcEngCaps><vcEngBlockBay>${number(en.blockToBay, 40)}</vcEngBlockBay><vcEngBayVent>${number(en.bayVent0, 0.04)},${number(en.bayVentK, 0.004)}</vcEngBayVent><vcEngSplit>${number(en.radiatorShare, 0.5)},${number(en.blockShare, 0.3)},${number(en.exhaustShare, 0.2)}</vcEngSplit><vcFirewallG>${number(en.firewallG, 2)}</vcFirewallG>`
     : ''
   const vehicle = item.type === 'Vehicle' && vehiclePartCode && !item.energyModel
     ? `<vehiclePart>${vehiclePartCode}</vehiclePart>` + (vehiclePartCode === 1 && params.cabin

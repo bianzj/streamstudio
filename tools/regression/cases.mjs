@@ -1,6 +1,8 @@
 // Engine regression cases built from the bundled examples (assets/examples).
 // Each case freezes one example + mode + meteo window + control overrides so
 // two engine builds can be run on identical inputs and compared.
+import { readFileSync } from 'node:fs'
+import { createMaterialPresets, createVehicleBodyMaterial, splitVehicleObj, VEHICLE_SPECTRA, vehicleMeshBinding } from '../../src/renderer/src/project-schema.js'
 
 // n x n identical objects centred in the cells of a square lattice over a
 // size x size domain (position rows: x y z scale rotation).
@@ -128,12 +130,42 @@ const VEH_DRIVE = (acOn) => urbanVehicles([
   { name: 'drive_car', paint: 'vehicle_paint_light', body: 'vehicle_body', rows: ['150 40 0 1 0'] }],
   [VEH_BODY({ occupants: 1, speed: 15, engineOn: true, acOn, heading: 90, windDirection: 270 })])
 
+// Vehicle parts model (docs/vehicle-thermal.md sections 3-4): the library sedan split into windshield / side / rear
+// glass, bonnet and paint groups, auto-bound by the table of project-schema.js; interior nodes (dashboard, seat,
+// steering wheel, lining) and the engine block + engine-bay air with the bonnet inside = bay air.
+// cars: [{ name, paint (colour id), rows, body: createVehicleBodyMaterial options, film }]
+const SEDAN_PARTS = splitVehicleObj(readFileSync(new URL('../../assets/obj-library/vehicle/typical/modern_sedan.obj', import.meta.url), 'utf8'))
+const PARTS_GROUPS = ['Blue', 'Blue_hood', 'Windows_front', 'Windows_side', 'Windows_rear', 'Black', 'Grey', 'Headlights', 'TailLights']
+const urbanVehicleParts = (cars, meteo = [12, 40]) => ({ example: 'urban_block', mode: 'eFacetEB', meteo,
+  addSpectra: VEHICLE_SPECTRA, addMaterials: [...cars.map((car) => createVehicleBodyMaterial(`${car.name}_body`, car.body || {})),
+    ...createMaterialPresets().materials.filter((item) => item.type === 'Vehicle' && item.name !== 'vehicle_material')],
+  files: { 'models/sedan_parts.obj': SEDAN_PARTS.content, ...Object.fromEntries(cars.map((car) => [`positions/${car.name}_position.txt`, car.rows.join('\n') + '\n'])) },
+  addObjects: cars.map((car) => {
+    const meshes = PARTS_GROUPS.map((name) => {
+      const bound = vehicleMeshBinding(name, { paint: car.paint, film: !!car.film, bodyMaterial: `${car.name}_body` })
+      return { name, spectralName: bound.spectralName, thermalName: 'vehicle_temperature', materialName: bound.materialName, canopyName: 'rigid_body' }
+    })
+    return { name: car.name, type: 'Vehicle', materialName: `${car.name}_body`, canopyName: 'rigid_body', spectralName: meshes[0].spectralName, fileName: 'models/sedan_parts.obj',
+      positionFile: `positions/${car.name}_position.txt`, shape: 'cube', dimensions: [1.82, 1.46, 4.58], instanceCount: car.rows.length, meshes }
+  }) })
+const PARTS_PARK = urbanVehicleParts([
+  { name: 'pk_white', paint: 'white', rows: ['150 40 0 1 0'] }, { name: 'pk_black', paint: 'black', rows: ['150 80 0 1 0'] },
+  { name: 'pk_silver', paint: 'silver', rows: ['150 20 0 1 0'] }, { name: 'pk_black_tree', paint: 'black', rows: ['177.3 12.2 0 1 0'] },
+  { name: 'pk_white_warm', paint: 'white', rows: ['150 60 0 1 0'], body: { engineWarm: true } }])
+const PARTS_DRIVE = (acOn) => urbanVehicleParts([
+  { name: 'dr_car', paint: 'white', rows: ['150 40 0 1 0'], body: { occupants: 1, speed: 15, engineOn: true, acOn, heading: 90, windDirection: 270 } }])
+
 export const CASES = {
   // FacetEB vehicle cabin (06:00-20:00): 5 parked cars (light paint in sun / tree / two building-side spots, dark paint
   // in sun), one driving car at 15 m/s without and with air conditioning.
   feb_urban_vehicle_park: VEH_PARK,
   feb_urban_vehicle_drive: VEH_DRIVE(false),
   feb_urban_vehicle_ac: VEH_DRIVE(true),
+  // Parts model: white / black / silver parked in the sun, black under a tree, white with a warm engine; driving
+  // 15 m/s with the engine on, without and with air conditioning.
+  feb_urban_vehicle_parts_park: PARTS_PARK,
+  feb_urban_vehicle_parts_drive: PARTS_DRIVE(false),
+  feb_urban_vehicle_parts_ac: PARTS_DRIVE(true),
   vrt_urban: { example: 'urban_block', mode: 'eVoxelRT' },
   vrt_urban_multiview: { example: 'urban_block', mode: 'eVoxelRT', set: { 'configuration.sensor.principalPlane': true } },
   veb_urban: { example: 'urban_block', mode: 'eVoxelEB', meteo: [23, 25] },

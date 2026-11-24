@@ -177,6 +177,8 @@
 
 **FacetEB 车辆座舱与车内温度（2026-11-24）。** 新增材料类型 `Vehicle`（部件 `vehiclePart`：车身 body、玻璃 glass、底盘 underbody）和车身材料的座舱参数 `params.cabin`：每辆车（对象每个放置点）一个集总座舱（空气 + 内饰质量），车身/玻璃为墙体面元，内侧边界为座舱气温，玻璃按光谱透射率把太阳送入座舱，另有乘员代谢、通风换气、空调（比例控制）、发动机热与车速强迫对流；停放（speed=0）与行驶两种工况。输出 `diagnostics/vehicle_cabin_node=<n>.json`、`faceteb_run.json` 的 `vehicles`/`vehicleCabinSummary`、日志行 `VEHICLE_CABIN` 与运行质量里的车辆汇总一行（最高座舱气温）。新建工程的 `vehicle_material` 改为 Vehicle 类型（钢板 + 内饰层，默认启用座舱），并新增 `vehicle_glass`、`vehicle_underbody` 材料与“车窗玻璃”光谱；界面材料对话框在 FacetEB 模式显示座舱字段。VoxelEB 不实现座舱，RT 模式仍用固定温度预设。人体适宜性评估（烫伤、热指数、分级、儿童/宠物滞留）是后续工作，不在本版。详见 `docs/vehicle-thermal.md`、用户手册 9.3.4、理论手册。
 
+**FacetEB 车辆部件分建模（2026-11-24）。** 在车辆座舱基础上把部件分开建模：车窗按前挡风（夹层 τ 0.60）/侧窗（0.70）/后窗（0.65）/隔热膜（0.38–0.45）分玻璃材料与光谱，各窗各节点透射量输出；内饰拆成仪表台、座椅（织物/皮革）、方向盘、车顶内衬/门板四节点与座舱空气联立（隐式线性方程、高斯消元，能量闭合 ≤ 10⁻¹²），透射太阳按份额分配，输出各节点温度与座椅接触面温度；发动机块 + 发动机舱空气独立节点（废热拆为散热器/机体/排气，格栅通风随车速，防火墙向座舱传热，引擎盖内侧 = 发动机舱空气，排气入底盘，`engineWarm` 停放余热衰减）；车漆颜色预设（白/银/黑/红/蓝/灰/近红外冷黑）。新导入的车辆对象在对象对话框“车辆参数”折叠区按网格组名自动绑定材料族（规则表 `VEHICLE_BINDING_RULES`），导入时库里的 `Windows` 组按面元方向拆成前/侧/后，引擎盖从漆面组拆出。工程字段：`params.cabin.interior`、`params.cabin.engine`，`vehiclePart` 增加 `hood`；XML 增加 `vcInt*`/`vcEng*`/`vcFirewallG`。输出新增 `interiorNodes`、`windowTransmitted_W`、`engine`。详见 `docs/vehicle-thermal.md` 第 10 节。
+
 ## 兼容性
 
 - `tools/build-engine.ps1` 构建的产品引擎只含核心（显式清空 `HISTREAM_EXTENSION_DIRS`），不再含外部扩展与 Bullet 碰撞模块，也不再需要本地 Bullet 源码；三维 RT/EB 与 STREAM 遥感工作流的代码路径不变。
@@ -210,6 +212,7 @@
 - 土壤方法 2 深层边界核对（2026-11-23）：模型未改，全部已有工程与算例结果逐字节不变；只在 `faceteb_run.json` 的 `completed[]` 增加 `soilColumn`（方法 2 地面时），不影响结果文件。
 
 - 新建工程的 `vehicle_material` 由 `Building` 改为 `Vehicle` 类型（钢板 + 内饰层，`params.cabin.enabled: true`），新增 `vehicle_glass`、`vehicle_underbody` 材料与 `vehicle_glass` 光谱；旧工程保存的载具材料（Building 类型）不变，没有 `vehiclePart` 的材料完全不进入座舱路径，FacetEB（feb_urban、feb_crop、feb_urban_ship）与 VoxelEB（veb_urban、veb_urban_ship_plate）抽样算例输出文件逐字节不变。新增算例 `feb_urban_vehicle_park/_drive/_ac`。缺省新工程里车辆对象的所有网格组仍绑定同一车身材料（没有玻璃面元，座舱无透射太阳），需把车窗组绑定到玻璃材料才有太阳得热。
+- 车辆部件分建模：新建工程的 `vehicle_material` 缺省带 `cabin.interior`（四节点）与 `cabin.engine`（发动机模型），新建/新导入的车辆对象自动绑定材料族；**已有工程不重新绑定、不改字段**，车身材料缺这两个字段时走第一版的集总节点与发动机均分到底盘，输出与第一版逐位相同（`feb_urban`、`feb_crop`、`feb_urban_ship`、`feb_urban_vehicle_park/_drive/_ac` 全部输出逐字节不变，VoxelEB 抽样仅诊断 JSON 的 `elapsedMs` 计时字段不同）。新工程缺省车辆的座舱结果因分节点与分窗光谱而改变（城市示例停放白漆晴面峰值 50.3 → 47.6 ℃，行驶 42.7 → 41.2 ℃，量级 −1.5 至 −2.7 K）。新增 `vehicle_*` 光谱/材料预设（车漆、前/侧/后窗玻璃、膜、灯具、轮胎、饰件、引擎盖）会出现在新建工程的预设列表里。新增算例 `feb_urban_vehicle_parts_park/_drive/_ac`、检查脚本 `tools/test-vehicle-parts.mjs`。
 
 ## 已做的检查（2026-11-22）
 
