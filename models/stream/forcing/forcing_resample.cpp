@@ -1,5 +1,7 @@
 #include "forcing_resample.h"
 
+#include "forcing_source.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -127,4 +129,93 @@ void distributeFlux(const std::vector<FluxRecord>& records, FluxShape shape, dou
         if (covered[i] > 0.95) out[i] = energy[i] / covered[i];
 }
 
+void standardiseQuantities(const ForcingMetadata& meta_, const std::map<std::string, std::vector<double>>& hourly,
+                           const std::map<std::string, std::vector<double>>& constant, size_t hours, size_t cells,
+                           const std::vector<std::string>& variables, ForcingReport& report, std::map<std::string, std::vector<float>>& data)
+{
+    constexpr double kNotANumber = std::numeric_limits<double>::quiet_NaN();
+    constexpr float kMissing = std::numeric_limits<float>::quiet_NaN();
+    const auto value = [&](const std::string& key, size_t hour, size_t cell) -> double {
+        if (const auto found = hourly.find(key); found != hourly.end()) return found->second[hour * cells + cell];
+        if (const auto found = constant.find(key); found != constant.end()) return found->second[cell];
+        return kNotANumber;
+    };
+    const auto altitude = [&](size_t hour, size_t cell) { return value("z", hour, cell) / kForcingStandardGravity; };
+    const auto temperature = [&](size_t hour, size_t cell) { return value("ta", hour, cell) + meta_.temperatureShiftK; };
+    bool pressureWarned = false;
+    const auto pressure = [&](size_t hour, size_t cell) -> double {
+        if (meta_.pressureType == "surface") return value("p", hour, cell);
+        const double height = altitude(hour, cell);
+        if (meta_.pressureType == "seaLevel") return std::isfinite(height) ? forcingPressureFromSeaLevel(value("p", hour, cell), height, temperature(hour, cell)) : kNotANumber;
+        if (std::isfinite(height)) return forcingPressureFromAltitude(height);
+        if (!pressureWarned) { pressureWarned = true; report.warn("没有气压且没有站点/格点海拔，地面气压取 1013.25 hPa"); }
+        return 101325.0;
+    };
+    const auto dewpoint = [&](size_t hour, size_t cell) -> double {
+        const double humidity = value("hum", hour, cell);
+        if (meta_.humidityType == "dewpoint") return humidity;
+        double ea = kNotANumber;  // hPa
+        if (meta_.humidityType == "vapourPressure") ea = humidity / 100.0;
+        else if (meta_.humidityType == "relative") ea = humidity * forcingSaturationVapourPressure(temperature(hour, cell) - 273.15);
+        else if (meta_.humidityType == "specific") ea = forcingVapourPressureFromSpecific(humidity, pressure(hour, cell));
+        else ea = forcingVapourPressureFromMixingRatio(humidity, pressure(hour, cell));
+        return forcingDewPointFromVapourPressure(ea);
+    };
+    const auto store = [&](const std::string& name, const auto& compute) {
+        auto& out = data[name];
+        out.assign(hours * cells, kMissing);
+        for (size_t h = 0; h < hours; ++h)
+            for (size_t cell = 0; cell < cells; ++cell) {
+                const double v = compute(h, cell);
+                if (std::isfinite(v)) out[h * cells + cell] = static_cast<float>(v);
+            }
+    };
+    const auto wind = [&](size_t hour, size_t cell, bool northward) -> double {
+        double u, v;
+        if (meta_.windType == "components") { u = value("u", hour, cell); v = value("v", hour, cell); }
+        else {
+            const double speed = value("speed", hour, cell);
+            if (meta_.windType == "speed") { u = speed; v = 0.0; }
+            else {
+                const double direction = value("dir", hour, cell) * 3.14159265358979323846 / 180.0;
+                const double sign = meta_.windConvention == "from" ? -1.0 : 1.0;
+                u = sign * speed * std::sin(direction);
+                v = sign * speed * std::cos(direction);
+            }
+        }
+        const double result = northward ? v : u;
+        return meta_.windFactor != 1.0 ? result * meta_.windFactor : result;
+    };
+    for (const auto& name : variables) {
+        if (name == "t2m") store(name, [&](size_t h, size_t c) { return temperature(h, c); });
+        else if (name == "sp") {
+            store(name, pressure);
+            if (meta_.pressureType != "surface") report.derived.push_back(meta_.pressureType == "seaLevel" ? "sp 由海平面气压 + 海拔换算" : "sp 由海拔按标准大气估算");
+        } else if (name == "d2m") {
+            store(name, dewpoint);
+            if (meta_.humidityType != "dewpoint") report.derived.push_back("d2m 由 " + meta_.humidityType + " 湿度换算");
+        } else if (name == "u10") store(name, [&](size_t h, size_t c) { return wind(h, c, false); });
+        else if (name == "v10") store(name, [&](size_t h, size_t c) { return wind(h, c, true); });
+        else if (name == "ssrd") store(name, [&](size_t h, size_t c) { return value("sw", h, c); });
+        else if (name == "strd") {
+            if (!!hourly.count("lw")) store(name, [&](size_t h, size_t c) { return value("lw", h, c); });
+            else {
+                report.warn("没有向下长波，按 Brutsaert 晴空参数化（不含云，阴天偏低）");
+                report.derived.push_back("strd 由 Brutsaert 晴空参数化估算");
+                store(name, [&](size_t h, size_t c) {
+                    const double ta = temperature(h, c), td = dewpoint(h, c);
+                    return std::isfinite(ta) && std::isfinite(td) ? forcingBrutsaertLongwave(ta, forcingSaturationVapourPressure(td - 273.15)) : kNotANumber;
+                });
+            }
+        } else if (name == "skt") store(name, [&](size_t h, size_t c) { return value("skt", h, c); });
+        else if (name == "swvl1") store(name, [&](size_t h, size_t c) { return value("swvl", h, c); });
+        else if (name == "z") {
+            auto& out = data[name];
+            out.assign(cells, kMissing);
+            const auto found = constant.find("z");
+            if (found != constant.end())
+                for (size_t cell = 0; cell < cells; ++cell) if (std::isfinite(found->second[cell])) out[cell] = static_cast<float>(found->second[cell]);
+        } else throw std::runtime_error("未知的标准强迫量 " + name);
+    }
+}
 }  // namespace stream

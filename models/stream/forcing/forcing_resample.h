@@ -3,8 +3,10 @@
 // every source ends up on the whole-hour grid, instantaneous values at the hour and fluxes as the mean over the hour
 // that ends there. All times are hours since 1970-01-01 UTC (fractions allowed), missing values are NaN.
 #include "forcing_metadata.h"
+#include "forcing_source.h"
 
 #include <cstdint>
+#include <map>
 #include <vector>
 
 namespace stream {
@@ -36,4 +38,11 @@ void distributeFlux(const std::vector<FluxRecord>& records, FluxShape shape, dou
 // Largest gap between consecutive records when the median spacing is `step`: max(6, 2 x step) unless maxGapHours is set.
 double forcingMaxGap(double maxGapHours, double stepHours);
 
+// Builds the standard quantities (t2m d2m sp u10 v10 ssrd strd skt swvl1 z) from the hourly channels of any source. `hourly`: channel key
+// (ta hum p u v speed dir sw lw skt swvl z) -> [hour][cell] SI values (fluxes in W m-2 of the hour); `constant`: [cell] values of time-invariant
+// channels. Humidity, pressure, wind and the Brutsaert longwave fallback follow docs/forcing-metadata.md 4.2-4.6; the wind factor and the air
+// temperature shift of the height correction are applied. Output: name -> [hour][cell] floats ("z": [cell]).
+void standardiseQuantities(const ForcingMetadata& meta, const std::map<std::string, std::vector<double>>& hourly,
+                           const std::map<std::string, std::vector<double>>& constant, size_t hours, size_t cells,
+                           const std::vector<std::string>& variables, ForcingReport& report, std::map<std::string, std::vector<float>>& data);
 }  // namespace stream
