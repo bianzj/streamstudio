@@ -1,11 +1,15 @@
 // stream: STREAM remote-sensing image simulation for Stream Studio.
 //   stream run <config.json>
 //   stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...
+//   stream forcing-preset [name]
+//   stream forcing-check <preset|metadata.json> [--data ...] [--json]
 #include "image.h"
 #include "../forcing/era5.h"
+#include "../forcing/forcing_metadata.h"
 #include "../scene/raster.h"
 
 #include <cpl_conv.h>
+#include <cpl_json.h>
 #include <gdal_priv.h>
 #include <ogr_srs_api.h>
 
@@ -58,16 +62,59 @@ std::string utf8FromWide(const wchar_t* text)
     return out;
 }
 
+// stream forcing-check <preset|metadata.json|JSON> [--json]: parses and validates a forcing metadata document.
+int forcingCheck(const std::vector<std::string>& args)
+{
+    bool json = false;
+    std::string specifier;
+    for (size_t index = 1; index < args.size(); ++index) {
+        if (args[index] == "--json") json = true;
+        else if (specifier.empty()) specifier = args[index];
+    }
+    stream::ForcingIssues issues;
+    const stream::ForcingMetadata metadata = stream::resolveForcingMetadata(specifier, std::filesystem::current_path(), &issues);
+    if (json) {
+        CPLJSONObject root;
+        root.Add("ok", issues.ok());
+        CPLJSONArray errors, warnings, notes;
+        for (const auto& text : issues.errors) errors.Add(text);
+        for (const auto& text : issues.warnings) warnings.Add(text);
+        for (const auto& text : metadata.notes) notes.Add(text);
+        root.Add("errors", errors);
+        root.Add("warnings", warnings);
+        root.Add("notes", notes);
+        if (issues.ok()) {
+            CPLJSONDocument summary;
+            if (summary.LoadMemory(stream::forcingMetadataSummaryJson(metadata))) root.Add("resolved", summary.GetRoot());
+        }
+        std::cout << root.Format(CPLJSONObject::PrettyFormat::Pretty) << "\n";
+    } else {
+        for (const auto& text : issues.errors) std::cout << "错误：" << text << "\n";
+        for (const auto& text : issues.warnings) std::cout << "警告：" << text << "\n";
+        for (const auto& text : metadata.notes) std::cout << "信息：" << text << "\n";
+        if (issues.ok()) std::cout << "气象强迫元数据 \"" << metadata.name << "\"（" << metadata.form << "）校验通过\n";
+    }
+    return issues.ok() ? 0 : 3;
+}
+
 int usage()
 {
     std::cerr << "usage: stream run <config.json>\n"
-                 "       stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...\n";
+                 "       stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...\n"
+                 "       stream forcing-preset [name]\n"
+                 "       stream forcing-check <preset|metadata.json> [--data pack.json|station.csv ...] [--json]\n";
     return 2;
 }
 
 int dispatch(const std::vector<std::string>& args)
 {
     if (args.size() == 2 && args[0] == "run") return stream::runImage(args[1]);
+    if (args.size() >= 1 && args[0] == "forcing-preset") {
+        if (args.size() == 1) { for (const auto& name : stream::forcingPresetNames()) std::cout << name << "\n"; return 0; }
+        std::cout << stream::forcingPresetJson(args[1]) << "\n";
+        return 0;
+    }
+    if (args.size() >= 2 && args[0] == "forcing-check") return forcingCheck(args);
     if (args.size() >= 3 && args[0] == "era5-register") {
         std::string product = "auto";
         std::vector<std::string> files;
