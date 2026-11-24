@@ -5627,6 +5627,12 @@ function recordRunQualityLine(line) {
     const sourceLabel = item.source === 'measured' ? '实测列' : 'Erbs'
     return `短波直散 · 节点 ${item.node + 1} · 直射份额 ${item.directFraction.toFixed(3)}（${sourceLabel}${item.kt >= 0 ? `，kt ${item.kt.toFixed(3)}` : ''}）`
   }
+  match = line.match(/^VEHICLE_CABIN\s+node=(\d+)\s+name=(\S+)\s+cabinC=(\S+)\s+interiorC=(\S+)\s+outdoorC=(\S+)/)
+  if (match) {
+    // FacetEB vehicle cabin (temperatures only); summarised when the run closes.
+    ;(quality.vehicle || (quality.vehicle = [])).push({ node: Number(match[1]), name: match[2], cabinC: Number(match[3]), interiorC: Number(match[4]), outdoorC: Number(match[5]) })
+    return ''
+  }
   return null
 }
 
@@ -5634,6 +5640,12 @@ function recordRunQualityLine(line) {
 function runQualitySummary(quality) {
   if (!quality) return []
   const lines = []
+  if (quality.vehicle?.length) {
+    const best = quality.vehicle.reduce((a, b) => (b.cabinC > a.cabinC ? b : a))
+    const hottest = quality.vehicle.reduce((a, b) => (b.interiorC > a.interiorC ? b : a))
+    const names = new Set(quality.vehicle.map((item) => item.name))
+    lines.push({ kind: '', text: `车辆座舱 · ${names.size} 辆 · 最高座舱气温 ${best.cabinC.toFixed(1)} ℃（${best.name}，节点 ${best.node + 1}，室外 ${best.outdoorC.toFixed(1)} ℃，高 ${(best.cabinC - best.outdoorC).toFixed(1)} K）· 最高内饰节点 ${hottest.interiorC.toFixed(1)} ℃（${hottest.name}，节点 ${hottest.node + 1}）` })
+  }
   if (quality.facet.length) {
     const failed = quality.facet.filter((item) => !item.converged)
     const worst = quality.facet.reduce((a, b) => (b.residualK > a.residualK ? b : a))

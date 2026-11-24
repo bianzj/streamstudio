@@ -175,6 +175,8 @@
 - **运行准备不阻塞事件循环**：引擎 exe、工程与气象文件的 SHA-256 改为流式计算并按 (路径, mtime, size) 缓存；运行输入目录（含裁切后的 OBJ）与气象快照改为异步复制；准备期间拒绝第二个运行请求。
 - **服务端重活移到后台线程（2026-11-23）**：读面元/过程结果 JSON、TIFF/ENVI 解码与响应编码、变化分析、结果列表遍历、OBJ 预览读取、OBJ/DEM 导入与大请求体解析、篷布生成、project.usd 导出、运行准备（读 OBJ、实例筛选与预裁切、面元规模预检、运行前检查）、STREAM 栅格显示与分类统计改在常驻后台计算线程池（默认 2 个线程，空闲 5 分钟退出）执行；FacetRT 出图与 ENVI→TIFF 转换在每次运行结束时的一次性线程中执行，结束即释放内存，“停止/重置”可中断。大响应以 Transferable ArrayBuffer 传回服务线程，不复制。这些请求执行期间其他接口照常响应：并发轻量请求的最大延迟由 0.1–1.4 s 降到 ≤ 0.07 s（FacetRT 83 MB 结果 JSON 读取 0.46 s → 0.04 s，FacetRT 出图 1.38 s → 0.02 s，ENVI 转换 0.67 s → 0.02 s，USD 首次导出 1.0 s → 0.02 s，运行准备 1.27 s → 0.02 s）；各接口响应与写出文件逐字节不变，单个请求总耗时基本不变。后台线程启动失败时自动退回服务线程同步执行。结果后处理期间界面仍显示“运行中”，不能开始新运行或删除结果。
 
+**FacetEB 车辆座舱与车内温度（2026-11-24）。** 新增材料类型 `Vehicle`（部件 `vehiclePart`：车身 body、玻璃 glass、底盘 underbody）和车身材料的座舱参数 `params.cabin`：每辆车（对象每个放置点）一个集总座舱（空气 + 内饰质量），车身/玻璃为墙体面元，内侧边界为座舱气温，玻璃按光谱透射率把太阳送入座舱，另有乘员代谢、通风换气、空调（比例控制）、发动机热与车速强迫对流；停放（speed=0）与行驶两种工况。输出 `diagnostics/vehicle_cabin_node=<n>.json`、`faceteb_run.json` 的 `vehicles`/`vehicleCabinSummary`、日志行 `VEHICLE_CABIN` 与运行质量里的车辆汇总一行（最高座舱气温）。新建工程的 `vehicle_material` 改为 Vehicle 类型（钢板 + 内饰层，默认启用座舱），并新增 `vehicle_glass`、`vehicle_underbody` 材料与“车窗玻璃”光谱；界面材料对话框在 FacetEB 模式显示座舱字段。VoxelEB 不实现座舱，RT 模式仍用固定温度预设。人体适宜性评估（烫伤、热指数、分级、儿童/宠物滞留）是后续工作，不在本版。详见 `docs/vehicle-thermal.md`、用户手册 9.3.4、理论手册。
+
 ## 兼容性
 
 - `tools/build-engine.ps1` 构建的产品引擎只含核心（显式清空 `HISTREAM_EXTENSION_DIRS`），不再含外部扩展与 Bullet 碰撞模块，也不再需要本地 Bullet 源码；三维 RT/EB 与 STREAM 遥感工作流的代码路径不变。
@@ -206,6 +208,8 @@
 - FacetEB 地面自由对流（2026-11-23）：全部 FacetEB 工程的地面结果变化——地面高于气温时（晴天白天，以及夜间仍暖于空气的地面）显热增大、地表变冷（城市/作物正午约 −0.7~−3.7 K，G/Rn −0.1~−0.19），间接影响近地叶片与建筑长波；无开关，不能恢复旧行为。`energy.comp` 对地面面元读取面元参数第 28 位（1 = 中性并联、2 = 稳定度修正取大，原为 0），C++ 与着色器需同时更新。VoxelEB、RayTracing、VoxelRT、FacetRT 不受影响。回归工具新增 `feb_urban_soil_day_most`（新壤土、开稳定度修正）。
 - 土壤方法 1 热历史（2026-11-23）：已有工程缺 `control.soilInertiaHistory`，按 `"truncated"`（原 8 节点）运行，结果逐字节不变；改为 `"full"` 后方法 1 的土壤/建筑（VoxelEB）与土壤（FacetEB）结果改变（正午 G/Rn 约 −0.06~−0.07，地表正午 +1.8~1.9 K、夜间最低 +0.9~1.6 K）。方法 0/2、木质固体不受影响。XML：Control `<soilInertiaHistory>1</soilInertiaHistory>`（FacetEB）与 soilSet `<inertiaHistory>full</inertiaHistory>`（VoxelEB），只在 full 时写出。着色器接口：`SoilSet` 末尾新增 `int inertiaHistory`（56 B），VoxelEB 描述符新增绑定 41（`B_SOILMEMORY`），C++ 与 SPV 需同时更新。回归工具新增 `veb_urban_soil_m1_2d`、`veb_urban_soil_m1_2d_full`、`feb_urban_soil_m1_2d`、`feb_urban_soil_m1_2d_full`（新壤土、方法 1、两天 0–96 节点）。
 - 土壤方法 2 深层边界核对（2026-11-23）：模型未改，全部已有工程与算例结果逐字节不变；只在 `faceteb_run.json` 的 `completed[]` 增加 `soilColumn`（方法 2 地面时），不影响结果文件。
+
+- 新建工程的 `vehicle_material` 由 `Building` 改为 `Vehicle` 类型（钢板 + 内饰层，`params.cabin.enabled: true`），新增 `vehicle_glass`、`vehicle_underbody` 材料与 `vehicle_glass` 光谱；旧工程保存的载具材料（Building 类型）不变，没有 `vehiclePart` 的材料完全不进入座舱路径，FacetEB（feb_urban、feb_crop、feb_urban_ship）与 VoxelEB（veb_urban、veb_urban_ship_plate）抽样算例输出文件逐字节不变。新增算例 `feb_urban_vehicle_park/_drive/_ac`。缺省新工程里车辆对象的所有网格组仍绑定同一车身材料（没有玻璃面元，座舱无透射太阳），需把车窗组绑定到玻璃材料才有太阳得热。
 
 ## 已做的检查（2026-11-22）
 
