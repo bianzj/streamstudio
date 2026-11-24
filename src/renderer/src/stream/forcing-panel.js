@@ -439,7 +439,9 @@ export function createForcingPanel({ api, getForm, getProject, getPack, markDirt
         <label><span>辐射时间戳约定</span><select class="select" data-fm-stamp>${[['', '按元数据'], ...Object.entries(STAMPS)].map(([key, label]) => `<option value="${key}"${stampValue() === key ? ' selected' : ''}>${label}</option>`).join('')}${stampValue() === 'mixed' ? '<option value="mixed" selected>各量不同</option>' : ''}</select></label>
         ${stationForm
     ? `<label><span>时间列名</span>${field('time.column', w.time?.column, { placeholder: 'time' })}</label><label><span>时间格式</span>${choice('time.format', TIME_FORMATS, w.time?.format || 'iso8601')}</label>`
-    : `<label><span>时间变量名</span>${field('time.variable', w.time?.variable, { type: 'list', placeholder: 'time' })}</label>`}
+    : `<label><span>时间变量名</span>${field('time.variable', w.time?.variable, { type: 'list', placeholder: 'time' })}</label>
+        <label><span>纬度坐标名</span>${field('grid.latitude', w.grid?.latitude, { type: 'list', placeholder: 'lat' })}</label>
+        <label><span>经度坐标名</span>${field('grid.longitude', w.grid?.longitude, { type: 'list', placeholder: 'lon' })}</label>`}
       </div></div>
       <div class="sw-fm-block"><h4>物理量</h4>
         <table class="sw-table sw-fm-table"><thead><tr><th>物理量</th><th>表示方式</th><th>源变量 / 列名</th><th>源单位</th><th>取值类型</th><th>高度（m）</th></tr></thead><tbody>${variableRows(w)}</tbody></table>
@@ -501,6 +503,7 @@ export function createForcingPanel({ api, getForm, getProject, getPack, markDirt
     afterRender() { syncFromForm(); render() },
     onInput, onChange, onClick, onToggle,
     isStation, render,
+    currentDocument: () => (state.working ? structuredClone(state.working) : null),
     // Problems that block a run (the pack row of gridded sources is validated by the workspace).
     problems() {
       const list = []
