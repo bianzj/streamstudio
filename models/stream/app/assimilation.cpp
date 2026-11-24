@@ -62,16 +62,21 @@ bool isMainThread()
 
 using Matrix = std::array<std::array<double, kMaxControls>, kMaxControls>;
 
-// Gauss-Jordan inverse with partial pivoting of the leading n x n block.
+// Gauss-Jordan inverse with partial pivoting of the leading n x n block. FIX(2026-11-24 A3): the singularity test is
+// relative to the largest entry (1e-12 x scale, as in inversion.cpp) instead of the absolute 1e-14, because the controls
+// are not normalised (Vcmax sigma >= 10 gives B^-1 ~ 1e-2, soil moisture sigma 0.1 gives 1e2).
 bool invert(Matrix& a, int n)
 {
     Matrix inverse{};
     for (int i = 0; i < n; ++i) inverse[i][i] = 1.0;
+    double scale = 0.0;
+    for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) scale = std::max(scale, std::abs(a[i][j]));
+    if (!(scale > 0.0) || !std::isfinite(scale)) return false;
     for (int column = 0; column < n; ++column) {
         int pivot = column;
         for (int row = column + 1; row < n; ++row)
             if (std::abs(a[row][column]) > std::abs(a[pivot][column])) pivot = row;
-        if (!(std::abs(a[pivot][column]) > 1e-14)) return false;
+        if (!(std::abs(a[pivot][column]) > 1e-12 * scale)) return false;
         std::swap(a[pivot], a[column]);
         std::swap(inverse[pivot], inverse[column]);
         const double diagonal = a[column][column];
@@ -305,7 +310,7 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
             backgroundControls[0][pixel] = static_cast<float>(moistureB);
             backgroundControls[1][pixel] = static_cast<float>(vcmaxB);
             backgroundControls[2][pixel] = leafArea;
-            if (obs.empty() || n == 0) { ++noObservation; finish(kQaInputInvalid); qaBands[5][pixel] = 0; continue; }
+            if (obs.empty() || n == 0) { ++noObservation; finish(kQaInputInvalid | kQaNoObservation); qaBands[5][pixel] = 0; continue; }
 
             // Covariance covers the primary thermal observation. Additional views
             // and optical observations remain independent blocks with their own sigma.

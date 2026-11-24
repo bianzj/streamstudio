@@ -243,7 +243,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
     progress(in.progressStart + 0.1 * span, lsct ? "组分温度反演" : "地表温度反演");
     std::atomic<int> rowsDone{0};
     long long retrieved = 0, failed = 0, notConverged = 0, lowSupport = 0, outOfRange = 0, illConditioned = 0;
-    long long stopConverged = 0, stopStalled = 0, stopNotUpdated = 0;  // FIX(2026-11-21 S-5 QA): LSCT stop reasons
+    long long stopConverged = 0, stopStalled = 0, stopNotUpdated = 0, stopStepFailed = 0, stopIterationLimit = 0;  // FIX(2026-11-21 S-5 QA): LSCT stop reasons
     double dfsSum = 0.0, residualSum = 0.0;
 
     if (!lsct) {
@@ -360,7 +360,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         for (auto& band : radianceShares) band.assign(grid.size(), kNaN);
         const int half = inv.window / 2;
         ParallelError errorsLsct;
-        #pragma omp parallel for schedule(dynamic, 2) reduction(+:retrieved, failed, notConverged, lowSupport, outOfRange, illConditioned, dfsSum, residualSum, stopConverged, stopStalled, stopNotUpdated)
+        #pragma omp parallel for schedule(dynamic, 2) reduction(+:retrieved, failed, notConverged, lowSupport, outOfRange, illConditioned, dfsSum, residualSum, stopConverged, stopStalled, stopNotUpdated, stopStepFailed, stopIterationLimit)
         for (int row = in.startRow; row < in.endRow; ++row) {
             if (errorsLsct.failed()) continue;
             try {
@@ -448,11 +448,15 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 };
                 double currentCost = 0.0, backgroundCost = NAN;
                 bool stalled = false, stepFailed = false;  // FIX(2026-11-21 S-5 QA): stop reasons
+                // FIX(2026-11-24 I1): which kind of failure ended the retrieval: 1 = the observation operator failed
+                // (QA bit 3 only), 2 = singular normal matrix (QA bit 4 with bit 3).
+                int failureKind = 0;
                 int acceptedSteps = 0;
-                if (!cost(x, currentCost)) ok = false;
+                if (!cost(x, currentCost)) { ok = false; failureKind = 1; }
                 backgroundCost = currentCost;
                 for (; ok && iteration < inv.maxIterations; ++iteration) {
-                    if (!normal(hessian, gradient, squares) || !invert(hessian, m)) { ok = false; break; }
+                    if (!normal(hessian, gradient, squares)) { ok = false; failureKind = 1; break; }
+                    if (!invert(hessian, m)) { ok = false; failureKind = 2; break; }
                     double largest = 0.0, step[kComponents]{};
                     for (int a = 0; a < m; ++a) {
                         for (int b = 0; b < m; ++b) step[a] += hessian[a][b] * gradient[b];
@@ -484,9 +488,16 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                     ++acceptedSteps;
                 }
                 // Posterior covariance at the solution.
-                if (!ok || !normal(hessian, gradient, squares) || !invert(hessian, m)) {
-                    qa[pixel] = static_cast<float>(flag | kQaIllConditioned | kQaRetrievalFailed);
-                    ++failed; ++illConditioned;
+                if (ok && !normal(hessian, gradient, squares)) { ok = false; failureKind = 1; }
+                if (ok && !invert(hessian, m)) { ok = false; failureKind = 2; }
+                if (!ok) {
+                    if (failureKind == 2) {
+                        qa[pixel] = static_cast<float>(flag | kQaIllConditioned | kQaRetrievalFailed);
+                        ++failed; ++illConditioned;
+                    } else {   // operator failed at the background or at the returned state: RetrievalFailed only
+                        qa[pixel] = static_cast<float>(flag | kQaRetrievalFailed);
+                        ++failed;
+                    }
                     continue;
                 }
                 // FIX(2026-11-21 S-5 QA): bit 10 (stalled after lowering the cost) and bit 11 (not updated) are not
@@ -494,10 +505,9 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 if (converged) ++stopConverged;
                 else if (stalled && acceptedSteps > 0) { flag |= kQaLineSearchStalled; ++stopStalled; }
                 else if (stalled) { flag |= kQaNotUpdated; ++stopNotUpdated; }
-                else { flag |= kQaNotConverged; ++notConverged; }
+                else { flag |= kQaNotConverged; ++notConverged; if (stepFailed) ++stopStepFailed; else ++stopIterationLimit; }
                 costs[0][pixel] = static_cast<float>(backgroundCost);
                 costs[1][pixel] = static_cast<float>(currentCost);
-                (void)stepFailed;
                 // Degrees of freedom for signal: m - tr(A B^-1).
                 double trace = 0.0;
                 for (int a = 0; a < m; ++a) for (int b = 0; b < m; ++b) trace += hessian[a][b] * backgroundInverse[b][a];
@@ -602,6 +612,9 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         counts.Add("convergedPixels", static_cast<GInt64>(stopConverged));
         counts.Add("lineSearchStalledPixels", static_cast<GInt64>(stopStalled));
         counts.Add("notUpdatedPixels", static_cast<GInt64>(stopNotUpdated));
+        // FIX(2026-11-24 I2): bit-9 pixels split as in the assimilation (stopReasons.iterationLimit / stepEvaluationFailed).
+        counts.Add("iterationLimitPixels", static_cast<GInt64>(stopIterationLimit));
+        counts.Add("stepEvaluationFailedPixels", static_cast<GInt64>(stopStepFailed));
     }
     long long cloud = 0, invalid = 0;
     for (const unsigned flag : flags) { if (flag & kQaCloud) ++cloud; else if (flag & kQaInputInvalid) ++invalid; }

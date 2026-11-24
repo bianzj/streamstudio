@@ -37,6 +37,10 @@ constexpr unsigned kQaNotConverged = 1u << 9;
 //   bit 11 not updated: no step lowered the cost at all; the analysis equals the background (J_a = J_b).
 // Bit 9 (not converged, rejected by default) now means: iteration limit reached while the cost was still decreasing,
 // the normal matrix was singular, or the operator failed on every trial step.
+// FIX(2026-11-24 A2): bit 12 (4096) marks an assimilation pixel with no usable observation or no control variable; it is
+// set together with bit 0 so existing "bit 0 = not analysed" masks keep working, while bit 0 alone still means invalid
+// inputs (geometry, LAI, solar position).
+constexpr unsigned kQaNoObservation = 1u << 12;
 constexpr unsigned kQaLineSearchStalled = 1u << 10;
 constexpr unsigned kQaNotUpdated = 1u << 11;
 
