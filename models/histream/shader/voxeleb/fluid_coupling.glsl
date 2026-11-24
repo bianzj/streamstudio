@@ -155,6 +155,39 @@ float localWindSpeed(uint sparseIndex)
     return count > 0.0 ? sum / count : ubom.meteo.u;
 }
 
+// Ship hull (BUILDING voxels of a Ship material; SoilSet ship* fields, all 0
+// = off and the code below returns its input unchanged).
+// Voxels whose centre lies below the material waterline exchange heat with
+// the scene water temperature (host: FluidParameters.localExchange.w, K;
+// 0 = not set, then the air) at waterHeatTransferCoefficient.
+bool shipSubmerged(uint sparseIndex, uint bioId)
+{
+    if (!(soilSets[bioId].waterHeatTransferCoefficient > 0.0)) return false;
+    return (float(voxelLinks[sparseIndex].voxelId.y) + 0.5) * setting.scale
+        < soilSets[bioId].waterlineHeight;
+}
+
+float shipWaterTemperatureC(float airTemperatureC)
+{
+    float kelvin = fluidParameters.localExchange.w;
+    return kelvin > 1.0 ? kelvin - 273.15 : airTemperatureC;
+}
+
+// Aerodynamic resistance of a ship hull voxel: wetted voxels use the water
+// coefficient; with a speed the forced convection of the relative wind
+// |u_wind - v_ship| competes with the scene exchange (larger conductance wins).
+float shipHullRaa(uint sparseIndex, uint bioId, float raa)
+{
+    if (shipSubmerged(sparseIndex, bioId))
+        return max(RHOA * CP / soilSets[bioId].waterHeatTransferCoefficient, 1.0);
+    float speed = soilSets[bioId].shipSpeed;
+    if (!(speed > 0.0)) return raa;
+    float wind = max(localWindSpeed(sparseIndex), 0.05);
+    float relative = sqrt(max(wind * wind + speed * speed
+        + 2.0 * wind * speed * soilSets[bioId].shipWindCosine, 0.0));
+    return min(raa, max(RHOA * CP / (8.3 + 4.1 * max(relative, 0.1)), 1.0));
+}
+
 // Effective aerodynamic resistance of a ground-type surface (soil, water,
 // building) including free convection. With the neutral wind-driven
 // resistance (control.stabilityCorrection off) exchange collapses at low

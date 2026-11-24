@@ -341,6 +341,7 @@ void main()
 #endif
 
             aeroConds[aeroId].ustar = ustar;
+            if(typeId == TYPE_BUILDING) raa = shipHullRaa(bufferId0, uint(meshLink.bioId), raa);
             voxelRaas[bufferId0].raa = raa;
             return;
         }
@@ -392,6 +393,7 @@ void main()
 #endif
             raa = (1.0 / (kappa * ustar)*(log((z-d)/z0m)-ph_z + ph_zr));
             if(isnan(raa) || isinf(raa) || raa < 1.0) raa = 50;
+            if(typeId == TYPE_BUILDING) raa = shipHullRaa(bufferId0, uint(meshLink.bioId), raa);
             voxelRaas[bufferId0].raa = raa;
             // voxelRaas[bufferId0].raa = surf1DId;
             // return;
@@ -542,6 +544,7 @@ void main()
                 }
                 raa = RHOA * CP / max(heatTransfer, 1.0);
                 if(isnan(raa) || isinf(raa) || raa < 1.0) raa = 50.0;
+                raa = shipHullRaa(bufferId0, uint(meshLink.bioId), raa);
                 voxelRaas[bufferId0].raa = raa;
             }else if (typeId == TYPE_VEGETATION) {
                 // for vegetation under overstory vegetation 

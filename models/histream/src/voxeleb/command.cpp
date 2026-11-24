@@ -122,6 +122,26 @@ void uploadStability(const std::shared_ptr<VoxelebIO>& modelio, bool enabled, do
     commandPool.submitAndWait(command);
 }
 
+// Ship waterline contact: publish the scene water temperature [K] to the
+// reserved localExchange.w lane (0 = unset; only written when a Ship material
+// has a waterline, so every other run keeps the lane at 0).
+void uploadShipWaterTemperature(const std::shared_ptr<VoxelebIO>& modelio, double kelvin)
+{
+    modelio->fluidParameters.localExchange.w = static_cast<float>(kelvin);
+    if (!modelio->m_pFluidParameters)
+        throw std::runtime_error("VoxelEB ship waterline needs the FluidParameters buffer");
+    nvvk::CommandPool commandPool(modelio->m_device, modelio->m_queueIndex);
+    vk::CommandBuffer command = commandPool.createCommandBuffer();
+    vkCmdUpdateBuffer(command, modelio->m_pFluidParameters->buffer, 0,
+                      sizeof(FluidParameters), &modelio->fluidParameters);
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    commandPool.submitAndWait(command);
+}
+
 // Desired scene 1/L from H (W m-2 per ground area) and u*, clamped to the
 // MOST applicability range -5 <= (z-d)/L <= 1 (energyphysics.h form;
 // rho and cp as in shader/global.glsl).
@@ -542,6 +562,13 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     };
     evaluateAerodynamics();
     modelio->inverseObukhov = inverseL;
+    // Ship waterline contact: the water temperature carries over from the
+    // previous node; the first node starts from its air temperature (also the
+    // value used when the scene has no water).
+    if (modelio->shipWaterline) {
+        if (!(modelio->shipWaterK > 1.0)) modelio->shipWaterK = airTemperatureK;
+        uploadShipWaterTemperature(modelio, modelio->shipWaterK);
+    }
     // |delta(z/L)| below which 1/L counts as converged.
     const auto stabilityTolerance = [](double zeta) { return 0.02 + 0.02 * std::abs(zeta); };
     // DEFERRED[中] 数值: 能量平衡迭代上限 50 写死且前 25 次才更新生理；未收敛时只记录 energyFinalUnconvergedStateCount，后续仍 updateTp 推进时间节点，若调用方不检查该计数，未收敛（甚至振荡）的温度会被当作正常结果传播到下一时间步；建议：将上限与生理冻结轮数做成配置项，并在未收敛计数>0 时输出警告/在结果元数据中标记。
@@ -574,6 +601,16 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
         submit(modelio, VoxelEBStage::budget, voxelSize1D, std::nullopt, std::nullopt);
         waitFence(modelio);
         modelio->energyIterations = kiter + 1;
+        if (modelio->shipWaterline) {
+            // Scene mean water temperature after this pass for the next one.
+            EBState waterState{};
+            readEnergyState(modelio, stateReadback, &waterState);
+            if (waterState.waterCount > 0) {
+                modelio->shipWaterVoxels = waterState.waterCount;
+                modelio->shipWaterK += 0.01 * double(waterState.waterTemperature) / waterState.waterCount;
+                uploadShipWaterTemperature(modelio, modelio->shipWaterK);
+            }
+        }
         if (stability && modelio->stabilityAvailable) {
             // Fluxes of this pass (evapo at the pre-update temperatures).
             EBState state{};

@@ -316,11 +316,21 @@ struct EBState
 	int sensible[EB_STATE_BINS];     // sum of H per cell footprint, 0.1 W m-2
 	int ustar[EB_STATE_BINS];        // sum of ground-column u*, 1e-4 m s-1
 	int height[EB_STATE_BINS];       // sum of z - d, 0.01 m
+	int waterCount;                  // scene water voxels (ship waterline contact)
+	int waterTemperature;            // sum of water voxel temperatures, 0.01 K
 };
 #else
 struct EBState
 {
 	int count;
+	// Only count and the ship water sums are used by the neutral pipelines;
+	// the middle lanes keep the offsets of the MOST declaration.
+	int groundCount;
+	int sensible[EB_STATE_BINS];
+	int ustar[EB_STATE_BINS];
+	int height[EB_STATE_BINS];
+	int waterCount;
+	int waterTemperature;
 };
 #endif
 
@@ -389,6 +399,11 @@ struct SoilSet
     int thermalClass;
     float convectiveScale;
     int inertiaHistory;   // method 1: 0 = 8 nodes (legacy), 1 = + sum-of-exponentials tail
+    // Ship hull (see structs_cg.h SoilSet); all 0 = off.
+    float shipSpeed;
+    float shipWindCosine;
+    float waterlineHeight;
+    float waterHeatTransferCoefficient;
 
     //BSMParam bsm;
 };

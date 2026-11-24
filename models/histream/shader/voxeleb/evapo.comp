@@ -96,6 +96,10 @@ void main()
     float dtime = ubom.meteo.dtime;
     float ea = localVaporPressureHpa(bufferId);
     float Ta = localAirTemperatureC(bufferId);
+    // Ship hull below its waterline: water-side exchange (aeresist.comp
+    // supplies the resistance), referenced to the scene water temperature.
+    bool shipWet = typeId == TYPE_BUILDING && shipSubmerged(bufferId, bioId);
+    float shipWaterC = shipWet ? shipWaterTemperatureC(Ta) : Ta;
     float ca = localAmbientCo2Ppm(bufferId);
     float ci;
     float H; // latent heat flux
@@ -136,9 +140,9 @@ void main()
         if(raa < 1) raa = 1;
         // Ground surfaces add free convection when warmer than the air
         // (budget.comp uses the same effective resistance per state).
-        raa = groundExchangeRaa(raa, Tc, Ta, typeId);
+        raa = groundExchangeRaa(raa, Tc, Ta, shipWet ? uint(TYPE_NULL) : typeId);
         // H = raa;
-        H = (RHOA * CP) / raa * (Tc-273.15 - Ta);
+        H = (RHOA * CP) / raa * (Tc-273.15 - (shipWet ? shipWaterC : Ta));
         LE = RHOA / (raa + rss) * lambda * (qi - qa);
 
         if (typeId == TYPE_WATER)

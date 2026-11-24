@@ -799,6 +799,15 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     }
 
     // state
+    {
+        // Ship waterline contact (minimal VoxelEB ship): switched on only by a
+        // Ship material with waterHeatTransferCoefficient > 0.
+        bool shipWaterline = false;
+        for (const SoilSet& soil : meshio->soilsets)
+            shipWaterline = shipWaterline || soil.waterHeatTransferCoefficient > 0.0f;
+        voxellstio->shipWaterline = shipWaterline;
+        if (shipWaterline) std::cout << "SHIP_WATERLINE\tvoxelEB hull voxels below the waterline exchange with the scene water temperature" << std::endl;
+    }
     auto cmdBufState = cmdGen.createCommandBuffer();
     size = sizeof(EBState);
     // voxelio->m_pStateBuffer = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufState,

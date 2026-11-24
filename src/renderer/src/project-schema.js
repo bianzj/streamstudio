@@ -531,7 +531,8 @@ export function createMaterialPresets() {
       // steel, e.g. EN 1993-1-2 / ISO 10456 steel) with a 22 °C interior; speed (m/s) adds the
       // ship's own motion to the wind (relative wind); waterlineHeight (world y, m; absent = off)
       // puts the hull facets below it in contact with the water. method/lambdas/rhos/cs stay the
-      // VoxelEB (semi-infinite solid) values.
+      // VoxelEB (semi-infinite solid) values; VoxelEB also reads speed, heading/windDirection and the
+      // fixed waterlineHeight + waterHeatTransferCoefficient (hull voxels below it, scene water temperature).
       { name: 'ship_material', label: '船舶表面物化', type: 'Ship', params: { method: 1, rss: 4000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 30, SMC: 0, Satwater: 0,
         wallMode: 'wall', thickness: 0.012, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, layers: [{ thickness: 0.012, lambda: 50, rho: 7850, cp: 460 }], speed: 0 } },
       // mixingDepth 2 m and a start temperature at the mean air temperature of the first 24 h:

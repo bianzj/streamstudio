@@ -139,6 +139,12 @@ VoxelebIO(){
     double stabilitySensibleHeat{0.0};
     int stabilityAeroUpdates{0};
     double stabilityChange{0.0};
+    // Ship waterline contact (Ship material waterHeatTransferCoefficient > 0):
+    // scene mean water temperature [K] of the last budget pass (0 = not yet
+    // set), water voxel count of that pass, and the switch.
+    bool shipWaterline{false};
+    double shipWaterK{0.0};
+    int shipWaterVoxels{0};
     std::shared_ptr<nvvk::Buffer> m_pScatteringStats;
     // Solar-visibility diagnostics of the current node (zero on skipped
     // night nodes) and the beam-normal irradiance that turns its

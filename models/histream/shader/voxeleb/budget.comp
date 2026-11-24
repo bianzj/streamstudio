@@ -85,6 +85,11 @@ void main()
     TsunlitOld = voxelTempes[bufferId].sunlit;
     TshadedOld = voxelTempes[bufferId].shaded;
     float Ta = localAirTemperatureC(bufferId);
+    // Ship hull below its waterline: water-side exchange against the scene
+    // water temperature, no free-convection add-on (see evapo.comp).
+    const bool shipWet = typeId == TYPE_BUILDING && shipSubmerged(bufferId, bioId);
+    const float TaH = shipWet ? shipWaterTemperatureC(Ta) : Ta;
+    const uint exchangeType = shipWet ? uint(TYPE_NULL) : typeId;
     float fallbackSunlit = Ta + 2.0 + 273.15;
     float fallbackShaded = Ta + 1.0 + 273.15;
     if (isnan(TsunlitOld) || isinf(TsunlitOld)
@@ -181,8 +186,8 @@ void main()
     float raa = max(voxelRaas[bufferId].raa, 1.0);
     // Same per-state effective resistance as evapo.comp (free convection on
     // ground surfaces warmer than the air; vegetation unchanged).
-    float raaSunlit = groundExchangeRaa(raa, TsunlitOld, Ta, typeId);
-    float raaShaded = groundExchangeRaa(raa, TshadedOld, Ta, typeId);
+    float raaSunlit = groundExchangeRaa(raa, TsunlitOld, TaH, exchangeType);
+    float raaShaded = groundExchangeRaa(raa, TshadedOld, TaH, exchangeType);
     float rss_sunlit = voxelRsss[bufferId].sunlit;
     float rss_shaded = voxelRsss[bufferId].shaded;
     if(typeId == TYPE_VEGETATION)
@@ -212,17 +217,17 @@ void main()
     float sensibleDerivative = (RHOA * CP) / raa;
     float sensibleDerivativeSunlit = (RHOA * CP) / raaSunlit;
     float sensibleDerivativeShaded = (RHOA * CP) / raaShaded;
-    if (groundFreeConvectionApplies(typeId)) {
+    if (groundFreeConvectionApplies(exchangeType)) {
 #ifdef VOXELEB_MOST
         sensibleDerivativeSunlit += RHOA * CP *
-            groundFreeExchangeExtraSlope(raa, TsunlitOld, Ta);
+            groundFreeExchangeExtraSlope(raa, TsunlitOld, TaH);
         sensibleDerivativeShaded += RHOA * CP *
-            groundFreeExchangeExtraSlope(raa, TshadedOld, Ta);
+            groundFreeExchangeExtraSlope(raa, TshadedOld, TaH);
 #else
         sensibleDerivativeSunlit += RHOA * CP *
-            groundFreeConductanceExtraSlope(TsunlitOld - 273.15 - Ta);
+            groundFreeConductanceExtraSlope(TsunlitOld - 273.15 - TaH);
         sensibleDerivativeShaded += RHOA * CP *
-            groundFreeConductanceExtraSlope(TshadedOld - 273.15 - Ta);
+            groundFreeConductanceExtraSlope(TshadedOld - 273.15 - TaH);
 #endif
     }
     float latentDerivativeSunlit = RHOA * lambdas_sunlit * e_to_q *
@@ -397,6 +402,15 @@ void main()
     
     voxelTempes[bufferId].sunlit = Tsunlit;
     voxelTempes[bufferId].shaded = Tshaded;
+    if(typeId == TYPE_WATER && fluidParameters.localExchange.w > 1.0)
+    {
+        // Scene water temperature for the ship waterline contact: fixed-point
+        // deviation (0.01 K) from the value the pass used.
+        float deviation = 0.5 * (Tsunlit + Tshaded) - fluidParameters.localExchange.w;
+        atomicAdd(ebState.waterCount, 1, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+        atomicAdd(ebState.waterTemperature, int(round(100.0 * clamp(deviation, -20.0, 20.0))),
+                  gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+    }
     atomicAdd(ebState.count,count,gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
 
 

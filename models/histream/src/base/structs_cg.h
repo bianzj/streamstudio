@@ -423,8 +423,12 @@ struct EBState
     int32_t sensible[kEnergyStateBins]; // 0.1 W m-2 per cell footprint
     int32_t ustar[kEnergyStateBins];    // 1e-4 m s-1
     int32_t height[kEnergyStateBins];   // 0.01 m
+    // Ship waterline contact: scene water voxel count and the sum of their
+    // temperatures in 0.01 K (fixed point, deterministic).
+    int32_t waterCount;
+    int32_t waterTemperature;
 };
-static_assert(sizeof(EBState) == 8 + 3 * 4 * kEnergyStateBins);
+static_assert(sizeof(EBState) == 8 + 3 * 4 * kEnergyStateBins + 8);
 
 struct alignas(16) FluidCellMeta
 {
@@ -490,6 +494,15 @@ struct SoilSet
     // Duhamel sum), 1 adds the older history as SOIL_MEMORY_MODES exponential
     // modes (control.soilInertiaHistory = "full").
     int inertiaHistory{0};
+    // Ship hull (material type Ship; all 0 = off, old behaviour). speed: m/s
+    // through the air; windCosine: cos(heading - wind-from direction), 0 keeps
+    // the perpendicular sqrt(u^2+v^2); waterHeatTransferCoefficient > 0 turns
+    // on the waterline: voxels whose centre lies below waterlineHeight (world y)
+    // exchange heat with the scene water temperature at this coefficient.
+    float shipSpeed{0.0f};
+    float shipWindCosine{0.0f};
+    float waterlineHeight{0.0f};
+    float waterHeatTransferCoefficient{0.0f};
     //BSMParam bsm;
 };
 

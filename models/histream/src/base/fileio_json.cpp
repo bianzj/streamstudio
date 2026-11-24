@@ -618,6 +618,33 @@ bool FileIO::readJson(const std::string& path, Mode mode) {
             // finite branches) always keeps the 8-node sum.
             value.soilset.inertiaHistory =
                 ProjectJson::string(project.control(), "soilInertiaHistory", "truncated") == "full" ? 1 : 0;
+            // Ship hull options (minimal VoxelEB version, all default off):
+            // speed through the air, course vs. wind-from direction, and a
+            // fixed waterline below which hull voxels exchange heat with the
+            // scene water. Same field names as the FacetEB Ship material.
+            const std::string typeName = ProjectJson::string(item, "type", "Soil");
+            if (value.type == Type::BUILDING && (typeName == "Ship" || typeName == "ship")) {
+                SoilSet& hull = value.soilset;
+                const float speed = ProjectJson::number(params, "speed", 0.0f);
+                if (!std::isfinite(speed) || speed < 0.0f || speed > 100.0f)
+                    throw std::runtime_error("Ship speed must be 0-100 m/s: " + value.name);
+                hull.shipSpeed = speed;
+                const float heading = ProjectJson::number(params, "heading", -1.0f);
+                const float windFrom = ProjectJson::number(params, "windDirection", -1.0f);
+                if (heading >= 0.0f && windFrom >= 0.0f) {
+                    if (!std::isfinite(heading) || !std::isfinite(windFrom) || heading > 360.0f || windFrom > 360.0f)
+                        throw std::runtime_error("Ship heading and wind direction must be 0-360 degrees: " + value.name);
+                    hull.shipWindCosine = static_cast<float>(
+                        std::cos((double(heading) - double(windFrom)) * 3.14159265358979323846 / 180.0));
+                }
+                if (params.contains("waterlineHeight") && params["waterlineHeight"].is_number()) {
+                    hull.waterlineHeight = ProjectJson::number(params, "waterlineHeight", 0.0f);
+                    hull.waterHeatTransferCoefficient = ProjectJson::number(params, "waterHeatTransferCoefficient", 500.0f);
+                    if (!std::isfinite(hull.waterlineHeight) || !std::isfinite(hull.waterHeatTransferCoefficient) ||
+                        !(hull.waterHeatTransferCoefficient > 0.0f))
+                        throw std::runtime_error("Invalid ship waterline parameters: " + value.name);
+                }
+            }
         }
         properties.push_back(std::move(value));
     }

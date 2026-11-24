@@ -89,6 +89,8 @@ const URBAN_SHIP = urbanShip()
 // The same ship floating in a pond whose surface is 0.65 m above the ground (the keel stays
 // 0.02 m above y = 0, where the scene domain is clipped): draft 0.63 m of the 1.5 m hull.
 const URBAN_SHIP_DRAFT = urbanShip('ship_material', '280 65 0.02 0.15 0', '280 65 0.65 1 0')
+const VEB_SHIP = (params) => ({ example: 'urban_block', mode: 'eVoxelEB', meteo: [16, 32], ...URBAN_SHIP, set: {
+  'configuration.scene.voxel': 1, 'configuration.materials.7.params': params } })
 const SHIP_NEW = { method: 1, rss: 4000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 30, SMC: 0, Satwater: 0, wallMode: 'wall',
   thickness: 0.012, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, layers: [{ thickness: 0.012, lambda: 50, rho: 7850, cp: 460 }], speed: 0 }
 
@@ -241,6 +243,15 @@ export const CASES = {
   feb_urban_ship_draft_shield: { example: 'urban_block', mode: 'eFacetEB', meteo: [0, 48], ...URBAN_SHIP_DRAFT, set: {
     'configuration.materials.7.params': { ...SHIP_NEW, waterlineSource: 'water', waterHeatTransferCoefficient: 500,
       waterShielding: true, waterFeedback: true } } },
+  // VoxelEB ship (minimal version, 2026-11-24): the same ship and pond, 1 m voxels (the example's 2 m
+  // voxels keep only 2 hull voxels), nodes 16-32 (morning to afternoon). The hull is BUILDING voxels of
+  // ship_material (semi-infinite solid SHIP_NEW cs/rhos/lambdas); speed is the forced convection of the
+  // relative wind, waterlineHeight (2.0 m: the hull/deck voxels are layer 1, centre 1.5 m, below it; the
+  // superstructure layers, centre 3.5 m and up, are not) couples the hull voxels to the scene water temperature at 500 W m-2 K-1.
+  veb_urban_ship: VEB_SHIP(SHIP_NEW),
+  veb_urban_ship_speed8: VEB_SHIP({ ...SHIP_NEW, speed: 8 }),
+  veb_urban_ship_waterline: VEB_SHIP({ ...SHIP_NEW, waterlineHeight: 2.0, waterHeatTransferCoefficient: 500 }),
+  veb_urban_ship_head: VEB_SHIP({ ...SHIP_NEW, speed: 8, heading: 0, windDirection: 0 }),
   // Soil thermal properties (2026-11-23) on the background loam (soilset: urban index 4,
   // forest index 11). SOIL_SCOPE = the former built-in loam (SCOPE cs 1180, rhos 1800,
   // lambdas 1.55; still the engine fallback), SOIL_LOAM = the new built-in loam (cs 1300,
