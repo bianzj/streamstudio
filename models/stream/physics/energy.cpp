@@ -19,7 +19,7 @@ constexpr double kCP = 1004.0;
 constexpr double kRd = 287.05;
 constexpr double kMAir = 28.96;
 constexpr double kMH2O = 18.0;
-constexpr double kSigma = 5.67e-8;
+constexpr double kSigma = kStefanBoltzmann;  // FIX(2026-11-24 T1): was a separate 5.67e-8
 constexpr double kResidualThreshold = 5.0;
 constexpr double kInnerThreshold = 1e-4;
 // Keep README, PORTING and scene_summary stability descriptions consistent with these tolerances.
@@ -171,7 +171,7 @@ ResistancesT<T> aerodynamicResistances(const EnergySurface& surface, const Forci
         ? std::cbrt(kGravity * buoyancy * 1000.0 / (density * kCP * forcing.ta))
         : 0.0;
     wind0 = std::hypot(wind0, wstar);
-    T wind(wind0);
+    const T wind(wind0);
     // DEFERRED[中] 物理: 驱动量是 ERA5 的 10 m 风（u10/v10）和 2 m 气温/露点（t2m/d2m），这里却直接当作高度 z=max(15 m, hc+0.1) 处的值。森林（hc 10–30 m）时 z 远高于 10 m 和 2 m，而 ERA5 诊断量是相对于其自身 d+z0 的；风偏小、气温梯度偏大，导致 ra 偏大、H 符号/量级偏差；建议：用 ERA5 自身粗糙度按对数廓线把 u10、t2m 外推到 z（或把 z 设为 10 m/2 m 并相应计算 rai），至少对 hc>2 m 的地类记日志提示
     const double z = std::max(surface.referenceHeight, hc + 0.1);
     const T weight = canopyWeightT<T>(lai);
@@ -198,12 +198,8 @@ ResistancesT<T> aerodynamicResistances(const EnergySurface& surface, const Forci
     const double zr = 2.5 * hc;
     const T displacement = hc * (1.0 - (1.0 - ad::exp(-sq)) / sq);
     const T roughness = ad::max((hc - displacement) * ad::exp(-kVonKarman * g1 + surface.aero.psicor), 1e-4);
-    if (hc > z) {
-        const T ustarTemp = ad::max(kVonKarman * wind /
-            ad::max(ad::log(ad::max((z - displacement) / roughness, 1.01)) - similarity.psim(z - displacement), 1e-6), 0.001);
-        wind = ad::max(ustarTemp / kVonKarman *
-            (ad::log(ad::max((hc - displacement) / roughness, 1.01)) - similarity.psim(hc - displacement)), 0.01);
-    }
+    // FIX(2026-11-24 L3): the former `if (hc > z)` branch (SCOPE's "wind at a point below the canopy top") was dead code:
+    // z = max(referenceHeight, hc + 0.1) is always above hc. Removed; results unchanged.
     const T ustar = ad::max(kVonKarman * wind /
         ad::max(ad::log(ad::max((z - displacement) / roughness, 1.01)) - similarity.psim(z - displacement) +
                 similarity.psim(roughness), 1e-6), 0.001);

@@ -1,5 +1,6 @@
 #include "forcing_metadata.h"
 
+#include "../physics/constants.h"
 #include "../scene/raster.h"
 
 #include <cpl_json.h>
@@ -663,7 +664,7 @@ double forcingPressureFromSeaLevel(double seaLevelPa, double altitudeM, double a
 double forcingBrutsaertLongwave(double airTemperatureK, double vapourPressureHPa)
 {
     const double emissivity = 1.24 * std::pow(std::max(vapourPressureHPa, 0.01) / airTemperatureK, 1.0 / 7.0);
-    return emissivity * 5.670374419e-8 * std::pow(airTemperatureK, 4);
+    return emissivity * kStefanBoltzmann * std::pow(airTemperatureK, 4);
 }
 
 bool forcingStandardQuantity(const std::string& name)

@@ -406,7 +406,7 @@ ImageConfig readImageConfig(const std::string& path)
         config.maxStabilityIterations = integerOr(energy, "maxStabilityIterations", 60, "temperature.energy.maxStabilityIterations");
         if (!(config.stomatalG0 > 0) || !(config.minWindSpeed >= 0) || !(config.referenceHeight > 0) ||
             !(config.leafEmissivity > 0 && config.leafEmissivity <= 1) ||
-            !(config.soilConductivity > 0) || !(config.soilVolumetricCapacity > 0) || config.maxIterations < 1 || config.maxStabilityIterations < 1)
+            !(config.soilConductivity > 0) || !(config.soilVolumetricCapacity > 0) || config.maxIterations < 1)
             throw std::runtime_error("能量平衡参数超出有效范围");
     } else if (mode == "rt") {
         const auto components = temperature.GetObj("components");
@@ -423,6 +423,11 @@ ImageConfig readImageConfig(const std::string& path)
         if (mode != "eb") {
             config.soilEmissivity = numberOr(energy, "soilEmissivity", 0.955, "temperature.energy.soilEmissivity");
             config.soilEmissivitySet = energy.GetObj("soilEmissivity").IsValid();
+            // FIX(2026-11-24 C5): RT imaging (optical reflectance) used a hard-coded 0.2 and ignored energy.diffuseFraction.
+            // It is now read here. RT has no shortwave input, so -1 (Erbs) cannot be evaluated and is rejected explicitly.
+            config.diffuseFraction = numberOr(energy, "diffuseFraction", 0.2, "temperature.energy.diffuseFraction");
+            if (!(config.diffuseFraction >= 0.0 && config.diffuseFraction <= 1.0))
+                throw std::runtime_error("RT 模式没有短波辐射输入，diffuseFraction 须为 0 到 1 之间的数（-1/Erbs 仅 EB 模式可用）");
         }
         // Negative selects the built-in dry-to-wet gain; otherwise it is the
         // emissivity at saturation and must be a valid value above the dry one.

@@ -281,7 +281,7 @@ bool thermalPixel(const ThermalScene& scene, const std::array<T, 4>& temperature
 
 double skyTemperatureFromLongwave(double longwave)
 {
-    constexpr double kSigma = 5.670374419e-8;
+    constexpr double kSigma = kStefanBoltzmann;
     return std::isfinite(longwave) && longwave > 0.0 ? std::pow(longwave / kSigma, 0.25) : std::nan("");
 }
 
