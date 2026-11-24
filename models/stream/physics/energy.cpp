@@ -73,35 +73,45 @@ struct Similarity {
         if (result.length > 0.0) result.stableInverse = std::min(1.0 / result.length, 1.0 / std::max(referenceHeight, 1e-6));
         return result;
     }
-    double psim(double value) const
+    // FIX(2026-11-24 M3): templated on the scalar so that displacement, roughness and heights may carry Ad derivatives.
+    template <class T>
+    T psim(const T& value) const
     {
         if (length < 0.0) {
-            const double x = std::pow(std::max(1.0 - 16.0 * value / length, 1e-8), 0.25);
-            return 2.0 * std::log((1.0 + x) / 2.0) + std::log((1.0 + x * x) / 2.0) - 2.0 * std::atan(x) + kPi / 2.0;
+            const T x = ad::pow(ad::max(1.0 - 16.0 * value / length, 1e-8), 0.25);
+            return 2.0 * ad::log((1.0 + x) / 2.0) + ad::log((1.0 + x * x) / 2.0) - 2.0 * ad::atan(x) + kPi / 2.0;
         }
-        if (length > 0.0) return -5.0 * std::max(value, 0.0) * stableInverse;
-        return 0.0;
+        if (length > 0.0) return -5.0 * ad::max(value, 0.0) * stableInverse;
+        return T(0.0);
     }
-    double psih(double value) const
+    template <class T>
+    T psih(const T& value) const
     {
         if (length < 0.0) {
-            const double x = std::pow(std::max(1.0 - 16.0 * value / length, 1e-8), 0.25);
-            return 2.0 * std::log((1.0 + x * x) / 2.0);
+            const T x = ad::pow(ad::max(1.0 - 16.0 * value / length, 1e-8), 0.25);
+            return 2.0 * ad::log((1.0 + x * x) / 2.0);
         }
-        if (length > 0.0) return -5.0 * std::max(value, 0.0) * stableInverse;
-        return 0.0;
+        if (length > 0.0) return -5.0 * ad::max(value, 0.0) * stableInverse;
+        return T(0.0);
     }
-    double phstar(double value, double reference, double displacement) const
+    template <class T>
+    T phstar(const T& value, double reference, const T& displacement) const
     {
         if (length < 0.0) {
-            const double x = std::pow(std::max(1.0 - 16.0 * value / length, 1e-8), 0.25);
-            return (value - displacement) / std::max(reference - displacement, 1e-9) * ((x * x - 1.0) / (x * x + 1.0));
+            const T x = ad::pow(ad::max(1.0 - 16.0 * value / length, 1e-8), 0.25);
+            return (value - displacement) / ad::max(reference - displacement, 1e-9) * ((x * x - 1.0) / (x * x + 1.0));
         }
-        if (length > 0.0) return -5.0 * std::max(value, 0.0) * stableInverse;
-        return 0.0;
+        if (length > 0.0) return -5.0 * ad::max(value, 0.0) * stableInverse;
+        return T(0.0);
     }
 };
 
+template <class T>
+T canopyWeightT(const T& lai)
+{
+    const T x = ad::clamp(lai / kSparseLai, 0.0, 1.0);
+    return x * x * (3.0 - 2.0 * x);
+}
 double canopyWeight(double lai)
 {
     const double x = std::clamp(lai / kSparseLai, 0.0, 1.0);
@@ -123,44 +133,56 @@ double bulkResistance(double height, double roughness, double wind, const Simila
 
 double resistanceCap(const Aerodynamics& aero) { return aero.maxResistance > 0.0 ? aero.maxResistance : std::numeric_limits<double>::infinity(); }
 
-double logRatio(double argument)
+template <class T>
+T logRatio(const T& argument0)
 {
-    argument = std::max(argument, 1e-8);
-    if (argument > 50.0) return std::log1p(-2.0 * std::exp(-argument));
-    const double e = std::exp(argument);
-    return std::log((e - 1.0) / (e + 1.0));
+    const T argument = ad::max(argument0, 1e-8);
+    if (ad::value(argument) > 50.0) return ad::log1p(-2.0 * ad::exp(-argument));
+    const T e = ad::exp(argument);
+    return ad::log((e - 1.0) / (e + 1.0));
 }
 
-struct Resistances {
-    double leaf = 0, soil = 0, ustar = 0.001, displacement = 0, height = 1, roughness = 0.01, weight = 0;
+// Aerodynamic resistances. FIX(2026-11-24 M3/A4): templated on the scalar of LAI, so that the assimilation's Ad run
+// carries dRa/dLAI (displacement, roughness, u*, rac, leaf boundary layer, canopy weight) into the Jacobian; before, the
+// resistances were frozen doubles and LAI only acted through the radiation and the leaf-area scaling of the fluxes.
+// 1/L and the convective gust (sceneSensible) stay frozen inputs (README, quasi-Newton note). The double
+// instantiation is the forward solve and performs the same arithmetic as before.
+template <class T>
+struct ResistancesT {
+    T leaf{0.0}, soil{0.0};
+    double ustar = 0.001, displacement = 0, height = 1, roughness = 0.01, weight = 0;
     bool limited = false;
 };
+using Resistances = ResistancesT<double>;
 
-Resistances aerodynamicResistances(const EnergySurface& surface, const Forcing& forcing, double inverseObukhov,
-                                   double density, double sceneSensible)
+template <class T>
+ResistancesT<T> aerodynamicResistances(const EnergySurface& surface, const Forcing& forcing, double inverseObukhov,
+                                       double density, double sceneSensible, const T& leafArea)
 {
-    Resistances result;
-    const double lai = std::max(surface.lai, 0.0);
+    ResistancesT<T> result;
+    const T lai = ad::max(leafArea, 0.0);
     const double hc = std::max(surface.height, 0.1);
     const double cap = resistanceCap(surface.aero);
-    double wind = std::max({forcing.wind, surface.aero.minWindSpeed, 0.01});
+    double wind0 = std::max({forcing.wind, surface.aero.minWindSpeed, 0.01});
     const double buoyancy = std::max(sceneSensible, 0.0);
     const double wstar = buoyancy > 0.0
         ? std::cbrt(kGravity * buoyancy * 1000.0 / (density * kCP * forcing.ta))
         : 0.0;
-    wind = std::hypot(wind, wstar);
+    wind0 = std::hypot(wind0, wstar);
+    T wind(wind0);
     // DEFERRED[中] 物理: 驱动量是 ERA5 的 10 m 风（u10/v10）和 2 m 气温/露点（t2m/d2m），这里却直接当作高度 z=max(15 m, hc+0.1) 处的值。森林（hc 10–30 m）时 z 远高于 10 m 和 2 m，而 ERA5 诊断量是相对于其自身 d+z0 的；风偏小、气温梯度偏大，导致 ra 偏大、H 符号/量级偏差；建议：用 ERA5 自身粗糙度按对数廓线把 u10、t2m 外推到 z（或把 z 设为 10 m/2 m 并相应计算 rai），至少对 hc>2 m 的地类记日志提示
-    double z = std::max(surface.referenceHeight, hc + 0.1);
-    result.weight = canopyWeight(lai);
-    const double profileReference = z + result.weight * (std::max(z, 2.5 * hc) - z);
-    const Similarity similarity = Similarity::make(inverseObukhov, profileReference);
-    result.limited = inverseObukhov > 0.0 && profileReference * inverseObukhov > 1.0;
+    const double z = std::max(surface.referenceHeight, hc + 0.1);
+    const T weight = canopyWeightT<T>(lai);
+    const T profileReference = z + weight * (std::max(z, 2.5 * hc) - z);
+    const Similarity similarity = Similarity::make(inverseObukhov, ad::value(profileReference));
+    result.limited = inverseObukhov > 0.0 && ad::value(profileReference) * inverseObukhov > 1.0;
+    result.weight = ad::value(weight);
 
-    if (lai <= 0.0) {
+    if (!(ad::value(lai) > 0.0)) {
         const double roughness = 0.01;
-        result.ustar = std::max(0.001, kVonKarman * wind /
+        result.ustar = std::max(0.001, kVonKarman * wind0 /
             std::max(std::log(z / roughness) - similarity.psim(z) + similarity.psim(roughness), 1e-6));
-        result.soil = std::min(bulkResistance(z, roughness, wind, similarity, surface.ground.heatRoughnessKb), cap);
+        result.soil = std::min(bulkResistance(z, roughness, wind0, similarity, surface.ground.heatRoughnessKb), cap);
         result.leaf = 0.0;
         result.height = z;
         result.roughness = roughness;
@@ -168,65 +190,64 @@ Resistances aerodynamicResistances(const EnergySurface& surface, const Forcing& 
         return result;
     }
 
-    const double sq = std::sqrt(std::max(surface.aero.cd1 * lai / 2.0, 1e-8));
-    const double g1 = std::max(3.3, std::pow(std::max(surface.aero.cssoil + surface.aero.cr * lai / 2.0, 1e-8), -0.5));
-    const double n = surface.aero.cd * lai / (2.0 * kVonKarman * kVonKarman);
+    const T sq = ad::sqrt(ad::max(surface.aero.cd1 * lai / 2.0, 1e-8));
+    const T g1 = ad::max(ad::pow(ad::max(surface.aero.cssoil + surface.aero.cr * lai / 2.0, 1e-8), -0.5), 3.3);
+    const T n = surface.aero.cd * lai / (2.0 * kVonKarman * kVonKarman);
     const double zr = 2.5 * hc;
-    double displacement = hc * (1.0 - (1.0 - std::exp(-sq)) / sq);
-    double roughness = std::max((hc - displacement) * std::exp(-kVonKarman * g1 + surface.aero.psicor), 1e-4);
+    const T displacement = hc * (1.0 - (1.0 - ad::exp(-sq)) / sq);
+    const T roughness = ad::max((hc - displacement) * ad::exp(-kVonKarman * g1 + surface.aero.psicor), 1e-4);
     if (hc > z) {
-        const double ustarTemp = std::max(0.001, kVonKarman * wind /
-            std::max(std::log(std::max((z - displacement) / roughness, 1.01)) - similarity.psim(z - displacement), 1e-6));
-        wind = std::max(0.01, ustarTemp / kVonKarman *
-            (std::log(std::max((hc - displacement) / roughness, 1.01)) - similarity.psim(hc - displacement)));
+        const T ustarTemp = ad::max(kVonKarman * wind /
+            ad::max(ad::log(ad::max((z - displacement) / roughness, 1.01)) - similarity.psim(z - displacement), 1e-6), 0.001);
+        wind = ad::max(ustarTemp / kVonKarman *
+            (ad::log(ad::max((hc - displacement) / roughness, 1.01)) - similarity.psim(hc - displacement)), 0.01);
     }
-    const double ustar = std::max(0.001, kVonKarman * wind /
-        std::max(std::log(std::max((z - displacement) / roughness, 1.01)) - similarity.psim(z - displacement) +
-                 similarity.psim(roughness), 1e-6));
-    double kh = kVonKarman * ustar * std::max(zr - displacement, 1e-6);
+    const T ustar = ad::max(kVonKarman * wind /
+        ad::max(ad::log(ad::max((z - displacement) / roughness, 1.01)) - similarity.psim(z - displacement) +
+                similarity.psim(roughness), 1e-6), 0.001);
+    T kh = kVonKarman * ustar * ad::max(zr - displacement, 1e-6);
     if (similarity.length < 0.0)
-        kh *= std::sqrt(std::max(1.0 - 16.0 * (hc - displacement) / similarity.length, 1e-6));
+        kh *= ad::sqrt(ad::max(1.0 - 16.0 * (hc - displacement) / similarity.length, 1e-6));
     else if (similarity.length > 0.0)
-        kh /= 1.0 + 5.0 * (hc - displacement) * std::min(1.0 / similarity.length, 1.0 / profileReference);
-    kh = std::max(kh, 1e-6);
-    const double canopyWind = std::max(ustar / kVonKarman *
-        (std::log(std::max((hc - displacement) / roughness, 1.01)) - similarity.psim(hc - displacement)), 0.01);
-    const double rai = z > zr ? 1.0 / (kVonKarman * ustar) *
-        (std::log(std::max((z - displacement) / std::max(zr - displacement, 1e-6), 1.01)) -
-         similarity.psih(z - displacement) + similarity.psih(zr - displacement)) : 0.0;
+        kh /= 1.0 + 5.0 * (hc - displacement) * ad::min(1.0 / similarity.length, 1.0 / profileReference);
+    kh = ad::max(kh, 1e-6);
+    const T canopyWind = ad::max(ustar / kVonKarman *
+        (ad::log(ad::max((hc - displacement) / roughness, 1.01)) - similarity.psim(hc - displacement)), 0.01);
+    const T rai = z > zr ? 1.0 / (kVonKarman * ustar) *
+        (ad::log(ad::max((z - displacement) / ad::max(zr - displacement, 1e-6), 1.01)) -
+         similarity.psih(z - displacement) + similarity.psih(zr - displacement)) : T(0.0);
     // 2026-11-20: the stability terms belong inside 1/(κu*) (they were subtracted from the resistance in s m-1, a
     // unit error inherited from SCOPE resistances.m / TIRTEB). phstar = 0 when neutral, so neutral runs are unchanged.
     // FIX(2026-11-21 B9): duplicated copy of the two comment lines above removed.
-    const double rar = 1.0 / (kVonKarman * ustar) * ((zr - hc) / std::max(zr - displacement, 1e-6) -
-                       similarity.phstar(zr, zr, displacement) + similarity.phstar(hc, zr, displacement));
-    const double profile = n > 1e-12 ? hc * std::sinh(n) / (n * kh) : hc / kh;
-    const double rac = n > 1e-12 ? profile * (logRatio(n) - logRatio(n * (roughness + displacement) / hc)) : 0.0;
-    const double windLeaf = std::max(canopyWind * std::exp(n * ((roughness + displacement) / hc - 1.0)), 0.01);
-    const double boundary = 70.0 / lai * std::sqrt(std::max(surface.leafWidth / windLeaf, 1e-8));
-    const double soilProfile = n > 1e-12
-        ? profile * (logRatio(n * (roughness + displacement) / hc) - logRatio(n * 0.01 / hc))
-        : 0.0;
-    const double above = std::min(rai + rar + rac, cap);
-    result.leaf = std::max(above + std::min(boundary, cap), 1e-3);
-    result.soil = std::max(above + std::min(soilProfile + surface.aero.soilBoundary, cap), 1e-3);
-    result.ustar = ustar;
-    result.displacement = displacement;
+    const T rar = 1.0 / (kVonKarman * ustar) * ((zr - hc) / ad::max(zr - displacement, 1e-6) -
+                  similarity.phstar(T(zr), zr, displacement) + similarity.phstar(T(hc), zr, displacement));
+    const bool nPositive = ad::value(n) > 1e-12;
+    const T profile = nPositive ? hc * ad::sinh(n) / (n * kh) : hc / kh;
+    const T rac = nPositive ? profile * (logRatio<T>(n) - logRatio<T>(n * (roughness + displacement) / hc)) : T(0.0);
+    const T windLeaf = ad::max(canopyWind * ad::exp(n * ((roughness + displacement) / hc - 1.0)), 0.01);
+    const T boundary = 70.0 / lai * ad::sqrt(ad::max(surface.leafWidth / windLeaf, 1e-8));
+    const T soilProfile = nPositive
+        ? profile * (logRatio<T>(n * (roughness + displacement) / hc) - logRatio<T>(n * 0.01 / hc))
+        : T(0.0);
+    const T above = ad::min(rai + rar + rac, cap);
+    result.leaf = ad::max(above + ad::min(boundary, cap), 1e-3);
+    result.soil = ad::max(above + ad::min(soilProfile + surface.aero.soilBoundary, cap), 1e-3);
+    result.ustar = ad::value(ustar);
+    result.displacement = ad::value(displacement);
     result.height = z;
-    result.roughness = roughness;
+    result.roughness = ad::value(roughness);
 
-    if (result.weight < 1.0) {
-        const double bareUstar = std::max(0.001, kVonKarman * wind /
+    if (ad::value(weight) < 1.0) {
+        const double bareUstar = std::max(0.001, kVonKarman * wind0 /
             std::max(std::log(std::max(z / 0.01, 1.01)) - similarity.psim(z) + similarity.psim(0.01), 1e-6));
-        const double bareSoil = std::min(bulkResistance(z, 0.01, wind, similarity, surface.ground.heatRoughnessKb), cap);
-        const double weight = result.weight;
-        result.ustar = weight * result.ustar + (1.0 - weight) * bareUstar;
+        const double bareSoil = std::min(bulkResistance(z, 0.01, wind0, similarity, surface.ground.heatRoughnessKb), cap);
+        result.ustar = ad::value(weight) * result.ustar + (1.0 - ad::value(weight)) * bareUstar;
         result.soil = weight * result.soil + (1.0 - weight) * bareSoil;
-        result.displacement *= weight;
-        result.roughness = std::exp(weight * std::log(result.roughness) + (1.0 - weight) * std::log(0.01));
+        result.displacement *= ad::value(weight);
+        result.roughness = std::exp(ad::value(weight) * std::log(result.roughness) + (1.0 - ad::value(weight)) * std::log(0.01));
     }
     return result;
 }
-
 // Smaller root of a x^2 + b x + c.
 template <class T>
 T smallerRoot(double a, const T& b, const T& c)
@@ -338,7 +359,7 @@ struct BalancesT {
 template <class T>
 BalancesT<T> balances(const EnergySurface& surface, const EnergyInputsT<T>& in, const Forcing& forcing,
                       double szaDeg, bool sunlit, double dtSeconds, const EnergyState& thermal,
-                      const Resistances& aero, double density)
+                      const ResistancesT<T>& aero, double density)
 {
     BalancesT<T> out;
     const T lai = ad::max(in.lai, 0.0);
@@ -360,18 +381,18 @@ BalancesT<T> balances(const EnergySurface& surface, const EnergyInputsT<T>& in, 
     const T leafIncomingSun = in.leafDirect + in.leafDiffuseSun + longwave.leafSun;
     const T leafIncomingShade = in.leafDiffuseShade + longwave.leafShade;
 
-    const double raLeaf = std::max(aero.leaf, 1.0);
-    const double raSoil = std::max(aero.soil, 1.0);
+    const T raLeaf = ad::max(aero.leaf, 1.0);
+    const T raSoil = ad::max(aero.soil, 1.0);
     out.soilResistance = ad::max(soilSurfaceResistanceT<T>(surface, in.soilMoisture), 0.0);
     if (leaves) {
         out.leafResistanceSun = stomatalResistanceT<T>(surface, in.leafSunlit, in.parSun, in.vcmax, forcing, density) / lai;
         out.leafResistanceShade = stomatalResistanceT<T>(surface, in.leafShaded, in.parShade, in.vcmax, forcing, density) / lai;
     }
 
-    const auto component = [&](const T& temperature, double ra, const T& rs, const T& incoming, const T& factor,
+    const auto component = [&](const T& temperature, const T& ra, const T& rs, const T& incoming, const T& factor,
                                const T& emissivity) {
         ComponentFluxT<T> flux;
-        const double resistanceAero = std::max(ra, 1.0);
+        const T resistanceAero = ad::max(ra, 1.0);
         const T resistanceSurface = ad::max(rs, 0.0);
         const T qi = saturationVapourPressureT(temperature - 273.15) * eToQ;
         const T lambda = latentHeatT(temperature);
@@ -417,7 +438,7 @@ void fluxes(const EnergySurface& surface, const Forcing& forcing, const Shortwav
     const double lai = std::max(surface.lai, 0.0);
     const bool leaves = lai > 0.0;
     const EnergyInputsT<double> inputs = energyInputs(surface, shortwave, state);
-    const Resistances aero = aerodynamicResistances(surface, forcing, inverseObukhov, density, sceneSensible);
+    const Resistances aero = aerodynamicResistances<double>(surface, forcing, inverseObukhov, density, sceneSensible, surface.lai);
     solution.aero = aero;
     solution.density = density;
     const BalancesT<double> b = balances<double>(surface, inputs, forcing, szaDeg, sunlit, dtSeconds, state, aero, density);
@@ -502,7 +523,7 @@ std::array<T, 4> energyResiduals(const EnergySurface& surface, const EnergyInput
                                  double inverseObukhov, double sceneSensible)
 {
     const double density = airDensity(forcing);
-    const Resistances aero = aerodynamicResistances(surface, forcing, inverseObukhov, density, sceneSensible);
+    const ResistancesT<T> aero = aerodynamicResistances<T>(surface, forcing, inverseObukhov, density, sceneSensible, inputs.lai);
     const BalancesT<T> b = balances<T>(surface, inputs, forcing, szaDeg, sunlit, dtSeconds, history, aero, density);
     const bool leaves = ad::value(inputs.lai) > 0.0;
     return {b.soilSunlit.residual, b.soilShaded.residual,

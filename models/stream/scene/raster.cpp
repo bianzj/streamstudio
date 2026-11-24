@@ -184,9 +184,8 @@ void writeTiff(const std::filesystem::path& path, const Grid& grid, const std::v
             throw std::runtime_error("写入结果失败：" + utf8FromPath(path));
     }
     // FIX(2026-11-24 R5): flushing and closing can fail (disk full, truncated file) after every RasterIO succeeded.
-    CPLErrorReset();
-    const CPLErr closed = dataset->Close();
-    if (closed != CE_None || CPLGetLastErrorType() == CE_Failure)
+    // Only the return code counts: unrelated CPL errors (e.g. PROJ missing proj.db while writing the CRS) must not fail the run.
+    if (dataset->Close() != CE_None)
         throw std::runtime_error("写入结果失败（刷盘或关闭文件出错，磁盘空间不足？）：" + utf8FromPath(path));
 }
 

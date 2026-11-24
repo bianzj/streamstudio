@@ -43,6 +43,24 @@ else ()
     target_link_libraries(stream PRIVATE OpenMP::OpenMP_CXX)
 endif ()
 
+# Gradient regression test of the assimilation EB Jacobian (FIX 2026-11-24 M3): Ad dR/dLAI against finite differences.
+# Not part of the default build; tools/test-stream-jacobian.py builds and runs it.
+add_executable(stream_jacobian_check EXCLUDE_FROM_ALL
+        tests/jacobian_check.cpp
+        physics/canopy.cpp
+        physics/energy.cpp
+        physics/heat_conduction.cpp
+        physics/radiosity.cpp
+        physics/shortwave.cpp)
+target_include_directories(stream_jacobian_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(stream_jacobian_check PRIVATE cxx_std_20)
+set_target_properties(stream_jacobian_check PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/$<CONFIG>/")
+if (MSVC)
+    target_compile_options(stream_jacobian_check PRIVATE /utf-8 /bigobj /wd4244 /wd4267 /wd4305 /wd4996)
+    target_compile_definitions(stream_jacobian_check PRIVATE NOMINMAX _USE_MATH_DEFINES)
+endif ()
+
 # FIX(2026-11-21 B-S5): GDAL / netCDF are found through their CMake package configs on every platform (vcpkg on
 # Windows, the system packages on Linux, e.g. Ubuntu libgdal-dev / libnetcdf-dev); a module / pkg-config fallback
 # covers distributions that ship no config file.
