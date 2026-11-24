@@ -36,6 +36,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -5152,9 +5153,21 @@ try {
     const bool cpuEnergy = cpuEnergyRequested || autoCpuEnergy;
     const bool gpuEnergy = !useCpuBackend && !cpuEnergy && model.supportsGpuEnergy();
     const char* verifyEnergy = std::getenv("HISTREAM_FACET_VALIDATE_ENERGY");
-    const bool shadowEnergy = gpuEnergy && verifyEnergy && std::string(verifyEnergy) == "1";
-    float shadowFluxMaximum = 0.0f, shadowIncidentMaximum = 0.0f, shadowUpdateMaximum = 0.0f;
+    // "1": strict audit, stops at the first CPU/GPU mismatch; "2": survey, runs to the
+    // end and reports every mismatching (surface class, field) pair in the run index.
+    const std::string verifyMode = verifyEnergy ? std::string(verifyEnergy) : std::string();
+    const bool shadowEnergy = gpuEnergy && (verifyMode == "1" || verifyMode == "2");
+    const bool shadowSurvey = shadowEnergy && verifyMode == "2";
+    float shadowFluxMaximum = 0.0f, shadowIncidentMaximum = 0.0f, shadowUpdateMaximum = 0.0f, shadowResistanceMaximum = 0.0f;
     uint64_t shadowEvaluations = 0, shadowUpdates = 0;
+    struct ShadowMismatch {
+        uint64_t count{0};
+        float maxDifference{0.0f}, cpu{0.0f}, gpu{0.0f};
+        uint32_t facet{0}, node{0};
+        int state{0};
+    };
+    std::map<std::string, ShadowMismatch> shadowMismatches;
+    std::map<std::string, uint64_t> shadowClassFacets; // facets audited per surface class
     if (!useCpuBackend && !cpuEnergy && !gpuEnergy)
         throw std::runtime_error("GPU FacetEB energy requires shaderFloat64 and energy.comp.spv; select the CPU or auto backend");
     runIndex.value["execution"] = {{"radiation", useCpuBackend ? "cpu" : "gpu"},
@@ -5975,12 +5988,16 @@ try {
 
         struct StateFluxes {
             std::vector<float> net, sensible, sensibleSlope, latent, latentSlope,
-                storage, storageSlope, photovoltaic, photovoltaicSlope, temperatureStep, stomatalMismatch,internal,internalSlope,source;
+                storage, storageSlope, photovoltaic, photovoltaicSlope, temperatureStep, stomatalMismatch,internal,internalSlope,source,
+                leafResistance;
         };
         const auto makeStateFluxes = [&]() {
             const std::vector<float> zero(surfaceCount, 0.0f);
-            return StateFluxes{zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,zero,zero,zero};
+            return StateFluxes{zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero,zero,zero,zero,zero};
         };
+        // CPU/GPU audit only: stomatal resistance imposed on the CPU leaf solve
+        // (index state * surfaceCount + side; <= 0 solves it freely).
+        const std::vector<float>* auditLeafResistance = nullptr;
         std::array<StateFluxes, 2> stateFlux{makeStateFluxes(), makeStateFluxes()};
         // Heat source of the facet balance (W m-2 facet area; energy.comp F[11]):
         // ship internal heat of a thin shell and, on the scene water facets, the
@@ -6188,7 +6205,12 @@ try {
                                         return std::array<double, 2>{residual, response};
                                     });
                                 };
-                                const auto coupled = facetphysics::coupledLeaf(thermal, physiology);
+                                const float imposedResistance = auditLeafResistance
+                                    ? (*auditLeafResistance)[size_t(state) * surfaceCount + side0] : 0.0f;
+                                const auto coupled = imposedResistance > 0.0f
+                                    ? facetphysics::LeafState{thermal(imposedResistance), double(imposedResistance)}
+                                    : facetphysics::coupledLeaf(thermal, physiology);
+                                flux.leafResistance[side0] = static_cast<float>(coupled.resistance);
                                 // All unknowns are re-solved at every outer radiation step. Relax
                                 // temperature towards the joint root, never freeze the physiology.
                                 flux.temperatureStep[side0] = temperatureRelaxation * static_cast<float>(
@@ -6537,6 +6559,34 @@ try {
                 failingEnergyFacets = statistics.failingFacets;
             };
             std::vector<float> shadowNextTemperature;
+            // Surface class of a facet, for the mismatch report.
+            const auto shadowClass = [&](uint32_t facet) -> std::string {
+                if (facet >= scene.leafFacetCount) return stabilityCorrection ? "ground(MOST)" : "ground";
+                const auto& surface = surfaceForFacet(scene, facet);
+                if (surface.vegetation) return surface.photovoltaic ? "leaf-pv" : "leaf";
+                if (wallIndex[facet] >= 0) return "wall";
+                if (surface.water) return "water";
+                if (gpuParameters[size_t(facet) * 32U + 30U] > 0.0f) return "submerged-hull";
+                return "solid-shell";
+            };
+            // Strict mode (1) throws at the first mismatch, survey mode (2) counts them.
+            const auto shadowMismatch = [&](uint32_t facet, int state, const std::string& field,
+                                            float difference, float cpuValue, float gpuValue) {
+                const std::string label = shadowClass(facet) + "/" + field;
+                auto& entry = shadowMismatches[label];
+                if (entry.count++ == 0 || difference > entry.maxDifference || !std::isfinite(difference)) {
+                    entry.facet = facet; entry.state = state; entry.node = static_cast<uint32_t>(node);
+                    entry.cpu = cpuValue; entry.gpu = gpuValue;
+                }
+                if (std::isfinite(difference)) entry.maxDifference = std::max(entry.maxDifference, difference);
+                if (!shadowSurvey)
+                    throw std::runtime_error("CPU/GPU energy shadow mismatch (" + label + ") at node " + std::to_string(node) +
+                        ", facet " + std::to_string(facet) + ", state " + std::to_string(state) +
+                        ", difference " + std::to_string(difference) +
+                        ", CPU " + std::to_string(cpuValue) + ", GPU " + std::to_string(gpuValue));
+            };
+            const std::array<const char*, 9> shadowFieldNames{"net", "sensible", "sensibleSlope", "latent",
+                "latentSlope", "storage", "storageSlope", "photovoltaic", "photovoltaicSlope"};
             // Optional audit: compare both implementations inside one run so
             // stochastic coplanar raster ties cannot change their forcing.
             const auto verifyGpuEvaluation = [&]() {
@@ -6546,10 +6596,48 @@ try {
                 auto cpuRadiation = audit.radiation;
                 cpuRadiation.incident.clear();
                 const auto cpuIncident = model.incidentIrradiance(cpuRadiation, audit.optics, skyLongwave);
-                for (size_t side = 0; side < surfaceCount; ++side)
-                    shadowIncidentMaximum = std::max(shadowIncidentMaximum,
-                        std::abs(cpuIncident[side] - audit.radiation.incident[side]));
+                for (size_t side = 0; side < surfaceCount; ++side) {
+                    const float difference = std::abs(cpuIncident[side] - audit.radiation.incident[side]);
+                    shadowIncidentMaximum = std::max(shadowIncidentMaximum, difference);
+                    if (!(difference <= 0.0001f))
+                        shadowMismatch(static_cast<uint32_t>(side / 2U), 0, "incident", difference,
+                            cpuIncident[side], audit.radiation.incident[side]);
+                }
+                // The coupled leaf solve (stomatal bisection with a log tolerance, each
+                // trial solving the leaf temperature) stops at the first trial inside
+                // the tolerance. Any rounding difference between the CPU float and the
+                // GPU double physiology can move that exit by one bisection step, so
+                // the two resistances may differ by about the tolerance (ln units) and
+                // leaf latent heat by a corresponding fraction. Therefore: (1) solve the
+                // CPU freely and compare only the resistance, loosely (0.1 in ln, a sanity
+                // bound: the exit band is the tolerance divided by the slope of
+                // ln(rs) - ln(target), which is small where humidity feedback is strong,
+                // so the difference can exceed twice the tolerance); (2) impose the GPU resistance
+                // on the CPU leaf and compare every flux and the
+                // stomatal mismatch tightly, which tests the formulas, not the exit step.
                 evaluateEnergyFluxes(audit.optics, cpuIncident);
+                std::vector<float> imposedResistance(2U * surfaceCount, 0.0f);
+                for (int state = 0; state < 2; ++state)
+                    for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet) {
+                        if (!surfaceForFacet(scene, facet).vegetation) continue;
+                        const size_t side = size_t(facet) * 2U, index = size_t(state) * surfaceCount + side;
+                        // energy.comp reports the leaf r_s in slot 11 (a leaf has no heat source).
+                        // Recovering it from the latent heat would be ill-conditioned near
+                        // saturation, where the vapour deficit is a difference of two nearly
+                        // equal float values.
+                        const double resistance = audit.fluxes[index * 12U + 11U];
+                        if (!(resistance >= 1.0 && resistance <= 625000.0)) continue;
+                        imposedResistance[index] = static_cast<float>(resistance);
+                        const float freeResistance = stateFlux[state].leafResistance[side];
+                        const float difference = static_cast<float>(std::abs(std::log(freeResistance / resistance)));
+                        shadowResistanceMaximum = std::max(shadowResistanceMaximum, difference);
+                        if (!(difference <= 0.1f))
+                            shadowMismatch(facet, state, "stomatalResistance(ln)", difference,
+                                freeResistance, static_cast<float>(resistance));
+                    }
+                auditLeafResistance = &imposedResistance;
+                evaluateEnergyFluxes(audit.optics, cpuIncident);
+                auditLeafResistance = nullptr;
                 shadowNextTemperature = audit.temperatures;
                 const std::array<std::vector<float> StateFluxes::*, 9> fields{
                     &StateFluxes::net, &StateFluxes::sensible, &StateFluxes::sensibleSlope,
@@ -6566,13 +6654,16 @@ try {
                             for (size_t field = 0; field < fields.size(); ++field) {
                                 const float difference = std::abs((flux.*fields[field])[side] - audit.fluxes[index * 12 + field]);
                                 if (!std::isfinite(difference) || difference > 0.01f)
-                                    throw std::runtime_error("CPU/GPU energy shadow flux mismatch at node " + std::to_string(node) +
-                                        ", facet " + std::to_string(facet) + ", state " + std::to_string(state) +
-                                        ", field " + std::to_string(field) + ", difference " + std::to_string(difference) +
-                                        ", CPU " + std::to_string((flux.*fields[field])[side]) +
-                                        ", GPU " + std::to_string(audit.fluxes[index * 12 + field]));
+                                    shadowMismatch(facet, state, shadowFieldNames[field], difference,
+                                        (flux.*fields[field])[side], audit.fluxes[index * 12 + field]);
                                 if (field == 0 || field == 1 || field == 3 || field == 5 || field == 7)
                                     shadowFluxMaximum = std::max(shadowFluxMaximum, difference);
+                            }
+                            if (object && surface.vegetation && imposedResistance[index] > 0.0f) {
+                                const float difference = std::abs(flux.stomatalMismatch[side] - audit.fluxes[index * 12 + 10]);
+                                if (!std::isfinite(difference) || difference > 0.0005f)
+                                    shadowMismatch(facet, state, "stomatalMismatch(ln)", difference,
+                                        flux.stomatalMismatch[side], audit.fluxes[index * 12 + 10]);
                             }
                             const float t = stateTemperature[state][side];
                             const float e = std::clamp(1.0f - audit.optics[side].reflectance - audit.optics[side].transmittance, 0.0f, 1.0f);
@@ -6588,8 +6679,8 @@ try {
                             shadowNextTemperature[down] = shadowNextTemperature[down ^ 1U];
                         }
                     }
-                if (shadowIncidentMaximum > 0.0001f)
-                    throw std::runtime_error("CPU/GPU incident irradiance shadow mismatch");
+                shadowClassFacets.clear();
+                for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) ++shadowClassFacets[shadowClass(facet)];
                 ++shadowEvaluations;
                 importGpuState(audit); // Auditing never substitutes CPU states.
             };
@@ -6609,13 +6700,16 @@ try {
                     const auto updated = model.readEnergyState();
                     for (size_t side = 0; side < shadowNextTemperature.size(); ++side) {
                         const float difference = std::abs(updated.temperatures[side] - shadowNextTemperature[side]);
-                        if (!std::isfinite(difference) || difference > 0.0002f)
-                            throw std::runtime_error("CPU/GPU temperature update shadow mismatch at node " +
-                                std::to_string(node) + ", iteration " + std::to_string(coupling) +
-                                ", state-side " + std::to_string(side) + ", difference " +
-                                std::to_string(difference) + " K, CPU " + std::to_string(shadowNextTemperature[side]) +
-                                ", GPU " + std::to_string(updated.temperatures[side]));
-                        shadowUpdateMaximum = std::max(shadowUpdateMaximum, difference);
+                        const uint32_t updatedFacet = static_cast<uint32_t>((side % surfaceCount) / 2U);
+                        // A leaf temperature is the root of the coupled leaf equation, which both
+                        // solvers stop once a Newton correction is below 0.01 K (leafThermalToleranceK):
+                        // rounding can move that exit by one iteration, so leaves get 1e-3 K.
+                        const float updateTolerance = updatedFacet < scene.leafFacetCount &&
+                            surfaceForFacet(scene, updatedFacet).vegetation ? 0.001f : 0.0002f;
+                        if (!std::isfinite(difference) || difference > updateTolerance)
+                            shadowMismatch(updatedFacet, int(side / surfaceCount),
+                                "temperatureUpdate(K)", difference, shadowNextTemperature[side], updated.temperatures[side]);
+                        if (std::isfinite(difference)) shadowUpdateMaximum = std::max(shadowUpdateMaximum, difference);
                     }
                     ++shadowUpdates;
                 }
@@ -7162,12 +7256,22 @@ try {
         }
         runIndex.value["products"].push_back(".facet_steps/energy_T=" + token + ".bin");
         runIndex.value["products"].push_back("photovoltaic_node_" + std::to_string(node) + ".csv");
-        if (shadowEnergy) runIndex.value["energyVerification"] = {
-            {"status", "PASS"}, {"sameRadiativeInputs", true},
-            {"evaluations", shadowEvaluations}, {"updates", shadowUpdates},
-            {"maxAbsIncident_W_m2", shadowIncidentMaximum},
-            {"maxAbsFlux_W_m2", shadowFluxMaximum},
-            {"maxAbsTemperatureUpdate_K", shadowUpdateMaximum}};
+        if (shadowEnergy) {
+            ProjectJson::Json mismatches = ProjectJson::Json::array();
+            for (const auto& [label, entry] : shadowMismatches)
+                mismatches.push_back({{"class_field", label}, {"count", entry.count},
+                    {"maxDifference", entry.maxDifference}, {"firstOrWorstNode", entry.node},
+                    {"facet", entry.facet}, {"state", entry.state}, {"cpu", entry.cpu}, {"gpu", entry.gpu}});
+            runIndex.value["energyVerification"] = {
+                {"status", shadowMismatches.empty() ? "PASS" : "MISMATCH"}, {"sameRadiativeInputs", true},
+                {"mode", shadowSurvey ? "survey" : "strict"},
+                {"evaluations", shadowEvaluations}, {"updates", shadowUpdates},
+                {"maxAbsIncident_W_m2", shadowIncidentMaximum},
+                {"maxAbsFlux_W_m2", shadowFluxMaximum},
+                {"maxAbsTemperatureUpdate_K", shadowUpdateMaximum},
+                {"maxLeafResistanceDifference_ln", shadowResistanceMaximum},
+                {"auditedFacetsByClass", shadowClassFacets}, {"mismatches", mismatches}};
+        }
         runIndex.value["completed"].push_back({
             {"node", node}, {"token", token}, {"julianTime", meteo.julianTime},
             {"solarZenith", scene.sunZenith}, {"solarAzimuth", scene.sunAzimuth},
@@ -7309,9 +7413,21 @@ try {
     runIndex.value["status"] = allNodesConverged ? "completed" : "non_converged";
     runIndex.value["finishedAt"] = utcTimestamp();
     runIndex.write();
+    if (shadowEnergy) {
+        std::cerr << "faceteb: audited facets by class:";
+        for (const auto& [label, count] : shadowClassFacets) std::cerr << " " << label << "=" << count;
+        std::cerr << "\n";
+        std::cerr << "faceteb: CPU/GPU energy audit " << (shadowMismatches.empty() ? "PASS" : "MISMATCH")
+                  << ", evaluations " << shadowEvaluations << ", temperature updates " << shadowUpdates
+                  << ", max |flux| " << shadowFluxMaximum << " W m-2, max |T update| " << shadowUpdateMaximum << " K, max leaf ln(rs) free-vs-GPU " << shadowResistanceMaximum << "\n";
+        for (const auto& [label, entry] : shadowMismatches)
+            std::cerr << "faceteb:   " << label << ": " << entry.count << " mismatches, max " << entry.maxDifference
+                      << ", at node " << entry.node << " facet " << entry.facet << " state " << entry.state
+                      << " CPU " << entry.cpu << " GPU " << entry.gpu << "\n";
+    }
     std::cout << "PROGRESS\t100\t" << (allNodesConverged ? "面元辐射传输与能量平衡耦合收敛" : "面元计算结束：存在未收敛节点，结果已保留") << std::endl;
     std::cout << "RESULT\t" << resultFile << std::endl;
-    return allNodesConverged ? 0 : 2;
+    return !shadowMismatches.empty() ? 3 : allNodesConverged ? 0 : 2;
 } catch (const std::exception& error) {
     std::cerr << "faceteb: " << error.what() << '\n';
     return 1;

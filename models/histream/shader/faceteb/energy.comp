@@ -37,7 +37,7 @@ void main() {
         if(pc.phase==1u) {
             for(uint side=0u;side<(object?1u:2u);++side) {
                 uint k=index+side,j=k*12u; float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
-                float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0)+(object?F[j+11u]:0.0);
+                float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0)+(object&&!leaf?F[j+11u]:0.0);
                 float response=faces*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
                 float candidate=clamp(temp+clamp(residual/max(1.0,response),-5.0,5.0),220.0,360.0);
                 float next=temp+(leaf?F[j+9u]:pc.relax*(candidate-temp));
@@ -79,7 +79,7 @@ void main() {
             float raw=P[p+4u]*(1.0+P[p+5u]*(temp-298.15))*inc;
             float power=P[p+1u]>.5?clamp(raw,0.0,max(0.0,available)):0.0;
             float ps=P[p+1u]>.5&&raw>0.0&&raw<available?P[p+4u]*P[p+5u]*inc:0.0;
-            float le=0.0,ls=0.0,step=0.0,mismatch=0.0;
+            float le=0.0,ls=0.0,step=0.0,mismatch=0.0,stomatal=0.0;
             if(water) {
                 float ra=pc.rho*1005.0/max(1.0e-6,conductance);
                 le=P[p+29u]*latent(temp,ra,P[p+7u]); ls=P[p+29u]*latentSlope(temp,ra,P[p+7u]);
@@ -105,13 +105,13 @@ void main() {
                     rs=dexp(.5lf*(lo+hi)); trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
                 }
                 step=pc.relax*float(clamp(trial-double(temp),-5.0lf,5.0lf));
-                le=latent(temp,rb,float(rs)); ls=latentSlope(temp,rb,float(rs));
+                le=latent(temp,rb,float(rs)); ls=latentSlope(temp,rb,float(rs)); stomatal=float(rs);
                 mismatch=float(abs(dlog(rs/double(physiology(f,double(temp),rs,par,rb,depth)))));
             }
             for(uint side=0u;side<2u;++side) {
                 uint j=(index+side)*12u;
                 F[j]=rn;F[j+1u]=h;F[j+2u]=conductance;F[j+3u]=le;F[j+4u]=ls;
-                F[j+5u]=storage;F[j+6u]=ss;F[j+7u]=power;F[j+8u]=ps;F[j+9u]=step;F[j+10u]=mismatch;F[j+11u]=source;
+                F[j+5u]=storage;F[j+6u]=ss;F[j+7u]=power;F[j+8u]=ps;F[j+9u]=step;F[j+10u]=mismatch;F[j+11u]=leaf?stomatal:source; // leaf: slot 11 reports r_s for the CPU audit (the leaf heat source is 0)
             }
         } else {
             for(uint side=0u;side<2u;++side) {
@@ -128,7 +128,7 @@ void main() {
         }
         for(uint side=0u;side<(object?1u:2u);++side) {
             uint k=index+side,j=k*12u;float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
-            float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0)+(object?F[j+11u]:0.0);
+            float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0)+(object&&!leaf?F[j+11u]:0.0);
             float response=faces*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
             maximum(0u,abs(residual));maximum(1u,abs(residual)/max(1.0,response));
             energyViolation=energyViolation||abs(residual)>=2.0;

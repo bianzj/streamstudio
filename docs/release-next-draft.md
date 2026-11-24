@@ -102,7 +102,11 @@
 - **服务端。** 提交时按引擎规则校验 `temperature.energy`（soilHeatMethod/temperatureMethod 白名单、diffuseFraction、spectralBinNm、heatRoughnessKb、soilEmissivityK 等，S1），不认识的字段不报错，只在提交返回的 `warnings` 和任务日志中提示已忽略；停止尚未启动引擎的任务（S7）；float32 nodata 比较经 `Math.fround`，`rasterBand` 的 min/max/mean/std 取全像元（`stats.sampled` 标明分位数/直方图仍来自抽样，S11）；结果缓存键加入 `ctimeMs`（首尾内容哈希评估后未加：每次查询需两次同步读，且漏中间改动）。
 - **兼容性。** 含冰雪类（内置 15）的 EB 场景结果变化（Tss 不再超过 0 °C，H、LE、G 随之变化，多出第 19 波段）；`iceMelt=false` 可恢复。所有 EB 示例因 σ 与 L4 有 1e-4 K 量级（中位数）的变化。RT 工程若写了 `energy.diffuseFraction` 会改变光学成像的直/散分配（此前被忽略，缺省 0.2 不变），写 `-1` 会报错。同化输出 QA 增加位 12，原先用位 0 判断“未分析”的掩膜仍有效。
 
-### 性能（2026-11-22，不改物理）
+### FacetEB CPU/GPU 一致性检查（2026-11-24，不改数值）
+
+- `HISTREAM_FACET_VALIDATE_ENERGY=1` 原先在叶片潜热上就报失配（0.34 W m⁻²），原因是气孔-叶温联立二分的容差提前退出让两侧 r_s 差约 0.013 ln，不是公式不同。现在检查用 GPU 的 r_s 重算 CPU 叶片再逐项比较；`=2` 汇总模式跑完全部节点并按表面类别列出不一致（`faceteb_run.json` 的 `energyVerification.mismatches`、`auditedFacetsByClass`，有不一致退出码 3）。着色器把叶片 r_s 写入通量槽 11（叶片原为 0，能量残差处已排除）。
+- **兼容性**：模型输出不变；feb_crop、feb_crop_hapke、feb_crop_periodic、feb_urban、feb_urban_mwir、feb_urban_mwir_night、feb_urban_shadow、_shadow_m1、_shadow_wall 的输出文件与基线 `bin_veship2` 逐字节相同。故意把 GPU 汽化潜热 +1%、Ball-Berry 斜率 +1%、地面显热 +1% 分别报 `latent`、`stomatalMismatch`、`ground/sensible`。未做大规模回归。
+
 
 以下改动经冻结算例对照，结果逐位相同或差异 ≤ 1e-4（VoxelEB 温度阻尼为 ≤ 0.05 K）。同一台机器上各模式总耗时降到原来的 1/1.5–1/7。
 

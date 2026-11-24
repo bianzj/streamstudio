@@ -1,5 +1,12 @@
 # Stream Studio 尚存问题核查（2026-10-05）
 
+## 2026-11-24 FacetEB CPU/GPU 一致性检查（leafle）
+
+### 已修正（2026-11-24）
+
+- **`HISTREAM_FACET_VALIDATE_ENERGY=1` 在基线上就报“叶片潜热不一致”（0.34 W m⁻²）**：结论是检查的问题，不是 CPU 与 GPU 公式不一致。feb_urban 第 23 节点 40842 号叶片面元：CPU 潜热 38.875、GPU 39.216 W m⁻²，由潜热反推两侧气孔电阻 578.2 / 570.7 s m⁻¹（r_b = 283 s m⁻¹），ln 差 0.013；气孔-叶温联立二分在 ln 差 ≤ 0.01 时即退出，两侧舍入差使退出步差一步。把 GPU 的 r_s 强加给 CPU 后全部通量一致（最大 4×10⁻⁴ W m⁻²）。检查改为：自由求解的 r_s 只做 ln 差 ≤ 0.1 的粗界检查，其余逐项用 GPU 的 r_s 严格比较（叶温更新 1×10⁻³ K、其余 2×10⁻⁴ K 与 0.01 W m⁻²）；新增 `=2` 汇总模式，跑完全部节点并按表面类别/字段统计。引擎结果不变。
+- 检查走完的算例：feb_urban、feb_urban_mwir、feb_urban_shadow（PASS），feb_crop 等（见发布草稿）；类别含叶片、地面、墙体、薄壳、水体、浸水船体。**未验证**：feb_urban_ship* 与 feb_urban_day 因耗时（审计 ≥ 6 分钟/算例）只部分跑完；开 MOST 的柱稳定度迭代差未单独检查。
+
 ## 2026-11-24 STREAM 剩余项（streambugs3）
 
 完整变更与兼容性见 `docs/release-next-draft.md`“STREAM 剩余审核项”。
