@@ -429,6 +429,10 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   }
 
   function readProjectMetadata(data) {
+    if (data.import) { // metadata picked anywhere: read back to the editor only
+      const { path, document } = forcingRules.importMetadataFile(data.path)
+      return { exists: true, path: windowsPath(path), metadata: document }
+    }
     const directory = projectDirectory(data.projectPath)
     const target = data.path ? String(data.path) : join(directory, metadataFileName(data.fileName))
     const absolute = resolve(normalizeHostPath(target))

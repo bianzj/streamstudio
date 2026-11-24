@@ -149,5 +149,19 @@ export function createForcingRules({ normalizeHostPath, windowsPath }) {
     return out
   }
 
-  return { buildForcing, resolveMetadata, readMetadataFile: metadataFile, checkDocument, existingFile, packFile, stationFiles, absolutePath, assertInlineSize, formOf }
+  // Import: a metadata document the user picked anywhere on disk is only read back to the editor (never handed to the
+  // engine from here), so it needs no directory rule - just the size cap and the shape of a metadata document.
+  function importMetadataFile(value) {
+    const path = existingFile(value, '气象强迫元数据文件')
+    if (!/\.json$/i.test(path)) throw new Error('气象强迫元数据文件须为 .json')
+    if (statSync(path).size > MAX_METADATA_FILE_BYTES) throw new Error(`气象强迫元数据文件过大（上限 ${MAX_METADATA_FILE_BYTES} 字节）`)
+    let document
+    try { document = JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')) } catch { throw new Error(`气象强迫元数据文件无法解析为 JSON：${windowsPath(path)}`) }
+    if (!isPlainObject(document) || (document.kind !== 'stream-forcing-metadata' && !isPlainObject(document.variables) && document.preset === undefined))
+      throw new Error(`不是气象强迫元数据文件：${windowsPath(path)}`)
+    checkDocument(document, '气象强迫元数据文件')
+    return { path, document }
+  }
+
+  return { buildForcing, resolveMetadata, readMetadataFile: metadataFile, importMetadataFile, checkDocument, existingFile, packFile, stationFiles, absolutePath, assertInlineSize, formOf }
 }

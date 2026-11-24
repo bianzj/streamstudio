@@ -32,6 +32,13 @@ export const streamApi = {
   era5Packs: (include = []) => post('/api/stream/era5/list', { include }),
   registerEra5: (data) => post('/api/stream/era5/register', data),
   removeEra5: (path) => post('/api/stream/era5/remove', { path }),
+  // Weather-forcing metadata (docs/forcing-metadata.md)
+  forcingPresets: () => request('/api/stream/forcing/presets'),
+  forcingPreset: (name) => post('/api/stream/forcing/preset', { name }),
+  checkForcing: (data) => post('/api/stream/forcing/check', data),
+  registerForcing: (data) => post('/api/stream/forcing/register', data),
+  saveForcingMetadata: (data) => post('/api/stream/forcing/metadata/save', data),
+  readForcingMetadata: (data) => post('/api/stream/forcing/metadata/read', data),
   openPath: (path) => post('/api/open', { path }),
   onEvent(callback) {
     // DEFERRED[低] 错误处理: 没有 onerror/onopen 处理，断线重连对调用方完全不可见，也无法在重连后触发状态重新同步；建议：onopen 时回调一个 { type: 'reconnected' } 事件（或在 status 事件中同步），连续失败时提示用户 —— 重连后的状态再同步已由服务端补发的 status 事件在 workspace.js 的 handleEvent 中修复；再新增 reconnected 事件类型会引入调用方未处理的新契约，断线提示也属新增文案，本轮不动
