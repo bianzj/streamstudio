@@ -213,7 +213,7 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
             const float lat = in.latitude[pixel], lon = in.longitude[pixel];
             const float vz = in.vza[pixel], va = in.vaa[pixel], leafArea = in.lai[pixel];
             if (!(std::isfinite(lat) && std::isfinite(lon) && std::abs(lat) <= 90 && std::abs(lon) <= 180) ||
-                !(vz >= 0 && vz < 90) || !(va >= -360 && va <= 360) || !(leafArea >= 0 && leafArea <= 100)) {
+                !(vz >= 0 && vz < 90) || !(va >= -360 && va <= 360) || !validLai(leafArea)) {  // FIX(2026-11-24 M1): LAI <= kMaxLai (20), nodata invalid
                 finish(kQaInputInvalid);
                 continue;
             }

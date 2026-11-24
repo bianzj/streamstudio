@@ -28,6 +28,10 @@ struct Aerodynamics {
 
 enum class SoilHeatMethod { Direct, Surface, Depth };
 
+// Hard limits of the component temperatures in the energy-balance solve, K (FIX 2026-11-24 M2: lower limit 240 -> 175).
+constexpr double kComponentTemperatureMin = 175.0;
+constexpr double kComponentTemperatureMax = 380.0;
+
 struct Ground {
     bool moistureResistance = false;
     double fixedResistance = 200.0;   // s m-1, TIRTEB template soil_rss

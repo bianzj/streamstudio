@@ -38,9 +38,12 @@ constexpr double kStabilityRelaxShrink = 0.5;
 constexpr double kStabilityRelaxGrow = 1.1;
 constexpr double kMaxInverseObukhov = 5.0;   // m-1
 constexpr double kMaxStep = 5.0;             // K per Newton step
-// DEFERRED[中] 物理: 组分温度硬下限 240 K（−33 °C）。高纬/青藏高原冬季夜间、冰雪地表的真实表面温度可低于 240 K，此时 updateTemperature 会被钳在 240 K，残差不收敛，亮温系统性偏高；建议：下限放宽到约 190–200 K（成像侧过滤是 100 K），或按 ERA5 skt 的最小值动态设定
-constexpr double kTmin = 240.0;
-constexpr double kTmax = 380.0;
+// FIX(2026-11-24 M2): component-temperature limits [kComponentTemperatureMin, kComponentTemperatureMax] (energy.h);
+// the lower limit was 240 K, which clamped polar / winter-night pixels at 240 K, left them unconverged with H of
+// hundreds of W m-2, and was inconsistent with the 180 K clamp of the Newton denominator. 175 K is below any real
+// near-surface temperature yet keeps the Newton iteration inside the validity range of the saturation formulas.
+constexpr double kTmin = kComponentTemperatureMin;
+constexpr double kTmax = kComponentTemperatureMax;
 constexpr double kSparseLai = 0.5;
 
 double saturationSlope(double celsius)
@@ -454,7 +457,7 @@ void updateTemperature(double& temperature, double residual, double ra, double r
     const double old = temperature;
     ra = std::max(ra, 1.0);
     rs = std::max(rs, 0.0);
-    const double t = std::clamp(old, 180.0, 380.0);
+    const double t = std::clamp(old, kTmin, kTmax);
     const double denominator = density * kCP / ra +
                                density * latentHeat(t) * (kMH2O / kMAir / std::max(forcing.p, 1e-6)) *
                                    saturationSlope(t - 273.15) / (ra + rs) +

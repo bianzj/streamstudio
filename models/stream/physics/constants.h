@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 namespace stream {
 
 constexpr double kPi = 3.14159265358979323846;
@@ -15,6 +17,12 @@ constexpr double kVonKarman = 0.4;
 constexpr double kGravity = 9.80665;
 constexpr double kDryAirGasConstant = 287.05;
 constexpr double kKelvin = 273.15;
+
+// FIX(2026-11-24 M1): largest LAI accepted as valid input (m2 m-2). The former 100 let packed-integer fill codes
+// (e.g. MODIS LAI 249-254 x 0.1 = 24.9-25.4 when the file does not declare nodata) through as real canopies.
+// nodata, negative and larger values are invalid; LAI = 0 (bare ground) stays valid.
+constexpr double kMaxLai = 20.0;
+inline bool validLai(double lai) { return std::isfinite(lai) && lai >= 0.0 && lai <= kMaxLai; }
 
 constexpr int kSpectralCount = 2001;  // 400-2400 nm at 1 nm
 constexpr int kFirstWavelength = 400;

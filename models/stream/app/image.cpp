@@ -220,6 +220,20 @@ int runImage(const std::string& configPath)
         return std::isfinite(lat) && std::isfinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
     };
 
+    // FIX(2026-11-24 M1): LAI outside [0, kMaxLai] (incl. packed fill codes after scaling) and nodata are invalid for
+    // vegetation pixels of the simulated region; count and warn so they are not mistaken for real canopies.
+    long long laiOutOfRange = 0, laiNoData = 0;
+    for (int row = startRow; row < endRow; ++row)
+        for (int column = startColumn; column < endColumn; ++column) {
+            const size_t p = static_cast<size_t>(row) * grid.width + column;
+            const auto* entry = classes.find(type[p]);
+            if (!entry || entry->surface != SurfaceKind::Vegetation) continue;
+            if (!std::isfinite(lai[p])) ++laiNoData;
+            else if (!validLai(lai[p])) ++laiOutOfRange;
+        }
+    if (laiOutOfRange) log("警告：" + std::to_string(laiOutOfRange) + " 个植被像元的 LAI 超出有效范围 [0, 20]（常见于未声明 nodata 的整型填充码经 scale 后变成 24.9–25.4），按无效输入处理");
+    if (laiNoData) log("提示：" + std::to_string(laiNoData) + " 个植被像元的 LAI 为 nodata，按无效输入处理");
+
     // ---------------- ERA5 pack (EB) ----------------
     era5::Pack idlePack;                         // stands in for the source when the run is not an energy balance
     std::unique_ptr<ForcingSource> forcingHolder;
@@ -465,7 +479,7 @@ int runImage(const std::string& configPath)
     std::array<std::vector<float>, 4> components;
     std::vector<std::vector<float>> forcingOut, fluxOut;
     std::vector<float> diffuseFractionOut(pixels, kNaN);
-    long long ebPixels = 0, ebConverged = 0, ebStable = 0, ebWaterPixels = 0, ebFailed = 0, ebNoForcing = 0;
+    long long ebPixels = 0, ebConverged = 0, ebStable = 0, ebWaterPixels = 0, ebFailed = 0, ebNoForcing = 0, ebClamped = 0;
     constexpr int kFluxBands = 18;
     // LSCT inversion uses the run's component temperatures (RT input or EB solution) as its background.
     const bool lsctInversion = config.inversion.target == InversionTarget::Lsct;
@@ -760,7 +774,7 @@ int runImage(const std::string& configPath)
         outcome.gradientValid = false;
         const auto* entry = classes.find(type[pixel]);
         if (!entry || entry->surface != SurfaceKind::Vegetation || !validLocation(pixel)) return false;
-        const double leafArea = std::clamp(controls.lai, 0.0, 100.0);
+        const double leafArea = std::clamp(controls.lai, 0.0, kMaxLai);
         const double moisture = std::clamp(controls.moisture, 0.0, 1.0);
         const PixelForcing forcing = pixelForcing(pixel);
         if (!validForcing(forcing.at(overpass))) return false;
@@ -862,15 +876,16 @@ int runImage(const std::string& configPath)
         fluxOut.assign(kFluxBands, std::vector<float>(pixels, kNaN));
         std::atomic<int> rowsDone{0};
         const int rowCount = endRow - startRow;
-        #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing)
+        #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing, ebClamped)
         for (int row = startRow; row < endRow; ++row) {
             for (int column = startColumn; column < endColumn; ++column) {
                 const size_t pixel = static_cast<size_t>(row) * grid.width + column;
                 const auto* entry = classes.find(type[pixel]);
                 if (!entry || entry->surface == SurfaceKind::Fill || !validLocation(pixel)) continue;
                 const float leafArea = lai[pixel];
-                // DEFERRED[中] 错误处理: LAI 上限 100 太宽。MODIS LAI（×0.1）的填充码 249–254（水体、裸地、冰雪、城市等）若未声明为 nodata，经 scale 后变成 24.9–25.4，会被当成有效 LAI 参与 EB 与成像；另外这条检查放在水体分支前面，水体像元的 LAI 一旦是 nodata，就连 skt 也拿不到；建议：把上限收紧到约 10–15，超限时记日志计数；水体判断移到 LAI 检查之前
-                if (!std::isfinite(leafArea) || leafArea < 0 || leafArea > 100) continue;
+                // FIX(2026-11-24 M1): the LAI range check (kMaxLai = 20, nodata invalid) applies to land pixels only and
+                // comes after the water test, so a water pixel whose LAI is nodata still gets its skin temperature.
+                if (entry->surface != SurfaceKind::Water && !validLai(leafArea)) continue;
                 const PixelForcing forcing = pixelForcing(pixel);
                 const Forcing atOverpass = forcing.at(overpass);
                 if (!validForcing(atOverpass)) { ++ebNoForcing; continue; }
@@ -920,6 +935,13 @@ int runImage(const std::string& configPath)
                 ++ebPixels;
                 if (result.converged) ++ebConverged;
                 if (result.stabilityConverged) ++ebStable;
+                {   // FIX(2026-11-24 M2): a component pinned at a temperature limit means the solve is not trustworthy
+                    const int count = leafArea > 0.0f ? 4 : 2;
+                    for (int k = 0; k < count; ++k) {
+                        const float t = components[k][pixel];
+                        if (!(t > kComponentTemperatureMin + 0.01 && t < kComponentTemperatureMax - 0.01)) { ++ebClamped; break; }
+                    }
+                }
             }
             const int done = ++rowsDone;
             if (isMainThread() && done % std::max(1, rowCount / 40) == 0) progress(10 + 60.0 * done / rowCount, "能量平衡求解");
@@ -929,6 +951,11 @@ int runImage(const std::string& configPath)
             std::to_string(ebWaterPixels) + " 个" + (ebFailed ? "，未能求解 " + std::to_string(ebFailed) + " 个" : "") +
             (ebNoForcing ? "，气象强迫无有效值（如陆面产品的海面）跳过 " + std::to_string(ebNoForcing) + " 个" : ""));
         log("EB 初值：土壤、叶片与土壤热历史全部取起转起点 " + formatUtc(marchStart) + " 的 2 m 气温（不使用 skt/stl1/stl2）");
+        if (ebPixels > ebConverged)
+            log("警告：能量平衡有 " + std::to_string(ebPixels - ebConverged) + " / " + std::to_string(ebPixels) +
+                " 个像元在过境时刻未收敛（eb_fluxes 波段 converged = 0，通量与组分温度仅供参考）" +
+                (ebClamped ? "；其中 " + std::to_string(ebClamped) + " 个像元的组分温度被钳在 " + std::to_string(static_cast<int>(kComponentTemperatureMin)) + "–" +
+                                 std::to_string(static_cast<int>(kComponentTemperatureMax)) + " K 限值上" : ""));
         if (initialLaterHour > 0 || initialDayMean > 0)
             log("警告：起转起点的 2 m 气温无效，初值改取起点后第一个有效时次 " + std::to_string(initialLaterHour.load()) + " 个像元、改取首个模拟日平均气温 " +
                 std::to_string(initialDayMean.load()) + " 个像元");
@@ -1084,9 +1111,11 @@ int runImage(const std::string& configPath)
             const auto* entry = classes.find(type[pixel]);
             if (!entry) { ++invalidType; continue; }
             const float viewZenith = vza[pixel], viewAzimuth = vaa[pixel];
-            const float leafArea = imagingLai[pixel];  // analysed LAI when the assimilation controls it
+            float leafArea = imagingLai[pixel];  // analysed LAI when the assimilation controls it
+            // FIX(2026-11-24 M1): water / fill pixels do not use LAI, so an invalid value there is no input error.
+            if (entry->surface != SurfaceKind::Vegetation && !validLai(leafArea)) leafArea = 0.0f;
             if (!validLocation(pixel) || !std::isfinite(viewZenith) || viewZenith < 0 || viewZenith >= 90 || !std::isfinite(viewAzimuth) ||
-                viewAzimuth < -360 || viewAzimuth > 360 || !std::isfinite(leafArea) || leafArea < 0 || leafArea > 100) { ++invalidInput; continue; }
+                viewAzimuth < -360 || viewAzimuth > 360 || !validLai(leafArea)) { ++invalidInput; continue; }
             const Sun sun = solarPosition(overpass, latitude[pixel], longitude[pixel], dem[pixel]);
             if (!sun.ok) { ++solarFailed; continue; }
             const double sza = sun.zenith, saa = sun.azimuth;
@@ -1181,6 +1210,8 @@ int runImage(const std::string& configPath)
     counts.Add("opticalPixels", static_cast<GInt64>(opticalPixels));
     counts.Add("thermalPixels", static_cast<GInt64>(thermalPixels));
     counts.Add("invalidInputPixels", static_cast<GInt64>(invalidInput));
+    counts.Add("laiOutOfRangePixels", static_cast<GInt64>(laiOutOfRange));  // vegetation, LAI outside [0, 20]
+    counts.Add("laiNoDataPixels", static_cast<GInt64>(laiNoData));
     counts.Add("unknownTypePixels", static_cast<GInt64>(invalidType));
     counts.Add("waterOrFillPixels", static_cast<GInt64>(waterPixels));
     counts.Add("nightPixels", static_cast<GInt64>(nightPixels));
@@ -1323,6 +1354,13 @@ int runImage(const std::string& configPath)
         temperatureInfo.Add("ebNodeCount", static_cast<GInt64>(nodes.size()));
         temperatureInfo.Add("solvedPixels", static_cast<GInt64>(ebPixels));
         temperatureInfo.Add("convergedPixels", static_cast<GInt64>(ebConverged));
+        temperatureInfo.Add("nonConvergedPixels", static_cast<GInt64>(ebPixels - ebConverged));
+        temperatureInfo.Add("temperatureLimitedPixels", static_cast<GInt64>(ebClamped));
+        if (ebPixels > ebConverged)
+            temperatureInfo.Add("warning", std::to_string(ebPixels - ebConverged) + " solved pixels did not converge at the overpass (eb_fluxes band converged = 0); " +
+                                               std::to_string(ebClamped) + " of them have a component temperature at the " +
+                                               std::to_string(static_cast<int>(kComponentTemperatureMin)) + "-" + std::to_string(static_cast<int>(kComponentTemperatureMax)) + " K limit");
+        temperatureInfo.Add("componentTemperatureLimitsK", std::to_string(static_cast<int>(kComponentTemperatureMin)) + "-" + std::to_string(static_cast<int>(kComponentTemperatureMax)));
         temperatureInfo.Add("stabilityConvergedPixels", static_cast<GInt64>(ebStable));
         temperatureInfo.Add("stability", "Monin-Obukhov coupled solve: 1/L fixed-point relaxation 0.5, H-only buoyancy; iteration tolerance 1e-4 + 0.02|target| (m-1), final acceptance 2x iteration tolerance");
         temperatureInfo.Add("energyScheme", "tirt");

@@ -305,7 +305,7 @@ def test_eb_runs_without_skt_and_soil_temperature(tmp_path):
     for name in ('tir_surface_temperature.tif', 'eb_fluxes.tif'):
         with gdal.Open(str(out_full / name)) as a, gdal.Open(str(out / name)) as b:
             assert np.array_equal(a.ReadAsArray(), b.ReadAsArray(), equal_nan=True)
-    assert '2 m 气温' in ret.stdout and '不使用 ERA5 skt' in ret.stdout
+    assert '2 m 气温' in ret.stdout and '不使用 skt' in ret.stdout
 
 
 def test_water_pixels_degrade_to_air_temperature_without_skt(tmp_path):

@@ -162,9 +162,10 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
             const auto* entry = in.classes.find(in.type[pixel]);
             if (!entry || entry->surface == SurfaceKind::Fill) continue;
             if (!mask.empty() && std::isfinite(mask[pixel]) && mask[pixel] != 0.0f) { flags[local] |= kQaCloud; continue; }
-            const float leafArea = in.lai[pixel];
+            float leafArea = in.lai[pixel];
+            if (entry->surface != SurfaceKind::Vegetation && !validLai(leafArea)) leafArea = 0.0f;  // FIX(2026-11-24 M1)
             const float lat = in.latitude[pixel], lon = in.longitude[pixel];
-            if (!std::isfinite(leafArea) || leafArea < 0 || leafArea > 100 || !std::isfinite(lat) || !std::isfinite(lon) ||
+            if (!validLai(leafArea) || !std::isfinite(lat) || !std::isfinite(lon) ||
                 lat < -90 || lat > 90 || lon < -180 || lon > 180) { flags[local] |= kQaInputInvalid; continue; }
             const Sun sun = solarPosition(in.overpass, lat, lon, in.dem[pixel]);
             if (!sun.ok) { flags[local] |= kQaInputInvalid; continue; }
