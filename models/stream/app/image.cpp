@@ -497,7 +497,10 @@ int runImage(const std::string& configPath)
     std::vector<std::vector<float>> forcingOut, fluxOut;
     std::vector<float> diffuseFractionOut(pixels, kNaN);
     long long ebPixels = 0, ebConverged = 0, ebStable = 0, ebWaterPixels = 0, ebFailed = 0, ebNoForcing = 0, ebClamped = 0;
-    constexpr int kFluxBands = 18;
+    constexpr int kBaseFluxBands = 18;
+    long long iceMeltPixels = 0, iceCappedPixels = 0;   // FIX(2026-11-24 ice melt)
+    double iceMeltSum = 0.0;
+    bool iceInScene = false;
     // LSCT inversion uses the run's component temperatures (RT input or EB solution) as its background.
     const bool lsctInversion = config.inversion.target == InversionTarget::Lsct;
     const bool assimilate = config.assimilation.enabled();
@@ -651,6 +654,8 @@ int runImage(const std::string& configPath)
         surface.soilMoisture = moisture;
         // DEFERRED[低] 物理: 冰雪（15）按普通平面地面处理：没有 273.15 K 上限，没有融化潜热，饱和水汽压也用的是水面 Tetens；中午强辐射下雪面温度可能算到 0 °C 以上，这在物理上不可能；建议：冰雪地类把 T 限制在 ≤273.15 K（超出部分能量计入融化），饱和水汽压改用冰面公式
         surface.ground = entry.ground;
+        // FIX(2026-11-24 ice melt): snow / ice grounds cannot exceed the melting point; the surplus is a melt flux.
+        if (config.iceMelt && entry.ice) surface.temperatureCap = kKelvin;
         if (entry.groundKind == GroundKind::Soil) {
             // Wet soil emits more: the broadband emissivity follows the
             // pixel water content between the dry value and saturation. The dry value is the class
@@ -742,6 +747,18 @@ int runImage(const std::string& configPath)
     };
     const auto marchNodes = [&](size_t pixel, const EnergySurface& surface, const OpticalSpectra& spectra, double leafArea,
                                 const PixelForcing& forcing, EnergyState& state, EbRun& run) {
+        if (surface.temperatureCap > 0.0 && state.soilSunlit > surface.temperatureCap) {
+            // Snow / ice that starts warmer than the melting point (warm 2 m air at the march start): the uniform start
+            // state (components and soil heat history) is the melting point instead.
+            const double start = surface.temperatureCap;
+            state.soilSunlit = state.soilShaded = state.leafSunlit = state.leafShaded = start;
+            state.soilSunState.history = {start};
+            state.soilShadeState.history = {start};
+            if (config.soilHeatMethod == SoilHeatMethod::Depth) {
+                initializeColumn(state.soilSunState.profile, start, start, start);
+                state.soilShadeState.profile = state.soilSunState.profile;
+            }
+        }
         for (size_t node = 0; node < nodes.size(); ++node) {
             const double time = nodes[node];
             const Sun sun = solarPosition(time, latitude[pixel], longitude[pixel], dem[pixel]);
@@ -824,6 +841,7 @@ int runImage(const std::string& configPath)
         outcome.temperatures = {state.soilSunlit, state.soilShaded, leaves ? state.leafSunlit : nan, leaves ? state.leafShaded : nan};
         outcome.fluxes = {run.result.netRadiation, run.result.sensible, run.result.latent, run.result.ground};
         for (auto& row : outcome.gradient) row.fill(0.0);
+        if (run.result.meltLimited) return true;   // a melt-capped component does not respond to the controls: no implicit derivative
 
         const EnergyInputsT<double> base = energyInputs(surface, run.shortwave, state);
         EnergyInputsT<Ad> x;
@@ -903,11 +921,20 @@ int runImage(const std::string& configPath)
         progress(10, "能量平衡求解");
         for (auto& band : components) band.assign(pixels, kNaN);
         forcingOut.assign(7, std::vector<float>(pixels, kNaN));
+        // Ice melt: the extra band (and the summary counts) exist only when a snow / ice class is present in the processed
+        // region and energy.iceMelt is on, so scenes without ice keep their output files unchanged.
+        if (config.iceMelt)
+            for (int row = startRow; row < endRow && !iceInScene; ++row)
+                for (int column = startColumn; column < endColumn; ++column) {
+                    const auto* entry = classes.find(type[static_cast<size_t>(row) * grid.width + column]);
+                    if (entry && entry->ice && entry->surface == SurfaceKind::Vegetation) { iceInScene = true; break; }
+                }
+        const int kFluxBands = kBaseFluxBands + (iceInScene ? 1 : 0);
         fluxOut.assign(kFluxBands, std::vector<float>(pixels, kNaN));
         std::atomic<int> rowsDone{0};
         const int rowCount = endRow - startRow;
         ParallelError errorsEb;
-        #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing, ebClamped)
+        #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing, ebClamped, iceMeltPixels, iceCappedPixels, iceMeltSum)
         for (int row = startRow; row < endRow; ++row) {
             if (errorsEb.failed()) continue;
             try {
@@ -957,13 +984,18 @@ int runImage(const std::string& configPath)
                 components[3][pixel] = static_cast<float>(state.leafShaded);
                 if (!(leafArea > 0.0f)) { components[2][pixel] = kNaN; components[3][pixel] = kNaN; }
                 const double obukhov = std::isfinite(result.obukhovLength) ? result.obukhovLength : std::numeric_limits<double>::quiet_NaN();
-                const double fluxes[kFluxBands] = {
+                double fluxes[kBaseFluxBands + 1] = {
                     result.netRadiation, result.sensible, result.latent, result.ground,
                     static_cast<double>(result.iterations), result.converged ? 1.0 : 0.0,
                     obukhov, result.ustar, result.stabilityConverged ? 1.0 : 0.0,
                     result.residual, result.stabilityResidual, result.stabilityLimited ? 1.0 : 0.0,
                     result.gustResidual, result.airDensity, result.roughness, result.displacement,
-                    result.canopyWeight, partitionLimited};
+                    result.canopyWeight, partitionLimited, std::numeric_limits<double>::quiet_NaN()};
+                if (iceInScene && surface.temperatureCap > 0.0) {
+                    fluxes[kBaseFluxBands] = result.meltFlux;
+                    ++iceCappedPixels;
+                    if (result.meltLimited) { ++iceMeltPixels; iceMeltSum += result.meltFlux; }
+                }
                 for (int k = 0; k < kFluxBands; ++k) fluxOut[k][pixel] = static_cast<float>(fluxes[k]);
                 ++ebPixels;
                 if (result.converged) ++ebConverged;
@@ -991,6 +1023,9 @@ int runImage(const std::string& configPath)
                 " 个像元在过境时刻未收敛（eb_fluxes 波段 converged = 0，通量与组分温度仅供参考）" +
                 (ebClamped ? "；其中 " + std::to_string(ebClamped) + " 个像元的组分温度被钳在 " + std::to_string(static_cast<int>(kComponentTemperatureMin)) + "–" +
                                  std::to_string(static_cast<int>(kComponentTemperatureMax)) + " K 限值上" : ""));
+        if (iceInScene)
+            log("冰雪融化：" + std::to_string(iceCappedPixels) + " 个冰雪像元的组分温度上限为 273.15 K，其中过境时刻有融化热汇的 " + std::to_string(iceMeltPixels) +
+                " 个（平均 " + format(iceMeltPixels ? iceMeltSum / iceMeltPixels : 0.0, 1) + " W m-2，eb_fluxes 第 19 波段）；energy.iceMelt=false 可恢复无上限的旧行为");
         if (initialLaterHour > 0 || initialDayMean > 0)
             log("警告：起转起点的 2 m 气温无效，初值改取起点后第一个有效时次 " + std::to_string(initialLaterHour.load()) + " 个像元、改取首个模拟日平均气温 " +
                 std::to_string(initialDayMean.load()) + " 个像元");
@@ -1328,12 +1363,13 @@ int runImage(const std::string& configPath)
                                                     "downward shortwave, horizontal (W m-2)", "downward longwave (W m-2)", "soil moisture (m3 m-3)"};
         writeTiff(outputDir / "eb_forcing.tif", grid, forcingOut, forcingNames);
         products.Add("eb_forcing.tif");
-        const std::vector<std::string> fluxNames{
+        std::vector<std::string> fluxNames{
             "net radiation (W m-2)", "sensible heat (W m-2)", "latent heat (W m-2)", "ground heat (W m-2)",
             "iterations", "converged", "Obukhov length (m)", "friction velocity (m s-1)", "stability converged",
             "energy balance residual (W m-2)", "stability residual (m-1)", "stability limited",
             "gustiness residual (W m-2)", "air density (kg m-3)", "aerodynamic roughness length (m)",
             "aerodynamic displacement (m)", "aerodynamic canopy weight", "shortwave partition limited"};
+        if (iceInScene) fluxNames.push_back("ice melt heat flux (W m-2)");   // NaN outside snow / ice pixels
         writeTiff(outputDir / "eb_fluxes.tif", grid, fluxOut, fluxNames);
         products.Add("eb_fluxes.tif");
         CPLJSONArray fluxStats;
@@ -1396,6 +1432,12 @@ int runImage(const std::string& configPath)
         temperatureInfo.Add("convergedPixels", static_cast<GInt64>(ebConverged));
         temperatureInfo.Add("nonConvergedPixels", static_cast<GInt64>(ebPixels - ebConverged));
         temperatureInfo.Add("temperatureLimitedPixels", static_cast<GInt64>(ebClamped));
+        temperatureInfo.Add("iceMelt", config.iceMelt);
+        if (iceInScene) {
+            temperatureInfo.Add("iceCappedPixels", static_cast<GInt64>(iceCappedPixels));
+            temperatureInfo.Add("iceMeltPixels", static_cast<GInt64>(iceMeltPixels));
+            temperatureInfo.Add("iceMeltMeanFluxWm2", iceMeltPixels ? iceMeltSum / iceMeltPixels : 0.0);
+        }
         if (ebPixels > ebConverged)
             temperatureInfo.Add("warning", std::to_string(ebPixels - ebConverged) + " solved pixels did not converge at the overpass (eb_fluxes band converged = 0); " +
                                                std::to_string(ebClamped) + " of them have a component temperature at the " +

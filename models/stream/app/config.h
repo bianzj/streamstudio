@@ -139,6 +139,7 @@ struct ImageConfig {
     double soilHeatFraction = 0.25;
     int solarBinWidth = 50;  // nm, energy-balance shortwave grouping (1 = full 1 nm integration)
     int maxIterations = 50;
+    bool iceMelt = true;  // FIX(2026-11-24): snow / ice classes are capped at 273.15 K (melt flux); false restores the old behaviour
     int maxStabilityIterations = 60;  // accepted for compatibility; the solver shares maxIterations (unused)
     // Reflected sky of the thermal brightness (2026-11-20). "skyLongwave": {"mode": "auto" | "none"} or a
     // constant / raster field {"value": W m-2} / {"file": ..., "band": n}. auto: EB uses ERA5 strd at the

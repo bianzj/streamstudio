@@ -332,7 +332,7 @@ T soilSurfaceResistanceT(const EnergySurface& surface, const T& moisture)
     return ad::exp(8.206 - 4.255 * wetness);
 }
 
-template <class T> struct ComponentFluxT { T net{}, sensible{}, latent{}, ground{}, residual{}; };
+template <class T> struct ComponentFluxT { T net{}, sensible{}, latent{}, ground{}, residual{}, melt{}; };
 using ComponentFlux = ComponentFluxT<double>;
 struct Fluxes { ComponentFlux soilSunlit, soilShaded, leafSunlit, leafShaded; };
 
@@ -343,6 +343,8 @@ struct Solution {
     double sceneSensible = 0, gustResidual = 1e9, density = 1.2;
     double soilSunlitFraction = 0, laiSunlit = 0;
     double maxResidual = 1e9;
+    double sceneMelt = 0;
+    bool melting = false;
     bool closed = false;
 };
 
@@ -444,6 +446,25 @@ void fluxes(const EnergySurface& surface, const Forcing& forcing, const Shortwav
     solution.leafResistanceSun = b.leafResistanceSun;
     solution.leafResistanceShade = b.leafResistanceShade;
     Fluxes result{b.soilSunlit, b.soilShaded, b.leafSunlit, b.leafShaded};
+    // Snow / ice: a component sitting on the temperature cap with a surplus of energy melts it instead of warming
+    // (the surplus is the melt flux; the component balance then closes). A component below the cap, or on it with a
+    // deficit, is unchanged, so classes without a cap follow the original path bit for bit.
+    solution.melting = false;
+    if (surface.temperatureCap > 0.0) {
+        const auto limit = [&](ComponentFlux& flux, double temperature) {
+            if (temperature >= surface.temperatureCap && flux.residual > 0.0) {
+                flux.melt = flux.residual;
+                flux.residual = 0.0;
+                solution.melting = true;
+            }
+        };
+        limit(result.soilSunlit, state.soilSunlit);
+        limit(result.soilShaded, state.soilShaded);
+        if (leaves) {
+            limit(result.leafSunlit, state.leafSunlit);
+            limit(result.leafShaded, state.leafShaded);
+        }
+    }
 
     const double soilSunFraction = std::clamp(shortwave.soilSunlitFraction, 0.0, 1.0);
     const double laiSunlit = std::clamp(shortwave.laiSunlit, 0.0, lai);
@@ -457,6 +478,8 @@ void fluxes(const EnergySurface& surface, const Forcing& forcing, const Shortwav
                           leafWeightSun * result.leafSunlit.sensible + leafWeightShade * result.leafShaded.sensible;
     solution.gustResidual = std::abs(sceneH - sceneSensible);
     solution.sceneSensible = sceneH;
+    solution.sceneMelt = soilSunFraction * result.soilSunlit.melt + (1.0 - soilSunFraction) * result.soilShaded.melt +
+                         leafWeightSun * result.leafSunlit.melt + leafWeightShade * result.leafShaded.melt;
     solution.fluxes = result;
     double maximum;
     if (leaves) maximum = std::max({std::abs(result.soilSunlit.residual), std::abs(result.soilShaded.residual),
@@ -471,7 +494,8 @@ void fluxes(const EnergySurface& surface, const Forcing& forcing, const Shortwav
 // ~170 steps for the inner tolerance while only 50 were allowed: no pixel ever converged.)
 // "robust" damps the step (0.8); every step is limited to kMaxStep and to [kTmin, kTmax].
 void updateTemperature(double& temperature, double residual, double ra, double rs, double groundDerivative,
-                       double emissivity, double faces, bool robust, double density, const Forcing& forcing)
+                       double emissivity, double faces, bool robust, double density, const Forcing& forcing,
+                       double cap = 0.0)
 {
     const double old = temperature;
     ra = std::max(ra, 1.0);
@@ -485,6 +509,7 @@ void updateTemperature(double& temperature, double residual, double ra, double r
     const double raw = (robust ? kNewtonRelaxRobust : 1.0) * residual / denominator;
     if (!std::isfinite(raw)) return;
     temperature = std::clamp(old + std::clamp(raw, -kMaxStep, kMaxStep), kTmin, kTmax);
+    if (cap > 0.0) temperature = std::min(temperature, cap);   // snow / ice cannot be warmer than the melting point
 }
 
 }  // namespace
@@ -607,22 +632,28 @@ EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& f
         const double previousGust = state.sceneSensible;
         if (leaves) {
             updateTemperature(state.leafSunlit, f.leafSunlit.residual, solution.aero.leaf, solution.leafResistanceSun,
-                              0.0, surface.leafEmissivity, 2.0 * lai, surface.robustTemperature, density, forcing);
+                              0.0, surface.leafEmissivity, 2.0 * lai, surface.robustTemperature, density, forcing, surface.temperatureCap);
             updateTemperature(state.leafShaded, f.leafShaded.residual, solution.aero.leaf, solution.leafResistanceShade,
-                              0.0, surface.leafEmissivity, 2.0 * lai, surface.robustTemperature, density, forcing);
+                              0.0, surface.leafEmissivity, 2.0 * lai, surface.robustTemperature, density, forcing, surface.temperatureCap);
         }
         updateTemperature(state.soilSunlit, f.soilSunlit.residual, solution.aero.soil, solution.soilResistance,
                           groundDerivative(state.soilSunlit), surface.ground.emissivity, 1.0, surface.robustTemperature,
-                          density, forcing);
+                          density, forcing, surface.temperatureCap);
         updateTemperature(state.soilShaded, f.soilShaded.residual, solution.aero.soil, solution.soilResistance,
                           groundDerivative(state.soilShaded), surface.ground.emissivity, 1.0, surface.robustTemperature,
-                          density, forcing);
+                          density, forcing, surface.temperatureCap);
         if (leaves) {
             if (!std::isfinite(state.leafSunlit)) state.leafSunlit = forcing.ta + 2.0;
             if (!std::isfinite(state.leafShaded)) state.leafShaded = forcing.ta + 1.0;
         }
         if (!std::isfinite(state.soilSunlit)) state.soilSunlit = forcing.ta + 2.0;
         if (!std::isfinite(state.soilShaded)) state.soilShaded = forcing.ta + 1.0;
+        if (surface.temperatureCap > 0.0) {   // non-finite fallbacks above must respect the cap too
+            state.leafSunlit = std::min(state.leafSunlit, surface.temperatureCap);
+            state.leafShaded = std::min(state.leafShaded, surface.temperatureCap);
+            state.soilSunlit = std::min(state.soilSunlit, surface.temperatureCap);
+            state.soilShaded = std::min(state.soilShaded, surface.temperatureCap);
+        }
         state.sceneSensible = solution.sceneSensible;
         if (bracketMode) {   // under-relaxed temperature and gust update: the frozen-1/L iteration itself may cycle (period ~5)
             double* targets[4] = {&state.leafSunlit, &state.leafShaded, &state.soilSunlit, &state.soilShaded};
@@ -700,6 +731,8 @@ EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& f
                          leafSunWeight * f.leafSunlit.latent + leafShadeWeight * f.leafShaded.latent;
     diagnostics.ground = soilSunFraction * f.soilSunlit.ground + (1.0 - soilSunFraction) * f.soilShaded.ground;
     diagnostics.residual = solution.maxResidual;
+    diagnostics.meltFlux = solution.sceneMelt;
+    diagnostics.meltLimited = solution.melting;
     diagnostics.stabilityResidual = std::abs(finalError);
     diagnostics.gustResidual = solution.gustResidual;
     diagnostics.soilSunlitFraction = soilSunFraction;

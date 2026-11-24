@@ -142,7 +142,9 @@ ClassTable loadClassTable(const std::filesystem::path& file)
                 entry.ground = readGround(ground, soilGround, context + ".ground");
                 // Any non-soil ground (impervious, snow, water) is a flat surface with a constant emissivity: no
                 // moisture-dependent emissivity and no Hapke soil table (water: 2026-11-20, used to default to soil).
-                if (ground.GetString("surface", "soil") != "soil") {
+                const std::string groundSurface = ground.GetString("surface", "soil");
+                entry.ice = groundSurface == "snow" || groundSurface == "ice" || groundSurface == "glacier";
+                if (groundSurface != "soil") {
                     entry.groundKind = GroundKind::Flat;
                     entry.groundReflectance = static_cast<float>(number(ground, "reflectance", 0.15, context + ".ground"));
                     if (!(entry.groundReflectance >= 0 && entry.groundReflectance <= 1))

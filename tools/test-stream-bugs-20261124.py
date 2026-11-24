@@ -130,3 +130,60 @@ def test_facet_border_ring_is_reported(tmp_path):
     ret2, _ = run(sub, 'facet', config)
     assert ret2.returncode == 0, ret2.stderr + ret2.stdout
     assert '最外一圈' not in ret2.stdout
+
+# ---------- ice melt: snow / ice classes are capped at 273.15 K, the surplus is a melt flux ----------
+def ice_scene(tmp_path, lai_value=0.0, **energy):
+    spec = importlib.util.spec_from_file_location('review', HERE / 'test-stream-review-20261124.py')
+    review = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(review)
+    with gdal.Open(str(CASE / 'inputs/type.tif')) as ds:
+        type0 = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    with gdal.Open(str(CASE / 'inputs/lai.tif')) as ds:
+        lai0 = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    region = review.REGION
+    type0[region] = 15
+    lai0[region] = lai_value
+    config = eb_config(**energy)
+    config['surface'] = dict(type=dict(file=review.clone(CASE / 'inputs/type.tif', tmp_path / 'ice_type.tif', type0, gdal.GDT_Float32)),
+                             lai=dict(file=review.clone(CASE / 'inputs/lai.tif', tmp_path / 'ice_lai.tif', lai0, gdal.GDT_Float32)),
+                             dem=dict(file=str(CASE / 'inputs/dem.tif')))
+    return config, region
+
+
+@pytest.mark.parametrize('lai', [0.0, 1.0])
+def test_ice_is_capped_at_the_melting_point(tmp_path, lai):
+    config, region = ice_scene(tmp_path, lai)
+    ret, out = run(tmp_path, 'ice', config)
+    assert ret.returncode == 0, ret.stderr + ret.stdout
+    with gdal.Open(str(out / 'components.tif')) as ds:
+        comp = ds.ReadAsArray()[:, 85:88, 107:110]
+    assert np.nanmax(comp) <= 273.15 + 1e-9, np.nanmax(comp)
+    with gdal.Open(str(out / 'eb_fluxes.tif')) as ds:
+        fl = ds.ReadAsArray()[:, 85:88, 107:110]
+        assert ds.RasterCount == 19
+    melt = fl[18]
+    assert (melt > 50).all(), melt                            # midday: a large energy surplus goes into melting
+    # the balance closes with the melt flux: Rn - H - LE - G - melt = 0 (bands: Rn, H, LE, G)
+    assert np.abs(fl[0] - fl[1] - fl[2] - fl[3] - melt).max() < 1.0
+    counts = summary(out)['temperature']
+    assert counts['iceMelt'] is True and counts['iceCappedPixels'] == 9 and counts['iceMeltPixels'] == 9
+    assert '冰雪融化' in ret.stdout
+
+
+def test_ice_melt_can_be_switched_off(tmp_path):
+    config, region = ice_scene(tmp_path, 0.0, iceMelt=False)
+    ret, out = run(tmp_path, 'ice_off', config)
+    assert ret.returncode == 0, ret.stderr + ret.stdout
+    with gdal.Open(str(out / 'components.tif')) as ds:
+        comp = ds.ReadAsArray()[:, 85:88, 107:110]
+        assert np.nanmax(comp) > 275.0                         # the old behaviour: snow warmer than 0 degC
+    with gdal.Open(str(out / 'eb_fluxes.tif')) as ds:
+        assert ds.RasterCount == 18
+
+
+def test_scene_without_ice_has_no_melt_band(tmp_path):
+    ret, out = run(tmp_path, 'plain', eb_config())
+    assert ret.returncode == 0, ret.stderr + ret.stdout
+    with gdal.Open(str(out / 'eb_fluxes.tif')) as ds:
+        assert ds.RasterCount == 18
+    assert 'iceMeltPixels' not in summary(out)['temperature']

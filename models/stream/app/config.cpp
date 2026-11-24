@@ -403,6 +403,7 @@ ImageConfig readImageConfig(const std::string& path)
         config.solarBinWidth = integerOr(energy, "spectralBinNm", 50, "temperature.energy.spectralBinNm");
         if (config.solarBinWidth < 1 || config.solarBinWidth > 100) throw std::runtime_error("spectralBinNm 须在 1–100 nm 之间");
         config.maxIterations = integerOr(energy, "maxIterations", 50, "temperature.energy.maxIterations");
+        config.iceMelt = energy.GetBool("iceMelt", true);
         config.maxStabilityIterations = integerOr(energy, "maxStabilityIterations", 60, "temperature.energy.maxStabilityIterations");
         if (!(config.stomatalG0 > 0) || !(config.minWindSpeed >= 0) || !(config.referenceHeight > 0) ||
             !(config.leafEmissivity > 0 && config.leafEmissivity <= 1) ||

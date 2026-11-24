@@ -407,6 +407,8 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
           temperatureMethod: temperatureInput.energy?.temperatureMethod || 'robust',
           diffuseFraction: hasNumber(temperatureInput.energy?.diffuseFraction) ? Number(temperatureInput.energy.diffuseFraction) : 0.2,
           enforceSolarLimit: temperatureInput.energy?.enforceSolarLimit !== false,
+          // FIX(2026-11-24): snow / ice classes are capped at 273.15 K by default; only an explicit false is sent.
+          ...(temperatureInput.energy?.iceMelt === false ? { iceMelt: false } : {}),
           spectralBinNm: hasNumber(temperatureInput.energy?.spectralBinNm) ? Number(temperatureInput.energy.spectralBinNm) : 50,
           soilThermal: temperatureInput.energy?.soilThermal === 'moisture' ? 'moisture' : 'constant',
           // Soil directional emissivity and the aerodynamic heat-roughness of the bare-soil path.

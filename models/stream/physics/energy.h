@@ -69,6 +69,10 @@ struct EnergySurface {
     double soilHeatFraction = 0.25;
     int maxIterations = 50;
     int maxStabilityIterations = 60;
+    // FIX(2026-11-24 ice melt): > 0 limits the four component temperatures to this value (273.15 K for snow / ice grounds).
+    // Energy that would warm a component above it is not stored: it is reported as a melt flux and the component balance
+    // closes with Rn - H - LE - G - melt = 0 (0 = no limit, the previous behaviour).
+    double temperatureCap = 0.0;
 };
 
 struct Forcing {
@@ -94,7 +98,9 @@ struct EnergyDiagnostics {
     double soilSunlitFraction = 0, laiSunlit = 0;
     double airDensity = 0, ustar = 0, displacement = 0, roughness = 0, canopyWeight = 0;
     double obukhovLength = 0;
+    double meltFlux = 0;            // W m-2 scene-weighted melt heat sink of temperature-capped (snow / ice) components
     int iterations = 0, stabilityIterations = 0;
+    bool meltLimited = false;       // at least one component sat on the temperature cap with a surplus of energy
     bool converged = false, stabilityConverged = false, stabilityLimited = false, fallbackUsed = false;
 };
 

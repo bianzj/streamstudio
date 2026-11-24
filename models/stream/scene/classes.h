@@ -20,6 +20,7 @@ struct ClassParameters {
     GroundKind groundKind = GroundKind::Soil;
     float groundReflectance = 0.15f;  // flat spectral reflectance of a non-soil ground
     Ground ground;
+    bool ice = false;  // ground.surface is snow / ice / glacier: component temperatures are capped at 273.15 K (energy.iceMelt)
     // FIX(2026-11-21 C9): crown / row structure keys found in classes.json for this class (comma separated, empty =
     // none). They are read into `canopy` for the record only: the engine simulates a homogeneous canopy.
     std::string ignoredStructure;
