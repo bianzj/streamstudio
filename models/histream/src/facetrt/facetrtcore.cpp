@@ -240,6 +240,17 @@ struct SurfaceParameters {
     bool windowCracked{false}, acOn{false}, engineOn{false};
     double acPower{3500}, acSetpointC{24}, acBandK{2}, enginePowerW{15000}, engineShare{0.3};
     float vehicleSpeed{0.0f}, vehicleWindCosine{0.0f};
+    // Vehicle parts model (docs/vehicle-thermal.md section 3/4). Absent tags keep the
+    // lumped interior node and the engine heat spread over the underbody (old results).
+    // vehiclePart 4 = bonnet (wall slab whose indoor side is the engine-bay air).
+    std::string meshName;                       // OBJ group of this material (per-window output)
+    bool interiorMulti{false};                  // dashboard / seat / wheel / lining nodes
+    std::array<double, 4> intShare{0.3, 0.35, 0.05, 0.3}, intCapacity{10000, 40000, 2000, 60000},
+        intHcA{4, 10, 1, 28}, intRadArea{1, 3, 0.25, 8};
+    double shellRadFraction{0.45}, seatEffusivity{300};
+    bool engineMulti{false}, engineWarm{false};
+    double engineWarmC{90}, engineBlockCapacity{80000}, engineBayCapacity{15000}, engineBlockBay{40}, bayVent0{0.04}, bayVentK{0.004}, firewallG{2};
+    std::array<double, 3> engineSplit{0.5, 0.3, 0.2}; // radiator -> bay air, block, exhaust -> underbody
     float leafWidth{0.1f};
     LeafBiochemistry leaf;
     uint8_t outputComponent{0}; // 0 unknown, 1 soil/background, 2 vegetation, 3 building, 4 PV, 5 water
@@ -3339,11 +3350,43 @@ std::string facetInputView(const std::string& path)
         // the cabin / driving parameters (params.cabin). Absent writes nothing.
         if (!pv && !leaf && !water && ProjectJson::string(item,"type")=="Vehicle") {
             const std::string part = ProjectJson::string(p,"vehiclePart","");
-            const int partCode = part=="body" ? 1 : part=="glass" ? 2 : part=="underbody" ? 3 : 0;
+            const int partCode = part=="body" ? 1 : part=="glass" ? 2 : part=="underbody" ? 3 : part=="hood" ? 4 : 0;
             if (partCode) xml << "<vehiclePart>" << partCode << "</vehiclePart>";
             if (partCode == 1 && p.contains("cabin") && p["cabin"].is_object()) {
                 const auto& c = p["cabin"];
                 const auto num = [&](const char* key, float fallback) { return ProjectJson::number(c, key, fallback); };
+                // Parts model (all optional): interior nodes and engine/bay nodes as comma lists.
+                const auto list = [&](const ProjectJson::Json& o, const char* key, std::initializer_list<const char*> ids, float fallback) {
+                    std::string text;
+                    for (const char* id : ids) {
+                        const float v = o.contains(id) && o[id].is_object() ? ProjectJson::number(o[id], key, fallback) : fallback;
+                        text += (text.empty() ? "" : ",") + std::to_string(v);
+                    }
+                    return text;
+                };
+                if (c.contains("interior") && c["interior"].is_object() && ProjectJson::boolean(c["interior"],"enabled",false)) {
+                    const auto& in = c["interior"];
+                    const auto ids = {"dashboard","seat","wheel","lining"};
+                    xml << "<vcIntModel>1</vcIntModel>"
+                        << "<vcIntShares>" << list(in,"share",ids,0.25f) << "</vcIntShares>"
+                        << "<vcIntCapacities>" << list(in,"capacity",ids,10000) << "</vcIntCapacities>"
+                        << "<vcIntHcA>" << list(in,"hcA",ids,4) << "</vcIntHcA>"
+                        << "<vcIntRadArea>" << list(in,"radArea",ids,1) << "</vcIntRadArea>"
+                        << "<vcShellRadFraction>" << ProjectJson::number(in,"shellRadFraction",0.45f) << "</vcShellRadFraction>"
+                        << "<vcSeatEffusivity>" << ProjectJson::number(in,"seatEffusivity",300) << "</vcSeatEffusivity>";
+                }
+                if (c.contains("engine") && c["engine"].is_object() && ProjectJson::boolean(c["engine"],"enabled",false)) {
+                    const auto& en = c["engine"];
+                    xml << "<vcEngModel>1</vcEngModel>"
+                        << "<vcEngWarm>" << (ProjectJson::boolean(en,"warm",false) ? 1 : 0) << "</vcEngWarm>"
+                        << "<vcEngWarmTemp>" << ProjectJson::number(en,"warmTemperature",90) << "</vcEngWarmTemp>"
+                        << "<vcEngCaps>" << ProjectJson::number(en,"blockCapacity",80000) << "," << ProjectJson::number(en,"bayCapacity",15000) << "</vcEngCaps>"
+                        << "<vcEngBlockBay>" << ProjectJson::number(en,"blockToBay",40) << "</vcEngBlockBay>"
+                        << "<vcEngBayVent>" << ProjectJson::number(en,"bayVent0",0.04f) << "," << ProjectJson::number(en,"bayVentK",0.004f) << "</vcEngBayVent>"
+                        << "<vcEngSplit>" << ProjectJson::number(en,"radiatorShare",0.5f) << "," << ProjectJson::number(en,"blockShare",0.3f) << ","
+                        << ProjectJson::number(en,"exhaustShare",0.2f) << "</vcEngSplit>"
+                        << "<vcFirewallG>" << ProjectJson::number(en,"firewallG",2) << "</vcFirewallG>";
+                }
                 xml << "<vcEnabled>" << (ProjectJson::boolean(c,"enabled",false) ? 1 : 0) << "</vcEnabled>"
                     << "<vcSpeed>" << num("speed",0) << "</vcSpeed>"
                     << "<vcOccupants>" << num("occupants",0) << "</vcOccupants>"
@@ -4638,8 +4681,9 @@ Scene loadProjectScene(const std::string& inputFile)
                         throw std::runtime_error("Invalid internal heat source (|flux| <= 1e5 W/m2, |power| <= 1e9 W): " + physicalName);
                     // Vehicle parts and cabin parameters (absent = old behaviour).
                     material.vehiclePart = static_cast<int>(xmlFloat(wallBlock, "vehiclePart", 0));
-                    if (material.vehiclePart < 0 || material.vehiclePart > 3)
-                        throw std::runtime_error("vehiclePart must be 0-3: " + physicalName);
+                    if (material.vehiclePart < 0 || material.vehiclePart > 4)
+                        throw std::runtime_error("vehiclePart must be 0-4: " + physicalName);
+                    material.meshName = meshNames.empty() ? std::string{} : meshNames[std::min(index, meshNames.size() - 1U)];
                     if (!trim(firstXmlTag(wallBlock, "vcSpeed")).empty() || !trim(firstXmlTag(wallBlock, "vcEnabled")).empty()) {
                         material.vehicleHasParams = true;
                         material.cabinEnabled = xmlFloat(wallBlock, "vcEnabled", 0) > 0.5f;
@@ -4673,6 +4717,56 @@ Scene loadProjectScene(const std::string& inputFile)
                             !(material.acSetpointC > -20 && material.acSetpointC < 50) ||
                             !(material.enginePowerW >= 0 && material.enginePowerW <= 1.0e6) || !(material.engineShare >= 0 && material.engineShare <= 1))
                             throw std::runtime_error("Invalid vehicle cabin parameters: " + physicalName);
+                        // Interior nodes and engine / bay nodes (absent = lumped interior, engine heat on the underbody).
+                        const auto csv = [&](const char* tag, size_t count, std::vector<double>& out) {
+                            const std::string text = trim(firstXmlTag(wallBlock, tag));
+                            if (text.empty()) return false;
+                            std::string spaced = text;
+                            std::replace(spaced.begin(), spaced.end(), ',', ' ');
+                            std::istringstream stream(spaced);
+                            out.clear();
+                            double value = 0;
+                            while (stream >> value) out.push_back(value);
+                            if (out.size() != count) throw std::runtime_error(std::string("Vehicle ") + tag + " needs " + std::to_string(count) + " values: " + physicalName);
+                            for (double v : out) if (!std::isfinite(v)) throw std::runtime_error(std::string("Invalid vehicle ") + tag + ": " + physicalName);
+                            return true;
+                        };
+                        if (xmlFloat(wallBlock, "vcIntModel", 0) > 0.5f) {
+                            std::vector<double> v;
+                            material.interiorMulti = true;
+                            if (csv("vcIntShares", 4, v)) std::copy(v.begin(), v.end(), material.intShare.begin());
+                            if (csv("vcIntCapacities", 4, v)) std::copy(v.begin(), v.end(), material.intCapacity.begin());
+                            if (csv("vcIntHcA", 4, v)) std::copy(v.begin(), v.end(), material.intHcA.begin());
+                            if (csv("vcIntRadArea", 4, v)) std::copy(v.begin(), v.end(), material.intRadArea.begin());
+                            material.shellRadFraction = xmlFloat(wallBlock, "vcShellRadFraction", 0.45f);
+                            material.seatEffusivity = xmlFloat(wallBlock, "vcSeatEffusivity", 300);
+                            double shareSum = 0;
+                            bool valid = material.shellRadFraction >= 0 && material.shellRadFraction <= 0.95 && material.seatEffusivity > 0;
+                            for (size_t k = 0; k < 4; ++k) {
+                                shareSum += material.intShare[k];
+                                valid = valid && material.intShare[k] >= 0 && material.intCapacity[k] > 10 && material.intHcA[k] > 0 && material.intRadArea[k] >= 0;
+                            }
+                            if (!valid || !(shareSum > 0.999 && shareSum < 1.001))
+                                throw std::runtime_error("Invalid vehicle interior nodes (shares sum to 1, capacity > 10 J/K, hcA > 0): " + physicalName);
+                        }
+                        if (xmlFloat(wallBlock, "vcEngModel", 0) > 0.5f) {
+                            std::vector<double> v;
+                            material.engineMulti = true;
+                            material.engineWarm = xmlFloat(wallBlock, "vcEngWarm", 0) > 0.5f;
+                            material.engineWarmC = xmlFloat(wallBlock, "vcEngWarmTemp", 90);
+                            if (csv("vcEngCaps", 2, v)) { material.engineBlockCapacity = v[0]; material.engineBayCapacity = v[1]; }
+                            material.engineBlockBay = xmlFloat(wallBlock, "vcEngBlockBay", 40);
+                            if (csv("vcEngBayVent", 2, v)) { material.bayVent0 = v[0]; material.bayVentK = v[1]; }
+                            if (csv("vcEngSplit", 3, v)) std::copy(v.begin(), v.end(), material.engineSplit.begin());
+                            material.firewallG = xmlFloat(wallBlock, "vcFirewallG", 2);
+                            const double splitSum = material.engineSplit[0] + material.engineSplit[1] + material.engineSplit[2];
+                            if (!(material.engineWarmC > -20 && material.engineWarmC < 200) || !(material.engineBlockCapacity > 100) ||
+                                !(material.engineBayCapacity > 10) || !(material.engineBlockBay > 0) || !(material.bayVent0 >= 0 && material.bayVentK >= 0) ||
+                                !(material.bayVent0 + material.bayVentK > 0) || !(material.firewallG >= 0 && material.firewallG <= 1000) ||
+                                std::any_of(material.engineSplit.begin(), material.engineSplit.end(), [](double s) { return !(s >= 0); }) ||
+                                !(splitSum > 0.999 && splitSum < 1.001))
+                                throw std::runtime_error("Invalid vehicle engine model (shares sum to 1, capacities and conductances positive): " + physicalName);
+                        }
                     }
                 }
             }
@@ -5531,6 +5625,14 @@ try {
         double maxAirK{-1}, maxAirTime{0}, maxInteriorK{-1};
         int maxAirNode{-1};
         double maxClosure{0};
+        // Parts model (interior nodes / engine and bay): bonnet facets and node temperatures.
+        std::vector<uint32_t> hoodFacets;
+        std::vector<size_t> hoodWalls;          // wall indices of the bonnet (indoor side = bay air)
+        double hoodArea{0};
+        std::array<double, 4> intK{}, maxIntK{-1, -1, -1, -1};
+        double boundaryK{0}, blockK{0}, bayK{0}, maxBlockK{-1}, maxBayK{-1}, maxEngineClosure{0};
+        bool parts{false};                      // interior nodes and/or engine model of the body material
+        std::map<std::string, double> maxWindowW; // peak transmitted power per window group (W)
     };
     std::vector<VehicleRuntime> vehicles(scene.vehicleNames.size());
     const auto vehicleOf = [&](uint32_t facet) -> uint32_t {
@@ -5554,23 +5656,38 @@ try {
             } else if (s.vehiclePart == 3) {
                 v.underFacets.push_back(f);
                 v.underArea += facetAreas[f];
+            } else if (s.vehiclePart == 4) {
+                v.hoodFacets.push_back(f);
+                v.hoodArea += facetAreas[f];
             }
             if ((s.vehiclePart == 1 || s.vehiclePart == 2) && wallIndex[f] >= 0) wallVehicle[size_t(wallIndex[f])] = int32_t(instance - 1U);
         }
         ProjectJson::Json list = ProjectJson::Json::array();
         for (auto& v : vehicles) {
+            v.parts = v.body && v.body->cabinEnabled && (v.body->interiorMulti || v.body->engineMulti);
             if (v.body && v.body->cabinEnabled)
                 for (size_t w = 0; w < wallVehicle.size(); ++w)
                     if (wallVehicle[w] == int32_t(&v - vehicles.data())) v.walls.push_back(w);
-            // Engine heat: spread over the underbody / engine-bay shell facets.
+            // Bonnet slabs: indoor side = engine-bay air with the engine model, else they behave like the body.
+            for (uint32_t f : v.hoodFacets) {
+                if (wallIndex[f] < 0 || !v.body || !v.body->cabinEnabled) continue;
+                if (!v.body->engineMulti) wallVehicle[size_t(wallIndex[f])] = int32_t(&v - vehicles.data());
+                (v.body->engineMulti ? v.hoodWalls : v.walls).push_back(size_t(wallIndex[f]));
+            }
+            // Engine heat: legacy = spread over the underbody shell; engine model = exhaust share only.
             if (v.body && v.body->engineOn && v.underArea > 0) {
                 if (internalHeat.empty()) internalHeat.assign(scene.leafFacetCount, 0.0f);
-                const double perArea = v.body->enginePowerW * v.body->engineShare / v.underArea;
+                const double perArea = v.body->enginePowerW * v.body->engineShare * (v.body->engineMulti ? v.body->engineSplit[2] : 1.0) / v.underArea;
                 for (uint32_t f : v.underFacets) internalHeat[f] += static_cast<float>(perArea);
             }
             list.push_back({{"name", v.name}, {"cabin", v.body && v.body->cabinEnabled}, {"speed_m_s", v.body ? v.body->vehicleSpeed : 0.0f},
                 {"bodyArea_m2", v.bodyArea}, {"glassArea_m2", v.glassArea}, {"underbodyArea_m2", v.underArea},
                 {"wallFacets", v.walls.size()}});
+            if (v.parts) {
+                list.back()["hoodArea_m2"] = v.hoodArea;
+                list.back()["interiorModel"] = v.body->interiorMulti ? "nodes" : "lumped";
+                list.back()["engineModel"] = v.body->engineMulti;
+            }
         }
         runIndex.value["vehicles"] = list;
     }
@@ -5929,8 +6046,22 @@ try {
         // temperature and the indoor air; eliminate the interior once per node.
         for (auto& v : vehicles) {
             if (v.walls.empty()) continue;
-            if (node == startNode) v.airK = v.interiorK = std::clamp(meteo.airTemperature + 273.15f, 220.0f, 340.0f);
-            for (size_t w : v.walls) wallIndoor[w] = v.airK;
+            if (node == startNode) {
+                v.airK = v.interiorK = std::clamp(meteo.airTemperature + 273.15f, 220.0f, 340.0f);
+                if (v.parts) {
+                    // Interiors start at the outdoor air; a warm engine (engineWarm) starts hot with a bay between.
+                    const auto& b = *v.body;
+                    v.intK.fill(v.airK);
+                    v.boundaryK = v.airK;
+                    v.blockK = v.bayK = v.airK;
+                    if (b.engineMulti && b.engineWarm) {
+                        v.blockK = std::max(v.airK, b.engineWarmC + 273.15);
+                        v.bayK = v.airK + 0.3 * (v.blockK - v.airK);
+                    }
+                }
+            }
+            for (size_t w : v.walls) wallIndoor[w] = v.parts ? v.boundaryK : v.airK;
+            for (size_t w : v.hoodWalls) wallIndoor[w] = v.bayK;
         }
         std::array<std::vector<facetphysics::WallResponse>, 2> wallResponses{
             std::vector<facetphysics::WallResponse>(wallFacets.size()), std::vector<facetphysics::WallResponse>(wallFacets.size())};
@@ -7100,8 +7231,13 @@ try {
         // cabin without iterating the surface solution; the slab profiles are then
         // advanced with the new cabin temperature (exact energy closure per slab).
         struct CabinNode {
-            bool active{false};
+            bool active{false}, parts{false};
             double airOld{}, interiorOld{}, outdoor{}, qTrans{}, qSolar{}, qWall0{}, kWall{}, qOcc{}, gVent{}, ach{}, qAc{}, airCap{}, interiorCap{};
+            // Parts model: node data of the step (interior nodes k = 0..3, air, engine block and bay).
+            int m{0};
+            double phi{0}, qFirewall{0}, gBay{0}, qEngine{0}, qBlock{0}, qRadiator{0}, qHood0{0}, kHood{0}, bayOld{0}, blockOld{0};
+            std::array<double, 4> intOld{}, share{}, cap{}, hcA{}, w{}, qIn{};
+            std::map<std::string, double> window;  // transmitted power per window group (W)
         };
         std::vector<CabinNode> cabinNodes(vehicles.size());
         std::vector<double> wallInnerK(wallFacets.size(), 0.0), wallOuterK(wallFacets.size(), 0.0), wallIndoorQ(wallFacets.size(), 0.0);
@@ -7114,12 +7250,17 @@ try {
             c.airOld = v.airK;
             c.interiorOld = v.interiorK;
             c.outdoor = airTemperature;
+            const double indoorRef = v.parts ? v.boundaryK : v.airK;
             for (uint32_t f : v.glassFacets) {
                 const int32_t gw = wallIndex[f];
                 const size_t gside = size_t(f) * 2U + (gw >= 0 ? wallOuter[size_t(gw)] : 0U);
-                c.qTrans += double(facetAreas[f]) * transmittedShortwave[gside];
+                const double watts = double(facetAreas[f]) * transmittedShortwave[gside];
+                c.qTrans += watts;
+                if (v.parts) c.window[surfaceForFacet(scene, f).meshName] += watts;
             }
-            for (size_t w : v.walls) {
+            // Linear response of the slabs: q(T) = q0 - K (T - T_ref) for the cabin walls (T_ref = indoorRef)
+            // and the bonnet slabs (T_ref = bay air).
+            const auto linearize = [&](size_t w, double reference, double& q0, double& k) {
                 const uint32_t f = wallFacets[w];
                 const size_t side = size_t(f) * 2U;
                 auto slab1 = slabOf(w);
@@ -7135,10 +7276,11 @@ try {
                     const auto r1 = facetphysics::wallResponse(wallProfiles[state][w], slab1, dTime,
                         internalHeat.empty() ? 0.0 : double(internalHeat[f]));
                     const double t1 = r1.offset[last] + r1.slope[last] * surface;
-                    c.qWall0 += weight * facetAreas[f] * conductance * (t0 - v.airK);
-                    c.kWall += weight * facetAreas[f] * conductance * (1.0 - (t1 - t0));
+                    q0 += weight * facetAreas[f] * conductance * (t0 - reference);
+                    k += weight * facetAreas[f] * conductance * (1.0 - (t1 - t0));
                 }
-            }
+            };
+            for (size_t w : v.walls) linearize(w, indoorRef, c.qWall0, c.kWall);
             c.airCap = double(airDensity) * 1005.0 * b.cabinVolume;
             c.interiorCap = b.interiorCapacity;
             c.ach = b.windowCracked ? std::max(b.ventilationAch, b.crackedAch) : b.ventilationAch;
@@ -7147,6 +7289,112 @@ try {
             c.gVent = c.airCap * c.ach / 3600.0;
             c.qSolar = b.absorbedFraction * c.qTrans;
             c.qOcc = double(b.occupants) * b.metabolicW;
+            if (v.parts) {
+                // Parts model: unknowns x = [T_air, T_interior k..., (T_block, T_bay)]; backward Euler, dense solve (n <= 7).
+                c.parts = true;
+                const bool engine = b.engineMulti;
+                const int m = b.interiorMulti ? 4 : 1;
+                c.m = m;
+                double radSum = 0;
+                for (int k = 0; k < m; ++k) {
+                    c.share[k] = b.interiorMulti ? b.intShare[k] : 1.0;
+                    c.cap[k] = b.interiorMulti ? b.intCapacity[k] : b.interiorCapacity;
+                    c.hcA[k] = b.interiorMulti ? b.intHcA[k] : b.interiorH * b.interiorArea;
+                    c.w[k] = b.interiorMulti ? b.intRadArea[k] : 0.0;
+                    c.intOld[k] = v.intK[k];
+                    radSum += c.w[k];
+                }
+                c.phi = b.interiorMulti && radSum > 0 ? b.shellRadFraction : 0.0;
+                for (int k = 0; k < m; ++k) c.w[k] = radSum > 0 ? c.w[k] / radSum : 0.0;
+                for (size_t w : v.hoodWalls) linearize(w, v.bayK, c.qHood0, c.kHood);
+                c.bayOld = v.bayK;
+                c.blockOld = v.blockK;
+                const int n = 1 + m + (engine ? 2 : 0), iBlock = 1 + m, iBay = 2 + m;
+                c.qEngine = engine && b.engineOn ? b.enginePowerW * b.engineShare : 0.0;
+                c.qBlock = c.qEngine * b.engineSplit[1];
+                c.qRadiator = c.qEngine * b.engineSplit[0] + (v.underArea > 0 ? 0.0 : c.qEngine * b.engineSplit[2]);
+                c.gBay = engine ? double(airDensity) * 1005.0 * (b.bayVent0 + b.bayVentK * double(b.vehicleSpeed)) : 0.0;
+                const double phi = c.phi, storeA = c.airCap / dTime, Tref = indoorRef;
+                const auto solve = [&](double acGain, double acSet, double acFixed) {
+                    std::array<std::array<double, 8>, 8> a{};
+                    std::array<double, 8> rhs{};
+                    // Air row.
+                    double hcSum = 0;
+                    for (int k = 0; k < m; ++k) hcSum += c.hcA[k];
+                    a[0][0] = storeA + hcSum + (1 - phi) * (1 - phi) * c.kWall + c.gVent + acGain + (engine ? b.firewallG : 0.0);
+                    rhs[0] = storeA * v.airK + (1 - phi) * (c.qWall0 + c.kWall * Tref) + c.qOcc + c.gVent * airTemperature + acGain * acSet - acFixed;
+                    for (int k = 0; k < m; ++k) a[0][1 + k] = -c.hcA[k] + (1 - phi) * c.kWall * phi * c.w[k];
+                    if (engine) a[0][iBay] = -b.firewallG;
+                    // Interior rows.
+                    for (int k = 0; k < m; ++k) {
+                        const double sk = c.cap[k] / dTime, wk = phi * c.w[k];
+                        a[1 + k][0] = -c.hcA[k] + wk * c.kWall * (1 - phi);
+                        for (int j = 0; j < m; ++j) a[1 + k][1 + j] = wk * c.kWall * phi * c.w[j];
+                        a[1 + k][1 + k] += sk + c.hcA[k];
+                        rhs[1 + k] = sk * v.intK[k] + c.share[k] * c.qSolar + wk * (c.qWall0 + c.kWall * Tref);
+                    }
+                    if (engine) {
+                        const double sE = b.engineBlockCapacity / dTime, sB = b.engineBayCapacity / dTime;
+                        a[iBlock][iBlock] = sE + b.engineBlockBay;
+                        a[iBlock][iBay] = -b.engineBlockBay;
+                        rhs[iBlock] = sE * v.blockK + c.qBlock;
+                        a[iBay][iBay] = sB + b.engineBlockBay + c.gBay + b.firewallG + c.kHood;
+                        a[iBay][iBlock] = -b.engineBlockBay;
+                        a[iBay][0] = -b.firewallG;
+                        rhs[iBay] = sB * v.bayK + c.qRadiator + c.gBay * airTemperature + c.qHood0 + c.kHood * c.bayOld;
+                    }
+                    for (int i = 0; i < n; ++i) {            // Gaussian elimination, partial pivoting
+                        int p = i;
+                        for (int r = i + 1; r < n; ++r) if (std::abs(a[r][i]) > std::abs(a[p][i])) p = r;
+                        if (!(std::abs(a[p][i]) > 0)) throw std::runtime_error("Singular vehicle cabin system");
+                        std::swap(a[i], a[p]); std::swap(rhs[i], rhs[p]);
+                        for (int r = i + 1; r < n; ++r) {
+                            const double factor = a[r][i] / a[i][i];
+                            for (int cc = i; cc < n; ++cc) a[r][cc] -= factor * a[i][cc];
+                            rhs[r] -= factor * rhs[i];
+                        }
+                    }
+                    std::array<double, 8> x{};
+                    for (int i = n - 1; i >= 0; --i) {
+                        double s = rhs[i];
+                        for (int cc = i + 1; cc < n; ++cc) s -= a[i][cc] * x[cc];
+                        x[i] = s / a[i][i];
+                    }
+                    return x;
+                };
+                auto x = solve(0, 0, 0);
+                if (b.acOn && b.acPower > 0) {
+                    const double setpoint = b.acSetpointC + 273.15;
+                    if (x[0] > setpoint) {
+                        const double gain = b.acPower / b.acBandK;
+                        const auto proportional = solve(gain, setpoint, 0);
+                        if (proportional[0] <= setpoint + b.acBandK) { x = proportional; c.qAc = gain * (x[0] - setpoint); }
+                        else { x = solve(0, 0, b.acPower); c.qAc = b.acPower; }
+                    }
+                }
+                v.airK = x[0];
+                for (int k = 0; k < m; ++k) v.intK[k] = x[1 + k];
+                double radMean = 0;
+                for (int k = 0; k < m; ++k) radMean += c.w[k] * v.intK[k];
+                v.boundaryK = (1 - phi) * v.airK + phi * radMean;
+                v.interiorK = v.intK[0];
+                if (engine) { v.blockK = x[iBlock]; v.bayK = x[iBay]; }
+                for (size_t w : v.walls) {
+                    wallIndoor[w] = v.boundaryK;
+                    const auto slab = slabOf(w);
+                    for (int state = 0; state < 2; ++state)
+                        wallResponses[state][w] = facetphysics::wallResponse(wallProfiles[state][w], slab, dTime,
+                            internalHeat.empty() ? 0.0 : double(internalHeat[wallFacets[w]]));
+                }
+                for (size_t w : v.hoodWalls) {
+                    wallIndoor[w] = v.bayK;
+                    const auto slab = slabOf(w);
+                    for (int state = 0; state < 2; ++state)
+                        wallResponses[state][w] = facetphysics::wallResponse(wallProfiles[state][w], slab, dTime,
+                            internalHeat.empty() ? 0.0 : double(internalHeat[wallFacets[w]]));
+                }
+                continue;
+            }
             const double conv = b.interiorH * b.interiorArea, storeI = c.interiorCap / dTime, storeA = c.airCap / dTime;
             const double total = storeI + conv, convEff = conv * storeI / total;
             const double rhs = storeA * v.airK + c.qWall0 + c.kWall * v.airK + c.qOcc + c.gVent * airTemperature +
@@ -7240,7 +7488,91 @@ try {
                     {"speed_m_s", v.body ? v.body->vehicleSpeed : 0.0f},
                     {"bodyOuterSurface_K", mean(v.bodyFacets, 0)}, {"glassOuterSurface_K", mean(v.glassFacets, 0)},
                     {"underbodySurface_K", mean(v.underFacets, 0)}};
-                if (c.active) {
+                if (c.active && c.parts) {
+                    // Parts model: air + interior nodes (+ engine block and bay), every node closes separately.
+                    const auto& b = *v.body;
+                    const int m = c.m;
+                    static const char* const names[4] = {"dashboard", "seat", "steeringWheel", "lining"};
+                    double hoodQ = 0;
+                    for (size_t w : v.hoodWalls) hoodQ += facetAreas[wallFacets[w]] * wallIndoorQ[w];
+                    const double airStore = c.airCap * (v.airK - c.airOld) / dTime;
+                    const double ventilation = c.gVent * (v.airK - airTemperature);
+                    const double firewall = b.engineMulti ? b.firewallG * (v.bayK - v.airK) : 0.0;
+                    const double qw = wallQ[vi];
+                    double convection = 0, intStore = 0, intResidual = 0, capSum = 0, tempSum = 0, nodeScale = 1.0;
+                    ProjectJson::Json nodes = ProjectJson::Json::array();
+                    for (int k = 0; k < m; ++k) {
+                        const double toAir = c.hcA[k] * (v.intK[k] - v.airK);
+                        const double store = c.cap[k] * (v.intK[k] - c.intOld[k]) / dTime;
+                        const double solar = c.share[k] * c.qSolar, shell = c.phi * c.w[k] * qw;
+                        const double residualK = store - (solar - toAir + shell);
+                        convection += toAir; intStore += store; intResidual += residualK;
+                        capSum += c.cap[k]; tempSum += c.cap[k] * v.intK[k];
+                        nodeScale = std::max({nodeScale, std::abs(solar), std::abs(toAir), std::abs(shell), std::abs(store)});
+                        v.maxIntK[k] = std::max(v.maxIntK[k], v.intK[k]);
+                        ProjectJson::Json node{{"name", b.interiorMulti ? names[k] : "lumped"}, {"temperature_K", v.intK[k]},
+                            {"solarAbsorbed_W", solar}, {"convectionToAir_W", toAir}, {"shellRadiationGain_W", shell},
+                            {"storage_W", store}, {"residual_W", residualK}};
+                        if (b.interiorMulti && k == 1) {
+                            // Seat surface temperature a bare hand/leg would touch: two semi-infinite bodies,
+                            // T_c = (e_seat T_seat + e_skin T_skin) / (e_seat + e_skin), e_skin = 1100, T_skin = 34 C.
+                            node["contactTemperature_K"] = (b.seatEffusivity * v.intK[k] + 1100.0 * 307.15) / (b.seatEffusivity + 1100.0);
+                        }
+                        nodes.push_back(std::move(node));
+                    }
+                    const double airResidual = airStore - (-convection + (1.0 - c.phi) * qw + c.qOcc + firewall - ventilation - c.qAc);
+                    const double residual = airResidual + intResidual;
+                    const double scale = std::max({nodeScale, std::abs(qw), std::abs(c.qOcc), std::abs(ventilation), std::abs(c.qAc), std::abs(airStore), std::abs(firewall)});
+                    v.maxClosure = std::max(v.maxClosure, std::abs(residual) / scale);
+                    if (v.airK > v.maxAirK) { v.maxAirK = v.airK; v.maxAirNode = node; v.maxAirTime = meteo.julianTime; }
+                    v.interiorK = capSum > 0 ? tempSum / capSum : v.intK[0];
+                    v.maxInteriorK = std::max(v.maxInteriorK, v.interiorK);
+                    double bodyInner = 0, bodyArea = 0, glassInner = 0, glassArea = 0;
+                    for (size_t w : v.walls) {
+                        const uint32_t f = wallFacets[w];
+                        if (surfaceForFacet(scene, f).vehiclePart == 2) { glassInner += facetAreas[f] * wallInnerK[w]; glassArea += facetAreas[f]; }
+                        else { bodyInner += facetAreas[f] * wallInnerK[w]; bodyArea += facetAreas[f]; }
+                    }
+                    row["cabinAirTemperature_K"] = v.airK;
+                    row["interiorTemperature_K"] = v.interiorK;
+                    row["cabinMinusOutdoor_K"] = v.airK - airTemperature;
+                    row["bodyInnerSurface_K"] = bodyArea > 0 ? bodyInner / bodyArea : 0.0;
+                    row["glassInnerSurface_K"] = glassArea > 0 ? glassInner / glassArea : 0.0;
+                    row["ventilationACH"] = c.ach;
+                    row["shellBoundaryTemperature_K"] = v.boundaryK;
+                    row["interiorNodes"] = nodes;
+                    ProjectJson::Json windows = ProjectJson::Json::object();
+                    for (const auto& [name, watts] : c.window) {
+                        windows[name] = watts;
+                        v.maxWindowW[name] = std::max(v.maxWindowW[name], watts);
+                    }
+                    row["windowTransmitted_W"] = windows;
+                    row["balance_W"] = {{"solarTransmitted", c.qTrans}, {"solarAbsorbedByInterior", c.qSolar},
+                        {"wallToCabin", qw}, {"occupants", c.qOcc}, {"ventilationLoss", ventilation}, {"firewallFromBay", firewall},
+                        {"airConditioning", c.qAc}, {"airStorage", airStore}, {"interiorStorage", intStore},
+                        {"residual", residual}, {"relativeResidual", std::abs(residual) / scale}};
+                    if (b.engineMulti) {
+                        const double blockStore = b.engineBlockCapacity * (v.blockK - c.blockOld) / dTime;
+                        const double bayStore = b.engineBayCapacity * (v.bayK - c.bayOld) / dTime;
+                        const double blockToBay = b.engineBlockBay * (v.blockK - v.bayK);
+                        const double bayLoss = c.gBay * (v.bayK - airTemperature);
+                        const double engineResidual = blockStore + bayStore - (c.qBlock + c.qRadiator - bayLoss - firewall + hoodQ);
+                        const double engineScale = std::max({1.0, std::abs(c.qEngine), std::abs(blockToBay), std::abs(bayLoss), std::abs(hoodQ), std::abs(blockStore), std::abs(bayStore)});
+                        v.maxEngineClosure = std::max(v.maxEngineClosure, std::abs(engineResidual) / engineScale);
+                        v.maxBlockK = std::max(v.maxBlockK, v.blockK);
+                        v.maxBayK = std::max(v.maxBayK, v.bayK);
+                        row["engine"] = {{"on", b.engineOn}, {"blockTemperature_K", v.blockK}, {"bayAirTemperature_K", v.bayK},
+                            {"hoodOuterSurface_K", mean(v.hoodFacets, 0)}, {"hoodInnerSurface_K", mean(v.hoodFacets, 2)},
+                            {"balance_W", {{"engineHeat", c.qEngine}, {"toBlock", c.qBlock}, {"toBayAir", c.qRadiator},
+                                {"toExhaust", c.qEngine * b.engineSplit[2]}, {"blockToBay", blockToBay}, {"bayVentilationLoss", bayLoss},
+                                {"firewallToCabin", firewall}, {"hoodFromSlabs", hoodQ}, {"blockStorage", blockStore}, {"bayStorage", bayStore},
+                                {"residual", engineResidual}, {"relativeResidual", std::abs(engineResidual) / engineScale}}}};
+                    }
+                    std::cout << "VEHICLE_PARTS\tnode=" << node << "\tname=" << v.name << "\tcabinC=" << v.airK - 273.15;
+                    for (int k = 0; k < m; ++k) std::cout << "\t" << (b.interiorMulti ? names[k] : "lumped") << "C=" << v.intK[k] - 273.15;
+                    if (b.engineMulti) std::cout << "\tblockC=" << v.blockK - 273.15 << "\tbayC=" << v.bayK - 273.15;
+                    std::cout << "\tqTrans=" << c.qTrans << std::endl;
+                } else if (c.active) {
                     const double airStore = c.airCap * (v.airK - c.airOld) / dTime;
                     const double interiorStore = c.interiorCap * (v.interiorK - c.interiorOld) / dTime;
                     const double ventilation = c.gVent * (v.airK - airTemperature);
@@ -7275,10 +7607,26 @@ try {
             diagnostic["vehicleCabin"] = rows;
             std::ofstream(outputDirectory / "diagnostics" / ("vehicle_cabin_node=" + std::to_string(node) + ".json")) << rows.dump(2);
             ProjectJson::Json summary = ProjectJson::Json::array();
-            for (const auto& v : vehicles)
+            for (const auto& v : vehicles) {
                 summary.push_back({{"name", v.name}, {"maxCabinAirTemperature_C", v.maxAirK - 273.15}, {"maxCabinNode", v.maxAirNode},
                     {"maxCabinTime", v.maxAirTime}, {"maxInteriorTemperature_C", v.maxInteriorK - 273.15},
                     {"maxRelativeClosure", v.maxClosure}});
+                if (v.parts) {
+                    auto& entry = summary.back();
+                    const int m = v.body->interiorMulti ? 4 : 1;
+                    ProjectJson::Json maxima = ProjectJson::Json::array();
+                    for (int k = 0; k < m; ++k) maxima.push_back(v.maxIntK[k] - 273.15);
+                    entry["maxInteriorNodeTemperature_C"] = maxima;
+                    ProjectJson::Json windows = ProjectJson::Json::object();
+                    for (const auto& [name, watts] : v.maxWindowW) windows[name] = watts;
+                    entry["maxWindowTransmitted_W"] = windows;
+                    if (v.body->engineMulti) {
+                        entry["maxEngineBlockTemperature_C"] = v.maxBlockK - 273.15;
+                        entry["maxEngineBayTemperature_C"] = v.maxBayK - 273.15;
+                        entry["maxEngineRelativeClosure"] = v.maxEngineClosure;
+                    }
+                }
+            }
             runIndex.value["vehicleCabinSummary"] = summary;
             runIndex.write();
         }
