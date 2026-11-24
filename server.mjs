@@ -3557,6 +3557,9 @@ function readTiff(path, requestedBand = 0, includeValues = false) {
   const predictor = Number(tagValue(317, [1])[0])
   const noDataText = String(tagValue(42113, '') || '').trim()
   const noData = noDataText && Number.isFinite(Number(noDataText)) ? Number(noDataText) : null
+  // FIX(2026-11-24 S11): a float32 raster stores the nodata value as float32; the tag text (e.g. -3.4028235e+38) is a double that
+  // is not the same number as the float32 pixel value, so compare through Math.fround or the fill value would not be masked.
+  const noDataCompare = noData != null && Number(bitsPerSample[0]) === 32 && Number(sampleFormats[0]) === 3 ? Math.fround(noData) : noData
   const pixelScale = tagValue(33550, []).map(Number)
   const tiePoint = tagValue(33922, []).map(Number)
   const geoKeys = tagValue(34735, []).map(Number)
@@ -3671,7 +3674,7 @@ function readTiff(path, requestedBand = 0, includeValues = false) {
   const valueAt = (x, y) => {
     const [sourceX, sourceY] = sourceCoordinates(x, y)
     const value = sourceValueAt(sourceX, sourceY, band)
-    return noData != null && value === noData ? Number.NaN : value
+    return noDataCompare != null && value === noDataCompare ? Number.NaN : value
   }
   for (let y = 0; y < outputHeight; y += 1) for (let x = 0; x < outputWidth; x += 1) {
     const value = valueAt(x, y)

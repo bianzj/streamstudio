@@ -34,6 +34,48 @@ function iterationCount(value) {
   return number
 }
 
+// FIX(2026-11-24 S1): the engine's temperature.energy rules (config.cpp), checked at submission so a bad value fails here and
+// not after the job has left the queue and its output folder exists. Only values the engine rejects are rejected.
+export const ENERGY_KEYS = ['scheme', 'soilHeatMethod', 'temperatureMethod', 'diffuseFraction', 'enforceSolarLimit', 'iceMelt',
+  'soilResistance', 'stomatalG0', 'minWindSpeed', 'maxAerodynamicResistance', 'referenceHeight', 'heatRoughnessKb',
+  'soilEmissivity', 'soilEmissivityWet', 'soilEmissivityModel', 'soilEmissivityK', 'surfaceTemperatureNormalisation',
+  'leafEmissivity', 'soilConductivity', 'soilVolumetricCapacity', 'soilThermal', 'soilHeatFraction', 'spectralBinNm',
+  'maxIterations', 'maxStabilityIterations']
+const isNumeric = (value) => typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')
+export function validateEnergy(energy) {
+  if (!energy || typeof energy !== 'object') return
+  const check = (key, ok, message) => {
+    const value = energy[key]
+    if (value === undefined || value === null || String(value).trim() === '') return
+    // true / [] / {} would turn into 1 / 0 / NaN through Number(); only real numbers (or numeric text) count.
+    if (!isNumeric(value) || !Number.isFinite(Number(value)) || !ok(Number(value))) throw new Error(`${key}：${message}`)
+  }
+  const choice = (key, allowed) => {
+    if (energy[key] !== undefined && energy[key] !== null && energy[key] !== '' && !allowed.includes(energy[key]))
+      throw new Error(`${key} 须为 ${allowed.join('、')} 之一`)
+  }
+  choice('soilHeatMethod', ['surface', 'depth', 'direct'])
+  choice('temperatureMethod', ['robust', 'direct'])
+  check('diffuseFraction', (v) => v === -1 || (v >= 0 && v <= 1), '须为 -1（Erbs）或 0 到 1 之间的数')
+  check('spectralBinNm', (v) => Number.isInteger(v) && v >= 1 && v <= 100, '须为 1–100 的整数（nm）')
+  check('heatRoughnessKb', (v) => v <= 20, '须不大于 20（≤0 表示按地类）')
+  check('soilEmissivityK', (v) => v > 0, '须大于 0')
+  check('soilHeatFraction', (v) => v >= 0 && v <= 1, '须在 0 与 1 之间')
+  check('leafEmissivity', (v) => v > 0 && v <= 1, '须在 (0, 1] 之间')
+  check('stomatalG0', (v) => v > 0, '须大于 0')
+  check('minWindSpeed', (v) => v >= 0, '须不小于 0')
+  check('referenceHeight', (v) => v > 0, '须大于 0')
+  check('soilConductivity', (v) => v > 0, '须大于 0')
+  check('soilVolumetricCapacity', (v) => v > 0, '须大于 0')
+}
+// Fields of temperature.energy that are not known to the engine mapping; they are ignored (never an error, so old
+// projects keep running) and reported back to the user as warnings.
+export function unknownEnergyFields(scene) {
+  const energy = scene?.temperature?.energy
+  if (!energy || typeof energy !== 'object' || Array.isArray(energy)) return []
+  return Object.keys(energy).filter((key) => !ENERGY_KEYS.includes(key))
+}
+
 // Local date + clock + UTC offset (v1 projects) -> ISO UTC overpass.
 export function localToUtc(date, time, timezone) {
   const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''))
@@ -388,6 +430,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
 
     let temperature
     if (mode === 'eb') {
+      validateEnergy(temperatureInput.energy)
       const source = temperatureInput.soilMoisture?.source === 'user' ? 'user' : 'era5'
       // DEFERRED[低] 错误处理: 这里的校验比引擎 config.cpp 宽松：soilHeatMethod/temperatureMethod 原样透传任意字符串，diffuseFraction 不限 [-1,1]，spectralBinNm 不限 1–100 的整数，heatRoughnessKb 不限 ≤20，soilEmissivityK 允许 ≤0；这些错误要等任务出队、建好输出目录后才由引擎报出；建议：在提交时按引擎相同规则校验（白名单 + 范围）
       temperature = { mode: 'eb', ...forcingRules.buildForcing(temperatureInput, { projectPath: input.projectPath, directories: forcingDirectories() }), soilMoisture: { source },
@@ -473,5 +516,11 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     return config
   }
 
-  return { readProjectFile, saveProjectFile, buildEngineConfig }
+  // Non-blocking findings about a scene: fields the engine mapping does not know and therefore drops silently.
+  function sceneWarnings(input) {
+    const scene = input?.scene && typeof input.scene === 'object' ? input.scene : input
+    const unknown = unknownEnergyFields(scene)
+    return unknown.length ? [`temperature.energy 中的 ${unknown.join('、')} 不是引擎支持的字段，已忽略（请检查拼写）`] : []
+  }
+  return { readProjectFile, saveProjectFile, buildEngineConfig, sceneWarnings }
 }

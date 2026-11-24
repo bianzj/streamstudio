@@ -204,12 +204,14 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
     // FIX(2026-11-21 S-5 QA): stop reasons of the analysed pixels
     long long stopConverged = 0, stopStalled = 0, stopNotUpdated = 0, stopIterationLimit = 0, stopSingular = 0, stopStepFailed = 0;
     double sumOmb = 0, sumOma = 0, sumDfs = 0;
+    // FIX(2026-11-24 E3): per-row partial sums added in row order (deterministic last digit, see inversion.cpp).
+    std::vector<double> rowOmb(static_cast<size_t>(std::max(grid.height, 0)), 0.0), rowOma(rowOmb.size(), 0.0), rowDfs(rowOmb.size(), 0.0);
     long long thermalPixels = 0;
-    std::atomic<int> rowsDone{0};
+    std::atomic<int> rowsDone{0}; int progressMark = 0;  // FIX(2026-11-24 E2): main thread only; reports whenever it finishes a row after enough rows are done
     const int rowCount = in.endRow - in.startRow;
 
     ParallelError errorsAssimilation;
-    #pragma omp parallel for schedule(dynamic, 2) reduction(+:analysed, noObservation, failed, notConverged, illConditioned, lowSupport, observationsUsed, sumOmb, sumOma, sumDfs, thermalPixels, stopConverged, stopStalled, stopNotUpdated, stopIterationLimit, stopSingular, stopStepFailed)
+    #pragma omp parallel for schedule(dynamic, 2) reduction(+:analysed, noObservation, failed, notConverged, illConditioned, lowSupport, observationsUsed, thermalPixels, stopConverged, stopStalled, stopNotUpdated, stopIterationLimit, stopSingular, stopStepFailed)
     for (int row = in.startRow; row < in.endRow; ++row) {
         if (errorsAssimilation.failed()) continue;
         try {
@@ -608,8 +610,8 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
                 qaBands[1][pixel] = static_cast<float>(omb / thermalCount);
                 qaBands[2][pixel] = static_cast<float>(oma / thermalCount);
                 qaBands[3][pixel] = static_cast<float>(std::sqrt(omaSquares / thermalCount));
-                sumOmb += omb / thermalCount;
-                sumOma += oma / thermalCount;
+                rowOmb[row] += omb / thermalCount;
+                rowOma[row] += oma / thermalCount;
                 ++thermalPixels;
             }
             qaBands[4][pixel] = static_cast<float>(dfs);
@@ -619,15 +621,16 @@ AssimilationResult runAssimilation(const AssimilationInputs& in, const std::arra
             result.analysed[pixel] = 1;
             ++analysed;
             observationsUsed += static_cast<long long>(m);
-            if (std::isfinite(dfs)) sumDfs += dfs;
+            if (std::isfinite(dfs)) rowDfs[row] += dfs;
             if (flags & kQaNotConverged) ++notConverged;  // FIX(2026-11-21 S-5 QA): bit 9 only (stalls / not updated counted apart)
             if (flags & kQaIllConditioned) ++illConditioned;
         }
         const int done = ++rowsDone;
-        if (isMainThread() && done % std::max(1, rowCount / 40) == 0)
+        if (isMainThread() && done >= progressMark + std::max(1, rowCount / 40) && (progressMark = done, true))
             progress(in.progressStart + in.progressSpan * done / rowCount, "同化分析");
         } catch (...) { errorsAssimilation.capture(); }
     }
+    for (size_t row = 0; row < rowOmb.size(); ++row) { sumOmb += rowOmb[row]; sumOma += rowOma[row]; sumDfs += rowDfs[row]; }
     errorsAssimilation.rethrow("同化");
 
     // ---- outputs ----

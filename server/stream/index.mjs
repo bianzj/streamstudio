@@ -136,6 +136,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   }
 
   function launch(job, args) {
+    if (job.stopped) { finish(job, 'stopped', null); return }
     job.status = 'running'
     job.startedAt = Date.now()
     job.stage = '启动引擎'
@@ -176,6 +177,9 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
       emit({ type: 'job-closed', job: { ...summary(job), status: 'stopped' }, status: 'stopped', code: null, elapsed: 0 })
       return { stopped: true }
     }
+    // FIX(2026-11-24 S7): an active job whose engine has not been spawned yet (start() still preparing the run) is marked
+    // stopped; launch() then closes it without spawning, instead of the click being ignored.
+    if (active && active.id === target && !active.child && !active.finished) { active.stopped = true; return { stopped: true } }
     if (!active?.child || active.id !== target) return { stopped: false }
     active.stopped = true
     if (process.platform === 'win32') {
@@ -199,6 +203,8 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     const name = String(scene.name || data.name || 'image').replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 64) || 'image'
     // Validate now so a bad form fails at submission rather than in the queue.
     const probe = projects.buildEngineConfig(scene, { outputDir: root, dataDir: dataDir() })
+    // Unknown temperature.energy fields are ignored (old projects must keep running) but reported, in the reply and in the job log.
+    const warnings = projects.sceneWarnings(scene)
     const pack = probe?.temperature?.era5?.pack
     if (typeof pack === 'string' && pack) {
       const bad = unreachableNonAsciiPackFile(resolve(normalizeHostPath(pack)))
@@ -218,6 +224,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
         job.manifest = { kind: 'stream-image-run', schemaVersion: 2, runId, name, outputDir: windowsPath(job.outputDir), status: 'running',
           mode: config.temperature.mode, overpass: config.overpass, startedAt: new Date().toISOString(), engine: windowsPath(engine()) }
         writeManifest(job, {})
+        for (const text of warnings) emit({ type: 'job-log', job: summary(job), level: 'warning', text: '警告：' + text })
         launch(job, ['run', configPath])
       },
       collect(status) {
@@ -226,7 +233,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
         return { products: runProducts(job.outputDir, status), summary: result }
       }
     }
-    return enqueue(job)
+    return { ...enqueue(job), ...(warnings.length ? { warnings } : {}) }
   }
 
   function readRun(directory) {

@@ -241,16 +241,19 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
     // ---------- retrieval ----------
     const double span = in.progressSpan;
     progress(in.progressStart + 0.1 * span, lsct ? "组分温度反演" : "地表温度反演");
-    std::atomic<int> rowsDone{0};
+    std::atomic<int> rowsDone{0}; int progressMark = 0;  // FIX(2026-11-24 E2): main thread only; reports whenever it finishes a row after enough rows are done
     long long retrieved = 0, failed = 0, notConverged = 0, lowSupport = 0, outOfRange = 0, illConditioned = 0;
     long long stopConverged = 0, stopStalled = 0, stopNotUpdated = 0, stopStepFailed = 0, stopIterationLimit = 0;  // FIX(2026-11-21 S-5 QA): LSCT stop reasons
     double dfsSum = 0.0, residualSum = 0.0;
+    // FIX(2026-11-24 E3): the means are summed per row (one thread per row) and then in row order, so the last digit no
+    // longer depends on the OpenMP reduction order.
+    std::vector<double> rowResidual(static_cast<size_t>(std::max(grid.height, 0)), 0.0), rowDfs(rowResidual.size(), 0.0);
 
     if (!lsct) {
         std::vector<float> lst(grid.size(), kNaN), sd(grid.size(), kNaN), qa(grid.size(), kNaN), residual(grid.size(), kNaN),
             used(grid.size(), kNaN), emissivity(grid.size(), kNaN);
         ParallelError errorsLst;
-        #pragma omp parallel for schedule(dynamic, 4) reduction(+:retrieved, failed, notConverged, outOfRange, residualSum)
+        #pragma omp parallel for schedule(dynamic, 4) reduction(+:retrieved, failed, notConverged, outOfRange)
         for (int row = in.startRow; row < in.endRow; ++row) {
             if (errorsLst.failed()) continue;
             try {
@@ -323,14 +326,15 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 used[pixel] = static_cast<float>(count);
                 emissivity[pixel] = static_cast<float>(weightSum);
                 qa[pixel] = static_cast<float>(flag);
-                residualSum += residual[pixel];
+                rowResidual[row] += residual[pixel];
                 ++retrieved;
             }
             const int done = ++rowsDone;
-            if (isMainThread() && done % std::max(1, height / 20) == 0)
+            if (isMainThread() && done >= progressMark + std::max(1, height / 20) && (progressMark = done, true))
                 progress(in.progressStart + span * (0.1 + 0.85 * done / height), "地表温度反演");
             } catch (...) { errorsLst.capture(); }
         }
+        for (size_t row = 0; row < rowResidual.size(); ++row) residualSum += rowResidual[row];
         errorsLst.rethrow("地表温度反演");
         const fs::path& dir = config.outputDir;
         writeTiff(dir / "lst.tif", grid, {lst}, {"LST (K)"});
@@ -360,7 +364,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         for (auto& band : radianceShares) band.assign(grid.size(), kNaN);
         const int half = inv.window / 2;
         ParallelError errorsLsct;
-        #pragma omp parallel for schedule(dynamic, 2) reduction(+:retrieved, failed, notConverged, lowSupport, outOfRange, illConditioned, dfsSum, residualSum, stopConverged, stopStalled, stopNotUpdated, stopStepFailed, stopIterationLimit)
+        #pragma omp parallel for schedule(dynamic, 2) reduction(+:retrieved, failed, notConverged, lowSupport, outOfRange, illConditioned, stopConverged, stopStalled, stopNotUpdated, stopStepFailed, stopIterationLimit)
         for (int row = in.startRow; row < in.endRow; ++row) {
             if (errorsLsct.failed()) continue;
             try {
@@ -543,15 +547,16 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 used[pixel] = static_cast<float>(set.size());
                 iterations[pixel] = static_cast<float>(iteration);
                 qa[pixel] = static_cast<float>(flag);
-                dfsSum += signal;
-                residualSum += residual[pixel];
+                rowDfs[row] += signal;
+                rowResidual[row] += residual[pixel];
                 ++retrieved;
             }
             const int done = ++rowsDone;
-            if (isMainThread() && done % std::max(1, height / 20) == 0)
+            if (isMainThread() && done >= progressMark + std::max(1, height / 20) && (progressMark = done, true))
                 progress(in.progressStart + span * (0.1 + 0.85 * done / height), "组分温度反演");
             } catch (...) { errorsLsct.capture(); }
         }
+        for (size_t row = 0; row < rowResidual.size(); ++row) { dfsSum += rowDfs[row]; residualSum += rowResidual[row]; }
         errorsLsct.rethrow("组分温度反演");
         const fs::path& dir = config.outputDir;
         const std::vector<std::string> names{"Tss sunlit soil temperature (K)", "Tsh shaded soil temperature (K)",

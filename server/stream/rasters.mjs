@@ -97,16 +97,35 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
     }
     const sorted = Float64Array.from(finite).sort()
     const quantile = (fraction) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * fraction)))] : null
-    const count = sorted.length
-    const minimum = count ? sorted[0] : null, maximum = count ? sorted[count - 1] : null
+    // FIX(2026-11-24 S11): count / minimum / maximum / mean / std come from every source pixel, not from the display sample
+    // (a skipped extreme would otherwise be missing); the quantiles and the histogram stay on the sample (stats.sampled).
+    let count = sorted.length
+    let minimum = count ? sorted[0] : null, maximum = count ? sorted[count - 1] : null
+    let mean = count ? sum / count : null, std = count ? Math.sqrt(Math.max(0, squares / count - (sum / count) ** 2)) : null
+    if (step > 1) {
+      let n = 0, lo = Infinity, hi = -Infinity, total = 0, totalSquares = 0, shift = null
+      for (let index = 0; index < tiff.values.length; index += 1) {
+        const sample = tiff.values[index]
+        if (!Number.isFinite(sample)) continue
+        if (shift === null) shift = sample   // shifted sums keep the variance stable for large offsets (e.g. Kelvin)
+        n += 1
+        if (sample < lo) lo = sample
+        if (sample > hi) hi = sample
+        total += sample - shift; totalSquares += (sample - shift) ** 2
+      }
+      if (n) {
+        count = n; minimum = lo; maximum = hi
+        mean = shift + total / n; std = Math.sqrt(Math.max(0, totalSquares / n - (total / n) ** 2))
+      }
+    }
     const histogram = new Array(96).fill(0)
-    if (count && maximum > minimum) for (const sample of sorted) histogram[Math.min(95, Math.floor((sample - minimum) / (maximum - minimum) * 96))] += 1
+    if (sorted.length && maximum > minimum) for (const sample of sorted) histogram[Math.max(0, Math.min(95, Math.floor((sample - minimum) / (maximum - minimum) * 96)))] += 1
     return {
       path: windowsPath(path), band: tiff.band, bands: tiff.bands, bandNames: tiff.bandNames,
       width, height, sourceWidth: tiff.width, sourceHeight: tiff.height, step,
       crs: tiff.crs, unit: tiff.unit, pixelSizeX: tiff.pixelSizeX, pixelSizeY: tiff.pixelSizeY, originX: tiff.originX, originY: tiff.originY,
       values: Buffer.from(output.buffer).toString('base64'),
-      stats: { count, minimum, maximum, mean: count ? sum / count : null, std: count ? Math.sqrt(Math.max(0, squares / count - (sum / count) ** 2)) : null,
+      stats: { count, minimum, maximum, mean, std, sampled: step > 1,
         p1: quantile(.01), p2: quantile(.02), p98: quantile(.98), p99: quantile(.99) },
       histogram
     }

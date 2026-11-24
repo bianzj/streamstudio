@@ -23,7 +23,10 @@ export function fileStamp(path) {
   try {
     const info = statSync(resolved)
     if (!info.isFile()) return null
-    return { path: resolved, mtimeMs: info.mtimeMs, size: info.size, key: `${resolved}|${info.mtimeMs}|${info.size}` }
+    // 2026-11-24: ctimeMs joins the key (same stat call, no extra I/O): it changes on every write and cannot be restored by
+    // utimes / copy-preserving tools, so an in-place rewrite that keeps mtime and size still invalidates. A head/tail content
+    // hash was evaluated and not added: it needs two synchronous reads per lookup and misses edits in the middle of the file.
+    return { path: resolved, mtimeMs: info.mtimeMs, size: info.size, key: `${resolved}|${info.mtimeMs}|${info.size}|${info.ctimeMs}` }
   } catch { return null }
 }
 

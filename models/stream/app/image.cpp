@@ -500,6 +500,7 @@ int runImage(const std::string& configPath)
     constexpr int kBaseFluxBands = 18;
     long long iceMeltPixels = 0, iceCappedPixels = 0;   // FIX(2026-11-24 ice melt)
     double iceMeltSum = 0.0;
+    std::vector<double> rowIceMelt(static_cast<size_t>(std::max(grid.height, 0)), 0.0);   // per-row partial sums, added in row order
     bool iceInScene = false;
     // LSCT inversion uses the run's component temperatures (RT input or EB solution) as its background.
     const bool lsctInversion = config.inversion.target == InversionTarget::Lsct;
@@ -931,10 +932,10 @@ int runImage(const std::string& configPath)
                 }
         const int kFluxBands = kBaseFluxBands + (iceInScene ? 1 : 0);
         fluxOut.assign(kFluxBands, std::vector<float>(pixels, kNaN));
-        std::atomic<int> rowsDone{0};
+        std::atomic<int> rowsDone{0}; int progressMark = 0;  // FIX(2026-11-24 E2): main thread only; reports whenever it finishes a row after enough rows are done
         const int rowCount = endRow - startRow;
         ParallelError errorsEb;
-        #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing, ebClamped, iceMeltPixels, iceCappedPixels, iceMeltSum)
+        #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing, ebClamped, iceMeltPixels, iceCappedPixels)
         for (int row = startRow; row < endRow; ++row) {
             if (errorsEb.failed()) continue;
             try {
@@ -994,7 +995,7 @@ int runImage(const std::string& configPath)
                 if (iceInScene && surface.temperatureCap > 0.0) {
                     fluxes[kBaseFluxBands] = result.meltFlux;
                     ++iceCappedPixels;
-                    if (result.meltLimited) { ++iceMeltPixels; iceMeltSum += result.meltFlux; }
+                    if (result.meltLimited) { ++iceMeltPixels; rowIceMelt[row] += result.meltFlux; }
                 }
                 for (int k = 0; k < kFluxBands; ++k) fluxOut[k][pixel] = static_cast<float>(fluxes[k]);
                 ++ebPixels;
@@ -1009,9 +1010,10 @@ int runImage(const std::string& configPath)
                 }
             }
             const int done = ++rowsDone;
-            if (isMainThread() && done % std::max(1, rowCount / 40) == 0) progress(10 + 60.0 * done / rowCount, "能量平衡求解");
+            if (isMainThread() && done >= progressMark + std::max(1, rowCount / 40) && (progressMark = done, true)) progress(10 + 60.0 * done / rowCount, "能量平衡求解");
             } catch (...) { errorsEb.capture(); }
         }
+        for (const double value : rowIceMelt) iceMeltSum += value;
         errorsEb.rethrow("能量平衡求解");
         log("能量平衡：" + std::to_string(ebPixels) + " 个像元，过境时刻收敛 " + std::to_string(ebConverged) + " 个（稳定度迭代收敛 " +
             std::to_string(ebStable) + " 个），水体取" + (waterSkinMissing ? " 2 m 气温（数据包无 skt）" : " 气象强迫表皮温度") + " " +
@@ -1168,7 +1170,7 @@ int runImage(const std::string& configPath)
     }
 
     long long invalidInput = 0, invalidType = 0, waterPixels = 0, nightPixels = 0, opticalPixels = 0, thermalPixels = 0, thermalFailed = 0, solarFailed = 0;
-    std::atomic<int> rowsDone{0};
+    std::atomic<int> rowsDone{0}; int progressMark = 0;  // FIX(2026-11-24 E2): main thread only; reports whenever it finishes a row after enough rows are done
     const int rowCount = endRow - startRow;
     const double imageStart = assimilationSpan > 0 ? assimilationStart + assimilationSpan
                             : inversionSpan > 0 ? inversionStart + inversionSpan : (eb ? 70 : 25);
@@ -1259,7 +1261,7 @@ int runImage(const std::string& configPath)
             }
         }
         const int done = ++rowsDone;
-        if (isMainThread() && done % std::max(1, rowCount / 40) == 0) progress(imageStart + imageSpan * done / rowCount, "逐像元成像");
+        if (isMainThread() && done >= progressMark + std::max(1, rowCount / 40) && (progressMark = done, true)) progress(imageStart + imageSpan * done / rowCount, "逐像元成像");
         } catch (...) { errorsImaging.capture(); }
     }
     errorsImaging.rethrow("逐像元成像");
