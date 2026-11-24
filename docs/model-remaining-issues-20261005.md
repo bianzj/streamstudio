@@ -2,9 +2,28 @@
 
 ## 2026-11-24 STREAM 引擎与同化审核（streamfix2）
 
-依据 2026-11-24 对 STREAM 引擎/同化/服务端的审核（M1–M4、A1–A5、E1、R5、C1–C3、L1/L2、S2–S5、E4）。本节随各块提交追加；已修正项的关键数字与测试见下，剩余项写明原因。
+依据 2026-11-24 对 STREAM 引擎/同化/服务端的审核（M1–M4、A1–A5、E1、R5、C1–C3、L1/L2、S2–S5、E4）。完整变更与兼容性见 `docs/release-next-draft.md`“STREAM 引擎与同化审核修正”。
 
-### A5 评估：雅可比对 1/L 与阵风冻结（准牛顿）与联合隐函数求导（块 4）
+### 已修正（2026-11-24）
+
+- **M1**：LAI 有效范围 0–100 → 0–20，填充码 249–254（×0.1 = 24.9–25.4）、nodata、负值按无效输入并计数告警（`counts.laiOutOfRangePixels`/`laiNoDataPixels`）；水体判断先于 LAI 检查，水体 LAI 为 nodata 仍取 `skt`。三个示例逐位不变。测试 `test_lai_fill_codes_and_water_nodata`、`test_water_pixel_with_nodata_lai_gets_skin_temperature`。
+- **M2（240 K 下限）**：组分温度下限 240 K → 175 K，牛顿分母钳位同为 175–380 K；北京 ERA5 降温 60 K 的夜间场景此前 4 个组分全钳在 240.00 K、全部未收敛、H 数百至数千 W m⁻²，现在低于 240 K、全部收敛、|H| < 150 W m⁻²；过境时刻有未收敛像元时日志警告，`scene_summary.json` 写 `nonConvergedPixels`/`temperatureLimitedPixels`/`warning`。测试 `test_cold_night_converges_below_240_k`、`test_unconverged_pixels_are_reported`。冰雪无 273.15 K 上限与融化潜热**仍未处理**（见下“仍未处理”）。
+- **M3/A4**：气动阻抗等对 LAI 的偏导进入 Ad 雅可比，LAI 的 ∂R/∂LAI 与有限差分（重算阻抗）一致到 1e-3 W m⁻²，叶光照 dT/dLAI 2.43 → 1.86 K（全非线性 1.33）；同化样例耗时 1.8 s 不变。回归测试 `tools/test-stream-jacobian.py`（`models/stream/tests/jacobian_check.cpp`）。
+- **M4、A1**：README 补节点 0 的 dt = 3600 s 与等温起点语义；同化输出质量位不影响分析场采用的说明。
+- **E1、R5、C1–C3、L1、L2**：并行区异常统一抛出（`app/parallel_error.h`，9 处）；输出 TIFF `Close()` 返回码检查；数值配置字段类型错误明确报错（`temperature.energy.*`、栅格 `value`、`skyLongwave` 非对象）；地形模式报错列全；旧“EB 起算点固定 00 UTC”DEFERRED 注释清理；scene_summary 稳定度文字改为自适应松弛 0.02–0.5。测试 `test_non_numeric_energy_fields_are_rejected`、`test_sky_longwave_number_and_string_value_are_rejected`、`test_unknown_terrain_mode_lists_every_mode`。
+- **S2–S5、E4（服务端）**：年份 1900–2200；`soilBrightness`、`maxIterations` 非法值返回 400；`start()` 先校验再建目录；非 ASCII 且无短名的 ERA5 数据文件提交时预检。测试 `tools/test-stream-server-review-20261124.mjs`；另补 EB 配置映射/默认值对表（读取 `config.cpp` 的默认值）、`rasters.mjs`、`index.mjs` 路由的最小测试 `tools/test-stream-server-tools-20261124.mjs`。
+- **强不稳定像元未收敛（stream-init 后 444 → 564 的回升）**：过境节点 1/L 括号法回退：2 日合成包 290 → 42，北京 Landsat 1 日包 52 → 5，MODIS 564 → 175（闭合残差 >100 W m⁻²：80 → 0、7 → 0、178 → 1），耗时不变，原已收敛像元逐位不变。测试 `test_unstable_pixels_converge_with_bracketing_fallback`。
+
+### 本轮未做及原因
+
+- **A5 联合隐函数求导**：见下节评估，估 1–2 个工作日、风险中等，只文档化。
+- **A1 输出侧 mask**：只写了文档（后处理按 `analysis_qa.tif` 屏蔽）；输出新增 mask 波段会改变产品清单与服务端/界面的产品列表，需要同步改动，未做。
+- **E1/R5 的自动测试**：并行区抛异常、磁盘写满没有确定性的外部触发方式，只做了代码审查与编译验证。
+- **S6、S1、S7、S11、E2、E3、A2、A3、I1、L3–L5、T1**：不在本轮范围，未做（S6 的“失败运行不列半成品”在 `test-stream-forcing-server.mjs` 已有测试）。
+- **强不稳定像元仍有少量未收敛**（MODIS 175、2 日包 42、1 日包 5）：回退预算有限（4 × `maxIterations`）；欠松弛 0.15/预算 6 更差，0.4/2 只到 330，说明余下像元可能没有稳态解（近中性处 1/L 符号翻转引起 u* 不连续），未进一步处理。
+
+### 关于 A5：雅可比对 1/L 与阵风冻结（评估）
+
 
 - 现状：同化的 EB 雅可比是过境节点的隐式导数 dT/dx = −(∂R/∂T)⁻¹ ∂R/∂x，其中 1/L 与对流阵风热通量（sceneSensible）作为已收敛的常量冻结；真实的稳态解还满足 1/L = f(T, x)、sceneSensible = H(T, 1/L, x)，x 变化会经 1/L 与阵风反馈到 T。因此这是准牛顿（拟牛顿）雅可比：方向近似、不保证是 MAP 代价的下降方向。已在 `models/stream/README.md`、`scene_summary.json` 的 `assimilation.method` 写明。
 - 影响（合成场景，中午强辐射，`models/stream/tests/jacobian_check.cpp`/streamreview 的 jac.cpp）：M3 修正后，LAI 的 ∂R/∂LAI 与有限差分逐项一致，剩余与“全非线性有限差分（每个扰动重新解 T 与 1/L）”的差全部来自冻结的 1/L 与阵风：作物 LAI 3，叶光照 dT/dLAI 1.86 vs 全 FD 1.33（+40 %；M3 之前 2.43，+82 %）；Vcmax25（默认控制量）叶光照 dT/dVcmax −0.054 vs −0.035 K/(μmol m⁻² s⁻¹)（约 +55 %），土壤光照的符号可以相反。EB 同化样例中表现为“线搜索停滞”比例高（北京 100×100 窗口，EB+热红外+光学，LAI 背景 ×1.25：converged 6007 / lineSearchStalled 3965 → M3 后 4822 / 5150，O−A 均方根 0.0212 → 0.0211 K，LAI 均方根误差 0.0358 → 0.0353），即更正确的 ∂R/∂LAI 并没有使 GN 步长更快收敛，主要偏差仍是冻结项。
@@ -102,7 +121,7 @@
 - ~~VoxelEB 短波直散比全时段固定为设置值（`fileio.cpp:1829`），不随时次变化。~~ 已修正（2026-11-23，`light.diffuseFractionMode = erbs`，见 2026-11-22 更新）。
 - ~~Hapke 影像仍为天顶方向的方向反射因子/发射率，未按能量守恒归一~~ 已修正（2026-11-23，见 2026-11-22 更新“Hapke 背景光谱求解守恒”：取天顶观测方向本身是正确用法，问题在于归一化）；~~反射率输出截断在 [0,1]~~（2026-11-22 已取消）。
 - ~~STREAM EB 从过境当天 00 UTC 起算~~ 已修正（2026-11-21 起相对过境往前启动：过境前 24 h；2026-11-24 缺省改为过境前 7 个 ERA5 整点时次，`temperature.spinupHours` 为时次个数，0–240，见 2026-11-22 更新“STREAM EB 起转”）。
-- STREAM 温度下限 240 K、冰雪不计融化：**仍未处理**。实测触发范围（合成场景：北京 2019-08-15 ERA5 整体下移）：240 K 下限在气温/表面温度低于约 −33 °C 时触发（下移 60 K、气温 227–236 K 时 4 个组分全部钳在 240.00 K，能量残差中位 816 W m⁻²，180408 像元仅 21 个标为收敛），即南极/格陵兰、西伯利亚/蒙古/黑龙江极端冬夜、青藏高原极端低温等极地与极端冬夜；冰雪无 273.15 K 上限与融化潜热在永久冰雪（地类 15）日照强、气温接近 0 °C 时触发（下移 30 K 的场景里 23329 个冰雪像元中 23314 个 Tss > 273.15 K，最高 280.0 K），即夏季高山冰川、青藏、格陵兰边缘。普通中纬度（一般冬季夜间 > −30 °C）两项都不触发。
+- STREAM 温度下限 240 K：**已修正（2026-11-24，见“2026-11-24 STREAM 引擎与同化审核”）**，组分温度下限改为 175 K；以下为修正前的实测。冰雪不计融化：**仍未处理**。实测触发范围（合成场景：北京 2019-08-15 ERA5 整体下移）：240 K 下限在气温/表面温度低于约 −33 °C 时触发（下移 60 K、气温 227–236 K 时 4 个组分全部钳在 240.00 K，能量残差中位 816 W m⁻²，180408 像元仅 21 个标为收敛），即南极/格陵兰、西伯利亚/蒙古/黑龙江极端冬夜、青藏高原极端低温等极地与极端冬夜；冰雪无 273.15 K 上限与融化潜热在永久冰雪（地类 15）日照强、气温接近 0 °C 时触发（下移 30 K 的场景里 23329 个冰雪像元中 23314 个 Tss > 273.15 K，最高 280.0 K），即夏季高山冰川、青藏、格陵兰边缘。普通中纬度（一般冬季夜间 > −30 °C）两项都不触发。
 
 部署状态（本节取代下文“部署状态”中的哈希）：当前工作区 `C:\work\streamstudio\models\bin_x64\Release\histream.exe` 的 SHA256 为 `78416e907144fe87c08c729dd77f937340d7469dd1b97b54693dbb1437a94a22`（Get-FileHash 实测，2026-11-20 18:09 构建，含建筑法线按几何定向与 A-buffer 自动扩层，与 `build-manifest.json` 一致）。构建产出 36 个 SPV，部署目录已清理 3 个旧文件 `shader/cases/VoxelTriTracing/*.spv` 与 2 个 `- 副本.comp`，清单 `staleShaderBinaries`/`missingShaderBinaries` 均为空。
 
