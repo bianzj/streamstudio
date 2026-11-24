@@ -191,9 +191,16 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   }
 
   function readRun(directory) {
-    const outputDir = resolve(normalizeHostPath(String(directory || '').trim()))
-    const manifest = JSON.parse(readFileSync(join(outputDir, 'run-manifest.json'), 'utf8'))
-    if (manifest.kind !== 'stream-image-run' && manifest.kind !== 'stream-scene-run') throw new Error('不是遥感影像模拟的输出目录')
+    const text = String(directory || '').trim()
+    if (!text) throw new Error('未指定运行输出目录')
+    const outputDir = resolve(normalizeHostPath(text))
+    // Friendly messages instead of the raw ENOENT / JSON.parse text.
+    if (!existsSync(outputDir) || !statSync(outputDir).isDirectory()) throw new Error(`找不到运行输出目录：${windowsPath(outputDir)}（可能已被移动或删除）`)
+    const manifestPath = join(outputDir, 'run-manifest.json')
+    if (!existsSync(manifestPath)) throw new Error(`该目录不是遥感影像模拟的输出目录（缺少 run-manifest.json）：${windowsPath(outputDir)}`)
+    let manifest
+    try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) } catch { throw new Error(`运行记录 run-manifest.json 无法读取或已损坏：${windowsPath(outputDir)}`) }
+    if (manifest?.kind !== 'stream-image-run' && manifest?.kind !== 'stream-scene-run') throw new Error('不是遥感影像模拟的输出目录')
     let result = null, config = null
     try { result = JSON.parse(readFileSync(join(outputDir, 'scene_summary.json'), 'utf8')) } catch {}
     for (const file of ['run-config.json', 'scene-config.json']) {

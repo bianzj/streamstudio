@@ -283,17 +283,19 @@ ImageConfig readImageConfig(const std::string& path)
         if (source != "era5" && source != "user") throw std::runtime_error("土壤水分来源须为 era5 或 user");
         config.soilMoistureFromEra5 = source == "era5";
         config.elevationCorrection = temperature.GetBool("elevationCorrection", true);
-        // FIX(2026-11-21 B10): configurable spin-up length (hours before the overpass). Default 24 h: TIRTEB runs whole
-        // days from the start of its meteorology and initialises with the first day's mean air temperature, and the
-        // surface heat history it keeps is 7 h; 24 h before the overpass covers a full diurnal cycle (night cooling
-        // included) for any longitude, which the former fixed 00 UTC start did not (≈2.5 h for East-Asian mornings).
+        // FIX(2026-11-21 B10, 2026-11-24): spin-up length = number of ERA5 hourly nodes before the overpass. Default 7:
+        // the 2 m air temperature already constrains the result strongly, and 7 matches the 7 h surface heat history
+        // TIRTEB keeps (so the history is full at the overpass). Counted in nodes relative to the overpass, never from a
+        // fixed clock time (2026-11-21 used 24 h; the first version used 00 UTC of the overpass day).
+        // A non-integer value is rounded up to whole nodes.
         const auto spinup = temperature.GetObj("spinupHours");
         if (spinup.IsValid() && spinup.GetType() != CPLJSONObject::Type::Integer &&
             spinup.GetType() != CPLJSONObject::Type::Long && spinup.GetType() != CPLJSONObject::Type::Double)
-            throw std::runtime_error("temperature.spinupHours 须为数值（小时）");
-        config.spinupHours = temperature.GetDouble("spinupHours", 24.0);
-        if (!std::isfinite(config.spinupHours) || config.spinupHours < 0.0 || config.spinupHours > 240.0)
-            throw std::runtime_error("temperature.spinupHours 须在 0–240 小时之间（缺省 24）");
+            throw std::runtime_error("temperature.spinupHours 须为数值（起转时次个数，缺省 7）");
+        const double spinupValue = temperature.GetDouble("spinupHours", 7.0);
+        if (!std::isfinite(spinupValue) || spinupValue < 0.0 || spinupValue > 240.0)
+            throw std::runtime_error("temperature.spinupHours 须在 0–240 之间（起转时次个数，缺省 7）");
+        config.spinupHours = static_cast<int>(std::ceil(spinupValue - 1e-9));
         const auto energy = temperature.GetObj("energy");
         const auto scheme = energy.GetString("scheme", "tirt");
         if (scheme != "tirt" && scheme != "tirt-analytic") throw std::runtime_error("能量平衡方案须为 tirt");

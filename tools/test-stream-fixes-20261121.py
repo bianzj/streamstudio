@@ -193,17 +193,38 @@ def test_spinup_falls_back_to_pack_start_with_warning(tmp_path):
     ret, out = run(tmp_path, 'spin', eb_config())
     assert ret.returncode == 0, ret.stderr + ret.stdout
     t = json.loads((out / 'scene_summary.json').read_text(encoding='utf-8'))['temperature']
-    assert t['spinupHoursRequested'] == 24 and abs(t['spinupHoursUsed'] - 2.5) < 1e-9
+    # default 7 nodes before the 02:30 overpass; the one-day pack only has 00, 01, 02 UTC
+    assert t['spinupNodesRequested'] == 7 and t['spinupNodesUsed'] == 3 and abs(t['spinupHoursUsed'] - 2.5) < 1e-9
+    assert t['ebNodeCount'] == 4 and any('起转不足' in note for note in t['notes'])
     assert '起转' in ret.stdout and '警告' in ret.stdout
+    assert '调试' not in ret.stdout
 
 
-def test_spinup_hours_is_respected(tmp_path):
+@pytest.mark.parametrize('value', [2, 1.5])
+def test_spinup_hours_is_respected(tmp_path, value):
     config = eb_config()
-    config['temperature']['spinupHours'] = 1.5
+    config['temperature']['spinupHours'] = value  # nodes (non-integers round up): 01 and 02 UTC before the 02:30 overpass
     ret, out = run(tmp_path, 'spin', config)
     assert ret.returncode == 0, ret.stderr + ret.stdout
     t = json.loads((out / 'scene_summary.json').read_text(encoding='utf-8'))['temperature']
     assert t['marchStart'] == '2019-08-15T01:00:00Z' and t['nodes'][0] == '2019-08-15T01:00:00Z'
+    assert t['spinupNodesUsed'] == 2 and not t['notes']
+
+
+def test_spinup_zero_nodes_runs_the_overpass_only(tmp_path):
+    config = eb_config()
+    config['temperature']['spinupHours'] = 0
+    ret, out = run(tmp_path, 'spin', config)
+    assert ret.returncode == 0, ret.stderr + ret.stdout
+    t = json.loads((out / 'scene_summary.json').read_text(encoding='utf-8'))['temperature']
+    assert t['nodes'] == ['2019-08-15T02:30:00Z'] and t['spinupNodesUsed'] == 0
+
+
+def test_spinup_without_earlier_data_is_an_error(tmp_path):
+    config = eb_config()
+    config['overpass'] = '2019-08-15T00:00:00Z'  # the pack starts at 00 UTC: no whole hour before the overpass
+    ret, _ = run(tmp_path, 'spin', config)
+    assert ret.returncode != 0 and '没有可用的整点时次' in ret.stderr
 
 
 @pytest.mark.parametrize('value', [-1, 500, 'x'])

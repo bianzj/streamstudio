@@ -8,8 +8,23 @@ export const PROJECT_FILE = 'stream-project.json'
 const COMPONENT_KEYS = ['soilSunlit', 'soilShaded', 'leafSunlit', 'leafShaded']
 const COMPONENT_LABELS = { soilSunlit: '光照土壤温度', soilShaded: '阴影土壤温度', leafSunlit: '光照叶片温度', leafShaded: '阴影叶片温度' }
 const OVERPASS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?Z$/
+// Strict calendar check of an OVERPASS match: Date.parse accepts 2019-02-30, 2019-04-31 and T24:00:00Z (rolled over by V8),
+// which the engine rejects, so round-trip the parts through Date.UTC and reject any that change.
+function validUtcParts(match) {
+  const [year, month, day, hour, minute] = match.slice(1, 6).map(Number)
+  const second = match[6] === undefined ? 0 : Number(match[6])
+  if (hour > 23 || minute > 59 || second > 59 || month < 1 || month > 12 || day < 1) return false
+  const date = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
+  date.setUTCFullYear(year)  // years 0–99 are mapped to 1900+ by Date.UTC
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+}
 // 空串/空白/null 视为“未提供”，避免 Number('') === 0 被当成有效取值。
 const hasNumber = (value) => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value))
+function spinupNodes(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number < 0 || number > 240) throw new Error('起转节点数（temperature.spinupHours）须在 0–240 之间，缺省 7')
+  return Math.ceil(number - 1e-9)
+}
 
 // Local date + clock + UTC offset (v1 projects) -> ISO UTC overpass.
 export function localToUtc(date, time, timezone) {
@@ -274,7 +289,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     if (!scene) throw new Error('缺少影像模拟配置')
     const overpass = String(scene.overpass || '').trim()
     const match = OVERPASS.exec(overpass)
-    if (!match || Number.isNaN(Date.parse(overpass))) throw new Error('过境时刻须为 UTC，格式 YYYY-MM-DDTHH:MM:SSZ')
+    if (!match || !validUtcParts(match)) throw new Error('过境时刻须为存在的 UTC 日期时间，格式 YYYY-MM-DDTHH:MM:SSZ（不接受 2019-02-30、T24:00 等）')
     const opticalEnabled = Boolean(scene.optical?.enabled)
     const thermalEnabled = Boolean(scene.thermal?.enabled)
     const assimilation = assimilationKind(scene)
@@ -359,6 +374,10 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
       // DEFERRED[低] 错误处理: 这里的校验比引擎 config.cpp 宽松：soilHeatMethod/temperatureMethod 原样透传任意字符串，diffuseFraction 不限 [-1,1]，spectralBinNm 不限 1–100 的整数，heatRoughnessKb 不限 ≤20，soilEmissivityK 允许 ≤0；这些错误要等任务出队、建好输出目录后才由引擎报出；建议：在提交时按引擎相同规则校验（白名单 + 范围）
       temperature = { mode: 'eb', era5: { pack: existingFile(temperatureInput.era5?.pack, 'ERA5 数据包') }, soilMoisture: { source },
         elevationCorrection: temperatureInput.elevationCorrection !== false,
+        // EB spin-up = number of whole-hour ERA5 nodes before the overpass (engine default 7 when omitted; 0–240; the
+        // engine rounds non-integers up).
+        ...(temperatureInput.spinupHours !== undefined && temperatureInput.spinupHours !== null && String(temperatureInput.spinupHours).trim() !== ''
+          ? { spinupHours: spinupNodes(temperatureInput.spinupHours) } : {}),
         energy: {
           scheme: 'tirt',
           // Preserve supported overrides; omitted fields keep the native engine's existing defaults.

@@ -160,12 +160,16 @@ int runImage(const std::string& configPath)
         log("土壤（干端）发射率按配置 " + format(config.soilEmissivity, 3) + "，能量平衡与成像共用");
     }
     const double overpass = config.overpass;
-    // FIX(2026-11-21 B10): resolved by temperature.spinupHours (default 24 h, see config.h); the march now starts at
-    // marchStart (below) instead of dayStart. Original note kept for reference:
+    // FIX(2026-11-21 B10, 2026-11-24): the march start is resolved from temperature.spinupHours = number of whole-hour
+    // ERA5 nodes before the overpass (default 7, see config.h); counted backwards from the overpass, never from a fixed
+    // clock time. marchStart (below) replaces the former dayStart (00 UTC of the overpass day). Original note kept:
     // DEFERRED[中] 物理: EB 起算点固定为过境当天 00 UTC，不考虑经度。对东亚/澳洲（UTC+8..+10）约 02:30 UTC 的过境，只积分当地上午 0.5–2.5 h，热历史默认 00 UTC 之前等温（无日变化记忆），G 与 Tss 偏差大；过境恰为 00:00 UTC 时只有 1 个时次，完全没有起转；建议：起转改为过境前固定时长（如 ≥24 h），或从按经度换算的当地午夜开始，并相应扩大 ERA5 读取时段
     const double dayStart = std::floor(overpass / 86400.0) * 86400.0;
-    double marchStart = dayStart;        // FIX(2026-11-21 B10): first EB node (set from spinupHours and the pack coverage)
-    double spinupUsedHours = 0.0;        // FIX(2026-11-21 B10): overpass - marchStart, hours
+    double marchStart = dayStart;        // first EB node (set from spinupHours and the pack coverage)
+    double spinupUsedHours = 0.0;        // overpass - marchStart, hours
+    int64_t marchStartHour = static_cast<int64_t>(std::llround(dayStart / 3600.0));  // whole hour of the first node
+    int spinupNodesUsed = 0;             // whole-hour nodes actually integrated before the overpass (excludes the overpass node)
+    std::vector<std::string> spinupNotes; // shortfall notice for scene_summary.json temperature.notes
     log("过境时刻 " + formatUtc(overpass) + "，温度来源：" + (eb ? "EB（ERA5 驱动能量平衡）" : "RT（给定组分温度）"));
 
     progress(1, "读取地表输入");
@@ -244,39 +248,52 @@ int runImage(const std::string& configPath)
         // Hours the solver reads: the march start through the hour after the overpass (flux interpolation);
         // ERA5-Land de-accumulation also needs the hour before the start.
         int64_t lastHour = static_cast<int64_t>(std::ceil(overpass / 3600.0)) + 1;
-        // FIX(2026-11-21 B10): start spinupHours before the overpass (whole hour); fall back to the earliest hour the
-        // pack covers continuously up to lastHour, with a warning. (Was: always 00 UTC of the overpass day.)
+        // FIX(2026-11-21 B10, 2026-11-24): march start = the spinupHours-th whole-hour ERA5 node counted backwards from
+        // the last whole hour before the overpass (a whole hour within 5 min before the overpass is replaced by the
+        // overpass node, the same tolerance as the node list below), i.e. the floor of the overpass time on the hourly
+        // grid, not a fixed clock time. 0 nodes: only the overpass node. If the pack does not cover the start, the
+        // march starts at the earliest hour the pack covers continuously up to lastHour (warning + scene_summary note).
+        // (Was: 00 UTC of the overpass day; 2026-11-21: floor(overpass - 24 h).)
         const int64_t overpassHour = static_cast<int64_t>(std::floor(overpass / 3600.0));
-        const int64_t desiredStartHour = static_cast<int64_t>(std::floor((overpass - config.spinupHours * 3600.0) / 3600.0));
+        const int64_t lastNodeHour = static_cast<int64_t>(std::ceil((overpass - 300.0) / 3600.0)) - 1;
+        const int requestedNodes = config.spinupHours;
+        const int64_t desiredStartHour = requestedNodes > 0 ? lastNodeHour - (requestedNodes - 1) : overpassHour;
         int64_t startHour = std::min(desiredStartHour, overpassHour);
+        const bool yearEdgePack = pack.fullYear() && pack.year() == when.year;
         {
             std::string coverageGap;
             while (startHour < overpassHour && !pack.covers(variables, startHour, lastHour, coverageGap)) ++startHour;
-            if (startHour > desiredStartHour)
-                log("警告：ERA5 数据包不覆盖要求的起转起点 " + formatUtc(static_cast<double>(desiredStartHour) * 3600.0) +
-                    "（temperature.spinupHours = " + format(config.spinupHours, 1) + " h），能量平衡改从数据包可用的最早时次 " +
-                    formatUtc(static_cast<double>(startHour) * 3600.0) + " 起转，实际起转 " +
-                    format((overpass - static_cast<double>(startHour) * 3600.0) / 3600.0, 2) + " h；结果的土壤热历史偏短，请补充更早的逐小时数据");
+            const int64_t usableNodes = requestedNodes > 0 ? std::max<int64_t>(0, lastNodeHour - startHour + 1) : 0;
+            if (requestedNodes > 0 && usableNodes == 0 && !yearEdgePack)
+                throw std::runtime_error("ERA5 数据包在过境时刻 " + formatUtc(overpass) + " 之前没有可用的整点时次，无法起转（temperature.spinupHours = " +
+                                         std::to_string(requestedNodes) + "）。请补充过境前的逐小时数据，或把起转节点数设为 0");
+            if (requestedNodes > 0 && usableNodes < requestedNodes) {
+                const std::string text = "ERA5 数据包不覆盖要求的起转起点 " + formatUtc(static_cast<double>(desiredStartHour) * 3600.0) +
+                    "（temperature.spinupHours = " + std::to_string(requestedNodes) + " 个时次），能量平衡改从数据包可用的最早时次 " +
+                    formatUtc(static_cast<double>(startHour) * 3600.0) + " 起转，实际 " + std::to_string(usableNodes) + " 个时次；结果的土壤热历史偏短，请补充更早的逐小时数据";
+                log("警告：" + text);
+                spinupNotes.push_back("起转不足：" + text);
+            }
+            spinupNodesUsed = static_cast<int>(usableNodes);
         }
-        marchStart = static_cast<double>(startHour) * 3600.0;
+        marchStartHour = startHour;
+        marchStart = requestedNodes > 0 ? static_cast<double>(startHour) * 3600.0 : overpass;
         spinupUsedHours = (overpass - marchStart) / 3600.0;
         const int64_t firstHour = startHour - (pack.landProduct() ? 1 : 0);
-        // TIRTEB initialises with the mean air temperature of the whole first simulated day.
-        const int64_t dayLastHour = startHour + 23;   // FIX(2026-11-21 B10): first simulated day = 24 h from the march start
-        const int64_t dayStartHour = startHour;
         std::string gap;
-        if (pack.covers(variables, dayStartHour, dayLastHour, gap)) lastHour = std::max(lastHour, dayLastHour);
         // A whole-year pack keeps the year-edge rule: hours just outside the year reuse the nearest one.
         if (!pack.covers(variables, firstHour, lastHour, gap) && !(pack.fullYear() && pack.year() == when.year))
             throw std::runtime_error("ERA5 数据包未覆盖本次能量平衡所需时段 " + formatUtc(firstHour * 3600.0) + " – " + formatUtc(lastHour * 3600.0) +
                                      "（" + gap + "）。请补充该时段的逐小时数据后重新登记");
         pack.load(variables, latMin, latMax, lonMin, lonMax, firstHour, lastHour);
         for (const auto& note : pack.notes()) log("ERA5：" + note);
-        const double elapsed = overpass - marchStart;  // FIX(2026-11-21 B10)
-        for (int hour = 0; hour * 3600.0 < elapsed - 300; ++hour) nodes.push_back(marchStart + hour * 3600.0);
+        // Whole-hour nodes from the march start, stopping 5 min before the overpass, then the overpass node itself.
+        if (requestedNodes > 0)
+            for (double node = marchStart; node < overpass - 300.0; node += 3600.0) nodes.push_back(node);
         nodes.push_back(overpass);
+        spinupNodesUsed = static_cast<int>(nodes.size()) - 1;
         log("ERA5 " + pack.product() + (pack.fullYear() ? " " + std::to_string(pack.year()) + " 整年" : " 时段数据") + "：能量平衡从 " + formatUtc(marchStart) + " 推进到过境时刻（起转 " +
-            format(spinupUsedHours, 2) + " h），共 " +
+            std::to_string(spinupNodesUsed) + " 个整点时次 / 请求 " + std::to_string(requestedNodes) + "，" + format(spinupUsedHours, 2) + " h），共 " +
             std::to_string(nodes.size()) + " 个时次" + (pack.available("stl2") ? "，深层土壤温度取 stl2" : "，深层土壤温度取 stl1") +
             (elevationCorrection ? "，按 DEM 与 ERA5 地形高度差订正气温与气压" : ""));
     }
@@ -515,7 +532,10 @@ int runImage(const std::string& configPath)
     }
     // ---- EB pixel machinery: one implementation for the forward solve and the assimilation re-solve ----
     const std::vector<float> noSpectrum;
-    const int64_t ebDayStartHour = static_cast<int64_t>(std::llround(marchStart / 3600.0));  // FIX(2026-11-21 B10)
+    // Initial leaf/soil-fallback temperature: mean 2 m air temperature of the first 24 h from the march start, but only
+    // of the hours loaded for the run (never later than one hour after the overpass; with the 7-node default the
+    // window is the spin-up itself). Explicit longer spin-ups (>= 23 nodes) keep the former 24 h window.
+    const int64_t ebDayStartHour = marchStartHour;
     const int64_t ebDayLastHour = std::min<int64_t>(ebDayStartHour + 23, pack.lastHour());
     const auto validForcing = [](const Forcing& f) {
         return std::isfinite(f.ta) && std::isfinite(f.ea) && std::isfinite(f.p) && std::isfinite(f.wind) &&
@@ -602,7 +622,7 @@ int runImage(const std::string& configPath)
         // which the run log promises); the 2 m column is anchored to the ERA5 soil levels. Leaves hold no heat
         // and converge in one step, so they keep the day-mean air temperature. With the day-mean air start the
         // soil was up to 6 K too warm at 06-08 local time and the first step had G = 0 (empty history).
-        // FIX(2026-11-21 B10): march start = overpass - spinupHours (was 00 UTC of the overpass day).
+        // FIX(2026-11-21 B10, 2026-11-24): march start = spinupHours whole-hour nodes before the overpass (was 00 UTC of the overpass day).
         const double skin = forcing.temperature("skt", marchStart);
         const double level1 = forcing.temperature("stl1", marchStart);
         const double level2 = pack.available("stl2") ? forcing.temperature("stl2", marchStart) : level1;
@@ -932,10 +952,6 @@ int runImage(const std::string& configPath)
             const auto& sample = first.second;
             log("土壤方向发射率：Hapke（K = " + format(config.hapkeSoilK, 2) + "），天底 " + format(sample.dry.at(0.0), 4) +
                 "，视角 55° " + format(sample.dry.at(55.0), 4) + "，半球均值等于地类值");
-            log("调试：地类 " + std::to_string(first.first) + " 半球发射率 " +
-                format(std::clamp(static_cast<double>(classes.classes[first.first].ground.emissivity), 1e-6, 1.0), 4) +
-                "，hemi(0) " + format(hapkeHemisphericalEmissivity(config.hapkeSoilK, 0.0), 4) +
-                "，hemi(0.2) " + format(hapkeHemisphericalEmissivity(config.hapkeSoilK, 0.2), 4));
             log("土壤发射率随含水量变化：干土（SMC ≤ " + format(kSoilDryWaterContent, 2) + "）" +
                 format(sample.dry.at(0.0), 4) + "，饱和 " + format(sample.wet.at(0.0), 4) +
                 "（天底；半球值同比例变化，可用 energy.soilEmissivityWet 指定饱和值）");
@@ -1223,9 +1239,11 @@ int runImage(const std::string& configPath)
         for (const double node : nodes) nodeList.Add(formatUtc(node));
         temperatureInfo.Add("nodes", nodeList);
         // FIX(2026-11-21 B10): spin-up actually integrated before the overpass.
-        temperatureInfo.Add("spinupHoursRequested", config.spinupHours);
+        temperatureInfo.Add("spinupNodesRequested", config.spinupHours);
+        temperatureInfo.Add("spinupNodesUsed", spinupNodesUsed);
         temperatureInfo.Add("spinupHoursUsed", spinupUsedHours);
         temperatureInfo.Add("marchStart", formatUtc(marchStart));
+        temperatureInfo.Add("ebNodeCount", static_cast<GInt64>(nodes.size()));
         temperatureInfo.Add("solvedPixels", static_cast<GInt64>(ebPixels));
         temperatureInfo.Add("convergedPixels", static_cast<GInt64>(ebConverged));
         temperatureInfo.Add("stabilityConvergedPixels", static_cast<GInt64>(ebStable));
@@ -1239,6 +1257,7 @@ int runImage(const std::string& configPath)
         temperatureInfo.Add("noForcingPixels", static_cast<GInt64>(ebNoForcing));
         temperatureInfo.Add("moistureFallbackPixels", static_cast<GInt64>(moistureFallback));
         CPLJSONArray notes;
+        for (const auto& note : spinupNotes) notes.Add(note);
         for (const auto& note : pack.notes()) notes.Add(note);
         temperatureInfo.Add("notes", notes);
     }

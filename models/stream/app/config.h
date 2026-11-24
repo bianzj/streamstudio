@@ -148,10 +148,12 @@ struct ImageConfig {
     // FIX(2026-11-21 C9): crown / row structure keys given in the run config (surface.*); not simulated, the run
     // warns and records a homogeneous canopy in scene_summary.json.
     std::vector<std::string> ignoredStructureKeys;
-    // FIX(2026-11-21 B10): EB spin-up before the overpass, hours (temperature.spinupHours, default 24). The march
-    // starts at the whole hour floor(overpass - spinupHours); if the ERA5 pack does not cover it, at the earliest
-    // covered hour (warning). The former start was always 00 UTC of the overpass day.
-    double spinupHours = 24.0;
+    // FIX(2026-11-21 B10, 2026-11-24): EB spin-up = number of whole-hour ERA5 nodes before the overpass
+    // (temperature.spinupHours, default 7, 0–240). The march starts at the whole hour that is the spinupHours-th node
+    // counted backwards from the last whole hour before the overpass (nodes within 5 min before the overpass do not
+    // count); if the ERA5 pack does not cover it, at the earliest covered hour (warning). The first version started at
+    // 00 UTC of the overpass day, 2026-11-21 used 24 h (default).
+    int spinupHours = 7;
 };
 
 ImageConfig readImageConfig(const std::string& path);
