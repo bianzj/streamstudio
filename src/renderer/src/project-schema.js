@@ -446,6 +446,7 @@ export function createMaterialPresets() {
       { name: 'red_brick', label: '红砖墙面', model: 'custom', reflectance: '0.28', transmittance: '0.0', refTir: 0.07, tauTir: 0, previewTexture: { enabled: true, preset: 'red-brick', repeatSize: 1.2 }, physicalTexture: { enabled: false, fileName: 'assets/texture-library/brick_variance.jpg', strength: 0.2, repeatSize: 2 }, params: {} },
       { name: 'human_surface', label: '人员典型光谱', model: 'custom', reflectance: '0.30', transmittance: '0.0', refTir: 0.02, tauTir: 0, params: {} },
       { name: 'vehicle_surface', label: '载具典型光谱', model: 'custom', reflectance: '0.20', transmittance: '0.0', refTir: 0.08, tauTir: 0, previewTexture: { enabled: true, preset: 'metal', repeatSize: 1.5 }, physicalTexture: { enabled: false, fileName: 'assets/texture-library/metal_variance.jpg', strength: 0.15, repeatSize: 1.5 }, params: {} },
+      { name: 'vehicle_glass', label: '车窗玻璃（τ_sol≈0.65）', model: 'custom', reflectance: '0.08', transmittance: '0.65', refTir: 0.1, tauTir: 0, previewTexture: { enabled: false, preset: 'concrete', repeatSize: 1 }, physicalTexture: { enabled: false, fileName: '', strength: 0.15, repeatSize: 1.5 }, params: {} },
       { name: 'ship_surface', label: '船舶典型光谱', model: 'custom', reflectance: '0.22', transmittance: '0.0', refTir: 0.06, tauTir: 0, params: {} },
       { name: 'water_surface', label: '水体光谱', model: 'custom', reflectance: '0.04', transmittance: '0.0', refTir: 0.02, tauTir: 0, params: {} },
       { name: 'tarp_olive_canvas', label: '篷布（军绿帆布）', model: 'file', fileName: 'assets/spectral-library/tarp_olive_canvas.txt', reflectance: '0.12', transmittance: '0.02', refTir: 0.10, tauTir: 0, previewTexture: { enabled: true, preset: 'canvas', repeatSize: 0.6 }, physicalTexture: { enabled: false, fileName: 'assets/texture-library/canvas_weave_variance.jpg', strength: 0.15, repeatSize: 0.5 }, params: {} },
@@ -526,7 +527,20 @@ export function createMaterialPresets() {
       { name: 'soilset', label: '典型壤土', type: 'Soil', params: { method: 2, rss: 2000, cs: 1300, rhos: 1600, lambdas: 1.0, Tsoil: 25, SMC: 25, Satwater: 0.45 } },
       { name: 'soil_dry', label: '干燥土壤', type: 'Soil', params: { method: 2, rss: 4000, cs: 1000, rhos: 1600, lambdas: 0.8, Tsoil: 30, SMC: 10, Satwater: 0.38 } },
       { name: 'soil_wet', label: '湿润土壤', type: 'Soil', params: { method: 2, rss: 800, cs: 1400, rhos: 1900, lambdas: 2.0, Tsoil: 22, SMC: 35, Satwater: 0.50 } },
-      { name: 'vehicle_material', label: '载具车身物化', type: 'Building', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0 } },
+      // FacetEB vehicle (docs/vehicle-thermal.md): the body is a 1 mm steel sheet + 6 mm trim/insulation wall whose indoor
+      // temperature is the lumped cabin air; glass is a 4.8 mm pane (tau_sol from its spectrum); underbody/tyres/lights
+      // are thin shells. cabin.enabled switches the cabin node on; VoxelEB/RT modes ignore these fields. Old projects keep
+      // their Building-type vehicle_material (fixed-temperature presets, bitwise old FacetEB results).
+      { name: 'vehicle_material', label: '载具车身物化', type: 'Vehicle', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0,
+        wallMode: 'wall', thickness: 0.007, indoorTemperature: 22, indoorHeatTransferCoefficient: 7, vehiclePart: 'body',
+        layers: [{ thickness: 0.001, lambda: 50, rho: 7850, cp: 460 }, { thickness: 0.006, lambda: 0.04, rho: 60, cp: 1400 }],
+        cabin: { enabled: true, occupants: 0, metabolicW: 100, speed: 0, ventilationACH: 0.5, windowCracked: false, crackedACH: 10, acOn: false, acPower: 3500, acSetpoint: 24,
+          engineOn: false, enginePower: 15000, engineShare: 0.3, volume: 2.8, interiorCapacity: 80000, interiorArea: 8, interiorH: 8, absorbedFraction: 0.8 } } },
+      { name: 'vehicle_glass', label: '载具玻璃', type: 'Vehicle', params: { method: 2, rss: 1000000000, cs: 840, rhos: 2500, lambdas: 1, Tsoil: 25, SMC: 0, Satwater: 0,
+        wallMode: 'wall', thickness: 0.0048, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, vehiclePart: 'glass',
+        layers: [{ thickness: 0.0048, lambda: 1, rho: 2500, cp: 840 }] } },
+      { name: 'vehicle_underbody', label: '载具内饰/底盘薄壳', type: 'Vehicle', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0,
+        vehiclePart: 'underbody', heatCapacityPerArea: 6000 } },
       // FacetEB hull: one 12 mm shipbuilding steel plate (λ 50, ρ 7850, cp 460: typical mild/hull
       // steel, e.g. EN 1993-1-2 / ISO 10456 steel) with a 22 °C interior; speed (m/s) adds the
       // ship's own motion to the wind (relative wind); waterlineHeight (world y, m; absent = off)
@@ -1108,6 +1122,22 @@ export function validateProject(value) {
         errors.push('墙体构造层无效（1–6 层，每层厚度、λ、ρ、cp 大于 0，总厚度 ≤ 5 m）：' + m.name)
     }
   }
+  for (const m of c.materials.filter((item) => item.type === 'Vehicle' && !item.energyModel)) {
+    const p = m.params || {}
+    if (p.vehiclePart !== undefined && p.vehiclePart !== '' && !['body', 'glass', 'underbody'].includes(p.vehiclePart))
+      errors.push('载具部件应为 body、glass 或 underbody：' + m.name)
+    const k = p.cabin
+    if (k && p.vehiclePart === 'body') {
+      const inRange = (value, lo, hi, fallback) => { const v = value === undefined || value === null || value === '' ? fallback : Number(value); return Number.isFinite(v) && v >= lo && v <= hi }
+      if (!inRange(k.occupants, 0, 8, 0) || !inRange(k.speed, 0, 100, 0) || !inRange(k.metabolicW, 0, 1000, 100) || !inRange(k.volume, 0.3, 100, 2.8) ||
+          !inRange(k.interiorCapacity, 100, 1e8, 80000) || !inRange(k.interiorArea, 0.01, 1000, 8) || !inRange(k.interiorH, 0.01, 1000, 8) ||
+          !inRange(k.absorbedFraction, 0, 1, 0.8) || !inRange(k.ventilationACH, 0, 100, 0.5) || !inRange(k.crackedACH, 0, 200, 10) ||
+          !inRange(k.acPower, 0, 2e5, 3500) || !inRange(k.acSetpoint, -20, 50, 24) || !inRange(k.enginePower, 0, 1e6, 15000) || !inRange(k.engineShare, 0, 1, 0.3))
+        errors.push('车辆座舱参数超出范围（乘员 0–8、车速 0–100 m/s、吸收份额 0–1 等）：' + m.name)
+      const given = (value) => value !== undefined && value !== null && value !== ''
+      if (given(k.heading) !== given(k.windDirection)) errors.push('车辆航向与风向需同时给出：' + m.name)
+    }
+  }
   for (const m of c.materials.filter((item) => item.type === 'Ship' && !item.energyModel)) {
     const p = m.params || {}
     const given = (value) => value !== undefined && value !== null && value !== ''
@@ -1266,9 +1296,17 @@ function materialXml(item) {
         Number(params.internalHeatPower) ? `<internalHeatPower>${number(params.internalHeatPower, 0)}</internalHeatPower>` : ''
       ].join('')
     : ''
+  // FacetEB vehicle part / cabin parameters (type Vehicle); absent = off, old XML unchanged.
+  const vehiclePartCode = { body: 1, glass: 2, underbody: 3 }[params.vehiclePart]
+  const cabin = params.cabin || {}
+  const vehicle = item.type === 'Vehicle' && vehiclePartCode && !item.energyModel
+    ? `<vehiclePart>${vehiclePartCode}</vehiclePart>` + (vehiclePartCode === 1 && params.cabin
+      ? `<vcEnabled>${cabin.enabled ? 1 : 0}</vcEnabled><vcSpeed>${number(cabin.speed, 0)}</vcSpeed><vcOccupants>${number(cabin.occupants, 0)}</vcOccupants><vcMetabolicW>${number(cabin.metabolicW, 100)}</vcMetabolicW><vcVolume>${number(cabin.volume, 2.8)}</vcVolume><vcInteriorCapacity>${number(cabin.interiorCapacity, 80000)}</vcInteriorCapacity><vcInteriorArea>${number(cabin.interiorArea, 8)}</vcInteriorArea><vcInteriorH>${number(cabin.interiorH, 8)}</vcInteriorH><vcAbsorbedFraction>${number(cabin.absorbedFraction, 0.8)}</vcAbsorbedFraction><vcVentilationAch>${number(cabin.ventilationACH, 0.5)}</vcVentilationAch><vcCrackedAch>${number(cabin.crackedACH, 10)}</vcCrackedAch><vcWindowCracked>${cabin.windowCracked ? 1 : 0}</vcWindowCracked><vcAcOn>${cabin.acOn ? 1 : 0}</vcAcOn><vcAcPower>${number(cabin.acPower, 3500)}</vcAcPower><vcAcSetpoint>${number(cabin.acSetpoint, 24)}</vcAcSetpoint><vcAcBand>${number(cabin.acBand, 2)}</vcAcBand><vcEngineOn>${cabin.engineOn ? 1 : 0}</vcEngineOn><vcEnginePower>${number(cabin.enginePower, 15000)}</vcEnginePower><vcEngineShare>${number(cabin.engineShare, 0.3)}</vcEngineShare>${hasNumber(cabin.heading) && hasNumber(cabin.windDirection) ? `<vcHeading>${number(cabin.heading, 0)}</vcHeading><vcWindDirection>${number(cabin.windDirection, 0)}</vcWindDirection>` : ''}`
+      : '')
+    : ''
   // 土壤方法 1 远期热历史（control.soilInertiaHistory = 'full'）；缺省不写，旧 XML 不变。
   const inertia = params.inertiaHistory === 'full' ? '<inertiaHistory>full</inertiaHistory>' : ''
-  return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 0.25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${inertia}${wall}${ship}</soilSet></property>`
+  return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 0.25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${inertia}${wall}${ship}${vehicle}</soilSet></property>`
 }
 
 export function projectToXml(value, paths = {}) {

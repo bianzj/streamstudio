@@ -223,6 +223,24 @@ function parseMaterialNode(node) {
     if (params.wallMode === 'wall' && xmlValue(node, 'wallLayers', '').trim()) params.layers = parseWallLayers(xmlValue(node, 'wallLayers', ''))
     // FacetEB ship hull options (soilSet of a Ship material).
     if (xmlValue(node, 'shipSpeed', '').trim()) params.speed = Number(xmlValue(node, 'shipSpeed', 0))
+    // FacetEB vehicle part and cabin parameters (vehiclePart 1 body, 2 glass, 3 underbody).
+    const vehiclePart = { 1: 'body', 2: 'glass', 3: 'underbody' }[Number(xmlValue(node, 'vehiclePart', 0))]
+    if (vehiclePart) {
+      params.vehiclePart = vehiclePart
+      if (vehiclePart === 'body' && xmlValue(node, 'vcEnabled', '').trim() !== '') {
+        const v = (tag, fallback) => Number(xmlValue(node, tag, fallback))
+        params.cabin = { enabled: v('vcEnabled', 0) > 0.5, occupants: v('vcOccupants', 0), metabolicW: v('vcMetabolicW', 100), speed: v('vcSpeed', 0),
+          ventilationACH: v('vcVentilationAch', 0.5), windowCracked: v('vcWindowCracked', 0) > 0.5, crackedACH: v('vcCrackedAch', 10),
+          acOn: v('vcAcOn', 0) > 0.5, acPower: v('vcAcPower', 3500), acSetpoint: v('vcAcSetpoint', 24), acBand: v('vcAcBand', 2),
+          engineOn: v('vcEngineOn', 0) > 0.5, enginePower: v('vcEnginePower', 15000), engineShare: v('vcEngineShare', 0.3), volume: v('vcVolume', 2.8),
+          interiorCapacity: v('vcInteriorCapacity', 80000), interiorArea: v('vcInteriorArea', 8), interiorH: v('vcInteriorH', 8),
+          absorbedFraction: v('vcAbsorbedFraction', 0.8) }
+        if (xmlValue(node, 'vcHeading', '').trim() && xmlValue(node, 'vcWindDirection', '').trim()) {
+          params.cabin.heading = v('vcHeading', 0)
+          params.cabin.windDirection = v('vcWindDirection', 0)
+        }
+      }
+    }
     if (xmlValue(node, 'waterlineHeight', '').trim()) {
       params.waterlineHeight = Number(xmlValue(node, 'waterlineHeight', 0))
       params.waterHeatTransferCoefficient = Number(xmlValue(node, 'waterHeatTransferCoefficient', 500))
@@ -243,7 +261,7 @@ function parseMaterialNode(node) {
     if (xmlValue(node, 'internalHeatFlux', '').trim()) params.internalHeatFlux = Number(xmlValue(node, 'internalHeatFlux', 0))
     if (xmlValue(node, 'internalHeatPower', '').trim()) params.internalHeatPower = Number(xmlValue(node, 'internalHeatPower', 0))
   }
-  return { name: node.getAttribute('name') || 'material', type, params }
+  return { name: node.getAttribute('name') || 'material', type: params.vehiclePart ? 'Vehicle' : type, params }
 }
 
 function parseXml(content, mode = state.mode) {
@@ -2244,7 +2262,9 @@ function physicalValues(item) {
     ...(item.type === 'Ship' && !shipValueGiven(p.waterlineHeight) && p.waterlineSource === 'water' ? [['水线', `场景水面${Number(p.waterlineOffset) ? ` ${p.waterlineOffset > 0 ? '+' : ''}${p.waterlineOffset} m` : ''}（吃水），水侧 h=${p.waterHeatTransferCoefficient ?? 500}`]] : []),
     ...(item.type === 'Ship' && shipValueGiven(p.heading) && shipValueGiven(p.windDirection) ? [['航向/风来向', `${p.heading}° / ${p.windDirection}°`]] : []),
     ...(item.type === 'Ship' && (p.waterShielding || p.waterFeedback) ? [['水体耦合', [p.waterShielding ? '水下遮蔽' : '', p.waterFeedback ? '反馈水温' : ''].filter(Boolean).join('、')]] : []),
-    ...(item.type === 'Ship' && (Number(p.internalHeatFlux) || Number(p.internalHeatPower)) ? [['内热源', [Number(p.internalHeatFlux) ? `${p.internalHeatFlux} W/m²` : '', Number(p.internalHeatPower) ? `${p.internalHeatPower} W` : ''].filter(Boolean).join(' + ')]] : [])]
+    ...(item.type === 'Ship' && (Number(p.internalHeatFlux) || Number(p.internalHeatPower)) ? [['内热源', [Number(p.internalHeatFlux) ? `${p.internalHeatFlux} W/m²` : '', Number(p.internalHeatPower) ? `${p.internalHeatPower} W` : ''].filter(Boolean).join(' + ')]] : []),
+    ...(item.type === 'Vehicle' && p.vehiclePart ? [['部件', { body: '车身（含座舱参数）', glass: '车窗玻璃', underbody: '底盘/轮胎/灯具薄壳' }[p.vehiclePart] || p.vehiclePart]] : []),
+    ...(item.type === 'Vehicle' && p.vehiclePart === 'body' && p.cabin ? [['座舱', p.cabin.enabled ? `开启，${p.cabin.occupants ?? 0} 人，车速 ${p.cabin.speed ?? 0} m/s，通风 ${p.cabin.ventilationACH ?? 0.5} ACH${p.cabin.acOn ? `，空调 ${p.cabin.acPower ?? 3500} W/${p.cabin.acSetpoint ?? 24} ℃` : ''}${p.cabin.engineOn ? '，发动机开' : ''}` : '关闭']] : [])]
 }
 
 function shipValueGiven(value) { return value !== undefined && value !== null && value !== '' && Number.isFinite(Number(value)) }
@@ -2297,7 +2317,7 @@ function materialLibraryHtml(c) {
   const spectra = c.spectra.map((item, index) => libraryCard(item.label || item.name, `${item.name} · ${item.model}`, [['反射率', item.reflectance], ['透射率', item.transmittance], ['TIR反射', item.refTir], ...(item.physicalTexture?.enabled ? [['物理纹理', Number(item.physicalTexture.relativeStd) > 0 ? `CV ${item.physicalTexture.relativeStd}` : `强度 ${item.physicalTexture.strength}`]] : []), ...(Number(item.openness) > 0 ? [['开孔率', item.openness]] : []), ...(item.classTexture?.enabled ? [['分类纹理', `${item.classTexture.classes.filter((entry) => entry.spectralName).length} 类`]] : []), ...(item.opennessTexture?.enabled ? [['开孔纹理', `${item.opennessTexture.minOpenness}–${item.opennessTexture.maxOpenness}`]] : []), ['预览', item.previewTexture?.enabled ? (previewLabels[item.previewTexture.preset] || item.previewTexture.preset) : '关闭']], 'spectrum', index)).join('')
   const thermals = c.thermals.map((item, index) => libraryCard(item.label || item.name, item.name, [['阳面', `${item.sunlitTemperature} K`], ['阴面', `${item.shadedTemperature} K`]], 'thermal', index)).join('')
   const canopies = c.canopies.map((item, index) => libraryCard(item.label || item.name, item.name, canopyValues(item), 'canopy', index)).join('')
-  const types = { Vegetation: '植被生理生化', Soil: '土壤表面物化', Water: '水体物性', Ship: '船舶表面物化' }
+  const types = { Vegetation: '植被生理生化', Soil: '土壤表面物化', Water: '水体物性', Ship: '船舶表面物化', Vehicle: '载具物化（座舱）' }
   const materials = c.materials.map((item, index) => libraryCard(item.label || item.name, `${item.name} · ${item.energyModel === 'wood' ? '木质固体热平衡' : item.energyModel === 'membrane' ? '篷布/织物薄膜' : (types[item.type] || item.type)}`, physicalValues(item), 'physical', index)).join('')
   return `<div class="property-group">${libraryHeading('光谱特征', c.spectra.length, 'spectrum')}<div class="library-list" data-library-list="spectrum">${spectra}</div></div><div class="property-group">${libraryHeading('温度特征', c.thermals.length, 'thermal')}<div class="library-list" data-library-list="thermal">${thermals}</div></div><div class="property-group">${libraryHeading('结构参数', c.canopies.length, 'canopy')}<div class="library-list" data-library-list="canopy">${canopies}</div></div><div class="property-group">${libraryHeading('物化属性', c.materials.length, 'physical')}<div class="library-list" data-library-list="physical">${materials}</div></div><div class="property-group"><div class="notice">点击任一属性可直接修改；保存后同步更新当前工程的 project.json。</div></div>`
 }
@@ -3608,7 +3628,7 @@ function setFormField(name, value) {
 function physicalTypeForObject(type) {
   if (type === 'SolarPanel') return 'Photovoltaic'
   if (type === 'Vegetation' || type === 'Fire' || type === 'Fog') return 'Vegetation'
-  if (type === 'Water' || type === 'Ship' || type === 'Building') return type
+  if (type === 'Water' || type === 'Ship' || type === 'Building' || type === 'Vehicle') return type
   return 'Soil'
 }
 
@@ -3650,6 +3670,28 @@ function shipFields(defaults = {}) {
   const fromWater = defaults.waterlineSource === 'water' && !shipValueGiven(defaults.waterlineHeight)
   const yesNo = (name, label, on) => `<label class="dialog-field"><span>${label}</span><select class="select" name="${name}"><option value="0" ${on ? '' : 'selected'}>关闭</option><option value="1" ${on ? 'selected' : ''}>开启</option></select></label>`
   return `<div class="notice">VoxelEB 船体体元读取航速、航向/风来向、固定水线高度与水侧换热系数（水温取场景水体体元平均，不反馈水温）、内热源面功率，以及“船体按钢板墙体计算”开关打开时的墙体厚度/构造层（折算为一块等效均质板）与室内温度/换热系数；水面吃水、水温、遮蔽、反馈与内热源总功率仅 FacetEB 生效。</div>${physicalInput('航速（m/s；0 = 停泊）。无航向/风向时相对风 √(u²+v²)，有则 |u风−v船|', 'shipSpeed', defaults.speed ?? 0, 0.1)}${physicalInput('航向（°，船首朝向，罗经方位：北 0°顺时针；与风向同时给出，留空 = 按垂直取模）', 'shipHeading', defaults.heading ?? '', 1)}${physicalInput('风来向（°，风吹来的方向，罗经方位：北 0°顺时针；留空同上）', 'shipWindDirection', defaults.windDirection ?? '', 1)}${physicalInput('水线高度（m，世界高度；留空 = 不计水线，或用下面的水面吃水）', 'shipWaterlineHeight', defaults.waterlineHeight ?? '', 0.01)}<label class="dialog-field"><span>水线来源（水线高度留空时）</span><select class="select" name="shipWaterlineSource"><option value="height" ${fromWater ? '' : 'selected'}>固定高度（上面的水线高度）</option><option value="water" ${fromWater ? 'selected' : ''}>场景水面（真实吃水，按面元浸湿比例）</option></select></label>${physicalInput('水面吃水偏移（m，正值抬高水线）', 'shipWaterlineOffset', defaults.waterlineOffset ?? 0, 0.01)}${physicalInput('水侧换热系数（W·m⁻²·K⁻¹）', 'shipWaterHeatTransferCoefficient', defaults.waterHeatTransferCoefficient ?? 500, 1)}${physicalInput('水温（℃，留空 = 场景水体平均温度，无水体时首节点气温）', 'shipWaterTemperature', defaults.waterTemperature ?? '', 0.1)}${yesNo('shipWaterShielding', '水线下面元遮蔽（不接收短波/长波）', defaults.waterShielding)}${yesNo('shipWaterFeedback', '船体热量反馈场景水温（需场景水体，不能同时给固定水温）', defaults.waterFeedback)}${yesNo('shipVoxelWall', 'VoxelEB：船体按钢板墙体计算（需墙体模式 = 墙体；关闭 = 半无限固体，旧工程缺省）', defaults.voxelWall)}${physicalInput('内热源面功率（W·m⁻²，面元面积均摊；缺省 0）', 'shipInternalHeatFlux', defaults.internalHeatFlux ?? 0, 1)}${physicalInput('内热源总功率（W，按该网格组面元面积均摊；烟囱/机舱请单独建物化；缺省 0）', 'shipInternalHeatPower', defaults.internalHeatPower ?? 0, 100)}`
+}
+
+// FacetEB vehicle cabin (Vehicle materials, docs/vehicle-thermal.md): part role and, for the body, the cabin / driving
+// parameters. Shown in FacetEB mode only; other modes keep the fixed temperature presets.
+function vehicleFields(defaults = {}) {
+  if (state.mode !== 'eFacetEB') return ''
+  const c = defaults.cabin || {}
+  const part = defaults.vehiclePart || ''
+  const checked = (value) => (value ? 'checked' : '')
+  return `<label class="dialog-field"><span>车辆部件（FacetEB）</span><select class="select" name="vehiclePart"><option value="" ${part ? '' : 'selected'}>不参与座舱（旧算法）</option><option value="body" ${part === 'body' ? 'selected' : ''}>车身（钢板，携带座舱参数）</option><option value="glass" ${part === 'glass' ? 'selected' : ''}>车窗玻璃（透射太阳进座舱）</option><option value="underbody" ${part === 'underbody' ? 'selected' : ''}>底盘/轮胎/灯具（薄壳，发动机热源）</option></select></label>`
+    + `<label class="dialog-field"><span>启用座舱（仅车身部件）</span><input name="cabinEnabled" type="checkbox" value="1" ${checked(c.enabled)}></label>`
+    + physicalInput('乘员数（0–8）', 'cabinOccupants', c.occupants ?? 0, 1) + physicalInput('每人代谢热（W）', 'cabinMetabolicW', c.metabolicW ?? 100, 1)
+    + physicalInput('车速（m/s，0 = 停放）', 'cabinSpeed', c.speed ?? 0, 0.1) + physicalInput('航向（°，留空 = 风垂直于行驶）', 'cabinHeading', c.heading ?? '', 1)
+    + physicalInput('风来向（°）', 'cabinWindDirection', c.windDirection ?? '', 1) + physicalInput('关窗通风换气（ACH）', 'cabinVentilationACH', c.ventilationACH ?? 0.5, 0.1)
+    + `<label class="dialog-field"><span>开窗缝</span><input name="cabinWindowCracked" type="checkbox" value="1" ${checked(c.windowCracked)}></label>` + physicalInput('开窗缝 ACH', 'cabinCrackedACH', c.crackedACH ?? 10, 1)
+    + `<label class="dialog-field"><span>开空调</span><input name="cabinAcOn" type="checkbox" value="1" ${checked(c.acOn)}></label>` + physicalInput('空调制冷功率（W）', 'cabinAcPower', c.acPower ?? 3500, 10)
+    + physicalInput('空调设定温度（℃）', 'cabinAcSetpoint', c.acSetpoint ?? 24, 0.5)
+    + `<label class="dialog-field"><span>发动机运转</span><input name="cabinEngineOn" type="checkbox" value="1" ${checked(c.engineOn)}></label>` + physicalInput('发动机热功率（W）', 'cabinEnginePower', c.enginePower ?? 15000, 100)
+    + physicalInput('进入罩下/底盘的份额', 'cabinEngineShare', c.engineShare ?? 0.3, 0.05)
+    + physicalInput('座舱容积（m³）', 'cabinVolume', c.volume ?? 2.8, 0.1) + physicalInput('内饰热容（J·K⁻¹）', 'cabinInteriorCapacity', c.interiorCapacity ?? 80000, 1000)
+    + physicalInput('内饰面积（m²）', 'cabinInteriorArea', c.interiorArea ?? 8, 0.5) + physicalInput('内饰换热系数（W·m⁻²·K⁻¹）', 'cabinInteriorH', c.interiorH ?? 8, 0.5)
+    + physicalInput('内饰吸收透射太阳的份额', 'cabinAbsorbedFraction', c.absorbedFraction ?? 0.8, 0.05)
 }
 
 // FacetEB wall layers as text: one layer per line "thickness, λ, ρ, cp" (outer to inner).
@@ -4043,7 +4085,7 @@ function renderPhysicalParameters() {
       physicalInput('比热容 cs', 'soilCs', defaults.cs, 1), physicalInput('密度 rhos', 'soilRhos', defaults.rhos, 1),
       physicalInput('导热率 λ', 'soilLambdas', defaults.lambdas, 0.01), physicalInput('初始温度', 'soilTsoil', defaults.Tsoil, 0.1),
       physicalInput('土壤含水量 SMC', 'soilSMC', defaults.SMC, 0.1), physicalInput('饱和含水量', 'soilSatwater', defaults.Satwater, 0.01),
-      wallModeFields(defaults), type === 'Ship' ? shipFields(defaults) : ''
+      wallModeFields(defaults), type === 'Ship' ? shipFields(defaults) : '', type === 'Vehicle' ? vehicleFields(defaults) : ''
     ].join('')
   }
 }
@@ -4611,6 +4653,24 @@ function physicalFromForm(values, type) {
       if (Number(values.shipInternalHeatFlux)) params.internalHeatFlux = Number(values.shipInternalHeatFlux)
       if (Number(values.shipInternalHeatPower)) params.internalHeatPower = Number(values.shipInternalHeatPower)
     }
+    if (type === 'Vehicle' && values.vehiclePart !== undefined) {
+      // Cabin / driving parameters of a Vehicle material (FacetEB only; absent fields keep the engine defaults).
+      const on = (key) => values[key] === '1' || values[key] === 'on' || values[key] === true
+      const given = (key) => String(values[key] ?? '').trim() !== ''
+      const num = (key, fallback) => (given(key) && Number.isFinite(Number(values[key])) ? Number(values[key]) : fallback)
+      if (values.vehiclePart) params.vehiclePart = values.vehiclePart
+      if (values.vehiclePart === 'body') {
+        params.cabin = {
+          enabled: on('cabinEnabled'), occupants: Math.max(0, Math.round(num('cabinOccupants', 0))), metabolicW: num('cabinMetabolicW', 100),
+          speed: Math.max(0, num('cabinSpeed', 0)), ventilationACH: Math.max(0, num('cabinVentilationACH', 0.5)),
+          windowCracked: on('cabinWindowCracked'), crackedACH: num('cabinCrackedACH', 10), acOn: on('cabinAcOn'), acPower: num('cabinAcPower', 3500),
+          acSetpoint: num('cabinAcSetpoint', 24), engineOn: on('cabinEngineOn'), enginePower: num('cabinEnginePower', 15000),
+          engineShare: num('cabinEngineShare', 0.3), volume: num('cabinVolume', 2.8), interiorCapacity: num('cabinInteriorCapacity', 80000),
+          interiorArea: num('cabinInteriorArea', 8), interiorH: num('cabinInteriorH', 8), absorbedFraction: num('cabinAbsorbedFraction', 0.8)
+        }
+        if (given('cabinHeading') && given('cabinWindDirection')) { params.cabin.heading = Number(values.cabinHeading); params.cabin.windDirection = Number(values.cabinWindDirection) }
+      }
+    }
   }
   // FIXED 配套：过滤掉 NaN/Infinity，避免“缺失”被写成 NaN（JSON 里是 null）
   params = Object.fromEntries(Object.entries(params).filter(([, value]) => typeof value !== 'number' || Number.isFinite(value)))
@@ -4733,7 +4793,7 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
     updateCanopyGField()
     return
   }
-  const typeOptions = [['Building', '建筑表面'], ['Photovoltaic', '光伏板热电耦合'], ['Membrane', '篷布/织物薄膜（FacetEB）'], ['Vegetation', '植被生理生化'], ['Wood', '木质固体热平衡'], ['Soil', '土壤表面物化'], ['Water', '水体物性'], ['Ship', '船舶表面物化']].map(([value, label]) => `<option value="${value}" ${value === state.presetPhysicalType ? 'selected' : ''}>${label}</option>`).join('')
+  const typeOptions = [['Building', '建筑表面'], ['Photovoltaic', '光伏板热电耦合'], ['Membrane', '篷布/织物薄膜（FacetEB）'], ['Vegetation', '植被生理生化'], ['Wood', '木质固体热平衡'], ['Soil', '土壤表面物化'], ['Water', '水体物性'], ['Ship', '船舶表面物化'], ['Vehicle', '载具物化（车身/玻璃/底盘，FacetEB 座舱）']].map(([value, label]) => `<option value="${value}" ${value === state.presetPhysicalType ? 'selected' : ''}>${label}</option>`).join('')
   const baseDefaults = createMaterialPresets().materials.find((entry) => state.presetPhysicalType === 'Photovoltaic' ? entry.energyModel === 'photovoltaic' : state.presetPhysicalType === 'Membrane' ? entry.energyModel === 'membrane' : state.presetPhysicalType === 'Wood' ? entry.energyModel === 'wood' : entry.type === state.presetPhysicalType && !entry.energyModel)?.params || {}
   const defaults = { ...baseDefaults, ...(item?.params || {}) }
   // An existing material keeps its own (possibly absent) fields whose engine
@@ -4766,7 +4826,7 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
   } else if (state.presetPhysicalType === 'Wood') {
     parameters = `${physicalInput('比热容 cs（J·kg⁻¹·K⁻¹）', 'soilCs', defaults.cs, 1)}${physicalInput('密度 rhos（kg·m⁻³）', 'soilRhos', defaults.rhos, 1)}${physicalInput('导热率 λ（W·m⁻¹·K⁻¹）', 'soilLambdas', defaults.lambdas, 0.01)}${physicalInput('对流换热倍率', 'woodConvectiveScale', defaults.convectiveScale ?? 1, 0.1)}${physicalInput('初始温度（℃）', 'soilTsoil', defaults.Tsoil, 0.1)}<div class="notice">木质固体不计算光合作用和蒸腾，温度由辐射、对流、导热与热储存共同求解。</div>`
   } else {
-    parameters = `${physicalInput('方法', 'soilMethod', defaults.method, 1)}${physicalInput('表面阻力 rss', 'soilRss', defaults.rss, 1)}${physicalInput('比热容 cs', 'soilCs', defaults.cs, 1)}${physicalInput('密度 rhos', 'soilRhos', defaults.rhos, 1)}${physicalInput('导热率 λ', 'soilLambdas', defaults.lambdas, 0.01)}${physicalInput('初始温度', 'soilTsoil', defaults.Tsoil, 0.1)}${physicalInput('土壤含水量 SMC', 'soilSMC', defaults.SMC, 0.1)}${physicalInput('饱和含水量', 'soilSatwater', defaults.Satwater, 0.01)}${wallModeFields(defaults)}${state.presetPhysicalType === 'Ship' ? shipFields(defaults) : ''}`
+    parameters = `${physicalInput('方法', 'soilMethod', defaults.method, 1)}${physicalInput('表面阻力 rss', 'soilRss', defaults.rss, 1)}${physicalInput('比热容 cs', 'soilCs', defaults.cs, 1)}${physicalInput('密度 rhos', 'soilRhos', defaults.rhos, 1)}${physicalInput('导热率 λ', 'soilLambdas', defaults.lambdas, 0.01)}${physicalInput('初始温度', 'soilTsoil', defaults.Tsoil, 0.1)}${physicalInput('土壤含水量 SMC', 'soilSMC', defaults.SMC, 0.1)}${physicalInput('饱和含水量', 'soilSatwater', defaults.Satwater, 0.01)}${wallModeFields(defaults)}${state.presetPhysicalType === 'Ship' ? shipFields(defaults) : ''}${state.presetPhysicalType === 'Vehicle' ? vehicleFields(defaults) : ''}`
   }
   target.innerHTML = `${presetSelect('物化类型', 'presetPhysicalType', 'physicalType', typeOptions)}${parameters}`
   $('#presetPhysicalType').addEventListener('change', (event) => {
