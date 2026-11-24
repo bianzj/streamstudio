@@ -227,6 +227,19 @@ struct SurfaceParameters {
     bool waterFeedback{false};
     float internalFlux{0.0f};
     float internalPower{0.0f};
+    // Vehicle (FacetEB car cabin, material type Vehicle). vehiclePart: 0 none,
+    // 1 body (carries the cabin parameters), 2 glass (transmits sun into the
+    // cabin), 3 underbody/engine bay (thin shell, engine heat). Cabin parameters
+    // are read from the body material of each vehicle instance.
+    int vehiclePart{0};
+    bool vehicleHasParams{false};
+    bool cabinEnabled{false};
+    int occupants{0};
+    double metabolicW{100}, cabinVolume{2.8}, interiorCapacity{80000}, interiorArea{8}, interiorH{8};
+    double absorbedFraction{0.8}, ventilationAch{0.5}, crackedAch{10};
+    bool windowCracked{false}, acOn{false}, engineOn{false};
+    double acPower{3500}, acSetpointC{24}, acBandK{2}, enginePowerW{15000}, engineShare{0.3};
+    float vehicleSpeed{0.0f}, vehicleWindCosine{0.0f};
     float leafWidth{0.1f};
     LeafBiochemistry leaf;
     uint8_t outputComponent{0}; // 0 unknown, 1 soil/background, 2 vegetation, 3 building, 4 PV, 5 water
@@ -251,6 +264,9 @@ struct Scene {
     std::vector<SurfaceParameters> materials;
     std::vector<float> reflectanceTextureFactors;
     uint32_t leafFacetCount{};
+    // Vehicle instance (1-based) of every facet; empty without vehicles.
+    std::vector<uint32_t> facetInstance;
+    std::vector<std::string> vehicleNames;
     Vec3 minimum{};
     Vec3 maximum{};
     float sunZenith{30.0f};
@@ -3319,6 +3335,38 @@ std::string facetInputView(const std::string& path)
             if (ProjectJson::number(p,"internalHeatPower",0) != 0)
                 xml << "<internalHeatPower>" << ProjectJson::number(p,"internalHeatPower",0) << "</internalHeatPower>";
         }
+        // Vehicle (material type Vehicle): part role and, on the body material,
+        // the cabin / driving parameters (params.cabin). Absent writes nothing.
+        if (!pv && !leaf && !water && ProjectJson::string(item,"type")=="Vehicle") {
+            const std::string part = ProjectJson::string(p,"vehiclePart","");
+            const int partCode = part=="body" ? 1 : part=="glass" ? 2 : part=="underbody" ? 3 : 0;
+            if (partCode) xml << "<vehiclePart>" << partCode << "</vehiclePart>";
+            if (partCode == 1 && p.contains("cabin") && p["cabin"].is_object()) {
+                const auto& c = p["cabin"];
+                const auto num = [&](const char* key, float fallback) { return ProjectJson::number(c, key, fallback); };
+                xml << "<vcEnabled>" << (ProjectJson::boolean(c,"enabled",false) ? 1 : 0) << "</vcEnabled>"
+                    << "<vcSpeed>" << num("speed",0) << "</vcSpeed>"
+                    << "<vcOccupants>" << num("occupants",0) << "</vcOccupants>"
+                    << "<vcMetabolicW>" << num("metabolicW",100) << "</vcMetabolicW>"
+                    << "<vcVolume>" << num("volume",2.8f) << "</vcVolume>"
+                    << "<vcInteriorCapacity>" << num("interiorCapacity",80000) << "</vcInteriorCapacity>"
+                    << "<vcInteriorArea>" << num("interiorArea",8) << "</vcInteriorArea>"
+                    << "<vcInteriorH>" << num("interiorH",8) << "</vcInteriorH>"
+                    << "<vcAbsorbedFraction>" << num("absorbedFraction",0.8f) << "</vcAbsorbedFraction>"
+                    << "<vcVentilationAch>" << num("ventilationACH",0.5f) << "</vcVentilationAch>"
+                    << "<vcCrackedAch>" << num("crackedACH",10) << "</vcCrackedAch>"
+                    << "<vcWindowCracked>" << (ProjectJson::boolean(c,"windowCracked",false) ? 1 : 0) << "</vcWindowCracked>"
+                    << "<vcAcOn>" << (ProjectJson::boolean(c,"acOn",false) ? 1 : 0) << "</vcAcOn>"
+                    << "<vcAcPower>" << num("acPower",3500) << "</vcAcPower>"
+                    << "<vcAcSetpoint>" << num("acSetpoint",24) << "</vcAcSetpoint>"
+                    << "<vcAcBand>" << num("acBand",2) << "</vcAcBand>"
+                    << "<vcEngineOn>" << (ProjectJson::boolean(c,"engineOn",false) ? 1 : 0) << "</vcEngineOn>"
+                    << "<vcEnginePower>" << num("enginePower",15000) << "</vcEnginePower>"
+                    << "<vcEngineShare>" << num("engineShare",0.3f) << "</vcEngineShare>";
+                if (num("heading",-1) >= 0 && num("windDirection",-1) >= 0)
+                    xml << "<vcHeading>" << num("heading",0) << "</vcHeading><vcWindDirection>" << num("windDirection",0) << "</vcWindDirection>";
+            }
+        }
         if (leaf) {
             std::string tparam = p.contains("Tparam") && p["Tparam"].is_string()
                 ? p["Tparam"].get<std::string>() : std::string("0.2,0.3,288,313,328");
@@ -4588,6 +4636,44 @@ Scene loadProjectScene(const std::string& inputFile)
                     if (!std::isfinite(material.internalFlux) || !std::isfinite(material.internalPower) ||
                         std::abs(material.internalFlux) > 1.0e5f || std::abs(material.internalPower) > 1.0e9f)
                         throw std::runtime_error("Invalid internal heat source (|flux| <= 1e5 W/m2, |power| <= 1e9 W): " + physicalName);
+                    // Vehicle parts and cabin parameters (absent = old behaviour).
+                    material.vehiclePart = static_cast<int>(xmlFloat(wallBlock, "vehiclePart", 0));
+                    if (material.vehiclePart < 0 || material.vehiclePart > 3)
+                        throw std::runtime_error("vehiclePart must be 0-3: " + physicalName);
+                    if (!trim(firstXmlTag(wallBlock, "vcSpeed")).empty() || !trim(firstXmlTag(wallBlock, "vcEnabled")).empty()) {
+                        material.vehicleHasParams = true;
+                        material.cabinEnabled = xmlFloat(wallBlock, "vcEnabled", 0) > 0.5f;
+                        material.occupants = static_cast<int>(xmlFloat(wallBlock, "vcOccupants", 0));
+                        material.metabolicW = xmlFloat(wallBlock, "vcMetabolicW", 100);
+                        material.cabinVolume = xmlFloat(wallBlock, "vcVolume", 2.8f);
+                        material.interiorCapacity = xmlFloat(wallBlock, "vcInteriorCapacity", 80000);
+                        material.interiorArea = xmlFloat(wallBlock, "vcInteriorArea", 8);
+                        material.interiorH = xmlFloat(wallBlock, "vcInteriorH", 8);
+                        material.absorbedFraction = xmlFloat(wallBlock, "vcAbsorbedFraction", 0.8f);
+                        material.ventilationAch = xmlFloat(wallBlock, "vcVentilationAch", 0.5f);
+                        material.crackedAch = xmlFloat(wallBlock, "vcCrackedAch", 10);
+                        material.windowCracked = xmlFloat(wallBlock, "vcWindowCracked", 0) > 0.5f;
+                        material.acOn = xmlFloat(wallBlock, "vcAcOn", 0) > 0.5f;
+                        material.acPower = xmlFloat(wallBlock, "vcAcPower", 3500);
+                        material.acSetpointC = xmlFloat(wallBlock, "vcAcSetpoint", 24);
+                        material.acBandK = xmlFloat(wallBlock, "vcAcBand", 2);
+                        material.engineOn = xmlFloat(wallBlock, "vcEngineOn", 0) > 0.5f;
+                        material.enginePowerW = xmlFloat(wallBlock, "vcEnginePower", 15000);
+                        material.engineShare = xmlFloat(wallBlock, "vcEngineShare", 0.3f);
+                        material.vehicleSpeed = xmlFloat(wallBlock, "vcSpeed", 0);
+                        if (!trim(firstXmlTag(wallBlock, "vcHeading")).empty() && !trim(firstXmlTag(wallBlock, "vcWindDirection")).empty())
+                            material.vehicleWindCosine = static_cast<float>(std::cos((double(xmlFloat(wallBlock, "vcHeading", 0)) -
+                                double(xmlFloat(wallBlock, "vcWindDirection", 0))) * kPi / 180.0));
+                        if (!(material.vehicleSpeed >= 0 && material.vehicleSpeed <= 100) || material.occupants < 0 || material.occupants > 8 ||
+                            !(material.metabolicW >= 0 && material.metabolicW <= 1000) || !(material.cabinVolume > 0.2 && material.cabinVolume < 100) ||
+                            !(material.interiorCapacity > 100) || !(material.interiorArea > 0) || !(material.interiorH > 0) ||
+                            !(material.absorbedFraction >= 0 && material.absorbedFraction <= 1) ||
+                            !(material.ventilationAch >= 0 && material.ventilationAch <= 100) || !(material.crackedAch >= 0 && material.crackedAch <= 200) ||
+                            !(material.acPower >= 0 && material.acPower <= 2.0e5) || !(material.acBandK > 0.01) ||
+                            !(material.acSetpointC > -20 && material.acSetpointC < 50) ||
+                            !(material.enginePowerW >= 0 && material.enginePowerW <= 1.0e6) || !(material.engineShare >= 0 && material.engineShare <= 1))
+                            throw std::runtime_error("Invalid vehicle cabin parameters: " + physicalName);
+                    }
                 }
             }
             const uint32_t materialIndex =
@@ -4611,12 +4697,24 @@ Scene loadProjectScene(const std::string& inputFile)
         const ObjGeometry geometry = modelFile.empty()
             ? cubeGeometry(objectXml)
             : readObjGeometry(resolveProjectAsset(inputPath, modelFile));
+        bool vehicleObject = false;
+        for (const auto& binding : bindings)
+            if (binding.materialIndex < scene.materials.size() && scene.materials[binding.materialIndex].vehiclePart > 0)
+                vehicleObject = true;
+        size_t placementIndex = 0;
         for (Placement placement :
              readPlacements(inputPath, objectXml, sceneWidth, sceneDepth)) {
             placement.z += dem.heightAboveMinimum(
                 placement.x, placement.y, sceneWidth, sceneDepth);
+            const uint32_t facetsBefore = scene.facetCount();
             appendGeometry(scene, geometry, placement, sceneWidth, sceneDepth,
                            sceneHeight, bindings);
+            if (vehicleObject) {
+                scene.facetInstance.resize(facetsBefore, 0U);
+                scene.vehicleNames.push_back(xmlAttribute(objectXml.substr(0, objectXml.find('>') + 1), "objName") + "#" + std::to_string(placementIndex));
+                scene.facetInstance.resize(scene.facetCount(), static_cast<uint32_t>(scene.vehicleNames.size()));
+            }
+            ++placementIndex;
         }
     }
 
@@ -5419,6 +5517,75 @@ try {
         }
         if (!internalHeat.empty()) runIndex.value["internalHeat"] = {{"area_m2", area}, {"power_W", power}};
     }
+    // Vehicles (material type Vehicle): one lumped cabin per object instance.
+    // Body and glass are wall slabs whose indoor temperature is the cabin air
+    // temperature of the instance; the cabin equation is solved on the host
+    // after each node (see the node loop), so CPU and GPU energy paths share it.
+    struct VehicleRuntime {
+        std::string name;
+        const SurfaceParameters* body{nullptr}; // body material (cabin parameters)
+        std::vector<uint32_t> bodyFacets, glassFacets, underFacets;
+        std::vector<size_t> walls;              // wall indices of body + glass facets
+        double bodyArea{0}, glassArea{0}, underArea{0};
+        double airK{0}, interiorK{0};
+        double maxAirK{-1}, maxAirTime{0}, maxInteriorK{-1};
+        int maxAirNode{-1};
+        double maxClosure{0};
+    };
+    std::vector<VehicleRuntime> vehicles(scene.vehicleNames.size());
+    const auto vehicleOf = [&](uint32_t facet) -> uint32_t {
+        return facet < scene.facetInstance.size() ? scene.facetInstance[facet] : 0U;
+    };
+    std::vector<int32_t> wallVehicle(wallFacets.size(), -1);
+    for (size_t i = 0; i < vehicles.size(); ++i) vehicles[i].name = scene.vehicleNames[i];
+    if (!vehicles.empty()) {
+        for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
+            const uint32_t instance = vehicleOf(f);
+            if (!instance) continue;
+            auto& v = vehicles[instance - 1U];
+            const auto& s = surfaceForFacet(scene, f);
+            if (s.vehiclePart == 1) {
+                v.bodyFacets.push_back(f);
+                v.bodyArea += facetAreas[f];
+                if (!v.body && s.vehicleHasParams) v.body = &s;
+            } else if (s.vehiclePart == 2) {
+                v.glassFacets.push_back(f);
+                v.glassArea += facetAreas[f];
+            } else if (s.vehiclePart == 3) {
+                v.underFacets.push_back(f);
+                v.underArea += facetAreas[f];
+            }
+            if ((s.vehiclePart == 1 || s.vehiclePart == 2) && wallIndex[f] >= 0) wallVehicle[size_t(wallIndex[f])] = int32_t(instance - 1U);
+        }
+        ProjectJson::Json list = ProjectJson::Json::array();
+        for (auto& v : vehicles) {
+            if (v.body && v.body->cabinEnabled)
+                for (size_t w = 0; w < wallVehicle.size(); ++w)
+                    if (wallVehicle[w] == int32_t(&v - vehicles.data())) v.walls.push_back(w);
+            // Engine heat: spread over the underbody / engine-bay shell facets.
+            if (v.body && v.body->engineOn && v.underArea > 0) {
+                if (internalHeat.empty()) internalHeat.assign(scene.leafFacetCount, 0.0f);
+                const double perArea = v.body->enginePowerW * v.body->engineShare / v.underArea;
+                for (uint32_t f : v.underFacets) internalHeat[f] += static_cast<float>(perArea);
+            }
+            list.push_back({{"name", v.name}, {"cabin", v.body && v.body->cabinEnabled}, {"speed_m_s", v.body ? v.body->vehicleSpeed : 0.0f},
+                {"bodyArea_m2", v.bodyArea}, {"glassArea_m2", v.glassArea}, {"underbodyArea_m2", v.underArea},
+                {"wallFacets", v.walls.size()}});
+        }
+        runIndex.value["vehicles"] = list;
+    }
+    const auto facetConvectiveScaleVehicle = [&](uint32_t facet) -> const SurfaceParameters* {
+        const uint32_t instance = vehicleOf(facet);
+        return instance && vehicles[instance - 1U].body && vehicles[instance - 1U].body->vehicleSpeed > 0.0f
+            ? vehicles[instance - 1U].body : nullptr;
+    };
+    // Indoor temperature of vehicle wall slabs (K), NaN = the material value.
+    std::vector<double> wallIndoor(wallFacets.size(), std::numeric_limits<double>::quiet_NaN());
+    const auto slabOf = [&](size_t w) {
+        facetphysics::WallSlab slab = surfaceForFacet(scene, wallFacets[w]).wallSlab;
+        if (std::isfinite(wallIndoor[w])) slab.indoorK = wallIndoor[w];
+        return slab;
+    };
     runIndex.write();
     const size_t firstGroundSide = static_cast<size_t>(scene.leafFacetCount) * 2U;
     const size_t groundSides = surfaceCount - firstGroundSide;
@@ -5760,10 +5927,15 @@ try {
         }
         // Wall slabs: start from steady conduction between the seed surface
         // temperature and the indoor air; eliminate the interior once per node.
+        for (auto& v : vehicles) {
+            if (v.walls.empty()) continue;
+            if (node == startNode) v.airK = v.interiorK = std::clamp(meteo.airTemperature + 273.15f, 220.0f, 340.0f);
+            for (size_t w : v.walls) wallIndoor[w] = v.airK;
+        }
         std::array<std::vector<facetphysics::WallResponse>, 2> wallResponses{
             std::vector<facetphysics::WallResponse>(wallFacets.size()), std::vector<facetphysics::WallResponse>(wallFacets.size())};
         for (size_t w = 0; w < wallFacets.size(); ++w) {
-            const auto& slab = surfaceForFacet(scene, wallFacets[w]).wallSlab;
+            const auto slab = slabOf(w);
             const size_t side0 = size_t(wallFacets[w]) * 2U;
             for (int state = 0; state < 2; ++state) {
                 if (node == startNode) {
@@ -5806,6 +5978,8 @@ try {
         std::vector<float> incidentDirect(surfaceCount, 0.0f);
         std::vector<float> absorbedParDirect(surfaceCount, 0.0f);
         std::vector<float> incidentShortwave(surfaceCount,0), photovoltaicPower(surfaceCount,0), photovoltaicSlope(surfaceCount,0);
+        // Shortwave transmitted through the vehicle glass (W m-2 per side).
+        std::vector<float> transmittedShortwave(vehicles.empty() ? 0U : surfaceCount, 0.0f);
         facetvk::SolveResult shortwaveSolution;
         shortwaveSolution.radiosity.assign(surfaceCount, 0.0f);
         facetvk::SolveResult diffuseSolution;
@@ -5886,6 +6060,8 @@ try {
                             windowOptics[side].transmittance,
                         0.0f, 1.0f);
                     incidentShortwave[side] += windowIncident[side];
+                    if (!transmittedShortwave.empty())
+                        transmittedShortwave[side] += windowOptics[side].transmittance * windowIncident[side];
                     absorbedShortwave[side] +=
                         absorptance * windowIncident[side];
                     const float windowDirect = windowOptics[side].directIrradiance;
@@ -5943,6 +6119,18 @@ try {
             const float squared = s.shipWindCosine == 0.0f ? meteo.windSpeed * meteo.windSpeed + s.shipSpeed * s.shipSpeed
                 : meteo.windSpeed * meteo.windSpeed + s.shipSpeed * s.shipSpeed +
                     2.0f * meteo.windSpeed * s.shipSpeed * s.shipWindCosine;
+            const float relative = std::sqrt(std::max(0.0f, squared));
+            return s.convectiveScale * (5.8f + 4.1f * std::sqrt(std::max(0.1f, relative))) / aerodynamicConductance;
+        };
+        // Facets of a vehicle instance use the vehicle's own speed / course
+        // (body material cabin parameters), same relative-wind rule as the ship.
+        const auto facetConvectiveScale = [&](uint32_t facet, const SurfaceParameters& s) {
+            const SurfaceParameters* body = facet < scene.leafFacetCount ? facetConvectiveScaleVehicle(facet) : nullptr;
+            if (!body) return objectConvectiveScale(s);
+            const float squared = body->vehicleWindCosine == 0.0f
+                ? meteo.windSpeed * meteo.windSpeed + body->vehicleSpeed * body->vehicleSpeed
+                : meteo.windSpeed * meteo.windSpeed + body->vehicleSpeed * body->vehicleSpeed +
+                    2.0f * meteo.windSpeed * body->vehicleSpeed * body->vehicleWindCosine;
             const float relative = std::sqrt(std::max(0.0f, squared));
             return s.convectiveScale * (5.8f + 4.1f * std::sqrt(std::max(0.1f, relative))) / aerodynamicConductance;
         };
@@ -6128,7 +6316,7 @@ try {
                                 ? airDensity * 1005.0f * surface.convectiveScale /
                                     aerodynamics.leafResistance
                                 : contact[0] > 0.0f ? contact[0]
-                                : (waterSurface || wall >= 0 ? 1.0f : 2.0f) * aerodynamicConductance * objectConvectiveScale(surface);
+                                : (waterSurface || wall >= 0 ? 1.0f : 2.0f) * aerodynamicConductance * facetConvectiveScale(facet, surface);
                             const float facetSensibleHeat = facetSensibleConductance *
                                 (T[side0] - contact[1]);
                             const CanopyColumn& column = columns[facetColumn[facet]];
@@ -6405,7 +6593,7 @@ try {
                 data[0] = mat.vegetation ? 1.0f : 0.0f;
                 data[1] = mat.photovoltaic ? 1.0f : 0.0f;
                 data[2] = mat.heatCapacityPerArea;
-                data[3] = mat.vegetation ? mat.convectiveScale : objectConvectiveScale(mat);
+                data[3] = mat.vegetation ? mat.convectiveScale : facetConvectiveScale(facet, mat);
                 data[4] = mat.pvEta25;
                 data[5] = mat.pvGamma;
                 data[6] = mat.pvBifaciality;
@@ -6906,6 +7094,84 @@ try {
             }
             previousObjectHeat[facet] = heat;
         }
+        // Vehicle cabins: implicit lumped air + interior-mass step. The wall inner
+        // heat flux is linear in the cabin air temperature (backward Euler
+        // response), q(Ta) = q0 - K (Ta - Ta0), so the walls are coupled to the
+        // cabin without iterating the surface solution; the slab profiles are then
+        // advanced with the new cabin temperature (exact energy closure per slab).
+        struct CabinNode {
+            bool active{false};
+            double airOld{}, interiorOld{}, outdoor{}, qTrans{}, qSolar{}, qWall0{}, kWall{}, qOcc{}, gVent{}, ach{}, qAc{}, airCap{}, interiorCap{};
+        };
+        std::vector<CabinNode> cabinNodes(vehicles.size());
+        std::vector<double> wallInnerK(wallFacets.size(), 0.0), wallOuterK(wallFacets.size(), 0.0), wallIndoorQ(wallFacets.size(), 0.0);
+        for (size_t vi = 0; vi < vehicles.size(); ++vi) {
+            auto& v = vehicles[vi];
+            if (v.walls.empty()) continue;
+            const auto& b = *v.body;
+            CabinNode& c = cabinNodes[vi];
+            c.active = true;
+            c.airOld = v.airK;
+            c.interiorOld = v.interiorK;
+            c.outdoor = airTemperature;
+            for (uint32_t f : v.glassFacets) {
+                const int32_t gw = wallIndex[f];
+                const size_t gside = size_t(f) * 2U + (gw >= 0 ? wallOuter[size_t(gw)] : 0U);
+                c.qTrans += double(facetAreas[f]) * transmittedShortwave[gside];
+            }
+            for (size_t w : v.walls) {
+                const uint32_t f = wallFacets[w];
+                const size_t side = size_t(f) * 2U;
+                auto slab1 = slabOf(w);
+                const double conductance = slab1.indoorConductance();
+                slab1.indoorK += 1.0;
+                const size_t last = slab1.cells() - 1;
+                for (int state = 0; state < 2; ++state) {
+                    const double weight = state == 0 ? sunlitPart[side] : 1.0 - sunlitPart[side];
+                    if (!(weight > 0)) continue;
+                    const double surface = stateTemperature[state][side];
+                    const auto& r0 = wallResponses[state][w];
+                    const double t0 = r0.offset[last] + r0.slope[last] * surface;
+                    const auto r1 = facetphysics::wallResponse(wallProfiles[state][w], slab1, dTime,
+                        internalHeat.empty() ? 0.0 : double(internalHeat[f]));
+                    const double t1 = r1.offset[last] + r1.slope[last] * surface;
+                    c.qWall0 += weight * facetAreas[f] * conductance * (t0 - v.airK);
+                    c.kWall += weight * facetAreas[f] * conductance * (1.0 - (t1 - t0));
+                }
+            }
+            c.airCap = double(airDensity) * 1005.0 * b.cabinVolume;
+            c.interiorCap = b.interiorCapacity;
+            c.ach = b.windowCracked ? std::max(b.ventilationAch, b.crackedAch) : b.ventilationAch;
+            if (b.vehicleSpeed > 0.0f) c.ach = std::max(c.ach, std::clamp(8.0 + 1.2 * double(b.vehicleSpeed), 10.0, 30.0));
+            if (b.acOn) c.ach = std::min(c.ach, 5.0);
+            c.gVent = c.airCap * c.ach / 3600.0;
+            c.qSolar = b.absorbedFraction * c.qTrans;
+            c.qOcc = double(b.occupants) * b.metabolicW;
+            const double conv = b.interiorH * b.interiorArea, storeI = c.interiorCap / dTime, storeA = c.airCap / dTime;
+            const double total = storeI + conv, convEff = conv * storeI / total;
+            const double rhs = storeA * v.airK + c.qWall0 + c.kWall * v.airK + c.qOcc + c.gVent * airTemperature +
+                conv * (storeI * v.interiorK + c.qSolar) / total;
+            const double lhs = storeA + c.kWall + c.gVent + convEff;
+            double air = rhs / lhs;
+            if (b.acOn && b.acPower > 0) {
+                const double setpoint = b.acSetpointC + 273.15;
+                if (air > setpoint) {
+                    const double gain = b.acPower / b.acBandK;
+                    const double proportional = (rhs + gain * setpoint) / (lhs + gain);
+                    if (proportional <= setpoint + b.acBandK) { air = proportional; c.qAc = gain * (air - setpoint); }
+                    else { air = (rhs - b.acPower) / lhs; c.qAc = b.acPower; }
+                }
+            }
+            v.airK = air;
+            v.interiorK = (storeI * c.interiorOld + c.qSolar + conv * air) / total;
+            for (size_t w : v.walls) {
+                wallIndoor[w] = air;
+                const auto slab = slabOf(w);
+                for (int state = 0; state < 2; ++state)
+                    wallResponses[state][w] = facetphysics::wallResponse(wallProfiles[state][w], slab, dTime,
+                        internalHeat.empty() ? 0.0 : double(internalHeat[wallFacets[w]]));
+            }
+        }
         if (!wallFacets.empty()) {
             // Advance the slabs to the solved surface temperatures. Closure per
             // facet: change of the area-weighted slab heat since the end of the
@@ -6913,7 +7179,7 @@ try {
             double area = 0, indoorSum = 0, outerSum = 0, innerSum = 0, closureSum = 0, closureMax = 0;
             for (size_t w = 0; w < wallFacets.size(); ++w) {
                 const uint32_t facet = wallFacets[w];
-                const auto& slab = surfaceForFacet(scene, facet).wallSlab;
+                const auto slab = slabOf(w);
                 const size_t side = size_t(facet) * 2U;
                 double heat = 0, conducted = 0, indoor = 0, inner = 0, outer = 0;
                 for (int state = 0; state < 2; ++state) {
@@ -6930,6 +7196,9 @@ try {
                 const double residual = (heat - previousWallHeat[w]) / dTime - (conducted - indoor) -
                     (internalHeat.empty() ? 0.0 : double(internalHeat[facet]));
                 previousWallHeat[w] = heat;
+                wallInnerK[w] = inner;
+                wallOuterK[w] = outer;
+                wallIndoorQ[w] = indoor;
                 area += facetAreas[facet];
                 indoorSum += facetAreas[facet] * indoor;
                 outerSum += facetAreas[facet] * outer;
@@ -6942,6 +7211,76 @@ try {
                 {"meanIndoorFlux_W_m2", indoorSum / area},
                 {"heatClosureMean_W_m2", closureAvailable ? closureSum / area : 0.0},
                 {"heatClosureMaxAbs_W_m2", closureAvailable ? closureMax : 0.0}};
+        }
+        if (!vehicles.empty()) {
+            // Cabin balance per vehicle (temperatures, no comfort indices):
+            //   dE/dt = Q_wall + Q_occ + Q_solar - G_vent (Ta - Tout) - Q_ac.
+            ProjectJson::Json rows = ProjectJson::Json::array();
+            std::vector<double> wallQ(vehicles.size(), 0.0);
+            for (size_t w = 0; w < wallFacets.size(); ++w)
+                if (wallVehicle[w] >= 0 && cabinNodes[size_t(wallVehicle[w])].active)
+                    wallQ[size_t(wallVehicle[w])] += facetAreas[wallFacets[w]] * wallIndoorQ[w];
+            for (size_t vi = 0; vi < vehicles.size(); ++vi) {
+                auto& v = vehicles[vi];
+                const CabinNode& c = cabinNodes[vi];
+                // Area-weighted surface temperatures of the body / glass / underbody.
+                const auto mean = [&](const std::vector<uint32_t>& facets, int which) {
+                    double sum = 0, a = 0;
+                    for (uint32_t f : facets) {
+                        const size_t side = size_t(f) * 2U;
+                        double value;
+                        if (wallIndex[f] >= 0 && which >= 1) value = which == 1 ? wallOuterK[size_t(wallIndex[f])] : wallInnerK[size_t(wallIndex[f])];
+                        else value = sunlitPart[side] * stateTemperature[0][side] + (1.0 - sunlitPart[side]) * stateTemperature[1][side];
+                        sum += facetAreas[f] * value;
+                        a += facetAreas[f];
+                    }
+                    return a > 0 ? sum / a : std::numeric_limits<double>::quiet_NaN();
+                };
+                ProjectJson::Json row{{"name", v.name}, {"node", node}, {"outdoorAirTemperature_K", double(airTemperature)},
+                    {"speed_m_s", v.body ? v.body->vehicleSpeed : 0.0f},
+                    {"bodyOuterSurface_K", mean(v.bodyFacets, 0)}, {"glassOuterSurface_K", mean(v.glassFacets, 0)},
+                    {"underbodySurface_K", mean(v.underFacets, 0)}};
+                if (c.active) {
+                    const double airStore = c.airCap * (v.airK - c.airOld) / dTime;
+                    const double interiorStore = c.interiorCap * (v.interiorK - c.interiorOld) / dTime;
+                    const double ventilation = c.gVent * (v.airK - airTemperature);
+                    const double inputs = wallQ[vi] + c.qOcc + c.qSolar;
+                    const double residual = airStore + interiorStore - (inputs - ventilation - c.qAc);
+                    const double scale = std::max({1.0, std::abs(inputs), std::abs(ventilation), std::abs(c.qAc), std::abs(airStore + interiorStore)});
+                    v.maxClosure = std::max(v.maxClosure, std::abs(residual) / scale);
+                    if (v.airK > v.maxAirK) { v.maxAirK = v.airK; v.maxAirNode = node; v.maxAirTime = meteo.julianTime; }
+                    v.maxInteriorK = std::max(v.maxInteriorK, v.interiorK);
+                    double bodyInner = 0, bodyArea = 0, glassInner = 0, glassArea = 0;
+                    for (size_t w : v.walls) {
+                        const uint32_t f = wallFacets[w];
+                        if (surfaceForFacet(scene, f).vehiclePart == 2) { glassInner += facetAreas[f] * wallInnerK[w]; glassArea += facetAreas[f]; }
+                        else { bodyInner += facetAreas[f] * wallInnerK[w]; bodyArea += facetAreas[f]; }
+                    }
+                    row["cabinAirTemperature_K"] = v.airK;
+                    row["interiorTemperature_K"] = v.interiorK;
+                    row["cabinMinusOutdoor_K"] = v.airK - airTemperature;
+                    row["bodyInnerSurface_K"] = bodyArea > 0 ? bodyInner / bodyArea : 0.0;
+                    row["glassInnerSurface_K"] = glassArea > 0 ? glassInner / glassArea : 0.0;
+                    row["ventilationACH"] = c.ach;
+                    row["balance_W"] = {{"solarTransmitted", c.qTrans}, {"solarAbsorbedByInterior", c.qSolar},
+                        {"wallToCabin", wallQ[vi]}, {"occupants", c.qOcc}, {"ventilationLoss", ventilation},
+                        {"airConditioning", c.qAc}, {"airStorage", airStore}, {"interiorStorage", interiorStore},
+                        {"residual", residual}, {"relativeResidual", std::abs(residual) / scale}};
+                    std::cout << "VEHICLE_CABIN\tnode=" << node << "\tname=" << v.name << "\tcabinC=" << v.airK - 273.15
+                              << "\tinteriorC=" << v.interiorK - 273.15 << "\toutdoorC=" << airTemperature - 273.15
+                              << "\tqTrans=" << c.qTrans << "\tacW=" << c.qAc << std::endl;
+                }
+                rows.push_back(std::move(row));
+            }
+            diagnostic["vehicleCabin"] = rows;
+            std::ofstream(outputDirectory / "diagnostics" / ("vehicle_cabin_node=" + std::to_string(node) + ".json")) << rows.dump(2);
+            ProjectJson::Json summary = ProjectJson::Json::array();
+            for (const auto& v : vehicles)
+                summary.push_back({{"name", v.name}, {"maxCabinAirTemperature_C", v.maxAirK - 273.15}, {"maxCabinNode", v.maxAirNode},
+                    {"maxCabinTime", v.maxAirTime}, {"maxInteriorTemperature_C", v.maxInteriorK - 273.15},
+                    {"maxRelativeClosure", v.maxClosure}});
+            runIndex.value["vehicleCabinSummary"] = summary;
+            runIndex.write();
         }
         if (anyWaterFeedback && nodeWaterK >= 0) {
             // Heat the wetted hull gives the water this node (W): area-weighted
