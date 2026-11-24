@@ -5,6 +5,7 @@
 依据 2026-11-22 两轮效率与精度改进（提交 `376c015`）。完整变更与兼容性见 `docs/release-next-draft.md`。
 
 已修正：
+- STREAM 气象强迫改为元数据驱动（2026-11-24，引擎侧）：变量名、单位、湿度类型、风/气温高度订正、时间步（1 h/3 h/站点任意步长，通量守恒重采样）与站点 CSV（最近站/IDW）由元数据描述，内置预设 `era5`、`era5-land`、`gldas-noah-0.25/1.0`、`station-csv`；ERA5 布局沿用原读取路径，结果与改动前逐字节相同。规格 `docs/forcing-metadata.md`，命令 `stream forcing-preset/forcing-check/forcing-register`，测试 `tools/test-forcing-metadata.py`。
 - STREAM EB 初值统一取起转起点的 2 m 气温（2026-11-24，`models/stream/app/image.cpp` initialState）：土壤（光照/阴影）、叶片、土壤热历史与 `depth` 土柱各层同温；不再用 ERA5 `skt`/`stl1`/`stl2` 初始化土壤（土壤温度并不确切已知）；数据包必需变量放宽为 `u10 v10 t2m d2m sp ssrd strd`，`skt` 仅水体像元用（缺省时水体降级为气温并警告）。旧工程结果会变，见 `docs/release-next-draft.md`。
 - 反射率/HDRF 不再截断到 [0,1]（RayTracing、VoxelRT、VoxelEB、FacetRT、FacetEB）；下文“反射率输出截断在 [0,1]”不再成立。
 - RayTracing：独立 `raytracingDepth`（默认 16），俄罗斯轮盘赌从第 3 次散射开始，周期穿越不占散射次数；阴影射线首次命中终止、起点偏移 1 mm。
@@ -56,11 +57,7 @@
   - 纵倾、横摇、波浪（水面起伏）、装载变化与运动对象吃水随时间变化：真实吃水是摆放时的静态几何与场景静态水面平均高度之比，不随时间变化；需要船体运动学（六自由度）与波面，当前场景没有对应输入，且会使面元几何逐节点变化（可见性/辐射度图要逐节点重建），超出能量平衡模块的范围。
   - 航速与航向不随对象移动自动换算（需手动填写），风向取常数、不读逐节点风向（FacetEB 气象输入未读风向）。
   - 水体仍为单层混合层：无水下吸收（短波穿透）、分层、尾流/水平输运；水线下面元只做“全遮蔽/不遮蔽”两档（`waterShielding`），没有水下光学衰减。
-- STREAM 气象强迫只实现了 ERA5 / ERA5-Land（2026-11-24 评估，**仍未处理**，不属于缺陷而是适配缺口）。EB 物理核心只要 Ta、ea、p、风速、水平面向下短波与长波；GLDAS 等其他来源要用起来，必须改的有：
-  1. 变量名与单位映射：`u10 v10 t2m d2m sp ssrd strd` 写死在 `era5.cpp` 的 `requiredVariables()` 与 `PixelForcing::at()`。GLDAS（Noah 3 h）为 `Tair_f_inst`（K）、`Qair_f_inst`（比湿 kg kg⁻¹，需与 `Psurf_f_inst` 换算水汽压，ERA5 给的是露点）、`Wind_f_inst`（标量风速，须核对参考高度）、`SWdown_f_tavg`/`LWdown_f_tavg`（时段平均通量 W m⁻²，而引擎把 `ssrd`/`strd` 当逐小时累积 J m⁻² 除以 3600，ERA5-Land 还要逐时差分）、`Psurf_f_inst`（Pa）、土壤水分 `SoilMoi0_10cm_inst`（kg m⁻²，÷100 → m³ m⁻³）。
-  2. 时间步：数据包索引、`covers()`、`Pack::load` 与 `instant()` 都假设整点逐小时；3 h 数据必须重采样到 1 h（瞬时量线性、通量量按晴空指数——`shortwave()` 现有的 ssrd/cosθ 插值可推广到 3 h 中心）；还需核对 tavg 时间戳是区间起点、终点还是中点。EB 节点是 EB 自己的整点栅格（dt = 节点间隔，表面热历史是 7 h 时间窗），不应跟着强迫步长变成 3 h；`spinupHours`（时次个数 = 小时数）对 3 h 强迫建议 ≥ 12。
-  3. 注册与校验：`era5-register`、`product` 只认 `era5`/`era5-land`（纬向步长 <0.15° 判 Land）、服务端 `index.mjs`、`config.mjs` 与界面文案/校验里写死 “ERA5 数据包”；水体 `skt` 与高程订正 `z`（m² s⁻²，GLDAS 另为 m 的地形文件）也是 ERA5 约定。
-  设计建议：（a）最小方案——外部 Python 预处理，把 GLDAS 转成 ERA5 命名/单位的逐小时 NetCDF（含 3 h→1 h 重采样、Qair→d2m、通量→累积 J m⁻²），引擎零改动，约 1 天；（b）引擎内置——在索引里加 `variableMap`（每个标准量对应源变量名、尺度/偏移、类型 instant/accumulated/flux、`stepHours`）与 `product: generic`，`PixelForcing` 通过映射取值并做时间重采样，注册与界面文案改为“气象强迫数据包”，约 3–5 天含测试。2026-11-24 起 `skt`/`stl1` 已不再是必需变量，这一步已完成。
+- STREAM 气象强迫的 GLDAS 适配（引擎侧已实现，2026-11-24；**仍未用真实 GLDAS 数据验证**）：预设 `gldas-noah-0.25`/`gldas-noah-1.0` 的变量名、单位、参考高度（Tair/Qair 按 2 m、Wind 按 10 m）与时间戳约定（`*_tavg` 按时段终点戳、时间变量为分钟）都是按产品命名和文档推断的，引擎测试只用合成数据（`tools/test-forcing-metadata.py`）；需要用户对照产品 README 与一份真实 GLDAS-2.x Noah NetCDF 核对后才能认为可用。服务端（`index.mjs`/`config.mjs` 的数据包登记与校验）与界面（元数据选择/编辑）尚未接入，仍只有 ERA5 的登记入口；EB 取风/气温的高度仍是 ERA5 约定（见 `energy.cpp` DEFERRED），元数据只折算源高度到该约定。
 - 其余见 2026-11-20 更新“仍未处理”。
 
 部署状态（取代 2026-11-20 的哈希）：`models\bin_x64\Release\histream.exe` 于 2026-11-22 22:47 重建（含太阳可见性追踪到出场景、逐节点直散拆分与 Facet 等效地面下边界），SHA256 `4dbe3f245062d0b2e6a81d4367adfc2af45822574bd32e9a4366e014ff920b2b`；`build-manifest.json` 随后由 `tools/write-build-manifest.mjs` 重写。

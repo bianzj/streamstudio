@@ -12,7 +12,7 @@ Stream Studio 中与 HiStream 三维引擎相互独立的影像级引擎：一�
 | 目录 | 内容 |
 | --- | --- |
 | `physics/` | 纯计算，不读写文件：PROSPECT/BSM（`optics`）、冠层闭合与热点（`canopy`）、`hom3` 节点辐射度（`radiosity`）、TIRTEB 短波分配与吸收（`shortwave`）、四组分能量平衡（`energy`）、土壤热（`heat_conduction`）、亮温（`brightness.h`）、SPA（`spa`） |
-| `forcing/` | ERA5 数据包登记与读取（`era5`）、像元气象的空间/时间插值（`pixel_forcing`）、UTC 时间（`utc`） |
+| `forcing/` | 气象强迫元数据（`forcing_metadata`：解析、预设、单位、校验）、强迫源接口（`forcing_source`）、网格数据包登记与读取（`era5`，含元数据标准化）、站点 CSV（`station_source`）、时间重采样与标准量推导（`forcing_resample`）、像元气象插值（`pixel_forcing`）、UTC 时间（`utc`） |
 | `scene/` | 网格与 GeoTIFF 读写（`raster`）、地类参数表（`classes`） |
 | `app/` | 配置 `stream-image-config` v2（`config`）、计算链路（`image`）、命令行入口（`main`） |
 | `classes/classes.json` | IGBP 地类参数表（冠层、叶片光学、光合、地面、空气动力学），带单位说明 |
@@ -34,6 +34,9 @@ cmake --build build/stream --config Release
 ```text
 stream run <run-config.json>
 stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...
+stream forcing-register <pack.json> --metadata <预设|元数据.json> <file.nc>...
+stream forcing-preset [名称]
+stream forcing-check <预设|元数据.json> [--data 数据包.json|站点.csv ...] [--json]
 ```
 
 配置由 `server/stream/config.mjs` 生成；进度以 `STREAM\tprogress\t<百分比>\t<阶段>` 写到 stdout，日志行以 `[STREAM]` 开头。
@@ -110,25 +113,29 @@ L↓ 由背景状态一次确定，反演/同化改变组分温度后不再重�
 
 纬度、经度省略时由地表类型栅格的地理参考换算为 WGS84。
 
-## 气象强迫来源：ERA5 为用例，其他来源的变量约定与限制
+## 气象强迫：元数据机制（ERA5 为用例）
 
-（2026-11-24 评估，未实现 GLDAS 等适配器。）EB 的物理核心只用六个量：近地面气温 Ta（K）、水汽压 ea（hPa）、气压 p（hPa）、风速（m s⁻¹）、水平面向下短波（W m⁻²）与向下长波（W m⁻²）。ERA5 / ERA5-Land 只是目前唯一实现的读入方式（`forcing/era5.cpp`，索引 `stream-era5-pack`，配置字段 `temperature.era5.pack`）。EB 的初值与运行除 `t2m` 外不再依赖 `skt`/`stl1`/`stl2`：必需变量为 `u10 v10 t2m d2m sp ssrd strd`；`skt` 只在地类含水体时读取（缺省时水体降级为气温并警告），`stl1`/`stl2` 不再使用，`swvl1`（`soilMoisture.source=era5`）与 `z`（DEM 订正）可选。
+EB 的物理核心只用六个量：近地面气温 Ta（K）、水汽压 ea（hPa）、气压 p（hPa）、风速（m s⁻¹）、水平面向下短波（W m⁻²）与向下长波（W m⁻²）。2026-11-24 起，引擎不再写死 ERA5 的变量名与单位：用一份**气象强迫元数据**（JSON）描述“数据里每个物理量叫什么、什么单位、测在多高、怎么随时间取值”，**标准化层**把任何来源转成内部标准量（ERA5 命名、SI 单位：`t2m d2m sp u10 v10 ssrd strd`，可选 `skt swvl1 z`），物理核心不变。完整规格、字段表、预设、换算公式与校验消息见 [`docs/forcing-metadata.md`](../../docs/forcing-metadata.md)，JSON Schema 见 `docs/forcing-metadata.schema.json`。
 
-| 项 | 现状 | 通用 / ERA5 特有 |
-| --- | --- | --- |
-| 物理量与单位 | Ta（K）、ea（由露点换算）、p（Pa→hPa，按 DEM 高差订正）、风速（由 u10/v10 合成）、短波/长波（水平面 W m⁻²） | 通用（引擎内部量） |
-| 变量名 | `u10 v10 t2m d2m sp ssrd strd skt swvl1 z` 硬编码在 `requiredVariables()`/`optionalVariables()`、`PixelForcing::at()`；服务端/界面文案与登记（`era5-register`、`era5Packs`）也写死 ERA5 | ERA5 特有 |
-| 辐射量类型 | `ssrd`/`strd` 是**逐小时累积量**（J m⁻²，除以 3600；ERA5-Land 自 00 UTC 累积，逐时差分） | ERA5 特有；GLDAS 的 `SWdown_f_tavg`/`LWdown_f_tavg` 是时段平均通量（W m⁻²），不能再除 3600、不做差分 |
-| 湿度 | 露点 `d2m`→ ea | ERA5 特有；GLDAS 为比湿 `Qair_f_inst`（kg kg⁻¹），需用 `Psurf_f_inst` 换算 ea = q·p/(0.622+0.378q) |
-| 时间轴 | 逐小时整点：`covers()` 要求每个整点都有数据，时间 `llround` 到整点，`instant()` 在相邻整点线性插值；短波按“晴空指数 ssrd/cosθ”在小时中心之间插值 | 假设 1 h 步长（写死），思路通用 |
-| 空间 | 规则经纬网、双线性、经度 0–360 与全球环绕；产品由 `|纬向步长|<0.15` 推断 era5 / era5-land（只影响累积差分） | 通用，0.25° / 1° 均可 |
-| 高程订正 | `z`（m² s⁻²，÷g） | ERA5 特有；GLDAS 的地形为单独文件（单位 m） |
-| 土壤水分 | `swvl1`（m³ m⁻³） | ERA5 特有；GLDAS Noah `SoilMoi0_10cm_inst`（kg m⁻²）÷100 才是体积含水量，或用 `soilMoisture.source=user` |
+| 来源 | 形态 | 元数据 | 说明 |
+| --- | --- | --- | --- |
+| ERA5 | 网格 NetCDF，逐小时 | 预设 `era5` | 缺省（旧工程只写 `temperature.era5.pack` 时按数据包的 `product` 取预设）；逐小时累积 J m⁻²，原路径读取，结果与引入元数据前逐字节相同 |
+| ERA5-Land | 网格，逐小时 | 预设 `era5-land` | 辐射自 00 UTC 累积，逐时差分 |
+| GLDAS-2.x Noah | 网格，3 小时 | 预设 `gldas-noah-0.25` / `gldas-noah-1.0` | 比湿→水汽压、时段平均辐射（W m⁻²，时段终点戳）、3 h→逐小时（短波按太阳高度分配、长波按中点线性，时段能量守恒）；**变量名、参考高度、时间戳约定按产品文档推断，尚未用真实 GLDAS 数据验证**（引擎测试用合成数据） |
+| 气象站 CSV | 单站/多站 | 预设 `station-csv` | 逐小时重采样、累积差分、最近站/IDW（≤4 站）、可选站点海拔订正；预设故意不写观测高度，请在元数据里补 `height_m` |
+| 其他 | 网格或站点 | 自定义元数据 | 改 `source`/`unit`/`kind`/`height_m`、湿度 `type`（露点/比湿/混合比/相对湿度/水汽压）、风 `type`（分量/风速风向/仅风速）、气压 `type`（地面/海平面/无）等；可写 `{"preset": "...", ...}` 只覆盖差异 |
 
-**3 小时（粗时间分辨率）强迫下的语义。** EB 的节点是 EB 自己的整点时间栅格（`marchStart + 3600 s × k`），步长 dt 取相邻节点间隔，表面热历史是 7 h 的**时间窗**（按实际经过的时间，不是 7 个条目），所以 `spinupHours` 的“时次个数”= 小时数，与强迫数据的时间步无关。3 小时强迫必须先重采样到 1 h 节点（瞬时量线性插值，通量量按晴空指数插值）；此时 7 个节点只跨约 2–3 个强迫时次，起点气温是插值值而不是观测，建议把 `spinupHours` 调到 ≥ 12，使土壤热历史与初值偏差充分衰减。不建议把 EB 节点直接改为 3 h（隐式求解仍稳定，但叶/土日变化与热历史窗口都会被过度平滑）。
+配置：`temperature.forcing = { "pack": "…/pack.json", "files": ["站点.csv"], "metadata": "预设名 | 元数据.json 路径 | 内联对象" }`（`temperature.forcingMetadata` 为 `forcing.metadata` 的简写）；旧字段 `temperature.era5.pack` 继续有效。数据包用 `stream era5-register`（ERA5）或 `stream forcing-register`（其他网格来源，索引里带元数据）登记，站点 CSV 无需登记。
 
-**GLDAS 变量约定（拟）。** 近地面气温 `Tair_f_inst`（K）→ t2m；比湿 `Qair_f_inst` + `Psurf_f_inst`（Pa）→ d2m/ea、sp；风速 `Wind_f_inst`（须按产品文档核对参考高度）→ 风速；`SWdown_f_tavg`、`LWdown_f_tavg`（W m⁻²，时段平均）→ ssrd/strd（不做累积换算）；`Rainf*` 不参与 EB。时间戳需核对是时段起点、终点还是中点。完整适配的工作项与设计建议见 `docs/model-remaining-issues-20261005.md`（2026-11-22 更新）。
+**命令**：`stream forcing-preset [名称]`（列出预设 / 输出预设 JSON）、`stream forcing-check <预设名|元数据.json|JSON 文本> [--data 数据包索引.json | 站点.csv ...] [--json]`（校验元数据，加 `--data` 时再按元数据打开数据：变量/列、时间解析、站点位置；`--json` 输出 `{ok, errors, warnings, notes, resolved}`）、`stream forcing-register <索引.json> --metadata <预设|元数据.json> <文件.nc>...`。
 
+**运行记录**：日志写出所用元数据与警告；`scene_summary.json` 的 `temperature.forcing` 记录元数据名与来源、各量的源变量/单位/高度、高度订正、换算（`derived`）、忽略项（`ignored`）、被 `missing`/`range` 剔除的值数（`valuesRemoved`）与警告；`temperature.era5` 保持原样。
+
+**EB 的参考高度**仍按 ERA5 约定（风 10 m、气温/露点 2 m）；元数据的 `heightCorrection` 只负责把源数据高度折算到这个约定（风对数律，气温可选递减率），`energy.cpp` 里把它们当作气动阻抗高度处的值是已知近似，本机制不改变它。
+
+**3 小时（粗时间分辨率）强迫下的语义。** EB 的节点是 EB 自己的整点时间栅格（`marchStart + 3600 s × k`），表面热历史是 7 h 的**时间窗**，所以 `spinupHours` 的“时次个数”= 小时数，与强迫数据的时间步无关。粗步长数据由标准化层重采样到逐小时（瞬时量线性插值，缺口超过 `max(6 h, 2×步长)` 视为缺测；通量量守恒分配）；此时 7 个节点只跨约 2–3 个强迫时次，起点气温是插值值而不是观测，建议把 `spinupHours` 调到 ≥ 12。不建议把 EB 节点直接改为 3 h。
+
+**限制**：网格数据须为整点记录（步长为整数小时），亚小时网格数据请先重采样；GRIB 请先转 NetCDF；`precipitation`、直射/散射短波只解析校验、EB 不使用；无向下长波时可选 Brutsaert 晴空参数化（`longwaveDown.fallback`，不含云，阴天偏低，强制警告）；无向下短波无法运行。
 ## 同化（直接模拟 / 同化）
 
 配置块 `assimilation`（`stream-image-config` v2，可选）。只需给出观测是什么和数据文件，其余（观测/背景误差、迭代、控制变量）是 `app/assimilation.cpp` 的内置默认值：

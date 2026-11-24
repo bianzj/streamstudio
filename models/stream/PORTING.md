@@ -13,7 +13,7 @@
 | `physics/energy.*` | `base/pipeline.py`、`base/aerodynamic.py`、`base/eb.py`、`base/biochemical.py`、`base/evapo.py` | TIRTEB 组件能量平衡、气动/气孔阻抗、温度修正、1/L 松弛求解 |
 | `physics/heat_conduction.*` | `base/heat_conduction.py` | `surface` 7 h 温度历史卷积（与 TIRTEB `HISTORY_SECONDS` 相同）、`depth` 2 m 土柱（16 节点，向后欧拉） |
 | `physics/brightness.h` | `base/brightness.py` / TiRT c1、c2 | Planck 辐亮度与反演亮温 |
-| `forcing/*` | 无（TiRT 读 CSV 气象） | 直接读 ERA5 / ERA5-Land NetCDF |
+| `forcing/*` | 无（TiRT 读 CSV 气象） | 气象强迫元数据驱动：ERA5 / ERA5-Land（原路径）、GLDAS 风格 3 h 网格、气象站 CSV，统一标准化为 ERA5 命名的 SI 标准量（`docs/forcing-metadata.md`） |
 | `scene/classes.*`、`classes/classes.json` | `base/io.py` `read_defined`、`defined.txt` | IGBP 参数表，带单位说明 |
 | `app/image.cpp` | 成像链路 | 逐像元 EB 时序与方向成像 |
 
@@ -50,7 +50,9 @@
 7. **土壤阻抗默认值**：`input_tirteb.csv` 的 `soil_rss=200` 常数模式；STREAM 同为常数 200，可在配置中改为 `sellers` 含水量关系。土壤水分仍驱动 BSM 光谱；用户输入的土壤水大于 1 时按百分数除以 100，BSM 内限制在 0.05–0.55。
 8. **叶片发射率**：EB 宽带取 0.985；成像按 `1−reflTir−transTir`（现表为 0.975）。TIRTEB 同样区分宽带与观测波段发射率。
 
-## ERA5（`forcing/*`）
+## 气象强迫（`forcing/*`；ERA5 为用例）
+
+- 2026-11-24 起变量名/单位/高度/时间步由气象强迫元数据描述（`forcing_metadata`、`forcing_source`、`forcing_resample`、`station_source`，规格见 `docs/forcing-metadata.md`）；ERA5 / ERA5-Land 布局（预设 `era5`、`era5-land`）仍走原读取路径，结果逐字节不变，以下细节指这一原路径。GLDAS 预设未经真实数据验证。
 
 - 数据包：任意时段逐小时数据，可多文件；登记时写 `kind = stream-era5-pack` 索引，`complete` 表示必需变量逐小时连续，`fullYear` 表示覆盖整年。
 - 必需 `u10 v10 t2m d2m sp ssrd strd`，可选 `skt`（仅水体像元用）、`stl1 stl2`（不再使用，可有可无）、`swvl1 z`（2026-11-24 前 `skt stl1` 为必需）；兼容 CDS 新旧 NetCDF 与 ERA5-Land 累积辐射差分。

@@ -54,6 +54,13 @@
 
 - **土壤方法 2 深层边界核对**（2026-11-23，不改数值，FacetEB 与 VoxelEB）：核对“方法 2 无深层恢复”——底边界是固定温度并经土层导热相连（FacetEB 3 m 处固定为初始地温，VoxelEB 1 m 节点固定为材料 `Tsoil`），热含量变化 = ΣG − 底通量，既非零通量也不漂移。城市示例三日对照（同壤土、同气象，对方法 1 完整历史，即无限半空间）：FacetEB 3 m 处温度变化 < 10⁻⁴ K，G 日均差 ≤ 0.24 W m⁻²、Ts 日较差 +0.25 K、正午 Ts +0.3 K、三日 ΣG −1.6%；VoxelEB 正午 Ts ≤ 0.16 K、日较差 +0.3 K，G 日均 +3.3–4.5 W m⁻²（来自 `Tsoil` 25 ℃ 与初温 26.85 ℃ 之差，约 1 W m⁻² K⁻¹）。离线双精度复算（与引擎 G 逐点一致）显示 FacetEB 3 m 对 30 天以内与一年波动的 G 日均偏差 ≤ 0.9 W m⁻²，VoxelEB 1 m 在 14 天以上或持续升降温时偏离更大，结论为设计合理、不改模型，建议 `Tsoil` 取与初温一致。新增 `faceteb_run.json` 每节点 `soilColumn` 诊断（面积平均表面温度、表面/底通量、土柱热含量与平均温度、底层温度）和回归算例 `feb_urban_soil_m2_3d`、`feb_urban_soil_m1_3d_full`、`veb_urban_soil_m2_3d`、`veb_urban_soil_m1_3d_full`。详见 `docs/model-remaining-issues-20261005.md`。
 
+### STREAM 气象强迫元数据（2026-11-24，引擎侧）
+
+- **气象强迫由元数据描述。** 变量名、单位、湿度类型（露点/比湿/混合比/相对湿度/水汽压）、风类型、气压类型、观测高度与订正、时间步长与时间戳含义、缺测与范围都写在一份 JSON 元数据里（`docs/forcing-metadata.md`），引擎标准化后再驱动 EB。内置预设：`era5`、`era5-land`、`gldas-noah-0.25`、`gldas-noah-1.0`、`station-csv`。
+- **新来源。** GLDAS 风格 3 小时网格（比湿→水汽压、时段平均辐射、3 h→逐小时的通量守恒分配）与气象站 CSV（单站/多站、最近站/IDW、站点海拔订正）。**GLDAS 预设尚未用真实 GLDAS 数据验证**，变量名、参考高度与时间戳约定待用户核对；引擎测试只用合成数据。
+- **兼容性。** 旧工程只写 `temperature.era5.pack` 时使用 `era5`/`era5-land` 预设，读取路径与改动前相同，四个 ERA5 基线算例（MODIS 1 km、Landsat 300 m 2 天/1 天、起转 24）输出 TIFF 与组分逐字节不变。新增配置 `temperature.forcing {pack, files, metadata}`（或 `temperature.forcingMetadata`），`scene_summary.json` 新增 `temperature.forcing`，`temperature.era5` 不变。
+- **命令行。** `stream forcing-preset`、`stream forcing-check <元数据> [--data …] [--json]`、`stream forcing-register <索引> --metadata <预设|文件> <nc…>`；`era5-register` 不变。服务端与界面尚未接入（仍只有 ERA5 登记入口）。
+
 ### STREAM EB 起转与稳定度迭代（2026-11-24，改变数值）
 
 - **起转（spin-up）缺省改为过境前 7 个 ERA5 整点时次。** `temperature.spinupHours` 现在是起转**时次个数**（缺省 7，0–240，非整数向上取整），起点永远相对过境时刻往前数，不是固定的 00 UTC 或固定的 24 h：取严格早于“过境前 5 min”的最后一个整点，再往前数 N 个整点（过境 02:55、N=7 → 前一日 20:00，共 8 个时次含过境时刻）。理由：2 m 空气温度已对结果约束很强，不需要起转太久；7 与表面热历史保留的 7 h 对应。数据包不覆盖起点时退回最早可用时次并警告，同时在 `scene_summary.json` 的 `temperature.notes` 写“起转不足”；`scene_summary.json` 新增 `spinupNodesRequested`/`spinupNodesUsed`/`ebNodeCount`（去掉 `spinupHoursRequested`）。过境前没有任何整点时次时（N>0）报错。初值见下条。
