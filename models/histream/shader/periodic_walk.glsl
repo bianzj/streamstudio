@@ -1,6 +1,7 @@
 #ifndef PERIODIC_WALK_GLSL
 #define PERIODIC_WALK_GLSL
 
+
 // Periodic boundary traversal shared by RayTracing and the voxel modes.
 //
 // The scene is one rectangular domain repeated along world x and z. A ray
@@ -24,9 +25,17 @@ const float PERIODIC_WALK_HUGE = 1.0e30;
 // setting.periodicNeighborCount at run time.
 layout(constant_id = 0) const bool PERIODIC_BOUNDARY_ENABLED = true;
 
+// Specialization constant 1: the run's crossing limit when the host knows it
+// (VoxelRT/VoxelEB set clamp(periodicTraversalCount, 0, 20)); -1 keeps the
+// limit a run-time value (pipelines that do not specialize it). A known limit
+// lets the driver fold every "periodic or not" decision of a call site
+// instead of compiling both alternatives into the periodic pipelines.
+layout(constant_id = 1) const int PERIODIC_CROSSING_LIMIT = -1;
+
 // Crossings allowed per query: 0 disables periodic traversal.
 int periodicCrossingLimit(int requested)
 {
+  if(PERIODIC_CROSSING_LIMIT >= 0) return PERIODIC_CROSSING_LIMIT;
   return PERIODIC_BOUNDARY_ENABLED ? clamp(requested, 0, 20) : 0;
 }
 

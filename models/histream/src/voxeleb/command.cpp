@@ -428,7 +428,7 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     }
     setting.scatteringStage = 0;
     setting.scatteringOrders = modelio->shortwaveScatteringOrders;
-    submit(modelio, VoxelEBStage::scatteringVNIR, voxelSize1D, std::nullopt, std::nullopt);
+    submit(modelio, VoxelEBStage::scatteringTrace, voxelSize1D, std::nullopt, std::nullopt);
     waitFence(modelio);
     // Each spectral group owns the entire directional field until all its
     // orders finish. Reusing two fields keeps memory independent of K.
@@ -446,7 +446,7 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
         // rescale it by their sky irradiance instead of retracing 64 rays.
         setting.scatteringStage = skyTransmittanceReady ? 4 : 1;
         setting.scatteringOrder = 0;
-        submit(modelio, VoxelEBStage::scatteringVNIR, voxelSize1D, std::nullopt, std::nullopt);
+        submit(modelio, VoxelEBStage::scatteringTrace, voxelSize1D, std::nullopt, std::nullopt);
         waitFence(modelio);
         skyTransmittanceReady = true;
         for (int order = 1; order <= modelio->shortwaveScatteringOrders; ++order) {
@@ -456,7 +456,7 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
             submit(modelio, VoxelEBStage::scatteringVNIR, voxelSize1D, std::nullopt, std::nullopt);
             waitFence(modelio);
             setting.scatteringStage = 3;
-            submit(modelio, VoxelEBStage::scatteringVNIR, voxelSize1D, std::nullopt, std::nullopt);
+            submit(modelio, VoxelEBStage::scatteringTrace, voxelSize1D, std::nullopt, std::nullopt);
             waitFence(modelio);
             orderMilliseconds[order - 1] += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - orderBegin).count();

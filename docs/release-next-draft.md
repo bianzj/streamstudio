@@ -64,7 +64,21 @@
 - VoxelRT：太阳方向不变时多视角/航点只重跑成像（61 视角 14 s → 4.5 s）。
 - RayTracing：批次按实测 GPU 耗时自适应切分（约 120 ms/批），消除开周期边界时的低占用和整图一次提交的 TDR 风险。
 - 服务端：FacetEB 逐节点出图改为每次运行一个常驻出图线程（超过 300 万面元时仍逐节点开线程，阈值 `STREAM_STUDIO_FACET_STEP_RESIDENT_FACETS`）。
-- **未开周期边界的 VoxelEB/VoxelRT 恢复周期一致化之前的耗时**：周期边界一致化后，`TurbidSegmentOpticalDepth` 里第二处盒内 DDA 调用（即使该分支从不执行）使驱动为短波散射着色器生成的代码慢约 1/3，周期遍历的其余分支又使其他传输 pass 变慢。现在盒内 DDA 只有一个调用点（按需 1–2 遍的循环），并新增特化常量 `PERIODIC_BOUNDARY_ENABLED`（`shader/periodic_walk.glsl`，constant_id 0）：VoxelRT/VoxelEB 建管线时按 `periodicTraversalCount > 0` 设置，未开周期时驱动去掉全部周期分支（RayTracing 不设置，按默认值照旧运行时判断）。耗时（同机、各跑 2 次取快）：veb_forest 12.15 → 9.63 s（一致化之前 9.59 s；短波散射每节点 3.43 → 2.52 s，之前 2.53 s），vrt_forest 6.42 → 6.19 s（之前 6.22 s），rt_forest 1.27 → 1.26 s；开周期 veb_forest_periodic 14.08 → 13.98 s、vrt_forest_periodic 7.62 → 7.41 s、rt_forest_periodic 1.26 → 1.25 s。33 个冻结算例的全部输出逐字节不变（下面零值像元修正涉及的像元除外）。开周期的 VoxelEB 仍比不开周期慢约 45%（短波散射 2.5 → 4.0 s/节点），其中约 1 s 来自第二遍盒内积分使驱动代码生成变差（该遍本身的计算约 0.14 s），尚未找到不改变结果又能消除它的写法（试过的合并循环、`[[dont_unroll]]`、特化常量分支均无效）。
+- **未开周期边界的 VoxelEB/VoxelRT 恢复周期一致化之前的耗时**：周期边界一致化后，`TurbidSegmentOpticalDepth` 里第二处盒内 DDA 调用（即使该分支从不执行）使驱动为短波散射着色器生成的代码慢约 1/3，周期遍历的其余分支又使其他传输 pass 变慢。现在盒内 DDA 只有一个调用点（按需 1–2 遍的循环），并新增特化常量 `PERIODIC_BOUNDARY_ENABLED`（`shader/periodic_walk.glsl`，constant_id 0）：VoxelRT/VoxelEB 建管线时按 `periodicTraversalCount > 0` 设置，未开周期时驱动去掉全部周期分支（RayTracing 不设置，按默认值照旧运行时判断）。耗时（同机、各跑 2 次取快）：veb_forest 12.15 → 9.63 s（一致化之前 9.59 s；短波散射每节点 3.43 → 2.52 s，之前 2.53 s），vrt_forest 6.42 → 6.19 s（之前 6.22 s），rt_forest 1.27 → 1.26 s；开周期 veb_forest_periodic 14.08 → 13.98 s、vrt_forest_periodic 7.62 → 7.41 s、rt_forest_periodic 1.26 → 1.25 s。33 个冻结算例的全部输出逐字节不变（下面零值像元修正涉及的像元除外）。开周期的 VoxelEB 仍比不开周期慢约 45%（短波散射 2.5 → 4.0 s/节点），其中约 1 s 来自第二遍盒内积分使驱动代码生成变差（该遍本身的计算约 0.14 s），尚未找到不改变结果又能消除它的写法（试过的合并循环、`[[dont_unroll]]`、特化常量分支均无效；后来的查明与处理见下条）。
+- **开周期 VoxelEB/VoxelRT 提速，不开周期同步提速**（2026-11-24，不改结果）：此前把开周期慢归因于第二遍盒内积分的代码生成。每 pass 计时与 `VK_KHR_pipeline_executable_properties`（寄存器/二进制大小/局部内存）显示真实原因有两个：① 所有 NanoVDB 查询 `nanovdbGet` 按值传 `NanoVDBLink`，读访问器缓存的叶/节点路径在每次调用后丢弃，每个体元查询都从根重走；周期遍历的 DDA、逃逸积分查询量成倍增加，代价被放大。现在 `nanovdbGet` 的链接参数为 `inout`（`shader/nanovdb_info.glsl`），读到的值不变。② 短波散射着色器把阶段 2（散射源 `buildSource`：64 项逐体元数组 + 16 KiB 共享叶核）与追踪阶段（0/1/3/4）放在同一模块，其寄存器与共享内存占用决定了追踪阶段的占用率；开周期代码使寄存器 162 → 176，越过 168 的台阶，追踪阶段 +46%。现在同一源文件再按 `-DSCATTER_TRACE_STAGE` 编译出追踪专用模块 `voxelrad_scattering_trace.comp.spv`（阶段 0/1/3/4，`VoxelEBStage::scatteringTrace`，开周期 168 寄存器、无共享内存），阶段 2 仍用原完整模块（把阶段 2 也单独编译时驱动的乘加融合不同，结果不再逐字节相同，故未采用）。另新增特化常量 `PERIODIC_CROSSING_LIMIT`（constant_id 1，VoxelRT/VoxelEB 建管线时设为 clamp(`periodicTraversalCount`, 0, 20)，默认 −1 表示运行时取值），使开周期管线内“是否周期”的判断在编译期折叠（单独约 1%）。`tools/write-build-manifest.mjs` 的预期着色器清单加入 trace 模块。耗时（同机、2 节点冻结算例，新旧引擎交替各 5 次取中位数）：
+
+  | 算例 | 旧 | 新 | 变化 |
+  |---|---|---|---|
+  | veb_forest_periodic（森林周期 8） | 11.36 s（短波散射 3.06 s/节点） | 7.23 s（1.44 s/节点） | −36% |
+  | veb_forest（不开周期） | 8.03 s（1.84 s/节点） | 6.09 s（1.17 s/节点） | −24% |
+  | veb_lattice_periodic | 8.01 s | 5.92 s | −26% |
+  | veb_urban（不开周期） | 3.59 s（0.71 s/节点） | 2.49 s（0.27 s/节点） | −31% |
+  | vrt_forest_periodic | 7.03 s | 5.50 s | −22% |
+  | vrt_forest（不开周期） | 5.71 s | 4.71 s | −18% |
+  | vrt_lattice_periodic | 5.70 s | 4.51 s | −21% |
+  | vrt_urban（不开周期） | 1.46 s | 1.26 s | −14% |
+
+  开周期/不开周期耗时比：VoxelEB 森林 1.41 → 1.19，VoxelRT 森林 1.23 → 1.17。逐 pass（veb_forest_periodic，插桩版，2 节点合计）：长波漫射（TIR 迭代）2.81 → 1.70 s，所有 pass 合计 8.77 → 4.64 s。剩余的开周期开销：VoxelRT 全部是周期遍历的真实工作量；VoxelEB 约 0.4 s 为周期代码存在（运行时关闭时同一管线仍慢 7%），约 0.8 s 为多副本光线查询与积分。验证：36 个冻结算例（全部 VoxelEB/VoxelRT 算例，含 veb_forest_periodic、veb_lattice_periodic、veb_urban、vrt_ 开头的全部，另抽样 feb_crop、feb_urban、frt_crop）新旧引擎输出逐文件逐字节比较——除 `project.json`/`result.json`（路径与耗时）、`diagnostics/scattering_node=*.json`（`elapsedMs`，以及 GPU 浮点原子累加的 `absorbedShortwave` 等统计量，旧引擎自己重跑也在相对 10⁻⁷ 量级变化，如 3138682.456 / 3138682.065 / 新 3138678.651）、Facet 的运行时间戳 JSON 外，所有图像、体元/面元过程文件、能量平衡/生理诊断、统计 CSV 均逐字节相同；无任何结果变化，未使用放宽的容差。
 
 ### 新工程默认值（2026-11-22）
 

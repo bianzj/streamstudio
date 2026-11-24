@@ -2,6 +2,9 @@
 // Created by admin on 2024/1/26.
 //
 #include <io.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include "pipeline.h"
 
 
@@ -49,11 +52,19 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelrtIO> &modelio)
         LOGI(error.c_str());
     }
 
-    // Specialization constant 0 (PERIODIC_BOUNDARY_ENABLED, periodic_walk.glsl):
-    // without periodic boundaries the driver drops every periodic branch.
-    const VkBool32 periodicBoundary = modelio->periodicNeighborCount > 0 ? VK_TRUE : VK_FALSE;
-    const VkSpecializationMapEntry periodicEntry{0, 0, sizeof(VkBool32)};
-    const VkSpecializationInfo periodicSpecialization{1, &periodicEntry, sizeof(VkBool32), &periodicBoundary};
+    // Specialization constants (periodic_walk.glsl): 0 = PERIODIC_BOUNDARY_ENABLED,
+    // 1 = PERIODIC_CROSSING_LIMIT. Without periodic boundaries the driver
+    // drops every periodic branch; with them the crossing limit is a
+    // compile-time constant, so the periodic and non-periodic code paths of
+    // a call site are no longer both kept.
+    struct PeriodicSpecData { VkBool32 enabled; int32_t limit; };
+    const PeriodicSpecData periodicData{
+        modelio->periodicNeighborCount > 0 ? VK_TRUE : VK_FALSE,
+        std::clamp<int32_t>(modelio->periodicNeighborCount, 0, 20)};
+    const VkSpecializationMapEntry periodicEntries[2] = {
+        {0, offsetof(PeriodicSpecData, enabled), sizeof(VkBool32)},
+        {1, offsetof(PeriodicSpecData, limit), sizeof(int32_t)}};
+    const VkSpecializationInfo periodicSpecialization{2, periodicEntries, sizeof(PeriodicSpecData), &periodicData};
 
     for (const auto &stage : magic_enum::enum_values<VoxelRTStage>())
     {

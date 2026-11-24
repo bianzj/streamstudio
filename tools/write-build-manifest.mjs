@@ -50,7 +50,9 @@ const builtShaderModules = new Set([
   ...['voxeleb', 'voxelrt'].flatMap(kind => fs.readdirSync(path.join(shaderSourceRoot, kind))
     .filter(file => file.endsWith('.comp')).map(file => `${kind}/${file}.spv`)),
   // VoxelEB Monin-Obukhov variants compiled with -DVOXELEB_MOST (CMakeLists.txt).
-  ...['aeresist', 'budget', 'evapo'].map(name => `voxeleb/${name}_most.comp.spv`)
+  ...['aeresist', 'budget', 'evapo'].map(name => `voxeleb/${name}_most.comp.spv`),
+  // VoxelEB scattering ray tracing stages compiled with -DSCATTER_TRACE_STAGE.
+  'voxeleb/voxelrad_scattering_trace.comp.spv'
 ].map(file => file.toLowerCase()))
 const deployedShaderBinaries = inventory(path.join(runtime, 'shader'), p => p.endsWith('.spv'))
   .map(file => ({ path: path.relative(runtime, file).replaceAll('\\', '/'), sha256: sha256(file) }))

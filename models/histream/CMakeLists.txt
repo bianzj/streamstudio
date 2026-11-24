@@ -305,6 +305,29 @@ foreach (VOXELEB_SHADER_SOURCE IN LISTS HISTREAM_VOXELEB_SHADER_FILES)
                 VERBATIM)
         list(APPEND HISTREAM_VOXELEB_SHADER_OUTPUTS "${VOXELEB_MOST_OUTPUT}")
     endif()
+    # Scattering ray tracing stages (0, 1, 3, 4): the same file with
+    # -DSCATTER_TRACE_STAGE, without the stage 2 source build (its arrays and shared memory would limit the occupancy of the tracing stages).
+    if (VOXELEB_SHADER_FILE STREQUAL "voxelrad_scattering_VNIR.comp")
+        set(VOXELEB_TRACE_OUTPUT
+                "${HISTREAM_VOXELEB_SHADER_BINARY_DIR}/voxelrad_scattering_trace.comp.spv")
+        add_custom_command(
+                OUTPUT "${VOXELEB_TRACE_OUTPUT}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory
+                        "${HISTREAM_VOXELEB_SHADER_BINARY_DIR}"
+                COMMAND "${HISTREAM_GLSLC}" --target-env=vulkan1.2 -DSCATTER_TRACE_STAGE=1
+                        "${VOXELEB_SHADER_SOURCE}"
+                        -o "${VOXELEB_TRACE_OUTPUT}"
+                DEPENDS "${VOXELEB_SHADER_SOURCE}"
+                        ${HISTREAM_SHARED_SHADER_DEPENDENCIES}
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/shade_state_voxel.glsl"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/parameters.h"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/bindingLayout.h"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/settings.h"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/global.glsl"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/shader/functions.glsl"
+                VERBATIM)
+        list(APPEND HISTREAM_VOXELEB_SHADER_OUTPUTS "${VOXELEB_TRACE_OUTPUT}")
+    endif()
 endforeach()
 add_custom_target(histream_voxeleb_shaders ALL
         DEPENDS ${HISTREAM_VOXELEB_SHADER_OUTPUTS})

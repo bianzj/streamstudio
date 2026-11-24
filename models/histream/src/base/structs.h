@@ -62,7 +62,8 @@ enum class VoxelEBStage
     updateTp,
     fluidLbm,
     fluidCommit,
-    out
+    out,
+    scatteringTrace
 };
 
 enum class VoxelRTStage

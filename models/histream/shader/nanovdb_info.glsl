@@ -24,8 +24,13 @@ NanoVDBLink nanovdbInit() {
 	return nanoVDBLink;
 }
 
-// obtain the data using Nanovdb structure and 3D position
-int nanovdbGet(NanoVDBLink nanoVDBLink, ivec3 pos)
+// obtain the data using Nanovdb structure and 3D position.
+// The link is inout: the read accessor caches the leaf/node path of the last
+// lookup, and consecutive cells of a DDA (or consecutive hits of a ray) are
+// neighbours. A by-value link discarded that cache after every call, so each
+// lookup walked the tree from the root again (the periodic boundary walks
+// issue several times more lookups per ray). The value read is unchanged.
+int nanovdbGet(inout NanoVDBLink nanoVDBLink, ivec3 pos)
 {
 	pnanovdb_coord_t ijk =pos;
 	pnanovdb_address_t address = pnanovdb_readaccessor_get_value_address(PNANOVDB_GRID_TYPE_INT32, nanoVDBLink.buf, nanoVDBLink.accessor, ijk);
