@@ -1,10 +1,12 @@
 #include "forcing_resample.h"
 
 #include "forcing_source.h"
+#include "utc.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <set>
 
 namespace stream {
 
@@ -217,5 +219,65 @@ void standardiseQuantities(const ForcingMetadata& meta_, const std::map<std::str
                 for (size_t cell = 0; cell < cells; ++cell) if (std::isfinite(found->second[cell])) out[cell] = static_cast<float>(found->second[cell]);
         } else throw std::runtime_error("未知的标准强迫量 " + name);
     }
+}
+
+std::vector<std::string> forcingChannelKeys(const ForcingMetadata& meta, const std::vector<std::string>& variables,
+                                            const std::function<bool(const std::string&)>& present)
+{
+    std::set<std::string> keys;
+    const auto wind = [&] {
+        if (meta.windType == "components") { keys.insert("u"); keys.insert("v"); }
+        else { keys.insert("speed"); if (meta.windType == "speedDirection") keys.insert("dir"); }
+    };
+    const auto pressure = [&] {
+        if (meta.pressureType == "surface") keys.insert("p");
+        else { keys.insert("z"); if (meta.pressureType == "seaLevel") { keys.insert("p"); keys.insert("ta"); } }
+    };
+    const auto dewpoint = [&] {
+        keys.insert("hum");
+        if (meta.humidityType != "dewpoint") { keys.insert("ta"); if (meta.humidityType != "vapourPressure") pressure(); }
+    };
+    for (const auto& name : variables) {
+        if (name == "t2m") keys.insert("ta");
+        else if (name == "d2m") dewpoint();
+        else if (name == "sp") pressure();
+        else if (name == "u10" || name == "v10") wind();
+        else if (name == "ssrd") keys.insert("sw");
+        else if (name == "strd") {
+            if (present("lw")) keys.insert("lw");
+            else { keys.insert("ta"); dewpoint(); }
+        } else if (name == "skt") keys.insert("skt");
+        else if (name == "swvl1") keys.insert("swvl");
+        else if (name == "z") keys.insert("z");
+    }
+    std::vector<std::string> out;
+    for (const auto& key : keys) if (present(key)) out.push_back(key);
+    return out;
+}
+
+bool recordsCover(const ForcingChannel& channel, double step, const std::vector<double>& times, bool flux, double maxGap,
+                  int64_t first, int64_t last, std::string& why)
+{
+    if (flux) {
+        for (int64_t hour = first; hour <= last; ++hour) {
+            bool covered = false;
+            for (const double t : times) {
+                const double end = (channel.kind == "previous" || channel.stamp == "interval_start") ? t + step : channel.stamp == "interval_mid" ? t + 0.5 * step : t;
+                if (end - step <= hour - 1 + 1e-9 && end >= hour - 1e-9) { covered = true; break; }
+            }
+            if (!covered) { why = formatUtc(static_cast<double>(hour) * 3600.0) + " 之前的一小时没有记录覆盖"; return false; }
+        }
+        return true;
+    }
+    double before = kNotANumber, after = kNotANumber;
+    for (const double t : times) { if (t <= first + 1e-9) before = t; if (t >= last - 1e-9 && !std::isfinite(after)) after = t; }
+    if (!std::isfinite(before)) { why = "最早的记录晚于 " + formatUtc(static_cast<double>(first) * 3600.0); return false; }
+    if (!std::isfinite(after)) { why = "最晚的记录早于 " + formatUtc(static_cast<double>(last) * 3600.0); return false; }
+    for (size_t i = 1; i < times.size(); ++i)
+        if (times[i] > before + 1e-9 && times[i - 1] < after - 1e-9 && times[i] - times[i - 1] > maxGap + 1e-9) {
+            why = formatUtc(times[i - 1] * 3600.0) + " 到 " + formatUtc(times[i] * 3600.0) + " 之间缺测超过 " + std::to_string(maxGap) + " h";
+            return false;
+        }
+    return true;
 }
 }  // namespace stream

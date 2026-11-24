@@ -6,6 +6,7 @@
 #include "image.h"
 #include "../forcing/era5.h"
 #include "../forcing/forcing_metadata.h"
+#include "../forcing/station_source.h"
 #include "../scene/raster.h"
 
 #include <cpl_conv.h>
@@ -65,15 +66,34 @@ std::string utf8FromWide(const wchar_t* text)
 // stream forcing-check <preset|metadata.json|JSON> [--json]: parses and validates a forcing metadata document.
 int forcingCheck(const std::vector<std::string>& args)
 {
-    bool json = false;
+    bool json = false, data = false;
     std::string specifier;
+    std::vector<std::string> dataFiles;
     for (size_t index = 1; index < args.size(); ++index) {
         if (args[index] == "--json") json = true;
+        else if (args[index] == "--data") data = true;
+        else if (data) dataFiles.push_back(args[index]);
         else if (specifier.empty()) specifier = args[index];
     }
     stream::ForcingIssues issues;
     const stream::ForcingMetadata metadata = stream::resolveForcingMetadata(specifier, std::filesystem::current_path(), &issues);
-    if (json) {
+    if (issues.ok() && !dataFiles.empty()) {
+        // Second step: open the data with the metadata (variables / columns present, time parsing, coverage).
+        try {
+            if (metadata.station()) {
+                std::vector<std::filesystem::path> files;
+                for (const auto& file : dataFiles) files.push_back(stream::pathFromUtf8(file));
+                const stream::StationSource source(metadata, files);
+                for (const auto& text : source.report().warnings) issues.warning(text);
+            } else {
+                stream::era5::Pack pack;
+                pack.open(stream::pathFromUtf8(dataFiles.front()), &metadata);
+                for (const auto& text : pack.report().warnings) issues.warning(text);
+            }
+        } catch (const std::exception& error) {
+            issues.error(error.what());
+        }
+    }    if (json) {
         CPLJSONObject root;
         root.Add("ok", issues.ok());
         CPLJSONArray errors, warnings, notes;

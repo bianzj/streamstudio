@@ -6,7 +6,9 @@
 #include "forcing_source.h"
 
 #include <cstdint>
+#include <functional>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace stream {
@@ -45,4 +47,12 @@ double forcingMaxGap(double maxGapHours, double stepHours);
 void standardiseQuantities(const ForcingMetadata& meta, const std::map<std::string, std::vector<double>>& hourly,
                            const std::map<std::string, std::vector<double>>& constant, size_t hours, size_t cells,
                            const std::vector<std::string>& variables, ForcingReport& report, std::map<std::string, std::vector<float>>& data);
+// Which channel keys (ta hum p u v speed dir sw lw skt swvl z) the standard quantities in `variables` need; `present` tells which exist.
+std::vector<std::string> forcingChannelKeys(const ForcingMetadata& meta, const std::vector<std::string>& variables,
+                                            const std::function<bool(const std::string&)>& present);
+
+// Do the records of one channel cover [first, last]? Flux intervals must cover every hour (h - 1, h]; instants need a record at or before
+// `first`, one at or after `last` and no gap above maxGapHours between them. `why` names the first problem.
+bool recordsCover(const ForcingChannel& channel, double stepHours, const std::vector<double>& times, bool flux, double maxGapHours,
+                  int64_t first, int64_t last, std::string& why);
 }  // namespace stream

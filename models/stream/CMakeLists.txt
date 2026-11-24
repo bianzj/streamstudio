@@ -20,6 +20,7 @@ add_executable(stream
         forcing/forcing_resample.cpp
         forcing/forcing_source.cpp
         forcing/pixel_forcing.cpp
+        forcing/station_source.cpp
         forcing/utc.cpp
         physics/canopy.cpp
         physics/effective_lai.cpp

@@ -5,6 +5,7 @@
 #include "thermal_view.h"
 #include "../forcing/era5.h"
 #include "../forcing/forcing_metadata.h"
+#include "../forcing/station_source.h"
 #include "../forcing/pixel_forcing.h"
 #include "../forcing/utc.h"
 #include "../physics/brightness.h"
@@ -220,15 +221,33 @@ int runImage(const std::string& configPath)
     };
 
     // ---------------- ERA5 pack (EB) ----------------
-    era5::Pack pack;
+    era5::Pack idlePack;                         // stands in for the source when the run is not an energy balance
+    std::unique_ptr<ForcingSource> forcingHolder;
     std::vector<double> nodes;
     bool elevationCorrection = false;
     bool waterSkinMissing = false;  // water pixels present but the pack has no skt: they take the 2 m air temperature
+    const auto makeSource = [&]() -> std::unique_ptr<ForcingSource> {
+    std::unique_ptr<ForcingSource> result;
+    ForcingMetadata forcingMetadata;
+    if (!config.forcingMetadata.empty()) forcingMetadata = resolveForcingMetadata(config.forcingMetadata, config.forcingBaseDir);
+    if (!config.forcingMetadata.empty() && forcingMetadata.station()) {
+        std::vector<std::filesystem::path> csv;
+        const auto absolute = [&](const std::filesystem::path& file, const std::filesystem::path& base) { return file.is_absolute() ? file : base / file; };
+        for (const auto& file : config.forcingFiles) csv.push_back(absolute(file, config.forcingBaseDir));
+        if (csv.empty())
+            for (const auto& entry : forcingMetadata.stations)
+                if (!entry.file.empty()) csv.push_back(absolute(pathFromUtf8(entry.file), forcingMetadata.baseDir.empty() ? config.forcingBaseDir : forcingMetadata.baseDir));
+        result = std::make_unique<StationSource>(forcingMetadata, csv);
+    } else {
+        auto grid = std::make_unique<era5::Pack>();
+        grid->open(config.era5Pack, config.forcingMetadata.empty() ? nullptr : &forcingMetadata);
+        result = std::move(grid);
+    }
+        return result;
+    };
+    if (eb) { progress(2, "读取气象数据包"); forcingHolder = makeSource(); }
+    ForcingSource& pack = forcingHolder ? *forcingHolder : static_cast<ForcingSource&>(idlePack);
     if (eb) {
-        progress(2, "读取气象数据包");
-        ForcingMetadata forcingMetadata;
-        if (!config.forcingMetadata.empty()) forcingMetadata = resolveForcingMetadata(config.forcingMetadata, config.forcingBaseDir);
-        pack.open(config.era5Pack, config.forcingMetadata.empty() ? nullptr : &forcingMetadata);
         {
             const ForcingMetadata& used = pack.metadata();
             log("气象强迫元数据：" + used.name + "（" + (used.origin == "preset" ? "预设" : used.origin == "file" ? "文件 " + utf8FromPath(used.path) : used.origin == "pack" ? "数据包索引" : "内联") +
@@ -251,7 +270,7 @@ int runImage(const std::string& configPath)
         if (latMin > latMax) throw std::runtime_error("计算范围内没有可用的像元（地类或经纬度无效）");
         std::vector<std::string> variables = era5::requiredVariables();
         if (config.soilMoistureFromEra5) {
-            if (!pack.available("swvl1")) throw std::runtime_error("土壤水分来源为气象强迫，但数据包中没有 swvl1");
+            if (!pack.available("swvl1")) throw std::runtime_error("土壤水分来源为气象强迫，但气象强迫数据里没有土壤水分（variables.soilMoisture）；请把 temperature.soilMoisture.source 设为 user 并提供土壤水分栅格");
             variables.push_back("swvl1");
         }
         // Water pixels take the ERA5 skin temperature skt (the only use left of skt). Without skt in the pack they degrade to the
@@ -260,7 +279,7 @@ int runImage(const std::string& configPath)
             if (pack.available("skt")) variables.push_back("skt");
             else {
                 waterSkinMissing = true;
-                const std::string text = "数据包没有 skt，计算范围内的水体像元改取过境时刻 2 m 气温作为水面温度（水体通常与气温相差数 K，精度较低）";
+                const std::string text = "气象强迫数据没有 skt（variables.skinTemperature），计算范围内的水体像元改取过境时刻 2 m 气温作为水面温度（水体通常与气温相差数 K，精度较低）";
                 log("警告：" + text);
                 spinupNotes.push_back("水体降级：" + text);
             }
@@ -268,7 +287,7 @@ int runImage(const std::string& configPath)
         elevationCorrection = config.elevationCorrection && config.dem.present() && pack.available("z");
         if (elevationCorrection) variables.push_back("z");
         else if (config.elevationCorrection && config.dem.present())
-            log("警告：已要求按 DEM 订正气温与气压，但气象数据包没有地表位势 z，本次不做高程订正");
+            log("警告：已要求按 DEM 订正气温与气压，但气象强迫数据没有地表位势/海拔（variables.orography 或站点海拔），本次不做高程订正");
         // Hours the solver reads: the march start through the hour after the overpass (flux interpolation);
         // ERA5-Land de-accumulation also needs the hour before the start.
         int64_t lastHour = static_cast<int64_t>(std::ceil(overpass / 3600.0)) + 1;

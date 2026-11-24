@@ -31,9 +31,9 @@ class Pack : public ForcingSource {
 public:
     // `metadata` (optional) decides how the files are read; without it the index "metadata" key or the preset of its product.
     void open(const std::filesystem::path& index, const ForcingMetadata* metadata = nullptr);
-    const ForcingMetadata& metadata() const { return meta_; }
+    const ForcingMetadata& metadata() const override { return meta_; }
     // False for the identity ERA5 / ERA5-Land layout, which is read exactly as before the metadata layer existed.
-    bool standardised() const { return generic_; }
+    bool standardised() const override { return generic_; }
     double lapseRate() const override { return meta_.lapseRateKPerKm / 1000.0; }
     int year() const override { return year_; }
     // Every required variable has all hours of year().

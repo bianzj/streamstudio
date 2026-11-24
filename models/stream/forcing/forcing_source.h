@@ -6,6 +6,8 @@
 
 namespace stream {
 
+struct ForcingMetadata;
+
 // Interpolation weights of one location: up to four cells (grid corners) or stations. Unused slots have weight 0.
 struct ForcingWeights {
     int index[4]{0, 0, 0, 0};
@@ -30,6 +32,8 @@ struct ForcingReport {
 class ForcingSource {
 public:
     virtual ~ForcingSource() = default;
+    virtual const ForcingMetadata& metadata() const = 0;  // the metadata the data were read with
+    virtual bool standardised() const = 0;                // false: the ERA5 layout, read without any conversion
     virtual const std::string& product() const = 0;       // preset / metadata name
     virtual int year() const = 0;
     virtual bool fullYear() const = 0;                    // every required quantity has all hours of year()
