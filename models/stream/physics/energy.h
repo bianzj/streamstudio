@@ -100,7 +100,9 @@ struct EnergyDiagnostics {
 
 EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& forcing,
                                   const ShortwaveAbsorption& shortwave, double szaDeg, bool sunlit,
-                                  double dtSeconds, EnergyState& state);
+                                  double dtSeconds, EnergyState& state, bool bracketFallback = false);
+// bracketFallback (the overpass node): a node that has not closed after maxIterations continues with a bracketing / bisection
+// search of 1/L (FIX 2026-11-24, see energy.cpp); earlier nodes keep the plain iteration (their history is not output).
 
 // Inputs of the four component balances at one node on any scalar type (double or Ad). The forward solve uses
 // double; the assimilation evaluates the same balance with Ad to get dR/dT and dR/dx at the converged state

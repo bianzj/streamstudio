@@ -778,7 +778,7 @@ int runImage(const std::string& configPath)
                 run.lit = beamLit;
                 run.dt = dt;
             }
-            run.result = solveEnergyNode(surface, meteo, shortwave, beamZenith, beamLit, dt, state);
+            run.result = solveEnergyNode(surface, meteo, shortwave, beamZenith, beamLit, dt, state, node + 1 == nodes.size());
         }
         return true;
     };

@@ -45,6 +45,8 @@ constexpr double kMaxStep = 5.0;             // K per Newton step
 constexpr double kTmin = kComponentTemperatureMin;
 constexpr double kTmax = kComponentTemperatureMax;
 constexpr double kSparseLai = 0.5;
+constexpr double kBracketDamping = 0.25;       // under-relaxation of the temperature and gust updates in the bracketing mode
+constexpr int kBracketBudget = 4;            // extra iterations of the bracketing mode, in units of maxIterations
 
 double saturationSlope(double celsius)
 {
@@ -555,7 +557,7 @@ template void johansenSoilThermal<Ad>(double, const Ad&, Ad&, Ad&);
 
 EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& forcing,
                                   const ShortwaveAbsorption& shortwave, double szaDeg, bool sunlit,
-                                  double dtSeconds, EnergyState& state)
+                                  double dtSeconds, EnergyState& state, bool bracketFallback)
 {
     EnergyDiagnostics diagnostics;
     const double lai = std::max(surface.lai, 0.0);
@@ -580,13 +582,22 @@ EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& f
     bool closed = false, stabilityClosed = false;
     int iterations = 0;
     double relax = kStabilityRelax, previousError = 0.0;  // adaptive 1/L relaxation
+    // FIX(2026-11-24 convergence): a node that has not closed after maxIterations (limit cycles of 1/L / temperature, mostly
+    // strongly unstable cropland and broadleaf forest) continues in a bracketing mode for kBracketBudget x maxIterations
+    // more iterations: temperatures and gust are first closed at a frozen 1/L, then 1/L is moved by expansion + bisection on
+    // target(1/L) - 1/L. Nodes that close within maxIterations follow the original path bit for bit.
+    bool bracketMode = false;
+    double bracketLow = std::numeric_limits<double>::quiet_NaN(), bracketHigh = bracketLow;
+    int expansions = 0;
+    int limit = std::max(1, surface.maxIterations);
+    std::array<double, 6> snapshot{};
     const double buoyancyCoefficient = -kVonKarman * kGravity / (density * kCP * forcing.ta);
 
     // One joint iteration, at most maxIterations (default 50) in total: each pass evaluates the fluxes, takes a
     // damped Newton step on the four component temperatures, updates the convective-gust heat flux and relaxes
     // 1/L towards its Monin-Obukhov target. Converged when energy, gust and stability residuals are all small.
     // maxStabilityIterations is accepted for compatibility only: temperature and 1/L share maxIterations (README).
-    for (int iteration = 0; iteration < std::max(1, surface.maxIterations); ++iteration) {
+    for (int iteration = 0; iteration < limit; ++iteration) {
         fluxes(surface, forcing, shortwave, szaDeg, sunlit, inverse, density, dtSeconds, state.sceneSensible,
                state, solution);
         ++iterations;
@@ -596,6 +607,8 @@ EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& f
         closed = solution.maxResidual <= kInnerResidual && solution.gustResidual <= kGustTolerance && stabilityClosed;
         if (closed) break;
         const auto& f = solution.fluxes;
+        const double previousTemperature[4] = {state.leafSunlit, state.leafShaded, state.soilSunlit, state.soilShaded};
+        const double previousGust = state.sceneSensible;
         if (leaves) {
             updateTemperature(state.leafSunlit, f.leafSunlit.residual, solution.aero.leaf, solution.leafResistanceSun,
                               0.0, surface.leafEmissivity, 2.0 * lai, surface.robustTemperature, density, forcing);
@@ -615,19 +628,61 @@ EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& f
         if (!std::isfinite(state.soilSunlit)) state.soilSunlit = forcing.ta + 2.0;
         if (!std::isfinite(state.soilShaded)) state.soilShaded = forcing.ta + 1.0;
         state.sceneSensible = solution.sceneSensible;
+        if (bracketMode) {   // under-relaxed temperature and gust update: the frozen-1/L iteration itself may cycle (period ~5)
+            double* targets[4] = {&state.leafSunlit, &state.leafShaded, &state.soilSunlit, &state.soilShaded};
+            for (int k = 0; k < 4; ++k) *targets[k] = previousTemperature[k] + kBracketDamping * (*targets[k] - previousTemperature[k]);
+            state.sceneSensible = previousGust + kBracketDamping * (state.sceneSensible - previousGust);
+        }
         const double error = target - inverse;
+        if (bracketMode) {
+            if (!(solution.maxResidual <= kInnerResidual && solution.gustResidual <= kGustTolerance)) continue;  // close T and gust at frozen 1/L first
+            if (error > 0.0) bracketLow = inverse; else bracketHigh = inverse;
+            double next;
+            if (std::isfinite(bracketLow) && std::isfinite(bracketHigh)) next = 0.5 * (bracketLow + bracketHigh);
+            else {
+                const double step = std::max(std::abs(error), 0.05) * static_cast<double>(1 << std::min(expansions++, 6));
+                next = std::clamp(inverse + (error > 0.0 ? step : -step), -kMaxInverseObukhov, kMaxInverseObukhov);
+            }
+            if (next == inverse) break;  // pinned at the 1/L limit: no root in range
+            inverse = next;
+            continue;
+        }
         relax = previousError * error < 0.0 ? std::max(kStabilityRelaxMin, relax * kStabilityRelaxShrink) : std::min(kStabilityRelax, relax * kStabilityRelaxGrow);
         previousError = error;
         inverse = std::clamp(inverse + relax * error, -kMaxInverseObukhov, kMaxInverseObukhov);
+        if (bracketFallback && iteration + 1 == std::max(1, surface.maxIterations)) {  // original budget exhausted without closure
+            bracketMode = true;
+            limit = iteration + 1 + kBracketBudget * std::max(1, surface.maxIterations);
+            snapshot = {state.leafSunlit, state.leafShaded, state.soilSunlit, state.soilShaded, inverse, state.sceneSensible};  // = the original path's result
+        }
     }
 
     // Final re-evaluation at the returned temperatures and stability.
-    fluxes(surface, forcing, shortwave, szaDeg, sunlit, inverse, density, dtSeconds, state.sceneSensible, state, solution);
-    const double ustar = std::max(solution.aero.ustar, 1e-8);
-    const double finalTarget = buoyancyCoefficient * solution.sceneSensible / std::pow(ustar, 3.0);
-    const double finalError = inverse - finalTarget;
-    stabilityClosed = std::abs(finalError) <= 2.0 * (kStabilityAbsTol + kStabilityRelTol * std::abs(finalTarget));
-    closed = stabilityClosed && solution.maxResidual <= kResidualThreshold && solution.gustResidual <= 2.0 * kGustTolerance;
+    double finalError = 0.0;
+    const auto finalEvaluation = [&]() {
+        fluxes(surface, forcing, shortwave, szaDeg, sunlit, inverse, density, dtSeconds, state.sceneSensible, state, solution);
+        const double ustar = std::max(solution.aero.ustar, 1e-8);
+        const double finalTarget = buoyancyCoefficient * solution.sceneSensible / std::pow(ustar, 3.0);
+        finalError = inverse - finalTarget;
+        stabilityClosed = std::abs(finalError) <= 2.0 * (kStabilityAbsTol + kStabilityRelTol * std::abs(finalTarget));
+        closed = stabilityClosed && solution.maxResidual <= kResidualThreshold && solution.gustResidual <= 2.0 * kGustTolerance;
+    };
+    finalEvaluation();
+    if (bracketMode && !closed) {
+        // The bracketing mode must never make a node worse: compare with the state the plain iteration ended in.
+        const std::array<double, 6> found{state.leafSunlit, state.leafShaded, state.soilSunlit, state.soilShaded, inverse, state.sceneSensible};
+        const double foundResidual = solution.maxResidual;
+        const auto load = [&](const std::array<double, 6>& v) {
+            state.leafSunlit = v[0]; state.leafShaded = v[1]; state.soilSunlit = v[2]; state.soilShaded = v[3];
+            inverse = v[4]; state.sceneSensible = v[5];
+        };
+        load(snapshot);
+        finalEvaluation();
+        if (!closed && !(solution.maxResidual < foundResidual)) {
+            load(found);
+            finalEvaluation();
+        }
+    }
     const int stabilityIterations = iterations;
     state.inverseObukhov = inverse;
 

@@ -181,3 +181,22 @@ def test_unknown_terrain_mode_lists_every_mode(tmp_path):
     assert ret.returncode != 0
     for mode in ('none', 'single', 'facet', 'composite', 'hill', 'ridge'):
         assert mode in ret.stderr
+
+# ---------- convergence: strongly unstable cropland / forest pixels no longer end in 1/L limit cycles ----------
+def test_unstable_pixels_converge_with_bracketing_fallback(tmp_path):
+    """12 x 12 window of the MODIS example in which the plain 1/L relaxation left 65 of 144 pixels unconverged
+    (limit cycles of temperature, gust and 1/L); the bracketing fallback of the overpass node closes them all."""
+    config = eb_config()
+    config['region'] = dict(startRow=89, endRow=101, startColumn=146, endColumn=158)
+    ret, out = run(tmp_path, 'unstable', config)
+    assert ret.returncode == 0, ret.stderr + ret.stdout
+    with gdal.Open(str(out / 'eb_fluxes.tif')) as ds:
+        fl = ds.ReadAsArray()[:, 89:101, 146:158]
+    solved = np.isfinite(fl[0])
+    converged = (fl[5] == 1) & (fl[8] == 1) & solved
+    print('solved', int(solved.sum()), 'converged', int(converged.sum()), 'max iterations', float(np.nanmax(fl[4])))
+    assert solved.sum() == 144
+    assert converged.sum() >= 140                       # engine before the fix: 79
+    closure = np.abs(fl[0] - fl[1] - fl[2] - fl[3])
+    assert np.nanmax(closure) < 100.0
+    assert summary(out)['temperature']['nonConvergedPixels'] == int(solved.sum() - converged.sum())
