@@ -2,7 +2,7 @@
   "kind": "stream-image-project",
   "schemaVersion": 2,
   "name": "北京市 Landsat 300 m · ERA5能量平衡",
-  "description": "内置精选：Landsat 300 m区域光学与热红外影像模拟。参考运行综合收敛180326/180408（99.95%），82个异常像元保留质量标记。数值收敛不代表独立观测精度。",
+  "description": "内置精选：Landsat 300 m区域光学与热红外影像模拟。参考运行（reference/，2026-10-31）综合收敛180326/180408（99.95%），82个异常像元；2026-11-24 引擎重算为180353/180408（99.97%），55个未收敛，均保留质量标记。数值收敛不代表独立观测精度。",
   "scene": {
     "name": "stream_beijing_300m_landsat",
     "locationSource": "georef",
