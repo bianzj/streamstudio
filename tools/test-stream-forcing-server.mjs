@@ -135,6 +135,12 @@ test('metadata save / read round trip and project path mapping', async () => {
   const scene = ebScene({ era5: { pack }, forcing: { metadata: saved.payload.path } }, { projectPath: project })
   assert.equal(store.buildEngineConfig(scene, { outputDir: root, dataDir: root }).temperature.forcing.metadata, saved.payload.path)
   assert.throws(() => store.buildEngineConfig(ebScene({ era5: { pack }, forcing: { metadata: saved.payload.path } }, { projectPath: join(root, 'proj', 'stream-project.json') }), { outputDir: root, dataDir: root }), /只能位于/)
+  // import reads a metadata document picked anywhere, but only metadata-shaped JSON
+  const picked = join(root, 'outside', 'picked.json')
+  writeFileSync(picked, JSON.stringify({ kind: 'stream-forcing-metadata', name: 'picked', preset: 'era5' }))
+  assert.equal((await call('POST', '/api/stream/forcing/metadata/read', { import: true, path: picked })).payload.metadata.name, 'picked')
+  writeFileSync(picked, JSON.stringify({ hello: 1 }))
+  assert.equal((await call('POST', '/api/stream/forcing/metadata/read', { import: true, path: picked })).status, 400)
   // project save/open mapping rewrites paths but never a preset name
   const mapped = { temperature: { forcing: { pack: 'p.json', files: ['a.csv'], metadata: 'forcing-metadata.json' } } }
   mapStreamScenePaths(mapped, (file) => `M/${file}`)
