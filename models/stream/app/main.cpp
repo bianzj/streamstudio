@@ -101,6 +101,7 @@ int usage()
 {
     std::cerr << "usage: stream run <config.json>\n"
                  "       stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...\n"
+                 "       stream forcing-register <pack.json> --metadata <preset|metadata.json> <file.nc>...\n"
                  "       stream forcing-preset [name]\n"
                  "       stream forcing-check <preset|metadata.json> [--data pack.json|station.csv ...] [--json]\n";
     return 2;
@@ -115,6 +116,21 @@ int dispatch(const std::vector<std::string>& args)
         return 0;
     }
     if (args.size() >= 2 && args[0] == "forcing-check") return forcingCheck(args);
+    if (args.size() >= 4 && args[0] == "forcing-register") {
+        std::string spec;
+        std::vector<std::string> files;
+        for (size_t index = 2; index < args.size(); ++index) {
+            if (args[index] == "--metadata" && index + 1 < args.size()) spec = args[++index];
+            else files.push_back(args[index]);
+        }
+        if (spec.empty()) throw std::runtime_error("forcing-register 需要 --metadata <预设名|元数据.json>");
+        // A metadata file is stored by absolute path so the pack still finds it when moved next to the index.
+        bool preset = spec.rfind("{", 0) == 0;
+        for (const auto& name : stream::forcingPresetNames()) preset = preset || name == spec;
+        if (!preset) spec = stream::utf8FromPath(std::filesystem::absolute(stream::pathFromUtf8(spec)));
+        const stream::ForcingMetadata metadata = stream::resolveForcingMetadata(spec, std::filesystem::current_path());
+        return stream::era5::registerForcingPack(files, stream::pathFromUtf8(args[1]), metadata, spec) ? 0 : 3;
+    }
     if (args.size() >= 3 && args[0] == "era5-register") {
         std::string product = "auto";
         std::vector<std::string> files;

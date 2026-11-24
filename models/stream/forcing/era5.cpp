@@ -1067,4 +1067,81 @@ float Pack::hourlyFlux(const std::string& variable, int64_t hour, const Weights&
     return std::max(0.0f, (current - previous) / 3600.0f);
 }
 
+bool registerForcingPack(const std::vector<std::string>& files, const fs::path& index, const ForcingMetadata& meta, const std::string& metadataSpec)
+{
+    if (files.empty()) throw std::runtime_error("请提供气象强迫 NetCDF 文件");
+    if (meta.station()) throw std::runtime_error("气象强迫元数据 \"" + meta.name + "\" 是站点形态，站点 CSV 无需登记，直接写进 temperature.forcing.files");
+    const Names names = namesOf(meta);
+    const std::vector<std::string> wanted = wantedOf(meta);
+    Axis latitude, longitude;
+    std::map<std::string, std::set<int64_t>> hours;
+    std::vector<std::string> dataNames;
+    CPLJSONArray fileList;
+    for (size_t position = 0; position < files.size(); ++position) {
+        const fs::path path = pathFromUtf8(files[position]);
+        if (!fs::is_regular_file(path)) throw std::runtime_error("气象强迫文件不存在：" + files[position]);
+        const NcFile file(path);
+        const FileScan scan = scanFile(file, names, wanted);
+        if (position == 0) { latitude = scan.latitude; longitude = scan.longitude; }
+        else if (!sameAxis(latitude, scan.latitude) || !sameAxis(longitude, scan.longitude))
+            throw std::runtime_error("气象强迫文件的经纬度网格不一致：" + files[position]);
+        for (const auto& name : scan.allNames) if (std::find(dataNames.begin(), dataNames.end(), name) == dataNames.end()) dataNames.push_back(name);
+        for (const auto& name : scan.variables) if (!scan.invariant.count(name)) for (const int64_t hour : scan.hours) hours[name].insert(hour);
+        CPLJSONObject entry;
+        const fs::path absolute = fs::absolute(path);
+        const fs::path local = absolute.lexically_relative(fs::absolute(index).parent_path());
+        const bool inside = !local.empty() && *local.begin() != "..";
+        entry.Add("path", utf8FromPath(inside ? local : absolute));
+        entry.Add("bytes", static_cast<GInt64>(fs::file_size(path)));
+        CPLJSONArray variableNames;
+        for (const auto& name : scan.variables) variableNames.Add(name);
+        entry.Add("variables", variableNames);
+        entry.Add("timeSteps", static_cast<GInt64>(scan.hours.size()));
+        fileList.Add(entry);
+        std::cout << "STREAM\tprogress\t" << (100.0 * (position + 1) / files.size()) << "\t扫描气象强迫文件\n";
+    }
+    ForcingIssues issues;
+    checkForcingAgainstNames(meta, dataNames, issues);
+    if (!issues.ok()) throw std::runtime_error(issues.errorText());
+    for (const auto& text : issues.warnings) std::cout << "[STREAM] 警告：" << text << "\n";
+    int64_t periodFirst = std::numeric_limits<int64_t>::min(), periodLast = std::numeric_limits<int64_t>::max();
+    for (const ForcingChannel* c : {&meta.airTemperature, &meta.humidity, &meta.shortwaveDown}) {
+        for (const auto& name : c->source) {
+            const auto found = hours.find(name);
+            if (found == hours.end() || found->second.empty()) continue;
+            periodFirst = std::max(periodFirst, *found->second.begin());
+            periodLast = std::min(periodLast, *found->second.rbegin());
+            break;
+        }
+    }
+    if (periodFirst > periodLast || periodFirst == std::numeric_limits<int64_t>::min()) throw std::runtime_error("气象强迫必需变量的时间范围没有重叠");
+    int year; unsigned month, day;
+    civilFromDays(periodFirst >= 0 ? periodFirst / 24 : (periodFirst - 23) / 24, year, month, day);
+    CPLJSONObject root, grid, latitudeItem, longitudeItem, period;
+    root.Add("kind", "stream-forcing-pack");
+    root.Add("schemaVersion", 1);
+    root.Add("product", meta.name);
+    root.Add("metadata", metadataSpec);
+    root.Add("stepHours", meta.stepHours);
+    root.Add("year", year);
+    root.Add("created", isoNow());
+    latitudeItem.Add("first", latitude.first); latitudeItem.Add("step", latitude.step); latitudeItem.Add("count", latitude.count);
+    longitudeItem.Add("first", longitude.first); longitudeItem.Add("step", longitude.step); longitudeItem.Add("count", longitude.count);
+    grid.Add("latitude", latitudeItem);
+    grid.Add("longitude", longitudeItem);
+    root.Add("grid", grid);
+    period.Add("start", formatUtc(static_cast<double>(periodFirst) * 3600.0));
+    period.Add("end", formatUtc(static_cast<double>(periodLast) * 3600.0));
+    period.Add("hours", static_cast<GInt64>(periodLast - periodFirst + 1));
+    root.Add("period", period);
+    root.Add("complete", true);
+    root.Add("files", fileList);
+    CPLJSONDocument document;
+    document.SetRoot(root);
+    if (!document.Save(utf8FromPath(index))) throw std::runtime_error("无法写出气象数据包索引：" + utf8FromPath(index));
+    std::cout << "[STREAM] 气象数据包：" << meta.name << " " << formatUtc(static_cast<double>(periodFirst) * 3600.0) << " – "
+              << formatUtc(static_cast<double>(periodLast) * 3600.0) << "（原始记录），" << files.size() << " 个文件\n";
+    return true;
+}
+
 }  // namespace stream::era5

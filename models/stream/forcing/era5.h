@@ -20,6 +20,10 @@ const std::vector<std::string>& optionalVariables();
 // continuous over the common period.
 bool registerPack(const std::vector<std::string>& files, const std::filesystem::path& index, const std::string& product);
 
+// Registers non-ERA5 gridded files described by forcing metadata (index kind stream-forcing-pack). `metadataSpec` is written to the index.
+bool registerForcingPack(const std::vector<std::string>& files, const std::filesystem::path& index, const ForcingMetadata& metadata,
+                         const std::string& metadataSpec);
+
 using Weights = ForcingWeights;
 
 // One pack, read over a latitude/longitude window and a range of UTC hours (ERA5 implementation of ForcingSource).
