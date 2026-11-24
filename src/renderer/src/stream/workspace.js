@@ -488,7 +488,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       <div class="sw-modal" id="swEra5" hidden role="dialog" aria-label="ERA5 数据">
         <div class="sw-modal-card">
           <header class="sw-modal-head"><h2>ERA5 数据</h2><button class="icon-button" type="button" data-action="era5-close" title="关闭">×</button></header>
-          <p class="sw-hint">数据包是一组逐小时 ERA5 或 ERA5-Land 单层 NetCDF，可只覆盖一天，也可覆盖整年（可为多个文件）；空间范围只需盖住影像并外扩约 2 个格点。EB 读取起转起点（过境前第 N 个整点时次，缺省 N = 7；ERA5-Land 另需再早一小时）到过境后 1 小时；数据包不含起点时从其最早时次起算并给出提示，但过境时刻之前至少要有 1 个整点时次。叶片初温取起点起（最多 24 h、不超过过境后 1 小时）已读取小时的平均气温。必需变量：u10、v10、t2m、d2m、sp、ssrd、strd、skt、stl1；可选：stl2、swvl1（土壤水分取 ERA5 时必需）、z（按 DEM 订正气温气压）。登记只读取时间轴，生成索引，不复制数据。</p>
+          <p class="sw-hint">数据包是一组逐小时 ERA5 或 ERA5-Land 单层 NetCDF，可只覆盖一天，也可覆盖整年（可为多个文件）；空间范围只需盖住影像并外扩约 2 个格点。EB 读取起转起点（过境前第 N 个整点时次，缺省 N = 7；ERA5-Land 另需再早一小时）到过境后 1 小时；数据包不含起点时从其最早时次起算并给出提示，但过境时刻之前至少要有 1 个整点时次。土壤（光照/阴影）、叶片与土壤热历史的初温都取起点时刻的 2 m 气温 t2m，不使用 skt、stl1、stl2。必需变量：u10、v10、t2m、d2m、sp、ssrd、strd；可选：skt（地类含水体时用作水面温度，缺省时水体改取气温并提示）、swvl1（土壤水分取 ERA5 时必需）、z（按 DEM 订正气温气压）。登记只读取时间轴，生成索引，不复制数据。</p>
           <div class="sw-era5-list" id="swEra5List"></div>
           <div class="sw-era5-new">
             <label><span>名称</span><input class="input" id="swEra5Label" maxlength="64" placeholder="例如 华北 2019"></label>
@@ -808,7 +808,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     const info = $('#swEra5Info')
     if (info) {
       const problems = !pack ? (t.era5.pack ? ['无法读取所选数据包索引'] : []) : packProblems(pack, form.overpass, t.soilMoisture.source, t.spinupHours)
-      info.textContent = pack ? [packPeriodLabel(pack), `${pack.files} 个文件`, pack.variables?.stl2 ? '含 stl2' : '无 stl2', pack.variables?.z ? '含 z' : '无 z（不做高程订正）', ...problems].join('；') : problems.join('；')
+      info.textContent = pack ? [packPeriodLabel(pack), `${pack.files} 个文件`, pack.variables?.skt ? '含 skt（水体用）' : '无 skt（水体改取气温）', pack.variables?.z ? '含 z' : '无 z（不做高程订正）', ...problems].join('；') : problems.join('；')
       info.dataset.level = problems.length ? 'error' : pack ? 'ok' : ''
     }
     const warning = $('#swEbWarn')
@@ -819,7 +819,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       window.textContent = !plan ? (Number.isNaN(spinupNodes(t.spinupHours)) ? '起转节点数须在 0–240 之间' : '')
         : plan.requested === 0
           ? `不起转：只在过境时刻 ${time} UTC 求解 1 个时次。`
-          : `起转 ${plan.usable} 个整点时次${plan.usable < plan.requested ? `（请求 ${plan.requested} 个）` : ''}：从 ${isoHour(plan.marchStart).slice(0, 16).replace('T', ' ')} UTC 推进到过境时刻 ${time} UTC，共 ${plan.nodeCount} 个时次（含过境时刻，与引擎一致）。土壤与叶片初温取起点的 ERA5 地表温度与平均气温；土壤热历史（7 h）与土柱自洽推进。`
+          : `起转 ${plan.usable} 个整点时次${plan.usable < plan.requested ? `（请求 ${plan.requested} 个）` : ''}：从 ${isoHour(plan.marchStart).slice(0, 16).replace('T', ' ')} UTC 推进到过境时刻 ${time} UTC，共 ${plan.nodeCount} 个时次（含过境时刻，与引擎一致）。土壤、叶片与土壤热历史的初温都取起点时刻的 2 m 气温；土壤热历史（7 h）与土柱由此自洽推进。`
     }
     const localTime = $('#swLocalTime')
     if (localTime) localTime.textContent = `显示时区 UTC${Number(form.displayTimezone) >= 0 ? '+' : ''}${Number(form.displayTimezone) || 0} 的当地时间：${localOverpass() || '—'}`
@@ -1995,7 +1995,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
     list.innerHTML = `<table class="sw-table"><thead><tr><th>名称</th><th>产品 / 时段</th><th>文件</th><th>状态</th><th></th></tr></thead><tbody>${packs.map((pack) => {
       const problems = [...pack.missingVariables, ...pack.incompleteVariables]
-      const optional = ['stl2', 'swvl1', 'z'].filter((name) => pack.variables?.[name]).join('、')
+      const optional = ['skt', 'swvl1', 'z'].filter((name) => pack.variables?.[name]).join('、')
       return `<tr data-pack="${escapeHtml(pack.path)}"${pack.path === form.temperature.era5.pack ? ' class="active"' : ''} title="${escapeHtml(pack.path)}">
         <td>${escapeHtml(pack.label)}</td><td>${escapeHtml(String(pack.product || '').toUpperCase())} ${escapeHtml(packPeriodLabel(pack))}</td><td>${pack.files}</td>
         <td>${pack.complete ? `可用${optional ? `（含 ${escapeHtml(optional)}）` : ''}` : `<span class="sw-bad">缺失或不连续：${escapeHtml(problems.join('、'))}</span>`}</td>

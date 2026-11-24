@@ -265,3 +265,65 @@ def test_eb_assimilation_cost_and_stop_classes(tmp_path):
     stops = json.loads((out / 'scene_summary.json').read_text(encoding='utf-8'))['assimilation']['stopReasons']
     assert sum(stops.values()) == ok.sum()
     print('stop reasons', stops)
+
+
+# ---------- 2026-11-24: EB initial values come from the 2 m air temperature; skt/stl1/stl2 are optional ----------
+def pack_without(tmp_path, drop):
+    """Copy of the example ERA5 pack whose NetCDF lacks the `drop` variables (index bytes updated)."""
+    import netCDF4
+    src = CASE / 'era5'
+    folder = tmp_path / 'era5_trimmed'
+    folder.mkdir()
+    index = json.loads((src / 'era5-pack.json').read_text(encoding='utf-8'))
+    for item in index['files']:
+        with netCDF4.Dataset(src / item['path']) as a, netCDF4.Dataset(folder / item['path'], 'w') as b:
+            b.setncatts({k: a.getncattr(k) for k in a.ncattrs()})
+            for name, dim in a.dimensions.items():
+                b.createDimension(name, None if dim.isunlimited() else len(dim))
+            for name, var in a.variables.items():
+                if name in drop:
+                    continue
+                fill = var.getncattr('_FillValue') if '_FillValue' in var.ncattrs() else None
+                out = b.createVariable(name, var.dtype, var.dimensions, fill_value=fill)
+                out.setncatts({k: var.getncattr(k) for k in var.ncattrs() if k != '_FillValue'})
+                out[:] = var[:]
+        item['bytes'] = (folder / item['path']).stat().st_size
+        item['variables'] = [v for v in item['variables'] if v not in drop]
+    index['variables'] = {k: v for k, v in index['variables'].items() if k not in drop}
+    (folder / 'era5-pack.json').write_text(json.dumps(index), encoding='utf-8')
+    return folder / 'era5-pack.json'
+
+
+def test_eb_runs_without_skt_and_soil_temperature(tmp_path):
+    full, out_full = run(tmp_path, 'full', eb_config())
+    assert full.returncode == 0, full.stderr + full.stdout
+    config = eb_config()
+    config['temperature']['era5']['pack'] = str(pack_without(tmp_path, {'skt', 'stl1', 'stl2'}))
+    ret, out = run(tmp_path, 'trim', config)
+    assert ret.returncode == 0, ret.stderr + ret.stdout
+    # the initial values never read skt / stl1 / stl2, so the result is bit-identical to the full pack
+    for name in ('tir_surface_temperature.tif', 'eb_fluxes.tif'):
+        with gdal.Open(str(out_full / name)) as a, gdal.Open(str(out / name)) as b:
+            assert np.array_equal(a.ReadAsArray(), b.ReadAsArray(), equal_nan=True)
+    assert '2 m 气温' in ret.stdout and '不使用 ERA5 skt' in ret.stdout
+
+
+def test_water_pixels_degrade_to_air_temperature_without_skt(tmp_path):
+    with gdal.Open(str(CASE / 'inputs/type.tif')) as ds:
+        water = np.full((ds.RasterYSize, ds.RasterXSize), 17, np.float32)
+        out_ds = gdal.GetDriverByName('GTiff').Create(str(tmp_path / 'water.tif'), ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32)
+        out_ds.SetGeoTransform(ds.GetGeoTransform()); out_ds.SetProjection(ds.GetProjection())
+        out_ds.GetRasterBand(1).WriteArray(water); out_ds = None
+    config = eb_config()
+    config['surface']['type'] = dict(file=str(tmp_path / 'water.tif'))
+    ret, out = run(tmp_path, 'water_skt', config)
+    assert ret.returncode == 0, ret.stderr + ret.stdout
+    config['temperature']['era5']['pack'] = str(pack_without(tmp_path, {'skt'}))
+    ret2, out2 = run(tmp_path, 'water_t2m', config)
+    assert ret2.returncode == 0, ret2.stderr + ret2.stdout
+    t = json.loads((out2 / 'scene_summary.json').read_text(encoding='utf-8'))['temperature']
+    assert any('水体降级' in note for note in t['notes']) and '没有 skt' in ret2.stdout
+    def mean(path):
+        with gdal.Open(str(path)) as ds:
+            return float(np.nanmean(ds.GetRasterBand(1).ReadAsArray()))
+    assert 200. < mean(out2 / 'tir_surface_temperature.tif') < 340. and 200. < mean(out / 'tir_surface_temperature.tif') < 340.

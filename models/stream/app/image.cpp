@@ -222,15 +222,20 @@ int runImage(const std::string& configPath)
     era5::Pack pack;
     std::vector<double> nodes;
     bool elevationCorrection = false;
+    bool waterSkinMissing = false;  // water pixels present but the pack has no skt: they take the 2 m air temperature
     if (eb) {
         progress(2, "读取 ERA5 数据包");
         pack.open(config.era5Pack);
         const UtcTime when = utcFromSeconds(overpass);
         double latMin = 90, latMax = -90, lonMin = 180, lonMax = -180;
+        bool waterPresent = false;
         for (int row = startRow; row < endRow; ++row)
             for (int column = startColumn; column < endColumn; ++column) {
                 const size_t pixel = static_cast<size_t>(row) * grid.width + column;
-                if (!validLocation(pixel) || !classes.find(type[pixel])) continue;
+                if (!validLocation(pixel)) continue;
+                const auto* entry = classes.find(type[pixel]);
+                if (!entry) continue;
+                if (entry->surface == SurfaceKind::Water) waterPresent = true;
                 latMin = std::min<double>(latMin, latitude[pixel]); latMax = std::max<double>(latMax, latitude[pixel]);
                 lonMin = std::min<double>(lonMin, longitude[pixel]); lonMax = std::max<double>(lonMax, longitude[pixel]);
             }
@@ -240,7 +245,17 @@ int runImage(const std::string& configPath)
             if (!pack.available("swvl1")) throw std::runtime_error("土壤水分来源为 ERA5，但数据包中没有 swvl1");
             variables.push_back("swvl1");
         }
-        if (pack.available("stl2")) variables.push_back("stl2");
+        // Water pixels take the ERA5 skin temperature skt (the only use left of skt). Without skt in the pack they degrade to the
+        // 2 m air temperature at the overpass (warning + scene_summary note) instead of failing the run.
+        if (waterPresent) {
+            if (pack.available("skt")) variables.push_back("skt");
+            else {
+                waterSkinMissing = true;
+                const std::string text = "数据包没有 skt，计算范围内的水体像元改取过境时刻 2 m 气温作为水面温度（水体通常与气温相差数 K，精度较低）";
+                log("警告：" + text);
+                spinupNotes.push_back("水体降级：" + text);
+            }
+        }
         elevationCorrection = config.elevationCorrection && config.dem.present() && pack.available("z");
         if (elevationCorrection) variables.push_back("z");
         else if (config.elevationCorrection && config.dem.present())
@@ -296,8 +311,7 @@ int runImage(const std::string& configPath)
         spinupNodesUsed = static_cast<int>(nodes.size()) - 1;
         log("ERA5 " + pack.product() + (pack.fullYear() ? " " + std::to_string(pack.year()) + " 整年" : " 时段数据") + "：能量平衡从 " + formatUtc(marchStart) + " 推进到过境时刻（起转 " +
             std::to_string(spinupNodesUsed) + " 个整点时次 / 请求 " + std::to_string(requestedNodes) + "，" + format(spinupUsedHours, 2) + " h），共 " +
-            std::to_string(nodes.size()) + " 个时次" + (pack.available("stl2") ? "，深层土壤温度取 stl2" : "，深层土壤温度取 stl1") +
-            (elevationCorrection ? "，按 DEM 与 ERA5 地形高度差订正气温与气压" : ""));
+            std::to_string(nodes.size()) + " 个时次" + (elevationCorrection ? "，按 DEM 与 ERA5 地形高度差订正气温与气压" : ""));
     }
 
     // ---------------- soil moisture ----------------
@@ -534,9 +548,9 @@ int runImage(const std::string& configPath)
     }
     // ---- EB pixel machinery: one implementation for the forward solve and the assimilation re-solve ----
     const std::vector<float> noSpectrum;
-    // Initial leaf/soil-fallback temperature: mean 2 m air temperature of the first 24 h from the march start, but only
-    // of the hours loaded for the run (never later than one hour after the overpass; with the 7-node default the
-    // window is the spin-up itself). Explicit longer spin-ups (>= 23 nodes) keep the former 24 h window.
+    // Fallback initial temperature (only when the 2 m air temperature at the march start is invalid): mean 2 m air temperature
+    // of the first 24 h from the march start, but only of the hours loaded for the run (never later than one hour after the
+    // overpass; with the 7-node default the window is the spin-up itself).
     const int64_t ebDayStartHour = marchStartHour;
     const int64_t ebDayLastHour = std::min<int64_t>(ebDayStartHour + 23, pack.lastHour());
     const auto validForcing = [](const Forcing& f) {
@@ -611,33 +625,41 @@ int runImage(const std::string& configPath)
         rho = leafRho != leafRhoBins.end() ? &leafRho->second : &noSpectrum;
         tau = leafTau != leafTauBins.end() ? &leafTau->second : &noSpectrum;
     };
+    std::atomic<long long> initialLaterHour{0}, initialDayMean{0};  // pixels whose t2m at the march start was invalid
     const auto initialState = [&](const PixelForcing& forcing) {
-        // TIRTEB initialises soil and leaf temperatures with the first simulated day's mean air temperature.
-        double initialSum = 0.0;
-        int initialCount = 0;
-        for (int64_t hour = ebDayStartHour; hour <= ebDayLastHour; ++hour) {
-            const double value = forcing.temperature("t2m", static_cast<double>(hour) * 3600.0);
-            if (std::isfinite(value)) { initialSum += value; ++initialCount; }
+        // FIX(2026-11-24): every initial temperature of the EB march (soil sunlit/shaded, leaf sunlit/shaded, the soil heat
+        // history of the semi-infinite method and every layer of the `depth` column) is the 2 m air temperature t2m at the
+        // march start. The soil temperature is not known with certainty, so ERA5 skt/stl1/stl2 are deliberately not used
+        // (the user's decision: all initial values from air temperature). With only a few spin-up nodes (default 7) the
+        // air temperature at the start is closer to the state at the start than the mean air temperature of the whole day
+        // (24 h from the start, mostly after the overpass), which was the former leaf start (the soil started from skt).
+        // Fallbacks: the first valid t2m after the start, then the mean over the first simulated day (counted, logged once).
+        const auto plausible = [](double value) { return std::isfinite(value) && value > 180.0 && value < 340.0; };
+        double initial = forcing.temperature("t2m", marchStart);
+        if (!plausible(initial)) {
+            initial = std::numeric_limits<double>::quiet_NaN();
+            for (int64_t hour = ebDayStartHour + 1; hour <= ebDayLastHour && !plausible(initial); ++hour) {
+                const double value = forcing.temperature("t2m", static_cast<double>(hour) * 3600.0);
+                if (plausible(value)) { initial = value; ++initialLaterHour; }
+            }
+            if (!plausible(initial)) {
+                double initialSum = 0.0;
+                int initialCount = 0;
+                for (int64_t hour = ebDayStartHour; hour <= ebDayLastHour; ++hour) {
+                    const double value = forcing.temperature("t2m", static_cast<double>(hour) * 3600.0);
+                    if (std::isfinite(value)) { initialSum += value; ++initialCount; }
+                }
+                initial = initialCount > 0 ? initialSum / initialCount : forcing.temperature("t2m", marchStart);
+                ++initialDayMean;
+            }
         }
-        const double initial = initialCount > 0 ? initialSum / initialCount : forcing.temperature("t2m", marchStart);
-        // Soil starts from the ERA5 skin temperature at the march start (the pack already carries skt, stl1 and stl2,
-        // which the run log promises); the 2 m column is anchored to the ERA5 soil levels. Leaves hold no heat
-        // and converge in one step, so they keep the day-mean air temperature. With the day-mean air start the
-        // soil was up to 6 K too warm at 06-08 local time and the first step had G = 0 (empty history).
-        // FIX(2026-11-21 B10, 2026-11-24): march start = spinupHours whole-hour nodes before the overpass (was 00 UTC of the overpass day).
-        const double skin = forcing.temperature("skt", marchStart);
-        const double level1 = forcing.temperature("stl1", marchStart);
-        const double level2 = pack.available("stl2") ? forcing.temperature("stl2", marchStart) : level1;
-        const bool soilFromEra5 = std::isfinite(skin) && skin > 180.0 && skin < 340.0;
-        const double soilInitial = soilFromEra5 ? skin : initial;
         EnergyState state;
-        state.soilSunlit = state.soilShaded = soilInitial;
+        state.soilSunlit = state.soilShaded = initial;
         state.leafSunlit = state.leafShaded = initial;
-        state.soilSunState.history = {soilInitial};
-        state.soilShadeState.history = {soilInitial};
-        if (soilFromEra5 && config.soilHeatMethod == SoilHeatMethod::Depth) {
-            initializeColumn(state.soilSunState.profile, soilInitial,
-                             std::isfinite(level1) ? level1 : soilInitial, std::isfinite(level2) ? level2 : soilInitial);
+        state.soilSunState.history = {initial};
+        state.soilShadeState.history = {initial};
+        if (config.soilHeatMethod == SoilHeatMethod::Depth) {
+            initializeColumn(state.soilSunState.profile, initial, initial, initial);  // uniform column
             state.soilShadeState.profile = state.soilSunState.profile;
         }
         return state;
@@ -832,7 +854,7 @@ int runImage(const std::string& configPath)
                 const double values[7] = {atOverpass.ta, atOverpass.ea, atOverpass.p, atOverpass.wind, overpassShortwave, atOverpass.longwave, soilMoisture[pixel]};
                 for (int k = 0; k < 7; ++k) forcingOut[k][pixel] = static_cast<float>(values[k]);
                 if (entry->surface == SurfaceKind::Water) {
-                    const float skin = static_cast<float>(forcing.temperature("skt", overpass));
+                    const float skin = static_cast<float>(forcing.temperature(waterSkinMissing ? "t2m" : "skt", overpass));
                     for (auto& band : components) band[pixel] = skin;
                     ++ebWaterPixels;
                     continue;
@@ -875,9 +897,13 @@ int runImage(const std::string& configPath)
             if (isMainThread() && done % std::max(1, rowCount / 40) == 0) progress(10 + 60.0 * done / rowCount, "能量平衡求解");
         }
         log("能量平衡：" + std::to_string(ebPixels) + " 个像元，过境时刻收敛 " + std::to_string(ebConverged) + " 个（稳定度迭代收敛 " +
-            std::to_string(ebStable) + " 个），水体取 ERA5 表皮温度 " +
+            std::to_string(ebStable) + " 个），水体取" + (waterSkinMissing ? " 2 m 气温（数据包无 skt）" : " ERA5 表皮温度") + " " +
             std::to_string(ebWaterPixels) + " 个" + (ebFailed ? "，未能求解 " + std::to_string(ebFailed) + " 个" : "") +
             (ebNoForcing ? "，ERA5 无有效值（如 ERA5-Land 海面）跳过 " + std::to_string(ebNoForcing) + " 个" : ""));
+        log("EB 初值：土壤、叶片与土壤热历史全部取起转起点 " + formatUtc(marchStart) + " 的 2 m 气温（不使用 ERA5 skt/stl1/stl2）");
+        if (initialLaterHour > 0 || initialDayMean > 0)
+            log("警告：起转起点的 2 m 气温无效，初值改取起点后第一个有效时次 " + std::to_string(initialLaterHour.load()) + " 个像元、改取首个模拟日平均气温 " +
+                std::to_string(initialDayMean.load()) + " 个像元");
     } else if (config.thermalEnabled || lsctInversion || assimilate) {
         const char* labels[] = {"光照土壤温度", "阴影土壤温度", "光照叶片温度", "阴影叶片温度"};
         if (!config.componentsFile.empty()) {

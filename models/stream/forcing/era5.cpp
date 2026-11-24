@@ -284,13 +284,15 @@ std::string isoNow()
 
 const std::vector<std::string>& requiredVariables()
 {
-    static const std::vector<std::string> names{"u10", "v10", "t2m", "d2m", "sp", "ssrd", "strd", "skt", "stl1"};
+    // FIX(2026-11-24): skt and stl1 are no longer required. The EB initial values come from the 2 m air temperature; skt is
+    // read only for water pixels (surface skin temperature), stl1/stl2 are not used by the model any more.
+    static const std::vector<std::string> names{"u10", "v10", "t2m", "d2m", "sp", "ssrd", "strd"};
     return names;
 }
 
 const std::vector<std::string>& optionalVariables()
 {
-    static const std::vector<std::string> names{"stl2", "swvl1", "z"};
+    static const std::vector<std::string> names{"skt", "stl1", "stl2", "swvl1", "z"};
     return names;
 }
 

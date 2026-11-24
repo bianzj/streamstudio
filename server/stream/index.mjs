@@ -240,9 +240,16 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     // Indexes registered before time-period packs only ever completed for a whole calendar year.
     const fullYear = pack.fullYear ?? Boolean(pack.complete)
     const period = pack.period || (fullYear ? { start: `${pack.year}-01-01T00:00:00Z`, end: `${pack.year}-12-31T23:00:00Z` } : null)
+    // 2026-11-24: skt / stl1 are no longer required (EB initial values come from the 2 m air temperature; skt is only
+    // read for water pixels). Indexes registered earlier may list them as missing or incomplete: do not block on that.
+    const optionalNow = new Set(['skt', 'stl1', 'stl2'])
+    const missingVariables = (pack.missingVariables || []).filter((name) => !optionalNow.has(name))
+    const incompleteVariables = (pack.incompleteVariables || []).filter((name) => !optionalNow.has(name))
+    const complete = Boolean(pack.complete) || (missingVariables.length === 0 && incompleteVariables.length === 0 &&
+      ((pack.missingVariables || []).length + (pack.incompleteVariables || []).length) > 0)
     return { path: windowsPath(path), label: pack.label || `${String(pack.product || 'era5').toUpperCase()} ${period ? period.start.slice(0, 10) : pack.year}`, product: pack.product,
-      year: pack.year, period, fullYear, complete: Boolean(pack.complete), files: (pack.files || []).length, variables: pack.variables || {},
-      missingVariables: pack.missingVariables || [], incompleteVariables: pack.incompleteVariables || [], grid: pack.grid, createdAt: pack.createdAt }
+      year: pack.year, period, fullYear, complete, files: (pack.files || []).length, variables: pack.variables || {},
+      missingVariables, incompleteVariables, grid: pack.grid, createdAt: pack.createdAt }
   }
 
   // Registered packs plus any pack a project points at elsewhere (for example one shipped inside the project).
