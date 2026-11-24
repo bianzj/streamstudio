@@ -1,4 +1,5 @@
 #pragma once
+#include "forcing_metadata.h"
 #include "forcing_source.h"
 
 #include <cstdint>
@@ -24,7 +25,12 @@ using Weights = ForcingWeights;
 // One pack, read over a latitude/longitude window and a range of UTC hours (ERA5 implementation of ForcingSource).
 class Pack : public ForcingSource {
 public:
-    void open(const std::filesystem::path& index);
+    // `metadata` (optional) decides how the files are read; without it the index "metadata" key or the preset of its product.
+    void open(const std::filesystem::path& index, const ForcingMetadata* metadata = nullptr);
+    const ForcingMetadata& metadata() const { return meta_; }
+    // False for the identity ERA5 / ERA5-Land layout, which is read exactly as before the metadata layer existed.
+    bool standardised() const { return generic_; }
+    double lapseRate() const override { return meta_.lapseRateKPerKm / 1000.0; }
     int year() const override { return year_; }
     // Every required variable has all hours of year().
     bool fullYear() const override { return fullYear_; }
@@ -32,7 +38,7 @@ public:
     // names the first variable and hour that are missing.
     bool covers(const std::vector<std::string>& variables, int64_t firstHour, int64_t lastHour, std::string& gap) const override;
     bool landProduct() const { return land_; }
-    int64_t leadHours() const override { return land_ ? 1 : 0; }
+    int64_t leadHours() const override;
     const std::string& product() const override { return product_; }
     bool available(const std::string& variable) const override;
     // Loads [firstHour, lastHour] (hours since 1970-01-01 UTC); hours outside the pack reuse the nearest one.
@@ -51,6 +57,16 @@ public:
 
 private:
     ForcingReport report_;
+    ForcingMetadata meta_;
+    bool generic_ = false;      // data are standardised through the metadata (hourly fluxes are stored as W m-2)
+    std::string indexProduct_;
+    // generic path
+    std::vector<std::string> channelsFor(const std::vector<std::string>& variables) const;
+    const ForcingChannel* channelOf(const std::string& key) const;
+    std::string rawName(const std::string& key) const;
+    double stepOf(const std::string& key) const;
+    bool channelCovers(const std::string& key, int64_t firstHour, int64_t lastHour, std::string& gap) const;
+    void loadGeneric(const std::vector<std::string>& variables, int64_t firstHour, int64_t lastHour);
     struct Source { int file = -1; size_t time = 0; };
     std::vector<std::string> files_;
     std::map<std::string, std::map<int64_t, Source>> sources_;

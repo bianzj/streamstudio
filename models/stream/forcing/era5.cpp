@@ -1,4 +1,5 @@
 #include "era5.h"
+#include "forcing_resample.h"
 #include "utc.h"
 #include "../scene/raster.h"
 
@@ -28,9 +29,6 @@ namespace {
 
 namespace fs = std::filesystem;
 constexpr float kMissing = std::numeric_limits<float>::quiet_NaN();
-const char* const kTimeNames[] = {"valid_time", "time"};
-const char* const kLatitudeNames[] = {"latitude", "lat"};
-const char* const kLongitudeNames[] = {"longitude", "lon"};
 
 std::string nativePath(const fs::path& path)
 {
@@ -76,6 +74,23 @@ public:
     {
         for (const char* name : names) if (int varid = variable(name); varid >= 0) return varid;
         return -1;
+    }
+    int firstVariable(const std::vector<std::string>& names) const
+    {
+        for (const auto& name : names) if (int varid = variable(name.c_str()); varid >= 0) return varid;
+        return -1;
+    }
+    std::vector<std::string> allVariableNames() const
+    {
+        std::vector<std::string> names;
+        int count = 0;
+        nc_inq_nvars(id_, &count);
+        for (int varid = 0; varid < count; ++varid) {
+            char name[NC_MAX_NAME + 1] = {};
+            nc_inq_varname(id_, varid, name);
+            names.push_back(name);
+        }
+        return names;
     }
     std::vector<double> readAll(int varid) const
     {
@@ -163,18 +178,28 @@ struct FileScan {
     Axis latitude, longitude;
     std::vector<int64_t> hours;  // per time index, hours since epoch
     std::vector<std::string> variables;
+    std::vector<std::string> allNames;  // every variable of the file (for messages)
     std::set<std::string> invariant;
 };
 
-FileScan scanFile(const NcFile& file)
+// Coordinate names and the reading rules of one pack: the ERA5 defaults, or what the forcing metadata declares.
+struct Names {
+    std::vector<std::string> time{"valid_time", "time"}, latitude{"latitude", "lat"}, longitude{"longitude", "lon"};
+    std::string timeUnits;       // overrides the units attribute
+    bool strictHours = false;    // metadata-driven packs: records must be on whole hours
+    std::set<std::string> orography{"z"};
+};
+
+FileScan scanFile(const NcFile& file, const Names& names, const std::vector<std::string>& wanted)
 {
     FileScan scan;
-    const int latitude = file.firstVariable(kLatitudeNames);
-    const int longitude = file.firstVariable(kLongitudeNames);
+    scan.allNames = file.allVariableNames();
+    const int latitude = file.firstVariable(names.latitude);
+    const int longitude = file.firstVariable(names.longitude);
     if (latitude < 0 || longitude < 0) throw std::runtime_error("ERA5 文件缺少 latitude/longitude：" + utf8FromPath(file.path()));
     scan.latitude = regularAxis(file.readAll(latitude), "纬度", file.path());
     scan.longitude = regularAxis(file.readAll(longitude), "经度", file.path());
-    const int time = file.firstVariable(kTimeNames);
+    const int time = file.firstVariable(names.time);
     int timeDimension = -1;
     if (time >= 0) {
         int timeDimensions = 0;
@@ -183,12 +208,15 @@ FileScan scanFile(const NcFile& file)
         if (nc_inq_vardimid(file.id(), time, &timeDimension) != NC_NOERR)
             throw std::runtime_error("无法读取 ERA5 时间变量的维度：" + utf8FromPath(file.path()));
         double scale = 0, epoch = 0;
-        timeUnits(file.textAttribute(time, "units"), scale, epoch);
+        timeUnits(names.timeUnits.empty() ? file.textAttribute(time, "units") : names.timeUnits, scale, epoch);
         // DEFERRED[低] 数值: llround 把非整点时刻（如 30 min、三小时步长的半点、带 offset 的累积窗口中点）悄悄吸附到最近整点，可能造成重复小时或错位；calendar 属性也被忽略；建议：|x−round(x)|>1e-3 h 时报错，calendar 非 standard/gregorian/proleptic_gregorian 时报错
-        for (const double value : file.readAll(time)) scan.hours.push_back(static_cast<int64_t>(std::llround((epoch + value * scale) / 3600.0)));
+        for (const double value : file.readAll(time)) {
+            const double hours = (epoch + value * scale) / 3600.0;
+            if (names.strictHours && std::abs(hours - std::round(hours)) > 1e-3)
+                throw std::runtime_error("气象强迫数据的时刻必须是整点（收到 " + formatUtc(hours * 3600.0) + "）；非整点或亚小时数据请先重采样：" + utf8FromPath(file.path()));
+            scan.hours.push_back(static_cast<int64_t>(std::llround(hours)));
+        }
     }
-    std::vector<std::string> wanted = requiredVariables();
-    wanted.insert(wanted.end(), optionalVariables().begin(), optionalVariables().end());
     for (const auto& name : wanted) {
         const int varid = file.variable(name.c_str());
         if (varid < 0) continue;
@@ -198,7 +226,7 @@ FileScan scanFile(const NcFile& file)
         nc_inq_vardimid(file.id(), varid, dims.data());
         const bool timed = timeDimension >= 0 && std::find(dims.begin(), dims.end(), timeDimension) != dims.end();
         scan.variables.push_back(name);
-        if (!timed || (scan.hours.size() == 1 && name == "z")) scan.invariant.insert(name);
+        if (!timed || (scan.hours.size() == 1 && names.orography.count(name))) scan.invariant.insert(name);
     }
     return scan;
 }
@@ -211,7 +239,7 @@ struct Layout {
     bool hasFill = false, hasMissing = false;
 };
 
-Layout layoutOf(const NcFile& file, const std::string& name)
+Layout layoutOf(const NcFile& file, const std::string& name, const Names& names)
 {
     Layout layout;
     layout.varid = file.variable(name.c_str());
@@ -221,7 +249,7 @@ Layout layoutOf(const NcFile& file, const std::string& name)
     std::vector<int> dims(dimensions);
     nc_inq_vardimid(file.id(), layout.varid, dims.data());
     int timeDimension = -1;
-    const int timeVariable = file.firstVariable(kTimeNames);
+    const int timeVariable = file.firstVariable(names.time);
     if (timeVariable >= 0) nc_inq_vardimid(file.id(), timeVariable, &timeDimension);
     for (int axis = 0; axis < dimensions; ++axis) {
         size_t length = 0;
@@ -229,8 +257,8 @@ Layout layoutOf(const NcFile& file, const std::string& name)
         layout.lengths.push_back(length);
         const auto dimension = file.dimensionName(dims[axis]);
         if (dims[axis] == timeDimension) layout.timeAxis = axis;
-        else if (dimension == "latitude" || dimension == "lat") layout.latitudeAxis = axis;
-        else if (dimension == "longitude" || dimension == "lon") layout.longitudeAxis = axis;
+        else if (std::find(names.latitude.begin(), names.latitude.end(), dimension) != names.latitude.end()) layout.latitudeAxis = axis;
+        else if (std::find(names.longitude.begin(), names.longitude.end(), dimension) != names.longitude.end()) layout.longitudeAxis = axis;
     }
     if (layout.latitudeAxis < 0 || layout.longitudeAxis < 0)
         throw std::runtime_error("ERA5 变量 " + name + " 缺少经纬度维：" + utf8FromPath(file.path()));
@@ -308,7 +336,7 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
         const fs::path path = pathFromUtf8(files[position]);
         if (!fs::is_regular_file(path)) throw std::runtime_error("ERA5 文件不存在：" + files[position]);
         const NcFile file(path);
-        const FileScan scan = scanFile(file);
+        const FileScan scan = scanFile(file, Names{}, [] { auto w = requiredVariables(); w.insert(w.end(), optionalVariables().begin(), optionalVariables().end()); return w; }());
         if (position == 0) { latitude = scan.latitude; longitude = scan.longitude; }
         else if (!sameAxis(latitude, scan.latitude) || !sameAxis(longitude, scan.longitude))
             throw std::runtime_error("ERA5 文件的经纬度网格不一致：" + files[position]);
@@ -416,16 +444,78 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
     return complete;
 }
 
-void Pack::open(const fs::path& index)
+namespace {
+
+std::vector<std::string> legacyWanted()
+{
+    std::vector<std::string> wanted = requiredVariables();
+    wanted.insert(wanted.end(), optionalVariables().begin(), optionalVariables().end());
+    return wanted;
+}
+
+Names namesOf(const ForcingMetadata& meta)
+{
+    Names names;
+    names.time = meta.timeVariables;
+    names.latitude = meta.latitudeNames;
+    names.longitude = meta.longitudeNames;
+    names.timeUnits = meta.timeUnits;
+    names.strictHours = true;
+    names.orography.clear();
+    for (const auto& name : meta.orography.source) names.orography.insert(name);
+    return names;
+}
+
+std::vector<std::string> wantedOf(const ForcingMetadata& meta)
+{
+    std::vector<std::string> wanted;
+    for (const ForcingChannel* c : {&meta.airTemperature, &meta.humidity, &meta.pressure, &meta.windU, &meta.windV, &meta.windSpeed,
+                                    &meta.windDirection, &meta.shortwaveDown, &meta.longwaveDown, &meta.skinTemperature,
+                                    &meta.soilMoisture, &meta.orography})
+        for (const auto& name : c->source) wanted.push_back(name);
+    return wanted;
+}
+
+double medianStep(const std::map<int64_t, int>& hours)
+{
+    std::vector<double> steps;
+    int64_t previous = 0;
+    bool first = true;
+    for (const auto& item : hours) {
+        if (item.first == std::numeric_limits<int64_t>::min()) continue;
+        if (!first) steps.push_back(static_cast<double>(item.first - previous));
+        previous = item.first;
+        first = false;
+    }
+    if (steps.empty()) return 1.0;
+    std::sort(steps.begin(), steps.end());
+    return steps[steps.size() / 2];
+}
+
+}  // namespace
+
+void Pack::open(const fs::path& index, const ForcingMetadata* metadata)
 {
     CPLJSONDocument document;
     if (!document.Load(utf8FromPath(index))) throw std::runtime_error("无法读取气象数据包索引：" + utf8FromPath(index));
     const auto root = document.GetRoot();
-    if (root.GetString("kind", "") != "stream-era5-pack" || root.GetInteger("schemaVersion", 0) != 1)
+    const std::string kind = root.GetString("kind", "");
+    if ((kind != "stream-era5-pack" && kind != "stream-forcing-pack") || root.GetInteger("schemaVersion", 0) != 1)
         throw std::runtime_error("不是气象数据包索引：" + utf8FromPath(index));
-    product_ = root.GetString("product", "era5");
-    land_ = product_ == "era5-land";
+    indexProduct_ = root.GetString("product", "era5");
     year_ = root.GetInteger("year", 0);
+    if (metadata) meta_ = *metadata;
+    else if (const std::string spec = root.GetString("metadata", ""); !spec.empty()) {
+        meta_ = resolveForcingMetadata(spec, fs::absolute(index).parent_path());
+        meta_.origin = "pack";
+    } else meta_ = forcingMetadataForProduct(indexProduct_);
+    if (meta_.station()) throw std::runtime_error("气象强迫元数据 \"" + meta_.name + "\" 是站点形态，不能用于网格数据包：" + utf8FromPath(index));
+    generic_ = !meta_.era5Layout();
+    land_ = !generic_ && meta_.shortwaveDown.kind == "cumulative";
+    product_ = generic_ ? meta_.name : indexProduct_;
+    for (const auto& text : meta_.warnings) report_.warn(text);
+    for (const auto& text : meta_.notes) report_.info(text);
+    for (const auto& name : meta_.ignored) report_.ignored.push_back(name);
     const auto grid = root.GetObj("grid");
     latitude0_ = grid.GetObj("latitude").GetDouble("first", 0);
     latitudeStep_ = grid.GetObj("latitude").GetDouble("step", 0);
@@ -438,6 +528,9 @@ void Pack::open(const fs::path& index)
     const double lastLongitude = longitude0_ + longitudeStep_ * (longitudeCount_ - 1);
     longitude360_ = std::max(longitude0_, lastLongitude) > 180.0 + 1e-6;
 
+    const Names names = generic_ ? namesOf(meta_) : Names{};
+    const std::vector<std::string> wanted = generic_ ? wantedOf(meta_) : legacyWanted();
+    std::vector<std::string> dataNames;
     const auto list = root.GetArray("files");
     for (int position = 0; position < list.Size(); ++position) {
         const auto item = list[position];
@@ -449,23 +542,161 @@ void Pack::open(const fs::path& index)
             throw std::runtime_error("气象强迫文件在登记后被修改，请重新登记数据包：" + utf8FromPath(path));
         files_.push_back(utf8FromPath(path));
         const NcFile file(path);
-        const FileScan scan = scanFile(file);
+        const FileScan scan = scanFile(file, names, wanted);
+        for (const auto& name : scan.allNames) if (std::find(dataNames.begin(), dataNames.end(), name) == dataNames.end()) dataNames.push_back(name);
         for (const auto& name : scan.variables) {
             if (scan.invariant.count(name)) { sources_[name][std::numeric_limits<int64_t>::min()] = Source{position, 0}; continue; }
             auto& map = sources_[name];
             for (size_t time = 0; time < scan.hours.size(); ++time) map.emplace(scan.hours[time], Source{position, time});
         }
     }
-    std::string absent;
-    for (const auto& name : requiredVariables()) if (!sources_.count(name)) absent += (absent.empty() ? "" : "、") + name;
-    if (!absent.empty()) throw std::runtime_error("气象数据包缺少必需变量 " + absent + "：" + utf8FromPath(index));
-    const int64_t yearFirst = daysFromCivil(year_, 1, 1) * 24;
-    std::string gap;
-    fullYear_ = covers(requiredVariables(), yearFirst, yearFirst + (isLeapYear(year_) ? 366 : 365) * 24 - 1, gap);
+    if (!generic_) {
+        std::string absent;
+        for (const auto& name : requiredVariables()) if (!sources_.count(name)) absent += (absent.empty() ? "" : "、") + name;
+        if (!absent.empty()) throw std::runtime_error("气象数据包缺少必需变量 " + absent + "：" + utf8FromPath(index));
+        const int64_t yearFirst = daysFromCivil(year_, 1, 1) * 24;
+        std::string gap;
+        fullYear_ = covers(requiredVariables(), yearFirst, yearFirst + (isLeapYear(year_) ? 366 : 365) * 24 - 1, gap);
+        return;
+    }
+    ForcingIssues issues;
+    checkForcingAgainstNames(meta_, dataNames, issues);
+    if (!issues.ok()) throw std::runtime_error(issues.errorText() + "：" + utf8FromPath(index));
+    for (const auto& text : issues.warnings) report_.warn(text);
+    // record spacing: declared step against the data
+    const std::string swRaw = rawName("sw");
+    if (!swRaw.empty() && meta_.stepHours > 0) {
+        std::map<int64_t, int> hours;
+        for (const auto& item : sources_[swRaw]) hours[item.first] = 0;
+        const double detected = medianStep(hours);
+        if (hours.size() > 1 && std::abs(detected - meta_.stepHours) > 0.01 * meta_.stepHours)
+            report_.warn("time.stepHours = " + std::to_string(meta_.stepHours) + " 与数据检测到的间隔 " + std::to_string(detected) + " h 不一致，按声明处理");
+    }
+    for (const char* key : {"ta", "hum", "p", "u", "v", "speed", "dir", "sw", "lw", "skt", "swvl", "z"}) {
+        if (rawName(key).empty()) continue;
+        const double step = stepOf(key);
+        if (!(step >= 1.0) || std::abs(step - std::round(step)) > 1e-6)
+            throw std::runtime_error("网格数据的记录间隔须为整数小时（" + std::string(key) + " 间隔 " + std::to_string(step) + " h），亚小时数据请先重采样");
+    }
+    fullYear_ = false;
+}
+
+const ForcingChannel* Pack::channelOf(const std::string& key) const
+{
+    if (key == "ta") return &meta_.airTemperature;
+    if (key == "hum") return &meta_.humidity;
+    if (key == "p") return &meta_.pressure;
+    if (key == "u") return &meta_.windU;
+    if (key == "v") return &meta_.windV;
+    if (key == "speed") return &meta_.windSpeed;
+    if (key == "dir") return &meta_.windDirection;
+    if (key == "sw") return &meta_.shortwaveDown;
+    if (key == "lw") return &meta_.longwaveDown;
+    if (key == "skt") return &meta_.skinTemperature;
+    if (key == "swvl") return &meta_.soilMoisture;
+    if (key == "z") return &meta_.orography;
+    return nullptr;
+}
+
+std::string Pack::rawName(const std::string& key) const
+{
+    const ForcingChannel* channel = channelOf(key);
+    if (!channel || !channel->declared) return "";
+    for (const auto& name : channel->source) if (sources_.count(name)) return name;
+    return "";
+}
+
+double Pack::stepOf(const std::string& key) const
+{
+    const ForcingChannel* channel = channelOf(key);
+    if (channel && channel->stepHours > 0) return channel->stepHours;
+    if (meta_.stepHours > 0) return meta_.stepHours;
+    const auto found = sources_.find(rawName(key));
+    if (found == sources_.end()) return 1.0;
+    std::map<int64_t, int> hours;
+    for (const auto& item : found->second) hours[item.first] = 0;
+    return medianStep(hours);
+}
+
+std::vector<std::string> Pack::channelsFor(const std::vector<std::string>& variables) const
+{
+    std::set<std::string> keys;
+    const auto wind = [&] {
+        if (meta_.windType == "components") { keys.insert("u"); keys.insert("v"); }
+        else { keys.insert("speed"); if (meta_.windType == "speedDirection") keys.insert("dir"); }
+    };
+    const auto pressure = [&] {
+        if (meta_.pressureType == "surface") keys.insert("p");
+        else { keys.insert("z"); if (meta_.pressureType == "seaLevel") { keys.insert("p"); keys.insert("ta"); } }
+    };
+    const auto dewpoint = [&] {
+        keys.insert("hum");
+        if (meta_.humidityType != "dewpoint") { keys.insert("ta"); if (meta_.humidityType != "vapourPressure") pressure(); }
+    };
+    for (const auto& name : variables) {
+        if (name == "t2m") keys.insert("ta");
+        else if (name == "d2m") dewpoint();
+        else if (name == "sp") pressure();
+        else if (name == "u10" || name == "v10") wind();
+        else if (name == "ssrd") keys.insert("sw");
+        else if (name == "strd") {
+            if (!rawName("lw").empty()) keys.insert("lw");
+            else { keys.insert("ta"); dewpoint(); }
+        } else if (name == "skt") keys.insert("skt");
+        else if (name == "swvl1") keys.insert("swvl");
+        else if (name == "z") keys.insert("z");
+    }
+    std::vector<std::string> out;
+    for (const auto& key : keys) if (!rawName(key).empty()) out.push_back(key);
+    return out;
+}
+
+bool Pack::channelCovers(const std::string& key, int64_t firstHour, int64_t lastHour, std::string& gap) const
+{
+    const std::string raw = rawName(key);
+    const ForcingChannel* channel = channelOf(key);
+    const auto found = sources_.find(raw);
+    if (found == sources_.end()) { gap = key + " 不在数据包中"; return false; }
+    if (found->second.count(std::numeric_limits<int64_t>::min())) return true;
+    const double step = stepOf(key);
+    const bool flux = (key == "sw" || key == "lw") && channel->kind != "instant";
+    std::vector<double> times;
+    for (const auto& item : found->second) times.push_back(static_cast<double>(item.first));
+    const auto describe = [&](int64_t hour) { return raw + " 缺少 " + formatUtc(static_cast<double>(hour) * 3600.0) + "（原始记录需包住该时段，记录间隔 " + std::to_string(step) + " h）"; };
+    if (flux) {
+        for (int64_t hour = firstHour; hour <= lastHour; ++hour) {
+            bool covered = false;
+            for (const double t : times) {
+                const double end = (channel->kind == "previous" || channel->stamp == "interval_start") ? t + step : channel->stamp == "interval_mid" ? t + 0.5 * step : t;
+                if (end - step <= hour - 1 + 1e-9 && end >= hour - 1e-9) { covered = true; break; }
+            }
+            if (!covered) { gap = describe(hour); return false; }
+        }
+        return true;
+    }
+    const double maxGap = forcingMaxGap(meta_.maxGapHours, step);
+    double before = std::numeric_limits<double>::quiet_NaN(), after = before;
+    for (const double t : times) { if (t <= firstHour + 1e-9) before = t; if (t >= lastHour - 1e-9 && !std::isfinite(after)) after = t; }
+    if (!std::isfinite(before)) { gap = describe(firstHour); return false; }
+    if (!std::isfinite(after)) { gap = describe(lastHour); return false; }
+    for (size_t i = 1; i < times.size(); ++i)
+        if (times[i] > before + 1e-9 && times[i - 1] < after - 1e-9 && times[i] - times[i - 1] > maxGap + 1e-9) {
+            gap = raw + " 在 " + formatUtc(times[i - 1] * 3600.0) + " 到 " + formatUtc(times[i] * 3600.0) + " 之间缺测超过 " + std::to_string(maxGap) + " h";
+            return false;
+        }
+    return true;
 }
 
 bool Pack::covers(const std::vector<std::string>& variables, int64_t firstHour, int64_t lastHour, std::string& gap) const
 {
+    if (generic_) {
+        for (const auto& name : variables) {
+            if (!available(name)) { gap = name + " 不在数据包中"; return false; }
+            for (const auto& key : channelsFor({name}))
+                if (!channelCovers(key, firstHour, lastHour, gap)) return false;
+        }
+        return true;
+    }
     for (const auto& name : variables) {
         const auto found = sources_.find(name);
         if (found == sources_.end()) { gap = name + " 不在数据包中"; return false; }
@@ -476,7 +707,29 @@ bool Pack::covers(const std::vector<std::string>& variables, int64_t firstHour, 
     return true;
 }
 
-bool Pack::available(const std::string& variable) const { return sources_.count(variable) > 0; }
+int64_t Pack::leadHours() const
+{
+    if (!generic_) return land_ ? 1 : 0;
+    int64_t lead = 0;
+    for (const char* key : {"sw", "lw"})
+        if (channelOf(key)->kind == "cumulative" && !rawName(key).empty()) lead = std::max<int64_t>(lead, static_cast<int64_t>(std::ceil(stepOf(key))));
+    return lead;
+}
+
+bool Pack::available(const std::string& variable) const
+{
+    if (!generic_) return sources_.count(variable) > 0;
+    if (variable == "t2m") return !rawName("ta").empty();
+    if (variable == "d2m") return !rawName("hum").empty();
+    if (variable == "sp") return meta_.pressureType == "none" || !rawName("p").empty();
+    if (variable == "u10" || variable == "v10") return meta_.windType == "components" ? !rawName("u").empty() && !rawName("v").empty() : !rawName("speed").empty();
+    if (variable == "ssrd") return !rawName("sw").empty();
+    if (variable == "strd") return !rawName("lw").empty() || meta_.longwaveFallback == "brutsaert";
+    if (variable == "skt") return !rawName("skt").empty();
+    if (variable == "swvl1") return !rawName("swvl").empty();
+    if (variable == "z") return !rawName("z").empty();
+    return false;
+}
 
 void Pack::load(const std::vector<std::string>& variables, double latitudeMin, double latitudeMax, double longitudeMin,
                 double longitudeMax, int64_t firstHour, int64_t lastHour)
@@ -500,8 +753,10 @@ void Pack::load(const std::vector<std::string>& variables, double latitudeMin, d
         throw std::runtime_error("影像范围不在气象数据包的覆盖范围内");
     firstHour_ = firstHour;
     lastHour_ = lastHour;
+    if (generic_) { loadGeneric(variables, firstHour, lastHour); return; }
 
     const size_t frame = static_cast<size_t>(rows_) * columns_;
+    const Names names;
     std::map<int, std::unique_ptr<NcFile>> opened;
     const auto file = [&](int position) -> const NcFile& {
         auto& slot = opened[position];
@@ -517,7 +772,7 @@ void Pack::load(const std::vector<std::string>& variables, double latitudeMin, d
             auto& values = data_[name];
             values.assign(frame, kMissing);
             const NcFile& nc = file(invariantSource->second.file);
-            readFrame(nc, layoutOf(nc, name), invariantSource->second.time, row0_, rows_, column0_, columns_, values.data());
+            readFrame(nc, layoutOf(nc, name, names), invariantSource->second.time, row0_, rows_, column0_, columns_, values.data());
             continue;
         }
         auto& values = data_[name];
@@ -544,10 +799,190 @@ void Pack::load(const std::vector<std::string>& variables, double latitudeMin, d
             }
             const NcFile& nc = file(source->second.file);
             auto layout = layouts.find(source->second.file);
-            if (layout == layouts.end()) layout = layouts.emplace(source->second.file, layoutOf(nc, name)).first;
+            if (layout == layouts.end()) layout = layouts.emplace(source->second.file, layoutOf(nc, name, names)).first;
             readFrame(nc, layout->second, source->second.time, row0_, rows_, column0_, columns_,
                       values.data() + static_cast<size_t>(hour - firstHour) * frame);
         }
+    }
+}
+
+void Pack::loadGeneric(const std::vector<std::string>& variables, int64_t firstHour, int64_t lastHour)
+{
+    constexpr double kNotANumber = std::numeric_limits<double>::quiet_NaN();
+    const Names names = namesOf(meta_);
+    const size_t frame = static_cast<size_t>(rows_) * columns_;
+    const size_t hours = static_cast<size_t>(lastHour - firstHour + 1);
+    std::map<int, std::unique_ptr<NcFile>> opened;
+    const auto file = [&](int position) -> const NcFile& {
+        auto& slot = opened[position];
+        if (!slot) slot = std::make_unique<NcFile>(pathFromUtf8(files_[position]));
+        return *slot;
+    };
+    const auto cellPosition = [&](size_t cell, double& latitude, double& longitude) {
+        latitude = latitude0_ + (row0_ + static_cast<double>(cell / columns_)) * latitudeStep_;
+        longitude = longitude0_ + (column0_ + static_cast<double>(cell % columns_)) * longitudeStep_;
+        while (longitude > 180.0) longitude -= 360.0;
+        while (longitude < -180.0) longitude += 360.0;
+    };
+    std::map<std::string, std::vector<double>> hourly;    // key -> [hour][cell] SI (fluxes: W m-2 of the hour)
+    std::map<std::string, std::vector<double>> constant;  // key -> [cell]
+    for (const auto& key : channelsFor(variables)) {
+        const ForcingChannel& channel = *channelOf(key);
+        const std::string raw = rawName(key);
+        const auto& map = sources_.at(raw);
+        long long removed = 0;
+        const auto convert = [&](float input) {
+            if (!std::isfinite(input)) return kNotANumber;
+            double value = input;
+            for (const double marker : channel.missing)
+                if (std::abs(value - marker) <= 1e-9 * std::max(1.0, std::abs(marker))) { ++removed; return kNotANumber; }
+            value = value * channel.scale + channel.offset;
+            if (channel.hasRange && (value < channel.rangeMin || value > channel.rangeMax)) { ++removed; return kNotANumber; }
+            return value * channel.unitFactor + channel.unitOffset;
+        };
+        std::map<int, Layout> layouts;
+        const auto read = [&](const Source& source, std::vector<float>& out) {
+            const NcFile& nc = file(source.file);
+            auto layout = layouts.find(source.file);
+            if (layout == layouts.end()) layout = layouts.emplace(source.file, layoutOf(nc, raw, names)).first;
+            out.assign(frame, kMissing);
+            readFrame(nc, layout->second, source.time, row0_, rows_, column0_, columns_, out.data());
+        };
+        if (const auto invariant = map.find(std::numeric_limits<int64_t>::min()); invariant != map.end()) {
+            std::vector<float> frameValues;
+            read(invariant->second, frameValues);
+            auto& values = constant[key];
+            values.resize(frame);
+            for (size_t cell = 0; cell < frame; ++cell) values[cell] = convert(frameValues[cell]);
+            if (removed) report_.removed[key] += removed;
+            continue;
+        }
+        const double step = stepOf(key);
+        const double maxGap = forcingMaxGap(meta_.maxGapHours, step);
+        const double pad = std::max(maxGap, 2.0 * step) + 1.0;
+        std::vector<double> times;
+        std::vector<std::vector<float>> frames;
+        for (const auto& item : map) {
+            if (item.first == std::numeric_limits<int64_t>::min()) continue;
+            if (item.first < firstHour - pad || item.first > lastHour + pad) continue;
+            times.push_back(static_cast<double>(item.first));
+            frames.emplace_back();
+            read(item.second, frames.back());
+        }
+        const bool fluxChannel = key == "sw" || key == "lw";
+        const bool intervals = fluxChannel && channel.kind != "instant";
+        auto& output = hourly[key];
+        output.assign(hours * frame, kNotANumber);
+        std::vector<double> series(times.size()), shifted(times.size()), result;
+        for (size_t cell = 0; cell < frame; ++cell) {
+            bool any = false;
+            for (size_t r = 0; r < times.size(); ++r) { series[r] = convert(frames[r][cell]); any = any || std::isfinite(series[r]); }
+            if (!any) continue;
+            if (intervals) {
+                double latitude, longitude;
+                cellPosition(cell, latitude, longitude);
+                distributeFlux(fluxRecordsFrom(channel, step, times, series), key == "sw" ? FluxShape::Solar : FluxShape::Smooth, latitude, longitude,
+                               firstHour, lastHour, result);
+            } else if (fluxChannel) {  // instantaneous irradiance: the hour (h - 1, h] takes the value at h - 0.5
+                for (size_t r = 0; r < times.size(); ++r) shifted[r] = times[r] + 0.5;
+                resampleInstant(shifted, series, firstHour, lastHour, maxGap, result);
+            } else if (channel.kind == "previous") {  // zero-order hold
+                result.assign(hours, kNotANumber);
+                for (int64_t hour = firstHour; hour <= lastHour; ++hour) {
+                    for (size_t r = times.size(); r-- > 0;)
+                        if (times[r] <= hour + 1e-9) { if (hour - times[r] <= maxGap + 1e-9) result[hour - firstHour] = series[r]; break; }
+                }
+            } else resampleInstant(times, series, firstHour, lastHour, maxGap, result);
+            for (size_t h = 0; h < hours; ++h) {
+                double value = result[h];
+                if (intervals || fluxChannel) value = std::isfinite(value) ? std::max(value, 0.0) : kNotANumber;
+                output[h * frame + cell] = value;
+            }
+        }
+        if (removed) report_.removed[key] += removed;
+    }
+    const auto value = [&](const std::string& key, size_t hour, size_t cell) -> double {
+        if (const auto found = hourly.find(key); found != hourly.end()) return found->second[hour * frame + cell];
+        if (const auto found = constant.find(key); found != constant.end()) return found->second[cell];
+        return kNotANumber;
+    };
+    const auto altitude = [&](size_t hour, size_t cell) { return value("z", hour, cell) / kForcingStandardGravity; };
+    const auto temperature = [&](size_t hour, size_t cell) { return value("ta", hour, cell) + meta_.temperatureShiftK; };
+    bool pressureWarned = false;
+    const auto pressure = [&](size_t hour, size_t cell) -> double {
+        if (meta_.pressureType == "surface") return value("p", hour, cell);
+        const double height = altitude(hour, cell);
+        if (meta_.pressureType == "seaLevel") return std::isfinite(height) ? forcingPressureFromSeaLevel(value("p", hour, cell), height, temperature(hour, cell)) : kNotANumber;
+        if (std::isfinite(height)) return forcingPressureFromAltitude(height);
+        if (!pressureWarned) { pressureWarned = true; report_.warn("没有气压且没有站点/格点海拔，地面气压取 1013.25 hPa"); }
+        return 101325.0;
+    };
+    const auto dewpoint = [&](size_t hour, size_t cell) -> double {
+        const double humidity = value("hum", hour, cell);
+        if (meta_.humidityType == "dewpoint") return humidity;
+        double ea = kNotANumber;  // hPa
+        if (meta_.humidityType == "vapourPressure") ea = humidity / 100.0;
+        else if (meta_.humidityType == "relative") ea = humidity * forcingSaturationVapourPressure(temperature(hour, cell) - 273.15);
+        else if (meta_.humidityType == "specific") ea = forcingVapourPressureFromSpecific(humidity, pressure(hour, cell));
+        else ea = forcingVapourPressureFromMixingRatio(humidity, pressure(hour, cell));
+        return forcingDewPointFromVapourPressure(ea);
+    };
+    const auto store = [&](const std::string& name, const auto& compute) {
+        auto& out = data_[name];
+        out.assign(hours * frame, kMissing);
+        for (size_t h = 0; h < hours; ++h)
+            for (size_t cell = 0; cell < frame; ++cell) {
+                const double v = compute(h, cell);
+                if (std::isfinite(v)) out[h * frame + cell] = static_cast<float>(v);
+            }
+        exact_[name].assign(hours, 1);
+    };
+    const auto wind = [&](size_t hour, size_t cell, bool northward) -> double {
+        double u, v;
+        if (meta_.windType == "components") { u = value("u", hour, cell); v = value("v", hour, cell); }
+        else {
+            const double speed = value("speed", hour, cell);
+            if (meta_.windType == "speed") { u = speed; v = 0.0; }
+            else {
+                const double direction = value("dir", hour, cell) * 3.14159265358979323846 / 180.0;
+                const double sign = meta_.windConvention == "from" ? -1.0 : 1.0;
+                u = sign * speed * std::sin(direction);
+                v = sign * speed * std::cos(direction);
+            }
+        }
+        const double result = northward ? v : u;
+        return meta_.windFactor != 1.0 ? result * meta_.windFactor : result;
+    };
+    for (const auto& name : variables) {
+        if (name == "t2m") store(name, [&](size_t h, size_t c) { return temperature(h, c); });
+        else if (name == "sp") {
+            store(name, pressure);
+            if (meta_.pressureType != "surface") report_.derived.push_back(meta_.pressureType == "seaLevel" ? "sp 由海平面气压 + 海拔换算" : "sp 由海拔按标准大气估算");
+        } else if (name == "d2m") {
+            store(name, dewpoint);
+            if (meta_.humidityType != "dewpoint") report_.derived.push_back("d2m 由 " + meta_.humidityType + " 湿度换算");
+        } else if (name == "u10") store(name, [&](size_t h, size_t c) { return wind(h, c, false); });
+        else if (name == "v10") store(name, [&](size_t h, size_t c) { return wind(h, c, true); });
+        else if (name == "ssrd") store(name, [&](size_t h, size_t c) { return value("sw", h, c); });
+        else if (name == "strd") {
+            if (!rawName("lw").empty()) store(name, [&](size_t h, size_t c) { return value("lw", h, c); });
+            else {
+                report_.warn("没有向下长波，按 Brutsaert 晴空参数化（不含云，阴天偏低）");
+                report_.derived.push_back("strd 由 Brutsaert 晴空参数化估算");
+                store(name, [&](size_t h, size_t c) {
+                    const double ta = temperature(h, c), td = dewpoint(h, c);
+                    return std::isfinite(ta) && std::isfinite(td) ? forcingBrutsaertLongwave(ta, forcingSaturationVapourPressure(td - 273.15)) : kNotANumber;
+                });
+            }
+        } else if (name == "skt") store(name, [&](size_t h, size_t c) { return value("skt", h, c); });
+        else if (name == "swvl1") store(name, [&](size_t h, size_t c) { return value("swvl", h, c); });
+        else if (name == "z") {
+            auto& out = data_[name];
+            out.assign(frame, kMissing);
+            const auto found = constant.find("z");
+            if (found != constant.end())
+                for (size_t cell = 0; cell < frame; ++cell) if (std::isfinite(found->second[cell])) out[cell] = static_cast<float>(found->second[cell]);
+        } else throw std::runtime_error("未知的标准强迫量 " + name);
     }
 }
 
@@ -599,6 +1034,10 @@ float Pack::at(const std::string& variable, int64_t hour, const Weights& weights
 float Pack::hourlyFlux(const std::string& variable, int64_t hour, const Weights& weights) const
 {
     hour = std::clamp(hour, firstHour_, lastHour_);
+    if (generic_) {
+        const float value = at(variable, hour, weights);
+        return std::isfinite(value) ? std::max(0.0f, value) : kMissing;
+    }
     if (!land_) {
         const float current = at(variable, hour, weights);
         if (!std::isfinite(current)) return kMissing;

@@ -17,6 +17,7 @@ add_executable(stream
         app/thermal_view.cpp
         forcing/era5.cpp
         forcing/forcing_metadata.cpp
+        forcing/forcing_resample.cpp
         forcing/forcing_source.cpp
         forcing/pixel_forcing.cpp
         forcing/utc.cpp
