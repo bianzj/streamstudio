@@ -425,6 +425,201 @@ export function effectivePorousSpectrum(spectrum, { readSpectrumFile, writeSpect
   return result
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// FacetEB vehicle parts (docs/vehicle-thermal.md section 2-4). All values are typical values to be verified
+// (标注“典型值待核对”). Paint / glass / tyre / trim spectra are broadband: reflectance = rho_sol, transmittance =
+// tau_sol, refTir = 1 - emissivity (TIR transmittance 0).
+const vehicleSpectrum = (name, label, reflectance, transmittance, refTir, preview = 'metal') => ({ name, label, model: 'custom', reflectance: String(reflectance),
+  transmittance: String(transmittance), refTir, tauTir: 0, previewTexture: { enabled: preview !== '', preset: preview || 'metal', repeatSize: 1.5 },
+  physicalTexture: { enabled: false, fileName: '', strength: 0.15, repeatSize: 1.5 }, params: {} })
+// Paint colours (rho_sol, emissivity 0.88): white 0.65, silver 0.45, black 0.06, red 0.30, blue 0.22, grey 0.30,
+// near-infrared "cool" black 0.25 (black in the visible, reflective pigments in the NIR).
+export const VEHICLE_PAINT_COLORS = [
+  { id: 'white', label: '白', reflectance: 0.65 }, { id: 'silver', label: '银', reflectance: 0.45 }, { id: 'black', label: '黑', reflectance: 0.06 },
+  { id: 'red', label: '红', reflectance: 0.30 }, { id: 'blue', label: '蓝', reflectance: 0.22 }, { id: 'grey', label: '灰', reflectance: 0.30 },
+  { id: 'black_cool', label: '黑（近红外冷漆）', reflectance: 0.25 }
+]
+export const vehiclePaintSpectrumName = (color) => `vehicle_paint_${VEHICLE_PAINT_COLORS.some((entry) => entry.id === color) ? color : 'white'}`
+export const VEHICLE_SPECTRA = [
+  ...VEHICLE_PAINT_COLORS.map((entry) => vehicleSpectrum(vehiclePaintSpectrumName(entry.id), `车漆·${entry.label}（ρ_sol≈${entry.reflectance}，ε≈0.88）`, entry.reflectance, 0, 0.12)),
+  // Windshield: laminated solar-control glass tau 0.60, rho 0.25 -> absorptance 0.15. Side: tempered tau 0.70 (rho 0.08, abs 0.22).
+  // Rear: tempered privacy glass tau 0.65 (rho 0.10, abs 0.25). Films: heat-insulating / low-E, tau 0.35-0.45.
+  vehicleSpectrum('vehicle_glass_front', '前挡风夹层玻璃（τ_sol 0.60，吸收≈0.15，ε 0.9）', 0.25, 0.60, 0.1, ''),
+  vehicleSpectrum('vehicle_glass_side', '侧窗钢化玻璃（τ_sol 0.70，ε 0.9）', 0.08, 0.70, 0.1, ''),
+  vehicleSpectrum('vehicle_glass_rear', '后窗钢化玻璃（τ_sol 0.65，ε 0.9）', 0.10, 0.65, 0.1, ''),
+  vehicleSpectrum('vehicle_glass_front_film', '前挡风隔热膜/Low-E（τ_sol 0.45）', 0.30, 0.45, 0.1, ''),
+  vehicleSpectrum('vehicle_glass_side_film', '侧/后窗隔热膜（τ_sol 0.38）', 0.32, 0.38, 0.1, ''),
+  vehicleSpectrum('vehicle_lamp_glass', '灯具玻璃/透镜（不透入座舱，ε 0.9）', 0.08, 0, 0.1, ''),
+  vehicleSpectrum('vehicle_tyre_rubber', '轮胎橡胶（ρ_sol 0.05，ε 0.9）', 0.05, 0, 0.1),
+  vehicleSpectrum('vehicle_trim_grey', '塑料饰件·灰（ρ_sol 0.20，ε 0.9）', 0.20, 0, 0.1),
+  vehicleSpectrum('vehicle_metal_bare', '裸露金属（ρ_sol 0.55，ε 0.2；排气/底盘金属件可选）', 0.55, 0, 0.8)
+]
+// Interior nodes of the cabin (dashboard, seat, steering wheel, roof lining + door panels): share of the absorbed
+// transmitted sun (dashboard 0.3 = most strongly lit, absorptance ~0.9; seats 0.35; wheel 0.05; lining/doors 0.3),
+// thermal capacity (J/K), convective hA to the cabin air (W/K), radiating area (m2, weights of the exchange with the
+// shell inner surface). Seat: fabric / leather differ in capacity and contact effusivity (J m-2 K-1 s-0.5).
+export const VEHICLE_SEAT_TYPES = { fabric: { capacity: 35000, effusivity: 200 }, leather: { capacity: 50000, effusivity: 450 } }
+export function vehicleInteriorDefaults(seatType = 'fabric') {
+  const seat = VEHICLE_SEAT_TYPES[seatType] || VEHICLE_SEAT_TYPES.fabric
+  return { enabled: true, seatType: VEHICLE_SEAT_TYPES[seatType] ? seatType : 'fabric', shellRadFraction: 0.45, seatEffusivity: seat.effusivity,
+    dashboard: { share: 0.30, capacity: 10000, hcA: 4, radArea: 1 }, seat: { share: 0.35, capacity: seat.capacity, hcA: 10, radArea: 3 },
+    wheel: { share: 0.05, capacity: 2000, hcA: 1, radArea: 0.25 }, lining: { share: 0.30, capacity: 60000, hcA: 28, radArea: 8 } }
+}
+// Engine block + engine-bay air: Q_eng = enginePower x engineShare split into radiator (to the bay air stream),
+// block and exhaust (underbody shell); firewallG = bulkhead conductance bay -> cabin (W/K).
+export function vehicleEngineDefaults() {
+  return { enabled: true, warm: false, warmTemperature: 90, blockCapacity: 80000, bayCapacity: 15000, blockToBay: 40, bayVent0: 0.04, bayVentK: 0.004,
+    radiatorShare: 0.5, blockShare: 0.3, exhaustShare: 0.2, firewallG: 2 }
+}
+// Auto-binding table: OBJ group name -> material family. First matching rule wins. `spectral` / `material` are
+// preset names; `paint` = the paint colour spectrum; `body` = the per-vehicle body material (carries cabin
+// parameters); `keep` = keep the spectrum already chosen (tarp). `glass` rules are refined by facet orientation
+// (splitVehicleObj: front / side / rear) when the OBJ has headlight and tail-light groups.
+export const VEHICLE_BINDING_RULES = [
+  { id: 'hood', label: '引擎盖', pattern: /(^|[_\s-])(hood|bonnet)([_\s-]|$)/i, spectral: 'paint', material: 'vehicle_hood' },
+  { id: 'windshield', label: '前挡风', pattern: /(windshield|windscreen|front[_\s-]*(window|glass|screen)|(windows?|glass)[_\s-]*front)/i, spectral: 'vehicle_glass_front', material: 'vehicle_glass_laminated' },
+  { id: 'rearWindow', label: '后窗', pattern: /(rear[_\s-]*(window|glass|screen)|back[_\s-]*window|(windows?|glass)[_\s-]*rear)/i, spectral: 'vehicle_glass_rear', material: 'vehicle_glass' },
+  { id: 'sideWindow', label: '侧窗', pattern: /(side[_\s-]*(window|glass)|door[_\s-]*(window|glass)|(windows?|glass)[_\s-]*side)/i, spectral: 'vehicle_glass_side', material: 'vehicle_glass' },
+  { id: 'glass', label: '车窗玻璃', pattern: /(^|[_\s-])(windows?|glass|glazing)([_\s-]|$)/i, spectral: 'vehicle_glass_side', material: 'vehicle_glass' },
+  { id: 'lamp', label: '灯具玻璃', pattern: /(head[_\s-]*(light|lamp)|tail[_\s-]*(light|lamp)|light|lamp)/i, spectral: 'vehicle_lamp_glass', material: 'vehicle_lamp' },
+  { id: 'tarpWheel', label: '篷布车轮', pattern: /part_2__covered_car/i, spectral: 'vehicle_tyre_rubber', material: 'vehicle_tyre' },
+  { id: 'tarp', label: '篷布（保持原有篷布处理）', pattern: /covered_car/i, spectral: 'keep', material: 'body' },
+  { id: 'tyre', label: '轮胎', pattern: /(^|[_\s-])(black|tyres?|tires?|wheels?|rubber)([_\s-]|$)/i, spectral: 'vehicle_tyre_rubber', material: 'vehicle_tyre' },
+  { id: 'trim', label: '塑料饰件', pattern: /(^|[_\s-])(grey|gray|trim|plastic|bumper|grille)([_\s-]|$)/i, spectral: 'vehicle_trim_grey', material: 'vehicle_trim' },
+  { id: 'paint', label: '车身漆面', pattern: /(white|blue|red|silver|green|yellow|orange|brown|paint|body|car|chassis)/i, spectral: 'paint', material: 'body' },
+  { id: 'other', label: '其余（车身/底盘）', pattern: /.*/, spectral: 'paint', material: 'body' }
+]
+// Binding of one group: { rule, spectralName, materialName }; spectralName null = keep the current choice.
+export function vehicleMeshBinding(meshName, { paint = 'white', film = false, bodyMaterial = 'vehicle_material' } = {}) {
+  const rule = VEHICLE_BINDING_RULES.find((entry) => entry.pattern.test(String(meshName || ''))) || VEHICLE_BINDING_RULES[VEHICLE_BINDING_RULES.length - 1]
+  let spectralName = rule.spectral === 'paint' ? vehiclePaintSpectrumName(paint) : rule.spectral === 'keep' ? null : rule.spectral
+  if (film && spectralName === 'vehicle_glass_front') spectralName = 'vehicle_glass_front_film'
+  else if (film && (spectralName === 'vehicle_glass_side' || spectralName === 'vehicle_glass_rear')) spectralName = 'vehicle_glass_side_film'
+  return { rule: rule.id, spectralName, materialName: rule.material === 'body' ? bodyMaterial : rule.material }
+}
+// Preset spectra / materials the auto-binding refers to, added to a project only when a vehicle object is created.
+export function vehiclePresetNames() {
+  return { spectra: VEHICLE_SPECTRA.map((item) => item.name), materials: ['vehicle_material', 'vehicle_glass', 'vehicle_glass_laminated', 'vehicle_hood', 'vehicle_tyre', 'vehicle_trim', 'vehicle_lamp', 'vehicle_underbody'] }
+}
+
+// Splits the glass group of a vehicle OBJ into <name>_front / _side / _rear (windshield, side windows, rear window)
+// and adds <paint>_hood to the paint group, by facet orientation in the vehicle frame. Forward = tail-light group
+// centroid -> headlight group centroid (horizontal; y is up). Without both light groups nothing is split.
+// Returns { content, split: { Windows: ['Windows_front', ...] }, forward, counts } (content unchanged if no split).
+export function splitVehicleObj(content, { glassRule = VEHICLE_BINDING_RULES.find((r) => r.id === 'glass'), paintRule = VEHICLE_BINDING_RULES.find((r) => r.id === 'paint') } = {}) {
+  const lines = String(content).split(/\r?\n/)
+  const vertices = []
+  const groups = []                       // { name, lines: [] }; faces keep order
+  let head = [], current = null
+  for (const line of lines) {
+    if (line.startsWith('v ')) vertices.push(line.slice(2).trim().split(/\s+/).slice(0, 3).map(Number))
+    // Vertex data may be interleaved with the faces: hoist it (indices are absolute, order per type is kept).
+    if (/^(v|vn|vt|vp)\s/.test(line)) { head.push(line); continue }
+    if (/^[go]\s/.test(line)) { current = { name: line.slice(2).trim(), header: line, lines: [] }; groups.push(current); continue }
+    if (current) current.lines.push(line); else head.push(line)
+  }
+  const faceOf = (line) => line.slice(2).trim().split(/\s+/).map((token) => {
+    const index = parseInt(token.split('/')[0], 10)
+    return vertices[index < 0 ? vertices.length + index : index - 1]
+  })
+  const centroid = (points) => points.reduce((sum, p) => [sum[0] + p[0] / points.length, sum[1] + p[1] / points.length, sum[2] + p[2] / points.length], [0, 0, 0])
+  const normalOf = (points) => {       // Newell
+    let n = [0, 0, 0]
+    for (let i = 0; i < points.length; i += 1) {
+      const a = points[i], b = points[(i + 1) % points.length]
+      n = [n[0] + (a[1] - b[1]) * (a[2] + b[2]), n[1] + (a[2] - b[2]) * (a[0] + b[0]), n[2] + (a[0] - b[0]) * (a[1] + b[1])]
+    }
+    const length = Math.hypot(...n) || 1
+    return n.map((value) => value / length)
+  }
+  const groupCentroid = (group) => {
+    const points = group.lines.filter((l) => l.startsWith('f ')).flatMap(faceOf)
+    return points.length ? centroid(points) : null
+  }
+  const find = (re) => groups.find((group) => re.test(group.name))
+  const headGroup = find(/head[_\s-]*(light|lamp)/i), tailGroup = find(/tail[_\s-]*(light|lamp)/i)
+  const none = { content, split: {}, forward: null, counts: {} }
+  if (!headGroup || !tailGroup) return none
+  const headC = groupCentroid(headGroup), tailC = groupCentroid(tailGroup)
+  if (!headC || !tailC) return none
+  let forward = [headC[0] - tailC[0], 0, headC[2] - tailC[2]]
+  const forwardLength = Math.hypot(...forward)
+  if (!(forwardLength > 0.5)) return none
+  forward = forward.map((value) => value / forwardLength)
+  const lateral = [-forward[2], 0, forward[0]]        // up (0,1,0) x forward: horizontal, to the vehicle's side
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+  const glassGroups = groups.filter((group) => glassRule.pattern.test(group.name) && !/head|tail|light|lamp/i.test(group.name) && group.lines.some((l) => l.startsWith('f ')))
+  const counts = {}, split = {}
+  const emitted = []
+  let windshieldBase = null
+  const glassInfo = new Map()
+  for (const group of glassGroups) {
+    const faces = group.lines.filter((l) => l.startsWith('f '))
+    const all = faces.flatMap(faceOf)
+    const middle = dot(centroid(all), forward)
+    const classes = { front: [], side: [], rear: [] }
+    for (const line of faces) {
+      const points = faceOf(line), n = normalOf(points), c = centroid(points)
+      const side = Math.abs(dot(n, lateral)) > 0.6
+      classes[side ? 'side' : dot(c, forward) >= middle ? 'front' : 'rear'].push(line)
+    }
+    glassInfo.set(group, classes)
+    const front = classes.front.flatMap(faceOf)
+    if (front.length) {
+      const base = front.reduce((best, p) => (dot(p, forward) > dot(best, forward) ? p : best), front[0])
+      if (!windshieldBase || dot(base, forward) > dot(windshieldBase, forward)) windshieldBase = base
+    }
+  }
+  for (const group of groups) {
+    const classes = glassInfo.get(group)
+    if (classes) {
+      const parts = ['front', 'side', 'rear'].filter((key) => classes[key].length)
+      if (parts.length) {
+        split[group.name] = parts.map((key) => `${group.name}_${key}`)
+        for (const key of parts) { counts[`${group.name}_${key}`] = classes[key].length; emitted.push({ header: `g ${group.name}_${key}`, lines: [...group.lines.filter((l) => !l.startsWith('f ')), ...classes[key]] }) }
+        continue
+      }
+    }
+    // Paint group: the bonnet = upward facets forward of the windshield base and not above it.
+    if (windshieldBase && paintRule.pattern.test(group.name) && !/head|tail|light|lamp|window|glass|tyre|tire|wheel|black|grey|gray|trim/i.test(group.name) &&
+        !VEHICLE_BINDING_RULES.slice(0, 8).some((rule) => rule.pattern.test(group.name))) {
+      const hood = [], rest = []
+      for (const line of group.lines) {
+        if (!line.startsWith('f ')) { rest.push(line); continue }
+        const points = faceOf(line), n = normalOf(points), c = centroid(points)
+        const isHood = n[1] > 0.5 && dot(c, forward) > dot(windshieldBase, forward) - 0.05 && c[1] < windshieldBase[1] + 0.12
+        ;(isHood ? hood : rest).push(line)
+      }
+      if (hood.length) {
+        split[group.name] = [group.name, `${group.name}_hood`]
+        counts[`${group.name}_hood`] = hood.length
+        counts[group.name] = rest.filter((l) => l.startsWith('f ')).length
+        emitted.push({ header: group.header, lines: rest })
+        emitted.push({ header: `g ${group.name}_hood`, lines: [...group.lines.filter((l) => !l.startsWith('f ')), ...hood] })
+        continue
+      }
+    }
+    emitted.push({ header: group.header, lines: group.lines })
+  }
+  if (!Object.keys(split).length) return none
+  const out = [...head]
+  for (const group of emitted) out.push(group.header, ...group.lines)
+  return { content: out.join('\n'), split, forward, counts }
+}
+export const VEHICLE_SPLIT_BINDINGS = { _front: 'windshield', _side: 'sideWindow', _rear: 'rearWindow', _hood: 'hood' }
+// Body material of one vehicle (the vehicle_material preset with this car's cabin / driving / engine state).
+// vent: 'closed' | 'crack' | 'open'; speed > 0 = driving; heading and windDirection together (degrees) or both absent.
+export function createVehicleBodyMaterial(name, { volume = 2.8, occupants = 0, speed = 0, heading, windDirection, vent = 'closed', engineOn = false, enginePower = 15000,
+  engineWarm = false, acOn = false, acPower = 3500, acSetpoint = 24, seat = 'fabric', interior = true, engine = true } = {}) {
+  const base = structuredClone(createMaterialPresets().materials.find((entry) => entry.name === 'vehicle_material'))
+  const cabin = { ...base.params.cabin, enabled: true, occupants, volume, speed, windowCracked: vent !== 'closed', crackedACH: vent === 'open' ? 30 : 10,
+    engineOn, enginePower, acOn, acPower, acSetpoint }
+  if (interior) cabin.interior = vehicleInteriorDefaults(seat); else delete cabin.interior
+  if (engine) cabin.engine = { ...vehicleEngineDefaults(), warm: engineWarm }; else delete cabin.engine
+  if (Number.isFinite(heading) && Number.isFinite(windDirection)) { cabin.heading = heading; cabin.windDirection = windDirection }
+  return { ...base, name, label: `${name} 车身（座舱）`, params: { ...base.params, cabin } }
+}
+
 export function createMaterialPresets() {
   return {
     spectra: [
@@ -447,6 +642,7 @@ export function createMaterialPresets() {
       { name: 'human_surface', label: '人员典型光谱', model: 'custom', reflectance: '0.30', transmittance: '0.0', refTir: 0.02, tauTir: 0, params: {} },
       { name: 'vehicle_surface', label: '载具典型光谱', model: 'custom', reflectance: '0.20', transmittance: '0.0', refTir: 0.08, tauTir: 0, previewTexture: { enabled: true, preset: 'metal', repeatSize: 1.5 }, physicalTexture: { enabled: false, fileName: 'assets/texture-library/metal_variance.jpg', strength: 0.15, repeatSize: 1.5 }, params: {} },
       { name: 'vehicle_glass', label: '车窗玻璃（τ_sol≈0.65）', model: 'custom', reflectance: '0.08', transmittance: '0.65', refTir: 0.1, tauTir: 0, previewTexture: { enabled: false, preset: 'concrete', repeatSize: 1 }, physicalTexture: { enabled: false, fileName: '', strength: 0.15, repeatSize: 1.5 }, params: {} },
+      ...VEHICLE_SPECTRA,
       { name: 'ship_surface', label: '船舶典型光谱', model: 'custom', reflectance: '0.22', transmittance: '0.0', refTir: 0.06, tauTir: 0, params: {} },
       { name: 'water_surface', label: '水体光谱', model: 'custom', reflectance: '0.04', transmittance: '0.0', refTir: 0.02, tauTir: 0, params: {} },
       { name: 'tarp_olive_canvas', label: '篷布（军绿帆布）', model: 'file', fileName: 'assets/spectral-library/tarp_olive_canvas.txt', reflectance: '0.12', transmittance: '0.02', refTir: 0.10, tauTir: 0, previewTexture: { enabled: true, preset: 'canvas', repeatSize: 0.6 }, physicalTexture: { enabled: false, fileName: 'assets/texture-library/canvas_weave_variance.jpg', strength: 0.15, repeatSize: 0.5 }, params: {} },
@@ -535,7 +731,22 @@ export function createMaterialPresets() {
         wallMode: 'wall', thickness: 0.007, indoorTemperature: 22, indoorHeatTransferCoefficient: 7, vehiclePart: 'body',
         layers: [{ thickness: 0.001, lambda: 50, rho: 7850, cp: 460 }, { thickness: 0.006, lambda: 0.04, rho: 60, cp: 1400 }],
         cabin: { enabled: true, occupants: 0, metabolicW: 100, speed: 0, ventilationACH: 0.5, windowCracked: false, crackedACH: 10, acOn: false, acPower: 3500, acSetpoint: 24,
-          engineOn: false, enginePower: 15000, engineShare: 0.3, volume: 2.8, interiorCapacity: 80000, interiorArea: 8, interiorH: 8, absorbedFraction: 0.8 } } },
+          engineOn: false, enginePower: 15000, engineShare: 0.3, volume: 2.8, interiorCapacity: 80000, interiorArea: 8, interiorH: 8, absorbedFraction: 0.8,
+          interior: vehicleInteriorDefaults('fabric'), engine: vehicleEngineDefaults() } } },
+      // Laminated windshield (2.1 mm glass + 0.76 mm PVB + 2.1 mm glass); tempered side/rear glass is vehicle_glass.
+      { name: 'vehicle_glass_laminated', label: '载具前挡风夹层玻璃', type: 'Vehicle', params: { method: 2, rss: 1000000000, cs: 840, rhos: 2500, lambdas: 1, Tsoil: 25, SMC: 0, Satwater: 0,
+        wallMode: 'wall', thickness: 0.00496, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, vehiclePart: 'glass',
+        layers: [{ thickness: 0.0021, lambda: 1, rho: 2500, cp: 840 }, { thickness: 0.00076, lambda: 0.2, rho: 1070, cp: 2000 }, { thickness: 0.0021, lambda: 1, rho: 2500, cp: 840 }] } },
+      // Bonnet: 0.8 mm steel + 10 mm fibre insulation liner; the indoor side is the engine-bay air (needs cabin.engine).
+      { name: 'vehicle_hood', label: '载具引擎盖（内侧=发动机舱空气）', type: 'Vehicle', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0,
+        wallMode: 'wall', thickness: 0.0108, indoorTemperature: 22, indoorHeatTransferCoefficient: 10, vehiclePart: 'hood',
+        layers: [{ thickness: 0.0008, lambda: 50, rho: 7850, cp: 460 }, { thickness: 0.01, lambda: 0.04, rho: 60, cp: 1400 }] } },
+      { name: 'vehicle_tyre', label: '载具轮胎薄壳', type: 'Vehicle', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0,
+        vehiclePart: 'underbody', heatCapacityPerArea: 12000 } },
+      { name: 'vehicle_trim', label: '载具塑料饰件薄壳', type: 'Vehicle', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0,
+        vehiclePart: 'underbody', heatCapacityPerArea: 3750 } },
+      { name: 'vehicle_lamp', label: '载具灯具薄壳', type: 'Vehicle', params: { method: 2, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0,
+        vehiclePart: 'underbody', heatCapacityPerArea: 5400 } },
       { name: 'vehicle_glass', label: '载具玻璃', type: 'Vehicle', params: { method: 2, rss: 1000000000, cs: 840, rhos: 2500, lambdas: 1, Tsoil: 25, SMC: 0, Satwater: 0,
         wallMode: 'wall', thickness: 0.0048, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, vehiclePart: 'glass',
         layers: [{ thickness: 0.0048, lambda: 1, rho: 2500, cp: 840 }] } },
@@ -1124,11 +1335,26 @@ export function validateProject(value) {
   }
   for (const m of c.materials.filter((item) => item.type === 'Vehicle' && !item.energyModel)) {
     const p = m.params || {}
-    if (p.vehiclePart !== undefined && p.vehiclePart !== '' && !['body', 'glass', 'underbody'].includes(p.vehiclePart))
-      errors.push('载具部件应为 body、glass 或 underbody：' + m.name)
+    if (p.vehiclePart !== undefined && p.vehiclePart !== '' && !['body', 'glass', 'underbody', 'hood'].includes(p.vehiclePart))
+      errors.push('载具部件应为 body、glass、underbody 或 hood：' + m.name)
     const k = p.cabin
     if (k && p.vehiclePart === 'body') {
       const inRange = (value, lo, hi, fallback) => { const v = value === undefined || value === null || value === '' ? fallback : Number(value); return Number.isFinite(v) && v >= lo && v <= hi }
+      if (k.interior?.enabled) {
+        const it = k.interior, nodes = ['dashboard', 'seat', 'wheel', 'lining'].map((id) => it[id] || {})
+        const shares = nodes.reduce((sum, node) => sum + (Number(node.share) || 0), 0)
+        if (!inRange(it.shellRadFraction, 0, 0.95, 0.45) || !inRange(it.seatEffusivity, 1, 1e4, 300) || Math.abs(shares - 1) > 1e-3 ||
+            nodes.some((node) => !inRange(node.share, 0, 1, 0.25) || !inRange(node.capacity, 10, 1e8, 10000) || !inRange(node.hcA, 0.01, 1e4, 4) || !inRange(node.radArea, 0, 1e3, 1)))
+          errors.push('车辆内饰节点参数无效（份额之和 = 1，热容 ≥ 10 J/K，hA > 0）：' + m.name)
+      }
+      if (k.engine?.enabled) {
+        const en = k.engine
+        const split = (Number(en.radiatorShare ?? 0.5)) + (Number(en.blockShare ?? 0.3)) + (Number(en.exhaustShare ?? 0.2))
+        if (!inRange(en.warmTemperature, -20, 200, 90) || !inRange(en.blockCapacity, 100, 1e9, 80000) || !inRange(en.bayCapacity, 10, 1e9, 15000) ||
+            !inRange(en.blockToBay, 0.01, 1e5, 40) || !inRange(en.bayVent0, 0, 100, 0.04) || !inRange(en.bayVentK, 0, 100, 0.004) ||
+            !inRange(en.firewallG, 0, 1000, 2) || Math.abs(split - 1) > 1e-3 || !(Number(en.bayVent0 ?? 0.04) + Number(en.bayVentK ?? 0.004) > 0))
+          errors.push('车辆发动机/发动机舱参数无效（散热器+机体+排气份额之和 = 1，热容与换热 > 0）：' + m.name)
+      }
       if (!inRange(k.occupants, 0, 8, 0) || !inRange(k.speed, 0, 100, 0) || !inRange(k.metabolicW, 0, 1000, 100) || !inRange(k.volume, 0.3, 100, 2.8) ||
           !inRange(k.interiorCapacity, 100, 1e8, 80000) || !inRange(k.interiorArea, 0.01, 1000, 8) || !inRange(k.interiorH, 0.01, 1000, 8) ||
           !inRange(k.absorbedFraction, 0, 1, 0.8) || !inRange(k.ventilationACH, 0, 100, 0.5) || !inRange(k.crackedACH, 0, 200, 10) ||
@@ -1297,11 +1523,19 @@ function materialXml(item) {
       ].join('')
     : ''
   // FacetEB vehicle part / cabin parameters (type Vehicle); absent = off, old XML unchanged.
-  const vehiclePartCode = { body: 1, glass: 2, underbody: 3 }[params.vehiclePart]
+  const vehiclePartCode = { body: 1, glass: 2, underbody: 3, hood: 4 }[params.vehiclePart]
   const cabin = params.cabin || {}
+  // Parts model (optional; absent = lumped interior / engine heat on the underbody, old XML unchanged).
+  const csv = (source, key, ids, fallback) => ids.map((id) => number(source?.[id]?.[key], fallback)).join(',')
+  const interiorXml = (it) => it && it.enabled
+    ? `<vcIntModel>1</vcIntModel><vcIntShares>${csv(it, 'share', ['dashboard', 'seat', 'wheel', 'lining'], 0.25)}</vcIntShares><vcIntCapacities>${csv(it, 'capacity', ['dashboard', 'seat', 'wheel', 'lining'], 10000)}</vcIntCapacities><vcIntHcA>${csv(it, 'hcA', ['dashboard', 'seat', 'wheel', 'lining'], 4)}</vcIntHcA><vcIntRadArea>${csv(it, 'radArea', ['dashboard', 'seat', 'wheel', 'lining'], 1)}</vcIntRadArea><vcShellRadFraction>${number(it.shellRadFraction, 0.45)}</vcShellRadFraction><vcSeatEffusivity>${number(it.seatEffusivity, 300)}</vcSeatEffusivity>`
+    : ''
+  const engineXml = (en) => en && en.enabled
+    ? `<vcEngModel>1</vcEngModel><vcEngWarm>${en.warm ? 1 : 0}</vcEngWarm><vcEngWarmTemp>${number(en.warmTemperature, 90)}</vcEngWarmTemp><vcEngCaps>${number(en.blockCapacity, 80000)},${number(en.bayCapacity, 15000)}</vcEngCaps><vcEngBlockBay>${number(en.blockToBay, 40)}</vcEngBlockBay><vcEngBayVent>${number(en.bayVent0, 0.04)},${number(en.bayVentK, 0.004)}</vcEngBayVent><vcEngSplit>${number(en.radiatorShare, 0.5)},${number(en.blockShare, 0.3)},${number(en.exhaustShare, 0.2)}</vcEngSplit><vcFirewallG>${number(en.firewallG, 2)}</vcFirewallG>`
+    : ''
   const vehicle = item.type === 'Vehicle' && vehiclePartCode && !item.energyModel
     ? `<vehiclePart>${vehiclePartCode}</vehiclePart>` + (vehiclePartCode === 1 && params.cabin
-      ? `<vcEnabled>${cabin.enabled ? 1 : 0}</vcEnabled><vcSpeed>${number(cabin.speed, 0)}</vcSpeed><vcOccupants>${number(cabin.occupants, 0)}</vcOccupants><vcMetabolicW>${number(cabin.metabolicW, 100)}</vcMetabolicW><vcVolume>${number(cabin.volume, 2.8)}</vcVolume><vcInteriorCapacity>${number(cabin.interiorCapacity, 80000)}</vcInteriorCapacity><vcInteriorArea>${number(cabin.interiorArea, 8)}</vcInteriorArea><vcInteriorH>${number(cabin.interiorH, 8)}</vcInteriorH><vcAbsorbedFraction>${number(cabin.absorbedFraction, 0.8)}</vcAbsorbedFraction><vcVentilationAch>${number(cabin.ventilationACH, 0.5)}</vcVentilationAch><vcCrackedAch>${number(cabin.crackedACH, 10)}</vcCrackedAch><vcWindowCracked>${cabin.windowCracked ? 1 : 0}</vcWindowCracked><vcAcOn>${cabin.acOn ? 1 : 0}</vcAcOn><vcAcPower>${number(cabin.acPower, 3500)}</vcAcPower><vcAcSetpoint>${number(cabin.acSetpoint, 24)}</vcAcSetpoint><vcAcBand>${number(cabin.acBand, 2)}</vcAcBand><vcEngineOn>${cabin.engineOn ? 1 : 0}</vcEngineOn><vcEnginePower>${number(cabin.enginePower, 15000)}</vcEnginePower><vcEngineShare>${number(cabin.engineShare, 0.3)}</vcEngineShare>${hasNumber(cabin.heading) && hasNumber(cabin.windDirection) ? `<vcHeading>${number(cabin.heading, 0)}</vcHeading><vcWindDirection>${number(cabin.windDirection, 0)}</vcWindDirection>` : ''}`
+      ? `<vcEnabled>${cabin.enabled ? 1 : 0}</vcEnabled><vcSpeed>${number(cabin.speed, 0)}</vcSpeed><vcOccupants>${number(cabin.occupants, 0)}</vcOccupants><vcMetabolicW>${number(cabin.metabolicW, 100)}</vcMetabolicW><vcVolume>${number(cabin.volume, 2.8)}</vcVolume><vcInteriorCapacity>${number(cabin.interiorCapacity, 80000)}</vcInteriorCapacity><vcInteriorArea>${number(cabin.interiorArea, 8)}</vcInteriorArea><vcInteriorH>${number(cabin.interiorH, 8)}</vcInteriorH><vcAbsorbedFraction>${number(cabin.absorbedFraction, 0.8)}</vcAbsorbedFraction><vcVentilationAch>${number(cabin.ventilationACH, 0.5)}</vcVentilationAch><vcCrackedAch>${number(cabin.crackedACH, 10)}</vcCrackedAch><vcWindowCracked>${cabin.windowCracked ? 1 : 0}</vcWindowCracked><vcAcOn>${cabin.acOn ? 1 : 0}</vcAcOn><vcAcPower>${number(cabin.acPower, 3500)}</vcAcPower><vcAcSetpoint>${number(cabin.acSetpoint, 24)}</vcAcSetpoint><vcAcBand>${number(cabin.acBand, 2)}</vcAcBand><vcEngineOn>${cabin.engineOn ? 1 : 0}</vcEngineOn><vcEnginePower>${number(cabin.enginePower, 15000)}</vcEnginePower><vcEngineShare>${number(cabin.engineShare, 0.3)}</vcEngineShare>${hasNumber(cabin.heading) && hasNumber(cabin.windDirection) ? `<vcHeading>${number(cabin.heading, 0)}</vcHeading><vcWindDirection>${number(cabin.windDirection, 0)}</vcWindDirection>` : ''}${interiorXml(cabin.interior)}${engineXml(cabin.engine)}`
       : '')
     : ''
   // 土壤方法 1 远期热历史（control.soilInertiaHistory = 'full'）；缺省不写，旧 XML 不变。

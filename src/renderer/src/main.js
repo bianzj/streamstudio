@@ -2,6 +2,7 @@ import { webApi } from './web-api.js'
 import { appStorage } from './storage.js'
 import { getLocale, startLocalization, t } from './i18n.js'
 import { invalidateImageTextures, loadXmlScene, updateSceneDynamics } from './scene-loader.js'
+import { createVehicleBodyMaterial, VEHICLE_PAINT_COLORS, VEHICLE_SEAT_TYPES, VEHICLE_SPECTRA, splitVehicleObj, vehicleEngineDefaults, vehicleInteriorDefaults, vehicleMeshBinding, vehiclePaintSpectrumName } from './project-schema.js'
 import { autoRadiationMaxSteps, createDefaultProject, createMaterialPresets, DEFAULT_CPU_THREADS, groundedPlacementHeight, MAX_SENSOR_BANDS, normalizeCpuThreads, normalizeRunTimeoutMinutes, normalizeTerrainEnvironment, normalizeProject, parseProjectJson, QUALITY_PRESET_LABELS, QUALITY_PRESETS, qualityPresetFields, qualityPresetMatches, qualityPresetValues, sensorBandValues, sensorCruisePositions, sensorViewAngles, simplifySolarSpectra, stringifyProject } from './project-schema.js'
 import { createStreamWorkspace } from './stream/workspace.js'
 import { createMenubar } from './menubar.js'
@@ -224,7 +225,7 @@ function parseMaterialNode(node) {
     // FacetEB ship hull options (soilSet of a Ship material).
     if (xmlValue(node, 'shipSpeed', '').trim()) params.speed = Number(xmlValue(node, 'shipSpeed', 0))
     // FacetEB vehicle part and cabin parameters (vehiclePart 1 body, 2 glass, 3 underbody).
-    const vehiclePart = { 1: 'body', 2: 'glass', 3: 'underbody' }[Number(xmlValue(node, 'vehiclePart', 0))]
+    const vehiclePart = { 1: 'body', 2: 'glass', 3: 'underbody', 4: 'hood' }[Number(xmlValue(node, 'vehiclePart', 0))]
     if (vehiclePart) {
       params.vehiclePart = vehiclePart
       if (vehiclePart === 'body' && xmlValue(node, 'vcEnabled', '').trim() !== '') {
@@ -238,6 +239,20 @@ function parseMaterialNode(node) {
         if (xmlValue(node, 'vcHeading', '').trim() && xmlValue(node, 'vcWindDirection', '').trim()) {
           params.cabin.heading = v('vcHeading', 0)
           params.cabin.windDirection = v('vcWindDirection', 0)
+        }
+        // Parts model: interior nodes and engine / bay nodes (comma lists, same order as the XML writer).
+        const list = (tag) => xmlValue(node, tag, '').split(',').map(Number)
+        if (xmlValue(node, 'vcIntModel', '').trim() === '1') {
+          const [share, capacity, hcA, radArea] = ['vcIntShares', 'vcIntCapacities', 'vcIntHcA', 'vcIntRadArea'].map(list)
+          const ids = ['dashboard', 'seat', 'wheel', 'lining']
+          const effusivity = v('vcSeatEffusivity', 300)
+          params.cabin.interior = { enabled: true, shellRadFraction: v('vcShellRadFraction', 0.45), seatEffusivity: effusivity,
+            seatType: effusivity >= 350 ? 'leather' : 'fabric', ...Object.fromEntries(ids.map((id, k) => [id, { share: share[k], capacity: capacity[k], hcA: hcA[k], radArea: radArea[k] }])) }
+        }
+        if (xmlValue(node, 'vcEngModel', '').trim() === '1') {
+          const caps = list('vcEngCaps'), vent = list('vcEngBayVent'), split = list('vcEngSplit')
+          params.cabin.engine = { enabled: true, warm: v('vcEngWarm', 0) > 0.5, warmTemperature: v('vcEngWarmTemp', 90), blockCapacity: caps[0], bayCapacity: caps[1],
+            blockToBay: v('vcEngBlockBay', 40), bayVent0: vent[0], bayVentK: vent[1], radiatorShare: split[0], blockShare: split[1], exhaustShare: split[2], firewallG: v('vcFirewallG', 2) }
         }
       }
     }
@@ -2263,7 +2278,7 @@ function physicalValues(item) {
     ...(item.type === 'Ship' && shipValueGiven(p.heading) && shipValueGiven(p.windDirection) ? [['航向/风来向', `${p.heading}° / ${p.windDirection}°`]] : []),
     ...(item.type === 'Ship' && (p.waterShielding || p.waterFeedback) ? [['水体耦合', [p.waterShielding ? '水下遮蔽' : '', p.waterFeedback ? '反馈水温' : ''].filter(Boolean).join('、')]] : []),
     ...(item.type === 'Ship' && (Number(p.internalHeatFlux) || Number(p.internalHeatPower)) ? [['内热源', [Number(p.internalHeatFlux) ? `${p.internalHeatFlux} W/m²` : '', Number(p.internalHeatPower) ? `${p.internalHeatPower} W` : ''].filter(Boolean).join(' + ')]] : []),
-    ...(item.type === 'Vehicle' && p.vehiclePart ? [['部件', { body: '车身（含座舱参数）', glass: '车窗玻璃', underbody: '底盘/轮胎/灯具薄壳' }[p.vehiclePart] || p.vehiclePart]] : []),
+    ...(item.type === 'Vehicle' && p.vehiclePart ? [['部件', { body: '车身（含座舱参数）', glass: '车窗玻璃', underbody: '底盘/轮胎/灯具薄壳', hood: '引擎盖（内侧=发动机舱空气）' }[p.vehiclePart] || p.vehiclePart]] : []),
     ...(item.type === 'Vehicle' && p.vehiclePart === 'body' && p.cabin ? [['座舱', p.cabin.enabled ? `开启，${p.cabin.occupants ?? 0} 人，车速 ${p.cabin.speed ?? 0} m/s，通风 ${p.cabin.ventilationACH ?? 0.5} ACH${p.cabin.acOn ? `，空调 ${p.cabin.acPower ?? 3500} W/${p.cabin.acSetpoint ?? 24} ℃` : ''}${p.cabin.engineOn ? '，发动机开' : ''}` : '关闭']] : [])]
 }
 
@@ -3679,7 +3694,7 @@ function vehicleFields(defaults = {}) {
   const c = defaults.cabin || {}
   const part = defaults.vehiclePart || ''
   const checked = (value) => (value ? 'checked' : '')
-  return `<label class="dialog-field"><span>车辆部件（FacetEB）</span><select class="select" name="vehiclePart"><option value="" ${part ? '' : 'selected'}>不参与座舱（旧算法）</option><option value="body" ${part === 'body' ? 'selected' : ''}>车身（钢板，携带座舱参数）</option><option value="glass" ${part === 'glass' ? 'selected' : ''}>车窗玻璃（透射太阳进座舱）</option><option value="underbody" ${part === 'underbody' ? 'selected' : ''}>底盘/轮胎/灯具（薄壳，发动机热源）</option></select></label>`
+  return `<label class="dialog-field"><span>车辆部件（FacetEB）</span><select class="select" name="vehiclePart"><option value="" ${part ? '' : 'selected'}>不参与座舱（旧算法）</option><option value="body" ${part === 'body' ? 'selected' : ''}>车身（钢板，携带座舱参数）</option><option value="glass" ${part === 'glass' ? 'selected' : ''}>车窗玻璃（透射太阳进座舱）</option><option value="underbody" ${part === 'underbody' ? 'selected' : ''}>底盘/轮胎/灯具（薄壳，发动机热源）</option><option value="hood" ${part === 'hood' ? 'selected' : ''}>引擎盖（内侧 = 发动机舱空气，需发动机模型）</option></select></label>`
     + `<label class="dialog-field"><span>启用座舱（仅车身部件）</span><input name="cabinEnabled" type="checkbox" value="1" ${checked(c.enabled)}></label>`
     + physicalInput('乘员数（0–8）', 'cabinOccupants', c.occupants ?? 0, 1) + physicalInput('每人代谢热（W）', 'cabinMetabolicW', c.metabolicW ?? 100, 1)
     + physicalInput('车速（m/s，0 = 停放）', 'cabinSpeed', c.speed ?? 0, 0.1) + physicalInput('航向（°，留空 = 风垂直于行驶）', 'cabinHeading', c.heading ?? '', 1)
@@ -3692,6 +3707,78 @@ function vehicleFields(defaults = {}) {
     + physicalInput('座舱容积（m³）', 'cabinVolume', c.volume ?? 2.8, 0.1) + physicalInput('内饰热容（J·K⁻¹）', 'cabinInteriorCapacity', c.interiorCapacity ?? 80000, 1000)
     + physicalInput('内饰面积（m²）', 'cabinInteriorArea', c.interiorArea ?? 8, 0.5) + physicalInput('内饰换热系数（W·m⁻²·K⁻¹）', 'cabinInteriorH', c.interiorH ?? 8, 0.5)
     + physicalInput('内饰吸收透射太阳的份额', 'cabinAbsorbedFraction', c.absorbedFraction ?? 0.8, 0.05)
+    + vehiclePartsFields(c)
+}
+
+// ---- Vehicle object dialog: "车辆参数" fold-out, auto-binding of the OBJ groups, per-vehicle body material ----
+const VEHICLE_CAR_TYPES = { sedan: { label: '轿车（座舱 2.8 m³）', volume: 2.8 }, suv: { label: 'SUV（座舱 3.6 m³）', volume: 3.6 }, van: { label: '厢式/MPV（座舱 5.0 m³）', volume: 5.0 } }
+function vehicleAutoBindEnabled() {
+  return !!state.pendingObject && state.mode === 'eFacetEB' && $('#materialObjectType').value === 'Vehicle' && document.querySelector('#vehicleParamFields [name="vpAutoBind"]')?.checked === true
+}
+function renderVehicleParams() {
+  const section = $('#vehicleParamsSection')
+  if (!section) return
+  const visible = !!state.pendingObject && state.mode === 'eFacetEB' && $('#materialObjectType').value === 'Vehicle'
+  section.hidden = !visible
+  if (!visible || $('#vehicleParamFields').dataset.built === '1') return
+  const select = (name, label, options, selected) => `<label class="dialog-field"><span>${label}</span><select class="select" name="${name}">${options.map(([value, text]) => `<option value="${value}" ${value === selected ? 'selected' : ''}>${text}</option>`).join('')}</select></label>`
+  const check = (name, label, on) => `<label class="dialog-field"><span>${label}</span><input name="${name}" type="checkbox" value="1" ${on ? 'checked' : ''}></label>`
+  $('#vehicleParamFields').innerHTML = check('vpAutoBind', '自动绑定材料族（按网格组名；关闭 = 沿用下表默认）', true)
+    + select('vpCarType', '车型 / 座舱容积', Object.entries(VEHICLE_CAR_TYPES).map(([id, entry]) => [id, entry.label]), 'sedan')
+    + physicalInput('座舱容积（m³，覆盖车型）', 'vpVolume', '', 0.1) + physicalInput('乘员数（0–8）', 'vpOccupants', 0, 1)
+    + select('vpState', '状态', [['park', '停放'], ['drive', '行驶']], 'park') + physicalInput('车速（m/s，行驶）', 'vpSpeed', 15, 0.5)
+    + physicalInput('航向（°，留空 = 风垂直于行驶）', 'vpHeading', '', 1) + physicalInput('风来向（°）', 'vpWindDirection', '', 1)
+    + check('vpEngineOn', '发动机运转', false) + physicalInput('发动机热功率（W，总量 = 功率 × 进车份额 0.3）', 'vpEnginePower', 15000, 100) + check('vpEngineWarm', '热车（发动机起始已热，停放余热衰减）', false)
+    + check('vpAcOn', '开空调', false) + physicalInput('空调制冷功率（W）', 'vpAcPower', 3500, 10) + physicalInput('空调设定温度（℃）', 'vpAcSetpoint', 24, 0.5)
+    + select('vpVent', '通风', [['closed', '关窗（0.5 ACH）'], ['crack', '开窗缝（10 ACH）'], ['open', '开窗（30 ACH）']], 'closed')
+    + select('vpFilm', '窗户膜', [['plain', '普通（前挡风 τ 0.60 / 侧窗 0.70 / 后窗 0.65）'], ['insulated', '隔热膜 / Low-E（τ 0.38–0.45）']], 'plain')
+    + select('vpPaint', '车漆颜色', VEHICLE_PAINT_COLORS.map((entry) => [entry.id, entry.label]), 'white')
+    + select('vpSeat', '座椅类型', [['fabric', '织物'], ['leather', '皮革']], 'fabric')
+  $('#vehicleParamFields').dataset.built = '1'
+  for (const element of $$('#vehicleParamFields select, #vehicleParamFields input[name="vpAutoBind"]'))
+    element.addEventListener('change', () => { if (state.pendingObject) renderMeshMaterialRows() })
+}
+function vehicleBindingOptions(values = null) {
+  const read = (name) => (values ? values[name] : document.querySelector(`#vehicleParamFields [name="${name}"]`)?.value)
+  return { paint: read('vpPaint') || 'white', film: read('vpFilm') === 'insulated' }
+}
+// Body material of a new vehicle object: the vehicle_material preset with the cabin parameters of the form.
+function vehicleBodyMaterial(values, name) {
+  const n = (key, fallback) => (String(values[key] ?? '').trim() !== '' && Number.isFinite(Number(values[key])) ? Number(values[key]) : fallback)
+  const given = String(values.vpHeading ?? '').trim() !== '' && String(values.vpWindDirection ?? '').trim() !== ''
+  return createVehicleBodyMaterial(name, { occupants: Math.max(0, Math.min(8, Math.round(n('vpOccupants', 0)))),
+    volume: n('vpVolume', (VEHICLE_CAR_TYPES[values.vpCarType] || VEHICLE_CAR_TYPES.sedan).volume), speed: values.vpState === 'drive' ? Math.max(0, n('vpSpeed', 15)) : 0,
+    heading: given ? Number(values.vpHeading) : undefined, windDirection: given ? Number(values.vpWindDirection) : undefined, vent: values.vpVent || 'closed',
+    engineOn: values.vpEngineOn === '1', enginePower: n('vpEnginePower', 15000), engineWarm: values.vpEngineWarm === '1', acOn: values.vpAcOn === '1',
+    acPower: n('vpAcPower', 3500), acSetpoint: n('vpAcSetpoint', 24), seat: values.vpSeat })
+}
+// Adds the preset spectra / materials the auto-binding refers to (only the missing ones, only for a new vehicle object).
+function ensureVehiclePresets() {
+  const presets = createMaterialPresets()
+  for (const spectrum of VEHICLE_SPECTRA) if (!state.config.spectra.some((entry) => entry.name === spectrum.name)) state.config.spectra.push(structuredClone(spectrum))
+  for (const material of presets.materials.filter((entry) => entry.type === 'Vehicle' && entry.name !== 'vehicle_material'))
+    if (!state.config.materials.some((entry) => entry.name === material.name)) state.config.materials.push(structuredClone(material))
+}
+
+// Interior nodes / engine model fields of a body material (docs/vehicle-thermal.md); the remaining node
+// parameters (capacity, hA, radiating area, block/bay capacities) travel in a hidden JSON and keep their values.
+function vehiclePartsFields(c = {}) {
+  const it = c.interior, en = c.engine
+  const checked = (value) => (value ? 'checked' : '')
+  const hidden = escapeHtml(JSON.stringify({ interior: it || null, engine: en || null }))
+  const share = (id) => it?.[id]?.share ?? vehicleInteriorDefaults()[id].share
+  return `<input type="hidden" name="cabinPartsJson" value="${hidden}">`
+    + `<label class="dialog-field"><span>内饰分节点（仪表台/座椅/方向盘/内衬，关闭 = 单一集总内饰）</span><input name="cabinInteriorNodes" type="checkbox" value="1" ${checked(it?.enabled)}></label>`
+    + `<label class="dialog-field"><span>座椅类型</span><select class="select" name="cabinSeatType"><option value="fabric" ${it?.seatType === 'leather' ? '' : 'selected'}>织物</option><option value="leather" ${it?.seatType === 'leather' ? 'selected' : ''}>皮革</option></select></label>`
+    + physicalInput('仪表台吸收份额', 'cabinShareDashboard', share('dashboard'), 0.05) + physicalInput('座椅吸收份额', 'cabinShareSeat', share('seat'), 0.05)
+    + physicalInput('方向盘吸收份额', 'cabinShareWheel', share('wheel'), 0.05) + physicalInput('车顶内衬/门板吸收份额（四项之和 = 1）', 'cabinShareLining', share('lining'), 0.05)
+    + physicalInput('内饰与壳体内表面的辐射份额 φ', 'cabinShellRadFraction', it?.shellRadFraction ?? 0.45, 0.05)
+    + `<label class="dialog-field"><span>发动机/发动机舱模型（发动机块 + 舱内空气 + 引擎盖内侧 + 排气）</span><input name="cabinEngineModel" type="checkbox" value="1" ${checked(en?.enabled)}></label>`
+    + `<label class="dialog-field"><span>热车（停放起始发动机已热，余热指数衰减）</span><input name="cabinEngineWarm" type="checkbox" value="1" ${checked(en?.warm)}></label>`
+    + physicalInput('热车初始机体温度（℃）', 'cabinEngineWarmTemperature', en?.warmTemperature ?? 90, 1)
+    + physicalInput('废热份额：散热器（进舱内空气）', 'cabinEngineRadiatorShare', en?.radiatorShare ?? 0.5, 0.05) + physicalInput('废热份额：发动机块', 'cabinEngineBlockShare', en?.blockShare ?? 0.3, 0.05)
+    + physicalInput('废热份额：排气（加到底盘面元；三项之和 = 1）', 'cabinEngineExhaustShare', en?.exhaustShare ?? 0.2, 0.05)
+    + physicalInput('防火墙向座舱传热（W·K⁻¹，0 = 不传）', 'cabinFirewallG', en?.firewallG ?? 2, 0.5)
 }
 
 // FacetEB wall layers as text: one layer per line "thickness, λ, ρ, cp" (outer to inner).
@@ -4127,18 +4214,35 @@ function renderMeshMaterialRows({ recommendVegetation = false } = {}) {
   const photovoltaic = physicalItems.find((item) => item.name === selectedPhysical)?.energyModel === 'photovoltaic'
   const preferredCanopy = photovoltaic ? 'rigid_body' : type === 'Fire' ? 'fire_medium' : type === 'Fog' ? 'fog_medium' : type === 'Vegetation' ? 'tree_leaf_canopy' : 'rigid_body'
   const savedSpecular = new Map($$('#meshMaterialRows tr').map(row => [row.dataset.meshName, meshSpecularFromRow(row)]))
-  $('#meshMaterialRows').innerHTML = pending.meshNames.map((name, index) => {
+  // FacetEB vehicles: preset families by group name (project-schema.js VEHICLE_BINDING_RULES); the listed names
+  // missing from an older project are offered too and added on save.
+  renderVehicleParams()
+  const vehicleAuto = vehicleAutoBindEnabled()
+  const vehicleOptions = vehicleAuto ? vehicleBindingOptions() : null
+  const spectrumItems = vehicleAuto ? [...(state.config.spectra || []), ...VEHICLE_SPECTRA.filter((item) => !(state.config.spectra || []).some((entry) => entry.name === item.name))] : (state.config.spectra || [])
+  const vehicleMaterials = vehicleAuto ? createMaterialPresets().materials.filter((item) => item.type === 'Vehicle' && !physicalItems.some((entry) => entry.name === item.name)) : []
+  // With auto-binding the splittable groups (glass, bonnet) are listed with their sub-group names.
+  let meshNames = pending.meshNames
+  if (vehicleAuto && pending.source?.content) {
+    const split = splitVehicleObj(pending.source.content).split
+    meshNames = meshNames.flatMap((name) => split[name] || [name])
+  }
+  $('#meshMaterialRows').innerHTML = meshNames.map((name, index) => {
     const defaults = {
       spectralName: selectedSpectrum,
       thermalName: selectedThermal,
       materialName: selectedPhysical,
       canopyName: preferredCanopy
     }
-    const binding = recommendVegetation && type === 'Vegetation' && !photovoltaic
+    let binding = recommendVegetation && type === 'Vegetation' && !photovoltaic
       ? recommendedVegetationMeshBinding(name, defaults) : defaults
-    const spectrumOptions = optionList(state.config.spectra || [], $('#spectralMaterialName').value, binding.spectralName)
+    if (vehicleAuto) {
+      const bound = vehicleMeshBinding(name, { ...vehicleOptions, bodyMaterial: selectedPhysical })
+      binding = { ...binding, spectralName: bound.spectralName || binding.spectralName, materialName: bound.materialName, canopyName: 'rigid_body' }
+    }
+    const spectrumOptions = optionList(spectrumItems, $('#spectralMaterialName').value, binding.spectralName)
     const thermalOptions = optionList(state.config.thermals || [], $('#thermalMaterialName').value, binding.thermalName)
-    const physicalOptions = optionList(physicalItems, $('#physicalMaterialName').value, binding.materialName)
+    const physicalOptions = optionList([...physicalItems, ...vehicleMaterials], $('#physicalMaterialName').value, binding.materialName)
     const canopyOptions = bindingOptionList(state.config.canopies || [], binding.canopyName, binding.canopyName)
     return `<tr data-mesh-name="${escapeHtml(name)}"><td title="${escapeHtml(name)}">${escapeHtml(name)}</td><td><select class="select mesh-spectrum" data-index="${index}">${spectrumOptions}</select></td><td><select class="select mesh-thermal" data-index="${index}">${thermalOptions}</select></td><td><select class="select mesh-physical" data-index="${index}">${physicalOptions}</select></td><td><select class="select mesh-canopy" data-index="${index}">${canopyOptions}</select></td><td>${meshSpecularFields({ enabled: savedSpecular.get(name) })}</td></tr>`
   }).join('')
@@ -4669,6 +4773,23 @@ function physicalFromForm(values, type) {
           interiorArea: num('cabinInteriorArea', 8), interiorH: num('cabinInteriorH', 8), absorbedFraction: num('cabinAbsorbedFraction', 0.8)
         }
         if (given('cabinHeading') && given('cabinWindDirection')) { params.cabin.heading = Number(values.cabinHeading); params.cabin.windDirection = Number(values.cabinWindDirection) }
+        // Parts model (interior nodes / engine): hidden JSON keeps the node parameters the form does not show.
+        let kept = {}
+        try { kept = JSON.parse(values.cabinPartsJson || '{}') || {} } catch { kept = {} }
+        if (on('cabinInteriorNodes')) {
+          const base = { ...vehicleInteriorDefaults(values.cabinSeatType), ...(kept.interior || {}) }
+          const seat = VEHICLE_SEAT_TYPES[values.cabinSeatType] || VEHICLE_SEAT_TYPES.fabric
+          const seatChanged = base.seatType !== (values.cabinSeatType || 'fabric')
+          params.cabin.interior = { ...base, enabled: true, seatType: values.cabinSeatType || 'fabric', shellRadFraction: num('cabinShellRadFraction', 0.45),
+            seatEffusivity: seatChanged ? seat.effusivity : base.seatEffusivity,
+            dashboard: { ...base.dashboard, share: num('cabinShareDashboard', 0.3) },
+            seat: { ...base.seat, share: num('cabinShareSeat', 0.35), ...(seatChanged ? { capacity: seat.capacity } : {}) },
+            wheel: { ...base.wheel, share: num('cabinShareWheel', 0.05) }, lining: { ...base.lining, share: num('cabinShareLining', 0.3) } }
+        }
+        if (on('cabinEngineModel')) {
+          params.cabin.engine = { ...vehicleEngineDefaults(), ...(kept.engine || {}), enabled: true, warm: on('cabinEngineWarm'), warmTemperature: num('cabinEngineWarmTemperature', 90),
+            radiatorShare: num('cabinEngineRadiatorShare', 0.5), blockShare: num('cabinEngineBlockShare', 0.3), exhaustShare: num('cabinEngineExhaustShare', 0.2), firewallG: num('cabinFirewallG', 2) }
+        }
       }
     }
   }
@@ -4985,7 +5106,11 @@ async function saveImportedObject(event) {
     values.transmittance = formData.getAll('transmittanceValue').map(String).join(',')
     if (values.spectralModel === 'file' && !values.fileName) throw new Error('请先导入波谱文件')
     stage = '复制 OBJ 到工程'
-    const imported = await api.importObj({ name: `${uniqueName(values.objectName, 'object')}.obj`, content: pending.source.content })
+    // FacetEB vehicle: split the glass group (front / side / rear) and the bonnet by facet orientation.
+    const vehicleAuto = vehicleAutoBindEnabled()
+    const rowNames = $$('#meshMaterialRows tr').map((row) => row.dataset.meshName)
+    const vehicleSplit = vehicleAuto && rowNames.length !== pending.meshNames.length ? splitVehicleObj(pending.source.content) : null
+    const imported = await api.importObj({ name: `${uniqueName(values.objectName, 'object')}.obj`, content: vehicleSplit ? vehicleSplit.content : pending.source.content })
     stage = '生成实例分布'
     const distribution = defaultDistribution({ type: values.objectType, dimensions: pending.dimensions })
     const instances = generateDistribution(distribution)
@@ -5003,11 +5128,18 @@ async function saveImportedObject(event) {
     if (thermalSelections.some((select) => select.value === '__new__')) upsertByName(state.config.thermals, thermal)
     if (values.materialPreset === '__new__' || physicalSelections.some((select) => select.value === '__new__')) upsertByName(state.config.materials, physical)
     const defaultCanopy = values.objectType === 'Fire' ? 'fire_medium' : values.objectType === 'Fog' ? 'fog_medium' : values.objectType === 'Vegetation' ? 'tree_leaf_canopy' : 'rigid_body'
-    const meshes = pending.meshNames.map((name, index) => ({
+    if (vehicleAuto) {
+      // Vehicle parts: add the preset families the table refers to and a body material that carries this car's cabin parameters.
+      ensureVehiclePresets()
+      upsertByName(state.config.materials, vehicleBodyMaterial(values, `${values.objectName}_body`))
+    }
+    const meshes = (vehicleAuto ? rowNames : pending.meshNames).map((name, index) => ({
       name,
       spectralName: spectralSelections[index].value === '__new__' ? spectrum.name : spectralSelections[index].value,
       thermalName: thermalSelections[index].value === '__new__' ? thermal.name : thermalSelections[index].value,
-      materialName: physicalSelections[index].value === '__new__' ? physical.name : physicalSelections[index].value,
+      materialName: vehicleAuto && ['paint', 'other', 'tarp'].includes(vehicleMeshBinding(name).rule) && physicalSelections[index].value === (values.materialPreset === '__new__' ? physical.name : values.materialPreset)
+        ? `${values.objectName}_body`
+        : physicalSelections[index].value === '__new__' ? physical.name : physicalSelections[index].value,
       canopyName: canopySelections[index]?.value || defaultCanopy,
       specularEnabled: meshSpecularFromRow($('#meshMaterialRows').rows[index])
     }))
