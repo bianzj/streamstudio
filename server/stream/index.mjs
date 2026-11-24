@@ -266,14 +266,14 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   function registerPack(data) {
     assertEngine()
     const files = (Array.isArray(data.files) ? data.files : []).map((value) => resolve(normalizeHostPath(String(value || '').trim().replace(/^"|"$/g, ''))))
-    if (!files.length) throw new Error('请选择 ERA5 NetCDF 文件')
-    for (const file of files) if (!existsSync(file) || !statSync(file).isFile()) throw new Error(`ERA5 文件不存在：${windowsPath(file)}`)
+    if (!files.length) throw new Error('请选择逐时气象强迫 NetCDF 文件')
+    for (const file of files) if (!existsSync(file) || !statSync(file).isFile()) throw new Error(`气象强迫文件不存在：${windowsPath(file)}`)
     const product = ['era5', 'era5-land'].includes(data.product) ? data.product : 'auto'
     const label = String(data.label || '').trim().slice(0, 64)
     mkdirSync(era5Directory(), { recursive: true })
     const index = join(era5Directory(), `pack-${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
     const job = {
-      kind: 'era5', label: label || 'ERA5 数据包', successCodes: [0, 3],
+      kind: 'era5', label: label || '气象数据包', successCodes: [0, 3],
       // DEFERRED[中] Bug: 所有 NetCDF 路径直接作为命令行参数，Windows CreateProcess 命令行上限约 32767 字符，按天下载的一年数据（数百个长路径）会让 spawn 失败（ENAMETOOLONG），并落入 launch 中 error 后不一定触发 close 的问题；建议：把文件列表写入临时清单文件，用 --files-from <list> 之类的参数传给引擎
       start() { launch(job, ['era5-register', index, '--product', product, ...files.map(windowsPath)]) },
       collect(status) {
@@ -292,8 +292,8 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
 
   function removePack(value) {
     const path = resolve(normalizeHostPath(String(value || '').trim()))
-    if (dirname(path).toLowerCase() !== resolve(era5Directory()).toLowerCase() || !existsSync(path)) throw new Error('只能移除登记目录中的 ERA5 数据包索引')
-    if (!packSummary(path)) throw new Error('不是 ERA5 数据包索引')
+    if (dirname(path).toLowerCase() !== resolve(era5Directory()).toLowerCase() || !existsSync(path)) throw new Error('只能移除登记目录中的气象数据包索引')
+    if (!packSummary(path)) throw new Error('不是气象数据包索引')
     unlinkSync(path)
     return { removed: true, path: windowsPath(path) }
   }
@@ -304,7 +304,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     const filters = {
       file: ['选择栅格文件', '栅格 (*.tif;*.tiff;*.img;*.dat;*.nc;*.h5;*.hdf)|*.tif;*.tiff;*.img;*.dat;*.nc;*.h5;*.hdf|所有文件 (*.*)|*.*', false],
       project: ['打开遥感影像模拟工程', 'STREAM 工程 (*.json)|*.json|所有文件 (*.*)|*.*', false],
-      era5: ['选择 ERA5 / ERA5-Land 逐小时 NetCDF 文件（可多选，覆盖一天到一年均可）', 'NetCDF (*.nc;*.nc4)|*.nc;*.nc4|所有文件 (*.*)|*.*', true]
+      era5: ['选择逐小时气象强迫 NetCDF 文件（可多选，覆盖一天到一年均可；ERA5 / ERA5-Land 为用例）', 'NetCDF (*.nc;*.nc4)|*.nc;*.nc4|所有文件 (*.*)|*.*', true]
     }
     const script = kind === 'folder' ? [
       "$ErrorActionPreference = 'Stop'", 'Add-Type -AssemblyName System.Windows.Forms',

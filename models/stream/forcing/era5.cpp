@@ -409,8 +409,8 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
     root.Add("incompleteVariables", incomplete);
     CPLJSONDocument document;
     document.SetRoot(root);
-    if (!document.Save(utf8FromPath(index))) throw std::runtime_error("无法写出 ERA5 数据包索引：" + utf8FromPath(index));
-    std::cout << "[STREAM] ERA5 数据包：" << product << " " << formatUtc(static_cast<double>(periodFirst) * 3600.0) << " – "
+    if (!document.Save(utf8FromPath(index))) throw std::runtime_error("无法写出气象数据包索引：" + utf8FromPath(index));
+    std::cout << "[STREAM] 气象数据包：" << product << " " << formatUtc(static_cast<double>(periodFirst) * 3600.0) << " – "
               << formatUtc(static_cast<double>(periodLast) * 3600.0) << "（" << expected << " 个时次" << (fullYear ? "，整年" : "") << "），"
               << files.size() << " 个文件，" << (complete ? "必需变量逐小时连续" : "必需变量缺失或不连续") << "\n";
     return complete;
@@ -419,10 +419,10 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
 void Pack::open(const fs::path& index)
 {
     CPLJSONDocument document;
-    if (!document.Load(utf8FromPath(index))) throw std::runtime_error("无法读取 ERA5 数据包索引：" + utf8FromPath(index));
+    if (!document.Load(utf8FromPath(index))) throw std::runtime_error("无法读取气象数据包索引：" + utf8FromPath(index));
     const auto root = document.GetRoot();
     if (root.GetString("kind", "") != "stream-era5-pack" || root.GetInteger("schemaVersion", 0) != 1)
-        throw std::runtime_error("不是 ERA5 数据包索引：" + utf8FromPath(index));
+        throw std::runtime_error("不是气象数据包索引：" + utf8FromPath(index));
     product_ = root.GetString("product", "era5");
     land_ = product_ == "era5-land";
     year_ = root.GetInteger("year", 0);
@@ -433,7 +433,7 @@ void Pack::open(const fs::path& index)
     longitude0_ = grid.GetObj("longitude").GetDouble("first", 0);
     longitudeStep_ = grid.GetObj("longitude").GetDouble("step", 0);
     longitudeCount_ = grid.GetObj("longitude").GetInteger("count", 0);
-    if (!latitudeStep_ || !longitudeStep_ || latitudeCount_ < 2 || longitudeCount_ < 2) throw std::runtime_error("ERA5 数据包网格无效");
+    if (!latitudeStep_ || !longitudeStep_ || latitudeCount_ < 2 || longitudeCount_ < 2) throw std::runtime_error("气象数据包网格无效");
     globalLongitude_ = std::abs(std::abs(longitudeStep_) * longitudeCount_ - 360.0) < std::abs(longitudeStep_) * 0.5;
     const double lastLongitude = longitude0_ + longitudeStep_ * (longitudeCount_ - 1);
     longitude360_ = std::max(longitude0_, lastLongitude) > 180.0 + 1e-6;
@@ -444,9 +444,9 @@ void Pack::open(const fs::path& index)
         fs::path path = pathFromUtf8(item.GetString("path", ""));
         // Relative entries belong to the index's folder, so a pack shipped inside a project stays valid when copied.
         if (path.is_relative()) path = fs::absolute(index).parent_path() / path;
-        if (!fs::is_regular_file(path)) throw std::runtime_error("ERA5 数据包中的文件不存在：" + utf8FromPath(path));
+        if (!fs::is_regular_file(path)) throw std::runtime_error("气象数据包中的文件不存在：" + utf8FromPath(path));
         if (static_cast<GInt64>(fs::file_size(path)) != item.GetLong("bytes", -1))
-            throw std::runtime_error("ERA5 文件在登记后被修改，请重新登记数据包：" + utf8FromPath(path));
+            throw std::runtime_error("气象强迫文件在登记后被修改，请重新登记数据包：" + utf8FromPath(path));
         files_.push_back(utf8FromPath(path));
         const NcFile file(path);
         const FileScan scan = scanFile(file);
@@ -458,7 +458,7 @@ void Pack::open(const fs::path& index)
     }
     std::string absent;
     for (const auto& name : requiredVariables()) if (!sources_.count(name)) absent += (absent.empty() ? "" : "、") + name;
-    if (!absent.empty()) throw std::runtime_error("ERA5 数据包缺少必需变量 " + absent + "：" + utf8FromPath(index));
+    if (!absent.empty()) throw std::runtime_error("气象数据包缺少必需变量 " + absent + "：" + utf8FromPath(index));
     const int64_t yearFirst = daysFromCivil(year_, 1, 1) * 24;
     std::string gap;
     fullYear_ = covers(requiredVariables(), yearFirst, yearFirst + (isLeapYear(year_) ? 366 : 365) * 24 - 1, gap);
@@ -497,7 +497,7 @@ void Pack::load(const std::vector<std::string>& variables, double latitudeMin, d
     columns_ = std::min(longitudeCount_ - 1, columnLast) - column0_ + 1;
     if (rows_ < 1 || columns_ < 1 || std::min(r0, r1) > latitudeCount_ + 1 || std::max(r0, r1) < -2 ||
         (!globalLongitude_ && (std::min(c0, c1) > longitudeCount_ + 1 || std::max(c0, c1) < -2)))
-        throw std::runtime_error("影像范围不在 ERA5 数据包的覆盖范围内");
+        throw std::runtime_error("影像范围不在气象数据包的覆盖范围内");
     firstHour_ = firstHour;
     lastHour_ = lastHour;
 
@@ -510,7 +510,7 @@ void Pack::load(const std::vector<std::string>& variables, double latitudeMin, d
     };
     for (const auto& name : variables) {
         const auto found = sources_.find(name);
-        if (found == sources_.end()) throw std::runtime_error("ERA5 数据包缺少变量 " + name);
+        if (found == sources_.end()) throw std::runtime_error("气象数据包缺少变量 " + name);
         const auto& map = found->second;
         auto invariantSource = map.find(std::numeric_limits<int64_t>::min());
         if (invariantSource != map.end()) {
@@ -538,7 +538,7 @@ void Pack::load(const std::vector<std::string>& variables, double latitudeMin, d
                         (best == map.end() || hour - previous->first < best->first - hour))
                         best = previous;
                 }
-                if (best == map.end()) throw std::runtime_error("ERA5 数据包缺少 " + name + " 在 " + formatUtc(hour * 3600.0) + " 附近的数据");
+                if (best == map.end()) throw std::runtime_error("气象数据包缺少 " + name + " 在 " + formatUtc(hour * 3600.0) + " 附近的数据");
                 notes_.push_back(name + " 在 " + formatUtc(hour * 3600.0) + " 使用相邻时次 " + formatUtc(best->first * 3600.0));
                 source = best;
             }

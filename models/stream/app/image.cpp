@@ -170,7 +170,7 @@ int runImage(const std::string& configPath)
     int64_t marchStartHour = static_cast<int64_t>(std::llround(dayStart / 3600.0));  // whole hour of the first node
     int spinupNodesUsed = 0;             // whole-hour nodes actually integrated before the overpass (excludes the overpass node)
     std::vector<std::string> spinupNotes; // shortfall notice for scene_summary.json temperature.notes
-    log("过境时刻 " + formatUtc(overpass) + "，温度来源：" + (eb ? "EB（ERA5 驱动能量平衡）" : "RT（给定组分温度）"));
+    log("过境时刻 " + formatUtc(overpass) + "，温度来源：" + (eb ? "EB（气象强迫驱动能量平衡）" : "RT（给定组分温度）"));
 
     progress(1, "读取地表输入");
     Grid grid;
@@ -224,7 +224,7 @@ int runImage(const std::string& configPath)
     bool elevationCorrection = false;
     bool waterSkinMissing = false;  // water pixels present but the pack has no skt: they take the 2 m air temperature
     if (eb) {
-        progress(2, "读取 ERA5 数据包");
+        progress(2, "读取气象数据包");
         pack.open(config.era5Pack);
         const UtcTime when = utcFromSeconds(overpass);
         double latMin = 90, latMax = -90, lonMin = 180, lonMax = -180;
@@ -242,7 +242,7 @@ int runImage(const std::string& configPath)
         if (latMin > latMax) throw std::runtime_error("计算范围内没有可用的像元（地类或经纬度无效）");
         std::vector<std::string> variables = era5::requiredVariables();
         if (config.soilMoistureFromEra5) {
-            if (!pack.available("swvl1")) throw std::runtime_error("土壤水分来源为 ERA5，但数据包中没有 swvl1");
+            if (!pack.available("swvl1")) throw std::runtime_error("土壤水分来源为气象强迫，但数据包中没有 swvl1");
             variables.push_back("swvl1");
         }
         // Water pixels take the ERA5 skin temperature skt (the only use left of skt). Without skt in the pack they degrade to the
@@ -259,7 +259,7 @@ int runImage(const std::string& configPath)
         elevationCorrection = config.elevationCorrection && config.dem.present() && pack.available("z");
         if (elevationCorrection) variables.push_back("z");
         else if (config.elevationCorrection && config.dem.present())
-            log("警告：已要求按 DEM 订正气温与气压，但 ERA5 数据包没有地表位势 z，本次不做高程订正");
+            log("警告：已要求按 DEM 订正气温与气压，但气象数据包没有地表位势 z，本次不做高程订正");
         // Hours the solver reads: the march start through the hour after the overpass (flux interpolation);
         // ERA5-Land de-accumulation also needs the hour before the start.
         int64_t lastHour = static_cast<int64_t>(std::ceil(overpass / 3600.0)) + 1;
@@ -282,10 +282,10 @@ int runImage(const std::string& configPath)
             while (startHour < overpassHour && !pack.covers(variables, startHour - landLead, lastHour, coverageGap)) ++startHour;
             const int64_t usableNodes = requestedNodes > 0 ? std::max<int64_t>(0, lastNodeHour - startHour + 1) : 0;
             if (requestedNodes > 0 && usableNodes == 0 && !yearEdgePack)
-                throw std::runtime_error("ERA5 数据包在过境时刻 " + formatUtc(overpass) + " 之前没有可用的整点时次，无法起转（temperature.spinupHours = " +
+                throw std::runtime_error("气象数据包在过境时刻 " + formatUtc(overpass) + " 之前没有可用的整点时次，无法起转（temperature.spinupHours = " +
                                          std::to_string(requestedNodes) + "）。请补充过境前的逐小时数据，或把起转节点数设为 0");
             if (requestedNodes > 0 && usableNodes < requestedNodes) {
-                const std::string text = "ERA5 数据包不覆盖要求的起转起点 " + formatUtc(static_cast<double>(desiredStartHour) * 3600.0) +
+                const std::string text = "气象数据包不覆盖要求的起转起点 " + formatUtc(static_cast<double>(desiredStartHour) * 3600.0) +
                     "（temperature.spinupHours = " + std::to_string(requestedNodes) + " 个时次），能量平衡改从数据包可用的最早时次 " +
                     formatUtc(static_cast<double>(startHour) * 3600.0) + " 起转，实际 " + std::to_string(usableNodes) + " 个时次；结果的土壤热历史偏短，请补充更早的逐小时数据";
                 log("警告：" + text);
@@ -300,18 +300,18 @@ int runImage(const std::string& configPath)
         std::string gap;
         // A whole-year pack keeps the year-edge rule: hours just outside the year reuse the nearest one.
         if (!pack.covers(variables, firstHour, lastHour, gap) && !(pack.fullYear() && pack.year() == when.year))
-            throw std::runtime_error("ERA5 数据包未覆盖本次能量平衡所需时段 " + formatUtc(firstHour * 3600.0) + " – " + formatUtc(lastHour * 3600.0) +
+            throw std::runtime_error("气象数据包未覆盖本次能量平衡所需时段 " + formatUtc(firstHour * 3600.0) + " – " + formatUtc(lastHour * 3600.0) +
                                      "（" + gap + "）。请补充该时段的逐小时数据后重新登记");
         pack.load(variables, latMin, latMax, lonMin, lonMax, firstHour, lastHour);
-        for (const auto& note : pack.notes()) log("ERA5：" + note);
+        for (const auto& note : pack.notes()) log("气象强迫：" + note);
         // Whole-hour nodes from the march start, stopping 5 min before the overpass, then the overpass node itself.
         if (requestedNodes > 0)
             for (double node = marchStart; node < overpass - 300.0; node += 3600.0) nodes.push_back(node);
         nodes.push_back(overpass);
         spinupNodesUsed = static_cast<int>(nodes.size()) - 1;
-        log("ERA5 " + pack.product() + (pack.fullYear() ? " " + std::to_string(pack.year()) + " 整年" : " 时段数据") + "：能量平衡从 " + formatUtc(marchStart) + " 推进到过境时刻（起转 " +
+        log("气象强迫（" + pack.product() + "）" + (pack.fullYear() ? std::to_string(pack.year()) + " 整年" : "时段数据") + "：能量平衡从 " + formatUtc(marchStart) + " 推进到过境时刻（起转 " +
             std::to_string(spinupNodesUsed) + " 个整点时次 / 请求 " + std::to_string(requestedNodes) + "，" + format(spinupUsedHours, 2) + " h），共 " +
-            std::to_string(nodes.size()) + " 个时次" + (elevationCorrection ? "，按 DEM 与 ERA5 地形高度差订正气温与气压" : ""));
+            std::to_string(nodes.size()) + " 个时次" + (elevationCorrection ? "，按 DEM 与气象强迫网格的地形高度差订正气温与气压" : ""));
     }
 
     // ---------------- soil moisture ----------------
@@ -329,7 +329,7 @@ int runImage(const std::string& configPath)
                 if (std::isfinite(value)) soilMoisture[pixel] = static_cast<float>(std::clamp(value, 0.0, 1.0));
                 else { soilMoisture[pixel] = classes.defaultSoilMoisture; ++moistureFallback; }
             }
-        log("土壤水分取 ERA5 swvl1（过境时刻）" + (moistureFallback ? "，" + std::to_string(moistureFallback) + " 个像元无 ERA5 陆面值，使用默认值" : std::string()));
+        log("土壤水分取气象强迫 swvl1（过境时刻）" + (moistureFallback ? "，" + std::to_string(moistureFallback) + " 个像元无强迫陆面值，使用默认值" : std::string()));
     } else {
         soilMoisture = fieldRaster(config.soilMoisture, grid, "土壤水分 SM", classes.defaultSoilMoisture, false);
         // DEFERRED[低] 物理: 用户土壤水分截断到 0.05–0.55，而 ERA5 路径（上面）截断到 0–1，两种来源对同一湿度的处理不一致；这个截断还会传入 EB（sellers 土壤阻抗、Johansen 热参数），并非只影响 BSM；另外"大于 1 视为百分比"的判据会把恰为 1.0（100%）或 0.x% 的输入误判；建议：BSM 的截断只在 bsm() 调用处做，EB 使用原值；百分比换算改为配置里的显式单位字段
@@ -897,10 +897,10 @@ int runImage(const std::string& configPath)
             if (isMainThread() && done % std::max(1, rowCount / 40) == 0) progress(10 + 60.0 * done / rowCount, "能量平衡求解");
         }
         log("能量平衡：" + std::to_string(ebPixels) + " 个像元，过境时刻收敛 " + std::to_string(ebConverged) + " 个（稳定度迭代收敛 " +
-            std::to_string(ebStable) + " 个），水体取" + (waterSkinMissing ? " 2 m 气温（数据包无 skt）" : " ERA5 表皮温度") + " " +
+            std::to_string(ebStable) + " 个），水体取" + (waterSkinMissing ? " 2 m 气温（数据包无 skt）" : " 气象强迫表皮温度") + " " +
             std::to_string(ebWaterPixels) + " 个" + (ebFailed ? "，未能求解 " + std::to_string(ebFailed) + " 个" : "") +
-            (ebNoForcing ? "，ERA5 无有效值（如 ERA5-Land 海面）跳过 " + std::to_string(ebNoForcing) + " 个" : ""));
-        log("EB 初值：土壤、叶片与土壤热历史全部取起转起点 " + formatUtc(marchStart) + " 的 2 m 气温（不使用 ERA5 skt/stl1/stl2）");
+            (ebNoForcing ? "，气象强迫无有效值（如陆面产品的海面）跳过 " + std::to_string(ebNoForcing) + " 个" : ""));
+        log("EB 初值：土壤、叶片与土壤热历史全部取起转起点 " + formatUtc(marchStart) + " 的 2 m 气温（不使用 skt/stl1/stl2）");
         if (initialLaterHour > 0 || initialDayMean > 0)
             log("警告：起转起点的 2 m 气温无效，初值改取起点后第一个有效时次 " + std::to_string(initialLaterHour.load()) + " 个像元、改取首个模拟日平均气温 " +
                 std::to_string(initialDayMean.load()) + " 个像元");

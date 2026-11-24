@@ -372,7 +372,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath }) {
     if (mode === 'eb') {
       const source = temperatureInput.soilMoisture?.source === 'user' ? 'user' : 'era5'
       // DEFERRED[低] 错误处理: 这里的校验比引擎 config.cpp 宽松：soilHeatMethod/temperatureMethod 原样透传任意字符串，diffuseFraction 不限 [-1,1]，spectralBinNm 不限 1–100 的整数，heatRoughnessKb 不限 ≤20，soilEmissivityK 允许 ≤0；这些错误要等任务出队、建好输出目录后才由引擎报出；建议：在提交时按引擎相同规则校验（白名单 + 范围）
-      temperature = { mode: 'eb', era5: { pack: existingFile(temperatureInput.era5?.pack, 'ERA5 数据包') }, soilMoisture: { source },
+      temperature = { mode: 'eb', era5: { pack: existingFile(temperatureInput.era5?.pack, '气象数据包') }, soilMoisture: { source },
         elevationCorrection: temperatureInput.elevationCorrection !== false,
         // EB spin-up = number of whole-hour ERA5 nodes before the overpass (engine default 7 when omitted; 0–240; the
         // engine rounds non-integers up).

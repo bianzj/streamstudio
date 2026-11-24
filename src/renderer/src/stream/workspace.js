@@ -1,5 +1,5 @@
 // STREAM remote-sensing image workspace: one overpass per image, with component temperatures either
-// given (RT) or solved by an ERA5-driven energy balance (EB). Independent of the HiStream 3-D project.
+// given (RT) or solved by a forcing-driven energy balance (EB). Independent of the HiStream 3-D project.
 import { streamApi } from './api.js'
 import { appStorage } from '../storage.js'
 
@@ -39,7 +39,7 @@ const PRODUCTS = {
   'tir_surface_temperature.tif': { label: '热红外方向温度', kind: 'thermal', unit: 'K', digits: 2, colormap: 'inferno' },
   'components.tif': { label: '组分温度', kind: 'thermal', unit: 'K', digits: 2, colormap: 'inferno' },
   'eb_fluxes.tif': { label: '能量平衡通量', kind: 'flux', unit: 'W m⁻²', digits: 1, colormap: 'rdylbu' },
-  'eb_forcing.tif': { label: 'ERA5 驱动（过境时刻）', kind: 'forcing', unit: '', digits: 2, colormap: 'viridis' },
+  'eb_forcing.tif': { label: '气象强迫（过境时刻）', kind: 'forcing', unit: '', digits: 2, colormap: 'viridis' },
   'solar_geometry.tif': { label: '太阳天顶角与方位角', kind: 'angle', unit: '°', digits: 2, colormap: 'viridis' },
   'lst.tif': { label: '反演 · 地表温度 LST', kind: 'thermal', unit: 'K', digits: 2, colormap: 'inferno' },
   'lst_uncertainty.tif': { label: '反演 · LST 不确定度 1σ', kind: 'sigma', unit: 'K', digits: 3, colormap: 'viridis' },
@@ -260,7 +260,7 @@ function exportScene(form) {
 }
 
 // EB spin-up, the same rule as the engine (models/stream/app/image.cpp, 2026-11-24): temperature.spinupHours = number of
-// whole-hour ERA5 nodes before the overpass (default 7, 0–240, non-integers round up). The march starts at the
+// whole-hour forcing nodes before the overpass (default 7, 0–240, non-integers round up). The march starts at the
 // spinupHours-th whole hour counted backwards from the last whole hour that is more than 5 min before the overpass
 // (never a fixed clock time); a pack that does not cover it starts at its earliest covered hour (warning only).
 const DEFAULT_SPINUP_NODES = 7
@@ -438,7 +438,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
         </div>
         <div class="sw-actions">
           <span class="sw-engine" id="swEngine"><i></i><span>正在检测引擎</span></span>
-          <button class="button ghost" type="button" data-action="era5" title="登记与管理 ERA5 气象数据"><svg><use href="#i-layers"/></svg>ERA5 数据</button>
+          <button class="button ghost" type="button" data-action="era5" title="登记与管理逐时气象强迫数据"><svg><use href="#i-layers"/></svg>气象强迫数据</button>
           <button class="button primary" type="button" data-action="run" id="swRun" title="F5"><svg><use href="#i-play"/></svg><span id="swRunLabel">运行模拟</span></button>
           <button class="button danger" type="button" data-action="stop" id="swStop" disabled><svg><use href="#i-stop"/></svg>停止</button>
         </div>
@@ -485,10 +485,10 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
           <section class="sw-card sw-grow"><h3>分地类统计</h3><p class="sw-note" id="swClassNote">运行后按 IGBP 地类统计当前显示波段。</p><div class="sw-table-wrap"><table class="sw-table" id="swClassStats"></table></div></section>
         </aside>
       </div>
-      <div class="sw-modal" id="swEra5" hidden role="dialog" aria-label="ERA5 数据">
+      <div class="sw-modal" id="swEra5" hidden role="dialog" aria-label="气象强迫数据">
         <div class="sw-modal-card">
-          <header class="sw-modal-head"><h2>ERA5 数据</h2><button class="icon-button" type="button" data-action="era5-close" title="关闭">×</button></header>
-          <p class="sw-hint">数据包是一组逐小时 ERA5 或 ERA5-Land 单层 NetCDF，可只覆盖一天，也可覆盖整年（可为多个文件）；空间范围只需盖住影像并外扩约 2 个格点。EB 读取起转起点（过境前第 N 个整点时次，缺省 N = 7；ERA5-Land 另需再早一小时）到过境后 1 小时；数据包不含起点时从其最早时次起算并给出提示，但过境时刻之前至少要有 1 个整点时次。土壤（光照/阴影）、叶片与土壤热历史的初温都取起点时刻的 2 m 气温 t2m，不使用 skt、stl1、stl2。必需变量：u10、v10、t2m、d2m、sp、ssrd、strd；可选：skt（地类含水体时用作水面温度，缺省时水体改取气温并提示）、swvl1（土壤水分取 ERA5 时必需）、z（按 DEM 订正气温气压）。登记只读取时间轴，生成索引，不复制数据。</p>
+          <header class="sw-modal-head"><h2>气象强迫数据</h2><button class="icon-button" type="button" data-action="era5-close" title="关闭">×</button></header>
+          <p class="sw-hint">数据包是一组逐小时气象强迫单层 NetCDF，以 ERA5 / ERA5-Land 为用例（变量名按 ERA5 约定），其他逐时气象强迫（如 GLDAS）按同样的变量名与单位整理后也可使用；可只覆盖一天，也可覆盖整年（可为多个文件）；空间范围只需盖住影像并外扩约 2 个格点。EB 读取起转起点（过境前第 N 个整点时次，缺省 N = 7；ERA5-Land 另需再早一小时）到过境后 1 小时；数据包不含起点时从其最早时次起算并给出提示，但过境时刻之前至少要有 1 个整点时次。土壤（光照/阴影）、叶片与土壤热历史的初温都取起点时刻的 2 m 气温 t2m，不使用 skt、stl1、stl2。必需变量：u10、v10、t2m、d2m、sp、ssrd、strd；可选：skt（地类含水体时用作水面温度，缺省时水体改取气温并提示）、swvl1（土壤水分取气象强迫时必需）、z（按 DEM 订正气温气压）。登记只读取时间轴，生成索引，不复制数据。</p>
           <div class="sw-era5-list" id="swEra5List"></div>
           <div class="sw-era5-new">
             <label><span>名称</span><input class="input" id="swEra5Label" maxlength="64" placeholder="例如 华北 2019"></label>
@@ -703,7 +703,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
   function packOptions() {
     const selected = form.temperature.era5.pack
     const known = packs.some((pack) => pack.path === selected)
-    return `<option value="">${packs.length ? '选择 ERA5 数据包…' : '尚未登记 ERA5 数据包'}</option>` +
+    return `<option value="">${packs.length ? '选择气象数据包…' : '尚未登记气象数据包'}</option>` +
       packs.map((pack) => `<option value="${escapeHtml(pack.path)}"${pack.path === selected ? ' selected' : ''}>${escapeHtml(pack.label)}（${escapeHtml(String(pack.product || '').toUpperCase())} ${escapeHtml(packPeriodLabel(pack))}${pack.external ? '，工程自带' : ''}${pack.complete ? '' : '，不可用'}）</option>`).join('') +
       (selected && !known ? `<option value="${escapeHtml(selected)}" selected>${escapeHtml(fileName(selected))}（无法读取）</option>` : '')
   }
@@ -724,15 +724,15 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
         <p class="sw-hint">组分温度只在启用热红外波段时使用。</p>
       </div>
       <div id="swEb"${t.mode === 'eb' ? '' : ' hidden'}>
-        <label class="sw-row"><span>ERA5 数据包</span><div class="sw-path"><select class="select" data-era5-pack>${packOptions()}</select><button class="icon-button" type="button" data-action="era5" title="登记与管理 ERA5 数据"><svg><use href="#i-layers"/></svg></button></div></label>
+        <label class="sw-row"><span>气象数据包</span><div class="sw-path"><select class="select" data-era5-pack>${packOptions()}</select><button class="icon-button" type="button" data-action="era5" title="登记与管理气象强迫数据"><svg><use href="#i-layers"/></svg></button></div></label>
         <p class="sw-field-info" id="swEra5Info"></p>
         <div class="sw-row"><span>土壤水分</span><div class="segmented">
-          ${segment('moisture-source', 'era5', 'ERA5 swvl1', t.soilMoisture.source)}
+          ${segment('moisture-source', 'era5', '气象强迫 swvl1', t.soilMoisture.source)}
           ${segment('moisture-source', 'user', '地表输入', t.soilMoisture.source)}
         </div></div>
-        <label class="sw-check"><input type="checkbox" data-path="temperature.elevationCorrection"${t.elevationCorrection ? ' checked' : ''}> 按 DEM 与 ERA5 地形高度差订正气温和气压（需提供 DEM，数据包含 z）</label>
+        <label class="sw-check"><input type="checkbox" data-path="temperature.elevationCorrection"${t.elevationCorrection ? ' checked' : ''}> 按 DEM 与气象强迫网格的地形高度差订正气温和气压（需提供 DEM，数据包含 z）</label>
         <label class="sw-row"><span>起转节点数</span><input class="input" data-path="temperature.spinupHours" data-number type="number" min="0" max="240" step="1" value="${escapeHtml(t.spinupHours)}" placeholder="缺省 ${DEFAULT_SPINUP_NODES}"></label>
-        <p class="sw-hint">EB 从过境前第 N 个整点时次（ERA5 逐小时）起推进到过境时刻，缺省 ${DEFAULT_SPINUP_NODES}，范围 0–240；与表面热历史保留的 7 h 对应，空气温度已对结果约束很强，不必起转太久。起点永远相对过境时刻往前数，不是固定的 00 UTC 或固定的 24 h；数据包不覆盖时从其最早时次起算并提示。</p>
+        <p class="sw-hint">EB 从过境前第 N 个整点时次（逐时气象强迫）起推进到过境时刻，缺省 ${DEFAULT_SPINUP_NODES}，范围 0–240；与表面热历史保留的 7 h 对应，空气温度已对结果约束很强，不必起转太久。起点永远相对过境时刻往前数，不是固定的 00 UTC 或固定的 24 h；数据包不覆盖时从其最早时次起算并提示。</p>
         <p class="sw-hint" id="swEbWindow"></p>
         <p class="sw-field-info" id="swEbWarn"></p>
       </div>`)
@@ -748,7 +748,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
           <svg><use href="#i-camera"/></svg><span>RT · 已知组分温度</span><small>直接给定 Tss / Tsh / Tls / Tlh</small>
         </button>
         <button type="button" class="mode-card${form.temperature.mode === 'eb' ? ' active' : ''}" data-temperature-mode="eb">
-          <svg><use href="#i-sun"/></svg><span>EB · ERA5 能量平衡</span><small>逐时次求解四组分温度</small>
+          <svg><use href="#i-sun"/></svg><span>EB · 气象强迫能量平衡</span><small>逐时次求解四组分温度</small>
         </button>
       </div>`
     $('#swParams').innerHTML = [
@@ -829,7 +829,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       surface: typeInfo?.width ? `${typeInfo.width} × ${typeInfo.height}` : '',
       location: String(form.overpass || '').replace('T', ' ').replace(/:\d{2}Z$/, ' UTC'),
       geometry: `${form.view.vza.mode === 'value' ? `${form.view.vza.value || 0}°` : '栅格'} / ${form.view.vaa.mode === 'value' ? `${form.view.vaa.value || 0}°` : '栅格'}`,
-      temperature: t.mode === 'eb' ? `EB · ${pack ? pack.label : '未选 ERA5 数据包'}` : `RT · ${t.components.source === 'package' ? '组分温度文件' : '四组分'}`,
+      temperature: t.mode === 'eb' ? `EB · ${pack ? pack.label : '未选气象数据包'}` : `RT · ${t.components.source === 'package' ? '组分温度文件' : '四组分'}`,
       optical: form.optical.enabled ? `${form.optical.bands.length} 个波段` : '未启用',
       thermal: form.thermal.enabled ? `${form.thermal.bands.length} 个波段` : '未启用',
       region: form.region.enabled ? `${form.region.startRow}–${form.region.endRow} 行` : '整景'
@@ -1084,8 +1084,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (t.mode === 'eb') {
       const pack = packs.find((item) => item.path === t.era5.pack)
       if (Number.isNaN(spinupNodes(t.spinupHours))) problems.push('起转节点数须在 0–240 之间（留空使用缺省 7）')
-      if (!t.era5.pack) problems.push('EB 模式请选择 ERA5 数据包')
-      else if (pack) problems.push(...packProblems(pack, form.overpass, t.soilMoisture.source, t.spinupHours).map((text) => `ERA5 ${text}`))
+      if (!t.era5.pack) problems.push('EB 模式请选择气象数据包')
+      else if (pack) problems.push(...packProblems(pack, form.overpass, t.soilMoisture.source, t.spinupHours).map((text) => `气象强迫：${text}`))
     }
     return problems
   }
@@ -1247,7 +1247,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       currentJobOutput = job.outputDir || null
       setRunning(true)
       setRunState('running', status?.running ? '等待中' : '启动引擎', 0)
-      addLog(`开始运行（${form.temperature.mode === 'eb' ? 'EB · ERA5 能量平衡' : 'RT · 已知组分温度'}${assimilating() ? ` + 同化${ASSIMILATION_OBSERVATIONS[form.assimilation.observation]}` : ''}）`)
+      addLog(`开始运行（${form.temperature.mode === 'eb' ? 'EB · 气象强迫能量平衡' : 'RT · 已知组分温度'}${assimilating() ? ` + 同化${ASSIMILATION_OBSERVATIONS[form.assimilation.observation]}` : ''}）`)
       const buffered = pendingEvents.filter((event) => event.job?.id === job.id)
       pendingEvents = []
       for (const event of buffered) handleEvent(event)
@@ -1359,7 +1359,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       ...(temperature?.mode === 'eb' ? [['能量平衡时次', (temperature.nodes || []).length],
         ...(Number.isFinite(temperature.spinupNodesUsed) ? [['起转时次', temperature.spinupNodesUsed < temperature.spinupNodesRequested ? `${temperature.spinupNodesUsed}（请求 ${temperature.spinupNodesRequested}，数据包不足）` : temperature.spinupNodesUsed]] : []),
         ['EB 求解像元', temperature.solvedPixels],
-        ['过境时刻收敛', temperature.convergedPixels], ['水体（ERA5 skt）', temperature.waterPixels]] : []),
+        ['过境时刻收敛', temperature.convergedPixels], ['水体（气象强迫 skt）', temperature.waterPixels]] : []),
       ...(summary.inversion ? [['反演', `${String(summary.inversion.target || '').toUpperCase()} · ${(summary.inversion.observations || []).length} 个观测`],
         ['反演成功', summary.inversion.counts?.retrievedPixels], ['反演失败', summary.inversion.counts?.failedPixels],
         ['云/掩膜', summary.inversion.counts?.cloudPixels],
@@ -1985,12 +1985,12 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     onClose()
   }
 
-  // ---------- ERA5 packs ----------
+  // ---------- forcing packs (project/engine field name: era5) ----------
   function renderEra5List() {
     if (!rendered) return
     const list = $('#swEra5List')
     if (!packs.length) {
-      list.innerHTML = `<p class="sw-note">还没有登记的 ERA5 数据包。登记目录：${escapeHtml(status?.era5Directory || '')}</p>`
+      list.innerHTML = `<p class="sw-note">还没有登记的气象数据包。登记目录：${escapeHtml(status?.era5Directory || '')}</p>`
       return
     }
     list.innerHTML = `<table class="sw-table"><thead><tr><th>名称</th><th>产品 / 时段</th><th>文件</th><th>状态</th><th></th></tr></thead><tbody>${packs.map((pack) => {
@@ -2015,14 +2015,14 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const picked = await api.pick('era5')
       if (!picked?.paths?.length) return
       const job = await api.registerEra5({ files: picked.paths, product: $('#swEra5Product').value, label: $('#swEra5Label').value })
-      $('#swEra5Status').textContent = `开始登记 ERA5 数据：${picked.paths.length} 个文件`
+      $('#swEra5Status').textContent = `开始登记气象强迫数据：${picked.paths.length} 个文件`
       $('#swEra5Status').dataset.level = ''
-      addLog(`ERA5 数据登记：${picked.paths.length} 个文件`)
-    } catch (error) { toast('无法登记 ERA5 数据包', error.message, 'error') }
+      addLog(`气象强迫数据登记：${picked.paths.length} 个文件`)
+    } catch (error) { toast('无法登记气象数据包', error.message, 'error') }
   }
 
   async function removeEra5(path) {
-    if (!window.confirm(`移除 ERA5 数据包索引？\n${path}\n只删除索引文件，不删除 ERA5 数据。`)) return
+    if (!window.confirm(`移除气象数据包索引？\n${path}\n只删除索引文件，不删除原始气象数据。`)) return
     try {
       await api.removeEra5(path)
       if (form.temperature.era5.pack === path) { form.temperature.era5.pack = ''; markDirty() }
@@ -2039,7 +2039,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (job.kind === 'era5') {
       const element = $('#swEra5Status')
       if (event.type === 'job-progress') element.textContent = `${job.stage} ${Math.round(job.progress)}%`
-      else if (event.type === 'job-log') { element.textContent = event.text; element.dataset.level = event.level === 'error' ? 'error' : '' ; addLog(`ERA5：${event.text}`, event.level || '') }
+      else if (event.type === 'job-log') { element.textContent = event.text; element.dataset.level = event.level === 'error' ? 'error' : '' ; addLog(`气象强迫：${event.text}`, event.level || '') }
       else if (event.type === 'job-closed') {
         const pack = event.result?.pack
         const ok = event.status === 'completed' && pack

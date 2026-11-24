@@ -278,7 +278,7 @@ ImageConfig readImageConfig(const std::string& path)
     if (mode == "eb") {
         config.mode = TemperatureMode::Eb;
         config.era5Pack = pathFromUtf8(temperature.GetObj("era5").GetString("pack", ""));
-        if (config.era5Pack.empty()) throw std::runtime_error("EB 模式需要 ERA5 年度包");
+        if (config.era5Pack.empty()) throw std::runtime_error("EB 模式需要气象数据包");
         const auto source = temperature.GetObj("soilMoisture").GetString("source", "era5");
         if (source != "era5" && source != "user") throw std::runtime_error("土壤水分来源须为 era5 或 user");
         config.soilMoistureFromEra5 = source == "era5";
