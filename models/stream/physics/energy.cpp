@@ -29,6 +29,13 @@ constexpr double kGustTolerance = 1.0;       // W m-2, scene sensible heat used 
 constexpr double kStabilityAbsTol = 1e-4;    // m-1, |1/L - target|
 constexpr double kStabilityRelTol = 0.02;    //      + 2 % of |target|
 constexpr double kStabilityRelax = 0.5;      // 1/L relaxation per iteration
+// FIX(2026-11-24): fixed relaxation 0.5 cannot converge a strongly unstable canopy (u* ~ 0.05-0.2 m/s, LAI ~ 2-3: the 1/L target map is
+// steeper than -3 and the iteration falls into a period-6 limit cycle, 50 iterations without convergence). The relaxation is therefore
+// adaptive: halved (down to kStabilityRelaxMin) when the 1/L error changes sign (overshoot), grown back by 10 % per step while the sign is steady.
+// Sweeping the first adaptive iteration (0/5/10/15/20/30) on the Beijing example: starting at iteration 0 left the fewest unconverged pixels.
+constexpr double kStabilityRelaxMin = 0.02;
+constexpr double kStabilityRelaxShrink = 0.5;
+constexpr double kStabilityRelaxGrow = 1.1;
 constexpr double kMaxInverseObukhov = 5.0;   // m-1
 constexpr double kMaxStep = 5.0;             // K per Newton step
 // DEFERRED[中] 物理: 组分温度硬下限 240 K（−33 °C）。高纬/青藏高原冬季夜间、冰雪地表的真实表面温度可低于 240 K，此时 updateTemperature 会被钳在 240 K，残差不收敛，亮温系统性偏高；建议：下限放宽到约 190–200 K（成像侧过滤是 100 K），或按 ERA5 skt 的最小值动态设定
@@ -548,6 +555,7 @@ EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& f
     double target = 0.0;
     bool closed = false, stabilityClosed = false;
     int iterations = 0;
+    double relax = kStabilityRelax, previousError = 0.0;  // adaptive 1/L relaxation
     const double buoyancyCoefficient = -kVonKarman * kGravity / (density * kCP * forcing.ta);
 
     // One joint iteration, at most maxIterations (default 50) in total: each pass evaluates the fluxes, takes a
@@ -583,7 +591,10 @@ EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& f
         if (!std::isfinite(state.soilSunlit)) state.soilSunlit = forcing.ta + 2.0;
         if (!std::isfinite(state.soilShaded)) state.soilShaded = forcing.ta + 1.0;
         state.sceneSensible = solution.sceneSensible;
-        inverse = std::clamp(inverse + kStabilityRelax * (target - inverse), -kMaxInverseObukhov, kMaxInverseObukhov);
+        const double error = target - inverse;
+        relax = previousError * error < 0.0 ? std::max(kStabilityRelaxMin, relax * kStabilityRelaxShrink) : std::min(kStabilityRelax, relax * kStabilityRelaxGrow);
+        previousError = error;
+        inverse = std::clamp(inverse + relax * error, -kMaxInverseObukhov, kMaxInverseObukhov);
     }
 
     // Final re-evaluation at the returned temperatures and stability.

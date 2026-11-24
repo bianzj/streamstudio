@@ -262,7 +262,9 @@ int runImage(const std::string& configPath)
         const bool yearEdgePack = pack.fullYear() && pack.year() == when.year;
         {
             std::string coverageGap;
-            while (startHour < overpassHour && !pack.covers(variables, startHour, lastHour, coverageGap)) ++startHour;
+            // ERA5-Land de-accumulation also reads the hour before the start, so that hour must be covered too.
+            const int64_t landLead = pack.landProduct() ? 1 : 0;
+            while (startHour < overpassHour && !pack.covers(variables, startHour - landLead, lastHour, coverageGap)) ++startHour;
             const int64_t usableNodes = requestedNodes > 0 ? std::max<int64_t>(0, lastNodeHour - startHour + 1) : 0;
             if (requestedNodes > 0 && usableNodes == 0 && !yearEdgePack)
                 throw std::runtime_error("ERA5 数据包在过境时刻 " + formatUtc(overpass) + " 之前没有可用的整点时次，无法起转（temperature.spinupHours = " +
