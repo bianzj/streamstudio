@@ -50,6 +50,9 @@ for (const name of names) {
   c.outDir = join(caseDir, 'out-placeholder')
   if (spec.meteo) { c.meteo.start = spec.meteo[0]; c.meteo.end = spec.meteo[1] }
   for (const [path, value] of Object.entries(spec.set || {})) setPath(project, path, value)
+  // Optional extra spectra / materials appended after normalization (vehicles).
+  for (const item of spec.addSpectra || []) c.spectra.push(structuredClone(item))
+  for (const item of spec.addMaterials || []) c.materials.push(structuredClone(item))
   // Optional scene objects appended after normalization (e.g. a water surface).
   for (const item of spec.addObjects || []) {
     c.objects.items.push(structuredClone(item))

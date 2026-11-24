@@ -94,7 +94,46 @@ const VEB_SHIP = (params) => ({ example: 'urban_block', mode: 'eVoxelEB', meteo:
 const SHIP_NEW = { method: 1, rss: 4000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 30, SMC: 0, Satwater: 0, wallMode: 'wall',
   thickness: 0.012, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, layers: [{ thickness: 0.012, lambda: 50, rho: 7850, cp: 460 }], speed: 0 }
 
+// Vehicle cabin (FacetEB, docs/vehicle-thermal.md): the library sedan (groups Blue, Windows, Black, Grey,
+// Headlights, TailLights) placed in the urban block. Body = 1 mm steel + 6 mm trim, glass = 4.8 mm pane
+// (tau_sol 0.65), the rest a thin shell. One body material per vehicle state (cabin parameters are per
+// body material); the paint (spectrum) is per object.
+const CABIN = { enabled: true, occupants: 0, speed: 0, ventilationACH: 0.5, windowCracked: false, acOn: false, engineOn: false }
+const VEH_COMMON = { method: 1, rss: 1000000000, cs: 900, rhos: 2700, lambdas: 10, Tsoil: 25, SMC: 0, Satwater: 0 }
+const VEH_BODY = (cabin = {}, extra = {}) => ({ name: 'vehicle_body', label: '载具车身物化', type: 'Vehicle', params: { ...VEH_COMMON, wallMode: 'wall',
+  thickness: 0.007, indoorTemperature: 22, indoorHeatTransferCoefficient: 7, vehiclePart: 'body',
+  layers: [{ thickness: 0.001, lambda: 50, rho: 7850, cp: 460 }, { thickness: 0.006, lambda: 0.04, rho: 60, cp: 1400 }],
+  cabin: { ...CABIN, ...cabin }, ...extra } })
+const VEH_GLASS = { name: 'vehicle_glass', label: '载具玻璃', type: 'Vehicle', params: { ...VEH_COMMON, wallMode: 'wall', thickness: 0.0048,
+  indoorTemperature: 22, indoorHeatTransferCoefficient: 8, vehiclePart: 'glass', layers: [{ thickness: 0.0048, lambda: 1.0, rho: 2500, cp: 840 }] } }
+const VEH_UNDER = { name: 'vehicle_underbody', label: '载具内饰/底盘薄壳', type: 'Vehicle', params: { ...VEH_COMMON, vehiclePart: 'underbody', heatCapacityPerArea: 6000 } }
+const VEH_SPECTRA = [
+  { name: 'vehicle_paint_light', label: '浅色车漆', model: 'custom', reflectance: '0.65', transmittance: '0.0', refTir: 0.1, tauTir: 0, params: {} },
+  { name: 'vehicle_paint_dark', label: '深色车漆', model: 'custom', reflectance: '0.12', transmittance: '0.0', refTir: 0.1, tauTir: 0, params: {} },
+  { name: 'vehicle_glass_spectrum', label: '车窗玻璃', model: 'custom', reflectance: '0.08', transmittance: '0.65', refTir: 0.1, tauTir: 0, params: {} }]
+const VEH_GROUPS = (paint, body) => ['Blue', 'Windows', 'Black', 'Grey', 'Headlights', 'TailLights'].map((name) => ({ name,
+  spectralName: name === 'Blue' ? paint : name === 'Windows' ? 'vehicle_glass_spectrum' : 'vehicle_surface', thermalName: 'vehicle_temperature',
+  materialName: name === 'Blue' ? body : name === 'Windows' ? 'vehicle_glass' : 'vehicle_underbody', canopyName: 'rigid_body' }))
+// vehicles: [{ name, paint, body (material name), rows: ['x y z scale rotation', ...] }], bodies: material objects
+const urbanVehicles = (vehicles, bodies, meteo = [12, 40]) => ({ example: 'urban_block', mode: 'eFacetEB', meteo,
+  addSpectra: VEH_SPECTRA, addMaterials: [...bodies, VEH_GLASS, VEH_UNDER],
+  files: Object.fromEntries(vehicles.map((v) => [`positions/${v.name}_position.txt`, v.rows.join('\n') + '\n'])),
+  addObjects: vehicles.map((v) => ({ name: v.name, type: 'Vehicle', materialName: v.body, canopyName: 'rigid_body', spectralName: v.paint,
+    fileName: 'assets/obj-library/vehicle/typical/modern_sedan.obj', positionFile: `positions/${v.name}_position.txt`,
+    shape: 'cube', dimensions: [1.82, 1.46, 4.58], instanceCount: v.rows.length, meshes: VEH_GROUPS(v.paint, v.body) })) })
+const VEH_PARK = urbanVehicles([
+  { name: 'park_light', paint: 'vehicle_paint_light', body: 'vehicle_body', rows: ['150 40 0 1 0', '177.3 12.2 0 1 0', '98 175 0 1 0', '98 236 0 1 0'] },
+  { name: 'park_dark', paint: 'vehicle_paint_dark', body: 'vehicle_body', rows: ['150 60 0 1 0'] }], [VEH_BODY()])
+const VEH_DRIVE = (acOn) => urbanVehicles([
+  { name: 'drive_car', paint: 'vehicle_paint_light', body: 'vehicle_body', rows: ['150 40 0 1 0'] }],
+  [VEH_BODY({ occupants: 1, speed: 15, engineOn: true, acOn, heading: 90, windDirection: 270 })])
+
 export const CASES = {
+  // FacetEB vehicle cabin (06:00-20:00): 5 parked cars (light paint in sun / tree / two building-side spots, dark paint
+  // in sun), one driving car at 15 m/s without and with air conditioning.
+  feb_urban_vehicle_park: VEH_PARK,
+  feb_urban_vehicle_drive: VEH_DRIVE(false),
+  feb_urban_vehicle_ac: VEH_DRIVE(true),
   vrt_urban: { example: 'urban_block', mode: 'eVoxelRT' },
   vrt_urban_multiview: { example: 'urban_block', mode: 'eVoxelRT', set: { 'configuration.sensor.principalPlane': true } },
   veb_urban: { example: 'urban_block', mode: 'eVoxelEB', meteo: [23, 25] },
