@@ -1,5 +1,5 @@
 #pragma once
-#include "era5.h"
+#include "forcing_source.h"
 #include "../physics/energy.h"
 
 namespace stream {
@@ -32,7 +32,7 @@ struct SurfaceShortwave {
 // direct-beam incidence ratio and the diffuse part by the sky-view factor. Forcing::shortwave is horizontal.
 class PixelForcing {
 public:
-    PixelForcing(const era5::Pack& pack, double latitude, double longitude, double elevationShift,
+    PixelForcing(const ForcingSource& pack, double latitude, double longitude, double elevationShift,
                  double slopeDeg = 0.0, double aspectDeg = 0.0, double diffuseFraction = 0.2,
                  double coneSlopeDeg = 0.0, double coneDensity = 0.0,
                  double ridgeSlopeDeg = 0.0, double ridgeStrikeDeg = 0.0, double ridgeDensity = 0.0,
@@ -51,8 +51,8 @@ public:
                                       double saaDeg) const;
 
 private:
-    const era5::Pack& pack_;
-    era5::Weights weights_;
+    const ForcingSource& pack_;
+    ForcingWeights weights_;
     double latitude_, longitude_, shift_;
     double slope_ = 0.0;   // radians
     double aspect_ = 0.0;  // radians, clockwise from north

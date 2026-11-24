@@ -16,6 +16,7 @@ add_executable(stream
         app/inversion.cpp
         app/thermal_view.cpp
         forcing/era5.cpp
+        forcing/forcing_source.cpp
         forcing/pixel_forcing.cpp
         forcing/utc.cpp
         physics/canopy.cpp

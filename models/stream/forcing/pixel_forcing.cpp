@@ -51,7 +51,7 @@ double approximateSunAzimuth(double latitudeDeg, double longitudeDeg, double uni
     return std::atan2(sinAzimuth, cosAzimuth);
 }
 
-PixelForcing::PixelForcing(const era5::Pack& pack, double latitude, double longitude, double elevationShift,
+PixelForcing::PixelForcing(const ForcingSource& pack, double latitude, double longitude, double elevationShift,
                            double slopeDeg, double aspectDeg, double diffuseFraction,
                            double coneSlopeDeg, double coneDensity,
                            double ridgeSlopeDeg, double ridgeStrikeDeg, double ridgeDensity, double ridgeEndFraction)
@@ -76,7 +76,7 @@ double PixelForcing::instant(const std::string& variable, double unixSeconds) co
 
 double PixelForcing::temperature(const std::string& variable, double unixSeconds) const
 {
-    return instant(variable, unixSeconds) - 0.0065 * shift_;
+    return instant(variable, unixSeconds) - pack_.lapseRate() * shift_;
 }
 
 double PixelForcing::state(const std::string& variable, double unixSeconds) const { return instant(variable, unixSeconds); }

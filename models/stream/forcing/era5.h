@@ -1,4 +1,6 @@
 #pragma once
+#include "forcing_source.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -17,38 +19,38 @@ const std::vector<std::string>& optionalVariables();
 // continuous over the common period.
 bool registerPack(const std::vector<std::string>& files, const std::filesystem::path& index, const std::string& product);
 
-struct Weights {
-    int index[4]{0, 0, 0, 0};
-    float weight[4]{0, 0, 0, 0};
-};
+using Weights = ForcingWeights;
 
-// One pack, read over a latitude/longitude window and a range of UTC hours.
-class Pack {
+// One pack, read over a latitude/longitude window and a range of UTC hours (ERA5 implementation of ForcingSource).
+class Pack : public ForcingSource {
 public:
     void open(const std::filesystem::path& index);
-    int year() const { return year_; }
+    int year() const override { return year_; }
     // Every required variable has all hours of year().
-    bool fullYear() const { return fullYear_; }
+    bool fullYear() const override { return fullYear_; }
     // True when every timed variable in `variables` has each hour of [firstHour, lastHour]; otherwise `gap`
     // names the first variable and hour that are missing.
-    bool covers(const std::vector<std::string>& variables, int64_t firstHour, int64_t lastHour, std::string& gap) const;
+    bool covers(const std::vector<std::string>& variables, int64_t firstHour, int64_t lastHour, std::string& gap) const override;
     bool landProduct() const { return land_; }
-    const std::string& product() const { return product_; }
-    bool available(const std::string& variable) const;
+    int64_t leadHours() const override { return land_ ? 1 : 0; }
+    const std::string& product() const override { return product_; }
+    bool available(const std::string& variable) const override;
     // Loads [firstHour, lastHour] (hours since 1970-01-01 UTC); hours outside the pack reuse the nearest one.
     void load(const std::vector<std::string>& variables, double latitudeMin, double latitudeMax, double longitudeMin,
-              double longitudeMax, int64_t firstHour, int64_t lastHour);
-    Weights weights(double latitude, double longitude) const;
+              double longitudeMax, int64_t firstHour, int64_t lastHour) override;
+    Weights weights(double latitude, double longitude) const override;
     // Value at an hour (clamped to the loaded range), NaN-aware bilinear in space.
-    float at(const std::string& variable, int64_t hour, const Weights& weights) const;
+    float at(const std::string& variable, int64_t hour, const Weights& weights) const override;
     // Mean downward flux (W m-2) over the hour ending at `hour`, de-accumulating ERA5-Land.
-    float hourlyFlux(const std::string& variable, int64_t hour, const Weights& weights) const;
-    bool loaded(const std::string& variable) const { return data_.count(variable) > 0; }
-    int64_t firstHour() const { return firstHour_; }
-    int64_t lastHour() const { return lastHour_; }
-    const std::vector<std::string>& notes() const { return notes_; }
+    float hourlyFlux(const std::string& variable, int64_t hour, const Weights& weights) const override;
+    bool loaded(const std::string& variable) const override { return data_.count(variable) > 0; }
+    int64_t firstHour() const override { return firstHour_; }
+    int64_t lastHour() const override { return lastHour_; }
+    const std::vector<std::string>& notes() const override { return notes_; }
+    const ForcingReport& report() const override { return report_; }
 
 private:
+    ForcingReport report_;
     struct Source { int file = -1; size_t time = 0; };
     std::vector<std::string> files_;
     std::map<std::string, std::map<int64_t, Source>> sources_;

@@ -278,7 +278,7 @@ int runImage(const std::string& configPath)
         {
             std::string coverageGap;
             // ERA5-Land de-accumulation also reads the hour before the start, so that hour must be covered too.
-            const int64_t landLead = pack.landProduct() ? 1 : 0;
+            const int64_t landLead = pack.leadHours();
             while (startHour < overpassHour && !pack.covers(variables, startHour - landLead, lastHour, coverageGap)) ++startHour;
             const int64_t usableNodes = requestedNodes > 0 ? std::max<int64_t>(0, lastNodeHour - startHour + 1) : 0;
             if (requestedNodes > 0 && usableNodes == 0 && !yearEdgePack)
@@ -296,7 +296,7 @@ int runImage(const std::string& configPath)
         marchStartHour = startHour;
         marchStart = requestedNodes > 0 ? static_cast<double>(startHour) * 3600.0 : overpass;
         spinupUsedHours = (overpass - marchStart) / 3600.0;
-        const int64_t firstHour = startHour - (pack.landProduct() ? 1 : 0);
+        const int64_t firstHour = startHour - pack.leadHours();
         std::string gap;
         // A whole-year pack keeps the year-edge rule: hours just outside the year reuse the nearest one.
         if (!pack.covers(variables, firstHour, lastHour, gap) && !(pack.fullYear() && pack.year() == when.year))
