@@ -4,6 +4,7 @@
 #include "inversion.h"
 #include "thermal_view.h"
 #include "../forcing/era5.h"
+#include "../forcing/forcing_metadata.h"
 #include "../forcing/pixel_forcing.h"
 #include "../forcing/utc.h"
 #include "../physics/brightness.h"
@@ -225,8 +226,16 @@ int runImage(const std::string& configPath)
     bool waterSkinMissing = false;  // water pixels present but the pack has no skt: they take the 2 m air temperature
     if (eb) {
         progress(2, "读取气象数据包");
-        pack.open(config.era5Pack);
-        const UtcTime when = utcFromSeconds(overpass);
+        ForcingMetadata forcingMetadata;
+        if (!config.forcingMetadata.empty()) forcingMetadata = resolveForcingMetadata(config.forcingMetadata, config.forcingBaseDir);
+        pack.open(config.era5Pack, config.forcingMetadata.empty() ? nullptr : &forcingMetadata);
+        {
+            const ForcingMetadata& used = pack.metadata();
+            log("气象强迫元数据：" + used.name + "（" + (used.origin == "preset" ? "预设" : used.origin == "file" ? "文件 " + utf8FromPath(used.path) : used.origin == "pack" ? "数据包索引" : "内联") +
+                "，" + (pack.standardised() ? "经元数据标准化" : "ERA5 原布局，无换算") + "）");
+            for (const auto& text : pack.report().infos) log("气象强迫：" + text);
+            for (const auto& text : pack.report().warnings) log("警告：" + text);
+        }        const UtcTime when = utcFromSeconds(overpass);
         double latMin = 90, latMax = -90, lonMin = 180, lonMax = -180;
         bool waterPresent = false;
         for (int row = startRow; row < endRow; ++row)
@@ -1263,6 +1272,27 @@ int runImage(const std::string& configPath)
         era5Info.Add("elevationCorrection", elevationCorrection);
         era5Info.Add("soilMoisture", config.soilMoistureFromEra5 ? "era5" : "user");
         temperatureInfo.Add("era5", era5Info);
+        {
+            // temperature.forcing: the metadata that was used and what the standardisation layer did (docs/forcing-metadata.md 9).
+            CPLJSONObject forcingInfo;
+            CPLJSONDocument summary;
+            if (summary.LoadMemory(forcingMetadataSummaryJson(pack.metadata()))) forcingInfo = summary.GetRoot();
+            const ForcingReport& report = pack.report();
+            const auto list = [](const std::vector<std::string>& values) {
+                CPLJSONArray array;
+                for (const auto& value : values) array.Add(value);
+                return array;
+            };
+            forcingInfo.Add("standardised", pack.standardised());
+            forcingInfo.Add("derived", list(report.derived));
+            forcingInfo.Add("ignored", list(report.ignored));
+            forcingInfo.Add("infos", list(report.infos));
+            forcingInfo.Add("warnings", list(report.warnings));
+            CPLJSONObject removed;
+            for (const auto& item : report.removed) removed.Add(item.first, static_cast<GInt64>(item.second));
+            forcingInfo.Add("valuesRemoved", removed);
+            temperatureInfo.Add("forcing", forcingInfo);
+        }
         CPLJSONArray nodeList;
         for (const double node : nodes) nodeList.Add(formatUtc(node));
         temperatureInfo.Add("nodes", nodeList);

@@ -90,7 +90,10 @@ struct ImageConfig {
     std::string componentsFile;
     std::array<Field, 4> components;
     // EB
-    std::filesystem::path era5Pack;
+    std::filesystem::path era5Pack;             // gridded forcing pack index (temperature.forcing.pack or temperature.era5.pack)
+    std::string forcingMetadata;                // preset name, metadata file path or inline JSON; empty = preset of the pack product
+    std::filesystem::path forcingBaseDir;       // relative metadata / station file paths resolve against it
+    std::vector<std::filesystem::path> forcingFiles;  // station CSV files (temperature.forcing.files)
     bool soilMoistureFromEra5 = true;
     bool elevationCorrection = true;
     TerrainRadiation terrainRadiation = TerrainRadiation::None;

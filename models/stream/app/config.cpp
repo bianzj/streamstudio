@@ -1,4 +1,5 @@
 #include "config.h"
+#include "../forcing/forcing_metadata.h"
 #include "../forcing/utc.h"
 
 #include <cpl_json.h>
@@ -277,8 +278,32 @@ ImageConfig readImageConfig(const std::string& path)
     const auto mode = temperature.GetString("mode", "rt");
     if (mode == "eb") {
         config.mode = TemperatureMode::Eb;
-        config.era5Pack = pathFromUtf8(temperature.GetObj("era5").GetString("pack", ""));
-        if (config.era5Pack.empty()) throw std::runtime_error("EB 模式需要气象数据包");
+        // Weather forcing (docs/forcing-metadata.md 8): temperature.forcing {pack, files, metadata} or the older era5.pack;
+        // temperature.forcingMetadata is shorthand for forcing.metadata.
+        const auto forcing = temperature.GetObj("forcing");
+        std::string pack = forcing.GetString("pack", "");
+        if (pack.empty()) pack = temperature.GetObj("era5").GetString("pack", "");
+        config.era5Pack = pathFromUtf8(pack);
+        config.forcingBaseDir = std::filesystem::absolute(pathFromUtf8(path)).parent_path();
+        auto metadata = forcing.GetObj("metadata");
+        if (!metadata.IsValid()) metadata = temperature.GetObj("forcingMetadata");
+        if (metadata.IsValid()) {
+            if (metadata.GetType() == CPLJSONObject::Type::String) config.forcingMetadata = metadata.ToString();
+            else if (metadata.GetType() == CPLJSONObject::Type::Object) config.forcingMetadata = metadata.Format(CPLJSONObject::PrettyFormat::Plain);
+            else throw std::runtime_error("temperature.forcing.metadata 须为预设名、元数据文件路径或元数据对象");
+        }
+        const auto files = forcing.GetArray("files");
+        for (int index = 0; index < files.Size(); ++index) config.forcingFiles.push_back(pathFromUtf8(files[index].ToString()));
+        bool stationForm = false;
+        if (!config.forcingMetadata.empty()) {
+            // Validated here so a wrong document fails before any raster is read; the data side is checked when the data open.
+            const ForcingMetadata resolved = resolveForcingMetadata(config.forcingMetadata, config.forcingBaseDir);
+            stationForm = resolved.station();
+            if (stationForm && config.forcingFiles.empty() && resolved.stations.empty())
+                throw std::runtime_error("气象强迫元数据 \"" + resolved.name + "\" 是站点形态，需要 temperature.forcing.files（站点 CSV）或元数据里登记的站点文件");
+        }
+        if (!stationForm && config.era5Pack.empty())
+            throw std::runtime_error(config.forcingMetadata.empty() ? "EB 模式需要气象数据包" : "网格形态的气象强迫需要数据包（temperature.forcing.pack 或 temperature.era5.pack）");
         const auto source = temperature.GetObj("soilMoisture").GetString("source", "era5");
         if (source != "era5" && source != "user") throw std::runtime_error("土壤水分来源须为 era5 或 user");
         config.soilMoistureFromEra5 = source == "era5";
