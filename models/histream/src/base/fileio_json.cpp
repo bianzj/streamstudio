@@ -644,6 +644,47 @@ bool FileIO::readJson(const std::string& path, Mode mode) {
                         !(hull.waterHeatTransferCoefficient > 0.0f))
                         throw std::runtime_error("Invalid ship waterline parameters: " + value.name);
                 }
+                // Internal heat source (W m-2 of hull surface; same field as
+                // the FacetEB Ship material).
+                hull.internalHeatFlux = ProjectJson::number(params, "internalHeatFlux", 0.0f);
+                if (!std::isfinite(hull.internalHeatFlux) || std::abs(hull.internalHeatFlux) > 1.0e5f)
+                    throw std::runtime_error("Invalid internal heat source (|flux| <= 1e5 W/m2): " + value.name);
+                // 12 mm steel plate (wallMode "wall"): VoxelEB only switches it
+                // on with the explicit voxelWall flag, so projects saved
+                // before it existed keep their semi-infinite solid hull.
+                if (ProjectJson::string(params, "wallMode", "shell") == "wall" &&
+                    ProjectJson::boolean(params, "voxelWall", false)) {
+                    double thickness = ProjectJson::number(params, "thickness", 0.2f);
+                    double resistance = 0.0, capacity = 0.0;
+                    if (params.contains("layers") && params["layers"].is_array() && !params["layers"].empty()) {
+                        if (params["layers"].size() > 6)
+                            throw std::runtime_error("Ship wall has more than 6 layers: " + value.name);
+                        thickness = 0.0;
+                        for (const auto& layer : params["layers"]) {
+                            const double t = layer.value("thickness", 0.0), k = layer.value("lambda", 0.0);
+                            const double rho = layer.value("rho", 0.0), cp = layer.value("cp", 0.0);
+                            if (!(t > 0.0 && k > 0.0 && rho > 0.0 && cp > 0.0))
+                                throw std::runtime_error("Invalid ship wall layer (thickness lambda rho cp): " + value.name);
+                            thickness += t;
+                            resistance += t / k;
+                            capacity += t * rho * cp;
+                        }
+                    } else {
+                        resistance = thickness / hull.lambdas;
+                        capacity = thickness * double(hull.rhos) * double(hull.cs);
+                    }
+                    if (!(thickness > 0.0 && thickness <= 5.0) || !(resistance > 0.0) || !(capacity > 0.0))
+                        throw std::runtime_error("Invalid ship wall (0 < thickness <= 5 m, lambda, rho, cp > 0): " + value.name);
+                    // One equivalent homogeneous plate: same total thickness,
+                    // thermal resistance and heat capacity as the layers.
+                    hull.plateThickness = static_cast<float>(thickness);
+                    hull.plateLambda = static_cast<float>(thickness / resistance);
+                    hull.plateCapacity = static_cast<float>(capacity / thickness);
+                    hull.plateIndoorC = ProjectJson::number(params, "indoorTemperature", 22.0f);
+                    hull.plateIndoorH = ProjectJson::number(params, "indoorHeatTransferCoefficient", 8.0f);
+                    if (!(hull.plateIndoorC > -70.0f && hull.plateIndoorC < 120.0f) || !(hull.plateIndoorH > 0.0f))
+                        throw std::runtime_error("Invalid ship wall indoor side (-70 < T < 120 C, h > 0): " + value.name);
+                }
             }
         }
         properties.push_back(std::move(value));

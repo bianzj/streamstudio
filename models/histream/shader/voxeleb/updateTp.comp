@@ -93,6 +93,34 @@ void main()
             return;
         }
 
+        if(typeId == TYPE_BUILDING && shipPlateOn(bioId))
+        {
+            // Ship steel plate: advance the implicit column with the surface
+            // temperature of the current sunlit fraction (linear, so this
+            // equals the mix of the two states' columns).
+            float sunlitFraction = clamp(voxelDirs[bufferId].solar, 0.0, 1.0);
+            float Tsunlit = voxelTempes[bufferId].sunlit;
+            float Tshaded = voxelTempes[bufferId].shaded;
+            if(isnan(Tsunlit) || isinf(Tsunlit) || Tsunlit > TMAX_THRESHOLD || Tsunlit < TMIN_THRESHOLD)
+                Tsunlit = Ta + 2.0 + 273.15;
+            if(isnan(Tshaded) || isinf(Tshaded) || Tshaded > TMAX_THRESHOLD || Tshaded < TMIN_THRESHOLD)
+                Tshaded = Ta + 1.0 + 273.15;
+            float surfaceC = mix(Tshaded, Tsunlit, sunlitFraction) - 273.15;
+            float plateOld[TLASTNUM], plateE[TLASTNUM], plateH[TLASTNUM];
+            for(int kdepth = 0; kdepth < TLASTNUM; kdepth++)
+                plateOld[kdepth] = mix(voxelTlasts[TlastId + kdepth].shaded,
+                                       voxelTlasts[TlastId + kdepth].sunlit, sunlitFraction);
+            shipPlateElimination(bioId, plateOld, dtime, plateE, plateH);
+            float above = surfaceC;
+            for(int kdepth = 0; kdepth < TLASTNUM; kdepth++)
+            {
+                above = plateE[kdepth] + (1.0 - plateH[kdepth]) * above;
+                voxelTlasts[TlastId + kdepth].sunlit = above;
+                voxelTlasts[TlastId + kdepth].shaded = above;
+            }
+            return;
+        }
+
         if(abs(soilSets[bioId].method-1)<0.1)
         {
             // Commit the sunlit/shaded area transfer evapo.comp applied to

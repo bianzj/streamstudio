@@ -252,6 +252,13 @@ export const CASES = {
   veb_urban_ship_speed8: VEB_SHIP({ ...SHIP_NEW, speed: 8 }),
   veb_urban_ship_waterline: VEB_SHIP({ ...SHIP_NEW, waterlineHeight: 2.0, waterHeatTransferCoefficient: 500 }),
   veb_urban_ship_head: VEB_SHIP({ ...SHIP_NEW, speed: 8, heading: 0, windDirection: 0 }),
+  // VoxelEB 12 mm steel plate and internal heat source (2026-11-24): voxelWall switches the plate on
+  // (new-project ship_material; projects without it keep the semi-infinite hull); internalHeatFlux in
+  // W m-2 of hull surface heats the plate's inner layer (or the surface balance without the plate).
+  veb_urban_ship_plate: VEB_SHIP({ ...SHIP_NEW, voxelWall: true }),
+  veb_urban_ship_plate_internal: VEB_SHIP({ ...SHIP_NEW, voxelWall: true, internalHeatFlux: 50 }),
+  veb_urban_ship_plate_wl: VEB_SHIP({ ...SHIP_NEW, voxelWall: true, waterlineHeight: 2.0, waterHeatTransferCoefficient: 500 }),
+  veb_urban_ship_internal_solid: VEB_SHIP({ ...SHIP_NEW, internalHeatFlux: 50 }),
   // Soil thermal properties (2026-11-23) on the background loam (soilset: urban index 4,
   // forest index 11). SOIL_SCOPE = the former built-in loam (SCOPE cs 1180, rhos 1800,
   // lambdas 1.55; still the engine fallback), SOIL_LOAM = the new built-in loam (cs 1300,

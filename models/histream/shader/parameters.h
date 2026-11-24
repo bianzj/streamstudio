@@ -404,6 +404,13 @@ struct SoilSet
     float shipWindCosine;
     float waterlineHeight;
     float waterHeatTransferCoefficient;
+    // Ship hull steel plate and internal heat source (structs_cg.h).
+    float plateThickness;
+    float plateLambda;
+    float plateCapacity;
+    float plateIndoorC;
+    float plateIndoorH;
+    float internalHeatFlux;
 
     //BSMParam bsm;
 };

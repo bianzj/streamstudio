@@ -188,6 +188,57 @@ float shipHullRaa(uint sparseIndex, uint bioId, float raa)
     return min(raa, max(RHOA * CP / (8.3 + 4.1 * max(relative, 0.1)), 1.0));
 }
 
+// Ship hull steel plate (SoilSet plate* fields; plateThickness 0 = off).
+// TLASTNUM equal implicit (backward Euler) layers; cell k holds T_k in degC
+// in the Tlast profile (both sunlit and shaded slots carry the same column,
+// like soil method 2). The surface node sits half a layer from the outer
+// face; the inner layer exchanges with the indoor temperature through the
+// half layer plus plateIndoorH, and takes the internal heat source.
+// Eliminating from the inner side gives T_1 = e_0 + (1 - h_0) Ts, so the
+// flux into the plate is linear in the new surface temperature:
+//   G(Ts) = gs (h_0 Ts - e_0),  dG/dTs = gs h_0,  gs = 2 lambda / dx.
+bool shipPlateOn(uint bioId)
+{
+    return soilSets[bioId].plateThickness > 0.0;
+}
+
+void shipPlateElimination(uint bioId, in float Told[TLASTNUM], float dtime,
+                          out float e[TLASTNUM], out float h[TLASTNUM])
+{
+    float dx = soilSets[bioId].plateThickness / float(TLASTNUM);
+    float lambdaPlate = max(soilSets[bioId].plateLambda, 1.0e-6);
+    float a = soilSets[bioId].plateCapacity * dx / max(dtime, 1.0);
+    float g = lambdaPlate / dx;
+    float gin = 1.0 / (dx / (2.0 * lambdaPlate) + 1.0 / max(soilSets[bioId].plateIndoorH, 1.0e-6));
+    float denominator = a + g + gin;
+    e[TLASTNUM - 1] = (a * Told[TLASTNUM - 1] + gin * soilSets[bioId].plateIndoorC
+                       + soilSets[bioId].internalHeatFlux) / denominator;
+    h[TLASTNUM - 1] = (a + gin) / denominator;
+    for (int k = TLASTNUM - 2; k >= 0; k--)
+    {
+        float gl = k == 0 ? 2.0 * g : g;
+        float d = a + gl + g * h[k + 1];
+        e[k] = (a * Told[k] + g * e[k + 1]) / d;
+        h[k] = (a + g * h[k + 1]) / d;
+    }
+}
+
+// Heat flux (W m-2) from the surface into the plate for surface temperature
+// Ts (degC), and its slope with Ts.
+float shipPlateSurfaceFlux(uint bioId, float Ts, float e0, float h0)
+{
+    float gs = 2.0 * max(soilSets[bioId].plateLambda, 1.0e-6) * float(TLASTNUM)
+               / soilSets[bioId].plateThickness;
+    return gs * (h0 * Ts - e0);
+}
+
+float shipPlateSurfaceSlope(uint bioId, float h0)
+{
+    float gs = 2.0 * max(soilSets[bioId].plateLambda, 1.0e-6) * float(TLASTNUM)
+               / soilSets[bioId].plateThickness;
+    return gs * h0;
+}
+
 // Effective aerodynamic resistance of a ground-type surface (soil, water,
 // building) including free convection. With the neutral wind-driven
 // resistance (control.stabilityCorrection off) exchange collapses at low

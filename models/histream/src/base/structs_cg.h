@@ -503,6 +503,18 @@ struct SoilSet
     float shipWindCosine{0.0f};
     float waterlineHeight{0.0f};
     float waterHeatTransferCoefficient{0.0f};
+    // Ship hull steel plate (material type Ship, wallMode "wall" + voxelWall;
+    // plateThickness 0 = off, the hull stays a semi-infinite solid). The plate
+    // has TLASTNUM implicit layers stored in the Tlast profile; the inner face
+    // exchanges with plateIndoorC through plateIndoorH. internalHeatFlux
+    // (W m-2 of hull surface, any hull voxel) heats the inner layer (plate) or
+    // enters the surface balance (no plate).
+    float plateThickness{0.0f};
+    float plateLambda{0.0f};
+    float plateCapacity{0.0f};     // rho * cp, J m-3 K-1
+    float plateIndoorC{22.0f};
+    float plateIndoorH{8.0f};
+    float internalHeatFlux{0.0f};
     //BSMParam bsm;
 };
 

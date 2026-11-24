@@ -189,7 +189,19 @@ void main()
         }
         else if(typeId == TYPE_SOIL || typeId == TYPE_BUILDING)
         {
-            if(soilSets[bioId].method == 0)
+            if(typeId == TYPE_BUILDING && shipPlateOn(bioId))
+            {
+                // Ship steel plate: flux into the implicit plate for the
+                // current surface temperature (linear, see fluid_coupling.glsl).
+                float plateOld[TLASTNUM], plateE[TLASTNUM], plateH[TLASTNUM];
+                for(int kdepth = 0; kdepth < TLASTNUM; kdepth++)
+                    plateOld[kdepth] = issunlit == 0
+                        ? voxelTlasts[TlastId+kdepth].shaded
+                        : voxelTlasts[TlastId+kdepth].sunlit;
+                shipPlateElimination(bioId, plateOld, dtime, plateE, plateH);
+                Gst = shipPlateSurfaceFlux(bioId, Tc - 273.15, plateE[0], plateH[0]);
+            }
+            else if(soilSets[bioId].method == 0)
             {
                 // GST is dimensionless. budget.comp computes/writes GST*Rn
                 // after the independent net radiation is available.

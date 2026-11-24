@@ -679,7 +679,7 @@ FacetEB 水面初温由“初始水温”（`initialTemperatureMode`）决定：
 
 ### 9.3.3 船舶表面（VoxelEB，最小版本）
 
-VoxelEB 的船体是 `Type::BUILDING` 体元，仍按半无限固体 `method/cs/rhos/lambdas` 计算；船舶物化（`type: 'Ship'`）下面四项也对 VoxelEB 生效，字段名与 FacetEB 相同，缺省全部关闭（旧工程结果逐字节不变）：
+VoxelEB 的船体是 `Type::BUILDING` 体元，缺省仍按半无限固体 `method/cs/rhos/lambdas` 计算（给了 `voxelWall: true` 才改用下面的钢板墙体）；船舶物化（`type: 'Ship'`）下面各项也对 VoxelEB 生效，字段名与 FacetEB 相同，缺省全部关闭（旧工程结果逐字节不变）：
 
 | 参数（project.json `params`） | VoxelEB 中的含义 | 默认 |
 |---|---|---|
@@ -687,8 +687,10 @@ VoxelEB 的船体是 `Type::BUILDING` 体元，仍按半无限固体 `method/cs/
 | `heading`、`windDirection` | 航向与风来向（罗经方位 0–360°，两项都给才生效）；相对风 \|u风 − v船\|，缺省按垂直取 √(u² + v²) | 不设 |
 | `waterlineHeight` | 水线高度，m（世界高度）；体元中心 (y 层号 + 0.5)·体元尺寸低于它的船体体元外侧只与水换热 | 不设 |
 | `waterHeatTransferCoefficient` | 水侧换热系数，W m⁻² K⁻¹，只在给了 `waterlineHeight` 时用；阻抗下限 1 s m⁻¹，实际上限约 1210 | 500 |
+| `wallMode: 'wall'` + `voxelWall: true` | 船体按钢板墙体计算：8 层隐式一维板，外侧表面温度 → 板内热通量，内侧经室内换热系数接室内恒温；`thickness`、`layers`（多层折算成一块等效均质板；无 `layers` 时用 `lambdas/rhos/cs`）、`indoorTemperature`、`indoorHeatTransferCoefficient` 与 FacetEB 同名。新建工程的船舶表面物化缺省为 12 mm 钢板（λ 50、ρ 7850、cp 460，室内 22 ℃、h 8）并带 `voxelWall`；旧工程没有 `voxelWall`，仍是半无限固体 | 不设 |
+| `internalHeatFlux` | 内热源，W m⁻²（船体表面）；有板时加在最内层，无板时加进表面能量平衡。`internalHeatPower` VoxelEB 不读；烟囱/排气等局部热源请用单独的船舶物化并给较高的 `internalHeatFlux` 近似 | 0 |
 
-水温取场景全部水体体元的均值（每次能量平衡迭代更新，随节点延续），场景没有水体时取首节点气温；船体向水的热量不反馈水温。限制：没有内热源、没有墙体构造层、没有水面吃水（`waterlineSource`）、没有遮蔽/反馈/固定水温，水线按体元中心判定，精度就是体元尺寸（体元 2 m 的城市示例里 28.5 m 的缩尺船只剩 2 个体元，评估航速/水线影响请用 1 m 或更细的体元）。界面“编辑船舶物化”的提示框说明了 VoxelEB 读取哪些项。回归算例 `veb_urban_ship`、`_speed8`、`_waterline`、`_head`（`tools/regression/cases.mjs`）。
+水温取场景全部水体体元的均值（每次能量平衡迭代更新，随节点延续），场景没有水体时取首节点气温；船体向水的热量不反馈水温。板体元的 8 层剖面也写进体元能量输出的 `soilProfile` 列（自外向内，列名里的深度是土壤深度，对板无意义）。限制：没有水面吃水（`waterlineSource`）、没有遮蔽/反馈/固定水温，水线按体元中心判定，精度就是体元尺寸（体元 2 m 的城市示例里 28.5 m 的缩尺船只剩 2 个体元，评估航速/水线影响请用 1 m 或更细的体元）。界面“编辑船舶物化”的提示框说明了 VoxelEB 读取哪些项。回归算例 `veb_urban_ship`、`_speed8`、`_waterline`、`_head`、`_plate`、`_plate_internal`、`_plate_wl`、`_internal_solid`（`tools/regression/cases.mjs`）。
 
 ### 9.4 篷布、遮阴棚与遮阳网
 

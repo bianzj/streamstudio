@@ -810,6 +810,13 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
             return false;
         }
         const MeshLink& meshLink = modelio->m_meshio->meshLinks[meshId];
+        // Ship steel plate voxels also report their plate layers (outer to inner).
+        if (meshLink.bioId >= 0 &&
+            meshLink.bioId < static_cast<int>(modelio->m_meshio->soilsets.size()) &&
+            meshLink.type == static_cast<int>(Type::BUILDING) &&
+            modelio->m_meshio->soilsets[meshLink.bioId].plateThickness > 0.0f) {
+            return true;
+        }
         return meshLink.type == static_cast<int>(Type::SOIL) &&
             meshLink.bioId >= 0 &&
             meshLink.bioId < static_cast<int>(modelio->m_meshio->soilsets.size()) &&

@@ -143,8 +143,14 @@ void main()
     // soil heat storage 
     float Gsunlit = voxelHeatFlux[bufferId].Gsunlit;
     float Gshaded = voxelHeatFlux[bufferId].Gshaded;
+    // Ship hull steel plate: G comes from evapo.comp (implicit plate); the
+    // internal heat source heats the plate there, or the surface balance
+    // below when the hull stays a semi-infinite solid.
+    const bool shipPlate = typeId == TYPE_BUILDING && shipPlateOn(bioId);
+    const float shipInternalSource = (typeId == TYPE_BUILDING && !shipPlate)
+        ? soilSets[bioId].internalHeatFlux : 0.0;
     if((typeId == TYPE_SOIL || typeId == TYPE_BUILDING) &&
-       soilSets[bioId].method == 0)
+       !shipPlate && soilSets[bioId].method == 0)
     {
         Gsunlit = netSunlitRad * GST;
         Gshaded = netShadedRad * GST;
@@ -252,7 +258,14 @@ void main()
     float radiativeScale = 1.0;
     if(typeId == TYPE_SOIL || typeId == TYPE_BUILDING)
     {
-        if(soilSets[bioId].method == 0)
+        if(shipPlate)
+        {
+            float plateOld[TLASTNUM], plateE[TLASTNUM], plateH[TLASTNUM];
+            for(int kdepth = 0; kdepth < TLASTNUM; kdepth++) plateOld[kdepth] = 0.0;
+            shipPlateElimination(bioId, plateOld, ubom.meteo.dtime, plateE, plateH);
+            storageDerivative = shipPlateSurfaceSlope(bioId, plateH[0]);
+        }
+        else if(soilSets[bioId].method == 0)
         {
             radiativeScale = 1.0 - GST;
         }
@@ -337,6 +350,11 @@ void main()
     {
         diffSunlitRad = netSunlitRad - (voxelHeatFlux[bufferId].LEsunlit + Gsunlit + voxelHeatFlux[bufferId].Hsunlit);
         diffShadedRad = netShadedRad - (voxelHeatFlux[bufferId].LEshaded + Gshaded + voxelHeatFlux[bufferId].Hshaded);
+        if(shipInternalSource != 0.0)
+        {
+            diffSunlitRad += shipInternalSource;
+            diffShadedRad += shipInternalSource;
+        }
         float denominatorSunlit = radiativeScale * 4.0 * emis * SIGMASB *
             pow(TsunlitOld, 3.0) + sensibleDerivativeSunlit +
             latentDerivativeSunlit + storageDerivative;
