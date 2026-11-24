@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://streamstudio.local/schemas/forcing-metadata.schema.json",
+  "title": "StreamStudio 气象强迫元数据",
+  "description": "描述气象强迫数据（网格 NetCDF 或站点 CSV）中每个物理量的变量名、单位、高度与时间约定；说明见 docs/forcing-metadata.md。结构校验之外的检查（变量是否存在、单位是否识别、kind 与 unit 是否匹配）由引擎 `stream forcing-check` 完成。",
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "kind": {"const": "stream-forcing-metadata"},
+    "schemaVersion": {"const": 1},
+    "name": {"type": "string", "minLength": 1},
+    "preset": {"$ref": "#/$defs/presetName", "description": "以内置预设为底，下面各项逐键覆盖（对象递归合并，数组整体替换）。"},
+    "description": {"type": "string"},
+    "form": {"enum": ["gridded", "station"]},
+    "time": {"$ref": "#/$defs/time"},
+    "grid": {"$ref": "#/$defs/grid"},
+    "station": {"$ref": "#/$defs/station"},
+    "variables": {"$ref": "#/$defs/variables"},
+    "heightCorrection": {"$ref": "#/$defs/heightCorrection"},
+    "spatial": {"$ref": "#/$defs/spatial"}
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "presetName": {"enum": ["era5", "era5-land", "gldas-noah-0.25", "gldas-noah-1.0", "station-csv"]},
+    "names": {
+      "oneOf": [
+        {"type": "string", "minLength": 1},
+        {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}
+      ]
+    },
+    "time": {
+      "type": "object",
+      "properties": {
+        "variable": {"$ref": "#/$defs/names"},
+        "column": {"type": "string", "minLength": 1},
+        "format": {"enum": ["iso8601", "epoch_seconds", "epoch_milliseconds", "yyyymmddhh", "yyyymmddhhmm"]},
+        "units": {"type": "string", "pattern": "^(seconds?|minutes?|hours?|days?) since "},
+        "stepHours": {"type": "number", "exclusiveMinimum": 0, "maximum": 744},
+        "utcOffsetHours": {"type": "number", "minimum": -14, "maximum": 14},
+        "maxGapHours": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "grid": {
+      "type": "object",
+      "properties": {
+        "latitude": {"$ref": "#/$defs/names"},
+        "longitude": {"$ref": "#/$defs/names"}
+      }
+    },
+    "station": {
+      "type": "object",
+      "properties": {
+        "delimiter": {"type": "string", "minLength": 1, "maxLength": 1},
+        "comment": {"type": "string", "maxLength": 1},
+        "columns": {
+          "type": "object",
+          "properties": {
+            "id": {"type": "string"}, "latitude": {"type": "string"},
+            "longitude": {"type": "string"}, "elevation": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
+        "stations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "latitude": {"type": "number", "minimum": -90, "maximum": 90},
+              "longitude": {"type": "number", "minimum": -360, "maximum": 360},
+              "elevation_m": {"type": "number"},
+              "file": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "kind": {"enum": ["instant", "previous", "interval_mean", "accumulated", "cumulative"]},
+    "stamp": {"enum": ["instant", "interval_start", "interval_end", "interval_mid"]},
+    "channelFields": {
+      "type": "object",
+      "properties": {
+        "source": {"$ref": "#/$defs/names"},
+        "unit": {"type": "string", "minLength": 1},
+        "scale": {"type": "number"},
+        "offset": {"type": "number"},
+        "kind": {"$ref": "#/$defs/kind"},
+        "stamp": {"$ref": "#/$defs/stamp"},
+        "resetHourUtc": {"type": "integer", "minimum": 0, "maximum": 23},
+        "stepHours": {"type": "number", "exclusiveMinimum": 0},
+        "height_m": {"type": "number", "exclusiveMinimum": 0},
+        "missing": {"type": "array", "items": {"type": "number"}},
+        "range": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}
+      }
+    },
+    "channel": {"$ref": "#/$defs/channelFields"},
+    "variables": {
+      "type": "object",
+      "properties": {
+        "airTemperature": {"$ref": "#/$defs/channel"},
+        "humidity": {
+          "allOf": [{"$ref": "#/$defs/channelFields"}],
+          "properties": {"type": {"enum": ["dewpoint", "specific", "mixingRatio", "relative", "vapourPressure"]}}
+        },
+        "pressure": {
+          "allOf": [{"$ref": "#/$defs/channelFields"}],
+          "properties": {"type": {"enum": ["surface", "seaLevel", "none"]}}
+        },
+        "wind": {
+          "type": "object",
+          "properties": {
+            "type": {"enum": ["components", "speedDirection", "speed"]},
+            "height_m": {"type": "number", "exclusiveMinimum": 0},
+            "u": {"$ref": "#/$defs/channel"},
+            "v": {"$ref": "#/$defs/channel"},
+            "speed": {"$ref": "#/$defs/channel"},
+            "direction": {
+              "allOf": [{"$ref": "#/$defs/channelFields"}],
+              "properties": {"convention": {"enum": ["from", "to"]}}
+            }
+          }
+        },
+        "shortwaveDown": {"$ref": "#/$defs/channel"},
+        "longwaveDown": {
+          "allOf": [{"$ref": "#/$defs/channelFields"}],
+          "properties": {"fallback": {"enum": ["none", "brutsaert"]}}
+        },
+        "precipitation": {"$ref": "#/$defs/channel"},
+        "skinTemperature": {"$ref": "#/$defs/channel"},
+        "soilMoisture": {
+          "allOf": [{"$ref": "#/$defs/channelFields"}],
+          "properties": {"thickness_m": {"type": "number", "exclusiveMinimum": 0}}
+        },
+        "orography": {"$ref": "#/$defs/channel"},
+        "directShortwave": {"$ref": "#/$defs/channel"},
+        "diffuseShortwave": {"$ref": "#/$defs/channel"}
+      },
+      "additionalProperties": false
+    },
+    "heightCorrection": {
+      "type": "object",
+      "properties": {
+        "wind": {
+          "type": "object",
+          "properties": {
+            "mode": {"enum": ["log", "none"]},
+            "targetHeight_m": {"type": "number", "exclusiveMinimum": 0},
+            "roughness_m": {"type": "number", "exclusiveMinimum": 0}
+          }
+        },
+        "airTemperature": {
+          "type": "object",
+          "properties": {
+            "mode": {"enum": ["none", "lapse"]},
+            "targetHeight_m": {"type": "number", "exclusiveMinimum": 0},
+            "lapseRate_K_per_m": {"type": "number", "minimum": 0, "maximum": 0.02}
+          }
+        }
+      }
+    },
+    "spatial": {
+      "type": "object",
+      "properties": {
+        "interpolation": {"enum": ["bilinear", "nearest", "idw"]},
+        "idwPower": {"type": "number", "exclusiveMinimum": 0},
+        "maxStations": {"type": "integer", "minimum": 1, "maximum": 4},
+        "maxDistanceKm": {"type": "number", "minimum": 0},
+        "lapseRateKPerKm": {"type": "number", "minimum": 0, "maximum": 20}
+      }
+    }
+  }
+}
