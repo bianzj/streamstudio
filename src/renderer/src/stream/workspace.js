@@ -185,7 +185,7 @@ function defaults() {
     temperature: {
       mode: 'rt',
       components: { source: 'fields', soilSunlit: { value: 315 }, soilShaded: { value: 303 }, leafSunlit: { value: 305 }, leafShaded: { value: 300 } },
-      componentsPackage: {}, era5: { pack: '' }, soilMoisture: { source: 'era5' }, elevationCorrection: true
+      componentsPackage: {}, era5: { pack: '' }, soilMoisture: { source: 'era5' }, elevationCorrection: true, spinupHours: DEFAULT_SPINUP_NODES
     }
   }
 }
@@ -254,42 +254,73 @@ function exportScene(form) {
   const packageFile = form.temperature.componentsPackage.file.trim()
   if (packageFile) scene.temperature.components.file = packageFile
   delete scene.temperature.componentsPackage
+  // Empty = engine default (7 nodes); the engine/server reject anything outside 0–240 (validate() catches it first).
+  if (scene.temperature.spinupHours === '' || scene.temperature.spinupHours === null || scene.temperature.spinupHours === undefined) delete scene.temperature.spinupHours
   return scene
 }
 
-// Number of energy-balance nodes from 00 UTC of the overpass day to the overpass (as the engine).
-function ebNodes(overpass) {
-  const time = Date.parse(overpass)
-  if (!Number.isFinite(time)) return 0
-  const elapsed = (time - Math.floor(time / 86400000) * 86400000) / 1000
-  let hours = 0
-  while (hours * 3600 < elapsed - 300) hours += 1
-  return hours + 1
+// EB spin-up, the same rule as the engine (models/stream/app/image.cpp, 2026-11-24): temperature.spinupHours = number of
+// whole-hour ERA5 nodes before the overpass (default 7, 0–240, non-integers round up). The march starts at the
+// spinupHours-th whole hour counted backwards from the last whole hour that is more than 5 min before the overpass
+// (never a fixed clock time); a pack that does not cover it starts at its earliest covered hour (warning only).
+const DEFAULT_SPINUP_NODES = 7
+const HOUR_MS = 3600000
+
+// '' / undefined -> default; returns NaN when the value is not a number in 0–240.
+function spinupNodes(value) {
+  if (value === '' || value === null || value === undefined) return DEFAULT_SPINUP_NODES
+  const number = Number(value)
+  if (!Number.isFinite(number) || number < 0 || number > 240) return NaN
+  return Math.ceil(number - 1e-9)
 }
 
 const isoHour = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
 
-// Hours of ERA5 the engine reads for an EB run (as image.cpp): 00 UTC of the overpass day (one hour earlier
-// for ERA5-Land de-accumulation) through the hour after the overpass.
-function era5Window(overpass, land) {
+// Plan of the EB march for an overpass and pack: requested / usable nodes, first node, hours the engine reads.
+// `pack` may be missing (only the requested window is described). Hours are integer hours since the epoch.
+function ebPlan(overpass, nodesValue, pack) {
   const time = Date.parse(overpass)
-  if (!Number.isFinite(time)) return null
-  const day = Math.floor(time / 86400000) * 86400000
-  return { start: isoHour(day - (land ? 3600000 : 0)), end: isoHour((Math.ceil(time / 3600000) + 1) * 3600000) }
+  const requested = spinupNodes(nodesValue)
+  if (!Number.isFinite(time) || !Number.isFinite(requested)) return null
+  const overpassHour = Math.floor(time / HOUR_MS)
+  const lastNodeHour = Math.ceil((time - 300000) / HOUR_MS) - 1
+  const lastHour = Math.ceil(time / HOUR_MS) + 1
+  const land = pack?.product === 'era5-land'
+  const desiredStart = requested > 0 ? lastNodeHour - (requested - 1) : overpassHour
+  let start = Math.min(desiredStart, overpassHour)
+  const yearEdge = Boolean(pack?.fullYear) && pack.year === new Date(time).getUTCFullYear()
+  const packStart = pack?.period ? Math.floor(Date.parse(pack.period.start) / HOUR_MS) : null
+  const packEnd = pack?.period ? Math.floor(Date.parse(pack.period.end) / HOUR_MS) : null
+  if (packStart !== null && !yearEdge) start = Math.min(Math.max(start, packStart + (land ? 1 : 0)), overpassHour)
+  const usable = requested > 0 ? Math.max(0, lastNodeHour - start + 1) : 0
+  const firstHour = start - (land ? 1 : 0)
+  return { requested, usable, nodeCount: usable + 1, desiredStart, start, lastHour, firstHour, packStart, packEnd, yearEdge,
+    marchStart: requested > 0 ? start * HOUR_MS : time, startsLate: requested > 0 && start > desiredStart }
 }
 
-function packProblems(pack, overpass, moistureSource) {
+// Blocking problems: the pack must cover the march start (or its fallback) through the hour after the overpass and must
+// leave at least one whole hour before the overpass when spin-up is requested.
+function packProblems(pack, overpass, moistureSource, nodesValue) {
   const problems = []
   if (!pack.complete) problems.push(`必需变量缺失或不连续：${[...pack.missingVariables, ...pack.incompleteVariables].join('、')}`)
-  const window = era5Window(overpass, pack.product === 'era5-land')
-  const year = Number(String(overpass).slice(0, 4))
-  const coversYearEdge = pack.fullYear && pack.year === year
-  if (window && pack.period && !coversYearEdge && (pack.period.start > window.start || pack.period.end < window.end))
-    problems.push(`数据包时段 ${pack.period.start.slice(0, 16).replace('T', ' ')} – ${pack.period.end.slice(0, 16).replace('T', ' ')} UTC 未覆盖本次所需的 ${window.start.slice(0, 16).replace('T', ' ')} – ${window.end.slice(0, 16).replace('T', ' ')} UTC`)
+  const plan = ebPlan(overpass, nodesValue, pack)
+  if (plan && pack.period && !plan.yearEdge) {
+    const label = (hour) => isoHour(hour * HOUR_MS).slice(0, 16).replace('T', ' ')
+    if (plan.requested > 0 && plan.usable === 0 && plan.packStart <= plan.lastHour)
+      problems.push(`数据包在过境时刻之前没有可用的整点时次（数据包 ${pack.period.start.slice(0, 16).replace('T', ' ')} – ${pack.period.end.slice(0, 16).replace('T', ' ')} UTC），无法起转；请补充过境前的逐小时数据，或把起转节点数设为 0`)
+    else if (plan.packStart > plan.firstHour || plan.packEnd < plan.lastHour)
+      problems.push(`数据包时段 ${pack.period.start.slice(0, 16).replace('T', ' ')} – ${pack.period.end.slice(0, 16).replace('T', ' ')} UTC 未覆盖本次所需的 ${label(plan.firstHour)} – ${label(plan.lastHour)} UTC`)
+  }
   if (moistureSource === 'era5' && !pack.variables?.swvl1) problems.push('数据包没有 swvl1，土壤水分请改用地表输入')
   return problems
 }
 
+// Non-blocking: the pack starts later than the requested spin-up (the engine starts at the pack's earliest hour).
+function packWarnings(pack, overpass, nodesValue) {
+  const plan = ebPlan(overpass, nodesValue, pack)
+  if (!plan || !plan.startsLate || plan.usable === 0 || plan.yearEdge) return []
+  return [`数据包不覆盖要求的 ${plan.requested} 个起转时次，实际从 ${isoHour(plan.start * HOUR_MS).slice(0, 16).replace('T', ' ')} UTC 起算，只有 ${plan.usable} 个（土壤热历史偏短，建议补充更早的逐小时数据）`]
+}
 function packPeriodLabel(pack) {
   if (pack.fullYear) return `${pack.year} 整年`
   if (!pack.period) return String(pack.year)
@@ -457,7 +488,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       <div class="sw-modal" id="swEra5" hidden role="dialog" aria-label="ERA5 数据">
         <div class="sw-modal-card">
           <header class="sw-modal-head"><h2>ERA5 数据</h2><button class="icon-button" type="button" data-action="era5-close" title="关闭">×</button></header>
-          <p class="sw-hint">数据包是一组逐小时 ERA5 或 ERA5-Land 单层 NetCDF，可只覆盖一天，也可覆盖整年（可为多个文件）；空间范围只需盖住影像并外扩约 2 个格点。EB 读取过境当天 00 UTC 到过境后 1 小时（ERA5-Land 另需前一日 23 UTC）；数据包含首日更多小时时同时用于首日平均气温初值。必需变量：u10、v10、t2m、d2m、sp、ssrd、strd、skt、stl1；可选：stl2、swvl1（土壤水分取 ERA5 时必需）、z（按 DEM 订正气温气压）。登记只读取时间轴，生成索引，不复制数据。</p>
+          <p class="sw-hint">数据包是一组逐小时 ERA5 或 ERA5-Land 单层 NetCDF，可只覆盖一天，也可覆盖整年（可为多个文件）；空间范围只需盖住影像并外扩约 2 个格点。EB 读取起转起点（过境前第 N 个整点时次，缺省 N = 7；ERA5-Land 另需再早一小时）到过境后 1 小时；数据包不含起点时从其最早时次起算并给出提示，但过境时刻之前至少要有 1 个整点时次。叶片初温取起点起（最多 24 h、不超过过境后 1 小时）已读取小时的平均气温。必需变量：u10、v10、t2m、d2m、sp、ssrd、strd、skt、stl1；可选：stl2、swvl1（土壤水分取 ERA5 时必需）、z（按 DEM 订正气温气压）。登记只读取时间轴，生成索引，不复制数据。</p>
           <div class="sw-era5-list" id="swEra5List"></div>
           <div class="sw-era5-new">
             <label><span>名称</span><input class="input" id="swEra5Label" maxlength="64" placeholder="例如 华北 2019"></label>
@@ -700,7 +731,10 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
           ${segment('moisture-source', 'user', '地表输入', t.soilMoisture.source)}
         </div></div>
         <label class="sw-check"><input type="checkbox" data-path="temperature.elevationCorrection"${t.elevationCorrection ? ' checked' : ''}> 按 DEM 与 ERA5 地形高度差订正气温和气压（需提供 DEM，数据包含 z）</label>
+        <label class="sw-row"><span>起转节点数</span><input class="input" data-path="temperature.spinupHours" data-number type="number" min="0" max="240" step="1" value="${escapeHtml(t.spinupHours)}" placeholder="缺省 ${DEFAULT_SPINUP_NODES}"></label>
+        <p class="sw-hint">EB 从过境前第 N 个整点时次（ERA5 逐小时）起推进到过境时刻，缺省 ${DEFAULT_SPINUP_NODES}，范围 0–240；与表面热历史保留的 7 h 对应，空气温度已对结果约束很强，不必起转太久。起点永远相对过境时刻往前数，不是固定的 00 UTC 或固定的 24 h；数据包不覆盖时从其最早时次起算并提示。</p>
         <p class="sw-hint" id="swEbWindow"></p>
+        <p class="sw-field-info" id="swEbWarn"></p>
       </div>`)
   }
 
@@ -769,16 +803,23 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     const moistureRow = $('[data-field="surface.soilMoisture"]')
     if (moistureRow) moistureRow.hidden = t.mode === 'eb' && t.soilMoisture.source === 'era5'
     const pack = packs.find((item) => item.path === t.era5.pack)
+    const plan = ebPlan(form.overpass, t.spinupHours, pack)
+    const warnings = pack ? packWarnings(pack, form.overpass, t.spinupHours) : []
     const info = $('#swEra5Info')
     if (info) {
-      const problems = !pack ? (t.era5.pack ? ['无法读取所选数据包索引'] : []) : packProblems(pack, form.overpass, t.soilMoisture.source)
+      const problems = !pack ? (t.era5.pack ? ['无法读取所选数据包索引'] : []) : packProblems(pack, form.overpass, t.soilMoisture.source, t.spinupHours)
       info.textContent = pack ? [packPeriodLabel(pack), `${pack.files} 个文件`, pack.variables?.stl2 ? '含 stl2' : '无 stl2', pack.variables?.z ? '含 z' : '无 z（不做高程订正）', ...problems].join('；') : problems.join('；')
       info.dataset.level = problems.length ? 'error' : pack ? 'ok' : ''
     }
+    const warning = $('#swEbWarn')
+    if (warning) { warning.textContent = warnings.join('；'); warning.dataset.level = warnings.length ? 'warning' : '' }
     const window = $('#swEbWindow')
     if (window) {
-      const { date, time } = overpassParts()
-      window.textContent = `只算过境当天：${date} 00:00 UTC → ${time} UTC，共 ${ebNodes(form.overpass)} 个时次。土壤与叶片初温取首日平均气温；土壤热历史（7 h）与土柱自洽推进。`
+      const { time } = overpassParts()
+      window.textContent = !plan ? (Number.isNaN(spinupNodes(t.spinupHours)) ? '起转节点数须在 0–240 之间' : '')
+        : plan.requested === 0
+          ? `不起转：只在过境时刻 ${time} UTC 求解 1 个时次。`
+          : `起转 ${plan.usable} 个整点时次${plan.usable < plan.requested ? `（请求 ${plan.requested} 个）` : ''}：从 ${isoHour(plan.marchStart).slice(0, 16).replace('T', ' ')} UTC 推进到过境时刻 ${time} UTC，共 ${plan.nodeCount} 个时次（含过境时刻，与引擎一致）。土壤与叶片初温取起点的 ERA5 地表温度与平均气温；土壤热历史（7 h）与土柱自洽推进。`
     }
     const localTime = $('#swLocalTime')
     if (localTime) localTime.textContent = `显示时区 UTC${Number(form.displayTimezone) >= 0 ? '+' : ''}${Number(form.displayTimezone) || 0} 的当地时间：${localOverpass() || '—'}`
@@ -883,7 +924,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const value = target.type === 'checkbox' ? target.checked : target.dataset.number !== undefined ? (target.value === '' ? '' : Number(target.value)) : target.value
       setPath(form, target.dataset.path, value)
       if (target.dataset.path === 'region.enabled') $('#swRegion').hidden = !value
-      if (target.dataset.path === 'optical.enabled' || target.dataset.path === 'thermal.enabled') syncGroups()
+      if (target.dataset.path === 'optical.enabled' || target.dataset.path === 'thermal.enabled' || target.dataset.path === 'temperature.spinupHours') syncGroups()
       markDirty()
       return
     }
@@ -1042,8 +1083,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     const t = form.temperature
     if (t.mode === 'eb') {
       const pack = packs.find((item) => item.path === t.era5.pack)
+      if (Number.isNaN(spinupNodes(t.spinupHours))) problems.push('起转节点数须在 0–240 之间（留空使用缺省 7）')
       if (!t.era5.pack) problems.push('EB 模式请选择 ERA5 数据包')
-      else if (pack) problems.push(...packProblems(pack, form.overpass, t.soilMoisture.source).map((text) => `ERA5 ${text}`))
+      else if (pack) problems.push(...packProblems(pack, form.overpass, t.soilMoisture.source, t.spinupHours).map((text) => `ERA5 ${text}`))
     }
     return problems
   }
@@ -1314,7 +1356,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     const rows = counts ? [
       ['过境时刻', summary.overpass ? summary.overpass.replace('T', ' ').replace('Z', ' UTC') : '—'],
       ['温度来源', temperature?.mode === 'eb' ? `EB · ${String(temperature.era5?.product || '').toUpperCase()} ${temperature.era5?.year || ''}` : 'RT'],
-      ...(temperature?.mode === 'eb' ? [['能量平衡时次', (temperature.nodes || []).length], ['EB 求解像元', temperature.solvedPixels],
+      ...(temperature?.mode === 'eb' ? [['能量平衡时次', (temperature.nodes || []).length],
+        ...(Number.isFinite(temperature.spinupNodesUsed) ? [['起转时次', temperature.spinupNodesUsed < temperature.spinupNodesRequested ? `${temperature.spinupNodesUsed}（请求 ${temperature.spinupNodesRequested}，数据包不足）` : temperature.spinupNodesUsed]] : []),
+        ['EB 求解像元', temperature.solvedPixels],
         ['过境时刻收敛', temperature.convergedPixels], ['水体（ERA5 skt）', temperature.waterPixels]] : []),
       ...(summary.inversion ? [['反演', `${String(summary.inversion.target || '').toUpperCase()} · ${(summary.inversion.observations || []).length} 个观测`],
         ['反演成功', summary.inversion.counts?.retrievedPixels], ['反演失败', summary.inversion.counts?.failedPixels],

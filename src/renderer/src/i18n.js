@@ -158,6 +158,13 @@ const ENGLISH_MESSAGES = Object.freeze({
   'DEM 地形': 'DEM Terrain',
   '影像模拟专用': 'Image Simulation Only',
   '与三维工程同源': 'Shared with the 3D Project',
+  '起转节点数': 'Spin-up Nodes',
+  '起转时次': 'Spin-up Nodes Used',
+  '缺省 7': 'Default 7',
+  'EB 从过境前第 N 个整点时次（ERA5 逐小时）起推进到过境时刻，缺省 7，范围 0–240；与表面热历史保留的 7 h 对应，空气温度已对结果约束很强，不必起转太久。起点永远相对过境时刻往前数，不是固定的 00 UTC 或固定的 24 h；数据包不覆盖时从其最早时次起算并提示。': 'The EB march starts at the N-th whole-hour ERA5 node before the overpass and runs to the overpass time. Default 7, range 0–240; this matches the 7 h surface heat history the model keeps, and 2 m air temperature already constrains the result strongly, so a long spin-up is not needed. The start is always counted backwards from the overpass, not a fixed 00 UTC or a fixed 24 h; if the pack does not cover it, the march starts at the pack\'s earliest hour and a notice is shown.',
+  '数据包是一组逐小时 ERA5 或 ERA5-Land 单层 NetCDF，可只覆盖一天，也可覆盖整年（可为多个文件）；空间范围只需盖住影像并外扩约 2 个格点。EB 读取起转起点（过境前第 N 个整点时次，缺省 N = 7；ERA5-Land 另需再早一小时）到过境后 1 小时；数据包不含起点时从其最早时次起算并给出提示，但过境时刻之前至少要有 1 个整点时次。叶片初温取起点起（最多 24 h、不超过过境后 1 小时）已读取小时的平均气温。必需变量：u10、v10、t2m、d2m、sp、ssrd、strd、skt、stl1；可选：stl2、swvl1（土壤水分取 ERA5 时必需）、z（按 DEM 订正气温气压）。登记只读取时间轴，生成索引，不复制数据。': 'The pack is a set of hourly ERA5 or ERA5-Land single-level NetCDF files covering one day to a whole year (several files allowed); the spatial extent only needs to cover the image plus about 2 grid cells. EB reads from the spin-up start (the N-th whole-hour node before the overpass, default N = 7; ERA5-Land needs one more earlier hour) to 1 h after the overpass. If the pack does not contain the start, the march starts at its earliest hour with a notice, but at least one whole-hour node before the overpass is required. Leaf initial temperature is the mean air temperature of the hours read from the start (at most 24 h, not beyond 1 h after the overpass). Required variables: u10, v10, t2m, d2m, sp, ssrd, strd, skt, stl1; optional: stl2, swvl1 (required when soil moisture comes from ERA5), z (DEM correction of air temperature and pressure). Registration only reads the time axis and builds an index; no data is copied.',
+  '起转节点数须在 0–240 之间（留空使用缺省 7）': 'Spin-up nodes must be between 0 and 240 (leave empty for the default 7)',
+  '起转节点数须在 0–240 之间': 'Spin-up nodes must be between 0 and 240',
   '共享输入：值保存在工程的 shared 段，三维模拟与影像模拟共用同一份；在任一工作台修改，另一侧立刻读到。': 'Shared input: stored in the project shared section and used by both the 3D and the image simulation; a change in either workbench is read by the other.',
   '这些输入只属于当前三维工程；影像模拟（STREAM）使用自己的工程，不读取这里的值。': 'These inputs belong to the 3D project only; STREAM uses its own project and does not read them.',
   '预设': 'Preset',
@@ -871,6 +878,10 @@ const PHRASE_REPLACEMENTS = [
 ]
 
 const DYNAMIC_TRANSLATIONS = [
+  [/^不起转：只在过境时刻\s+(.+?)\s+UTC 求解 1 个时次。$/u, 'No spin-up: only the overpass time $1 UTC is solved (1 node).'],
+  [/^起转 (\d+) 个整点时次(?:（请求 (\d+) 个）)?：从 (.+?) UTC 推进到过境时刻 (.+?) UTC，共 (\d+) 个时次（含过境时刻，与引擎一致）。土壤与叶片初温取起点的 ERA5 地表温度与平均气温；土壤热历史（7 h）与土柱自洽推进。$/u,
+    (_, used, requested, start, time, count) => `Spin-up ${used} whole-hour node${used === '1' ? '' : 's'}${requested ? ` (${requested} requested)` : ''}: from ${start} UTC to the overpass ${time} UTC, ${count} nodes in total including the overpass (same as the engine). Soil and leaf start from the ERA5 skin temperature and the mean air temperature at the start; the 7 h soil heat history and the soil column advance self-consistently.`],
+  [/^数据包不覆盖要求的 (\d+) 个起转时次，实际从 (.+?) UTC 起算，只有 (\d+) 个（土壤热历史偏短，建议补充更早的逐小时数据）$/u, 'The pack does not cover the requested $1 spin-up nodes; the march starts at $2 UTC with only $3 (short soil heat history; add earlier hourly data).'],
   [/^场景范围\s+(.+)$/u, 'Scene Extent $1'],
   [/^计算域\s+X\s+(.+?)\s+·\s+Y\s+(.+?)\s+·\s+Z\s+(.+?)\s+m$/u, 'Calculation Domain X $1 · Y $2 · Z $3 m'],
   [/^Three\.js 显示全部实例；运行时跳过完整 OBJ 包围盒与计算域 X=\[(.+?),\s*(.+?)\]、Y=\[(.+?),\s*(.+?)\]、Z=\[(.+?),\s*(.+?)\] m 无交集的实例；跨界对象仅计算域内部分。$/u, 'Three.js displays all instances. At runtime, instances whose complete OBJ bounds do not intersect the X=[$1, $2], Y=[$3, $4], Z=[$5, $6] m domain are skipped; only the in-domain portion of crossing objects is simulated.'],
