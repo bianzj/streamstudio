@@ -91,20 +91,21 @@ L↓ 由背景状态一次确定，反演/同化改变组分温度后不再重�
 | `scheme` | `tirt` | 仅接受 `tirt`（兼容旧值 `tirt-analytic`） |
 | `soilHeatMethod` | `surface` | `surface` 7 h 温度历史；`depth` 2 m 土柱；`direct` 净辐射比例 |
 | `temperatureMethod` | `robust` | `robust`（0.8 阻尼牛顿，单步最多 5 K）或 `direct`（含潜热导数的近似导数） |
-| `diffuseFraction` | `0.2` | 直/散分配；`-1` 为 Erbs 反算 |
+| `diffuseFraction` | `0.2` | 直/散分配；`-1` 为 Erbs 反算（仅 EB，需要短波输入）。RT 模式（2026-11-24 C5）也读取该字段（只影响光学成像的直/散分配，0–1，缺省 0.2），RT 没有短波输入，`-1` 或越界明确报错 |
 | `enforceSolarLimit` | `true` | 晴空 DNI 上限，超出直射转漫射 |
 | `soilResistance.method` | `constant` | `constant` 或 `sellers`（含水量关系） |
 | `soilResistance.value` | `200` | 常数土壤阻抗 s m⁻¹；须为 (0, 100000] 的数值，否则报错（2026-11-21 FIX B-S1） |
 | `stomatalG0` | `0.01` | 气孔导度下限 mol m⁻² s⁻¹ |
 | `minWindSpeed` / `maxAerodynamicResistance` | `0.05` / `400` | 风与分段气动阻抗限制 |
 | `referenceHeight` | `15` | 气象参考高度 m（冠层更高时抬到冠层顶以上 0.1 m） |
-| `soilEmissivity` / `leafEmissivity` | 地类值 / `0.985` | EB 宽带发射率；`soilEmissivity` 是干端值，给出时同时替换 `classes.json` 中所有土壤地类的 `ground.emissivity`，能量平衡与成像/反演共用；省略时两者都用地类值（表内土壤均为 0.955） |
+| `soilEmissivity` / `leafEmissivity` | 地类值 / `0.985` | EB 宽带发射率（**`leafEmissivity` 只作用于 EB 的能量平衡**；热红外成像/反演的叶片发射率取地类的 `1 − reflTir − transTir`，2026-11-24 C6 说明）；`soilEmissivity` 是干端值，给出时同时替换 `classes.json` 中所有土壤地类的 `ground.emissivity`，能量平衡与成像/反演共用；省略时两者都用地类值（表内土壤均为 0.955） |
 | `soilEmissivityWet` | 干端 +0.03（≤0.995） | 饱和土壤发射率；土壤发射率按像元含水量在干端值与该值之间插值（见 `physics/soil_emissivity.h`） |
 | `soilConductivity` / `soilVolumetricCapacity` | `1.55` / `1.298e6` | 土壤热参数（仅土壤地类） |
 | `soilHeatFraction` | `0.25` | 仅 `direct` 方法使用 |
 | `spectralBinNm` | `50` | EB 短波分组宽度（nm）；默认 50 nm（约 41 个波段），可设 `1` 做 1 nm 全谱，或设 10 折中 |
 | `maxIterations` | `50` | 温度与 1/L 联合迭代上限 |
-| `maxStabilityIterations` | — | 已不使用（温度与 1/L 共用 `maxIterations`），保留只为兼容旧配置 |
+| `maxStabilityIterations` | — | 已不使用（温度与 1/L 共用 `maxIterations`），保留只为兼容旧配置；2026-11-24 起不再参与取值范围校验（C4，此前 <1 报错） |
+| `iceMelt` | `true` | 冰雪地类（`classes.json` 中 `ground.surface` 为 `snow`/`ice`/`glacier`，内置类 15）的组分温度上限 273.15 K，多余能量记为融化热汇；`false` 恢复无上限的旧行为（2026-11-24，见下“冰雪融化”） |
 | `heatRoughnessKb` | 地类值 | 裸土整体阻抗的 kB⁻¹=ln(z0/z0h)；只作用于 LAI<0.5 的裸土路径（LAI≥0.5 无效，与 TiRT 相同，2026-11-21 FIX B4 说明） |
 
 起转节点数 `temperature.spinupHours`（与 `era5` 同级，**缺省 7**，范围 0–240，单位是逐小时气象强迫的**时次个数**，不是固定时刻或固定时长；2026-11-21 FIX B10 引入，2026-11-24 缺省由 24 h 改为 7 个时次）：能量平衡从过境前第 N 个整点时次开始逐时推进。取整规则（向前取整到整点，沿用 B10 的整点实现）：先取严格早于“过境前 5 min”的最后一个整点（过境 02:55 → 02:00；过境 03:00 → 02:00；过境 03:06 → 03:00），再往前数 N 个整点（含它自己），该整点就是起点；时次序列为起点…该整点，加上过境时刻本身，共 N+1 个时次。例：过境 02:55，N=7 → 起点前一日 20:00，共 8 个时次；起点永远相对过境往前数，不是固定的 00 UTC 或固定的 24 h。N=0 只求解过境时刻 1 个时次；非整数向上取整。数据包不覆盖起点时从数据包连续覆盖的最早时次开始并警告（ERA5-Land 起点前还需一小时），同时在 `scene_summary.json` 的 `temperature.notes` 写“起转不足”提示；过境时刻之前没有任何整点时次时（N>0）报错。`scene_summary.json` 记录 `spinupNodesRequested`/`spinupNodesUsed`（不含过境时刻的整点时次数）、`ebNodeCount`（含过境时刻）、`marchStart`、`spinupHoursUsed`（过境减起点，小时）。缺省 7 的理由：2 m 气温已对结果约束很强，不需要起转太久；7 与 TIRTEB 表面热历史保留的 7 h 对应（过境时历史恰好填满）；相对过境计数，与经度无关。兼容性：旧工程未写该字段时，缺省由 24 h 改为 7 个时次，结果会变化（见 docs/release-next-draft.md）；显式写了值的工程仍按其值，但含义由“小时”变为“时次个数”，过境不在整点时相差最多 1 个时次（例：过境 02:55、值 24，旧版 25 个整点时次，现为 24 个）；旧版的小数值现在向上取整。初值（2026-11-24 起）：土壤（光照/阴影）、叶片、土壤热历史（半无限方法的 `history`）与 `depth` 土柱各层的初温**全部取起转起点时刻的 2 m 气温 `t2m`**（土柱各层同温）；起点 `t2m` 无效时退回起点后第一个有效 `t2m`，再退回首个模拟日（起点起至多 24 h）的平均气温，并在日志警告。不再用 ERA5 `skt`/`stl1`/`stl2` 初始化土壤：土壤温度并不确切已知，初值统一用空气温度。起转只有几个节点，起点气温比“当天平均气温”更接近起点的实际状态。旧做法（2026-11-24 之前）：土壤取起点 `skt`、`depth` 土柱按 `stl1`/`stl2`、叶片取起点起至多 24 h 的平均气温。兼容性：旧工程重算结果会变化（见 docs/release-next-draft.md）；`inverseObukhov`、`sceneSensible` 等其他初值不变；水体像元仍取过境时刻的 ERA5 `skt`（数据包没有 `skt` 时水体改取过境时刻 2 m 气温并警告，`notes` 记“水体降级”）。
@@ -113,7 +114,11 @@ L↓ 由背景状态一次确定，反演/同化改变组分温度后不再重�
 
 **温度限值与未收敛（2026-11-24）**：四组分温度被限制在 175–380 K（原下限 240 K 会把极地/高寒冬夜像元钳在 240 K 且不收敛；成像侧仍以 100 K 过滤）。LAI 有效范围为 0–20：nodata、负值与大于 20 的值（常见于未声明 nodata 的整型填充码，如 MODIS LAI 249–254 × 0.1 = 24.9–25.4）按无效输入处理（植被像元，日志警告并计入 `scene_summary.json` 的 `counts.laiOutOfRangePixels` / `laiNoDataPixels`），LAI = 0 的裸地仍有效；水体与填充类不受 LAI 影响，水体像元的 LAI 为 nodata 时照样取 `skt`。过境时刻仍有未收敛像元时，日志与 `temperature.warning` 给出警告，`temperature.nonConvergedPixels`、`temperatureLimitedPixels`（有组分温度停在限值上的像元数）给出统计；逐像元见 `eb_fluxes.tif` 的 `converged` 波段。**1/L 括号法回退（2026-11-24）**：过境时刻节点在 `maxIterations` 次迭代后仍未闭合时（强不稳定的农田/阔叶林：温度、阵风与 1/L 的极限环），继续最多 4 × `maxIterations` 次迭代的括号模式——先在冻结的 1/L 下用欠松弛（0.25）的温度/阵风更新使能量残差与阵风闭合，再对 1/L 用扩展 + 二分法求 target(1/L) − 1/L 的根；若结果不比原迭代终点更好则保留原终点。在 `maxIterations` 内闭合的节点与像元逐位不变，起转节点（只影响热历史）不使用回退；这些像元的 `eb_fluxes.tif` `iterations` 波段可达 250。
 
+**冰雪融化（2026-11-24，缺省开启，`energy.iceMelt=false` 恢复旧行为）**：冰雪类（`ground.surface` 为 `snow`/`ice`/`glacier`，内置冰雪 15）的四个组分温度被限制在 273.15 K 以内。组分在上限上且 Rn − H − LE − G > 0 时，多余能量不再升温，而记为融化热汇 melt（W m⁻²，场景加权方式与 H、LE 相同），组分平衡写为 Rn − H − LE − G − melt = 0 并视为闭合；上限上能量为负时温度照常下降。起转起点气温高于 273.15 K 时冰雪像元的初温（含土壤热历史）取 273.15 K。含冰雪类的场景，`eb_fluxes.tif` 追加第 19 波段 `ice melt heat flux (W m-2)`（冰雪像元外为 NaN），`scene_summary.json` 的 `temperature` 增加 `iceMelt`、`iceCappedPixels`、`iceMeltPixels`、`iceMeltMeanFluxWm2`，日志打印“冰雪融化”一行；场景里没有冰雪类（或 `iceMelt=false`）时输出与原来逐位相同、仍为 18 个波段。同化：过境时刻有组分被融化上限钳住的像元，温度已是上限、对控制量无响应，隐式导数被拒绝（QA 位 4 病态），分析保持背景。局限：饱和水汽压仍用水面 Tetens（未改冰面公式）；只限制温度，不模拟雪水当量与融化后地类变化。合成验证（北京 1 日包、23329 个冰雪像元，ERA5 整体降温 30/20/15 K，即 −30 K 场景及其 +10、+15 K 升温）：iceMelt 开时 Tss 全部 ≤ 273.15 K（有叶片时叶温同），含 melt 的能量闭合残差 ≤ 0.5 W m⁻²，melt 均值 144–560 W m⁻²；关时 Tss 为 274–292 K。极稳定层结（1/L 触及 5 m⁻¹ 限值，L ≈ 0.3 m）下的冰雪像元会出现 `converged = 0`（稳定度极限，与融化无关）。
+
 数值型配置字段（`temperature.energy` 下的 `diffuseFraction`、`minWindSpeed`、`maxAerodynamicResistance`、`maxIterations` 等，以及栅格字段的 `value`）必须是 JSON 数字，字符串/布尔/对象会报错（此前被静默当作 0）；`skyLongwave` 必须是对象（`{"value":300}`、`{"file":…}` 或 `{"mode":"none"}`）。
+
+**2026-11-24 的小修正**：① 起转节点各自取自己的日序数（Erbs 与晴空 DNI 上限的日地距离修正 E0；此前所有节点用过境日，起转跨 00 UTC 时前一日的节点有 <0.1 % 的 E0 误差；北京 2 日包 Ts 变化 12330 个像元，多为单精度末位、>0.01 K 仅 4 个、最大 0.125 K，1 日包与 MODIS 示例逐位不变）（L4）；② Stefan–Boltzmann 常数统一为 5.670374419e-8 W m⁻² K⁻⁴（EB、辐射度、热红外成像与气象强迫的长波共用 `constants.h`，此前 EB/辐射度用 5.67e-8，相对差 6.6e-6；北京示例 Rn +0.03 W m⁻²、Ts 中位数 1.8e-4 K、最大 0.2–0.7 K 出现在未收敛像元）（T1）；③ 面元法（`terrain.mode = facet`）需要 8 邻域，栅格最外一圈像元的坡度保持 0（按平地）；处理区域内有这样的像元时日志警告并给出个数，请让 DEM 比研究区大一圈（L5）；④ `energy.cpp` 中从不执行的 `hc > z` 分支清理（L3，结果不变）。
 
 地形（``surface.terrain`` 为 single / facet / hill / ridge）时，水平气象强迫短波先按 `diffuseFraction` 与晴空 DNI 上限（按真实太阳天顶角）分为直射/漫射，再把直射乘局地入射余弦 cos i / cos θs、漫射乘天空视角因子得到坡面短波；能量平衡以该坡面短波、固定的坡面漫射份额和局地入射角 i（冠层直射消光、光照组分比例、长波光照/阴影划分）求解，复合地形取面积平均的 max(0, cos i)。水平像元保持原算法。`eb_forcing.tif` 的下行短波为水平值。
 

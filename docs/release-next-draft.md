@@ -91,6 +91,17 @@
 - **文档澄清。** README 补充起转节点 0 的 dt = 3600 s 与等温起点语义（M4）、同化输出质量位只是标注、不影响分析场采用（A1）。
 - **兼容性。** 极寒场景（气温 < 约 −33 °C）的结果会变化；过境节点原本未闭合的 EB 像元（北京示例 0.08–3.7 %）通量和温度会变化，其余像元不变；EB 同化的雅可比（含 LAI 控制量）变化，同化结果略有变化。
 
+### STREAM 剩余审核项：冰雪融化、引擎小修正与服务端（2026-11-24，第二批，改变数值）
+
+依据同一份审核报告中上一批未处理的项（编号见 `docs/model-remaining-issues-20261005.md`“2026-11-24 STREAM 剩余项”）。测试：`tools/test-stream-bugs-20261124.py`（C4、C5、I1、I2、A2、L5、冰雪融化）、`tools/test-stream-server-bugs-20261124.mjs`（S1、S7、S11、缓存键）。
+
+- **冰雪融化上限（缺省开启）。** 冰雪地类（`ground.surface` 为 `snow`/`ice`/`glacier`，内置类 15）的四个组分温度上限 273.15 K，多余能量记为融化热汇，组分平衡写为 Rn − H − LE − G − melt = 0；`temperature.energy.iceMelt=false` 恢复旧行为。含冰雪类的场景，`eb_fluxes.tif` 追加第 19 波段“ice melt heat flux (W m-2)”，`scene_summary.json` 的 `temperature` 增加 `iceMelt`、`iceCappedPixels`、`iceMeltPixels`、`iceMeltMeanFluxWm2`；没有冰雪类的场景输出逐位不变（北京 2 日包/1 日包与 MODIS 示例均已核对，仍为 18 个波段）。合成场景（北京 1 日包，23329 个冰雪像元，ERA5 −30 K 及其 +10、+15 K 升温，有/无叶片）：开时 Tss 与叶温全部 ≤ 273.15 K，含 melt 的闭合残差 ≤ 0.5 W m⁻²，melt 均值 144–560 W m⁻²；关时 Tss 达 274–292 K（叶温至 302 K）；非冰雪像元开/关逐位相同。极稳定层结下（1/L 触顶，L ≈ 0.3 m）冰雪像元 `converged` 比例下降（+10 K：9086/23329，+15 K：4421/23329），这是稳定度限值，不是融化引入的；饱和水汽压仍为水面公式。同化中被融化上限钳住的像元拒绝隐式导数（QA 位 4）。
+- **σ 统一（T1）。** EB、辐射度、热红外成像与气象强迫长波共用 5.670374419e-8 W m⁻² K⁻⁴（此前 EB/辐射度 5.67e-8）。北京 1 日包：Rn +0.03 W m⁻²，Ts 中位数变化 1.8e-4 K、p99 1.9e-3 K，最大 0.23 K（未收敛像元，迭代终点翻转）；MODIS 最大 0.72 K。
+- **起转各节点自己的日序数（L4）。** Erbs 与晴空 DNI 上限的 E0 按节点日期计算，起转跨 00 UTC 时前一日节点不再用过境日。北京 2 日包 Ts 变化 12330 个像元（多为单精度末位 3e-5 K，>0.01 K 4 个，最大 0.125 K），1 日包与 MODIS 逐位不变。
+- **引擎小项。** 反演：LSCT 在背景处算子求值失败只置位 3（不再同时置位 4、不计 `illConditionedPixels`，I1）；bit 9 像元拆分 `iterationLimitPixels`/`stepEvaluationFailedPixels`（I2）；同化无观测/无控制量像元置位 0 与新位 12（4096，A2）；同化矩阵奇异判据改相对阈值 1e-12（A3，同化样例逐位不变）。配置：RT 模式读取 `energy.diffuseFraction`（0–1，`-1` 明确报错，C5）；`maxStabilityIterations` 不再参与范围校验（C4）；面元法边界一圈坡度为 0 时日志警告并给出个数（L5）；`hc > z` 死代码清理（L3，逐位不变）；进度不再因主线程行数不整除而漏报（E2）；同化/反演的均值按行累加，末位不再依赖线程数（E3，threads 1/3/8 的 meanOmb/Oma/DFS 完全一致）。
+- **服务端。** 提交时按引擎规则校验 `temperature.energy`（soilHeatMethod/temperatureMethod 白名单、diffuseFraction、spectralBinNm、heatRoughnessKb、soilEmissivityK 等，S1），不认识的字段不报错，只在提交返回的 `warnings` 和任务日志中提示已忽略；停止尚未启动引擎的任务（S7）；float32 nodata 比较经 `Math.fround`，`rasterBand` 的 min/max/mean/std 取全像元（`stats.sampled` 标明分位数/直方图仍来自抽样，S11）；结果缓存键加入 `ctimeMs`（首尾内容哈希评估后未加：每次查询需两次同步读，且漏中间改动）。
+- **兼容性。** 含冰雪类（内置 15）的 EB 场景结果变化（Tss 不再超过 0 °C，H、LE、G 随之变化，多出第 19 波段）；`iceMelt=false` 可恢复。所有 EB 示例因 σ 与 L4 有 1e-4 K 量级（中位数）的变化。RT 工程若写了 `energy.diffuseFraction` 会改变光学成像的直/散分配（此前被忽略，缺省 0.2 不变），写 `-1` 会报错。同化输出 QA 增加位 12，原先用位 0 判断“未分析”的掩膜仍有效。
+
 ### 性能（2026-11-22，不改物理）
 
 以下改动经冻结算例对照，结果逐位相同或差异 ≤ 1e-4（VoxelEB 温度阻尼为 ≤ 0.05 K）。同一台机器上各模式总耗时降到原来的 1/1.5–1/7。

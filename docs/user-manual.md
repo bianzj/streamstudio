@@ -54,6 +54,8 @@
 
 运行结束仅代表程序完成。EB 案例还需检查能量平衡收敛、温度范围、NoData 和 QA。内置旧参考（2026-10-31 运行，示例 reference/ 目录）中，MODIS 综合收敛 17037/17241（98.82%，204 个异常像元），Landsat 为 180326/180408（99.95%，82 个异常像元）；这些是已有参考记录，不是 2.0.1 的全图重算证明。2026-11-24 引擎重算（起转缺省 7 个时次、1/L 自适应松弛、初值取起点 2 m 气温、过境节点括号法回退）为 MODIS 17066/17241（98.99%，175 个未收敛）、Landsat 180403/180408（99.997%，5 个未收敛），内置数据包只有一天，实际起转 3 个时次；日志与 `scene_summary.json` 的 `temperature.warning`/`nonConvergedPixels`/`temperatureLimitedPixels` 会报告未收敛像元数。LAI 有效范围为 0–20（nodata、负值、大于 20 的值，例如未声明 nodata 的 MODIS 填充码 249–254 × 0.1，按无效输入处理并在日志、`counts.laiOutOfRangePixels` 计数）。失败像元不能作为有效温度参与精度统计。软件的发布测试报告也不等同于实测验证报告。
 
+冰雪地类（内置类 15 “冰雪”及 `classes.json` 中 `ground.surface` 为 `snow`/`ice`/`glacier` 的自定义类）在 EB 中的组分温度不会超过 273.15 K（2026-11-24 起，缺省开启）：多余能量记为融化热汇，写在 `eb_fluxes.tif` 第 19 波段，`scene_summary.json` 的 `temperature.iceMeltPixels`/`iceMeltMeanFluxWm2` 与日志给出统计；`temperature.energy.iceMelt=false` 可恢复旧行为。没有冰雪类的场景输出不变。提交运行时，服务端按引擎同一套规则检查 `temperature.energy` 各取值的范围（如 `diffuseFraction` 须为 −1 或 0–1、`spectralBinNm` 须为 1–100 的整数），不认识的字段名不会报错，只在返回的 `warnings` 与任务日志里提示“已忽略”。RT 模式下 `temperature.energy.diffuseFraction`（0–1）也会生效，用于光学成像的直/散分配，`-1`（Erbs）在 RT 下报错。
+
 三维能量平衡模式运行结束后，日志中的“运行质量”汇总未收敛节点、最多迭代次数、最大温度等效残差和步数截断（见第 14 节）。FacetEB 未收敛节点的结果会保留，但应先调整迭代上限或松弛系数再使用。
 
 ## 1. 软件用途
