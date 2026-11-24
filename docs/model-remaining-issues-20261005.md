@@ -57,7 +57,7 @@
   - 纵倾、横摇、波浪（水面起伏）、装载变化与运动对象吃水随时间变化：真实吃水是摆放时的静态几何与场景静态水面平均高度之比，不随时间变化；需要船体运动学（六自由度）与波面，当前场景没有对应输入，且会使面元几何逐节点变化（可见性/辐射度图要逐节点重建），超出能量平衡模块的范围。
   - 航速与航向不随对象移动自动换算（需手动填写），风向取常数、不读逐节点风向（FacetEB 气象输入未读风向）。
   - 水体仍为单层混合层：无水下吸收（短波穿透）、分层、尾流/水平输运；水线下面元只做“全遮蔽/不遮蔽”两档（`waterShielding`），没有水下光学衰减。
-- STREAM 气象强迫的 GLDAS 适配（引擎侧已实现，2026-11-24；**仍未用真实 GLDAS 数据验证**）：预设 `gldas-noah-0.25`/`gldas-noah-1.0` 的变量名、单位、参考高度（Tair/Qair 按 2 m、Wind 按 10 m）与时间戳约定（`*_tavg` 按时段终点戳、时间变量为分钟）都是按产品命名和文档推断的，引擎测试只用合成数据（`tools/test-forcing-metadata.py`）；需要用户对照产品 README 与一份真实 GLDAS-2.x Noah NetCDF 核对后才能认为可用。服务端（`index.mjs`/`config.mjs` 的数据包登记与校验）与界面（元数据选择/编辑）尚未接入，仍只有 ERA5 的登记入口；EB 取风/气温的高度仍是 ERA5 约定（见 `energy.cpp` DEFERRED），元数据只折算源高度到该约定。
+- STREAM 气象强迫的 GLDAS 适配（引擎侧已实现，2026-11-24；**仍未用真实 GLDAS 数据验证**）：预设 `gldas-noah-0.25`/`gldas-noah-1.0` 的变量名、单位、参考高度（Tair/Qair 按 2 m、Wind 按 10 m）与时间戳约定（`*_tavg` 按时段终点戳、时间变量为分钟）都是按产品命名和文档推断的，引擎测试只用合成数据（`tools/test-forcing-metadata.py`）；需要用户对照产品 README 与一份真实 GLDAS-2.x Noah NetCDF 核对后才能认为可用。服务端（元数据 API、`temperature.forcing` 透传与路径校验、通用数据包登记）与界面（来源选择、元数据编辑、校验、保存为工程元数据）已于 2026-11-24 接入（`server/stream/forcing.mjs`、`src/renderer/src/stream/forcing-panel.js`，测试 `tools/test-stream-forcing-server.mjs`）；**界面尚未在打包后的程序里实际点击验证**（只做了语法检查、临时目录构建、假 DOM 逻辑冒烟），GLDAS 预设的真实数据验证仍待用户。EB 取风/气温的高度仍是 ERA5 约定（见 `energy.cpp` DEFERRED），元数据只折算源高度到该约定。
 - 其余见 2026-11-20 更新“仍未处理”。
 
 部署状态（取代 2026-11-20 的哈希）：`models\bin_x64\Release\histream.exe` 于 2026-11-22 22:47 重建（含太阳可见性追踪到出场景、逐节点直散拆分与 Facet 等效地面下边界），SHA256 `4dbe3f245062d0b2e6a81d4367adfc2af45822574bd32e9a4366e014ff920b2b`；`build-manifest.json` 随后由 `tools/write-build-manifest.mjs` 重写。

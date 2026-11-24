@@ -59,7 +59,15 @@
 - **气象强迫由元数据描述。** 变量名、单位、湿度类型（露点/比湿/混合比/相对湿度/水汽压）、风类型、气压类型、观测高度与订正、时间步长与时间戳含义、缺测与范围都写在一份 JSON 元数据里（`docs/forcing-metadata.md`），引擎标准化后再驱动 EB。内置预设：`era5`、`era5-land`、`gldas-noah-0.25`、`gldas-noah-1.0`、`station-csv`。
 - **新来源。** GLDAS 风格 3 小时网格（比湿→水汽压、时段平均辐射、3 h→逐小时的通量守恒分配）与气象站 CSV（单站/多站、最近站/IDW、站点海拔订正）。**GLDAS 预设尚未用真实 GLDAS 数据验证**，变量名、参考高度与时间戳约定待用户核对；引擎测试只用合成数据。
 - **兼容性。** 旧工程只写 `temperature.era5.pack` 时使用 `era5`/`era5-land` 预设，读取路径与改动前相同，四个 ERA5 基线算例（MODIS 1 km、Landsat 300 m 2 天/1 天、起转 24）输出 TIFF 与组分逐字节不变。新增配置 `temperature.forcing {pack, files, metadata}`（或 `temperature.forcingMetadata`），`scene_summary.json` 新增 `temperature.forcing`，`temperature.era5` 不变。
-- **命令行。** `stream forcing-preset`、`stream forcing-check <元数据> [--data …] [--json]`、`stream forcing-register <索引> --metadata <预设|文件> <nc…>`；`era5-register` 不变。服务端与界面尚未接入（仍只有 ERA5 登记入口）。
+- **命令行。** `stream forcing-preset`、`stream forcing-check <元数据> [--data …] [--json]`、`stream forcing-register <索引> --metadata <预设|文件> <nc…>`；`era5-register` 不变。服务端与界面接入见下一节。
+
+### STREAM 气象强迫元数据：服务端与界面（2026-11-24）
+
+- **界面。** 影像模拟工作台“温度来源 → EB”新增“气象强迫来源”：来源类型（ERA5 / ERA5-Land / GLDAS 0.25° / GLDAS 1° / 气象站点 CSV / 自定义）、物理量表（源变量/列名、源单位、取值类型、高度、湿度/风/气压类型）、时间（步长、UTC 偏移、时间戳约定）、站点表与插值、高度订正，“校验”显示引擎的错误/警告/说明及实际生效的处理，“保存为工程元数据”写出工程目录下的 `forcing-metadata.json`。选 ERA5 时行为与之前一致，元数据细节在“高级”折叠区。登记弹窗增加 GLDAS 与“按当前面板元数据”的登记。
+- **服务端 API。** `GET /api/stream/forcing/presets`；`POST /api/stream/forcing/preset | check | register | metadata/save | metadata/read`；`/api/stream/pick` 新增 `station`、`metadata`；`/api/stream/era5/list` 同时列出 `stream-forcing-pack`（含 `metadata`、`stepHours`）。工程字段 `temperature.forcing {pack, files, metadata}` 透传给引擎：元数据对象 ≤ 64 KB、元数据文件 ≤ 256 KB，元数据文件路径只允许在工程目录、`Documents\Stream Studio\forcing-metadata`、数据包所在目录内，站点文件须为绝对路径且不含 `..`。工程保存时这些路径与其他输入一样改写为相对路径。
+- **兼容性。** 旧工程只有 `temperature.era5.pack` 时生成的引擎配置不变；新增字段缺省时不出现。
+- **审核 S6。** 引擎被强杀或崩溃（运行状态不是 completed）后，`run-manifest.json` 的 `products` 为空，运行信息也不再列出写到一半的 `.tif`。
+- **未验证。** 界面实际点击需打包后查看（本次只做了语法检查、临时目录的 vite 构建、假 DOM 的逻辑冒烟与服务端测试 `tools/test-stream-forcing-server.mjs`）；GLDAS 预设仍未用真实数据验证。
 
 ### STREAM EB 起转与稳定度迭代（2026-11-24，改变数值）
 
