@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：descriptor.cpp
+// 功能：VoxelRT 模式描述符集的创建与销毁
+// 主要模块/步骤：
+//   1. 声明 18 个 binding（顺序见 descriptor.h 的 VoxelrtbindingInd）：存储缓冲 + TLAS +
+//      2 个 UNIFORM 缓冲（sensor、light）
+//   2. 创建布局、描述符池（容量 1 个集）并分配描述符集
+//   3. 把 buffer.cpp 创建的缓冲及加速结构 TLAS 写入描述符集
+//   4. destroy：销毁池与布局并清空句柄
+// 数据流：VoxelrtIO 中的缓冲/TLAS → vkUpdateDescriptorSets → VoxelRT 计算着色器
+// 与其他文件的关系：声明见 descriptor.h；缓冲创建见 buffer.cpp；管线布局使用本布局（待核对）
+// 注意：thermal 绑定仅在 meshio->thermals 非空时写入（与 buffer.cpp 的条件一致）
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/25.
 //
@@ -5,6 +19,10 @@
 #include "descriptor.h"
 
 
+// 模块：创建 VoxelRT 描述符集。
+// 输入：modelio 中已创建的各缓冲、TLAS；输出：m_descSetLayout、m_descPool、m_descSet。
+// 说明：所有 binding 共用同一组着色器阶段标志（片元/计算/光线生成/相交）；
+//   所有缓冲用 VK_WHOLE_SIZE 整体绑定。
 bool Descriptor::createDescriptor(std::shared_ptr<VoxelrtIO> &modelio){
 
     auto & m_device = modelio->m_device;
@@ -21,6 +39,7 @@ bool Descriptor::createDescriptor(std::shared_ptr<VoxelrtIO> &modelio){
  //   auto & sceneio = modelio->m_sceneio;
 
 
+    // 步骤 1：声明 binding；加速结构 tlas 另加最近命中阶段。
     VkShaderStageFlags flags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_INTERSECTION_BIT_KHR;
     bindings.addBinding(VoxelrtbindingInd::spectral, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags);
     bindings.addBinding(VoxelrtbindingInd::thermal, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags);
@@ -42,10 +61,13 @@ bool Descriptor::createDescriptor(std::shared_ptr<VoxelrtIO> &modelio){
     bindings.addBinding(VoxelrtbindingInd::waterSet, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags);
 
 
+    // 步骤 2：创建布局、池与描述符集（池容量为 1 个集）。
     m_descSetLayout = bindings.createLayout(m_device);
     m_descSetPool = bindings.createPool(m_device, 1);
     m_descSet = nvvk::allocateDescriptorSet(m_device, m_descSetPool, m_descSetLayout);
 
+    // 步骤 3：逐 binding 写入缓冲信息，最后一次性 vkUpdateDescriptorSets。
+    //   thermal 为空时不写（着色器若静态使用该 binding 属风险，见 buffer.cpp 的 DEFERRED 说明）。
     std::vector<VkWriteDescriptorSet> updates;
 
     // component    
@@ -122,6 +144,7 @@ bool Descriptor::createDescriptor(std::shared_ptr<VoxelrtIO> &modelio){
     return true;
 }
 
+// 模块：销毁描述符池（描述符集随池释放）与布局，并把句柄置空。
 void Descriptor::destroy(std::shared_ptr<VoxelrtIO> &modelio) {
 
     vkDestroyDescriptorPool(modelio->m_device, modelio->m_descPool, nullptr);

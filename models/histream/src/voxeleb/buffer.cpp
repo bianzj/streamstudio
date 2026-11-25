@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：buffer.cpp
+// 功能：VoxelEB（体元能量平衡）模式的 GPU 缓冲创建与销毁：把 VoxelebIO 里的 CPU 数据
+//       （材质/热/冠层表、网格、体元链接、气象、状态初值、流体网格等）上传为 Vulkan 缓冲。
+// 主要模块：
+//   1. Buffer::createBuffer  按“表上传 → 温度初值 → 稠密流体网格 → 场景几何 → 加速结构 →
+//                            观测/光源 → 辐射场 → 气动/气象 → 生物/空气 → 蒸散/土壤状态 →
+//                            输出影像”的顺序创建全部缓冲（步骤编号见函数内注释）
+//   2. Buffer::destroy       按创建的对应关系销毁缓冲
+// 数据流：VoxelebIO（及 meshio、instanceio、voxelio、surfio、virtualio）→ 本文件 →
+//         各 IO 对象上的 nvvk::Buffer 句柄 + 推送常量中的设备地址 → voxeleb 的各计算着色器。
+// 关系：声明见 buffer.h；由 voxeleb.cpp 调用（createBuffer 在初始化，destroy 在收尾）；
+//       数据结构定义在 base/structs_cg.h（须与 GLSL 对齐）；输出尺寸检查见 base/outputsize.h。
+// 约定：温度缓冲内单位为 K（气温 Ta 为 °C，加 273.15 换算）；TLAST 土壤温度剖面单位为 °C；
+//       空气采样高度 [m]、风速 [m s-1]、水汽压 [hPa]、CO2 [ppm]；
+//       流体网格索引轴为 (x, y=垂直, z)，线性索引 x + nx·(z + nz·y)。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/28.
 //
@@ -14,6 +32,14 @@
 
 
 
+// 模块：createBuffer——VoxelEB 模式一次性创建全部 GPU 缓冲（参数 voxellstio 即 VoxelebIO）。
+// 输入：VoxelebIO 里的材质/热/冠层表、体元链接、气象节点、流体与地形环境设置、传感器/光源等；
+// 输出：写回各 IO 对象中的 m_p*Buffer（nvvk::Buffer 的 shared_ptr），并填写推送常量里的
+//       设备地址（radianceAddress、scatteringStatsAddress）与 imageEnvironment 开关。
+// 步骤：1 材质/热/冠层表；2 体元温度初值；3 稠密流体网格（风/温湿初值、稀疏→稠密映射、D3Q19、参数）；
+//       4 场景网格、实例/体元链接、NanoVDB；5 加速结构；6 传感器/光源/波长/大气/方向；
+//       7 辐射场与诊断缓冲、净辐射、Pnet；8 气动参数；9 气象与 Raa；10 生物参数与空气；
+// 副作用：每个缓冲经临时命令缓冲上传并同步等待（submitAndWait），因此只应在初始化时调用。
 bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
 
     VkDevice & m_device = voxellstio->m_device;
@@ -28,6 +54,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     auto & m_pAccelStruct = voxellstio->m_pAccelStruct;
     auto & defined = voxellstio->m_defined;
 
+    // 步骤 1：光谱、固定光谱、热参数与冠层表，非空时才上传为存储缓冲。
     nvvk::CommandPool cmdGen(m_device, m_queue.familyIndex);
 
     // spectral
@@ -68,6 +95,9 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
         cmdGen.submitAndWait(cmdBufCanopy);
     }
 
+    // 步骤 2：体元温度初值（sunlit / shaded 两个分量，单位 K）。缺省 298.15 K；
+    //         有气象节点时取起始节点气温 Ta（°C，仅接受 -100~100 °C 范围内的有限值）。
+    //         地形空气廓线启用时，按体元的空气采样高度修正气温，并检查结果在 150~400 K 之内。
     // Energy-balance temperatures are prognostic state variables.  Thermal
     // material temperatures belong to the pure radiative-transfer modes and
     // must not seed or prescribe VoxelEB.  Start the nonlinear solve from the
@@ -121,6 +151,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
             voxelTempes[i] = {localTemperature, localTemperature};
         }
     }
+    // 覆盖规则：土壤体元用配置的初始土壤温度；冠层结构类型 2/3（对应火/雾，见流体单元类型）
+    // 且 fixedTemperature > 0 的体元，温度固定为该值。
     // Soil starts from the configured initial soil temperature Tsold.
     const bool hasInitialSoilTemperature = std::isfinite(voxellstio->initialSoilTemperature);
     const auto isSoilVoxel = [&](size_t index) {
@@ -148,11 +180,15 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
                 canopy.fixedTemperature, canopy.fixedTemperature};
         }
     }
+    // 上传体元温度缓冲（设备本地；后续时间步在 GPU 上更新，并可作为拷贝源回读）。
     voxelio->m_pTempeBuffer = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufTempe, voxelTempes,
                                                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufTempe);
 
+    // 步骤 3：稠密流体网格。网格索引轴为 (x, y=垂直, z)：水平间距取 max(0.1, fluid.voxelSize) m，
+    //         垂直范围取场景高度与输出高度中较大者；未启用流体时退化为 1×1×1。
+    //         与稀疏辐射体元的对应关系由 FluidCellMeta（surfaceIndex/kind/lad）记录。
     // Dense atmospheric grid used by the fast integrated fluid solver.  The
     // radiative/energy model remains sparse; FluidCellMeta links both grids.
     const float radiativeHorizontalSpacing = std::max(0.01f, voxellstio->stepsize_surface);
@@ -171,11 +207,14 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     const uint64_t fluidCellCount = static_cast<uint64_t>(voxellstio->fluidGridSize.x)
         * static_cast<uint64_t>(voxellstio->fluidGridSize.y)
         * static_cast<uint64_t>(voxellstio->fluidGridSize.z);
+    // D3Q19 格子玻尔兹曼每个单元存 19 个分布函数，总数需能用 32 位索引表示，否则报错。
     if (fluidCellCount == 0
         || fluidCellCount > std::numeric_limits<uint32_t>::max() / 19U) {
         throw std::runtime_error("D3Q19 fluid grid is too large for 32-bit population indexing");
     }
     voxellstio->fluidCellCount = fluidCellCount;
+    // 记录空气采样高度的范围；启用流体时扩展到覆盖整个流体网格的垂直范围，
+    // 供下面的气象节点检查（validateAirState）使用。
     if (!airSamplingHeights.empty()) {
         const auto range = std::minmax_element(airSamplingHeights.begin(), airSamplingHeights.end());
         voxellstio->terrainAirHeightRange = {*range.first, *range.second};
@@ -193,9 +232,14 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
             voxellstio->terrainAirHeightRange.x, voxellstio->terrainAirHeightRange.y);
     }
 
+    // 步骤 3.1：初始风场与格子速度换算。初始风速取起始节点风速 u（m s-1），
+    //         风向分解为 (sin, 0, cos) 水平分量。
     const float direction = glm::radians(voxellstio->fluid.windDirection);
     const float initialWind = !voxellstio->meteos.empty()
         ? std::max(0.0f, voxellstio->meteos[initialNode].u) : 0.0f;
+    // 格子速度上限（格子单位，入口处更严）：用于保持 LBM 的低马赫数稳定（取值依据待核对）。
+    // latticeVelocityScale 为物理速度（m s-1）到格子速度的固定换算比，取遍历所有气象节点的最大风速
+    // 和 fluid.maxVelocity 所需的最大值，且不小于 1。
     constexpr float latticeVelocityLimit = 0.18f;
     constexpr float inletLatticeVelocityLimit = 0.08f;
     float maximumMeteoWind = initialWind;
@@ -211,6 +255,9 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     const glm::vec4 wind{
         initialWind * std::sin(direction), 0.0f,
         initialWind * std::cos(direction), 0.0f};
+    // 步骤 3.2：流体场初值。fluidVelocity：xyz 为风速 [m s-1]；
+    //         fluidScalar：x=温度 [K]，z=水汽（气象 ea，缺省 15；单位 hPa，待核对），y、w 初值为 0；
+    //         启用地形空气廓线时，按单元中心高度给温度和水汽赋垂直分布。
     std::vector<glm::vec4> fluidVelocity(static_cast<size_t>(fluidCellCount), wind);
     std::vector<glm::vec4> fluidScalar(
         static_cast<size_t>(fluidCellCount),
@@ -241,12 +288,15 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     std::vector<int> buildingTop(horizontalCellCount, -1);
     std::vector<int> buildingSurface(horizontalCellCount, -1);
 
+    // denseIndex：稠密网格线性索引 x + nx·(z + nz·y)；越界返回 -1。
     const auto denseIndex = [&](int x, int y, int z) -> int64_t {
         if (x < 0 || y < 0 || z < 0 || x >= voxellstio->fluidGridSize.x
             || y >= voxellstio->fluidGridSize.y || z >= voxellstio->fluidGridSize.z) return -1;
         return static_cast<int64_t>(x) + static_cast<int64_t>(voxellstio->fluidGridSize.x)
             * (static_cast<int64_t>(z) + static_cast<int64_t>(voxellstio->fluidGridSize.z) * y);
     };
+    // mappedRange：把稀疏体元的 [i·s, (i+1)·s) 区间映射到流体网格的索引闭区间 [first, last]；
+    // 与网格无交集时返回空区间 {1, 0}；±1e-5 的容差避免边界浮点误差多算一格。
     const auto mappedRange = [](int sourceIndex, float sourceSpacing,
                                 float targetSpacing, int targetCount) {
         const float lower = static_cast<float>(sourceIndex) * sourceSpacing;
@@ -258,12 +308,16 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
             static_cast<int>(std::ceil(upper / targetSpacing - 1e-5f)) - 1);
         return std::pair<int, int>{first, last};
     };
+    // 单元类型优先级：固体(1) > 火/雾(3、4) > 植被(2) > 空气(0)；多个体元落入同一流体单元时
+    // 取优先级高者（相同时后者覆盖，植被的 lad 取最大值）。
     const auto kindPriority = [](int kind) {
         if (kind == 1) return 4;
         if (kind == 3 || kind == 4) return 3;
         if (kind == 2) return 2;
         return 0;
     };
+    // 步骤 3.3：把稀疏辐射体元映射到稠密流体网格，填 fluidMeta（surfaceIndex、kind、lad）。
+    //         kind：0 空气、1 固体、2 植被、3 火、4 雾；植被叶面积密度 lad = LAI / max(垂直间距, 冠高)。
     for (size_t sparseIndex = 0; sparseIndex < voxelio->voxellinks.size(); ++sparseIndex) {
         const VoxelLink& link = voxelio->voxellinks[sparseIndex];
         int kind = 1;
@@ -286,6 +340,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
                         lad = std::max(0.0f, canopy.lai /
                             std::max(radiativeVerticalSpacing, canopy.height));
                     }
+                    // 冠层结构类型 → 流体单元类型：1→固体(1)，2→火(3)，3→雾(4)，其余（含 0）→植被(2)。
                     kind = canopyStructure == 1 ? 1
                         : canopyStructure == 2 ? 3
                         : canopyStructure == 3 ? 4 : 2;
@@ -298,6 +353,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
         const auto rangeZ = mappedRange(id.z, radiativeHorizontalSpacing,
                                         horizontalSpacing, voxellstio->fluidGridSize.z);
         if (rangeX.first > rangeX.second || rangeZ.first > rangeZ.second) continue;
+        // 垂直序号为负的体元（地表以下的表面体元，待核对）只给最底层空气单元记录 surfaceIndex，
+        // 不参与固体/植被分类。
         if (id.y < 0) {
             for (int z = rangeZ.first; z <= rangeZ.second; ++z)
                 for (int x = rangeX.first; x <= rangeX.second; ++x) {
@@ -362,6 +419,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
                 }
             }
 
+    // 步骤 3.4：D3Q19 格子：19 个离散速度方向 c_i 及其权重 w_i（静止 1/3，6 个轴向 1/18，12 个对角 1/36）。
     constexpr std::array<std::array<int, 3>, 19> latticeDirections{{
         {{0,0,0}}, {{1,0,0}}, {{-1,0,0}}, {{0,1,0}}, {{0,-1,0}},
         {{0,0,1}}, {{0,0,-1}}, {{1,1,0}}, {{-1,-1,0}}, {{1,-1,0}},
@@ -390,6 +448,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
         if (speed > latticeVelocityLimit) {
             latticeVelocity *= latticeVelocityLimit / speed;
         }
+        // 平衡态分布（密度 ρ=1）：f_i = w_i·[1 + 3 c_i·u + 4.5 (c_i·u)² − 1.5 |u|²]；
+        // 固体单元速度取 0；速度超过 latticeVelocityLimit 时按比例缩回。
         const float velocitySquared = glm::dot(latticeVelocity, latticeVelocity);
         for (size_t direction = 0; direction < latticeDirections.size(); ++direction) {
             const auto& c = latticeDirections[direction];
@@ -401,6 +461,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
         }
     }
 
+    // 步骤 3.5：上传流体缓冲。速度、标量、LBM 分布函数各建 A/B 两份（推测为乒乓交换，待核对）；
+    //         另有单元元数据与密度缓冲。
     const VkBufferUsageFlags fluidUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     auto createFluidVector = [&](const auto& values) {
@@ -419,6 +481,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     voxellstio->m_pFluidLbmB = createFluidVector(fluidLbm);
     voxellstio->m_pFluidDensity = createFluidVector(fluidDensity);
 
+    // 步骤 3.6：填写并上传流体参数 uniform（FluidParameters，布局见 base/structs_cg.h）：
+    //         网格尺寸/开关、间距与时间步、环境风与温度、物理系数、源项、耦合间距、地形廓线。
     voxellstio->fluidParameters.grid = glm::ivec4(
         voxellstio->fluidGridSize, voxellstio->fluid.enabled ? 1 : 0);
     voxellstio->fluidParameters.spacingTime = glm::vec4(
@@ -448,6 +512,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     cmdGen.submitAndWait(fluidParameterCommand);
 
 
+    // 步骤 4：场景几何缓冲：每个 primMesh 的顶点/索引缓冲（带设备地址，供 BLAS 构建与着色器读取），
+    //          然后是 meshLink、实例链接、体元链接/六面体/NanoVDB 数据。
     ///--------------------------------------------------------------------
     ///  Scene properties
     ///--------------------------------------------------------------------
@@ -518,11 +584,13 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     }
 
 
+    // 步骤 5：用前面的网格与实例构建加速结构（BLAS/TLAS）。
     ///--------------------------------------------------------------------
     ///  Accelerate properties
     ///--------------------------------------------------------------------
     m_pAccelStruct->createAccelStruct(m_device,meshio,instanceio);
 
+    // 步骤 6：观测/光源几何缓冲：传感器、光源 uniform；波长、大气条件存储缓冲；再建体元方向缓冲。
     ///--------------------------------------------------------------------
     ///  geometry properties
     ///--------------------------------------------------------------------
@@ -564,6 +632,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
                                                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufDir);
 
+    // 步骤 7：体元辐射场缓冲：先清零，并把设备地址写入推送常量供着色器直接引用。
     // rads
     VkCommandBuffer cmdBufRads = cmdGen.createCommandBuffer();
     // Radiance field (N x DIFFUSENUM VoxelRad) followed by the per-direction
@@ -580,10 +649,13 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     const bool imageEnvironment = environmentFloats > 0
         && fieldEntries + (environmentFloats + 1) / 2 <= VkDeviceSize(UINT32_MAX);
     voxellstio->setting.imageEnvironment = imageEnvironment ? 1 : 0;
+    // 总字节数 = 辐射场 + 各方向天空间隙透射率 + （可选）图像多次散射环境；
+    // 环境部分每个 VoxelRad 容纳 2 个 float，故按 (n+1)/2 个条目计。
     const VkDeviceSize radianceBytes = static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(VoxelRad)
         + static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(float)
         + (imageEnvironment ? (environmentFloats + 1) / 2 * sizeof(VoxelRad) : 0);
     auto& radianceAllocator = voxellstio->m_radianceAllocator;
+    // 辐射场缓冲很大，用单独的专用分配器分配并由 VoxelebIO 持有（具体原因待核对）。
     radianceAllocator = std::make_unique<nvvk::ResourceAllocatorDedicated>(
         m_device, voxellstio->m_physicalDevice);
     voxelio->m_pRadsBuffer = std::make_shared<nvvk::Buffer>(radianceAllocator->createBuffer(
@@ -600,6 +672,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
               << "\taddress=" << voxellstio->setting.radianceAddress << std::endl;
 
     {
+        // 短波散射/太阳可见性诊断缓冲（统计块位于 kSolarVisibilityStatsOffset 之后），
+        // 地址同样写入推送常量。
         constexpr VkDeviceSize statsBytes =
             kSolarVisibilityStatsOffset + sizeof(SolarVisibilityStats);
         voxellstio->m_pScatteringStats = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(
@@ -616,6 +690,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
         }
     }
 
+    // （步骤 7 续）净辐射 VoxelNetRad 与 PAR 吸收量 VoxelPnet 缓冲，逐体元，初值全为 0。
     // netRad
     VkCommandBuffer cmdBufNetRad = cmdGen.createCommandBuffer();
     std::vector<VoxelNetRad> voxelNetRads(n_voxel, VoxelNetRad{0, 0, 0, 0});
@@ -632,6 +707,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
                                                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufPnet);
 
+// 步骤 8：气动参数（aeroconds）。
 ///--------------------------------------------------------------------
     ///  aero properties
     ///--------------------------------------------------------------------
@@ -642,6 +718,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
                                                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufAero);
 
+    // 步骤 9：气象 uniform（当前节点 k_node 的 Meteo）与体元空气动力学阻抗 Raa 缓冲（初值 0）。
     ///--------------------------------------------------------------------
     ///  meteo properties
     ///--------------------------------------------------------------------
@@ -673,6 +750,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
                                                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufRaa);
 
+    // 步骤 10：生物参数（叶片、土壤、水体参数表）与体元叶面空气状态 VoxelAir、表面阻抗 Rss。
     ///--------------------------------------------------------------------
     ///  bio properties
     ///--------------------------------------------------------------------
@@ -684,6 +762,10 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     // waterSet
     meshio->m_pWaterSetBuffer = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufBio, meshio->watersets, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     // air
+    // 叶面空气状态初值：cs = Ca、ci = 0.7·Ca（ppm），es = ea（hPa），向阳/背阴相同；
+    // 再叠加地形环境给出的 CO2 超额 co2ExcessPpm（cs 全加，ci 按 0.7 倍加）。
+    // 说明：这里用的是第 0 个气象节点，而前面的温度初值用 initialNode（起始节点）；
+    //       当 startTimeNode ≠ 0 时两者可能不一致（疑似问题，待核对）。
     const Meteo& firstMeteo = voxellstio->meteos[0];
     const VoxelAir initialAir{{firstMeteo.Ca, firstMeteo.Ca},
                               {0.7f * firstMeteo.Ca, 0.7f * firstMeteo.Ca},
@@ -720,6 +802,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
                                                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufRss);
 
+    // 步骤 11：蒸散/能量平衡状态：热通量 VoxelHeatflux（清零）、土壤温度历史 TLAST、
+    //          土壤方法 1 的长历史记忆缓冲、能量平衡统计状态 EBState。
     ///--------------------------------------------------------------------
     ///  Evapo properties
     ///--------------------------------------------------------------------
@@ -731,6 +815,9 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     if (!voxelio->m_pFluxBuffer->buffer) throw std::runtime_error("Cannot allocate voxel flux buffer");
     vkCmdFillBuffer(cmdBufEvapo, voxelio->m_pFluxBuffer->buffer, 0, VK_WHOLE_SIZE, 0);
     // tLast
+    // TLAST 初值（单位 °C）：每体元 TLASTNUM 层，由表面温度向深层温度线性过渡。
+    // 表面温度：土壤体元用 initialSoilTemperature，否则用初始气温；
+    // 深层温度：方法 2 土壤取该土壤集的 Tsoil（仅接受 -100~100 °C 的有限值），否则等于表面温度。
     const float initialTemperatureC = initialTemperature - 273.15f;
     const size_t tlastElementCount = static_cast<size_t>(n_voxel) * static_cast<size_t>(TLASTNUM);
     if (n_voxel < 0
@@ -808,6 +895,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
         voxellstio->shipWaterline = shipWaterline;
         if (shipWaterline) std::cout << "SHIP_WATERLINE\tvoxelEB hull voxels below the waterline exchange with the scene water temperature" << std::endl;
     }
+    // EBState 缓冲：能量平衡的定点累加统计量（布局须与 shader/parameters.h 一致，见 structs_cg.h）。
     auto cmdBufState = cmdGen.createCommandBuffer();
     size = sizeof(EBState);
     // voxelio->m_pStateBuffer = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufState,
@@ -822,11 +910,13 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     cmdGen.submitAndWait(cmdBufState);
 
 
+    // 步骤 12：虚拟屏幕输出影像缓冲（宽×高×波段个 float，初值 0）与叶面积密度 lad 缓冲。
     ///--------------------------------------------------------------------
     ///  Virtual Sceen properties
     ///--------------------------------------------------------------------
     /// storage
     VkCommandBuffer cmdBufStorage = cmdGen.createCommandBuffer();
+    // 先检查输出影像的元素数不超过设备单个存储缓冲上限（见 base/outputsize.h），超限抛异常。
     const size_t outputSize = checkedOutputImageElements(voxellstio->m_physicalDevice, voxellstio->imageSize.x, voxellstio->imageSize.y, voxellstio->n_wave);
     std::vector<float> outputImage(outputSize, 0.0);
     virtualio->m_pBufferStorage = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufStorage, outputImage,
@@ -840,6 +930,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     cmdGen.submitAndWait(cmdBufLad);
 
 
+    // 收尾：释放上传用的暂存缓冲。
+    // 注意：函数总是返回 false（疑似遗留写法）；调用方 voxeleb.cpp 未使用返回值。
     m_pAlloc->finalizeAndReleaseStaging();
 
     return false;
@@ -848,6 +940,10 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
 
 
 
+// 模块：destroy——销毁 createBuffer 创建的缓冲，辐射场缓冲由其专用分配器销毁并释放分配器。
+// 注意：m_pFixedSpectralBuffer、m_pBufferWave、m_pBufferInstanceLink、m_pVoxelLinkBuffer、
+//       m_pVoxelNanoBuffer 等在创建时有条件（表为空则不创建），此处却无条件解引用销毁，
+//       条件不满足时可能解引用空指针（疑似问题，待核对）。
 void Buffer::destroy(std::shared_ptr<VoxelebIO> &voxellstio){
 
     VkDevice & m_device = voxellstio->m_device;

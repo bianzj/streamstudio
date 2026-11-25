@@ -1,3 +1,23 @@
+// ==========================================================================
+// 文件：facetrt_vulkan.h
+// 功能：FacetRT / FacetEB 共用的 Vulkan 光栅辐射度后端 FacetrtVulkan 的接口声明与数据结构。
+//   以栅格化 A-buffer 估计面元各侧之间的可见性，压缩成 CSR 边表后在 GPU 上求解双面
+//   反射/透射的辐射度；同时提供日照可见比例、光谱波段求解和 GPU 能量平衡的入口。
+// 主要模块：
+//   1. 异常类型：EdgeHashOverflow（边哈希表溢出）、RasterLayerOverflow（A-buffer 层数不足）
+//   2. 输入数据：Vertex（几何）、Direction（可见性方向）、SurfaceOptics（逐 side 光学参数）、Config
+//   3. 可见性图诊断 GraphDiagnostics 与下边界 GroundBoundary（等效地面）
+//   4. 求解结果 SolveResult，GPU 能量平衡与光谱的推送/快照结构
+//   5. 设备枚举 rankDevices 与类 FacetrtVulkan（公共接口 + 私有 Vulkan 资源）
+// 流程：initialize → setGeometry → buildVisibilityGraph → solve / solveAccelerated，
+//   或在其上使用 beginEnergyNode/evaluateEnergy（能量平衡）、beginSpectral/solveSpectralBand（光谱）。
+// 与其他文件：实现在 facetrt_vulkan.cpp；着色器在 models/histream/shader；
+//   使用者包括 facetrtcore.cpp、facetrtio.h、faceteb/facetebio.h、base/appsetting.cpp。
+// 约定：每面元两个 oriented side：side = 2*facet 为几何法向侧，2*facet+1 为反面；
+//   Vertex 为非索引三角形列表，同一面元的 3 个顶点相邻且法向相同；
+//   Direction 指向虚拟正交相机，各方向须有相同立体角权重。
+// ==========================================================================
+
 #pragma once
 
 #include <vulkan/vulkan.h>
@@ -12,6 +32,7 @@
 namespace facetvk
 {
 
+// 异常：边哈希表容量已达 GPU storage buffer 上限仍放不下所有可见面对（不可恢复）。
 struct EdgeHashOverflow : std::runtime_error
 {
     EdgeHashOverflow() : std::runtime_error("Visibility edge hash overflow at the GPU storage-buffer limit")
@@ -60,6 +81,11 @@ struct SurfaceOptics
     float directIrradiance{};
 };
 
+// 初始化配置。rasterWidth/Height：每个可见性方向的栅格分辨率（像素）；
+// maxFragmentsPerPixel：A-buffer 每像素初始层数（1..256，溢出时自动扩大）；
+// gpuIndex：rankDevices 排序后的设备序号；
+// periodicNeighborCount：周期边界的邻接复制瓦片数（0..20，只参与遮挡）；
+// periodicSizeX/Z：周期域在 x、z 方向的尺寸（与几何同单位）。
 struct Config
 {
     uint32_t rasterWidth{512};
@@ -73,6 +99,9 @@ struct Config
     float periodicSizeZ{1.0f};
 };
 
+// 可见性图的诊断信息：面元/side/有向边数量，A-buffer 与哈希表溢出计数，
+// 闭合误差 maxClosureError（每个 side 的各类计数之和与采样数之比偏离 1 的最大值），
+// 以及下边界相关的逃逸/天空比例（见各字段注释）。
 struct GraphDiagnostics
 {
     uint32_t facetCount{};
@@ -117,6 +146,8 @@ GroundBoundary applyGroundBoundary(const std::vector<Vertex> &vertices, uint32_t
 // Equivalent-ground radiosity of a solution (sky value without ground sides).
 float groundBoundaryRadiosity(const GroundBoundary &ground, const std::vector<float> &radiosity, float skyRadiosity);
 
+// 求解结果：radiosity 为逐 side 辐射度；iterations 为实际迭代数；
+// maxDelta 为最后一次扫描的最大变化量（收敛判据）；incident 为逐 side 入射辐照度。
 struct SolveResult
 {
     std::vector<float> radiosity;
@@ -128,23 +159,35 @@ struct SolveResult
     float groundRadiosity{};
 };
 
+// GPU 能量平衡的 push constant（48 字节，与 faceteb/energy.comp 一致）：
+// facets 面元数；objects 物体面元数（其余为地面）；method 气孔模型（0 Collatz，其他 Farquhar）；
+// phase 阶段（0 通量/残差，1 温度更新，2 长波光学参数）；air 气温（K）；rho 空气密度；
+// pressure 气压（hPa）；vapor 水汽压（hPa）；dt 时间步（s）；co2（ppm）；
+// relaxation 温度松弛因子；wind 风速（m/s，对应 shader 的 reserved 字段）。
 struct EnergyPush
 {
     uint32_t facets{}, objects{}, method{}, phase{};
     float air{}, rho{}, pressure{}, vapor{}, dt{}, co2{}, relaxation{}, wind{};
 };
+// 能量平衡状态快照：temperatures（K，每（状态,侧）一个）、fluxes（每（状态,侧）12 个 float）；
+// optics 与 radiation 仅在 readEnergyState(true) 时填充。
 struct EnergySnapshot
 {
     std::vector<float> temperatures, fluxes;
     std::vector<SurfaceOptics> optics;
     SolveResult radiation;
 };
+// 一次 evaluateEnergy 的统计：maxima[0..4] 依次为最大残差、最大残差/响应、最大气孔失配、
+// 最大叶残差、最大温度步长；failingFacets 为能量不闭合（|残差| 超限）的面元数。
 struct EnergyStatistics
 {
     std::array<float, 5> maxima{};
     uint32_t failingFacets{};
 };
 
+// 光谱求解的 push constant（56 字节，与 facetrt/spectral.comp 一致）：phase 阶段；band 当前波段；
+// facets/materials 数量；sunX/Y/Z 太阳方向；strength Hapke 背景强度；beam 光束法向辐照度；
+// scale 输出缩放；thermal 热红外标志；ping 当前解所在缓冲；bands 波段总数。
 struct SpectralPush
 {
     uint32_t phase{}, band{}, facets{}, materials{};
@@ -152,6 +195,7 @@ struct SpectralPush
     float beam{}, scale{1.0f};
     uint32_t thermal{}, ping{}, bands{}, reserved{};
 };
+// 光谱审计数据：某波段的 optics、（亮,阴）发射、上次物理辐射度、输出辐射度与亮/阴状态。
 struct SpectralAudit
 {
     std::vector<SurfaceOptics> optics;
@@ -159,6 +203,7 @@ struct SpectralAudit
     std::vector<float> raw, output, states;
 };
 
+// 可用 GPU 候选：物理设备、图形+计算队列族、排序得分（独显优先）。
 struct DeviceCandidate
 {
     VkPhysicalDevice device{VK_NULL_HANDLE};
@@ -169,6 +214,9 @@ struct DeviceCandidate
 // GPUs usable by the Facet Vulkan backend, in Config::gpuIndex order.
 std::vector<DeviceCandidate> rankDevices(VkInstance instance);
 
+// 类：FacetrtVulkan（不可拷贝）。生命周期：initialize → setGeometry →
+// buildVisibilityGraph → solve*；setGeometry 会使已建的可见性图失效。
+// 接口均为同步调用（内部提交后等待 GPU 完成）。
 // Raster-only Vulkan radiosity model:
 // 1. Equal-solid-angle directions rasterize all facets into an A-buffer.
 // 2. A compute pass depth-sorts each pixel and records adjacent oriented sides.
@@ -218,6 +266,8 @@ class FacetrtVulkan
     SpectralAudit readSpectralAudit(uint32_t band);
     // Audit-only restore after the retained reference solver used m_optics.
     void restoreSpectralOptics(const std::vector<SurfaceOptics> &optics);
+    // GPU 能量平衡接口。supportsGpuEnergy/Incident 取决于设备是否支持 shaderFloat64 且
+    // 对应着色器存在。
     // Pack layout is shared with energy.comp: 32 floats/facet, 12/state/side.
     // All iterative temperatures and fluxes stay device-resident between calls.
     bool supportsGpuEnergy() const noexcept
@@ -251,6 +301,7 @@ class FacetrtVulkan
     }
 
   private:
+    // 以下为私有实现细节：Vulkan 缓冲包装、CSR 边、push constant 结构与各类资源句柄。
     struct Buffer
     {
         VkBuffer buffer{VK_NULL_HANDLE};
@@ -264,6 +315,9 @@ class FacetrtVulkan
         uint32_t count{};
     };
 
+    // 可见性阶段 push constant：viewProjection 为列主序的 4×4 视图投影矩阵；
+    // viewDirection 为单位视线方向；raster = (宽, 高, 每像素最大层数, 哈希容量)；
+    // periodic = (x 尺寸, z 尺寸, 邻接瓦片数, 保留)。
     struct VisibilityPush
     {
         float viewProjection[16]{};
@@ -272,6 +326,8 @@ class FacetrtVulkan
         float periodic[4]{};  // domain X/Z size, neighbour count, reserved
     };
 
+    // 求解阶段 push constant：ping 为当前读取的辐射度缓冲；skyRadiosity 天空辐射度；
+    // relaxation 松弛因子；groundSideCount 为等效地面的 side 数。
     struct SolvePush
     {
         uint32_t facetCount{};
@@ -339,6 +395,7 @@ class FacetrtVulkan
     void validateGeometry(const std::vector<Vertex> &vertices) const;
     void validateOptics(const std::vector<SurfaceOptics> &optics) const;
 
+    // 成员：配置与几何；以下按可见性资源 → 求解资源 → incident/能量 → 光谱的顺序排列。
     Config m_config{};
     std::string m_shaderDirectory;
     std::vector<Vertex> m_geometry;

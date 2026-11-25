@@ -1,3 +1,11 @@
+// ==========================================================================
+// 文件：raytracingio.cpp
+// 功能：RaytracingIO 的实现文件占位。当前只包含 raytracingio.h，其余函数（createCPUBuffer、
+//       setup、input 等）均已被注释掉，不产生任何代码。
+// 说明：RaytracingIO 的全部成员在 raytracingio.h 中以 public 数据成员定义，逻辑分布在
+//       raytracing.cpp 及各子模块中。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/24.
 //

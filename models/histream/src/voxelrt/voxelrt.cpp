@@ -1,3 +1,24 @@
+// ==========================================================================
+// 文件：voxelrt.cpp
+// 功能：VoxelRT（体元辐射）模式的顶层驱动：初始化 Vulkan 资源、读取工程设置、创建 GPU 资源、
+//   按观测几何循环执行辐射传输，并把结果写成 TIFF 影像和三维辐射过程文件。
+// 主要模块/步骤：
+//   1. 匿名命名空间辅助函数：Planck 辐亮度、辐射过程元数据字段、波段名称
+//   2. Voxelrt::setup：从 AppSetting 取得设备/队列，建立命令池、分配器、调试工具
+//   3. Voxelrt::upload / uploadSetting / uploadDefined：读取工程 XML 与场景（光学、体元化、几何）
+//   4. Voxelrt::updateSetting：把工程设置填入 GPU 推送常量 VoxelRTSetting
+//   5. Voxelrt::create：创建缓冲、描述符、管线、命令
+//   6. Voxelrt::run：按（天顶角、方位角）或 UAV 航点循环，运行传输并输出
+//   7. outputRadiationProcess / outputVoxel / output / outputPos：回读 GPU 结果并写盘
+//   8. Voxelrt::destroy：释放资源
+// 数据流：FileIO（工程 XML）→ VoxelrtIO（运行时状态）→ Buffer/Descriptor/Pipeline/Command →
+//   GPU 计算着色器（shader/voxelrt）→ 回读 → TIFF / voxelrt.bin + voxelrt.json。
+// 与其他文件的关系：声明见 voxelrt.h；状态容器 voxelrtio.h；管线 pipeline.cpp；
+//   派发顺序 command.cpp；缓冲 buffer.cpp；描述符 descriptor.cpp。
+// 约定：波长大于 50 视为 nm，否则视为 μm；大于 2.5 μm 的波段按热红外（Planck 辐亮度）处理，
+//   其余按反射（光学）波段处理。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/26.
 //
@@ -10,6 +31,10 @@
 #include <fstream>
 
 namespace {
+// 作用：黑体 Planck 光谱辐亮度。
+// 输入：波长（>50 视为 nm，否则 μm）、温度 K；输出：W m-2 sr-1 μm-1。
+// 说明：c1 = 2hc²（W μm4 m-2 sr-1），c2 = hc/k（μm K）；波长下限 1e-6 μm、
+// 温度下限 1 K，避免除零/溢出；用 expm1 提高低温/长波下的精度。
 float planckRadiance(const float wavelengthNanometers, const float temperatureKelvin) {
     constexpr double c1 = 1.1910439340652e8;
     constexpr double c2 = 14388.291040407;
@@ -22,6 +47,10 @@ float planckRadiance(const float wavelengthNanometers, const float temperatureKe
         (std::pow(wavelength, 5.0) * std::expm1(c2 / (temperature * wavelength))));
 }
 
+// 作用：向 voxelrt.json 的元数据流写入一个“辐射过程”字段（JSON 对象）。
+// 输入：波长 wavelength（nm 或 μm，同上约定）、该字段在 voxelrt.bin 每体元记录中的偏移 offset。
+// 说明：热红外波段输出平均出射光谱辐亮度，光学波段输出归一化入射照明；
+// label/definition 为前端显示用的中英文说明字符串。
 void writeVoxelrtProcessField(std::ostream& metadata, const float wavelength,
                              const int offset) {
     // Same optical/thermal split as voxelrtBandNames and the VoxelRT shaders:
@@ -43,6 +72,8 @@ void writeVoxelrtProcessField(std::ostream& metadata, const float wavelength,
              << "\"}";
 }
 
+// 作用：生成每个波段的 TIFF 波段说明文字。
+// 规则：<= 2.5 μm 为反射率；更长波段在 temperatureOutput 时为亮温（K），否则为光谱辐亮度。
 std::vector<std::string> voxelrtBandNames(const std::vector<float>& waves,
                                           const bool temperatureOutput) {
     std::vector<std::string> names;
@@ -64,6 +95,10 @@ std::vector<std::string> voxelrtBandNames(const std::vector<float>& waves,
 
 
 
+// 模块：初始化。把 AppSetting 中的 Vulkan 上下文/队列交给 VoxelrtIO，
+// 建立命令池、资源分配器和调试命名工具，并查询光追属性、初始化 SBT 与加速结构构建器。
+// 说明：VoxelRT 的核心是计算着色器；SBT/加速结构这两项初始化沿用其他模式的框架，
+// 是否被 VoxelRT 实际用到（待核对）。
 bool Voxelrt::setup(AppSetting &appsetting, std::shared_ptr<VoxelrtIO> &modelio){
 
 
@@ -113,6 +148,8 @@ bool Voxelrt::setup(AppSetting &appsetting, std::shared_ptr<VoxelrtIO> &modelio)
 
 
 
+// 模块：读取工程并构建场景。顺序：defined 文件 → 组分光学参数 → 运行设置
+// → 体元场景 → 几何；运行设置必须先于体元化（原因见函数内已有注释）。
 bool Voxelrt::upload(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelrtIO> &modelio){
 
     // auto & fileio = modelio->m_fileio;
@@ -133,6 +170,9 @@ bool Voxelrt::upload(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelrtIO>
     return true;
 }
 
+// 模块：把 VoxelRT 工程 XML（sensorxml、settingxml）中的传感器与求解设置复制到 VoxelrtIO。
+// 涉及：波段/视角数、温度/显示/反照率/影像/辐射过程输出开关、影像分辨率、最大深度、
+// 采样数、非均质体元、周期边界邻域数、天空盒、加速求解器、体元碰撞（散射）阶数。
 bool Voxelrt::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelrtIO> &modelio) {
 
     modelio->n_wave = fileio->m_pVoxelrtXml->sensorxml.waves.size();
@@ -156,6 +196,10 @@ bool Voxelrt::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
     return true;
 }
 
+// 模块：把 VoxelrtIO 的运行参数填入 GPU 推送常量 modelio->setting（VoxelRTSetting）。
+// 说明：scale 为体元边长 stepsize_surface（m）；voxelSize 取自 voxelSize_XZY，
+// 其 y 分量（竖直层数）随后按场景高度重新计算；体元边长各向同性，竖直也用 stepsize_surface
+// （scene.cpp 要求 stepsize_surface == stepsize_height）。
 bool Voxelrt::updateSetting(std::shared_ptr<VoxelrtIO> &modelio){
 
     // auto &opo = modelio->m_opo;
@@ -190,6 +234,8 @@ bool Voxelrt::updateSetting(std::shared_ptr<VoxelrtIO> &modelio){
 
 
 
+// 模块：读取 defined 数据到 m_defined（具体内容见 FileIO::readDefined，待核对）。
+// 注意：函数总是返回 false，调用方 upload 不检查该返回值。
 bool Voxelrt::uploadDefined(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelrtIO> &modelio)
 {
 
@@ -198,6 +244,8 @@ bool Voxelrt::uploadDefined(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
     return false;
 }
 
+// 模块：创建 GPU 资源。顺序：缓冲 → 描述符 → 计算管线 → 命令 → 推送常量。
+// 管线创建失败（找不到/无法加载 .spv）时返回 false，由上层中止。
 bool Voxelrt::create(std::shared_ptr<VoxelrtIO> &modelio) {
 
 
@@ -211,6 +259,10 @@ bool Voxelrt::create(std::shared_ptr<VoxelrtIO> &modelio) {
     return true;
 }
 
+// 模块：主循环。对每个观测几何运行体元辐射传输并输出结果。
+// 分支：UAV 航点模式（isUAVTrave）按航点循环，太阳取第一个角度；
+//       常规模式按 angles（vza/vaa/sza/saa）循环。
+// 副作用：向 stdout 打印 PROGRESS / OBSERVATION 行，供上层服务解析进度（待核对）。
 bool Voxelrt::run(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &fileio) {
 
 
@@ -220,6 +272,8 @@ bool Voxelrt::run(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &
 
     // The gap and diffuse passes depend on the sun only, never on the view:
     // reuse them for every observation/waypoint that shares the previous sun.
+    // 步骤 1：定义“带复用的传输”函数。gap 与 diffuse 阶段只依赖太阳方向，与观测方向无关；
+    // 太阳角度与上一次相同时只重跑 out 阶段（成像），省去重算漫射传输。
     bool transportValid = false;
     float transportSza = 0.0f, transportSaa = 0.0f;
     const auto runTransport = [&](const Angle& sun) {
@@ -234,6 +288,7 @@ bool Voxelrt::run(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &
         transportSaa = sun.saa;
     };
 
+    // 步骤 2：按观测模式循环——UAV 航点 或 视角序列。
     if(modelio->isUAVTrave && modelio->n_pos > 0) {
 
         for (int kpos = 0; kpos < modelio->n_pos; kpos++) {
@@ -280,12 +335,19 @@ bool Voxelrt::run(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &
     return true;
 }
 
+// 模块：导出体元辐射过程（三维场景辐射场）到工程目录下的 voxelrt.bin / voxelrt.json。
+// 仅在 isRadiationProcess 且第一个观测（kangle==0 或 kpos==0）后调用一次，因为 VoxelRT
+// 只有一个静态辐射场。输入：n_voxel、方向缓冲（VoxelDir）、辐射缓冲（VoxelRad）。
+// 步骤：回读 GPU 缓冲 → 写二进制记录 → 写 JSON 元数据（字段偏移、单位、定义）。
 void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
     if (!modelio || modelio->n_voxel <= 0 || !modelio->m_voxelio ||
         !modelio->m_voxelio->m_pDirBuffer || !modelio->m_voxelio->m_pRadsBuffer) {
         return;
     }
 
+    // 步骤 1：从 GPU 回读每体元的方向数据（VoxelDir，含 solar 日照比例）与辐射缓冲（VoxelRad）。
+    //         辐射缓冲每体元步长 = DIFFUSENUM（方向暂存区）+ 2*n_wave；
+    //         环境项（cumulated）位于 DIFFUSENUM + band 处（布局以 buffer.cpp 为准，待核对）。
     const size_t voxelCount = static_cast<size_t>(modelio->n_voxel);
     const int bandCount = modelio->n_wave;
     const size_t radiationStride = static_cast<size_t>(DIFFUSENUM) +
@@ -308,6 +370,9 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
     download(*modelio->m_voxelio->m_pRadsBuffer, radiosities.data(),
              radiosities.size() * sizeof(VoxelRad));
 
+    // 步骤 2：写 voxelrt.bin（float32 小端，体元交错）。每体元记录依次为：
+    //         体元中心 x、y、z（m）、各波段平均辐射量（nband 个）、光照比例 sunlit_fraction，
+    //         共 4 + n_wave 个 float，与下面 JSON 中的 recordFloats / offset 对应。
     // VoxelRT has one static radiation field.  Store it beside the TIFFs,
     // matching FacetRT's root-level three-dimensional scene output.
     const std::filesystem::path directory = std::filesystem::path(modelio->projectDir);
@@ -318,6 +383,7 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
     if (!binary) {
         throw std::runtime_error("Cannot write voxel radiation process file: " + binaryPath.string());
     }
+    // 体元中心坐标 = (体元整数号 + 0.5) * 体元边长；边长下限 1e-4 m 防止退化。
     const float scale = std::max(0.0001f, modelio->stepsize_surface);
     for (size_t voxel = 0; voxel < voxelCount; ++voxel) {
         const VoxelLink& link = modelio->m_voxelio->voxellinks[voxel];
@@ -328,6 +394,7 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
         };
         binary.write(reinterpret_cast<const char*>(position), sizeof(position));
         const float sunlitFraction = std::clamp(directions[voxel].solar, 0.0f, 1.0f);
+        // 由体元所属实例找到对应网格（材料）；越界时 mesh 保持为空，热红外项退化为环境辐亮度。
         const MeshLink* mesh = nullptr;
         if (link.instanceId >= 0 &&
             link.instanceId < static_cast<int>(modelio->m_instanceio->instanceLinks.size())) {
@@ -340,6 +407,7 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
             const size_t environmentIndex = voxel * radiationStride +
                 static_cast<size_t>(DIFFUSENUM) + static_cast<size_t>(band);
             const float environmentValue = radiosities[environmentIndex].cumulated;
+            // 环境项非有限值（NaN/Inf）一律置 0，并截断为非负，防止污染输出文件。
             const float environmentRadiance =
                 std::isfinite(environmentValue) ? std::max(0.0f, environmentValue) : 0.0f;
             const float wavelength = band < static_cast<int>(modelio->waves.size())
@@ -383,6 +451,7 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
                     planckRadiance(wavelength, thermal.sunlitTemperature);
             }
 
+            // 按日照比例混合受光/背阴两种状态：sunlit*S + shaded*(1-S)，与 JSON 的 aggregation 字段一致。
             const float averagedRadiance =
                 sunlitFraction * sunlitRadiance +
                 (1.0f - sunlitFraction) * shadedRadiance;
@@ -392,6 +461,8 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
     }
     binary.close();
 
+    // 步骤 3：写 voxelrt.json 元数据：记录格式、体元尺寸、每个波段字段（偏移 3+band）
+    //         以及最后的 sunlit_fraction 字段（偏移 3+n_wave）。
     std::ofstream metadata(metadataPath, std::ios::trunc);
     metadata << std::setprecision(9)
              << "{\n  \"kind\": \"voxel-radiation-process\",\n"
@@ -417,11 +488,15 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
     if (bandCount != 0) metadata << ',';
     metadata << "{\"id\":\"sunlit_fraction\",\"label\":\"光照比例 [-]\",\"offset\":"
              << 3 + bandCount << "}]\n}\n";
+    // 向 stdout 报告元数据文件路径，供上层服务发现并加载（待核对）。
     std::cout << "PROCESS\t" << metadataPath.string() << std::endl;
 }
 
 
 
+// 模块：释放资源。先等待设备空闲，再依次销毁缓冲、SBT、加速结构构建器、描述符、管线、
+// 命令对象、命令池与分配器。
+// 注意：函数总是返回 false（含成功路径），调用方是否依赖该返回值（待核对）。
 bool Voxelrt::destroy(std::shared_ptr<VoxelrtIO> & modelio){
 
     const VkResult waitIdleResult = vkDeviceWaitIdle(modelio->m_device);
@@ -448,6 +523,11 @@ bool Voxelrt::destroy(std::shared_ptr<VoxelrtIO> & modelio){
 
 
 
+// 模块：常规观测（正射/视角序列）的 TIFF 输出。
+// 输入：knode（-1 表示无时间戳）、kangle（观测角序号）；读取虚拟屏幕存储缓冲
+//       （nWave 个波段平面，先波段后像元）。
+// 输出：经几何校正和（可选）大气校正的多波段 TIFF，经 FileIO::writeTIFData 写出。
+// 步骤：1) 回读像素；2) orthcorrect 求坐标映射系数；3) 逐像元重采样 + 大气校正；4) 写文件。
 void Voxelrt::output(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &fileio, int knode, int kangle) {
     VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     const int width = modelio->imageSize.x;
@@ -473,6 +553,8 @@ void Voxelrt::output(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO
     modelio->m_pAlloc->unmap(pixelBuffer);
     modelio->m_pAlloc->destroy(pixelBuffer);
 
+    // 步骤 2：取得该视角的几何校正映射。cx、cy 为 4 个系数，源像元坐标 =
+    //         i*c0 + j*c1 + i*j*c2 + c3（i、j 为输出像元列、行；双线性型映射，待核对）。
     Angle angle = modelio->angles[kangle];
     Eigen::VectorXd cx;
     Eigen::VectorXd cy;
@@ -481,6 +563,8 @@ void Voxelrt::output(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO
     std::vector<float> orthData(totalElements, 0.0f);
     for (int i = 0; i < width; ++i) {
         for (int j = 0; j < height; ++j) {
+            // 步骤 3：映射后截断取整，越界像元跳过（保持 0）；值为 0 的源像元视为无数据，
+            //         不做大气校正，避免把背景变成非零。
             const int ii = static_cast<int>(i * cx[0] + j * cx[1] + i * j * cx[2] + cx[3]);
             const int jj = static_cast<int>(i * cy[0] + j * cy[1] + i * j * cy[2] + cy[3]);
             if (ii < 0 || ii >= width || jj < 0 || jj >= height) {
@@ -509,6 +593,11 @@ void Voxelrt::output(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO
         voxelrtBandNames(modelio->waves, modelio->isTemperature));
 }
 
+// 模块：透视投影或 UAV 航点观测的 TIFF 输出（不做正射重采样，像元与传感器像面一一对应）。
+// 输入：knode（-1 表示无时间戳）、kpos（航点序号，-1 表示单一固定传感器）。
+// 说明：太阳/视角信息取 angles[0]；传感器高度优先取该航点高度 uavposes[kpos].z。
+//       对没有命中任何体元的像元（值为 0 或非有限）且位于视场内的，用天空辐射模型填充；
+//       其余像元只做大气校正。
 void Voxelrt::outputPos(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &fileio, int knode, int kpos) {
     VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     const int width = modelio->imageSize.x;
@@ -536,6 +625,8 @@ void Voxelrt::outputPos(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<Fil
     const float sensorHeight = kpos >= 0 && kpos < static_cast<int>(modelio->uavposes.size())
         ? modelio->uavposes[kpos].z : fileio->m_pVoxelrtXml->sensorxml.position.z;
     const size_t imageElements = static_cast<size_t>(width) * height;
+    // 步骤 2：求每个像元对应的视线天顶角；负值表示该像元不是天空像元（由 atmosphereSkyPixelZenith
+    //         的返回值判定，具体条件待核对）。
     std::vector<float> skyZenith(imageElements, -1.0f);
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
@@ -548,6 +639,7 @@ void Voxelrt::outputPos(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<Fil
             }
         }
     }
+    // 步骤 3：逐波段逐像元：空像元且为天空 → 天空输出值；否则 → 大气校正后的输出值。
     for (int band = 0; band < nWave; ++band) {
         const size_t offset = static_cast<size_t>(band) * imageElements;
         for (size_t pixel = 0; pixel < imageElements; ++pixel) {
@@ -574,6 +666,8 @@ void Voxelrt::outputPos(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<Fil
 }
 
 
+// 模块：体元通量/温度等 3D 输出的占位。函数体已全部注释掉（旧 VoxelEB 遗留），
+// VoxelRT 现用 outputRadiationProcess 导出三维辐射场。
 void Voxelrt::outputVoxel(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<FileIO> &fileio) {
 
 

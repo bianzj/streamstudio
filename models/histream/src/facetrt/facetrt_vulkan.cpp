@@ -1,3 +1,27 @@
+// ==========================================================================
+// 文件：facetrt_vulkan.cpp
+// 功能：FacetRT / FacetEB 共用的 Vulkan 光栅辐射度后端 FacetrtVulkan 的实现（声明见 facetrt_vulkan.h）。
+//   用光栅化 A-buffer 估计面元各侧之间的可见性（视角因子的光栅估计），再在 GPU 上做
+//   双面反射/透射的 Jacobi 辐射度迭代；还提供直射日照比例、光谱波段求解与 GPU 能量平衡。
+// 主要模块：
+//   1. 匿名命名空间工具：哈希空槽键、周期瓦片偏移表、向量运算、校验层回调
+//   2. 设备选择 rankDevices、Vulkan 上下文/命令池/缓冲/着色器加载等底层封装
+//   3. 几何上传 setGeometry 与正交投影 makeProjection（含周期边界邻接瓦片）
+//   4. 可见性图 buildVisibilityGraph：光栅 → 解析 → 回读哈希表 → CSR → 下边界（等效地面）
+//   5. 日照可见比例 computeSunlitFraction（4×4 亚像素抖动）
+//   6. 辐射度求解 solve / solveAccelerated 与入射辐照度 incidentIrradiance
+//   7. GPU 能量平衡（energy.comp）：beginEnergyNode / evaluateEnergy / updateEnergyTemperature
+//   8. 光谱波段求解（spectral.comp）：beginSpectral / solveSpectralBand / readSpectralOutput
+//   9. 资源释放 destroy*
+// 数据流：Vertex 三角形列表 + 方向集 → A-buffer → 边哈希（无向边 = 射线计数）→ CSR 边表
+//   → 与 SurfaceOptics 一起在 GPU 上迭代求解各 side 的辐射度（计数/分母即交换权重）。
+// 与其他文件：着色器位于 models/histream/shader（facetrt/ 与 faceteb/），按名称加载 *.spv；
+//   调用方：facetrtcore.cpp（GPU 可见性/求解/能量/光谱内核）、appsetting.cpp（设备枚举）；
+// 约定：每个面元有两个 oriented side：side = 2*facet（几何法向侧）、2*facet+1（反面）；
+//   可见性方向指向虚拟相机；辐射度/辐照度单位由调用方决定，本文件不做单位换算；
+//   所有 Vulkan 调用均同步提交并等待（endCommands），错误一律抛异常。
+// ==========================================================================
+
 #include "facetrt_vulkan.h"
 
 #include <algorithm>
@@ -16,6 +40,8 @@
 namespace facetvk {
 namespace {
 
+// 匿名命名空间：本文件内部使用的常量与小工具（不对外导出）。
+// kEmptyEdgeKey：边哈希表中“空槽”的哨兵键（64 位全 1）。
 constexpr uint64_t kEmptyEdgeKey = std::numeric_limits<uint64_t>::max();
 // Highest per-pixel fragment count the visibility shaders can resolve
 // (MAX_FRAGMENTS in visibility_resolve.comp / direct_resolve.comp).
@@ -28,9 +54,11 @@ struct ShaderModuleGuard {
     ~ShaderModuleGuard() { if (module != VK_NULL_HANDLE) vkDestroyShaderModule(device, module, nullptr); }
 };
 
+// 可见性管线共用的 push constant 可见阶段（顶点/片元/计算），对应 VisibilityPush。
 constexpr VkShaderStageFlags kVisibilityPushStages = VK_SHADER_STAGE_VERTEX_BIT |
                                                      VK_SHADER_STAGE_FRAGMENT_BIT |
                                                      VK_SHADER_STAGE_COMPUTE_BIT;
+// 作用：Vulkan 校验层回调，仅输出 WARNING 及以上级别的消息到 stderr；始终返回 VK_FALSE（不中断调用）。
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                                VkDebugUtilsMessageTypeFlagsEXT,
                                                const VkDebugUtilsMessengerCallbackDataEXT* data,
@@ -66,6 +94,7 @@ std::array<float, 3> cross3(const std::array<float, 3>& a, const std::array<floa
             a[0] * b[1] - a[1] * b[0]};
 }
 
+// 作用：向量归一化；长度不大于 1e-8 时抛 invalid_argument（可见性方向不允许为零向量）。
 std::array<float, 3> normalize3(std::array<float, 3> value)
 {
     const float length = std::sqrt(dot3(value, value));
@@ -78,6 +107,9 @@ std::array<float, 3> normalize3(std::array<float, 3> value)
     return value;
 }
 
+// 作用：周期边界邻接瓦片的 (X, Z) 整数偏移表。index=0 为本体 {0,0}；
+// index=1..20 依次为一圈 4 邻 + 4 角 + 外圈 12 个；超出 20 时钳到最后一项。
+// 与 Config::periodicNeighborCount、Config::periodicSizeX/Z 配合使用（偏移乘以域尺寸）。
 std::array<int, 2> periodicTileOffset(uint32_t index)
 {
     static constexpr std::array<std::array<int, 2>, 20> offsets{{
@@ -93,6 +125,11 @@ std::array<int, 2> periodicTileOffset(uint32_t index)
 
 } // namespace
 
+// 模块：GPU 枚举与排序。
+// 筛选条件：非 CPU 类型设备；支持 shaderInt64、shaderBufferInt64Atomics、
+// fragmentStoresAndAtomics；存在同时具备 graphics+compute 的队列族。
+// 评分：独显 1000、其他 100，再加 maxImageDimension2D/1024；按分数稳定降序，
+// 与 Config::gpuIndex 的下标一致。
 std::vector<DeviceCandidate> rankDevices(VkInstance instance)
 {
     uint32_t deviceCount = 0;
@@ -140,6 +177,13 @@ std::vector<DeviceCandidate> rankDevices(VkInstance instance)
     return candidates;
 }
 
+// 模块：可见性图的下边界（“等效地面”）处理。
+// 作用：把 firstGroundFacet 及之后的面元视为地面：其背朝下的一侧（由面元法向 y 分量判定）
+// 置为失效（分母=0、天空计数=0、地面计数=kInactiveSide），另一侧（朝上）按面积权重
+// （总和归一为 1）构成“等效地面”，供向下逃逸的视线取其平均辐射度。
+// 输入：顶点（每面元 3 顶点，法向相同）、三类逐侧计数（长度均为 2×面元数）；
+// 输出：GroundBoundary，并填充 diagnostics 的 ground* / skyFraction 诊断量。
+// 诊断量只统计非地面的物体侧（side < first*2），地面的朝下侧不计入任何分母。
 GroundBoundary applyGroundBoundary(const std::vector<Vertex>& vertices, uint32_t firstGroundFacet,
                                    std::vector<uint32_t>& denominators, std::vector<uint32_t>& skyCounts,
                                    std::vector<uint32_t>& groundCounts, GraphDiagnostics& diagnostics)
@@ -157,6 +201,7 @@ GroundBoundary applyGroundBoundary(const std::vector<Vertex>& vertices, uint32_t
                                               {c[0] - a[0], c[1] - a[1], c[2] - a[2]});
         return 0.5 * std::sqrt(double(n[0]) * n[0] + double(n[1]) * n[1] + double(n[2]) * n[2]);
     };
+    // 步骤 1：地面面元（索引 >= first）：朝下一侧失效；朝上一侧按面积权重加入等效地面。
     GroundBoundary ground;
     double total = 0.0;
     std::vector<double> weights;
@@ -177,6 +222,8 @@ GroundBoundary applyGroundBoundary(const std::vector<Vertex>& vertices, uint32_t
     for (double weight : weights) ground.weights.push_back(static_cast<float>(weight / total));
     diagnostics.groundFacets = facets - first;
     diagnostics.inactiveGroundSides = facets - first;
+    // 步骤 2：统计物体侧（非地面）的向下逃逸/天空比例；按分母（可见性采样数）加权，
+    // 另外给出按面元面积加权的逐侧平均与最大逐侧比例。
     double denominator = 0.0, escaped = 0.0, sky = 0.0, areaSum = 0.0, areaEscape = 0.0;
     uint32_t escapeSides = 0U;
     float maximum = 0.0f;
@@ -192,6 +239,7 @@ GroundBoundary applyGroundBoundary(const std::vector<Vertex>& vertices, uint32_t
         areaSum += weight;
         areaEscape += weight * fraction;
     }
+    // 步骤 3：单独统计朝上地面侧的逃逸比例，然后写入诊断结构（分母为 0 时一律置 0）。
     double groundDenominator = 0.0, groundEscaped = 0.0;
     for (uint32_t side : ground.sides) {
         groundDenominator += denominators[side];
@@ -207,6 +255,8 @@ GroundBoundary applyGroundBoundary(const std::vector<Vertex>& vertices, uint32_t
     return ground;
 }
 
+// 作用：等效地面辐射度 = Σ weight_i × radiosity[side_i]（double 累加）；
+// 没有地面面元时退化为天空辐射度 skyRadiosity。
 float groundBoundaryRadiosity(const GroundBoundary& ground, const std::vector<float>& radiosity, float skyRadiosity)
 {
     if (ground.sides.empty()) return skyRadiosity;
@@ -221,6 +271,7 @@ FacetrtVulkan::~FacetrtVulkan()
     destroy();
 }
 
+// 作用：检查 VkResult，非 VK_SUCCESS 时抛 runtime_error（含操作名与错误码）。
 void FacetrtVulkan::require(VkResult result, const char* operation) const
 {
     if (result != VK_SUCCESS) {
@@ -230,6 +281,9 @@ void FacetrtVulkan::require(VkResult result, const char* operation) const
     }
 }
 
+// 作用：初始化后端：先 destroy() 释放旧资源，校验栅格尺寸与每像素最大片元数（1..256，
+// 与着色器 MAX_FRAGMENTS 一致），保存配置与着色器目录（SPIR-V 所在），
+// 再创建 Vulkan 上下文与命令池。几何和管线在 setGeometry / buildVisibilityGraph 中创建。
 void FacetrtVulkan::initialize(const Config& config, const std::string& shaderDirectory)
 {
     destroy();
@@ -245,6 +299,10 @@ void FacetrtVulkan::initialize(const Config& config, const std::string& shaderDi
     createCommandPool();
 }
 
+// 作用：创建 Vulkan 1.2 实例（可选校验层）、选择物理设备、创建逻辑设备与单个队列。
+// 设备特性：shaderInt64 + shaderBufferInt64Atomics（64 位边键原子操作）、
+// fragmentStoresAndAtomics（片元着色器写 A-buffer）；shaderFloat64 有则启用，
+// 结果记入 m_shaderFloat64；有双精度时才创建 incident 管线，且在 energy.comp.spv 存在时创建能量资源。
 void FacetrtVulkan::createContext()
 {
     const char* validationLayer = "VK_LAYER_KHRONOS_validation";
@@ -294,6 +352,7 @@ void FacetrtVulkan::createContext()
             "The GPU must provide a graphics+compute queue, shaderBufferInt64Atomics and fragmentStoresAndAtomics");
     }
     // DEFERRED[低] 错误处理: gpuIndex 越界时被静默钳到最后一块 GPU，用户配置错误不会被发现（可能落到集显上）；建议：越界时抛错或至少打印警告与实际选中的设备名。
+    // 注意：gpuIndex 超出候选数量时钳到最后一块可用 GPU（见上方 DEFERRED 说明）。
     const size_t selected = std::min<size_t>(m_config.gpuIndex, candidates.size() - 1U);
     m_physicalDevice = candidates[selected].device;
     m_queueFamily = candidates[selected].queueFamily;
@@ -324,6 +383,7 @@ void FacetrtVulkan::createContext()
     vkGetDeviceQueue(m_device, m_queueFamily, 0, &m_queue);
 }
 
+// 作用：创建命令池（transient + 可单独复位），所有一次性命令缓冲都由 beginCommands() 从中分配。
 void FacetrtVulkan::createCommandPool()
 {
     VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -334,6 +394,7 @@ void FacetrtVulkan::createCommandPool()
             "vkCreateCommandPool");
 }
 
+// 作用：在 typeBits 允许的内存类型中，返回第一个包含全部 properties 标志的类型下标；找不到则抛错。
 uint32_t FacetrtVulkan::findMemoryType(uint32_t typeBits,
                                          VkMemoryPropertyFlags properties) const
 {
@@ -348,6 +409,8 @@ uint32_t FacetrtVulkan::findMemoryType(uint32_t typeBits,
     throw std::runtime_error("No compatible Vulkan memory type was found");
 }
 
+// 作用：创建 VkBuffer 并分配、绑定独立的 VkDeviceMemory（每个缓冲一次 vkAllocateMemory）。
+// 说明：大小最小取 4 字节（避免零长度缓冲）；失败时先释放已创建的句柄再重新抛出。
 FacetrtVulkan::Buffer FacetrtVulkan::createBuffer(VkDeviceSize size,
                                                        VkBufferUsageFlags usage,
                                                        VkMemoryPropertyFlags properties) const
@@ -375,6 +438,8 @@ FacetrtVulkan::Buffer FacetrtVulkan::createBuffer(VkDeviceSize size,
     return result;
 }
 
+// 模块：同步命令提交。beginCommands() 分配并开始一个 ONE_TIME_SUBMIT 命令缓冲；
+// endCommands() 结束、提交、用 fence 等待完成并释放（每次提交都阻塞到 GPU 完成）。
 VkCommandBuffer FacetrtVulkan::beginCommands() const
 {
     VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -392,6 +457,8 @@ VkCommandBuffer FacetrtVulkan::beginCommands() const
     return commandBuffer;
 }
 
+// 说明：stage 变量记录最近一步的名称，失败时用于错误信息；
+// 等待 fence 失败（pending）时命令缓冲可能仍在 GPU 上运行，因此不释放它。
 void FacetrtVulkan::endCommands(VkCommandBuffer commandBuffer) const
 {
     VkResult result = vkEndCommandBuffer(commandBuffer);
@@ -420,6 +487,7 @@ void FacetrtVulkan::endCommands(VkCommandBuffer commandBuffer) const
     require(result, stage);
 }
 
+// 作用：同步的缓冲到缓冲拷贝（从 offset 0 开始拷 size 字节）。
 void FacetrtVulkan::copyBuffer(VkBuffer source, VkBuffer destination, VkDeviceSize size) const
 {
     VkCommandBuffer commandBuffer = beginCommands();
@@ -428,6 +496,8 @@ void FacetrtVulkan::copyBuffer(VkBuffer source, VkBuffer destination, VkDeviceSi
     endCommands(commandBuffer);
 }
 
+// 作用：主机 → 设备上传：写入临时的 host-visible staging 缓冲，再拷贝到设备端缓冲；
+// size 超过目标缓冲大小时抛 out_of_range。
 void FacetrtVulkan::uploadBuffer(Buffer& destination,
                                     const void* data,
                                     VkDeviceSize size) const
@@ -452,6 +522,7 @@ void FacetrtVulkan::uploadBuffer(Buffer& destination,
     destroyBuffer(staging);
 }
 
+// 作用：设备 → 主机回读：先拷到 host-visible staging 缓冲，再映射并 memcpy 到 data。
 void FacetrtVulkan::downloadBuffer(const Buffer& source,
                                       void* data,
                                       VkDeviceSize size) const
@@ -475,6 +546,7 @@ void FacetrtVulkan::downloadBuffer(const Buffer& source,
     destroyBuffer(staging);
 }
 
+// 作用：释放缓冲及其显存，并把 Buffer 结构清零；对空句柄安全，可重复调用。
 void FacetrtVulkan::destroyBuffer(Buffer& buffer) const
 {
     if (buffer.buffer != VK_NULL_HANDLE) {
@@ -486,6 +558,8 @@ void FacetrtVulkan::destroyBuffer(Buffer& buffer) const
     buffer = {};
 }
 
+// 作用：从 m_shaderDirectory 读取 SPIR-V（.spv）文件并创建 VkShaderModule；
+// 文件大小必须为正且是 4 字节的整数倍。调用者负责销毁（常用 ShaderModuleGuard）。
 VkShaderModule FacetrtVulkan::loadShader(const std::string& fileName) const
 {
     const std::string path = m_shaderDirectory + "/" + fileName;
@@ -510,6 +584,8 @@ VkShaderModule FacetrtVulkan::loadShader(const std::string& fileName) const
     return module;
 }
 
+// 作用：返回不小于 value 的最小 2 的幂（value<=1 时为 1）；超过 2^31 时回绕为 0，
+// 调用者通过 capacity < 请求值 检测该溢出。
 uint32_t FacetrtVulkan::nextPowerOfTwo(uint32_t value) const
 {
     if (value <= 1U) {
@@ -524,6 +600,8 @@ uint32_t FacetrtVulkan::nextPowerOfTwo(uint32_t value) const
     return value + 1U;
 }
 
+// 作用：边哈希表容量上限 = 不超过 maxStorageBufferRange / 8 字节（每槽一个 uint64 键）的最大 2 的幂；
+// 设备上限小于 65536 个槽时视为不可用并抛错。
 uint32_t FacetrtVulkan::maximumHashCapacity() const
 {
     VkPhysicalDeviceProperties properties{};
@@ -541,6 +619,9 @@ uint32_t FacetrtVulkan::maximumHashCapacity() const
     return maximumCapacity;
 }
 
+// 作用：确定边哈希表容量（槽数，2 的幂）。
+// Config::edgeHashCapacity 非 0 时取其向上取 2 的幂，超过设备上限则抛 overflow_error；
+// 为 0 时自动取 max(65536, 64×oriented side 数) 向上取 2 的幂，并以设备上限封顶。
 uint32_t FacetrtVulkan::chooseHashCapacity() const
 {
     const uint32_t maximumCapacity = maximumHashCapacity();
@@ -560,6 +641,9 @@ uint32_t FacetrtVulkan::chooseHashCapacity() const
     return nextPowerOfTwo(static_cast<uint32_t>(requested));
 }
 
+// 作用：A-buffer（片元缓冲）允许占用的显存预算（字节）。
+// 环境变量 HISTREAM_FACET_RASTER_BUDGET_MB（单位 MB，须为正数）优先；
+// 否则取最大 device-local 堆的 1/4。
 uint64_t FacetrtVulkan::rasterLayerBudgetBytes() const
 {
     if (const char* requested = std::getenv("HISTREAM_FACET_RASTER_BUDGET_MB")) {
@@ -582,6 +666,10 @@ uint64_t FacetrtVulkan::rasterLayerBudgetBytes() const
     return deviceLocal / 4U;
 }
 
+// 作用：A-buffer 每像素层数不足时扩容（只修改 m_config.maxFragmentsPerPixel，
+// 由调用者随后重建可见性资源）。新层数 = max(2×当前, 上次溢出实测所需层数向上取 2 的幂)，
+// 封顶 kMaximumRasterLayers(256)；每片元占 8 字节，若超过 maxStorageBufferRange
+// 或显存预算则返回 false（调用者随后抛 RasterLayerOverflow）。
 bool FacetrtVulkan::growRasterLayers()
 {
     const uint32_t current = std::max(1U, m_config.maxFragmentsPerPixel);
@@ -617,6 +705,8 @@ bool FacetrtVulkan::growRasterLayers()
     return true;
 }
 
+// 作用：校验几何输入：必须是非空三角形列表（顶点数为 3 的倍数）、坐标有限、
+// 法向为单位向量（长度允许 0.99~1.01）。
 void FacetrtVulkan::validateGeometry(const std::vector<Vertex>& vertices) const
 {
     if (vertices.empty() || (vertices.size() % 3U) != 0U) {
@@ -637,6 +727,10 @@ void FacetrtVulkan::validateGeometry(const std::vector<Vertex>& vertices) const
     }
 }
 
+// 作用：上传几何并（重新）创建可见性相关资源。
+// 步骤：1) 校验并等待设备空闲，释放旧的 solve/可见性资源；2) 记录面元数与包围盒；
+// 3) 选择边哈希容量；4) 创建可见性缓冲、上传顶点、创建描述符与光栅/解析管线。
+// 副作用：会使已有的可见性图失效，需重新调用 buildVisibilityGraph。
 void FacetrtVulkan::setGeometry(const std::vector<Vertex>& vertices)
 {
     if (!initialized()) {
@@ -666,6 +760,11 @@ void FacetrtVulkan::setGeometry(const std::vector<Vertex>& vertices)
     createVisibilityPipelines();
 }
 
+// 作用：为一个可见性方向构造正交投影矩阵（列主序，视图×投影合一）。
+// direction 指向虚拟相机，右/上轴由参考轴叉乘得到（|view.z|<0.9 用 z 轴，否则用 y 轴）。
+// x/y 窗口半径取中心块（原始几何）包围球，使每个方向的像素面积一致，
+// 即各方向的可见性计数权重相同；深度范围覆盖周期副本的包围球，映射到 [0,1]，
+// 离相机越远深度越大。
 std::array<float, 16> FacetrtVulkan::makeProjection(const Direction& direction) const
 {
     const std::array<float, 3> view = normalize3({direction.x, direction.y, direction.z});
@@ -674,6 +773,7 @@ std::array<float, 16> FacetrtVulkan::makeProjection(const Direction& direction) 
                                                : std::array<float, 3>{0.0f, 1.0f, 0.0f};
     const std::array<float, 3> right = normalize3(cross3(reference, view));
     const std::array<float, 3> up = cross3(view, right);
+    // 步骤 1：把周期邻接瓦片（最多 20 个）的包围盒并入，得到用于深度范围的扩展包围盒。
     std::array<float, 3> extendedMin = m_boundsMin;
     std::array<float, 3> extendedMax = m_boundsMax;
     const uint32_t neighborCount = std::min(m_config.periodicNeighborCount, 20U);
@@ -696,6 +796,7 @@ std::array<float, 16> FacetrtVulkan::makeProjection(const Direction& direction) 
         extendedMax[2] - extendedMin[2]};
     const float radius = std::max(0.5f * std::sqrt(dot3(diagonal, diagonal)) * 1.001f,
                                   1.0e-4f);
+    // 步骤 2：只用中心块的包围球确定 x/y 窗口（原作者说明见下）。
     // Only central-block fragments are receivers, and every occluder of a
     // central facet projects onto that facet's pixel, so the x/y window only
     // has to cover the central block. Using the central bounding sphere (the
@@ -715,6 +816,7 @@ std::array<float, 16> FacetrtVulkan::makeProjection(const Direction& direction) 
     const float windowRadius = std::max(
         0.5f * std::sqrt(dot3(centralDiagonal, centralDiagonal)) * 1.001f, 1.0e-4f);
 
+    // 步骤 3：填充矩阵：x/y 为相对中心块中心的右/上投影，z 为沿视线方向的深度（0.5 居中）。
     std::array<float, 16> matrix{};
     matrix[0] = right[0] / windowRadius;
     matrix[1] = up[0] / windowRadius;
@@ -732,6 +834,12 @@ std::array<float, 16> FacetrtVulkan::makeProjection(const Direction& direction) 
     return matrix;
 }
 
+// 模块：可见性阶段的设备端缓冲（全部 device-local 的 storage buffer）。
+// m_fragments：A-buffer，像素数 × maxFragmentsPerPixel × 8 字节；m_pixelCounts：每像素片元数；
+// m_edgeKeys/m_edgeCounts：边哈希表（uint64 键 = 一对相邻 oriented side，计数 uint32）；
+// m_denominator/m_skyCounts/m_groundCounts：逐 side 的可见性采样数、天空与向下逃逸计数；
+// m_visibilityStats：溢出统计（4 个 uint32；statistics[1] 为哈希溢出次数）；m_directTotal/m_directVisible：太阳直射可见性计数。
+// 会先检查各缓冲是否超过 maxStorageBufferRange，超过则抛错。
 void FacetrtVulkan::createVisibilityResources()
 {
     const VkBufferUsageFlags deviceStorage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -783,6 +891,11 @@ void FacetrtVulkan::createVisibilityResources()
                                    deviceStorage, deviceLocal);
 }
 
+// 模块：可见性阶段的描述符。两个 8 绑定的 storage-buffer 集合：
+//   集合 0（m_visibilityDescriptorSet，建图）：fragments, pixelCounts, edgeKeys, edgeCounts,
+//     denominator, skyCounts, visibilityStats, groundCounts；
+//   集合 1（m_directDescriptorSet，太阳可见性）：同上，但 denominator/skyCounts 换成
+//     directTotal/directVisible。绑定编号必须与 visibility*.comp / direct_resolve.comp 一致。
 void FacetrtVulkan::createVisibilityDescriptors()
 {
     std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
@@ -858,6 +971,10 @@ void FacetrtVulkan::createVisibilityDescriptors()
                            directWrites.data(), 0, nullptr);
 }
 
+// 模块：可见性管线。1) 光栅管线（visibility.vert/frag）：无颜色/深度附件，不剔除背面，
+// 视口与裁剪为动态状态，片元着色器把每个片元写入 A-buffer；
+// 2) 计算管线 visibility_resolve（逐像素深度排序并登记相邻 oriented side 的边）；
+// 3) 计算管线 direct_resolve（太阳方向的直射可见性）。三者共用 VisibilityPush 的 push constant。
 void FacetrtVulkan::createVisibilityPipelines()
 {
     VkPushConstantRange pushRange{};
@@ -874,6 +991,7 @@ void FacetrtVulkan::createVisibilityPipelines()
                                    &m_visibilityPipelineLayout),
             "vkCreatePipelineLayout(visibility)");
 
+    // 渲染通道没有任何附件：光栅阶段只为产生片元，结果通过 storage buffer 输出。
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     VkRenderPassCreateInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
@@ -983,6 +1101,10 @@ void FacetrtVulkan::createVisibilityPipelines()
             "vkCreateComputePipelines(direct resolve)");
 }
 
+// 模块：辐射度求解阶段的设备端缓冲。
+// CSR 行偏移与边（CsrEdge{neighbor, count}）、逐 side 的光学参数 / 两份 ping-pong 辐射度 /
+// 入射辐照度，以及等效地面的 side 索引、权重和均值（4 个 float，初始为 0）。
+// 无边或无地面时分配最小占位缓冲，避免零长度。
 void FacetrtVulkan::createSolveResources(uint32_t directedEdgeCount)
 {
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -1018,6 +1140,10 @@ void FacetrtVulkan::createSolveResources(uint32_t directedEdgeCount)
     }
 }
 
+// 模块：求解阶段描述符（13 个 storage buffer，仅计算阶段可见）。绑定顺序：
+//   0 rowOffsets, 1 edges, 2 denominator, 3 skyCounts, 4 optics, 5 radiosityA,
+//   6 radiosityB, 7 residual, 8 incident, 9 groundCounts, 10 groundSides,
+//   11 groundWeights, 12 groundMean（须与 radiosity/incident/energy 等着色器一致）。
 void FacetrtVulkan::createSolveDescriptors()
 {
     std::array<VkDescriptorSetLayoutBinding, 13> bindings{};
@@ -1069,6 +1195,10 @@ void FacetrtVulkan::createSolveDescriptors()
                            0, nullptr);
 }
 
+// 模块：求解阶段的计算管线，共用 SolvePush 的 push constant 与求解描述符布局。
+// radiosity.comp：Jacobi 迭代；ground_mean.comp：等效地面均值归约；
+// incident.comp：入射辐照度，仅在设备支持 shaderFloat64 时创建；
+// 此外 energy.comp.spv 存在时创建 GPU 能量平衡资源（同样要求 shaderFloat64）。
 void FacetrtVulkan::createSolvePipeline()
 {
     VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SolvePush)};
@@ -1123,6 +1253,9 @@ void FacetrtVulkan::createSolvePipeline()
     }
 }
 
+// 作用：构建可见性图（对外入口），带自动恢复：
+// 边哈希表溢出时把容量翻倍并重传几何后重建；A-buffer 溢出时通过 growRasterLayers() 加层后重建；
+// 已达设备上限则重新抛出异常。同时保存方向列表，供之后太阳可见性溢出时重建同一张图。
 GraphDiagnostics FacetrtVulkan::buildVisibilityGraph(
     const std::vector<Direction>& directions)
 {
@@ -1146,6 +1279,13 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraph(
     }
 }
 
+// 作用：构建一次可见性图（不含溢出重试，重试见 buildVisibilityGraph）。
+// 输入：一组等立体角权重的方向（指向虚拟相机）；输出：GraphDiagnostics，
+// 并把 CSR 边表、逐 side 分母/天空/地面计数和等效地面保存在成员中，同时建好求解资源。
+// 步骤：1) 准备 push constant；2) 清零计数与哈希表；3) 逐方向光栅 + 解析；
+// 4) 回读哈希表/计数并检查溢出；5) 取出无向边；6) 展开为有向边并建 CSR；
+// 7) 应用下边界并回传计数；8) 计算闭合误差诊断；9) 创建求解资源/描述符/管线。
+// 溢出时抛 RasterLayerOverflow 或 EdgeHashOverflow（片元溢出优先）。
 GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     const std::vector<Direction>& directions)
 {
@@ -1157,6 +1297,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     }
     destroySolveResources();
 
+    // 步骤 1：push constant：光栅尺寸、每像素最大层数、哈希容量，以及周期域尺寸与邻接瓦片数。
+    // viewProjection/viewDirection 在每个方向的循环里填写。
     VisibilityPush push{};
     push.raster[0] = m_config.rasterWidth;
     push.raster[1] = m_config.rasterHeight;
@@ -1167,6 +1309,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     push.periodic[2] = static_cast<float>(m_config.periodicNeighborCount);
 
     VkCommandBuffer commandBuffer = beginCommands();
+    // 步骤 2：清零累积缓冲；边键填 0xFFFFFFFF（即 kEmptyEdgeKey，表示空槽），
+    // 各方向的计数在 GPU 上累加，直到全部方向处理完才回读。
     vkCmdFillBuffer(commandBuffer, m_edgeKeys.buffer, 0, m_edgeKeys.size, 0xffffffffU);
     vkCmdFillBuffer(commandBuffer, m_edgeCounts.buffer, 0, m_edgeCounts.size, 0U);
     vkCmdFillBuffer(commandBuffer, m_denominator.buffer, 0, m_denominator.size, 0U);
@@ -1195,6 +1339,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
                                              0,
                                              nullptr};
 
+    // 步骤 3：逐方向：清 pixelCounts → 光栅化全部面元写入 A-buffer → 计算着色器解析并累加。
+    // 每个方向一个命令缓冲，同步提交。
     // DEFERRED[低] 性能: 每个可见性方向单独 beginCommands/endCommands（每次新建 fence 并阻塞 vkWaitForFences），方向数大时 CPU-GPU 往返成为瓶颈；建议：把多个方向录制进同一命令缓冲（方向间已有 resolveToNext 屏障），批量提交。
     for (const Direction& inputDirection : directions) {
         commandBuffer = beginCommands();
@@ -1210,6 +1356,7 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
         push.viewDirection[3] = 0.0f;
 
         vkCmdFillBuffer(commandBuffer, m_pixelCounts.buffer, 0, m_pixelCounts.size, 0U);
+        // 每个方向前清零每像素片元计数 pixelCounts。
         VkMemoryBarrier countClear{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         countClear.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         countClear.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1217,6 +1364,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
                              1, &countClear, 0, nullptr, 0, nullptr);
 
+        // 光栅：instance 数 = 周期邻接瓦片数 + 1（本体 + 邻接复制体，复制体只参与遮挡），
+        // 邻接数最多取 20（与 periodicTileOffset 表一致）。
         vkCmdBeginRenderPass(commandBuffer, &renderBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
@@ -1239,6 +1388,7 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                              1, &rasterToResolve, 0, nullptr, 0, nullptr);
 
+        // 解析：visibility_resolve 每线程一个像素（工作组 64 线程），排序片元并写边哈希/计数。
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 m_visibilityPipelineLayout, 0, 1,
@@ -1261,6 +1411,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
         endCommands(commandBuffer);
     }
 
+    // 步骤 4：回读哈希表、各 side 计数与统计量。statistics[0] = A-buffer 溢出，
+    // [1] = 哈希表溢出，[2] = 溢出时观察到的最深片元列表长度（用于下次扩层）。
     // DEFERRED[中] 内存: 整张边哈希表（容量可达 maxStorageBufferRange/8，即最多 ~512M 项 → 4 GiB 键 + 2 GiB 计数）一次性回读到主机，另外 downloadBuffer 还要分配同样大小的 host-visible staging，容易耗尽内存；建议：在 GPU 上先压缩非空槽（prefix-sum/compaction）再回读，或分块回读。
     std::vector<uint64_t> edgeKeys(m_hashCapacity);
     std::vector<uint32_t> edgeCounts(m_hashCapacity);
@@ -1291,6 +1443,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
         throw EdgeHashOverflow();
     }
 
+    // 步骤 5：收集非空槽为无向边：键高 32 位为 sideA，低 32 位为 sideB，值为射线计数；
+    // side 下标越界说明 GPU 结果损坏，直接报错。
     std::vector<std::pair<uint64_t, uint32_t>> undirectedEdges;
     undirectedEdges.reserve(std::min<uint32_t>(m_hashCapacity / 16U, 1U << 20U));
     for (uint32_t slot = 0; slot < m_hashCapacity; ++slot) {
@@ -1305,6 +1459,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
         undirectedEdges.emplace_back(edgeKeys[slot], edgeCounts[slot]);
     }
 
+    // 步骤 6：把无向边展开为双向的有向边并建 CSR：先统计每行度数并前缀和得到行偏移，
+    // 再按键排序后填充，使浮点累加顺序可复现。
     m_rowOffsetsCpu.assign(surfaceCount() + 1U, 0U);
     for (const auto& entry : undirectedEdges) {
         const uint32_t sideA = static_cast<uint32_t>(entry.first >> 32U);
@@ -1328,6 +1484,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
         m_edgesCpu[cursor[sideB]++] = {sideA, count};
     }
     diagnostics.directedEdgeCount = static_cast<uint32_t>(m_edgesCpu.size());
+    // 步骤 7：没有任何 side 有采样则无法求解（报错）；之后应用下边界，
+    // 并把调整后的分母/天空/地面计数写回 GPU。
     if (std::none_of(m_denominatorCpu.begin(), m_denominatorCpu.end(), [](uint32_t n){return n>0;}))
         throw std::runtime_error("Visibility raster has no surface samples; radiation results are invalid");
     // Lower boundary: downward escapes see the equivalent ground and the
@@ -1343,6 +1501,8 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     uploadBuffer(m_skyCounts, m_skyCountsCpu.data(), m_skyCountsCpu.size() * sizeof(uint32_t));
     uploadBuffer(m_groundCounts, m_groundCountsCpu.data(), m_groundCountsCpu.size() * sizeof(uint32_t));
 
+    // 步骤 8：闭合误差诊断：对每个有效 side，（天空计数 + 地面逃逸计数 + 全部邻边计数）
+    // 应与分母相等，取 |比值 − 1| 的最大值写入 maxClosureError；无样本的 side 跳过。
     float maxClosureError = 0.0f;
     for (uint32_t side = 0; side < surfaceCount(); ++side) {
         if (m_groundCountsCpu[side] == kInactiveSide) continue;
@@ -1361,12 +1521,15 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     }
     diagnostics.maxClosureError = maxClosureError;
 
+    // 步骤 9：用新的 CSR 数据创建求解缓冲、描述符与管线。
     createSolveResources(diagnostics.directedEdgeCount);
     createSolveDescriptors();
     createSolvePipeline();
     return diagnostics;
 }
 
+// 作用：计算每个 oriented side 的直射日照比例（对外入口）。
+// A-buffer 溢出（低太阳高度角会使每像素片元更多）时扩层、重建几何与可见性图后重试。
 std::vector<float> FacetrtVulkan::computeSunlitFraction(const Direction& sunDirection)
 {
     for (;;) {
@@ -1387,6 +1550,10 @@ std::vector<float> FacetrtVulkan::computeSunlitFraction(const Direction& sunDire
     }
 }
 
+// 作用：沿 sunDirection（指向太阳）做一次直射可见性光栅，返回长度 2×面元数的比例数组：
+// visible/total，其中 total 为落在该 side 上的样本数，visible 为其中最近（未被遮挡）的样本数。
+// 无样本的 side 返回 NaN，由调用者用邻近面估计。
+// 为了让小于一个像素的面元也有样本，对栅格做 4×4 的亚像素抖动，共 16 次累加。
 std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sunDirection)
 {
     if (m_directResolvePipeline == VK_NULL_HANDLE || m_facetCount == 0U) {
@@ -1409,6 +1576,7 @@ std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sun
     push.periodic[2] = static_cast<float>(m_config.periodicNeighborCount);
 
     VkCommandBuffer commandBuffer = beginCommands();
+    // 步骤 1：清零直射计数与统计量，16 次抖动的结果累加在同一缓冲中。
     vkCmdFillBuffer(commandBuffer, m_directTotal.buffer, 0, m_directTotal.size, 0U);
     vkCmdFillBuffer(commandBuffer, m_directVisible.buffer, 0, m_directVisible.size, 0U);
     vkCmdFillBuffer(commandBuffer, m_visibilityStats.buffer, 0, m_visibilityStats.size, 0U);
@@ -1418,6 +1586,8 @@ std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sun
                               static_cast<float>(m_config.rasterHeight), 0.0f, 1.0f};
     const VkRect2D scissor{{0, 0}, {m_config.rasterWidth, m_config.rasterHeight}};
     const uint64_t pixels = uint64_t(m_config.rasterWidth) * m_config.rasterHeight;
+    // 步骤 2：亚像素抖动循环。每次把 viewProjection 平移半个像素范围内的偏移（NDC 单位），
+    // 清 pixelCounts → 光栅（使用 m_directDescriptorSet）→ direct_resolve 累加 total/visible。
     // Facets smaller than a pixel are sampled with probability ~ their area,
     // and an unsampled facet has no sunlit estimate. Stratified sub-pixel
     // jitter multiplies the samples by kSunJitter^2.
@@ -1489,6 +1659,7 @@ std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sun
         0,1,&readback,0,nullptr,0,nullptr);
     endCommands(commandBuffer);
 
+    // 步骤 3：回读计数；片元溢出（statistics[0]）则记录所需层数并抛 RasterLayerOverflow。
     std::vector<uint32_t> total(surfaceCount());
     std::vector<uint32_t> visible(surfaceCount());
     std::array<uint32_t, 4> statistics{};
@@ -1511,6 +1682,8 @@ std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sun
     return fraction;
 }
 
+// 作用：校验光学参数：长度必须是 2×面元数；值有限且非负；反射率+透射率 <= 1.0001（容差）；
+// emission 允许为负，但 emission + reflectance×directIrradiance 不得为负（见内部说明）。
 void FacetrtVulkan::validateOptics(const std::vector<SurfaceOptics>& optics) const
 {
     if (optics.size() != surfaceCount()) {
@@ -1534,6 +1707,9 @@ void FacetrtVulkan::validateOptics(const std::vector<SurfaceOptics>& optics) con
     }
 }
 
+// 作用：录制一次完整的辐射度求解：两份 ping-pong 辐射度与残差清零（初值为 0），
+// 从 ping=0 做 iterations 次 Jacobi 迭代，再计算入射辐照度。
+// 返回最终结果所在的 ping 缓冲下标（0 表示 radiosityA，1 表示 radiosityB，待核对）。
 uint32_t FacetrtVulkan::recordSolve(VkCommandBuffer commandBuffer, float skyRadiosity, uint32_t iterations,
                                     float relaxation)
 {
@@ -1551,6 +1727,12 @@ uint32_t FacetrtVulkan::recordSolve(VkCommandBuffer commandBuffer, float skyRadi
     return ping;
 }
 
+// 作用：录制 iterations 次 Jacobi 辐射度扫描（radiosity.comp，每线程处理一个面元的两侧）。
+// 输入：ping = 当前读取的缓冲（0=radiosityA，1=radiosityB），每次扫描写另一份后翻转；
+// 返回最后一次扫描所写缓冲的下标（即当前迭代值所在缓冲）。
+// 每次扫描先清零 residual（存放本次最大变化量，float 位模式），有地面时先更新等效地面均值
+// （保证与 Jacobi 迭代一致）；indirect=true 时工作组数取自 m_spectralDispatch（光谱加速模式）。
+// 副作用：++m_solveGeneration，使 evaluateEnergy 不再沿用旧的热启动结果。
 uint32_t FacetrtVulkan::recordIterations(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity,
                                         uint32_t iterations, float relaxation, bool indirect)
 {
@@ -1586,6 +1768,7 @@ uint32_t FacetrtVulkan::recordIterations(VkCommandBuffer commandBuffer, uint32_t
     return ping;
 }
 
+// 作用：计算/传输之间的全局内存屏障，也让结果对主机读取与间接调度可见。
 void FacetrtVulkan::computeBarrier(VkCommandBuffer commandBuffer) const
 {
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1599,6 +1782,8 @@ void FacetrtVulkan::computeBarrier(VkCommandBuffer commandBuffer) const
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+// 作用：用 ground_mean.comp（单个工作组）把 ping 缓冲中地面朝上侧按面积权重求均值，
+// 写入 m_groundMean（等效地面辐射度）；结束后重新绑定 radiosity 管线，供后续扫描使用。
 void FacetrtVulkan::recordGroundMean(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity)
 {
     SolvePush push{m_facetCount, ping, skyRadiosity, 1.0f};
@@ -1617,6 +1802,7 @@ void FacetrtVulkan::recordGroundMean(VkCommandBuffer commandBuffer, uint32_t pin
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_solvePipeline);
 }
 
+// 作用：回读最近一次求解/入射计算得到的等效地面辐射度；尚未创建缓冲时返回 0。
 float FacetrtVulkan::groundRadiosity() const
 {
     if (m_groundMean.buffer == VK_NULL_HANDLE) return 0.0f;
@@ -1625,6 +1811,9 @@ float FacetrtVulkan::groundRadiosity() const
     return value;
 }
 
+// 作用：录制末态的等效地面均值，并在有 incident 管线时按 side 计算入射辐照度（写 m_incident）。
+// 没有 incident 管线（设备无 shaderFloat64）时只更新地面均值，入射需由 CPU 的
+// incidentIrradiance() 计算。
 void FacetrtVulkan::recordIncident(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity)
 {
     // Final equivalent ground of this solve (incident pass and diagnostics).
@@ -1642,6 +1831,11 @@ void FacetrtVulkan::recordIncident(VkCommandBuffer commandBuffer, uint32_t ping,
     computeBarrier(commandBuffer);
 }
 
+// 模块：GPU 能量平衡（energy.comp）的资源。布局与 faceteb/energy.comp 的头注释一致：
+//   0 参数 P（每面元 32 float）、1 输入 I（每（状态,侧）12 float，状态 0=日照 1=阴影）、
+//   2 温度 T（每（状态,侧）1 float）、3 通量 F（每（状态,侧）12 float）、
+//   4 optics 与 5 incident（与求解阶段共用）、6 stats（7 个 uint32，主机可见，用于读回）。
+// push constant 为 EnergyPush（48 字节）。
 void FacetrtVulkan::createEnergyResources()
 {
     static_assert(sizeof(EnergyPush) == 48);
@@ -1710,6 +1904,7 @@ void FacetrtVulkan::createEnergyResources()
             "energy pipeline");
 }
 
+// 作用：释放能量平衡的管线、描述符与缓冲，并清空句柄。
 void FacetrtVulkan::destroyEnergyResources()
 {
     if (m_energyPipeline)
@@ -1732,6 +1927,10 @@ void FacetrtVulkan::destroyEnergyResources()
     destroyBuffer(m_energyStats);
 }
 
+// 作用：开始一个能量平衡节点：校验并上传面元参数、输入和初始温度，保存 push constant。
+// 校验：GPU 能量可用；数组长度与面元数匹配（参数 32/面元，输入 12×2 个/side，
+// 温度 2 个/side）；push.facets 等于面元数；method 只能是 0 或 1；dt、pressure、relaxation
+// 必须为正；所有数值有限。
 void FacetrtVulkan::beginEnergyNode(const EnergyPush &push, const std::vector<float> &parameters,
                                     const std::vector<float> &inputs, const std::vector<float> &temperatures)
 {
@@ -1751,12 +1950,15 @@ void FacetrtVulkan::beginEnergyNode(const EnergyPush &push, const std::vector<fl
     updateEnergyInputs(inputs);
     uploadBuffer(m_energyTemperatures, temperatures.data(), temperatures.size() * sizeof(float));
 }
+// 作用：仅重新上传输入 I（每（状态,侧）12 个 float，各分量含义见 energy.comp 头注释）。
 void FacetrtVulkan::updateEnergyInputs(const std::vector<float> &inputs)
 {
     if (inputs.size() != size_t(surfaceCount()) * 2 * 12)
         throw std::invalid_argument("GPU energy input dimensions");
     uploadBuffer(m_energyInputs, inputs.data(), inputs.size() * sizeof(float));
 }
+// 作用：录制一次 energy.comp 调度（每线程一个面元），phase 取值：
+// 0 = 计算通量与残差统计，1 = 牛顿更新温度，2 = 由当前温度更新长波光学参数。
 void FacetrtVulkan::recordEnergy(VkCommandBuffer commandBuffer, uint32_t phase)
 {
     computeBarrier(commandBuffer);
@@ -1769,6 +1971,9 @@ void FacetrtVulkan::recordEnergy(VkCommandBuffer commandBuffer, uint32_t phase)
     vkCmdDispatch(commandBuffer, (m_facetCount + 63U) / 64U, 1, 1);
     computeBarrier(commandBuffer);
 }
+// 作用：读回 energy.comp 写入的 7 个统计量：stats[0..4] 为 EnergyStatistics::maxima
+// （最大残差、最大残差/响应、最大气孔失配、最大叶残差、最大温度步长），stats[6] 为能量不闭合
+// 面元数；stats[5] 非 0 表示出现非有限值或无效生理量，此时抛 runtime_error。
 EnergyStatistics FacetrtVulkan::readEnergyStatistics()
 {
     void *mapped = nullptr;
@@ -1783,11 +1988,16 @@ EnergyStatistics FacetrtVulkan::readEnergyStatistics()
     values.failingFacets = bits[6];
     return values;
 }
+// 作用：对当前温度做一次“长波辐射 + 能量通量”评估，返回残差统计（供外层耦合迭代判断收敛）。
+// 步骤：清统计 → phase 2 更新长波 optics → 长波 Jacobi 求解（冷启动 64 次扫描；
+// 沿用上次结果时 16 次）→ phase 0 计算通量与残差 → 读回统计。
 EnergyStatistics FacetrtVulkan::evaluateEnergy(float skyRadiosity)
 {
     VkCommandBuffer cmd = beginCommands();
     vkCmdFillBuffer(cmd, m_energyStats.buffer, 0, m_energyStats.size, 0);
     recordEnergy(cmd, 2);
+    // 步骤：长波辐射求解。仅当自上次 evaluateEnergy 以来没有其他求解动过 ping-pong 缓冲
+    // （m_solveGeneration 未变）才热启动，否则冷启动。
     // Longwave Jacobi. The first evaluation after any other solve starts cold
     // with 64 sweeps. Later coupling iterations start from the previous
     // longwave radiosity, which only differs through the temperature update;
@@ -1813,6 +2023,7 @@ EnergyStatistics FacetrtVulkan::evaluateEnergy(float skyRadiosity)
     endCommands(cmd);
     return readEnergyStatistics();
 }
+// 作用：执行 phase 1 的牛顿温度更新，返回本步最大温度步长 stats[4]（K，用于判断收敛）。
 float FacetrtVulkan::updateEnergyTemperature()
 {
     VkCommandBuffer cmd = beginCommands();
@@ -1821,6 +2032,8 @@ float FacetrtVulkan::updateEnergyTemperature()
     endCommands(cmd);
     return readEnergyStatistics().maxima[4];
 }
+// 作用：读回温度与通量；includeRadiation=true 时还读回 optics、末态辐射度（取最后一次
+// evaluateEnergy 所在 ping 缓冲）、入射辐照度、最大变化量、迭代次数与等效地面辐射度。
 EnergySnapshot FacetrtVulkan::readEnergyState(bool includeRadiation)
 {
     EnergySnapshot result;
@@ -1848,6 +2061,9 @@ EnergySnapshot FacetrtVulkan::readEnergyState(bool includeRadiation)
     return result;
 }
 
+// 作用：固定迭代次数的辐射度求解（Jacobi，初值为 0）。
+// 输入：逐 side 的光学参数、天空辐射度（非负）、迭代数、松弛因子 relaxation ∈ (0,1]；
+// 输出：辐射度、最后一次扫描的最大变化量 maxDelta、（有 incident 管线时）入射辐照度。
 SolveResult FacetrtVulkan::solve(const std::vector<SurfaceOptics> &optics, float skyRadiosity, uint32_t iterations,
                                  float relaxation)
 {
@@ -1885,6 +2101,9 @@ SolveResult FacetrtVulkan::solve(const std::vector<SurfaceOptics> &optics, float
     return result;
 }
 
+// 作用：带收敛判据的辐射度求解：每批 batchIterations 次扫描后回读 maxDelta，
+// 不超过 tolerance 或达到 maximumIterations 即停止；可给定初值 initialRadiosity 热启动。
+// 步骤：1) 校验输入；2) 初始化 ping-pong 缓冲；3) 分批迭代；4) 计算入射并回读结果。
 SolveResult FacetrtVulkan::solveAccelerated(
     const std::vector<SurfaceOptics>& optics,
     float skyRadiosity,
@@ -1922,6 +2141,7 @@ SolveResult FacetrtVulkan::solveAccelerated(
     }
 
     uploadBuffer(m_optics, optics.data(), optics.size() * sizeof(SurfaceOptics));
+    // 步骤 2：初始化两份 ping-pong 缓冲：有初值则都写入初值，否则清零（光学参数已在上面上传）。
     ++m_solveGeneration; // overwrites the ping-pong buffers below
     if (initialRadiosity != nullptr) {
         const VkDeviceSize bytes =
@@ -1939,6 +2159,7 @@ SolveResult FacetrtVulkan::solveAccelerated(
 
     SolveResult result{};
     uint32_t ping = 0U;
+    // 步骤 3：分批迭代；每批结束同步一次并回读最大变化量，用于判断是否已收敛。
     while (result.iterations < maximumIterations) {
         const uint32_t count = std::min(
             batchIterations, maximumIterations - result.iterations);
@@ -1955,6 +2176,7 @@ SolveResult FacetrtVulkan::solveAccelerated(
         }
     }
 
+    // 步骤 4：计算入射辐照度与等效地面，回读最终辐射度与入射辐照度。
     VkCommandBuffer incidentCommands = beginCommands();
     recordIncident(incidentCommands, ping, skyRadiosity);
     endCommands(incidentCommands);
@@ -1970,6 +2192,11 @@ SolveResult FacetrtVulkan::solveAccelerated(
     return result;
 }
 
+// 作用：CPU 版入射辐照度（GPU 已有结果 solution.incident 时直接返回）。
+// 公式：E = max(0, [N_sky·L_sky + N_ground·L_ground + Σ_j count_j·B_j] / N + E_direct)，
+// 其中 N 为该 side 的采样总数（denominator），B_j 为邻接 side 的辐射度。
+// 分母为 0（无栅格样本）的 side 按全天空处理（diffuse = skyRadiosity，见 buildVisibilityGraphOnce 中的 DEFERRED 说明）；
+// 失效的地面背侧只取直射项。
 std::vector<float> FacetrtVulkan::incidentIrradiance(
     const SolveResult& solution,
     const std::vector<SurfaceOptics>& optics,
@@ -2018,22 +2245,34 @@ std::vector<float> FacetrtVulkan::incidentIrradiance(
     return irradiance;
 }
 
+// 作用：开始一次光谱求解会话：上传面元记录与材料光谱，创建 spectral.comp 管线。
+// 输入：facets = 每面元 12 个 float（其后可接 Hapke 查表）；materialBands = 每（波段,材料）
+// 4 个 float（反射率、透射率、日照侧热发射、阴影侧热发射）；sun = 太阳方向；
+// backgroundStrength = Hapke 背景强度；beamIrradiance = 光束法向辐照度。
+// 输出缓冲 m_spectralOutput 大小为 (3×bands+1)×side 数 个 float：
+//   [band*n+s] 辐射度；[bands*n+2*(band*n+s)+{0,1}] 亮/阴状态；[3*bands*n+s] 漫射模式的直射分量。
+// 步骤：1) 校验输入；2) 保存 push 默认值；3) 创建缓冲并上传；4) 创建 10 绑定的描述符；
+// 5) 创建管线；6) 清零输出。布局须与 spectral.comp 的头注释一致。
 void FacetrtVulkan::beginSpectral(const std::vector<float>& facets, const std::vector<float>& materialBands,
                                  uint32_t bands, uint32_t materials, const Direction& sun, float backgroundStrength,
                                  float beamIrradiance)
 {
+    // 步骤 1：校验：需已建好求解管线；面元记录不少于 12×面元数；材料数组大小 = 波段×材料×4；全部有限。
     // Facet records (12 floats each), optionally followed by the Hapke tables.
     if (m_solvePipeline == VK_NULL_HANDLE || facets.size() < size_t(m_facetCount) * 12U || bands == 0 ||
         materials == 0 || materialBands.size() != size_t(bands) * materials * 4U)
         throw std::invalid_argument("Invalid spectral facet/material layout");
     for (float v : facets) if (!std::isfinite(v)) throw std::invalid_argument("Non-finite spectral facet");
     for (float v : materialBands) if (!std::isfinite(v)) throw std::invalid_argument("Invalid material spectrum");
+    // 步骤 2：释放旧会话并初始化 push（phase=0、scale=1、thermal=0）。
     destroySpectralResources();
     static_assert(sizeof(SpectralPush) == 56);
     m_spectralPush = {0, 0, m_facetCount, materials, sun.x, sun.y, sun.z, backgroundStrength,
                       beamIrradiance, 1, 0, 0, bands, 0};
     const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const auto device = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    // 步骤 3：创建缓冲。输出缓冲不得超过 maxStorageBufferRange，且元素下标须能放进 uint32。
+    // m_spectralConvergence 为主机可见（迭代数、最大变化量）；m_spectralDispatch 是间接调度参数。
     const VkDeviceSize outputBytes = (VkDeviceSize(bands) * 3U + 1U) * surfaceCount() * sizeof(float);
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
@@ -2049,6 +2288,8 @@ void FacetrtVulkan::beginSpectral(const std::vector<float>& facets, const std::v
     m_spectralDispatch = createBuffer(8U * sizeof(uint32_t), usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, device);
     uploadBuffer(m_spectralFacets, facets.data(), facets.size() * sizeof(float));
     uploadBuffer(m_spectralMaterials, materialBands.data(), materialBands.size() * sizeof(float));
+    // 步骤 4：描述符绑定：0 面元，1 材料，2 optics（与求解共用），3 发射，4/5 辐射度 A/B，
+    // 6 上次物理辐射度（热启动），7 输出，8 间接调度参数，9 residual（与求解共用）。
     std::array<VkDescriptorSetLayoutBinding, 10> bindings{};
     for (uint32_t i = 0; i < bindings.size(); ++i)
         bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -2074,6 +2315,7 @@ void FacetrtVulkan::beginSpectral(const std::vector<float>& facets, const std::v
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[i].pBufferInfo = &infos[i];
     }
     vkUpdateDescriptorSets(m_device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+    // 步骤 5：创建 spectral.comp 管线（着色器模块创建后立即销毁）。
     const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SpectralPush)};
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout.setLayoutCount = 1; layout.pSetLayouts = &m_spectralSetLayout;
@@ -2088,10 +2330,12 @@ void FacetrtVulkan::beginSpectral(const std::vector<float>& facets, const std::v
     vkDestroyShaderModule(m_device, module, nullptr);
     require(created, "spectral compute pipeline");
     auto cmd = beginCommands();
+    // 步骤 6：输出缓冲清零。
     vkCmdFillBuffer(cmd, m_spectralOutput.buffer, 0, m_spectralOutput.size, 0U);
     computeBarrier(cmd); endCommands(cmd);
 }
 
+// 作用：录制一次 spectral.comp 调度（每线程一个 side）；phase 见 solveSpectralBand。
 void FacetrtVulkan::recordSpectral(VkCommandBuffer commandBuffer, const SpectralPush& push)
 {
     computeBarrier(commandBuffer);
@@ -2102,6 +2346,13 @@ void FacetrtVulkan::recordSpectral(VkCommandBuffer commandBuffer, const Spectral
     computeBarrier(commandBuffer);
 }
 
+// 作用：求解一个光谱波段并把结果写入 m_spectralOutput（用 readSpectralOutput 读回）。
+// 参数：thermal=热红外波段；sky=天空辐射度；scale=输出缩放；accelerated=用收敛判据的
+// 间接调度（否则固定 64 次扫描）；warmStart=用上次结果作初值（仅加速模式）；
+// diffuse=只做漫射求解（仅 band 0）；beam>=0 覆盖该波段的光束辐照度。
+// spectral.comp 的 phase：0 生成 optics/发射，4 漫射模式清直射项，5/6 加速模式的间接调度
+// 初始化/更新，2 输出辐射度与亮阴状态，3 漫射输出。
+// 步骤：1) 设置 push；2) phase 0/4；3) 设初值；4) 迭代；5) 入射 + 输出；6) 读回收敛信息。
 SolveResult FacetrtVulkan::solveSpectralBand(uint32_t band, bool thermal, float sky, float scale,
                                            bool accelerated, bool warmStart, bool diffuse, float beam)
 {
@@ -2109,14 +2360,17 @@ SolveResult FacetrtVulkan::solveSpectralBand(uint32_t band, bool thermal, float 
         !std::isfinite(scale) || scale <= 0 || (diffuse && band != 0) || !std::isfinite(beam))
         throw std::invalid_argument("Invalid GPU spectral band solve");
     auto push = m_spectralPush;
+    // 步骤 1：以 beginSpectral 的 push 为基础设置波段、热红外标志、光束与缩放。
     // Per-band beam-normal irradiance (beam < 0: the value from beginSpectral).
     // Thermal bands pass their 2.5-6 um solar beam in radiance units (0 above
     // 6 um), so the shader applies it exactly like the optical beam.
     const float bandBeam = beam >= 0.0f ? beam : (thermal ? 0.0f : m_spectralPush.beam);
     push.band = band; push.thermal = thermal; push.beam = bandBeam; push.scale = scale;
     push.phase = diffuse ? 4U : 0U;
+    // 步骤 2：录制 phase 0（漫射模式为 4）生成该波段的光学参数与发射。
     auto cmd = beginCommands();
     recordSpectral(cmd, push);
+    // 步骤 3：初值：加速 + 热启动时用上次物理辐射度作为 A/B 初值，否则清零。
     if (warmStart && accelerated) {
         const VkBufferCopy copy{0, 0, m_spectralPrevious.size};
         vkCmdCopyBuffer(cmd, m_spectralPrevious.buffer, m_radiosityA.buffer, 1, &copy);
@@ -2127,6 +2381,9 @@ SolveResult FacetrtVulkan::solveSpectralBand(uint32_t band, bool thermal, float 
     }
     computeBarrier(cmd);
     uint32_t ping = 0U;
+    // 步骤 4：迭代。加速模式：phase 5 初始化间接调度参数，随后 8 批（每批 8 次扫描 + phase 6
+    // 更新收敛状态），把迭代数与最大变化量从 m_spectralDispatch 拷到 convergence 缓冲
+    // （具体收敛逻辑见 spectral.comp，待核对）；否则固定 64 次扫描并拷贝 residual。
     if (accelerated) {
         push.phase = 5U;
         recordSpectral(cmd, push);
@@ -2143,6 +2400,8 @@ SolveResult FacetrtVulkan::solveSpectralBand(uint32_t band, bool thermal, float 
         const VkBufferCopy copy{0, sizeof(uint32_t), sizeof(uint32_t)};
         vkCmdCopyBuffer(cmd, m_residual.buffer, m_spectralConvergence.buffer, 1, &copy);
     }
+    // 步骤 5：计算入射辐照度与等效地面，再用 phase 2（漫射为 3）把辐射度整理进输出缓冲；
+    // 提交后读回迭代数与最大变化量（非加速模式固定记为 64 次）。
     recordIncident(cmd, ping, sky);
     push.ping = ping; push.phase = diffuse ? 3U : 2U;
     recordSpectral(cmd, push); endCommands(cmd);
@@ -2157,6 +2416,7 @@ SolveResult FacetrtVulkan::solveSpectralBand(uint32_t band, bool thermal, float 
     return result;
 }
 
+// 作用：读回整个光谱输出缓冲（布局见 beginSpectral）。
 std::vector<float> FacetrtVulkan::readSpectralOutput()
 {
     if (m_spectralPipeline == VK_NULL_HANDLE) throw std::logic_error("No spectral output");
@@ -2165,6 +2425,8 @@ std::vector<float> FacetrtVulkan::readSpectralOutput()
     return output;
 }
 
+// 作用：审计用读回：optics、发射、上次物理辐射度，以及指定波段的输出与亮/阴状态切片
+// （偏移 b = band×n，状态起点 k = bands×n + 2b）。
 SpectralAudit FacetrtVulkan::readSpectralAudit(uint32_t band)
 {
     SpectralAudit audit;
@@ -2179,6 +2441,7 @@ SpectralAudit FacetrtVulkan::readSpectralAudit(uint32_t band)
     return audit;
 }
 
+// 作用：释放光谱会话的管线、描述符与缓冲。
 void FacetrtVulkan::destroySpectralResources()
 {
     if (m_spectralPipeline) vkDestroyPipeline(m_device, m_spectralPipeline, nullptr);
@@ -2192,12 +2455,15 @@ void FacetrtVulkan::destroySpectralResources()
     destroyBuffer(m_spectralDispatch);
 }
 
+// 作用：审计用：保留的参考求解器改写 m_optics 后，重新上传指定的 optics。
 void FacetrtVulkan::restoreSpectralOptics(const std::vector<SurfaceOptics>& optics)
 {
     validateOptics(optics);
     uploadBuffer(m_optics, optics.data(), optics.size() * sizeof(SurfaceOptics));
 }
 
+// 作用：释放求解阶段的全部资源（光谱、能量、incident、地面、radiosity 管线、CSR 与
+// 辐射度缓冲）并清空 CPU 侧 CSR。可重复调用；设备未创建时直接返回。
 void FacetrtVulkan::destroySolveResources()
 {
     if (m_device == VK_NULL_HANDLE) {
@@ -2240,6 +2506,7 @@ void FacetrtVulkan::destroySolveResources()
     m_edgesCpu.clear();
 }
 
+// 作用：释放可见性阶段的管线、渲染通道、描述符与缓冲，并清空 CPU 侧计数副本。
 void FacetrtVulkan::destroyVisibilityResources()
 {
     if (m_device == VK_NULL_HANDLE) {
@@ -2295,6 +2562,8 @@ void FacetrtVulkan::destroyVisibilityResources()
     m_groundCountsCpu.clear();
 }
 
+// 作用：完整销毁：等待设备空闲 → 求解资源 → 可见性资源 → 命令池 → 设备 → 校验 messenger →
+// 实例，并把句柄与计数复位，使对象可再次 initialize。
 void FacetrtVulkan::destroy()
 {
     if (m_device != VK_NULL_HANDLE) {

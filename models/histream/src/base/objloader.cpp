@@ -1,3 +1,22 @@
+// ==========================================================================
+// 文件：objloader.cpp
+// 功能：ObjLoader 的实现：把 OBJ 文件、背景平面或 DEM 地形转换成引擎使用的 ObjMesh
+//   （顶点 VertexAttribute + 三角形索引），并提供 DEM 高程查询。
+// 主要模块：
+//   1. 匿名命名空间辅助：越界顶点检查、tinyobj 读取结果校验、材质 id 读取
+//   2. loadModel：读入整个 OBJ（所有 shape）；loadMesh：按名称读入指定网格
+//   3. createBackground / createGridBackground：y=0 的矩形或网格化背景地面
+//   4. creatBackgroundFromDEM：GDAL 读取 DEM → 重采样 → 生成地形网格并保存高程图
+//   5. getHeightAt / interpolateZValues：在高程图上双线性插值（地表高度 / 离地高度换算）
+//   6. 文件中大段被注释掉的 DEM 历史实现仅供参考，不参与编译
+// 数据流：文件或参数 → ObjLoader 内部 m_vertices / m_indices → 复制到公开成员 m_objmesh，
+//   由 scene.cpp 取走构建场景网格（loadModel / loadMesh / create*Background / interpolateZValues）。
+// 与其他文件：声明见 objloader.h；tinyobj 的实现由本文件定义 TINYOBJLOADER_IMPLEMENTATION 引入；
+//   使用 GDAL 与 OpenCV（cv::Mat、cv::resize）处理 DEM。
+// 约定：引擎统一右手系 +X 北、+Y 向上、+Z 东；背景与 DEM 网格以场景中心为原点，
+//   DEM 图像第 0 行为北（+X），列向东（+Z）；高程以 DEM 有效最小值为零点。
+// ==========================================================================
+
 /******************************************************************************
  * Copyright 1998-2018 NVIDIA Corp. All Rights Reserved.
  *****************************************************************************/
@@ -16,6 +35,7 @@
 
 namespace {
 // tinyobj only warns about out-of-range face indices and still reports Valid().
+// 作用：按 OBJ 顶点下标取该顶点的 xyz 指针；下标越界时抛 runtime_error（tinyobj 对此只告警）。
 const float* objVertex(const tinyobj::attrib_t& attrib, int vertexIndex, const std::string& filename)
 {
     if (vertexIndex < 0 || static_cast<size_t>(vertexIndex) * 3 + 2 >= attrib.vertices.size())
@@ -23,12 +43,14 @@ const float* objVertex(const tinyobj::attrib_t& attrib, int vertexIndex, const s
     return &attrib.vertices[static_cast<size_t>(vertexIndex) * 3];
 }
 
+// 作用：OBJ 解析失败（!Valid()）时抛异常，信息中带文件名与 tinyobj 的错误文本。
 void requireValidObj(const tinyobj::ObjReader& reader, const std::string& filename)
 {
     if (!reader.Valid())
         throw std::runtime_error("Cannot load OBJ: " + filename + " " + reader.Error());
 }
 
+// 作用：取形状第一个面的材质 id，无面材质信息时返回 -1（本类实际不使用材质，仅记录到 ShapeInfo）。
 int firstMaterialId(const tinyobj::shape_t& shape)
 {
     return shape.mesh.material_ids.empty() ? -1 : shape.mesh.material_ids[0];
@@ -51,6 +73,9 @@ int firstMaterialId(const tinyobj::shape_t& shape)
 /// 把obj文件中所有的mesh都读取进去，只读取vertex和index
 /// </summary>
 /// <param name="filename"></param>
+// 步骤：1) 用 tinyobj 解析文件；2) 逐 shape 记录 ShapeInfo（顶点偏移、面数、名称）；
+//   3) 按面角展开顶点（不共享顶点，索引顺序递增）；4) 同时统计最低高程 minElevation（y 方向）；
+//   5) 把顶点/索引整体复制到 m_objmesh。只读位置，法线/纹理/颜色/材质均不读取。
 void ObjLoader::loadModel(const std::string& filename)
 {
     clearCurrentInfo();
@@ -172,6 +197,10 @@ void ObjLoader::loadModel(const std::string& filename)
 /// </summary>
 /// <param name="filename"></param>
 /// <param name="meshname"></param>
+// 步骤：1) 解析文件；2) 判断是否存在名为 meshname 的 shape（同名 g 块会被 tinyobj 拆成多个 shape，
+//      都属于该网格）；3) 找不到时：exactMatch=false 则回退为加载整个 OBJ 并告警，
+//      exactMatch=true 则只告警、不加载任何网格；4) 按面角展开顶点，并读取纹理坐标（v 翻转为 1-v）
+//      与顶点颜色（若存在）；5) 复制到 m_objmesh。与 loadModel 不同：不更新 minElevation。
 void ObjLoader::loadMesh(const std::string& filename, const std::string& meshname,
                          bool exactMatch)
 {
@@ -248,6 +277,8 @@ void ObjLoader::loadMesh(const std::string& filename, const std::string& meshnam
     m_objmesh.indices = m_indices;
 }
 
+// 作用：生成 y=0 的矩形背景地面（两个三角形）。bgSize.x = x 方向长度，bgSize.y = z 方向宽度，
+//   以原点为中心；输出到 m_objmesh（6 个顶点、索引 0..5），并把 minElevation 置 0。
 void ObjLoader::createBackground(glm::vec3 bgSize)
 {
     clearCurrentInfo();
@@ -294,6 +325,10 @@ void ObjLoader::createBackground(glm::vec3 bgSize)
     minElevation = 0;
 }
 
+// 作用：生成 y=0 的网格化背景地面，使每个三角形的物理纹理系数可以逐格变化。
+// 输入：bgSize（x 方向长度、y 分量为 z 方向宽度，以原点为中心）、step（期望格距）；
+//   格距限幅：不小于 0.01，且每边最多约 2048 格（与 DEM 地面分辨率上限一致）。
+// 输出：m_objmesh（rows x columns 个顶点，每格两个三角形）；minElevation = 0。
 void ObjLoader::createGridBackground(glm::vec3 bgSize, float step)
 {
     clearCurrentInfo();
@@ -327,6 +362,8 @@ void ObjLoader::createGridBackground(glm::vec3 bgSize, float step)
 }
 
 
+// 说明：从此处起到 clearCurrentInfo 之前（含 getShiftInterp）都是被注释掉的历史版本（基于 ThinPlateSpline / Bilinear
+//   插值器的 DEM 地形生成），当前不参与编译，仅作参考；现行实现见下方 creatBackgroundFromDEM。
 // void ObjLoader::creatBackgroundFromDEM(const std::string& filename, nvmath::vec3f sceneSize)
 // {
 //     clearCurrentInfo();
@@ -870,6 +907,8 @@ void ObjLoader::createGridBackground(glm::vec3 bgSize, float step)
 
 
 
+// 说明：当前是空实现（原清空 m_vertices / m_indices 的语句已被注释）。因此各 load/create 函数
+//   靠自己 clear 或直接覆盖；loadModel / loadMesh 重复调用同一对象时会在旧数据后追加。
 void ObjLoader::clearCurrentInfo()
 {
 //    m_vertices.swap(std::vector<VertexAttribute>());
@@ -878,6 +917,10 @@ void ObjLoader::clearCurrentInfo()
 
 
 
+// 作用：查询世界坐标 (worldX, worldZ) 处的地形高度（m_heightmap 双线性插值）。
+// 输入：世界坐标（以场景中心为原点，+X 北、+Z 东）；输出：相对 centerElevation 的高度（y 坐标）。
+// 说明：高程图尚未生成、场景尺寸无效或点落在范围外时，返回 minElevation - centerElevation。
+//   图像行 0 对应北（+X），列向东（+Z），故行号由 1 - localX/size.x 得到。
 // 在类中实现该函数
 float ObjLoader::getHeightAt(float worldX, float worldZ)
 {
@@ -926,6 +969,16 @@ float ObjLoader::getHeightAt(float worldX, float worldZ)
 }
 
 
+// 模块：由 GeoTIFF/DEM 生成地形网格，并保存高程图供 getHeightAt / interpolateZValues 查询。
+// 输入：filename（GDAL 可读的 DEM，只用第 1 波段）、sceneSize（x = 北向长度，y = 东向宽度，
+//   单位与场景一致）、targetStep（期望网格间距）。
+// 输出：m_objmesh（共享顶点的规则网格）、m_heightmap（重采样后、已减去最低点的高程）、
+//   m_worldOrigin / m_worldSize / m_sceneSizeCache；centerElevation 置 0。
+// 步骤：1) 校验场景尺寸；2) 用 GDAL 读取 DEM；3) 无效值（nodata 或非有限）替换为有效最小值；
+//   4) 按 sceneSize 与间距重采样（每边最多约 2048 格）；5) 减去 DEM 最低点作为场景零高程；
+//   6) 生成顶点与三角形索引。
+// 说明：minElevation 在本函数中没有被更新（沿用旧值，默认 0），与 getHeightAt 的越界返回值有关（待核对）。
+//   失败（尺寸非法、打不开或读不出 DEM、无有效高程）时抛 std::runtime_error。
 void ObjLoader::creatBackgroundFromDEM(const std::string& filename,
                                         nvmath::vec3f sceneSize,
                                         float targetStep)
@@ -983,6 +1036,8 @@ void ObjLoader::creatBackgroundFromDEM(const std::string& filename,
 
     // Resample the complete DEM extent onto the configured scene extent:
     // rows run north-south along sceneSize.x, columns east along sceneSize.y.
+    // 步骤 4 说明：格距下限 0.01；并保证最长边不超过 2048 格（避免巨大 DEM 生成过密网格）。
+    //   行数对应 sceneSize.x，列数对应 sceneSize.y；整幅 DEM 范围被拉伸到配置的场景范围。
     const float requestedStep = std::max(targetStep, 0.01f);
     const float cappedStep = std::max(
         requestedStep,
@@ -995,6 +1050,7 @@ void ObjLoader::creatBackgroundFromDEM(const std::string& filename,
                0, 0, cv::INTER_LINEAR);
 
     // 以 DEM 最低点作为场景零高程，确保地表和后续导入对象使用同一基准。
+    // 步骤 5：高程减去 DEM 有效最小值，使地表最低点 y = 0；centerElevation 因此恒为 0。
     m_heightmap = m_heightmap - minimumElevation;
     centerElevation = 0.0f;
 
@@ -1005,6 +1061,8 @@ void ObjLoader::creatBackgroundFromDEM(const std::string& filename,
     m_worldOrigin = { -sceneSize.x / 2.0f, 0.0f, -sceneSize.y / 2.0f };
     m_worldSize = sceneSize;
 
+    // 步骤 6：生成网格。顶点数为 newRows*newCols（下方旧注释中的 (Rows+1)*(Cols+1) 与代码不符），
+    //   相邻四个顶点组成一格，拆成两个三角形。
     // 3. 生成网格 (Triangles)
     // 采用“共享顶点”方式，即 (Rows+1)*(Cols+1) 个顶点，而不是面片汤
     m_vertices.clear();
@@ -1065,6 +1123,12 @@ void ObjLoader::creatBackgroundFromDEM(const std::string& filename,
 }
 
 
+// 作用：把“相对地表的离地高度”转换为场景 y 坐标：对每个点按位置在 m_heightmap 上双线性插值，
+//   并把地表高程累加到 tempz[i]。
+// 输入：sceneSize；tempx / tempy 为 [0, sceneSize.x] / [0, sceneSize.y] 内的局部坐标（x 北、y 东），
+//   tempz 为离地高度（原地修改）；num_points 为点数。
+// 说明：超出范围的点保持原高度不变；高程图未初始化时 tempz 被清零并告警；场景尺寸无效时直接返回。
+//   索引上限取 size-1-0.0001，避免浮点误差越界。
 void ObjLoader::interpolateZValues(nvmath::vec3f sceneSize, float* tempx, float* tempy, float* tempz, int num_points)
 {
     // 场景尺寸无效时无法做归一化，保留输入中的离地高度。

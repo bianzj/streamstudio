@@ -1,3 +1,19 @@
+// ==========================================================================
+// 文件：voxelebio.h
+// 功能：VoxelEB 模式（体元能量平衡）的运行数据总容器 VoxelebIO
+// 主要模块：
+//   1. 系统与场景信息：目录、体元尺度/原点、步长、年/时区、初始土壤温度
+//   2. 气象与几何信息：meteos、传感器/光源、角度、波长、无人机位姿、大气/气溶胶条件
+//   3. 运行设置：时间节点、影像、过程开关、能量迭代与 Monin–Obukhov 稳定度诊断、船舶水线、
+//      短波直散分离（diffuseFractionMode）、流体（fluid*）参数
+//   4. GPU 缓冲：波长、大气、传感器、光源、气象、气溶胶、流体速度/标量/LBM 缓冲
+//   5. Vulkan 句柄：设备、队列、围栏、描述符、各管线与布局、SBT 等
+// 数据流：voxeleb.cpp 读入工程填充本类 → buffer/descriptor/pipeline/command 创建并使用 GPU 资源
+// 与其他文件的关系：由 voxeleb.h/voxeleb.cpp 使用；子 IO 结构（meshio、voxelio 等）在 base/*.h
+// 约定：长度 m、温度 K、辐照度 W m-2；voxelSize_XZY 的分量顺序为 X、Z、Y（待核对）；
+//   浮点缺省 NaN 表示“未配置”（如 initialSoilTemperature）
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/26.
 //
@@ -39,6 +55,7 @@ typedef nvvk::ResourceAllocatorVma Allocator;
 typedef nvvk::ResourceAllocatorDedicated Allocator;
 #endif
 
+// 类：VoxelEB 的数据容器（含 CPU 数据、GPU 缓冲句柄与 Vulkan 对象），各成员由 Voxeleb 各接口填充。
 class VoxelebIO {
 public:
 VoxelebIO(){
@@ -51,6 +68,7 @@ VoxelebIO(){
     m_voxelio = std::make_shared<VoxelIO>();
 };
 
+    // 模块 1：系统与场景信息。
     // system info
     std::string projectDir;
     std::string definedDir;
@@ -77,6 +95,7 @@ VoxelebIO(){
     int n_buffer = 0;
     int n_surface = 0;
 
+    // 模块 2：气象信息（逐时间节点的气象序列 meteos 与当前节点 meteo）。
     //Meteo Info
     std::vector<Meteo> meteos;
     Meteo meteo;
@@ -86,6 +105,7 @@ VoxelebIO(){
     float lon;
    // MeteoMeta meta;
 
+    // 模块 3：观测几何与大气条件（传感器、光源、角度、波长、UAV 位姿等）。
     //Geometry info
     SensorMatrix sensor;   // original sensor become the angular sensor and spectral wavesets
     LightSet     light;
@@ -99,6 +119,7 @@ VoxelebIO(){
     std::vector<AtomCond> atomconds;
     std::vector<AeroCond>  aeroconds;
 
+    // 模块 4：运行设置与诊断量；n_pipeline 为管线个数（待核对）。
     // setting infor
     int n_pipeline = 15;
     int n_wave;
@@ -165,6 +186,7 @@ VoxelebIO(){
     int fluidSubsteps{1};
     FluidParameters fluidParameters{};
 
+    // 模块 5：子 IO 结构、推送常量设置与 GPU 缓冲句柄。
     std::shared_ptr<MeshIO> m_meshio;
     std::shared_ptr<InstanceIO> m_instanceio;
     std::shared_ptr<VirtualIO> m_virtualio;
@@ -193,6 +215,7 @@ VoxelebIO(){
     std::shared_ptr<nvvk::Buffer> m_pFluidMeta;
     std::shared_ptr<nvvk::Buffer> m_pFluidParameters;
 
+    // 模块 6：Vulkan 设备/队列/同步对象。
     // initialization
     VkDevice                       m_device;
     VkPhysicalDevice               m_physicalDevice;
@@ -207,6 +230,7 @@ VoxelebIO(){
     std::vector<VkSemaphore> m_semaphores;
     int semaphoresNum{ 0 };
 
+    // 模块 7：create 阶段创建的命令池、描述符、管线布局、管线与光追 SBT 对象。
     // create
     nvvk::CommandPool   m_genCmdBuf;
     // VkCommandPool m_cmdPool{ VK_NULL_HANDLE };

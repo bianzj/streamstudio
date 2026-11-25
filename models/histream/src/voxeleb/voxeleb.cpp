@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：voxeleb.cpp
+// 功能：VoxelEB 模式（体元能量平衡）的顶层流程实现：初始化、数据上传、逐时间节点求解与输出
+// 主要模块/步骤：
+//   1. 匿名命名空间工具：光学/热红外波长判别、普朗克反演亮温、波段名称
+//   2. setup / upload / uploadSetting / updateSetting：初始化 Vulkan 与分配器，读入工程设置
+//   3. uploadMeteo / updateMeteo / applyShortwaveSplit：气象序列加载，逐节点更新 GPU 气象缓冲
+//      与短波直散分离
+//   4. create / run / runObserver / destroy：创建 GPU 资源、能量平衡与辐射求解、观测输出、释放
+//   5. output / outputTxt / outputVoxel / outputFluidSlices 等：结果写出
+// 数据流：FileIO（工程 XML、气象）→ VoxelebIO（CPU 数据）→ buffer/descriptor/pipeline/command
+//   创建 GPU 资源 → 逐时间节点更新气象并求解 → 输出影像/体元/能量收支
+// 与其他文件的关系：声明见 voxeleb.h，状态见 voxelebio.h；场景/几何/成分由 base/ 下
+//   Scene、Geometry、Compo 构建；短波直散分离见 base/shortwave_split.h
+// 约定：长度 m、气象温度 Ta 以 °C 存储并在送入 GPU 时加 273.15 转为 K（待核对）、
+//   土壤温度 K；波长 ≤ 2500 nm 视为光学波段（输出反射率），其余为热红外
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/26.
 //
@@ -20,6 +38,8 @@
 
 namespace {
 
+// 作用：判断波长是否属于光学（反射）波段。波长 ≤ 2.5 视为微米并换算为 nm，
+//   换算后 ≤ 2500 nm 即为光学波段，其余按热红外处理。
 bool isOpticalWavelength(float wavelength)
 {
     const float wavelengthNanometers = wavelength <= 2.5f
@@ -27,6 +47,10 @@ bool isOpticalWavelength(float wavelength)
     return wavelengthNanometers <= 2500.0f;
 }
 
+// 作用：由单色辐亮度反演亮温（普朗克函数的逆）。
+// 输入：波长（> 50 视为 nm，否则视为 µm）、辐亮度（W m-2 sr-1 µm-1）；输出：亮温 K，
+//   辐亮度非有限或 ≤ 0 时返回 0。
+// 说明：c1 = 2hc²（W µm4 m-2 sr-1），c2 = hc/k（µm·K），T = c2 / (λ·ln(c1/(L·λ^5) + 1))。
 float inversePlanckTemperature(float wavelengthNanometers, float radiance)
 {
     if (!std::isfinite(radiance) || radiance <= 0.0f) {
@@ -46,6 +70,8 @@ float inversePlanckTemperature(float wavelengthNanometers, float radiance)
         : 0.0f;
 }
 
+// 作用：生成各波段的输出名称与单位：光学波段为反射率，热红外波段按
+//   temperatureOutput 选择亮温（K）或光谱辐亮度。
 std::vector<std::string> voxelebBandNames(const std::vector<float>& waves,
                                           bool temperatureOutput)
 {
@@ -67,6 +93,8 @@ std::vector<std::string> voxelebBandNames(const std::vector<float>& waves,
 
 } // namespace
 
+// 模块：初始化。从 appsetting 取 Vulkan 设备/队列，初始化命令池、资源分配器、调试工具，
+//   查询光追属性，并按需设置 SBT 与加速结构构建器。
 bool Voxeleb::setup(AppSetting &appsetting, std::shared_ptr<VoxelebIO> &modelio){
 
 
@@ -116,6 +144,8 @@ bool Voxeleb::setup(AppSetting &appsetting, std::shared_ptr<VoxelebIO> &modelio)
 
 
 
+// 模块：读入工程数据。顺序：defined 参数 → 成分属性 → 设置 → 场景 → 几何 → 气象 → 气溶胶；
+//   设置必须先于场景构建，因为 hex 提取开关在场景构建时使用。
 bool Voxeleb::upload(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &modelio){
 
     // auto & fileio = modelio->m_fileio;
@@ -135,6 +165,7 @@ bool Voxeleb::upload(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO>
     return true;
 }
 
+// 模块：从工程 XML（sensor/setting/light/fluid/scene）复制运行设置到 VoxelebIO。
 bool Voxeleb::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &modelio) {
 
     modelio->n_wave = fileio->m_pVoxelebXml->sensorxml.waves.size();
@@ -145,6 +176,7 @@ bool Voxeleb::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
     modelio->isImage = fileio->m_pVoxelebXml->sensorxml.isImage;
     modelio->isRadiationProcess = fileio->m_pVoxelebXml->sensorxml.isRadiationProcess;
     modelio->isEnergyProcess = fileio->m_pVoxelebXml->sensorxml.isEnergyProcess;
+    // 兼容旧工程：只给出笼统的 isProcess 时按能量过程处理。
     if (!modelio->isRadiationProcess && !modelio->isEnergyProcess &&
         fileio->m_pVoxelebXml->sensorxml.isProcess) {
         modelio->isEnergyProcess = true;
@@ -165,6 +197,7 @@ bool Voxeleb::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
         fileio->m_pVoxelebXml->settingxml.shortwaveScatteringOrders;
     modelio->setting.maxStep = fileio->m_pVoxelebXml->settingxml.radiationMaxSteps;
     modelio->diffuseFractionMode = fileio->m_pVoxelebXml->lightxml.diffuseFractionMode;
+    // 固定直射比例限幅到 [0, 1]；nodeDirectFraction 初值同它，erbs 模式下逐节点更新。
     modelio->fixedDirectFraction = std::clamp(fileio->m_pVoxelebXml->lightxml.direct, 0.0f, 1.0f);
     modelio->nodeDirectFraction = modelio->fixedDirectFraction;
     modelio->fluid = fileio->m_pVoxelebXml->fluidxml;
@@ -180,6 +213,8 @@ bool Voxeleb::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
     return true;
 }
 
+// 模块：把 VoxelebIO 中的设置同步到推送常量 setting（VoxelLstSetting）。
+// 说明：setting.voxelSize 的竖直分量被改写为按场景高度和表面步长取整的格数。
 bool Voxeleb::updateSetting(std::shared_ptr<VoxelebIO> &modelio){
 
     // auto &opo = modelio->m_opo;
@@ -207,6 +242,8 @@ bool Voxeleb::updateSetting(std::shared_ptr<VoxelebIO> &modelio){
 }
 
 
+// 模块：读入气象序列（meteos、atomconds）及直散分离所需数据，备份到 m_stableMeteos。
+// 说明：初始土壤温度 Tsold 仅在 150–400 K 内才采用，否则保持 NaN（即沿用气温）。
 bool  Voxeleb::uploadMeteo(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &modelio){
 
 
@@ -225,6 +262,10 @@ bool  Voxeleb::uploadMeteo(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Voxe
    return true;
 }
 
+// 模块：切换到第 knode 个时间节点的气象，并写入 GPU。
+// 步骤 1：检查节点范围，越界抛异常。
+// 步骤 2：用 vkCmdUpdateBuffer 更新气象缓冲；若启用流体，同时重算流体子步数与环境风参数。
+// 步骤 3：加传输→计算着色器的缓冲屏障，提交并等待完成。
 bool Voxeleb::updateMeteo(std::shared_ptr<VoxelebIO> &modelio, int knode){
 
     if (knode < 0 || knode >= static_cast<int>(m_stableMeteos.size())) {
@@ -238,6 +279,8 @@ bool Voxeleb::updateMeteo(std::shared_ptr<VoxelebIO> &modelio, int knode){
     vk::CommandBuffer cmdBuf = cmdBufGet.createCommandBuffer();
     vkCmdUpdateBuffer(cmdBuf, (*modelio->m_pMeteoBuffer).buffer, 0, sizeof(Meteo), &modelio->meteo);
     if (modelio->m_pFluidParameters) {
+        // 流体子步数 = max(标量时间步给出的子步数, 流风穿越一个计算域所需子步数（上限 4096）)；
+        //   时间间隔下限 0.1，风速下限 0。子步长 = interval / 子步数（dTime 单位待核对，推测为 s）。
         const float interval = std::max(0.1f, modelio->meteo.dTime);
         const float windSpeed = std::max(0.0f, modelio->meteo.u);
         const int scalarSubsteps = std::max(1, static_cast<int>(std::ceil(
@@ -255,6 +298,8 @@ bool Voxeleb::updateMeteo(std::shared_ptr<VoxelebIO> &modelio, int knode){
         // requested scalar time step is still honored.
         modelio->fluidSubsteps = std::max(scalarSubsteps, flowSubsteps);
         modelio->fluidParameters.spacingTime.w = interval / modelio->fluidSubsteps;
+        // 环境风：x = u·sin(风向)，z = u·cos(风向)，w = 气温 Ta + 273.15（°C → K）。
+        //   风向的角度约定（来向/去向）待核对。
         const float direction = glm::radians(modelio->fluid.windDirection);
         modelio->fluidParameters.ambientWind = glm::vec4(
             windSpeed * std::sin(direction), 0.0f,
@@ -262,6 +307,7 @@ bool Voxeleb::updateMeteo(std::shared_ptr<VoxelebIO> &modelio, int knode){
         vkCmdUpdateBuffer(cmdBuf, modelio->m_pFluidParameters->buffer, 0,
                           sizeof(FluidParameters), &modelio->fluidParameters);
     }
+    // 屏障：保证 vkCmdUpdateBuffer（传输写）对之后的计算着色器读可见。
     VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -285,6 +331,10 @@ bool Voxeleb::updateMeteo(std::shared_ptr<VoxelebIO> &modelio, int knode){
     return true;
 }
 
+// 模块：逐节点短波直散分离（light.diffuseFractionMode：0 固定比例，1 erbs 模型）。
+// 步骤 1：取天顶角（首个角度的 sza；无角度时取 180°，视为夜间）与年积日。
+// 步骤 2：调用 shortwave_split::split 得到直射比例并打印 SHORTWAVE_SPLIT 日志。
+// 步骤 3：固定模式到此为止；erbs 模式下更新 LightSet 与 VNIR 的 atomconds 并重传 GPU。
 void Voxeleb::applyShortwaveSplit(std::shared_ptr<VoxelebIO> &modelio, int knode)
 {
     const float zenith = modelio->angles.empty() ? 180.0f : modelio->angles.front().sza;
@@ -318,6 +368,7 @@ void Voxeleb::applyShortwaveSplit(std::shared_ptr<VoxelebIO> &modelio, int knode
         modelio->atomconds[i].direct = modelio->unitShortwaveShapes[i].direct * split.directFraction;
         modelio->atomconds[i].diffuse = modelio->unitShortwaveShapes[i].diffuse * (1.0f - split.directFraction);
     }
+    // 把更新后的 atomconds 写回 GPU 缓冲，vkCmdUpdateBuffer 每次最多 65536 字节，故分块。
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(count * sizeof(AtomCond));
     nvvk::CommandPool pool(modelio->m_device, modelio->m_queueIndex);
     vk::CommandBuffer command = pool.createCommandBuffer();
@@ -335,6 +386,7 @@ void Voxeleb::applyShortwaveSplit(std::shared_ptr<VoxelebIO> &modelio, int knode
     pool.submitAndWait(command);
 }
 
+// 模块：读入 defined 参数（材质/物种等自定义库，待核对）到 modelio->m_defined。
 bool Voxeleb::uploadDefined(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &modelio)
 {
 
@@ -343,6 +395,8 @@ bool Voxeleb::uploadDefined(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
     return true;
 }
 
+// 模块：创建 GPU 资源。顺序：缓冲 → 描述符 → 管线（失败则返回 false）→ 命令/同步对象，
+//   最后调用 updateSetting 同步推送常量。
 bool Voxeleb::create(std::shared_ptr<VoxelebIO> &modelio) {
 
 
@@ -356,11 +410,19 @@ bool Voxeleb::create(std::shared_ptr<VoxelebIO> &modelio) {
     return true;
 }
 
+// 模块：VoxelEB 主流程，逐时间节点做能量平衡并输出观测。
+// 步骤 1：若设置了环境变量 HISTREAM_OBSERVER_MANIFEST，转入 runObserver。
+// 步骤 2：启用地形环境时，写 diagnostics/terrain-environment.json 记录输入与模型假设。
+// 步骤 3：清空并重写 result_statistics.txt 表头。
+// 步骤 4：对 [startTimeNode, endTimeNode) 内每个节点：更新气象/太阳位置/短波直散分离 →
+//   （可选）流体推进 → 能量平衡 runEB → 输出体元与逐角度观测影像。
+// 返回值：成功 true；runEB 失败时返回 false。
 bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &fileio) {
     if (const char* observer = std::getenv("HISTREAM_OBSERVER_MANIFEST")) {
         return runObserver(modelio, fileio, observer);
     }
 
+    // 步骤 2：地形环境诊断。JSON 中的 *Solved/*Coupled 等字段（均为 false）标明这些过程未求解。
     const auto& environment = modelio->terrainEnvironment;
     if (environment.airEnabled || environment.soilEnabled || environment.co2ValleyExcess != 0) {
         const std::filesystem::path directory = std::filesystem::path(modelio->projectDir) / "diagnostics";
@@ -392,6 +454,7 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
 
 
 // for(int knode = 72; knode < 75;knode = knode + 1) {
+    // 步骤 3：重置统计文件。
     /// 清除txt文件信息
     // 以写入模式打开文件（std::ios::trunc 会清空文件）
     std::ofstream file(modelio->projectDir + "\\result_statistics.txt", std::ios::trunc);
@@ -414,6 +477,7 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
 
     //modelio->startTimeNode = 63;
     //modelio->endTimeNode = 74;
+    // 步骤 4：时间节点循环（半开区间 [startTimeNode, endTimeNode)）。
     for(int knode = modelio->startTimeNode; knode < modelio->endTimeNode;knode = knode +1) {
     // for(int knode = 0; knode < 144;knode = knode + 1) {
         modelio->k_node = knode;
@@ -433,8 +497,11 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
             m_pCommand->runFluid(modelio, modelio->fluidSubsteps);
         }
 
+        // 步骤 5：本节点能量平衡求解（GPU）；失败则中止整个运行。
         if (!m_pCommand->runEB(modelio)) return false;
 
+        // 诊断（仅在设置环境变量时）：回读 VoxelTempe，按网格类型（0..5）统计向阳/背阴温度极值，
+        //   输出 TEMPERATURE_RANGE 日志。
         if (std::getenv("HISTREAM_TEMPERATURE_DIAGNOSTICS") != nullptr &&
             modelio->m_voxelio->m_pTempeBuffer) {
             const size_t count = static_cast<size_t>(modelio->n_voxel);
@@ -477,6 +544,7 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
             outputFluidSlices(modelio);
         }
 
+        // 进度：10%–95% 按已完成节点数线性映射。
         const int completed = knode - modelio->startTimeNode + 1;
         const int total = std::max(1, modelio->endTimeNode - modelio->startTimeNode);
         const int progress = 10 + 85 * completed / total;
@@ -489,6 +557,8 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
     //    if (knode == 73)
         // if (1)
         {
+        // 步骤 6：观测。常规模式逐角度观测；UAV 巡航模式每个节点只观测 1 次，
+        //   航点按 (knode - startTimeNode) % n_pos 轮换。
         const int observationCount = modelio->isUAVTrave ? 1 : modelio->n_angle;
         const int cruisePosition = modelio->isUAVTrave && modelio->n_pos > 0
             ? (knode - modelio->startTimeNode) % modelio->n_pos : -1;
@@ -504,6 +574,7 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
             Angle angle = modelio->angles[kangle];
 
             ////updateSetting(modelio);
+            // 步骤 7：对当前观测几何做辐射传输（Command::runRT），随后输出。
             m_pCommand->runRT(modelio);
 
     //        std::cout << "Success: " << kangle << std::endl;
@@ -519,6 +590,7 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
                               << " H=" << position.z << std::endl;
                 }
 
+                // isImage 为真时写出影像 TIFF；outputTxt 总是追加统计行。
                 if (modelio->isImage)
                 {
                     output(modelio,fileio,knode, kangle, cruisePosition);
@@ -536,6 +608,8 @@ bool Voxeleb::run(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &
 
 
 
+// 模块：释放资源。先 vkDeviceWaitIdle，再依次销毁缓冲、SBT、加速结构、描述符、管线、
+//   命令对象、命令池与分配器。注意：函数末尾固定返回 false（见 return 处）。
 bool Voxeleb::destroy(std::shared_ptr<VoxelebIO> & modelio){
 
     const VkResult waitIdleResult = vkDeviceWaitIdle(modelio->m_device);
@@ -560,6 +634,14 @@ bool Voxeleb::destroy(std::shared_ptr<VoxelebIO> & modelio){
 
 
 
+// 模块：把当前观测角度的影像写成 TIFF。
+// 输入：knode 时间节点，kangle 观测角度序号，kpos 航点序号（-1 为非巡航）。
+// 步骤 1：检查影像尺寸/波段/角度序号合法，否则直接返回。
+// 步骤 2：把 GPU 输出缓冲回读到主机（布局：波段主序，[band][y][x]，每波段 imageElements 个 float）。
+// 步骤 3：逐像元选取源像元（正射投影时按 orthcorrect 的多项式映射，越界跳过）。
+// 步骤 4：逐波段取值：天空像元且无有效信号 → 大气模型填天空值；其余 → 大气订正，
+//   热红外且 isTemperature 时由辐亮度反演亮温（inversePlanckTemperature）。
+// 步骤 5：写 TIFF（大气启用时后缀 _v_a，否则 _v）。
 void Voxeleb::output(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &fileio, int knode, int kangle, int kpos) {
     VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     const int width = modelio->imageSize.x;
@@ -594,6 +676,7 @@ void Voxeleb::output(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO
     std::vector<unsigned char> surfaceMask(observerCapture ? imageElements : 0, 0);
     Eigen::VectorXd cx;
     Eigen::VectorXd cy;
+    // 正射投影：cx、cy 为 4 个系数，源像元 ii = cx0·i + cx1·j + cx2·i·j + cx3（取整），jj 同理。
     if (!perspective) m_pGeometry->orthcorrect(modelio, angle.vza, angle.vaa, cx, cy);
 
     for (int i = 0; i < width; ++i) {
@@ -606,6 +689,7 @@ void Voxeleb::output(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO
                 if (ii < 0 || ii >= width || jj < 0 || jj >= height) continue;
                 source = static_cast<size_t>(jj) * width + ii;
             }
+            // 仅透视投影判断天空像元并给出该像元的天顶角（待核对该函数的角度约定）。
             float skyZenith = 0.0f;
             const bool isSkyPixel = perspective && atmosphereSkyPixelZenith(
                 i, j, width, height,
@@ -624,6 +708,7 @@ void Voxeleb::output(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO
                 const size_t bandOffset = static_cast<size_t>(band) * imageElements;
                 const float sourceValue = sourceData[bandOffset + source];
                 float value = sourceValue;
+                // 天空像元且源值无效或为 0：用大气模型填值；光学波段在夜间（Rin ≤ 0.5）置 0。
                 if ((!std::isfinite(sourceValue) || sourceValue == 0.0f) && isSkyPixel && !thermalSurfaceHit) {
                     value = atmosphereSkyOutputValue(
                         fileio->m_pVoxelebXml->atmospherexml,
@@ -644,6 +729,7 @@ void Voxeleb::output(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO
         }
     }
 
+    // 观测器模式下额外保存热红外有信号的“地表命中”掩膜（每像元 1 字节）。
     if (observerCapture) {
         const auto path = std::filesystem::path(modelio->projectDir) /
             ("surface_mask_P=" + std::to_string(kpos) + ".bin");
@@ -658,6 +744,11 @@ void Voxeleb::output(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO
         fileio->m_pVoxelebXml->atmospherexml.enabled ? "_v_a" : "_v", kpos, false,
         voxelebBandNames(modelio->waves, modelio->isTemperature));
 }
+// 模块：把当前观测角度各波段的影像平均值追加到 result_statistics.txt。
+// 步骤 1：回读 GPU 输出缓冲（布局同 output）；步骤 2：按 orthcorrect 多项式做正射重采样
+//   （与 output 不同，此处不区分透视投影）；热红外且 isTemperature 时反演亮温。
+// 步骤 3：每波段只对值 > 0 的像元求平均（0 视为无数据）；步骤 4：按波段追加一行
+//   “t sza saa vza vaa wavelength mean”（表头在 run 中写入）。
 void Voxeleb::outputTxt(std::shared_ptr<VoxelebIO>& modelio, std::shared_ptr<FileIO>& fileio, int kangle)
 {
     VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -715,6 +806,7 @@ void Voxeleb::outputTxt(std::shared_ptr<VoxelebIO>& modelio, std::shared_ptr<Fil
         }
     }
 
+    // 步骤 3：逐波段统计正值像元均值，无有效像元时为 0。
     const float time = modelio->meteo.t;
     std::vector<float> meanValues(static_cast<size_t>(nWave), 0.0f);
     for (int band = 0; band < nWave; ++band) {
@@ -732,6 +824,7 @@ void Voxeleb::outputTxt(std::shared_ptr<VoxelebIO>& modelio, std::shared_ptr<Fil
             ? 0.0f : static_cast<float>(sum / count);
     }
 
+    // 步骤 4：以追加方式写统计行；路径用 Windows 反斜杠拼接。
     std::ofstream outfile(modelio->projectDir + "\\result_statistics.txt", std::ios::app);
     if (!outfile.is_open()) {
         std::cerr << "Error: Could not open file "
@@ -746,6 +839,16 @@ void Voxeleb::outputTxt(std::shared_ptr<VoxelebIO>& modelio, std::shared_ptr<Fil
                 << "\n";
     }
 }
+// 模块：回读并校验本时间节点的体元状态，写出诊断文件（run 每节点调用，即使不导出过程数据）。
+// 步骤 1：检查所需 GPU 缓冲存在，否则抛异常。
+// 步骤 2：下载方向、净辐射、热通量、温度、光量子通量、气孔/表面阻抗缓冲到主机。
+// 步骤 3：为每个有效体元调用 histream::energy_output::calculate 得到能量收支（Balance）。
+// 步骤 4：必要时下载土壤剖面温度 TLAST。
+// 步骤 5：写 diagnostics/physiology_node=*.json（及 .bin）：生理量统计与有效性检查，
+//   发现非有限/无效状态则抛异常。
+// 步骤 6：写 diagnostics/energy_balance_node=*.json：辐射/热通量收支、闭合残差、稳定度与
+//   太阳可见性诊断。
+// 输出的 .bin 为每体元 10 个 float32（小端）交错存放，偏移见 JSON 的 fields。
 void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &fileio) {
     (void)fileio;
     if (!modelio || modelio->n_voxel <= 0) return;
@@ -757,6 +860,7 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
         throw std::runtime_error("Missing VoxelEB buffers required for state validation");
     }
 
+    // 步骤 2：主机侧数组与下载函数（经暂存缓冲回读）。
     const size_t voxelCount = static_cast<size_t>(modelio->n_voxel);
     if (modelio->m_voxelio->voxellinks.size() < voxelCount) {
         throw std::runtime_error("VoxelEB link count does not match the GPU state");
@@ -784,6 +888,8 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
     download(*modelio->m_voxelio->m_pPnetBuffer, photonFlux.data(), voxelCount * sizeof(VoxelPnet));
     download(*modelio->m_voxelio->m_pRssBuffer, surfaceResistance.data(), voxelCount * sizeof(VoxelRss));
 
+    // 体元 → 组分编码：土壤 1、植被 2、建筑 3、水体 5，其它为 0（0 表示不参与统计）；
+    //   编码 4 在此未使用（待核对）。
     const auto componentForVoxel = [&](size_t voxel) -> float {
         if (!modelio->m_instanceio || !modelio->m_meshio || voxel >= modelio->m_voxelio->voxellinks.size()) return 0;
         const int instance = modelio->m_voxelio->voxellinks[voxel].instanceId;
@@ -795,6 +901,7 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
             : type == static_cast<int>(Type::BUILDING) ? 3 : type == static_cast<int>(Type::WATER) ? 5 : 0;
     };
 
+    // 是否带土壤剖面输出：船体钢板（建筑且 plateThickness > 0）或土壤方法 method == 2。
     const auto isProfileSoilVoxel = [&](size_t voxel) {
         if (!modelio->m_instanceio || !modelio->m_meshio ||
             voxel >= modelio->m_voxelio->voxellinks.size()) {
@@ -822,6 +929,7 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
             meshLink.bioId < static_cast<int>(modelio->m_meshio->soilsets.size()) &&
             modelio->m_meshio->soilsets[meshLink.bioId].method == 2;
     };
+    // 是否为“参与介质”体元：植被类且冠层 structureType 为 2 或 3（据下文注释为火/雾，待核对）。
     const auto isParticipatingVoxel = [&](size_t voxel) {
         if (componentForVoxel(voxel) != 2) return false;
         const auto& link = modelio->m_voxelio->voxellinks[voxel];
@@ -831,6 +939,8 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
         const int structure = modelio->m_meshio->canopies[canopy].structureType;
         return structure == 2 || structure == 3;
     };
+    // 步骤 3：逐体元能量收支。热红外反射/透射率取固定材质谱表（见下方注释）的末波段。
+    //   Exchange 类型：参与介质 prescribedMedium，叶片 twoSidedLeaf，其它 singleSurface。
     std::vector<histream::energy_output::Balance> energyBalance(voxelCount);
     for (size_t voxel = 0; voxel < voxelCount; ++voxel) {
         using namespace histream::energy_output;
@@ -868,6 +978,7 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
             : component == 2 ? Exchange::twoSidedLeaf : Exchange::singleSurface;
         energyBalance[voxel] = calculate(input);
     }
+    // 步骤 4：仅在能量过程开启且 TLAST 缓冲存在时，才检查并下载土壤剖面温度。
     bool hasSoilProfile = false;
     if (modelio->isEnergyProcess && modelio->m_voxelio->m_pTLASTBuffer) {
         for (size_t voxel = 0; voxel < voxelCount && !hasSoilProfile; ++voxel) {
@@ -881,6 +992,7 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
                  voxelCount * TLASTNUM * sizeof(TLAST));
     }
 
+    // 时间标签：meteo.t 为 年积日 + 日内小数；换算为 DOY<d>_<HH>-<MM>，进位处理四舍五入后的 1440 分钟。
     const double julianTime = static_cast<double>(modelio->meteo.t);
     int day = static_cast<int>(std::floor(julianTime));
     int totalMinutes = static_cast<int>(std::llround((julianTime - day) * 1440.0));
@@ -892,6 +1004,7 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
     time << "DOY" << day << '_' << std::setw(2) << std::setfill('0') << totalMinutes / 60
          << '-' << std::setw(2) << std::setfill('0') << totalMinutes % 60;
 
+    // 步骤 5：生理诊断（10 项指标），单位见 metricUnits；光学量/通量下限检查见下方。
     // A separate diagnostic contract keeps existing process-record offsets stable.
     const std::filesystem::path diagnosticDirectory =
         std::filesystem::path(modelio->projectDir) / "diagnostics";
@@ -930,6 +1043,8 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
             diagnosticBinary.write(reinterpret_cast<const char*>(values), sizeof(values));
         }
         if (!modelio->m_voxelio->voxellinks[voxel].isValid || componentForVoxel(voxel) == 0) continue;
+        // 体元有效性：温度、显热/储热通量、净辐射分量须为有限值，向阳比例须在 [0, 1]，
+        //   适用闭合的体元其净辐射与能量残差也须有限。
         bool invalid = !std::isfinite(temperatures[voxel].sunlit) || !std::isfinite(temperatures[voxel].shaded)
             || !std::isfinite(flux.Hsunlit) || !std::isfinite(flux.Hshaded)
             || !std::isfinite(flux.Gsunlit) || !std::isfinite(flux.Gshaded)
@@ -987,10 +1102,12 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
     diagnostic << "]\n}\n";
     diagnostic.close();
     if (!diagnostic) throw std::runtime_error("Cannot save physiology diagnostics");
+    // 存在无效体元则抛异常（诊断 JSON 已写出，路径随异常信息给出）。
     if (invalidVoxelCount != 0) {
         throw std::runtime_error("Non-finite or invalid VoxelEB state in " + std::to_string(invalidVoxelCount)
             + " voxels; diagnostic: " + diagnosticPath.string());
     }
+    // 步骤 6：能量收支闭合诊断（6 项：吸收短波、吸收长波、发射长波、净辐射、热通量和、残差）。
     // Keep process binary offsets unchanged and expose closure separately.
     // Assess the refreshed final state even when process exports are disabled.
     {
@@ -1100,6 +1217,10 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
         std::cout << "\tdiagnostics=" << path.string() << std::endl;
     }
 
+    // 步骤 7：过程数据导出（仅在 isRadiationProcess / isEnergyProcess 开启时），写入 process/ 目录：
+    //   voxelthermal_T=*.bin（每体元 3 个 float：向阳温度 K、背阴温度 K、向阳比例）、
+    //   首节点一次性的 voxel_scene_links.bin 与 material_sensor_spectra.csv、
+    //   voxelrt_/voxeleb_T=*.bin/.json（逐体元过程量）、以及可选的 voxelfluid_T=*.bin/.json。
     if (!modelio->isRadiationProcess && !modelio->isEnergyProcess) return;
 
     const std::filesystem::path directory = std::filesystem::path(modelio->projectDir) / "process";
@@ -1119,6 +1240,8 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
     thermalBinary.close();
     if (!thermalBinary) throw std::runtime_error("Cannot save voxel thermal state");
 
+    // 仅在首个时间节点写一次静态文件：体元-场景链接（每体元 6 个 int32：
+    //   instanceId、meshId、spectralId、canopyId、type、faceId）与材质光谱表。
     if (modelio->k_node == modelio->startTimeNode) {
         // Stable row order matches every hourly process and thermal-state file.
         std::vector<int32_t> links(voxelCount * 6);
@@ -1146,6 +1269,13 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
         spectra.close();
         if (!spectra) throw std::runtime_error("Cannot save material spectra");
     }
+    // 写一类过程文件（type 为 "radiation" 或 "energy"）。每体元记录（float32 小端交错）：
+    //   位置 3 个（体元中心 = (voxelId + 0.5)·stepsize_surface，m）+ 过程量 + [土壤剖面温度 TLASTNUM 个，
+    //   仅 energy 且存在剖面] + 状态 2 个（组分编码、温度 K）。
+    //   radiation 过程量 3 个：短波（散射 + 向阳比例·直射，VNIR 通道）、长波（TIR 通道）、净辐射；
+    //   energy 过程量 5 个：LE、H、G、GPP、NPP。成对的向阳/背阴量按向阳比例加权求和。
+    //   componentOffset 为状态字段起点的 float 偏移，recordFloats = componentOffset + 2。
+    //   元数据 JSON 同时记录字段偏移与辐射/碳通量约定。
     const auto writeProcess = [&](const std::string& type) {
         // Radiation in VoxelEB is a time sequence of VoxelRT fields;
         // energy fluxes retain the VoxelEB model name.
@@ -1289,6 +1419,10 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
     };
     if (modelio->isRadiationProcess) writeProcess("radiation");
     if (modelio->isEnergyProcess) writeProcess("energy");
+    // 流体过程导出（能量过程且启用流体时）：下载速度场 A 与标量场 A，按网格顺序写出。
+    //   每格记录 8 个 float（启用 airEnabled 时 10 个）：位置 xyz（m）、速度 xyz、
+    //   标量 x（空气温度 K）、标量 y（烟雾浓度）、[水汽压 hPa、相对湿度 %]。
+    //   索引顺序：y 为最外层（index / (nx·nz)），其次 z，最内层 x。
     if (modelio->isEnergyProcess && modelio->fluid.enabled &&
         modelio->m_pFluidVelocityA && modelio->m_pFluidScalarA &&
         modelio->fluidCellCount > 0) {
@@ -1359,6 +1493,12 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
     }
 }
 
+// 模块：把流体（LBM）场在指定高度的水平切片写成 GeoTIFF（每个时间节点调用一次）。
+// 步骤 1：未启用流体/未请求输出/缓冲缺失/网格尺寸非法时直接返回。
+// 步骤 2：下载元数据（及按需的速度场、标量场）。
+// 步骤 3：按 fluid.outputHeight 求切片层 layerY（限幅到 [0, ny-1]），抽取该层的风与气温。
+// 步骤 4：写 fluid_wind_H=*m_T=*.tif（4 波段）与 fluid_air_temperature_H=*m_T=*.tif（1 波段）。
+// 约定：网格索引 x + nx·(z + nz·y)，y 为竖直层；无数据值为 NaN；气温由 K 转为 °C。
 void Voxeleb::outputFluidSlices(std::shared_ptr<VoxelebIO>& modelio)
 {
     if (!modelio || !modelio->fluid.enabled
@@ -1399,6 +1539,7 @@ void Voxeleb::outputFluidSlices(std::shared_ptr<VoxelebIO>& modelio)
         download(*modelio->m_pFluidScalarA, scalar.data(), cellCount * sizeof(glm::vec4));
     }
 
+    // 切片高度取层中心：actualHeight = (layerY + 0.5)·spacingY，与请求高度的差异记入元数据。
     const float spacingX = std::max(0.0001f, modelio->fluidParameters.spacingTime.x);
     const float spacingY = std::max(0.0001f, modelio->fluidParameters.spacingTime.y);
     const float spacingZ = std::max(0.0001f, modelio->fluidParameters.spacingTime.z);
@@ -1416,6 +1557,9 @@ void Voxeleb::outputFluidSlices(std::shared_ptr<VoxelebIO>& modelio)
     if (modelio->fluid.outputAirTemperature) {
         temperature.assign(pixelCount, noData);
     }
+    // 抽取切片：目标行号 nz-1-z（z 方向上下翻转，使影像上方对应较大的 z）。
+    //   meta.kind == 1 的格点不写入，保持 NaN（含义待核对，推测为固体/障碍格）。
+    //   风 4 波段：水平风速、X 分量、竖直分量（速度的 y 分量）、Y 分量（速度的 z 分量）。
     for (int z = 0; z < nz; ++z) {
         for (int x = 0; x < nx; ++x) {
             const size_t source = static_cast<size_t>(x)
@@ -1437,6 +1581,7 @@ void Voxeleb::outputFluidSlices(std::shared_ptr<VoxelebIO>& modelio)
         }
     }
 
+    // 时间标签：同 outputVoxel（DOY<d>_<HH>-<MM>）。
     const double julianTime = static_cast<double>(modelio->meteo.t);
     int day = static_cast<int>(std::floor(julianTime));
     int totalMinutes = static_cast<int>(std::llround((julianTime - day) * 1440.0));
@@ -1456,6 +1601,8 @@ void Voxeleb::outputFluidSlices(std::shared_ptr<VoxelebIO>& modelio)
     GDALAllRegister();
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("GTiff");
     if (!driver) throw std::runtime_error("GDAL GTiff driver is unavailable");
+    // GeoTransform：原点取场景 X 起点与 Y 上沿（sceneOrigin.y + sceneSize.y），像元 X 间距 spacingX、
+    //   Y 间距 -spacingZ（北向上）；坐标为场景局部坐标（m），无地理投影。
     const double geoTransform[6] = {
         static_cast<double>(modelio->sceneOrigin_XYZ.x), static_cast<double>(spacingX), 0.0,
         static_cast<double>(modelio->sceneOrigin_XYZ.y + modelio->sceneSize_XYZ.y),
@@ -1524,6 +1671,8 @@ void Voxeleb::outputFluidSlices(std::shared_ptr<VoxelebIO>& modelio)
 }
 
 
+// 模块：气溶胶条件载入。目前只有 AeroType::ONE（单一条件）被写入 aeroconds；
+//   image 与 gridCal 分支为未实现的占位（只有无用的局部变量）；函数固定返回 false。
 bool Voxeleb::uploadAero(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &modelio) {
 
 
@@ -1540,4 +1689,6 @@ bool Voxeleb::uploadAero(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Voxele
 
 
 }
+// runObserver（HISTREAM_OBSERVER_MANIFEST 观测器模式）的实现在 observer_capture.inl 中，
+//   通过 #include 并入本编译单元（该文件不在本次整理范围）。
 #include "observer_capture.inl"

@@ -1,3 +1,24 @@
+// ==========================================================================
+// 文件：structs_cg.h
+// 功能：CPU 与 GPU（着色器）共用的内核数据结构：传感器、光照、材质/冠层/土壤/水体参数、
+//       体元状态记录、推送常量与流体网格参数；部分结构须与 GLSL（shader/parameters.h 等）逐字节一致。
+// 主要模块：
+//   1. 传感器与光照：SensorMatrix、LightSet、Spectral、Thermal
+//   2. 各模式推送常量：RayRTSetting（RayTracing）、VoxelLstSetting（VoxelEB）、VoxelRTSetting（VoxelRT）
+//   3. 散射/太阳可见性诊断记录：ScatteringOrderStats、SolarVisibilityStats
+//   4. 空气动力与冠层参数：AtomCond、AeroCond、Canopy
+//   5. 几何与链接：Instance、VertexAttribute、MeshBuffer、MeshLink、VoxelLink、VoxelHex
+//   6. 体元状态量：VoxelDir/Rad/Tempe/NetRad/Pnet/Raa/Rss/Air/Heatflux、TLAST、EBState
+//   7. 流体耦合：FluidCellMeta、FluidParameters
+//   8. 生化、土壤、水体、建筑与气象：LeafBio、SoilSet、WaterSet、BuildUp、Meteo
+// 数据流：fileio/fileio_json 解析场景 → 填充这些结构 → 以缓冲或推送常量上传 → 着色器读写；
+//         GPU 结果按相同结构读回供 CPU 后处理与输出。
+// 关系：被 structs.h、各模式 IO（raytracingio.h、voxelebio.h、voxelrtio.h）及 virtualio.h 包含。
+// 约定：带 static_assert 的结构（RayRTSetting、VoxelLstSetting、VoxelLink、VoxelHex、VoxelTempe、
+//       VoxelAir、EBState、FluidParameters 等）的字节偏移/大小与 GLSL 对齐，修改字段需同步着色器；
+//       温度 K、热通量 W m-2、阻抗 s m-1（各字段另有注明时以字段为准）。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/25.
 // For the kernel struct used both in the cpu and gpu part;
@@ -18,6 +39,9 @@
 
 
 
+// 模块：传感器/相机参数，CPU 与 GPU 共用的内核结构。
+// viewInverse / projInverse 为视图、投影矩阵的逆（用于由像素生成射线）；
+// focalDist、aperture 为焦距与光圈（景深相关，待核对）；n_wave 为波段数；direction 的含义待核对。
 struct alignas(16) SensorMatrix
 {
     glm::mat4 viewInverse;
@@ -30,6 +54,9 @@ struct alignas(16) SensorMatrix
     glm::vec3 direction;
 };
 
+// 模块：光照设置（太阳与天空），CPU/GPU 共用。
+// direction 为太阳方向；direct/diffuse 为直射/散射分量比例；Rin/Rli 为入射短波/长波
+// （W m-2，见 structs.h 的 Meteo 同名字段）；skyTemperature、solarTemperature 单位 K。
 struct alignas(16) LightSet
 {
     glm::vec3 direction{ 100, 100, 0 };
@@ -43,6 +70,7 @@ struct alignas(16) LightSet
 
 };
 
+// 模块：材质光谱属性：反射率、透射率，以及镜面反射比例与粗糙度（缺省 0 与 0.25）。
 struct  Spectral{
     float reflectance;
     float transmittance;
@@ -50,11 +78,15 @@ struct  Spectral{
     float specularRoughness{0.25f};
 };
 
+// 模块：材质热状态：向阳面与背阴面温度（单位 K，待核对）。
 struct Thermal{
     float sunlitTemperature;
     float shadedTemperature;
 };
 
+// 模块：RayTracing 模式的推送常量/设置，布局须与 GLSL 一致（见下方 static_assert 偏移）。
+// imageSize 来自传感器分辨率；band1..band3 为输出显示所用波段；sceneSize 为场景水平尺寸；
+// periodicNeighborCount 为周期边界的邻域复制数；sceneTop 见字段注释。
 struct alignas(16) RayRTSetting
 {
     int frame{ 0 };
@@ -84,6 +116,9 @@ static_assert(offsetof(RayRTSetting, sceneTop) == 72);
 static_assert(sizeof(RayRTSetting) == 80);
 
 
+// 模块：VoxelEB（体元能量平衡）的推送常量，64 位地址字段用于绕过存储缓冲描述符大小限制。
+// 布局须与 GLSL 推送常量一致，偏移与总大小由下方 static_assert 固定为 128 字节。
+// n_jump 为光谱加速宽度（voxeleb.cpp 中取自 spectralAccelerationWidth）。
 struct alignas(32)  VoxelLstSetting
 {
 
@@ -132,6 +167,7 @@ static_assert(offsetof(VoxelLstSetting, energyIteration) == 120);
 static_assert(offsetof(VoxelLstSetting, imageEnvironment) == 124);
 static_assert(sizeof(VoxelLstSetting) == 128);
 
+// 模块：多次散射统计记录（每个散射阶一条，32 字节），CPU 读回用于诊断。
 // Three scattering orders plus the unscattered sky; matches scatter_stats.glsl.
 struct ScatteringOrderStats {
     uint32_t maxStepTruncations{0};
@@ -145,6 +181,8 @@ struct ScatteringOrderStats {
 };
 static_assert(sizeof(ScatteringOrderStats) == 32);
 
+// 模块：太阳可见性（间隙阶段）诊断记录，紧接 ScatteringOrderStats 之后存放。
+// kSolarVisibilityStatsOffset 为其在统计缓冲中的字节偏移（4 条 ScatteringOrderStats 之后）。
 // Solar-visibility diagnostics of the VoxelEB gap stage, stored right after
 // the four ScatteringOrderStats; matches SolarVisibilityStatsRecord in
 // scatter_stats.glsl. *Max fields are float bit patterns.
@@ -166,6 +204,8 @@ struct SolarVisibilityStats {
 static_assert(sizeof(SolarVisibilityStats) == 64);
 constexpr uint64_t kSolarVisibilityStatsOffset = 4 * sizeof(ScatteringOrderStats);
 
+// 模块：VoxelRT（体元辐射）模式的推送常量，字段含义与 VoxelLstSetting 的同名项相同；
+// collisionOrders/collisionOrder 分别为总的与当前的碰撞（散射）阶数（待核对）。
 // DEFERRED[低] 可维护性: VoxelRTSetting 同样作为推送常量与 GLSL 共享布局，却没有像 VoxelLstSetting 那样的 offsetof/sizeof static_assert，字段增删时 C++/GLSL 布局会悄然错位；建议：补充同样的布局断言。
 struct alignas(32)  VoxelRTSetting
 {
@@ -192,6 +232,7 @@ struct alignas(32)  VoxelRTSetting
     int collisionOrder{1};
 };
 
+// 模块：大气辐射传输结果（与 MODTRAN 衔接）：按波长 wavelength 给出直射与散射辐照分量。
 // atmospheric radiative transfer linked to modtrain
 struct AtomCond
 {
@@ -200,6 +241,8 @@ struct AtomCond
     float diffuse{0};
 };
 
+// 模块：空气动力学阻抗所需的状态/参数（植被 type=0，建筑 type=1）。
+// L（应为 Monin-Obukhov 长度，待核对）与 ustar（摩擦速度）为迭代更新量，其余为高度、LAI、叶宽、覆盖度。
 // aerodynamic condition for resistance
 // DEFERRED[中] 未初始化: AeroCond/Canopy/LeafBio/SoilSet/WaterSet/BuildUp/Meteo 以及 Spectral、Thermal 的大部分物理字段无默认值；JSON 缺省某一项时（如 Canopy::LIDFa、LeafBio::Tparam、SoilSet::lambdas）上传到 GPU 的是栈上垃圾值，可能产生 NaN 或除零（如 leafwidth/hc 为 0 时空气动力学阻抗）；建议：给出物理合理的默认值（参照 SCOPE 默认参数），解析层对必填项显式报错。
 struct AeroCond
@@ -214,6 +257,9 @@ struct AeroCond
     float cover; // ???
 };
 
+// 模块：冠层/介质结构参数，CPU/GPU 共用，须与 shader/parameters.h 的 Canopy 保持一致。
+// structureType：0 冠层、1 刚体、2 火/烟、3 雾；其后为介质的消光、散射反照率、不对称因子、发射比例。
+// lidf[13] 为 SAIL 叶倾角分布频率，diffuseG[32] 为散射积分用的 G 函数（见字段注释）。
 struct Canopy
 {
     float lai;  // this is used for the aerodynamic resistance inside a system
@@ -244,11 +290,13 @@ struct Canopy
 };
 
 
+// 模块：几何实例相关结构。InstanceLink 只记录实例所用网格 id。
 struct InstanceLink
 {
     uint32_t meshId;
 };
 
+// Instance：网格 meshId 及其对象到世界、世界到对象的 4x4 变换矩阵。
 struct  Instance
 {
     int meshId;
@@ -256,6 +304,7 @@ struct  Instance
     glm::mat4 world2objectMatrix;
 };
 
+// 顶点属性：位置、法向、颜色、纹理坐标。
 struct VertexAttribute
 {
     glm::vec3 pos;
@@ -264,10 +313,12 @@ struct VertexAttribute
     glm::vec2 texCoord;
 };
 
+// 模块：网格缓冲与网格链接（以下 MeshBuffer / MeshLink）。
 ///-----------------------------------------------------
 /// Mesh seems like a geometry in a geometric optical model
 ///-----------------------------------------------------
 
+// MeshBuffer：网格的顶点/索引数量及其 Vulkan 顶点缓冲、索引缓冲。
 struct MeshBuffer
 {
     uint32_t nbIndices{ 0 };
@@ -276,6 +327,8 @@ struct MeshBuffer
     nvvk::Buffer   indexBuffer;
 };
 
+// MeshLink：网格到材质/热/冠层/生化参数的索引（spectralId、thermalId、canopyId、bioId），
+// 以及顶点、索引缓冲的设备地址，供着色器按地址访问。
 struct MeshLink
 {
     int type;
@@ -289,6 +342,10 @@ struct MeshLink
     uint64_t indexAddress;
 };
 
+// 模块：体元链接记录（VoxelLink，48 字节，对应 GLSL std430 步长）。
+// voxelId 为体元整数坐标；instanceId/aeroId/faceId 为所属实例、空气动力区域、面元索引；
+// isValid 为 0 的体元被跳过；leafDensity、normal 为几何导出的叶密度与表面法向；
+// hexId 指向异质体元参数 VoxelHex，-1 表示均匀体元（兼容旧行为）。
 // voxel link
 struct alignas(16) VoxelLink
 {
@@ -305,6 +362,8 @@ struct alignas(16) VoxelLink
     glm::vec3 normal{0.0f, 0.0f, 0.0f};
 };
 
+// 模块：异质性体元参数（160 字节）：ax/ay/az、rho 与模型 model 相关的 a/b/c，children 为子体元数据；
+// 各字段具体物理含义（model=10 的轴向消光与六面邻居 beta 等）见 GLSL 实现（待核对）。
 struct VoxelHex
 {
     float ax{1.0f};
@@ -323,6 +382,8 @@ static_assert(sizeof(VoxelLink) == 48, "VoxelLink must match GLSL std430 stride"
 static_assert(sizeof(VoxelHex) == 160, "VoxelHex must match GLSL std430 stride");
 
 
+// 模块：体元辐射/温度/通量等逐体元状态记录（VoxelDir 至 VoxelHeatflux）。
+// VoxelDir：solar 为太阳相关照射量（具体含义待核对），skyDiffuse 为未碰撞天空散射相对开阔水平面的比例。
 struct VoxelDir
 {
     float solar;
@@ -330,6 +391,7 @@ struct VoxelDir
     float skyDiffuse;
 };
 
+// VoxelRad：逐体元、逐波段、逐方向的辐射场记录；induced 为本轮入射/散射源，cumulated 为累积量，二者用法随模式与阶数略有差异（见 shader）。
 struct VoxelRad
 {
     float cumulated;
@@ -337,6 +399,7 @@ struct VoxelRad
     //float diffuse;
 };
 
+// VoxelTempe：体元向阳/背阴组分温度；solarFraction 为土壤方法 1 历史的向阳比例，首个时间节点提交前为负。
 struct VoxelTempe
 {
     float sunlit;
@@ -347,6 +410,7 @@ struct VoxelTempe
 };
 static_assert(sizeof(VoxelTempe) == 12, "VoxelTempe must match GLSL std430 stride");
 
+// VoxelNetRad：可见近红外（VNIR）与热红外（TIR）波段的直射/散射辐射。
 struct VoxelNetRad
 {
     float directVrad;   // direct radiance at VNIR bands
@@ -355,12 +419,14 @@ struct VoxelNetRad
     float diffuseTrad;  // diffuse radiance at TIR bands
 };
 
+// VoxelPnet：体元吸收的直射/散射 PAR 光量子通量（directPnet 见 voxelrad_direct_VNIR.comp）。
 struct VoxelPnet
 {
     float directPnet;
     float diffusePnet;
 };
 
+// VoxelRaa：体元空气动力学阻抗 raa（s m-1）。
 // aerodynamic resistance
 struct VoxelRaa
 {
@@ -370,6 +436,7 @@ struct VoxelRaa
 
 
 
+// VoxelRss：体元向阳/背阴表面阻抗 rss（s m-1）。
 // surface resistance
 struct VoxelRss
 {
@@ -377,6 +444,8 @@ struct VoxelRss
     float shaded;   // surface resistance at shaded surface in this voxel
 };
 
+// 模块：叶面空气状态（VoxelAir，36 字节）。数组下标 0 背阴、1 向阳；
+// heightM、soilMoisture、co2ExcessPpm 来自 TerrainEnvironment（见 terrain_environment.h）。
 // Leaf-surface state per conditional component: [0] shaded, [1] sunlit.
 struct VoxelAir
 {
@@ -392,6 +461,7 @@ static_assert(offsetof(VoxelAir, heightM) == 24);
 static_assert(offsetof(VoxelAir, soilMoisture) == 28);
 static_assert(offsetof(VoxelAir, co2ExcessPpm) == 32);
 
+// 模块：向阳/背阴组分的能量平衡通量（H 显热、LE 潜热、G 储热）及叶片光合 GPP/NPP。
 // Rn - H - LE - G = 0
 struct VoxelHeatflux
 {
@@ -407,6 +477,7 @@ struct VoxelHeatflux
     float NPPshaded;
 };
 
+// 模块：温度历史记录（向阳/背阴），按 TLASTNUM 个节点/层存放，用于土壤热惯性（Duhamel 求和）等历史相关更新。
 // temperature at LAST time nodes
 struct TLAST
 {
@@ -414,6 +485,8 @@ struct TLAST
     float shaded;   // shaded temperature
 };
 
+// 模块：能量平衡的 MOST（Monin-Obukhov）稳定度修正所需的整数累加状态。
+// 用定点整数累加是为了让 GPU 原子加的结果确定、与线程顺序无关；各数组按字段注释的缩放因子存储。
 // Layout must match EBState in shader/parameters.h (MOST fixed-point sums).
 constexpr int kEnergyStateBins = 128;
 struct EBState
@@ -430,6 +503,7 @@ struct EBState
 };
 static_assert(sizeof(EBState) == 8 + 3 * 4 * kEnergyStateBins + 8);
 
+// 模块：流体网格单元元数据：surfaceIndex 为所属表面索引（-1 无），kind 为单元类型，lad 为叶面积密度。
 struct alignas(16) FluidCellMeta
 {
     int surfaceIndex{-1};
@@ -438,6 +512,8 @@ struct alignas(16) FluidCellMeta
     float padding{0.0f};
 };
 
+// 模块：流体耦合参数（128 字节，须与着色器一致）：网格、间距与时间步、环境风/温度、
+// 物理系数、源项、地形空气廓线（heightProfile 与 TerrainEnvironment 对应）以及局地交换开关。
 struct alignas(16) FluidParameters
 {
     glm::ivec4 grid{1, 1, 1, 0};
@@ -457,6 +533,8 @@ static_assert(offsetof(FluidParameters, heightProfile) == 96);
 static_assert(offsetof(FluidParameters, localExchange) == 112);
 
 
+// 模块：叶片生化/光合参数（Vcmax、Ball-Berry 气孔参数、温度响应参数、非光化学淬灭速率等）。
+// 多数字段无默认值，缺省时依赖解析层赋值。
 struct LeafBio
 {
     float Vcmax;		// maximum carboxylation capacity (at optimum temperature)
@@ -474,6 +552,8 @@ struct LeafBio
     int Tcor;
 };
 
+// 模块：土壤/固体表面热与光学参数：热惯性（cs、rhos、lambdas）、含水量、BRDF（朗伯或 Hapke）、
+// 木质/建筑分类，以及舰船船体选项（航速、水线、钢板层，全部默认 0 表示关闭，保持旧工程行为）。
 struct SoilSet
 {
     int method;
@@ -518,6 +598,7 @@ struct SoilSet
     //BSMParam bsm;
 };
 
+// 模块：开阔水体能量平衡与反射参数（朗伯或 Fresnel-Cox-Munk）。
 // Open-water energy balance parameters.
 struct WaterSet
 {
@@ -531,6 +612,7 @@ struct WaterSet
     float diffuseFraction{0.02f};  // residual subsurface/Lambert component
 };
 
+// 模块：建筑/人工表面的热参数（cs、rhos、lambdas 取值范围见字段行注释），Tin 为室内温度（待核对）。
 struct BuildUp
 {
     int method;
@@ -541,6 +623,9 @@ struct BuildUp
     float Tin;
 };
 
+// 模块：单个时间节点的气象强迫，来自气象文件（列顺序 t Ta ea p u Rin Rli，见 fileio.cpp）。
+// Ta 为气温（°C），ea 水汽压（hPa），u 风速（m s-1），Rin/Rli 入射短波/长波（W m-2）；
+// p 单位待核对；dTime 为时间步长（默认 600，单位应为 s，待核对）。
 struct Meteo
 {
     float z;

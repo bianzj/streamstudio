@@ -1,3 +1,51 @@
+// ==========================================================================
+// 文件：facetrtcore.cpp（histream / facetrt）
+// 功能：FacetRT（面元辐射）与 FacetEB（面元能量平衡）两种模式的完整核心实现。文件很大
+//       （约 8100 行），把“场景/参数读取 → 面元可见性图 → 辐射求解 → 能量平衡 → 结果输出”
+//       全部放在一个翻译单元里；对外只暴露 facetrtcore.h 中的 runFacetRTCore / runFacetEBCore。
+// 主要模块/步骤（按文件先后顺序）：
+//   1. 公共基础（匿名命名空间开头）：线程数与 OpenMP 并行、UTC 时间戳、FacetRunIndex
+//      （faceteb_run.json 运行索引）、常量（光栅尺寸/层数、迭代数、Stefan-Boltzmann 等）、
+//      2.5–6 um 反射太阳光谱形状 mwirSolarShape（与 shader/mwir_solar.glsl 保持一致）。
+//   2. 数据结构：SurfaceParameters（单个材质的光学/热学/生理/船体/车辆参数）、
+//      FacetRTParameters、Scene（三角面元顶点、材质索引、太阳角、光栅设置、周期邻域）、
+//      CpuGraph（CPU 稀疏可见性图）、RunResult（一次辐射运行的结果与耗时）。
+//   3. 向量小工具与 OBJ 三角形读取/按域裁剪（appendTriangle、clipPolygonToPlane、
+//      loadTreeWithSoil）；半球方向、太阳方向、Planck 辐亮度、波段取值。
+//   4. 背景（地面/土壤）Hapke 双向反射与红外方向发射率（含 Gauss-Legendre 积分表、
+//      反照率表），以及反射率纹理方差因子 finalizeReflectanceTextureFactors。
+//   5. 能量平衡用的辅助物理：饱和水汽压、潜热通量及其导数、叶片气孔阻抗（调用
+//      leafbiochemistry.h）、土壤储热系数与历史记忆模态。
+//   6. 光学参数组装：makeOptics / makeEnergyShortwaveOptics / makeEnergyLongwaveOptics /
+//      makeSpectralOptics / makeStateSpectralOptics（把材质参数变成每个面元的反射/透射/发射）。
+//   7. CPU 光栅化后端：CpuRasterizer（正交投影 + 每像素定长片元列表 A-buffer）→ buildCpuGraph（可见性图）→
+//      computeCpuSunlit（受光比例）→ solveCpu / incidentIrradianceCpu（Jacobi 辐射迭代）→ runCpu。
+//   8. GPU 后端：prepareGpuSpectral / runGpuSpectral / runGpu（经 facetrt_vulkan.h 的
+//      FacetrtVulkan），并在 CPU/GPU 间做谱带一致性自检；writeWebResult 输出 facetrt.json。
+//   9. 项目输入解析（第二个匿名命名空间）：XML/JSON 文本读取、标签/属性提取、材质与光学系数、
+//      土壤与光源（太阳/天空光谱）、OBJ 几何与 DEM 地面、放置变换、loadProjectScene。
+//  10. runFacetRTCore：读场景 → 选后端（cpu/gpu/auto，auto 时 GPU 失败回退 CPU）→ 求解 → 写结果。
+//  11. runFacetEBCore（文件最后的巨型函数）：读气象与控制参数 → 建共享可见性图 →
+//      选择 GPU/CPU 能量后端 → 初始化冠层柱/土壤/墙体/水体/船体/车辆状态 →
+//      逐时间节点循环：太阳位置与受光比例 → 阳光/阴影状态迁移 → 短波窗口辐射求解 →
+//      辐射-能量耦合迭代（残差判据收敛）→ 车辆舱室等附加模型 → 波段图像与过程/诊断产品输出。
+// 数据流：project.json 与 OBJ/DEM/气象文件 → Scene + SurfaceParameters → 可见性图（GPU 或
+//       CPU）→ 逐波段辐射求解 →（EB 模式）逐节点能量平衡 → faceteb.json / facetrt.json、
+//       *.bin、diagnostics、PROGRESS/RESULT 标准输出行（由 Node 服务端解析进度）。
+// 与其他文件的关系：
+//   - 入口：facetrt/command.cpp 调 runFacetRTCore；faceteb/command.cpp 调 runFacetEBCore。
+//   - 依赖：facetrt_vulkan.h（GPU 可见性/求解/能量内核）、energyphysics.h（EB 物理公式）、
+//     leafbiochemistry.h（叶片光合/气孔）、lumpedthermal.h（集总热体）、
+//     ../base/*（projectjson、compo、土壤 TIR 发射率、反射率纹理、shortwave_split）、
+//     ../thirdparty/spa.h（太阳位置）；着色器见 models/histream/shader。
+// 约定：温度 K；辐照/通量 W m-2；波长在输入中可为 nm 或 um（>50 视为 nm，见 mwirSolarShape）；
+//       时间步 dTime 单位 s；每个面元有两侧（side = facet*2 + 0/1），每侧再分
+//       受光(0)/阴影(1)两个状态；坐标系 y 向上、+X 为北、+Z 为东（SPA 方位角自北顺时针，见 sunDirection）；
+//       Vec3 为 float[3]。
+// 注意：本文件位于匿名命名空间内的函数多为内部实现；大量开关来自 HISTREAM_* 环境变量与
+//       project.json 的 control/light 设置，缺省值用于兼容旧工程。
+// ==========================================================================
+
 #include "facetrtcore.h"
 #include "../base/projectjson.h"
 #include "facetrt_vulkan.h"
@@ -44,6 +92,10 @@
 #include <gdal_priv.h>
 #include <omp.h>
 
+// 模块：匿名命名空间 1（文件内部实现，至 `} // namespace` 为止）。
+// 顺序：基础工具与常量 → 数据结构 → OBJ 读取 → Hapke/反射率纹理 → 能量平衡辅助物理 →
+// 光学参数组装 → CPU 光栅化后端 → GPU 后端 → writeWebResult。
+// 第 2 个匿名命名空间是项目输入（project.json / XML）解析，再后是两个对外入口。
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -83,6 +135,8 @@ void parallelRanges(size_t count, size_t grain, Body&& body)
     if (failure) std::rethrow_exception(failure);
 }
 
+// 作用：当前 UTC 时间的 ISO-8601 字符串（秒精度，如 2026-01-01T00:00:00Z）。
+// 用途：faceteb_run.json 的 startedAt / finishedAt。
 std::string utcTimestamp() {
     const std::time_t now = std::time(nullptr);
     std::tm utc{};
@@ -107,6 +161,8 @@ struct FacetRunIndex {
         stream << value.dump(2) << '\n';
         if (!stream) throw std::runtime_error("FacetEB cannot write run index");
     }
+    // 析构保护：运行中途抛异常或被中断而 status 仍为 running 时，改写为 failed 并记录
+    // finishedAt；写盘失败被吞掉，避免在析构中再抛异常。
     ~FacetRunIndex() {
         if (value.value("status", "") == "running") {
             value["status"] = "failed";
@@ -115,6 +171,15 @@ struct FacetRunIndex {
         }
     }
 };
+// 常量说明：
+//   - kRasterSize/kRasterLayers：可见性光栅默认 1024×1024，每像素最多 64 个片元层（A-buffer）；
+//     场景水平范围 >= kLargeSceneExtent 时改用 2048×2048 且只保留 16 层，使片元缓冲总量
+//     不变（见 loadProjectScene）。kMaximumRasterLayers 是自适应层数的上限。
+//   - kSkyDirectionCount：建可见性图时使用的半球方向数（见 makeHemisphereDirections）。
+//   - kIterations：辐射 Jacobi 迭代的默认次数上限。
+//   - kStandaloneSoilGridResolution：独立 OBJ 无地形时自动补的地面每边格数（48）。
+//   - kBeamNormalIrradiance / kSkyDiffuseIrradiance：FacetRT 历史缺省光照（W m-2），
+//     Scene 中水平天空散射缺省取 kSkyDiffuseIrradiance 的一半（即 50 W m-2）。
 constexpr float kPi = 3.14159265358979323846f;
 constexpr uint32_t kRasterSize = 1024;
 constexpr uint32_t kRasterLayers = 64;
@@ -148,6 +213,9 @@ constexpr std::array<float, 36> kMwirSolarShape = {
     1.1073e-06f, 3.5406e-08f, 9.0807e-14f, 0.0f, 0.0f, 0.0f};
 constexpr float kMwirSkySolarRatio = 0.0847f;
 
+// 作用：2.5–6 um 反射太阳光谱形状（kMwirSolarShape，100 nm 间隔）的线性插值。
+// 输入：波长（>50 视为 nm，否则 um）；输出：um-1，乘以水平总短波（W m-2）得 W m-2 um-1。
+// 区间 (2.5, 6) um 之外恒为 0。
 float mwirSolarShape(float wavelength)
 {
     const float um = wavelength > 50.0f ? wavelength * 0.001f : wavelength;
@@ -163,6 +231,12 @@ float mwirSolarShape(float wavelength)
 
 using facetbio::LeafBiochemistry;
 
+// 模块：一种材质（面元类别）的全部参数，既用于 FacetRT 也用于 FacetEB。
+// 分组：光学（逐波段 reflectance / transmittance、热红外 tir*、energy* 能量窗口用）；
+// 热学与土壤（比热/密度/导热、heatCapacityPerArea、soilTemperatureMethod）；
+// 植被（leaf 生理参数、leafWidth、surfaceResistance）；光伏 pv*；水体 water*；
+// 建筑墙体 wallSlab；船体 ship*/waterline*；车辆 vehicle*/cabin*/engine* 等。
+// 缺省值多为兼容旧工程的历史值；各字段旁的注释说明了开关语义。
 struct SurfaceParameters {
     std::vector<float> reflectance{0.10f};
     std::vector<float> transmittance{0.05f};
@@ -257,6 +331,9 @@ struct SurfaceParameters {
 
 };
 
+// 模块：FacetRT/FacetEB 的辐射参数。wavelengths 为波长（nm，缺省 550）；object / ground 为
+// 物体与地面材质参数（ground 缺省 ρ=0.20、sunlit 305 K、shaded 295 K）；skyTemperature（K）；
+// bandBeamNormal / bandSkyDiffuse 为逐波段光照，为空时回退到 Scene 的宽带缺省。
 struct FacetRTParameters {
     std::vector<float> wavelengths{550.0f};
     SurfaceParameters object;
@@ -269,6 +346,11 @@ struct FacetRTParameters {
     std::vector<float> bandSkyDiffuse;
 };
 
+// 模块：面元场景。vertices 每 3 个顶点为一个三角面元（含几何法向），materialIndices 指向 materials。
+// 前 leafFacetCount 个面元是“物体”面元（名称沿用旧工程的“叶”），其后是地面面元（待核对）。
+// 每个面元有两侧：side = facet*2 + 0（法向侧）/ +1（反法向侧）。
+// sunZenith / sunAzimuth 单位为度；minimum / maximum 为域包围盒（长度单位，通常 m）；
+// visibilityRaster* 为可见性光栅分辨率与层数；periodic* 为周期边界邻域副本（个数与平铺尺寸）。
 struct Scene {
     std::vector<facetvk::Vertex> vertices;
     std::vector<uint32_t> materialIndices;
@@ -300,6 +382,8 @@ struct Scene {
     uint32_t facetCount() const { return static_cast<uint32_t>(vertices.size() / 3U); }
 };
 
+// 作用：取第 band 个波段的法向直射辐照（bandBeamIrradiance）或水平天空散射辐照
+// （bandSkyIrradiance），单位 W m-2；没有逐波段值时回退到 Scene 的宽带缺省。
 float bandBeamIrradiance(const Scene& scene, const FacetRTParameters& parameters, size_t band)
 {
     return band < parameters.bandBeamNormal.size()
@@ -312,6 +396,8 @@ float bandSkyIrradiance(const Scene& scene, const FacetRTParameters& parameters,
         ? parameters.bandSkyDiffuse[band] : scene.skyDiffuseIrradiance;
 }
 
+// 作用：按面元密度自适应选择可见性光栅每像素的片元层数。
+// 输出：从 scene.visibilityRasterLayers 起翻倍，直到覆盖估计层数或达到 kMaximumRasterLayers。
 uint32_t adaptiveVisibilityRasterLayers(const Scene& scene)
 {
     const double pixelCount = static_cast<double>(scene.visibilityRasterSize) *
@@ -334,6 +420,8 @@ uint32_t adaptiveVisibilityRasterLayers(const Scene& scene)
     return layers;
 }
 
+// 可见性图的一条边：neighbor 为被看到的面侧（side）索引，count 为该方向上看到它的光栅样本数
+// （权重）。同一面侧的所有 count 与天空/地面计数之和等于该侧的 denominator。
 struct Edge {
     uint32_t neighbor{};
     uint32_t count{};
@@ -380,6 +468,7 @@ ProjectJson::Json groundEscapeJson(const facetvk::GraphDiagnostics& graph)
             {"objectSkyFraction", graph.skyFraction}};
 }
 
+// 作用：把下边界（物体侧向下逃逸）诊断格式化成中文日志行，写入 PROGRESS 标准输出。
 std::string groundEscapeLog(const facetvk::GraphDiagnostics& graph)
 {
     std::ostringstream text;
@@ -390,6 +479,10 @@ std::string groundEscapeLog(const facetvk::GraphDiagnostics& graph)
     return text.str();
 }
 
+// 模块：CPU 可见性图（CSR 稀疏格式）。rowOffsets/edges：每个面侧可见的其他面侧；
+// denominators：该侧总采样数；skyCounts / groundCounts：看到天空 / 等效地面的采样数
+// （groundCounts == kInactiveSide 表示该侧不参与求解，如地面背面）；
+// ground：下边界等效地面信息；diagnostics：图的统计与诊断。
 struct CpuGraph {
     std::vector<uint32_t> rowOffsets;
     std::vector<Edge> edges;
@@ -400,6 +493,9 @@ struct CpuGraph {
     facetvk::GraphDiagnostics diagnostics;
 };
 
+// 模块：一次 FacetRT 辐射运行的结果与耗时（writeWebResult 据此写 facetrt.json）。
+// solution 为宽带辐射度；bandRadiosity / bandStates 为逐波段结果；*Ms 为各阶段毫秒数；
+// spectral*Error 为 GPU 谱段路径与 CPU 参考的最大偏差（自检用，待核对具体含义）。
 struct RunResult {
     std::string backend;
     facetvk::GraphDiagnostics graph;
@@ -423,6 +519,8 @@ struct RunResult {
     std::vector<uint32_t> spectralIterations;
 };
 
+// 小型 Vec3（float[3]）向量工具：add / subtract / multiply / dot / cross（右手系）/ normalized。
+// normalized 对零长度向量抛异常（用于发现退化三角形）。
 Vec3 add(const Vec3& a, const Vec3& b)
 {
     return {a[0] + b[0], a[1] + b[1], a[2] + b[2]};
@@ -438,6 +536,9 @@ Vec3 multiply(const Vec3& value, float scale)
     return {value[0] * scale, value[1] * scale, value[2] * scale};
 }
 
+// 作用：周期边界副本的平铺偏移（X、Z 方向的格数）。index 0 为中心块（0,0）；
+// 1–20 依次为 4 个边邻、4 个角邻、4 个二阶边邻、8 个“马步”邻，对应
+// Scene.periodicNeighborCount 取 0/4/8/12/20；平移量 = 偏移 × periodicSizeX / periodicSizeZ。
 std::array<int, 2> periodicTileOffset(uint32_t index)
 {
     static constexpr std::array<std::array<int, 2>, 20> offsets{{
@@ -477,6 +578,8 @@ double milliseconds(Clock::time_point begin, Clock::time_point end)
     return std::chrono::duration<double, std::milli>(end - begin).count();
 }
 
+// 作用：解析 OBJ 面记录中 v/vt/vn 的顶点位置索引，支持负数相对索引（-1 为最后一个顶点）。
+// 输出：0 基索引；缺失或越界时抛异常。
 int parsePositionIndex(const std::string& token, size_t vertexCount)
 {
     const std::string text = token.substr(0, token.find('/'));
@@ -491,6 +594,8 @@ int parsePositionIndex(const std::string& token, size_t vertexCount)
     return index;
 }
 
+// 作用：向场景追加一个三角面元（3 个顶点 + 几何法向 (b-a)×(c-a) 归一化 + 材质索引）。
+// 退化三角形（法向模长平方 <= 1e-16）被丢弃并返回 false。
 bool appendTriangle(Scene& scene,
                     const Vec3& a,
                     const Vec3& b,
@@ -512,6 +617,8 @@ bool appendTriangle(Scene& scene,
     return true;
 }
 
+// 作用：Sutherland–Hodgman 单平面裁剪。保留坐标 axis 上 >= plane（keepGreater）或 <= plane
+// 的部分，容差 1e-6；返回裁剪后的多边形顶点（可能为空）。
 std::vector<Vec3> clipPolygonToPlane(const std::vector<Vec3>& source,
                                      size_t axis,
                                      float plane,
@@ -547,6 +654,8 @@ std::vector<Vec3> clipPolygonToPlane(const std::vector<Vec3>& source,
     return result;
 }
 
+// 作用：把三角形依次对域盒 [minimum, maximum] 的 6 个面裁剪，剩余多边形按扇形剖分后写入场景，
+// 保证面元不超出模拟域。
 void appendTriangleInsideDomain(Scene& scene,
                                 const Vec3& a,
                                 const Vec3& b,
@@ -566,6 +675,10 @@ void appendTriangleInsideDomain(Scene& scene,
     }
 }
 
+// 模块：读取单个 OBJ（输入不是 project.json 而是 .obj 时的独立模式）。
+// 输入：OBJ 文件，可含名为 HISTREAM_TERRAIN 的对象（其后的三角形视为地形）。
+// 输出：Scene，材质 0 = 物体缺省，材质 1 = 地面（ρ=0.20）；leafFacetCount 为物体面元数。
+// 说明：高度整体平移使最低点 y = 0；无地形时在 y = -0.01 处补一块方形土壤。
 Scene loadTreeWithSoil(const std::string& fileName)
 {
     std::ifstream input(fileName);
@@ -573,6 +686,7 @@ Scene loadTreeWithSoil(const std::string& fileName)
         throw std::runtime_error("Cannot open tree OBJ: " + fileName);
     }
 
+    // 步骤 1：逐行解析 o / v / f 记录；多边形面按扇形拆成三角形，记录地形三角形的起点。
     std::vector<Vec3> positions;
     std::vector<std::array<int, 3>> triangles;
     size_t terrainTriangleStart = std::numeric_limits<size_t>::max();
@@ -608,6 +722,7 @@ Scene loadTreeWithSoil(const std::string& fileName)
         throw std::runtime_error("Tree OBJ contains no usable geometry");
     }
 
+    // 步骤 2：求包围盒，并把所有顶点沿 y 平移使最低点为 0。
     Vec3 minimum{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
                  std::numeric_limits<float>::max()};
     Vec3 maximum{std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(),
@@ -622,6 +737,7 @@ Scene loadTreeWithSoil(const std::string& fileName)
         position[1] -= minimum[1];
     }
 
+    // 步骤 3：先写入物体三角形（计入 leafFacetCount），地形三角形使用材质 1。
     const bool hasTerrain = terrainTriangleStart != std::numeric_limits<size_t>::max() &&
                             terrainTriangleStart < triangles.size();
     Scene scene;
@@ -645,6 +761,8 @@ Scene loadTreeWithSoil(const std::string& fileName)
     }
     scene.leafFacetCount = hasTerrain ? leafFacetCount : scene.facetCount();
 
+    // 步骤 4：无地形时，在包围盒四周各外扩 0.5×最大水平边长，用
+    // kStandaloneSoilGridResolution² 个方格（每格 2 个三角形）铺一块地面，y = -0.01。
     float x0 = minimum[0];
     float x1 = maximum[0];
     float z0 = minimum[2];
@@ -679,6 +797,8 @@ Scene loadTreeWithSoil(const std::string& fileName)
     return scene;
 }
 
+// 作用：生成 kSkyDirectionCount（40）个上半球方向，供建可见性图使用。
+// 方法：黄金角螺旋，y = (i+0.5)/N 在高度上均匀（近似等立体角分布）。
 std::vector<facetvk::Direction> makeHemisphereDirections()
 {
     constexpr float goldenAngle = 2.39996322972865332f;
@@ -695,6 +815,7 @@ std::vector<facetvk::Direction> makeHemisphereDirections()
     return directions;
 }
 
+// 作用：太阳天顶角/方位角（度）→ 指向太阳的单位向量（y 向上）。
 facetvk::Direction sunDirection(const Scene& scene)
 {
     const float zenith = scene.sunZenith * kPi / 180.0f;
@@ -728,6 +849,9 @@ std::array<float, 2> facetRtThermalSolar(const Scene& scene, float wavelength)
             scale * scene.skyDiffuseIrradiance * kMwirSkySolarRatio};
 }
 
+// 作用：最简宽带光学参数：物体 ρ=0.10、τ=0.05，地面 ρ=0.20、τ=0；
+// directIrradiance = 受光比例 × max(0, n·s) × 法向直射辐照（W m-2）。
+// side 的法向：偶数侧为几何法向，奇数侧取反。
 std::vector<facetvk::SurfaceOptics> makeOptics(const Scene& scene,
                                                 const std::vector<float>& sunlit)
 {
@@ -752,6 +876,9 @@ std::vector<facetvk::SurfaceOptics> makeOptics(const Scene& scene,
     return optics;
 }
 
+// 作用：Planck 黑体光谱辐亮度，单位 W m-2 sr-1 um-1。
+// 输入：波长（>50 视为 nm，否则 um）、温度 K（下限 1 K）。
+// 常数：c1 = 2hc² = 1.19104e8 W um4 m-2 sr-1，c2 = hc/k = 14388.29 um K。
 float planckRadiance(float wavelengthNanometers, float temperature)
 {
     constexpr double c1 = 1.1910439340652e8;
@@ -766,6 +893,7 @@ float planckRadiance(float wavelengthNanometers, float temperature)
         (std::pow(wavelengthMicrometers, 5.0) * std::expm1(exponent)));
 }
 
+// 作用：取逐波段数组的第 band 项；索引超出时取最后一项，数组为空时返回 fallback。
 float bandValue(const std::vector<float>& values, size_t band, float fallback)
 {
     if (values.empty()) {
@@ -795,6 +923,11 @@ float windowBandValue(const std::vector<float>& values, size_t firstSample,
         : bandValue(values, (firstSample + lastSample) / 2U, fallback);
 }
 
+// 模块：背景（非植被地表，backgroundHeterogeneity = Hapke）的 Hapke 双向反射模型。
+// facetHapkeH：Hapke 多次散射 H 函数的近似 (1+2μ)/(1+2μγ)，γ = sqrt(1-w)，w 为单次散射反照率。
+// facetHapkeKernel：w/(4π)·μ0/(μ0+μ)·[1 + B(g) + H(μ0)H(μ) - 1]，相函数取各向同性，
+// B(g) 为反向散射（opposition）峰，幅度 1、宽度 0.1，g 为相位角（rad）；μ0、μ 分别为
+// 入射与出射方向与法向夹角的余弦。
 float facetHapkeH(float mu, float singleScatteringAlbedo)
 {
     const float gamma = std::sqrt(std::max(1.0f - singleScatteringAlbedo, 1.0e-6f));
@@ -818,6 +951,8 @@ float facetHapkeKernel(float mu0, float mu, float phaseAngle,
 // background, clamped to [0,1]; `base` is the already clamped Lambert value.
 float hapkeClampedFactor(float base, float mu0, float mu, float phaseAngle)
 {
+    // 由 Lambert 基准反射率 base 反解单次散射反照率：base 取作半无限介质的法向反射率
+    // r0 = (1-γ)/(1+γ)，即 w = 4·base/(1+base)²；限幅避免 γ 趋于 0 或 1 时的奇异。
     const float singleScatteringAlbedo = std::clamp(
         4.0f * base / std::pow(1.0f + base, 2.0f), 1.0e-5f, 0.999f);
     const float directional = facetHapkeKernel(
@@ -875,6 +1010,8 @@ struct UnitGaussLegendre {
     {
         constexpr int n = 16;
         for (int i = 0; i < n; ++i) {
+            // 对第 i 个 Legendre 多项式根：用经验初值做牛顿迭代（最多 100 次，|步长| < 1e-15 停止），
+            // 再把 [-1,1] 上的根映射到 [0,1]。
             double x = std::cos(3.14159265358979323846 * (i + 0.75) / (n + 0.5));
             double derivative = 1.0;
             for (int iteration = 0; iteration < 100; ++iteration) {
@@ -915,6 +1052,8 @@ struct HapkeAlbedoTable {
 
     static float baseAt(int index) { return 0.999f * index / (kBaseCount - 1); }
 
+    // 作用：方向-半球反照率 A(μ0) = (1/π)∫BRF·μ dΩ。出射天顶方向用 16 点 Gauss-Legendre，
+    // 相对方位角用 32 点中点法（被积函数对称，只积 [0,π]）。
     static double albedo(float base, double mu0)
     {
         const auto& rule = unitGaussLegendre();
@@ -940,6 +1079,8 @@ struct HapkeAlbedoTable {
         return 2.0 * sum;
     }
 
+    // 构造：预计算 101 个 base × 65 个 μ0 的 A(μ0)、101 个 base 的双半球反照率，以及
+    // 101 个发射率的热红外半球均值。开销较大，由 hapkeAlbedoTable() 以静态局部变量只算一次。
     HapkeAlbedoTable()
         : directional(size_t(kBaseCount) * kMuCount), bihemispherical(kBaseCount),
           thermalHemispherical(kBaseCount)
@@ -972,6 +1113,8 @@ struct HapkeAlbedoTable {
         out.insert(out.end(), thermalHemispherical.begin(), thermalHemispherical.end());
     }
 
+    // sampleThermal / sampleDirectional / sampleBihemispherical：对上面的表做线性或双线性插值；
+    // base 归一到 [0, 0.999]，μ0 归一到 [0, 1]。
     float sampleThermal(float emissivity) const
     {
         const float x = std::clamp(emissivity, 0.0f, 1.0f) * (kBaseCount - 1);
@@ -1034,6 +1177,8 @@ float backgroundHapkeEnergyReflectance(float reflectance, float mu0,
     return base + (std::clamp(hapke, 0.0f, 0.999f) - base) * s;
 }
 
+// 作用：热红外方向发射率因子 base·shape(cosine)/shape(1)，以天顶（μ=1）归一并限幅到 [0,1]。
+// 与下面 infraredHapkeImageEmissivity 的“半球均值归一”新约定不同。
 float infraredHapkeDirectionalFactor(float base, float cosine)
 {
     const float singleScatteringAlbedo = std::clamp(
@@ -1118,6 +1263,8 @@ struct BackgroundViewGeometry {
     float mu0{}, mu{}, phase{};
 };
 
+// 作用：把太阳方向与天顶视线翻折到面元法向所在半球后，求 mu0（太阳）、mu（视线）与法向
+// 夹角的余弦（下限 1e-4），以及两者的相位角 phase（rad）。
 BackgroundViewGeometry backgroundViewGeometry(const Vec3& rawNormal, const Vec3& sun)
 {
     const Vec3 normal = normalized(rawNormal);
@@ -1132,6 +1279,8 @@ BackgroundViewGeometry backgroundViewGeometry(const Vec3& rawNormal, const Vec3&
     return geometry;
 }
 
+// 作用：取面元所属材质参数；材质索引缺失或越界时按前 leafFacetCount 个面元为物体、
+// 其余为地面，回退到默认物体/地面材质（兼容没有材质表的旧场景）。
 const SurfaceParameters& surfaceForFacet(const Scene& scene, uint32_t facet)
 {
     const uint32_t materialIndex =
@@ -1149,6 +1298,7 @@ const SurfaceParameters& surfaceForFacet(const Scene& scene, uint32_t facet)
 }
 
 
+// 作用：三角面元面积 0.5·|AB×AC|（场景长度单位的平方，通常 m2）。
 float facetArea(const Scene& scene, uint32_t facet)
 {
     const facetvk::Vertex& a = scene.vertices[facet * 3U];
@@ -1163,6 +1313,8 @@ float facetArea(const Scene& scene, uint32_t facet)
     return 0.5f * std::sqrt(dot(cross(edgeA, edgeB), cross(edgeA, edgeB)));
 }
 
+// 作用：在面元重心处对反射率扰动纹理做世界坐标三平面采样（按 |法向| 加权，
+// repeatSize 为纹理重复尺寸），返回零均值偏差；材质没有纹理时返回 0。
 float sampledReflectanceVariance(const Scene& scene, uint32_t facet,
                                  const SurfaceParameters& surface)
 {
@@ -1181,6 +1333,8 @@ float sampledReflectanceVariance(const Scene& scene, uint32_t facet,
         surface.reflectanceTextureRepeatSize);
 }
 
+// 作用：该材质允许的反射率缩放因子上限，保证 ρ·f + τ <= 1，即 f <= (1-τ)/ρ；
+// 对 reflectance 与 energyReflectance 各波段取最小值，没有有效波段时为 +inf。
 float maximumMeanPreservingFactor(const SurfaceParameters& surface)
 {
     float maximumFactor = std::numeric_limits<float>::infinity();
@@ -1201,6 +1355,11 @@ float maximumMeanPreservingFactor(const SurfaceParameters& surface)
     return maximumFactor;
 }
 
+// 模块：反射率纹理扰动因子。每个面元的因子 f = 1 + scale × 偏差，其中偏差先在材质内按面积
+// 去均值，所以每种材质的面积加权平均因子保持为 1（不改变平均反射率）。
+// 输出：scene.reflectanceTextureFactors（无纹理或强度为 0 的面元为 1），并向日志打印
+// 各材质因子的均值、变异系数与范围。
+// scale 由 physicalTextureScale 给出，受 maximumMeanPreservingFactor 限制。
 void finalizeReflectanceTextureFactors(Scene& scene)
 {
     const uint32_t facetCount = scene.facetCount();
@@ -1220,6 +1379,8 @@ void finalizeReflectanceTextureFactors(Scene& scene)
     std::vector<MaterialStatistics> statistics(scene.materials.size());
     std::vector<float> samples(facetCount, 0.0f);
     std::vector<float> areas(facetCount, 0.0f);
+    // 步骤 1：逐面元采样偏差（只处理有纹理且 strength 或 relativeStd > 0 的材质），
+    // 并按材质累计面积与面积加权和。
     for (uint32_t facet = 0; facet < facetCount; ++facet) {
         if (facet >= scene.materialIndices.size()) continue;
         const uint32_t materialIndex = scene.materialIndices[facet];
@@ -1234,6 +1395,8 @@ void finalizeReflectanceTextureFactors(Scene& scene)
         statistics[materialIndex].areaWeightedSample +=
             static_cast<double>(areas[facet]) * samples[facet];
     }
+    // 步骤 2：减去材质面积加权均值得到零均值偏差，并累计面积加权平方和与偏差极值，
+    // 供 physicalTextureScale 换算缩放系数。
     for (uint32_t facet = 0; facet < facetCount; ++facet) {
         if (facet >= scene.materialIndices.size() || !(areas[facet] > 0.0f)) continue;
         const uint32_t materialIndex = scene.materialIndices[facet];
@@ -1248,6 +1411,7 @@ void finalizeReflectanceTextureFactors(Scene& scene)
         stats.deviation.minimumDeviation = std::min(stats.deviation.minimumDeviation, deviation);
         stats.deviation.maximumDeviation = std::max(stats.deviation.maximumDeviation, deviation);
     }
+    // 步骤 3：每种材质由 strength / relativeStd 求缩放系数 scale（受反射率上限约束）。
     for (size_t materialIndex = 0;
          materialIndex < scene.materials.size(); ++materialIndex) {
         MaterialStatistics& stats = statistics[materialIndex];
@@ -1258,6 +1422,7 @@ void finalizeReflectanceTextureFactors(Scene& scene)
             surface.reflectanceTextureRelativeStd, stats.deviation,
             maximumMeanPreservingFactor(surface));
     }
+    // 步骤 4：因子 = 1 + scale × 偏差，写入 scene.reflectanceTextureFactors，同时统计均值与范围。
     for (uint32_t facet = 0; facet < facetCount; ++facet) {
         if (facet >= scene.materialIndices.size() || !(areas[facet] > 0.0f)) continue;
         const uint32_t materialIndex = scene.materialIndices[facet];
@@ -1270,6 +1435,7 @@ void finalizeReflectanceTextureFactors(Scene& scene)
         stats.minimumFactor = std::min(stats.minimumFactor, factor);
         stats.maximumFactor = std::max(stats.maximumFactor, factor);
     }
+    // 步骤 5：逐材质打印因子的面积加权均值、变异系数 cv 与取值范围，便于核对纹理强度。
     for (size_t materialIndex = 0;
          materialIndex < statistics.size(); ++materialIndex) {
         const MaterialStatistics& stats = statistics[materialIndex];
@@ -1289,6 +1455,9 @@ float reflectanceTextureFactor(const Scene& scene, uint32_t facet)
         ? scene.reflectanceTextureFactors[facet] : 1.0f;
 }
 
+// 作用：饱和水汽压 e_s（hPa），Tetens 型公式 6.107·10^(7.5·T/(237.3+T))，T 为摄氏度。
+// 输入：温度 K，内部限幅到 [-80, 80] °C；saturationVaporPressureSlope 为其对 T 的解析导数
+// （hPa K-1，2.3026 = ln10）。
 float saturationVaporPressure(float temperature)
 {
     const float celsius = std::clamp(temperature - 273.15f, -80.0f, 80.0f);
@@ -1303,6 +1472,10 @@ float saturationVaporPressureSlope(float temperature)
         std::pow(237.3f + celsius, 2.0f);
 }
 
+// 作用：潜热通量 LE = ρ_air·λ·0.622·max(0, e_s(T)-e)/p / (ra + rs)，单位 W m-2。
+// 输入：温度 K、空气密度 kg m-3、气压 hPa（下限 100）、水汽压 hPa、
+// 空气动力阻抗 ra 与表面阻抗 rs（s m-1，两者之和下限 1）。
+// λ = (2.501 - 0.002361·T_C)×1e6 J kg-1。
 float latentHeatFlux(float temperature,
                      float airDensity,
                      float airPressure,
@@ -1321,6 +1494,8 @@ float latentHeatFlux(float temperature,
         std::max(1.0f, aerodynamicResistance + surfaceResistance);
 }
 
+// 作用：latentHeatFlux 对温度的导数（W m-2 K-1），包含饱和水汽压斜率项和 λ 随温度变化项
+// （-2361 J kg-1 K-1）；结果下限 0，用于能量残差对温度的斜率。
 float latentHeatFluxDerivative(float temperature,
                                float airDensity,
                                float airPressure,
@@ -1359,12 +1534,19 @@ double quadraticRoot(double a, double b, double c, bool larger)
     return larger == (b < 0.0) ? q / a : c / q;
 }
 
+// 作用：整叶气孔阻抗 rs（s m-1）：Collatz 型 C3/C4 光合 + Ball-Berry 气孔导度，Ci 自洽求解。
+// 输入：leaf 生理参数、叶温 K、吸收 PAR（单位待核对）、水汽压 hPa、气压 hPa、
+// 冠层相对深度（限幅 [-1, 0]，用于 vcmax25 随深度衰减）、环境 CO2 ppm。
+// 输出：rs，限幅在 [1, 625000] s m-1（625000 为气孔关闭时的上限）。
 // Whole-leaf Collatz resistance [s m-1]. A(Ci), Ball-Berry and CO2 diffusion
 // must use the SAME Ci, including the nonzero Ball-Berry intercept.
 float leafStomatalResistance(const LeafBiochemistry& leaf, float temperature,
                              float absorbedPar, float vaporPressure, float pressure,
                              float relativeDepth, float co2Ppm)
 {
+    // 步骤 1：温度与深度修正的光合参数：vcmax25 随深度指数衰减；qt 为 0.1·(T-298.15)·修正系数，
+    // 各酶动力学参数（kc、ko、kpep、vcmax、比选择性、暗呼吸 rd）按 Q10 型因子随温度变化；
+    // je 为光限制的电子传输速率；gammaStar 为 C3 的 CO2 补偿点。
     constexpr double closed = 625000.0, o2Permil = 209.0;
     const double tc = temperature;
     const bool c4 = leaf.type > 3.5f;
@@ -1391,6 +1573,9 @@ float leafStomatalResistance(const LeafBiochemistry& leaf, float temperature,
     const double product = leaf.ballBerrySlope * relativeHumidity;
     const double minCiPpm = (c4 ? 0.1 : 0.3) * co2Ppm;
     const double intercept = std::max(0.0f, leaf.ballBerry0);
+    // 步骤 2：净同化 A(Ci) = 总同化 - rd。C4：vc = vcmax、vs = kpep·Ci、ve = je/6；
+    // C3：Rubisco 限制 vc、光限制 ve、产物限制 vs；总同化由两次非直角双曲线（曲率 0.8、0.98）
+    // 平滑取最小。无光、无 Ball-Berry 斜率或胁迫因子 <= 0 时总同化为 0。
     const auto assimilation = [&](double ciPpm) {
         const double ci = ciPpm * ppm2bar;
         double vc, ve, vs;
@@ -1406,6 +1591,9 @@ float leafStomatalResistance(const LeafBiochemistry& leaf, float temperature,
         if (absorbedPar <= 0.0f || product <= 0.0 || leaf.stressFactor <= 0.0f) ag = 0.0;
         return ag - rd;
     };
+    // 步骤 3：求 Ci 使 Ci = Cs - 1.6·A/gs，其中 gs = g0 + m·RH·A/Cs（Ball-Berry）。
+    // 无截距 g0 时有解析闭式 Ci = Cs·(1 - 1.6/(m·RH))（下限 minCiPpm）；有截距时用二分法
+    // （最多 24 次，容差 0.01 ppm）。
     double molarConductance = intercept;
     if (co2Ppm > 0.0 && assimilation(co2Ppm) > 0.0) {
         double ci = product > 0.0 ? std::max(minCiPpm, co2Ppm * (1.0 - 1.6 / product)) : minCiPpm;
@@ -1427,12 +1615,16 @@ float leafStomatalResistance(const LeafBiochemistry& leaf, float temperature,
         molarConductance = std::max(intercept, intercept + product * a / co2Ppm);
         molarConductance = std::max(molarConductance, 1.6 * a / (co2Ppm - minCiPpm));
     }
+    // 步骤 4：摩尔导度 → 速度导度：g[m s-1] = g[mol m-2 s-1]·R·T/P（P 由 hPa 换成 Pa），
+    // 阻抗取倒数并限幅；导度非正时按关闭处理。
     // Both intercept and assimilation terms use the local molar volume.
     const double conductance = molarConductance * 8.314 * tc / (pressure * 100.0);
     return conductance > 0.0
         ? static_cast<float>(std::clamp(1.0 / conductance, 1.0, closed)) : static_cast<float>(closed);
 }
 
+// 作用：土壤储热系数 = 2·sqrt(c·ρ·k)/sqrt(π·dTime)，单位 W m-2 K-1，其中 sqrt(c·ρ·k) 为热惯量；
+// dTime 为时间步长 s（下限 1 s）。用于把土壤导热通量对地表温度线性化（推导待核对）。
 float soilStorageCoefficient(const SurfaceParameters& surface, float dTime)
 {
     const float thermalInertia = std::sqrt(std::max(
@@ -1473,6 +1665,9 @@ SoilMemoryModes soilMemoryModes(float dTime, size_t explicitNodes)
     return modes;
 }
 
+// 作用：把材质的逐波段值压成一个宽带短波值（材质没有 1 nm 的 energy* 数据时的回退）。
+// 1 个值直接使用；2 个值视为可见光/近红外两个宽带，权重 0.43/0.57；3 个以上假设在
+// 400–2400 nm 等距，以 5778 K 黑体（近似太阳光谱）为权重做加权平均；非有限值跳过或取 fallback。
 float shortwaveWeightedBandValue(
     const std::vector<float>& values, float fallback)
 {
@@ -1509,6 +1704,12 @@ float shortwaveWeightedBandValue(
         : fallback;
 }
 
+// 模块：FacetEB 一个短波能量窗口（1 nm 样本区间 [firstSample, lastSample]，spectralWeight
+// 为窗口内太阳光谱权重）的面元光学参数。
+// 输入：每侧受光比例 sunlit、法向直射辐照 directNormalIrradiance 与水平散射 diffuseIrradiance
+// （W m-2）。输出：每侧 reflectance / transmittance / directIrradiance。
+// 说明：窗口平均 ρ、τ 只与材质有关，先按材质算一次；反射率乘纹理因子并限幅，τ <= 1-ρ；
+// 背景面元用 backgroundHapkeEnergyReflectance 保证半球能量守恒，物体面元不用 Hapke。
 std::vector<facetvk::SurfaceOptics> makeEnergyShortwaveOptics(
     const Scene& scene,
     const std::vector<float>& sunlit,
@@ -1521,6 +1722,8 @@ std::vector<facetvk::SurfaceOptics> makeEnergyShortwaveOptics(
     const facetvk::Direction direction = sunDirection(scene);
     const Vec3 sun{direction.x, direction.y, direction.z};
     std::vector<facetvk::SurfaceOptics> optics(scene.facetCount() * 2U);
+    // 步骤 1：按材质预计算窗口平均 ρ/τ：有 energyReflectance 时按太阳权重做梯形平均，
+    // 否则回退到 shortwaveWeightedBandValue；末尾一项存放回退材质。
     // Window-mean reflectance/transmittance depend only on the material (and
     // the leaf/ground fallback), not on the facet: evaluate the ~100-sample
     // window integral once per material instead of twice per facet.
@@ -1552,6 +1755,7 @@ std::vector<facetvk::SurfaceOptics> makeEnergyShortwaveOptics(
     materialWindow[materialCount][1] = windowOptics(SurfaceParameters{}, true);
     materialWindow[materialCount][0] = windowOptics(
         surfaceForFacet(scene, std::numeric_limits<uint32_t>::max()), false);
+    // 步骤 2：并行逐面元：取材质窗口值 → 乘纹理因子 → 逐侧计算直射辐照与反射率/透射率。
     parallelRanges(scene.facetCount(), 4096U, [&](size_t begin, size_t end) {
     for (uint32_t facet = static_cast<uint32_t>(begin); facet < end; ++facet) {
         const bool leaf = facet < scene.leafFacetCount;
@@ -1597,6 +1801,10 @@ std::vector<facetvk::SurfaceOptics> makeEnergyShortwaveOptics(
     return optics;
 }
 
+// 作用：FacetEB 长波（热红外宽带）面元光学参数。ρ = tirReflectance、τ = tirTransmittance，
+// 半球发射率 ε = 1-ρ-τ（背景 Hapke 方向发射率只用于图像，不改变这里的 ε）。
+// emission = ε·σ·[f·T_sunlit⁴ + (1-f)·T_shaded⁴]，f 为受光比例，温度限幅 [1, 1000] K。
+// 输入：受光/阴影两个状态的逐侧温度 stateTemperature（K）与受光比例 sunlitPart。
 std::vector<facetvk::SurfaceOptics> makeEnergyLongwaveOptics(
     const Scene& scene,
     const std::array<std::vector<float>, 2>& stateTemperature,
@@ -1633,6 +1841,8 @@ std::vector<facetvk::SurfaceOptics> makeEnergyLongwaveOptics(
     return optics;
 }
 
+// 作用：把短波与长波两次辐射求解的辐射度逐侧相加，得到总辐射度；迭代次数与 maxDelta
+// 取两者较大值；清空 incident 缓存（它只对应未混合的解）。两者尺寸不一致时抛异常。
 facetvk::SolveResult combineRadiativeSolutions(
     const facetvk::SolveResult& shortwave,
     const facetvk::SolveResult& longwave)
@@ -1653,6 +1863,11 @@ facetvk::SolveResult combineRadiativeSolutions(
     return combined;
 }
 
+// 模块：FacetRT 第 band 个波段的面元光学参数（反射、透射、发射、直射辐照）。
+// 波长 > 2500 nm 视为热红外：ρ/τ 取 tir*，发射 = ε·Planck(T)，按受光比例在材质的
+// sunlitTemperature / shadedTemperature（K）之间混合，并反射 2.5–6 um 的太阳光；
+// 否则为光学波段：ρ/τ 取逐波段值（ρ 乘纹理因子），directIrradiance = 受光 × cos × 波段法向直射。
+// 输出：每侧 SurfaceOptics；可选输出 stateEmission（受光点/阴影点发射）与 image（图像反射）。
 // stateEmission (optional): per side, the emission of a sunlit and of a shaded
 // point of that facet, for the sunlit/shaded image states.
 std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
@@ -1711,6 +1926,10 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
             float imageEmissivity = emissivity;
             float beamReflectance = -1.0f;
             ImageReflection sideImage;
+            // 背景（非物体）面元的 Hapke 处理，四种情形：
+            //   1. Hapke + 热红外：求解保持 Lambert 半球发射率，图像用按半球均值归一的方向发射率；
+            //   2. Hapke + 光学：漫射用 base，光束用方向-半球反照率 beamReflectance，图像用 BRF；
+            //   3、4. Hapke 关闭（strength = 0）：旧公式，数值上等于 Lambert 值，保留以与旧结果一致。
             if (!object && hapke && thermal) {
                 reflectance = std::clamp(
                     1.0f - transmittance - emissivity, 0.0f, 1.0f);
@@ -1748,6 +1967,8 @@ std::vector<facetvk::SurfaceOptics> makeSpectralOptics(
             optics[side].transmittance = std::min(
                 transmittance, 1.0f - reflectance);
             if (thermal) {
+                // 热红外：发射 = ε·B(λ, T)，按 facetIlluminated 混合受光/阴影温度；stateEmission 另存
+                // 受光点与阴影点各自的图像发射；directIrradiance 为反射的太阳光（辐亮度单位）。
                 const float sunlitBlackbody = planckRadiance(wavelength, surface.sunlitTemperature);
                 const float shadedBlackbody = planckRadiance(wavelength, surface.shadedTemperature);
                 const float sunlitEmission = emissivity * sunlitBlackbody;
@@ -1809,6 +2030,8 @@ void appendSurfaceStates(const Scene& scene,
             const uint32_t side = facet * 2U + localSide;
             const uint32_t opposite = facet * 2U + (1U - localSide);
             const facetvk::SurfaceOptics& surface = optics[side];
+            // shared：辐射度中扣除本侧直射反射、对侧直射透射与发射后剩下的漫射 + 多次散射部分，
+            // 受光点与阴影点共用。
             const float shared = radiosity[side]
                 - surface.reflectance * surface.directIrradiance
                 - surface.transmittance * optics[opposite].directIrradiance
@@ -1844,12 +2067,19 @@ bool isOpticalWavelength(float wavelength)
     return wavelengthNanometers <= 2500.0f;
 }
 
+// 作用：把 FacetRT 逐波段谱段求解所需的数据一次性上传到 GPU（model.beginSpectral）。
+// 输入：场景、每侧受光比例 sunlit、波段参数 parameters；副作用：GPU 端保存面元记录与材质谱表。
+// 说明：材质数 = scene.materials + 2（末尾两个为默认物体 / 默认地面回退材质）。
+// 数据布局与 shader/spectral.comp 对应，修改时需同步。
 void prepareGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const std::vector<float>& sunlit,
                         const FacetRTParameters& parameters)
 {
     const auto direction = sunDirection(scene);
     const Vec3 sun{direction.x, direction.y, direction.z};
     const uint32_t materials = static_cast<uint32_t>(scene.materials.size()) + 2U;
+    // 步骤 1：每个面元 12 个 float：[0..2] 原始法向，[3] 反射率纹理因子，[4] 材质索引，
+    // [5] 是否物体面元，[6..7] 两侧受光比例，[8] 太阳入射余弦 mu0，[9] 反向散射峰因子
+    // 1/(1+tan(g/2)/0.1)（与 facetHapkeKernel 同参数），[10] |法向 y|，[11] 天顶视线余弦 mu。
     std::vector<float> facets(size_t(scene.facetCount()) * 12U);
     for (uint32_t f = 0; f < scene.facetCount(); ++f) {
         float* p = facets.data() + size_t(f) * 12U;
@@ -1879,6 +2109,8 @@ void prepareGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const
     // Hapke background: the albedo tables follow the facet records (see
     // HapkeAlbedoTable::append and spectral.comp); not built otherwise.
     if (scene.backgroundAngularStrength > 0.0f) hapkeAlbedoTable().append(facets);
+    // 步骤 2：逐波段 × 材质预计算 4 个值：ρ、τ、受光温度 Planck 辐亮度、阴影温度 Planck 辐亮度
+    // （热红外波段 > 2500 nm 才有后两项），然后调用 beginSpectral 上传。
     // Spectral tables and blackbody radiance are material properties: evaluate
     // once per material/band instead of repeating expm1 for every oriented side.
     std::vector<float> materialBands(parameters.wavelengths.size() * materials * 4U);
@@ -1901,6 +2133,11 @@ void prepareGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const
                         bandBeamIrradiance(scene, parameters, 0));
 }
 
+// 作用：FacetEB 逐波段图像（光学与热红外）的面元光学参数，构造方式与 makeSpectralOptics
+// 相同，区别是温度来自 stateTemperature（逐侧受光/阴影两个状态，K，限幅 [1, 2000]），
+// 波段类型用 isOpticalWavelength 判断，directIrradiance 用传入的 directNormalIrradiance
+// （光学波段为归一光束，热红外为 2.5–6 um 太阳光辐亮度，其余为 0）。
+// 输出：每侧 SurfaceOptics；stateEmission 为受光/阴影点的图像发射；image 为 Hapke 背景的图像反射。
 std::vector<facetvk::SurfaceOptics> makeStateSpectralOptics(
     const Scene& scene,
     const std::vector<float>& sunlit,
@@ -2012,12 +2249,15 @@ std::vector<facetvk::SurfaceOptics> makeStateSpectralOptics(
     return optics;
 }
 
+// 投影后顶点：x、y 为像素坐标（浮点），depth 为归一化深度 [0,1]（0 为离观察点最近）。
 struct ProjectedVertex {
     float x{};
     float y{};
     float depth{};
 };
 
+// A-buffer 片元：depth 同上；cameraSide 为面元朝向观察点的那一侧的 side 索引；
+// central 表示来自中心块（false 为周期副本，只遮挡和发射，不作接收者）。
 struct Fragment {
     float depth{};
     uint32_t cameraSide{};
@@ -2025,8 +2265,15 @@ struct Fragment {
     bool central{true};
 };
 
+// 模块：保留的 CPU 光栅化器（GPU 后端之外的参考/回退实现）。
+// 对一个方向做正交投影：每个三角形（含周期副本）按像素光栅化，把片元写入该像素的定长列表
+// （A-buffer，层由原子计数分配）；超出 layers 的片元只计入溢出数，由调用方加深层数后重来
+// （见 growCpuRasterLayers）。深度按包含全部周期副本的包围球归一，x/y 开窗只含中心块。
 class CpuRasterizer {
 public:
+    // 构造：分配每像素计数器与片元数组；计算两个包围球：m_center / m_radius 含全部周期副本
+    // （用于深度归一），m_windowCenter / m_windowRadius 只含中心块（用于 x/y 开窗）；
+    // 半径放大 1.001 倍并设下限，避免边缘面元落到窗口外。
     CpuRasterizer(const Scene& scene, uint32_t width, uint32_t height, uint32_t layers)
         : m_scene(scene),
           m_width(width),
@@ -2064,13 +2311,24 @@ public:
             0.5f * std::sqrt(dot(centralDiagonal, centralDiagonal)) * 1.001f, 1.0e-4f);
     }
 
+    // 作用：沿 inputDirection 对整个场景（含周期复制块）做一次正交投影的 CPU 软光栅化，
+    //       把每个像素上覆盖到的所有三角形片元（深度 + 面元侧 id）存入 A-buffer（多层）。
+    // 输入：inputDirection 为指向“相机/观察点”一侧的单位方向；jitterX/Y 为亚像素抖动（像素）。
+    // 输出：返回超出层数上限 m_layers 而被丢弃的片元数（非 0 表示 A-buffer 溢出）。
+    // 说明：深度归一化到 [0,1]（越小越靠近相机）；cameraSide = 2*facet + (法线朝向相机 ? 0 : 1)。
+    // 作用：沿 inputDirection（指向观察点的方向）做一次正交光栅化；jitterX/jitterY 为像素偏移。
+    // 输出：溢出片元数（> 0 表示层数不够）。结果保存在 count() / fragments() 中。
     uint32_t rasterize(const facetvk::Direction& inputDirection,
                        float jitterX = 0.0f, float jitterY = 0.0f)
     {
+        // 步骤 1：清零每个像素的片元计数，上一方向的结果不能带入本方向。
+        // 步骤 1：清零每像素片元计数。
         parallelRanges(m_pixelCount, 1U << 16U, [&](size_t begin, size_t end) {
             for (size_t pixel = begin; pixel < end; ++pixel)
                 m_counts[pixel].store(0U, std::memory_order_relaxed);
         });
+        // 步骤 2：由视线方向构造正交基（right, up）；参考轴在视线接近竖直时改用 y 轴，避免叉积退化。
+        // 步骤 2：建立正交相机基 (right, up, view)；参考向量避开与 view 近平行的方向。
         const Vec3 view = normalized({inputDirection.x, inputDirection.y, inputDirection.z});
         const Vec3 reference = std::abs(view[2]) < 0.9f ? Vec3{0.0f, 0.0f, 1.0f}
                                                         : Vec3{0.0f, 1.0f, 0.0f};
@@ -2080,6 +2338,11 @@ public:
         const size_t facetCount = m_scene.facetCount();
         const size_t triangleCount = facetCount * (m_scene.periodicNeighborCount + 1U);
 
+        // 步骤 3：并行遍历“中心块 + 周期邻块”的全部三角形：按 tileIndex 平移顶点，
+        //         x/y 用中心块窗口（m_windowCenter/Radius）映射到像素，深度用整体外接球（m_center/Radius）。
+        // 步骤 3：并行遍历所有三角形（triangle = tile × facetCount + facet；tile 0 为中心块，
+        // 其余为周期副本，平移 tile 偏移 × periodicSize），投影后逐三角形光栅化。
+        // cameraSide 取面元朝向观察点的那一侧（法向与 view 同向为 side0，否则为 side1）。
         parallelRanges(triangleCount, 512U, [&](size_t begin, size_t end) {
           for (size_t triangle = begin; triangle < end; ++triangle) {
             const uint32_t tileIndex = static_cast<uint32_t>(triangle / facetCount);
@@ -2103,6 +2366,8 @@ public:
                 projected[corner].depth =
                     0.5f - dot(relative, view) / (2.0f * m_radius);
             }
+            // 该面元的几何法线与视线同向则相机看到的是 side 0（正面），否则是 side 1（背面）；
+            // tileIndex == 0 才是中心块，周期副本只作遮挡/发射、不作为接收者。
             const facetvk::Vertex& first = m_scene.vertices[facet * 3U];
             const Vec3 normal{first.normal[0], first.normal[1], first.normal[2]};
             const uint32_t cameraSide = facet * 2U + (dot(normal, view) >= 0.0f ? 0U : 1U);
@@ -2112,6 +2377,9 @@ public:
         return overflow.load();
     }
 
+    // 只读访问器：某像素实际可用的片元层数（计数可能因溢出超过 m_layers，这里截断到 m_layers）。
+    // 访问器：count 为像素已写入的片元数（被 layers 截断）；fragments 为 [pixel*layers + layer]
+    // 排布的扁平数组，片元顺序与线程调度有关，使用前须按 fragmentBefore 排序。
     uint32_t count(size_t pixel) const
     {
         return std::min(m_counts[pixel].load(std::memory_order_relaxed), m_layers);
@@ -2121,18 +2389,29 @@ public:
     uint32_t layers() const { return m_layers; }
 
 private:
+    // 边函数：(a→b) 边与点 p 的二维叉积（带符号的两倍三角形面积），用于重心坐标与内外判定。
+    // 边函数：点 p 相对有向边 a→b 的叉积（两倍三角形有向面积，用于重心坐标与内外判定）。
     static float edge(float ax, float ay, float bx, float by, float px, float py)
     {
         return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
     }
 
+    // 作用：把一个已投影到像素坐标的三角形光栅化，向覆盖到的每个像素追加一个片元。
+    // 输入：p 为三个顶点的像素坐标与归一化深度；side 为 cameraSide；central 标记是否中心块。
+    // 说明：像素中心采样；用原子计数 fetch_add 分配层号，故可被多线程并行调用；
+    //       层号 >= m_layers 时只累加 overflow，不写入片元。
+    // 作用：用边函数光栅化一个投影三角形：遍历包围盒内的像素，像素中心（+0.5）落入三角形内
+    // 则在该像素原子地取一层，写入重心插值的深度、side 与 central；层数不够时只累加溢出数。
+    // 面积接近 0（< 1e-8）的退化投影直接跳过。
     void rasterTriangle(const ProjectedVertex (&p)[3], uint32_t side, bool central,
                         std::atomic<uint32_t>& overflow)
     {
+        // 步骤 1：投影后面积接近 0 的退化三角形（与视线几乎平行）直接跳过。
         const float area = edge(p[0].x, p[0].y, p[1].x, p[1].y, p[2].x, p[2].y);
         if (std::abs(area) < 1.0e-8f) {
             return;
         }
+        // 步骤 2：求三角形的像素包围盒，并裁剪到图像范围内。
         const int x0 = std::max(0, static_cast<int>(std::floor(
                                        std::min({p[0].x, p[1].x, p[2].x}))));
         const int x1 = std::min(static_cast<int>(m_width) - 1,
@@ -2145,6 +2424,8 @@ private:
                                     std::max({p[0].y, p[1].y, p[2].y}))));
         for (int y = y0; y <= y1; ++y) {
             for (int x = x0; x <= x1; ++x) {
+                // 步骤 3：对包围盒内每个像素中心，用三条边函数得到（未归一化的）重心坐标 w0/w1/w2，
+                //         并按三角形朝向（area 的符号）判断是否在内部。
                 const float px = static_cast<float>(x) + 0.5f;
                 const float py = static_cast<float>(y) + 0.5f;
                 const float w0 = edge(p[1].x, p[1].y, p[2].x, p[2].y, px, py);
@@ -2156,6 +2437,7 @@ private:
                 if (!inside) {
                     continue;
                 }
+                // 步骤 4：分配层号；超出层数上限则只计入溢出；否则用重心坐标插值深度并写入片元。
                 const size_t pixel = static_cast<size_t>(y) * m_width + x;
                 const uint32_t layer = m_counts[pixel].fetch_add(1U, std::memory_order_relaxed);
                 if (layer >= m_layers) {
@@ -2170,6 +2452,9 @@ private:
         }
     }
 
+    // 成员：场景引用、A-buffer 尺寸、深度球（m_center/m_radius，覆盖周期副本）、
+    //       x/y 窗口球（m_windowCenter/m_windowRadius，仅覆盖中心块）、每像素原子计数与片元数组
+    //       （第 pixel 个像素的第 layer 层在 m_fragments[pixel * m_layers + layer]）。
     const Scene& m_scene;
     uint32_t m_width{};
     uint32_t m_height{};
@@ -2196,8 +2481,16 @@ bool fragmentBefore(const Fragment& a, const Fragment& b)
 
 using Progress = std::function<void(int, const std::string&)>;
 
+// 模块：CPU 版可见性图构建（与 GPU 的 visibility_resolve 流程对应的参考实现）。
+// 作用：对半球方向集合逐方向光栅化，按像素深度排序后统计每个“面元侧”（side）的
+//       接收分母 denominators、直达天空计数 skyCounts、向下逃逸计数 groundCounts，
+//       以及面元侧之间的可见边（CSR 稀疏图：rowOffsets + edges{neighbor,count}）。
+// 输入：场景 scene、进度回调 progress（进度区间约 5–70%）。
+// 输出：CpuGraph；若 A-buffer 层数溢出则抛出 runtime_error（结果不可信）。
+// 约定：side = 2*facet + {0,1}；计数里的“2”是权重，使两侧各计一次（见下方各处说明）。
 CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
 {
+    // 步骤 1：创建光栅器与各类计数器（原子计数，供多线程像素循环并发累加）。
     CpuRasterizer raster(scene, scene.visibilityRasterSize,
                          scene.visibilityRasterSize,
                          scene.visibilityRasterLayers);
@@ -2210,6 +2503,7 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
     // Thread maps hold one direction only and are folded into key-sharded totals after
     // each direction, so peak memory does not grow with the thread count.
     constexpr size_t edgeShardCount = 64U;
+    // 按 key 的乘法哈希高 6 位分到 64 个分片（与 edgeShardCount 对应），便于分片并行合并。
     const auto edgeShard = [](uint64_t key) {
         return static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> 58U);
     };
@@ -2221,6 +2515,7 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
     const uint32_t layers = raster.layers();
     const auto& fragments = raster.fragments();
 
+    // 步骤 2：逐个半球方向：先光栅化，再并行处理每个像素的片元链。
     for (uint32_t directionIndex = 0; directionIndex < directions.size(); ++directionIndex) {
         overflow += raster.rasterize(directions[directionIndex]);
         parallelRanges(raster.pixelCount(), 4096U, [&](size_t begin, size_t end) {
@@ -2234,6 +2529,7 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
             }
             local.assign(fragments.begin() + pixel * layers,
                          fragments.begin() + pixel * layers + count);
+            // 该像素的片元按深度由近到远排序（相机侧在前），相邻片元之间即为互相可见的一对。
             std::sort(local.begin(), local.end(), fragmentBefore);
             // Same weighting as visibility_resolve.comp: central fragments
             // receive with weight 2, a depth-adjacent pair weighs its number
@@ -2243,11 +2539,14 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
                 denominators[fragment.cameraSide].fetch_add(2U, std::memory_order_relaxed);
                 denominators[fragment.cameraSide ^ 1U].fetch_add(2U, std::memory_order_relaxed);
             }
+            // 最靠近相机的中心片元，其朝向相机的一侧沿视线方向直接看到天空。
             if (local.front().central)
                 skyCounts[local.front().cameraSide].fetch_add(2U, std::memory_order_relaxed);
             // Downward escape: the lower boundary, not the sky.
             if (local.back().central)
                 groundCounts[local.back().cameraSide ^ 1U].fetch_add(2U, std::memory_order_relaxed);
+            // 相邻片元对：前一片元背向相机的一侧（cameraSide ^ 1）与后一片元朝向相机的一侧互相可见；
+            // 累加到无向边 (lo, hi)，权重为这一对中的中心片元数（0 表示两者都是周期副本，忽略）。
             for (uint32_t i = 0; i + 1U < count; ++i) {
                 const uint32_t sideA = local[i].cameraSide ^ 1U;
                 const uint32_t sideB = local[i + 1U].cameraSide;
@@ -2265,6 +2564,8 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
             }
         }
         });
+        // 本方向处理完后，把各线程的边计数并入按 key 分片的总表并清空线程表，
+        // 避免线程表的内存随方向数累积。
         parallelRanges(edgeShardCount, 1U, [&](size_t begin, size_t end) {
             for (size_t shard = begin; shard < end; ++shard) {
                 EdgeMap& merged = mergedShards[shard];
@@ -2280,6 +2581,8 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
     }
     threadEdgeCounts = {};
 
+    // 步骤 3：原子计数拷贝到 graph，并施加下边界（地面面元的下表面置为无效，
+    //         向下逃逸的射线记为“等效地面”）；同时填写 graph.diagnostics 的地面逃逸统计。
     graph.denominators.resize(surfaceCount);
     graph.skyCounts.resize(surfaceCount);
     graph.groundCounts.resize(surfaceCount);
@@ -2290,6 +2593,7 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
     }
     graph.ground = facetvk::applyGroundBoundary(scene.vertices, scene.leafFacetCount, graph.denominators,
                                                 graph.skyCounts, graph.groundCounts, graph.diagnostics);
+    // 步骤 4：把分片表摊平成 (key, count) 数组并按 key 排序，保证图的构造与线程数无关、可复现。
     size_t edgeTotal = 0;
     for (const EdgeMap& shard : mergedShards) edgeTotal += shard.size();
     std::vector<std::pair<uint64_t, uint32_t>> edgeCounts;
@@ -2300,6 +2604,8 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
     }
     std::sort(edgeCounts.begin(), edgeCounts.end());
 
+    // 步骤 5：由无向边生成对称的 CSR 邻接表：先统计每个顶点的度，前缀和得 rowOffsets，
+    //         再把每条边 (a,b) 同时写入 a 与 b 的行，count 相同。
     graph.rowOffsets.assign(surfaceCount + 1U, 0U);
     for (const auto& entry : edgeCounts) {
         ++graph.rowOffsets[static_cast<uint32_t>(entry.first >> 32U) + 1U];
@@ -2316,6 +2622,8 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
         graph.edges[cursor[b]++] = {a, entry.second};
     }
 
+    // 步骤 6：闭合性检验：对每个有效 side，(sky + ground + 全部邻边 count) / denominator 理论上应为 1，
+    //         取最大偏差记入 diagnostics.maxClosureError（仅诊断，不修正图）。
     float closureError = 0.0f;
     for (uint32_t side = 0; side < surfaceCount; ++side) {
         if (graph.groundCounts[side] == facetvk::kInactiveSide) continue;
@@ -2335,18 +2643,24 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
     graph.diagnostics.directedEdgeCount = static_cast<uint32_t>(graph.edges.size());
     graph.diagnostics.fragmentOverflow = overflow;
     graph.diagnostics.maxClosureError = closureError;
+    // A-buffer 层数不够会丢片元、破坏闭合性，这里直接报错而不是静默返回错误的图。
     if (overflow != 0U) {
         throw std::runtime_error("CPU A-buffer overflow");
     }
     return graph;
 }
 
+// 模块：CPU 版受太阳直射比例（sunlit fraction）计算。
+// 作用：从太阳方向光栅化，每像素最近的中心片元视为被太阳照亮，
+//       统计每个 side 的“被照亮样本数 / 总样本数”。亚像素抖动 4×4 共 16 次以降低混叠。
+// 输出：长度 2*facetCount 的数组；没有任何样本的 side 为 NaN（由 fillUnsampledSunlit 补全）。
 std::vector<float> computeCpuSunlit(const Scene& scene)
 {
     CpuRasterizer raster(scene, scene.visibilityRasterSize,
                          scene.visibilityRasterSize,
                          scene.visibilityRasterLayers);
     const size_t sideCount = static_cast<size_t>(scene.facetCount()) * 2U;
+    // total：每个 side 在太阳视角下被覆盖的样本总数；visible：其中处于最近层（被照亮）的样本数。
     std::unique_ptr<std::atomic<uint32_t>[]> total(new std::atomic<uint32_t>[sideCount]());
     std::unique_ptr<std::atomic<uint32_t>[]> visible(new std::atomic<uint32_t>[sideCount]());
     const uint32_t layers = raster.layers();
@@ -2367,6 +2681,8 @@ std::vector<float> computeCpuSunlit(const Scene& scene)
             if (count == 0U) {
                 continue;
             }
+            // 该像素所有中心片元都计入 total；只有最近的那个（且为中心块）计入 visible。
+            // 周期副本只参与“最近”的遮挡判断，不累加自己的计数。
             const Fragment* nearest = nullptr;
             for (uint32_t layer = 0; layer < count; ++layer) {
                 const Fragment& fragment = fragments[pixel * layers + layer];
@@ -2390,6 +2706,7 @@ std::vector<float> computeCpuSunlit(const Scene& scene)
     return fraction;
 }
 
+// 补全未采样受光比例用的空间哈希：整数网格单元（1 m）的键及其哈希函数。
 struct SunCellKey {
     int x, y, z;
     bool operator==(const SunCellKey& other) const {
@@ -2431,6 +2748,7 @@ void fillUnsampledSunlit(const Scene& scene, std::vector<float>& sunlit)
         return sign * (vertex.normal[0] * sun[0] + vertex.normal[1] * sun[1] +
                        vertex.normal[2] * sun[2]) > 0.0f;
     };
+    // 步骤 1：把已有样本的、朝向太阳的 side 的受光比例累加到所在单元和全局，用于后续估计。
     bool anyMissing = false;
     for (uint32_t side = 0; side < sunlit.size(); ++side) {
         if (std::isnan(sunlit[side])) { anyMissing = true; continue; }
@@ -2441,6 +2759,8 @@ void fillUnsampledSunlit(const Scene& scene, std::vector<float>& sunlit)
         global.sum += sunlit[side];
         ++global.count;
     }
+    // 步骤 2：对缺样本的 side：背向太阳取 0；否则依次取同单元均值、3×3×3 邻域均值、全局均值，
+    //         全局也没有样本时取 1（缺省视为被照亮）。
     if (!anyMissing) return;
     for (uint32_t side = 0; side < sunlit.size(); ++side) {
         if (!std::isnan(sunlit[side])) continue;
@@ -2466,6 +2786,13 @@ void fillUnsampledSunlit(const Scene& scene, std::vector<float>& sunlit)
     }
 }
 
+// 模块：CPU 版辐射度（radiosity）迭代求解。
+// 作用：在可见性图上解 B = E + ρ·H(同侧) + τ·H(对侧)，其中入射 H = 图上邻居 B 的加权平均
+//       + 天空 skyRadiosity·skyCounts/分母 + 等效地面 + 直射辐照 directIrradiance。
+// 输入：graph、每侧光学量 optics（emission/reflectance/transmittance/directIrradiance）、
+//       skyRadiosity（天空入射）、maximumIterations、relaxation（欠松弛系数）。
+// 输出：radiosity（每个 side）、迭代次数、最后一次迭代的最大变化 maxDelta、等效地面辐射度。
+// 说明：固定迭代次数，不做收敛提前退出；用 Jacobi 式（double buffer）更新，便于并行。
 facetvk::SolveResult solveCpu(const CpuGraph& graph,
                               const std::vector<facetvk::SurfaceOptics>& optics,
                               const Progress& progress,
@@ -2478,9 +2805,12 @@ facetvk::SolveResult solveCpu(const CpuGraph& graph,
     std::vector<float> next(surfaceCount, 0.0f);
     float maxDelta = 0.0f;
     maximumIterations = std::max(1U, maximumIterations);
+    // relaxation 限制在 [0.01, 1]：1 为纯 Jacobi，小于 1 为欠松弛（B ← B + ω·(新 − 旧)）。
     relaxation = std::clamp(relaxation, 0.01f, 1.0f);
 
     float groundValue = skyRadiosity;
+    // 入射漫射 H(side)：(sky 计数·天空 + ground 计数·等效地面 + Σ 邻边 count·邻居 B) / 分母。
+    // 无效 side（地面下表面）返回 0；分母为 0 的 side 视为只看见天空。
     auto incoming = [&](uint32_t side) {
         const uint32_t ground = graph.groundCounts[side];
         if (ground == facetvk::kInactiveSide) return 0.0f;
@@ -2503,6 +2833,7 @@ facetvk::SolveResult solveCpu(const CpuGraph& graph,
     constexpr size_t kFacetGrain = 2048U;
     const size_t facetCount = surfaceCount / 2U;
     std::vector<float> chunkDelta((facetCount + kFacetGrain - 1U) / kFacetGrain, 0.0f);
+    // 迭代主循环：每轮先由当前解更新等效地面，再按面元并行更新两侧（透射项耦合同一面元的两侧）。
     for (uint32_t iteration = 0; iteration < maximumIterations; ++iteration) {
         // Equivalent ground of the current iterate, as ground_mean.comp.
         groundValue = facetvk::groundBoundaryRadiosity(graph.ground, current, skyRadiosity);
@@ -2527,6 +2858,7 @@ facetvk::SolveResult solveCpu(const CpuGraph& graph,
         maxDelta = chunkDelta.empty() ? 0.0f
             : *std::max_element(chunkDelta.begin(), chunkDelta.end());
         current.swap(next);
+        // 每 8 轮报告一次进度（80–100%）。
         if ((iteration & 7U) == 7U) {
             progress(80 + static_cast<int>(20U * (iteration + 1U) / maximumIterations),
                      "CPU radiosity iteration " + std::to_string(iteration + 1U) + "/" +
@@ -2538,6 +2870,10 @@ facetvk::SolveResult solveCpu(const CpuGraph& graph,
     return result;
 }
 
+// 作用：由已解出的辐射度计算每个 side 的总入射辐照度（漫射 + 直射），供后续能量平衡使用。
+// 输入：可见性图 graph、辐射度解 solution、光学量 optics、天空辐射 skyRadiosity。
+// 输出：每个 side 的入射辐照度（≥ 0）。无效 side（地面下表面）只保留直射项；
+//       分母为 0 的 side 漫射项取 skyRadiosity。尺寸不一致时抛 invalid_argument。
 std::vector<float> incidentIrradianceCpu(
     const CpuGraph& graph,
     const facetvk::SolveResult& solution,
@@ -2576,6 +2912,7 @@ std::vector<float> incidentIrradianceCpu(
     return irradiance;
 }
 
+// 作用：复制光学量并把直射辐照置 0（仍保留 emission），用于求“仅漫射”基线解。
 std::vector<facetvk::SurfaceOptics> withoutDirectLight(
     const std::vector<facetvk::SurfaceOptics>& optics)
 {
@@ -2599,6 +2936,7 @@ std::vector<facetvk::SurfaceOptics> withoutOpticalDirectLight(
     return diffuse;
 }
 
+// 作用：直射增强量 = max(0, 含直射辐射度 − 仅漫射辐射度)，逐 side；两者长度必须一致。
 std::vector<float> lightEnhancement(
     const std::vector<float>& illuminated,
     const std::vector<float>& diffuseOnly)
@@ -2613,6 +2951,9 @@ std::vector<float> lightEnhancement(
     return enhancement;
 }
 
+// 模块：CPU 光栅路径的完整宽波段（单波段）求解流程，用于无 GPU 或对照验证。
+// 输入：场景 scene、进度回调；输出：RunResult（图诊断、sunlit、辐射度解、直射增强、耗时）。
+// 步骤：可见性图 → 受光比例 → 光学量 + 辐射度求解 → 无直射基线求解并取差。
 RunResult runCpu(const Scene& scene, const Progress& progress)
 {
     RunResult result;
@@ -2621,11 +2962,13 @@ RunResult runCpu(const Scene& scene, const Progress& progress)
     progress(2, "Preparing CPU raster buffers");
 
     const auto visibilityBegin = Clock::now();
+    // 步骤 1：构建可见性图（进度 2–70%）。
     const CpuGraph graph = buildCpuGraph(scene, progress);
     const auto visibilityEnd = Clock::now();
     result.graph = graph.diagnostics;
     result.visibilityMs = milliseconds(visibilityBegin, visibilityEnd);
 
+    // 步骤 2：太阳方向光栅化得到受光比例，缺样本的 side 用邻近值补全。
     progress(74, "CPU sunlight raster");
     const auto sunlightBegin = Clock::now();
     result.sunlit = computeCpuSunlit(scene);
@@ -2633,12 +2976,14 @@ RunResult runCpu(const Scene& scene, const Progress& progress)
     const auto sunlightEnd = Clock::now();
     result.sunlightMs = milliseconds(sunlightBegin, sunlightEnd);
 
+    // 步骤 3：由受光比例生成每侧光学量，并求含直射的辐射度解。
     const std::vector<facetvk::SurfaceOptics> optics = makeOptics(scene, result.sunlit);
     progress(80, "CPU radiosity solve");
     const auto solveBegin = Clock::now();
     // Same sky as the spectral path (Scene::skyDiffuseIrradiance; the legacy
     // broadband path previously used 100 W m-2 against 50 in the spectral path).
     result.solution = solveCpu(graph, optics, progress, scene.skyDiffuseIrradiance);
+    // 步骤 4：去掉直射再解一次作为漫射基线（进度回调置空），两者之差为直射增强。
     progress(98, "CPU diffuse baseline and direct-light enhancement");
     const facetvk::SolveResult diffuseSolution =
         solveCpu(graph, withoutDirectLight(optics),
@@ -2726,6 +3071,13 @@ void reportHapkeEnergyClosure(const Scene& scene, const FacetRTParameters& param
     }
 }
 
+// 模块：GPU 常驻的多波段（光谱）求解。逐波段调用 solveSpectralBand，光学量/状态在 GPU 上生成。
+// 输入：已加载几何与可见性图的 model、scene、parameters（波长列表、求解器类型、天空温度等）。
+// 输出：写入 result：sunlit、各波段迭代数、solution（取第 0 波段）、bandRadiosity、
+//       bandStates、lightEnhancement，以及 quantity/units 说明。
+// 约定：光学波段输出为表观反射率（除以 参考辐照 = beam·cosθs + sky）；
+//       热红外波段输出为光谱辐亮度 W m-2 sr-1 um-1，scale 取 1。
+// 环境变量：HISTREAM_FACET_VALIDATE_SPECTRAL=1 时对每个波段做 GPU 与 CPU 参考的逐项校验。
 void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const FacetRTParameters& parameters,
                     const Progress& progress, RunResult& result)
 {
@@ -2740,6 +3092,7 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
     for (size_t band = 0; band < parameters.wavelengths.size(); ++band) {
         const float wavelength = parameters.wavelengths[band];
         const bool thermal = !isOpticalWavelength(wavelength);
+        // 加速求解器时，上一波段与本波段同为光学/同为热红外则用上一波段的解作初值（热启动）。
         const bool warm = parameters.acceleratedSolver && band > 0 && previousThermal == thermal;
         allThermal = allThermal && thermal; anyThermal = anyThermal || thermal;
         // Per-band light from the project settings (configureFacetRTLight);
@@ -2748,6 +3101,8 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
             ? facetRtThermalSolar(scene, wavelength) : std::array<float, 2>{0.0f, 0.0f};
         const float beam = thermal ? thermalSolar[0] : bandBeamIrradiance(scene, parameters, band);
         const float reference = beam * cosineSolarZenith + bandSkyIrradiance(scene, parameters, band);
+        // 光学波段 scale = 1/参考辐照（把输出归一为表观反射率）；热红外或参考辐照过小时不缩放。
+        // 热红外波段的天空项为天空温度的黑体辐亮度 + thermalSolar[1]（6 um 以下的太阳天空部分）。
         const float scale = thermal || reference <= 1e-8f ? 1.0f : 1.0f / reference;
         const float sky = thermal
             ? planckRadiance(wavelength, parameters.skyTemperature) + thermalSolar[1]
@@ -2760,6 +3115,9 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
         if (band == 0) {
             result.solution.iterations = stats.iterations; result.solution.maxDelta = stats.maxDelta;
         }
+        // 校验分支（仅 HISTREAM_FACET_VALIDATE_SPECTRAL=1）：用 CPU 重新生成光学量并用同一图、
+        // 同一 sunlit 求参考解，与 GPU 的光学量、原始辐射度、输出和表面状态逐项比较；
+        // 超出容差（5e-5 + 5e-6·|cpu|）抛 runtime_error。参考解只用于比较，不写入 GPU 输出。
         if (auditEnabled) {
             const auto audit = model.readSpectralAudit(static_cast<uint32_t>(band));
             std::vector<std::array<float, 2>> emission;
@@ -2799,14 +3157,20 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
             }
             for (size_t k = 0; k < states.size(); ++k) check(audit.states[k], states[k], result.spectralStatesError);
             previousAuditRaw = audit.raw;
+            // 校验用的参考解可能改写了 GPU 上的光学量，这里恢复（具体机制待核对）。
             model.restoreSpectralOptics(audit.optics);
             ++result.spectralBandsChecked;
         }
+        // 第 0 波段（光学）额外求一次“仅漫射”基线（solveSpectralBand 的 diffuse = true），
+        // 供 readSpectralOutput 末段的 lightEnhancement 使用。
         if (band == 0 && !thermal) {
             model.solveSpectralBand(0, false, sky, scale, parameters.acceleratedSolver, false, true, beam);
         }
         previousThermal = thermal;
     }
+    // 读回 GPU 输出，布局（n = 2·facetCount，B = 波段数，bandValues = n·B）：
+    // [0, bandValues) 各波段辐射度；[bandValues, 3·bandValues) 各波段表面状态；
+    // [3·bandValues, 末尾) 直射增强。第 0 波段的 n 个值同时作为 solution.radiosity。
     const auto output = model.readSpectralOutput();
     reportHapkeEnergyClosure(scene, parameters, result.sunlit, output);
     const size_t n = size_t(scene.facetCount()) * 2U, bandValues = n * parameters.wavelengths.size();
@@ -2815,11 +3179,15 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
         result.bandRadiosity.assign(output.begin(), output.begin() + bandValues);
     result.bandStates.assign(output.begin() + bandValues, output.begin() + 3U * bandValues);
     result.lightEnhancement.assign(output.begin() + 3U * bandValues, output.end());
+    // 按波段构成标注输出物理量与单位。
     if (allThermal) { result.quantity = "spectral radiance"; result.units = "W m-2 sr-1 um-1"; }
     else if (!anyThermal) { result.quantity = "reflectance"; result.units = "1"; }
     else { result.quantity = "reflectance and spectral radiance"; result.units = "band-dependent"; }
 }
 
+// 模块：Vulkan GPU 路径的完整流程。spectralParameters 为空时走单波段（宽波段）求解，
+//       非空时走光谱求解；返回含耗时、图诊断、sunlit、辐射度与直射增强的 RunResult。
+// 步骤：建设备/上传几何 → GPU 构建可见性图 → 受光比例 → 求解（见下方三个分支）。
 RunResult runGpu(const Scene& scene,
                  const std::string& shaderDirectory,
                  const Progress& progress,
@@ -2829,6 +3197,7 @@ RunResult runGpu(const Scene& scene,
     result.backend = "Vulkan GPU";
     const auto totalBegin = Clock::now();
     progress(3, "Creating Vulkan device and GPU buffers");
+    // 步骤 1：用场景的光栅尺寸、每像素最大片元层数、周期邻块数与周期尺寸配置 GPU 模型。
     facetvk::Config config{};
     config.rasterWidth = scene.visibilityRasterSize;
     config.rasterHeight = scene.visibilityRasterSize;
@@ -2843,6 +3212,7 @@ RunResult runGpu(const Scene& scene,
     model.setGeometry(scene.vertices);
     model.setGroundFacets(scene.leafFacetCount);
 
+    // 步骤 2：GPU 构建半球方向的可见性图（进度 10–70%）。
     progress(10, "GPU visibility graph: 40 directions at " +
                      std::to_string(scene.visibilityRasterSize) + " x " +
                      std::to_string(scene.visibilityRasterSize));
@@ -2852,6 +3222,7 @@ RunResult runGpu(const Scene& scene,
     progress(70, groundEscapeLog(result.graph));
     result.visibilityMs = milliseconds(visibilityBegin, visibilityEnd);
 
+    // 步骤 3：太阳方向的受光比例，缺样本的 side 用邻近值补全（与 CPU 路径相同）。
     progress(72, "GPU sunlight visibility raster");
     const auto sunlightBegin = Clock::now();
     result.sunlit = model.computeSunlitFraction(sunDirection(scene));
@@ -2860,6 +3231,10 @@ RunResult runGpu(const Scene& scene,
     result.sunlightMs = milliseconds(sunlightBegin, sunlightEnd);
 
     const auto solveBegin = Clock::now();
+    // 步骤 4：求解有三个分支：
+    //   a) 单波段：GPU Jacobi 求含直射解，再求去直射的漫射基线，两者之差为直射增强；
+    //   b) 光谱且未指定 HISTREAM_FACET_SPECTRAL_BACKEND=cpu：runGpuSpectral（光学量在 GPU 上生成）；
+    //   c) 光谱且指定为 cpu：光学量/状态在 CPU 上逐波段生成，仍调用 GPU 的 solve 求辐射度。
     if (spectralParameters == nullptr) {
         progress(82, "GPU Jacobi radiosity: 64 iterations");
         const std::vector<facetvk::SurfaceOptics> optics =
@@ -2892,6 +3267,8 @@ RunResult runGpu(const Scene& scene,
         std::vector<float> previousRawRadiosity;
         const float cosineSolarZenith =
             std::max(0.0f, sunDirection(scene).y);
+        // 分支 c 的逐波段循环：生成光学量 → 求解（加速求解器可用上一波段解作初值）→
+        // 收集表面状态 → 光学波段除以参考辐照转为表观反射率 → 第 0 波段额外求漫射基线。
         for (size_t band = 0; band < spectralParameters->wavelengths.size(); ++band) {
             const float wavelength = spectralParameters->wavelengths[band];
             const bool thermal = !isOpticalWavelength(wavelength);
@@ -2958,6 +3335,7 @@ RunResult runGpu(const Scene& scene,
                     result.bandRadiosity.end(),
                     bandSolution.radiosity.begin(), bandSolution.radiosity.end());
             }
+            // 第 0 波段的解作为主解 result.solution；光学波段还用去直射的漫射解来计算直射增强。
             if (band == 0U) {
                 result.solution = bandSolution;
                 if (!thermal) {
@@ -2998,6 +3376,11 @@ RunResult runGpu(const Scene& scene,
     return result;
 }
 
+// 作用：把 RunResult 写成 Web 前端读取的 JSON 文件（UTF-8 文本，浮点保留 9 位有效数字）。
+// 内容：backend/quantity/units、执行位置（execution）、光谱校验统计、面元数与顶点位置、
+//       图诊断（graph）、耗时（timing）、迭代数与 maxDelta，以及数组字段
+//       wavelengths、sunlit、radiosity、lightEnhancement、bandRadiosity、bandStates。
+//       bandRadiosity/bandStates 为空时不写；数组中出现非有限值会抛 runtime_error。
 void writeWebResult(const std::string& fileName,
                     const Scene& scene,
                     const RunResult& result)
@@ -3050,6 +3433,7 @@ void writeWebResult(const std::string& fileName,
            << "  \"iterations\": " << result.solution.iterations << ",\n"
            << "  \"maxDelta\": " << result.solution.maxDelta << ",\n";
 
+    // 写一个浮点数组字段：用 to_chars 批量序列化到 64 KiB 缓冲再写出（避免逐值的 ostream 开销）。
     const auto writeArray = [&output](const char* name,
                                       const std::vector<float>& values,
                                       bool trailingComma) {
@@ -3091,6 +3475,7 @@ void writeWebResult(const std::string& fileName,
 
 namespace {
 
+// XML 文本转义：& < > " ' 依次替换为对应实体（与后面的 decodeXmlText 互逆）。
 std::string xmlEscaped(std::string value)
 {
     const std::pair<const char*, const char*> entities[] = {
@@ -3107,6 +3492,7 @@ std::string xmlEscaped(std::string value)
     return value;
 }
 
+// 把浮点数组用逗号拼接成文本（用于 <controlBand> 等标签）。
 std::string joined(const std::vector<float>& values)
 {
     std::ostringstream output;
@@ -3117,6 +3503,8 @@ std::string joined(const std::vector<float>& values)
     return output.str();
 }
 
+// 把 object["meshes"] 数组里每个网格的 key 字段（缺省 fallback）用逗号拼接；
+// 没有 meshes 或结果为空时返回 fallback。用于一个对象含多个网格时的名称列表。
 std::string joinedNames(const ProjectJson::Json& object, const char* key,
                         const std::string& fallback)
 {
@@ -3131,10 +3519,19 @@ std::string joinedNames(const ProjectJson::Json& object, const char* key,
     return output.str().empty() ? fallback : output.str();
 }
 
+// 模块：project.json → 内存中的旧式 XML（HiStreamProject）适配层。
+// 作用：把统一的 project.json（control/light/scene/objects/spectra/thermals/materials/
+//       canopies/meteorology/sensor）转成 FacetRT 原有的标签式解析器所读的 XML 文本，
+//       不落盘；缺省值与旧工程保持一致。
+// 输入：project.json 路径；输出：XML 字符串。
+// XML 结构：Control → Geometry(Light/Sensor) → Scene(Object) → Attribute(Optical/Thermal/
+//       Biochemistry：soilSet、surfaceEnergy、canopyAero、nodeTimeStepsSeconds) → Meteorology。
+// 异常：背景地面材料为光伏板、集总热参数非法、timeStepSeconds 不合法等情形抛 runtime_error。
 // The facet solver still uses its proven tag-oriented parsing routines. This
 // adapter is memory-only: project.json remains the sole file and CLI contract.
 std::string facetInputView(const std::string& path)
 {
+    // 步骤 1：读取工程并取各节；背景地面不允许使用光伏材料（光伏板必须是场景对象）。
     const ProjectJson project = ProjectJson::load(path);
     const auto& scene = project.scene();
     const auto& light = project.light();
@@ -3148,6 +3545,11 @@ std::string facetInputView(const std::string& path)
             throw std::runtime_error("Photovoltaic panels must be scene objects, not background ground");
     const std::filesystem::path defined = project.runtimeDefinedDirectory();
     std::ostringstream xml;
+    // 步骤 2：写 Control 段（后端、GPU 编号、递归深度、周期邻块数、耦合迭代、温度容差与松弛等）。
+    // 周期邻块数：先取 periodicTraversalCount；缺省时若 periodicBoundary 为真则取
+    // periodicNeighborCount（缺省 8），否则为 0；最后限幅到 [0, 20]。
+    // 随后依次写 Light（天顶/方位角、天空温度、直射比例、短波辐照限幅 0–2000 W m-2）、
+    // Sensor（波段）、Scene（场景尺寸、背景材料与 Hapke/Lambert 选择）。
     xml << "<HiStreamProject><Control>"
         << "<outDir>" << xmlEscaped(project.outputDirectory().string()) << "</outDir>"
         << "<facetBackend>" << xmlEscaped(ProjectJson::string(control, "facetBackend", "gpu")) << "</facetBackend>"
@@ -3197,6 +3599,8 @@ std::string facetInputView(const std::string& path)
         << "<backgroundAngularStrength>" << ProjectJson::number(background, "angularEffectStrength", 0.5f) << "</backgroundAngularStrength>";
     if (ProjectJson::boolean(scene, "terrain", false) && !ProjectJson::string(scene, "demFile").empty())
         xml << "<DEM>" << xmlEscaped(project.resolve(ProjectJson::string(scene, "demFile")).string()) << "</DEM>";
+    // 步骤 3：对象列表；Fire、Fog 与带 medium 字段的对象不属于面元场景，跳过。
+    // dimensions 不足 3 个分量时补 1。
     xml << "<Object>";
     for (const auto& object : project.objects()) {
         const std::string type = ProjectJson::string(object, "type", "Vegetation");
@@ -3225,6 +3629,8 @@ std::string facetInputView(const std::string& path)
         if (!positions.empty()) xml << "<objectPosition>" << xmlEscaped(project.resolve(positions).string()) << "</objectPosition>";
         xml << "</object>";
     }
+    // 步骤 4：光学（反射率/透射率）材料：写模型类型、反射/透射谱、热红外反射/透射、
+    //         PROSPECT/BSM 参数（缺省值与旧工程一致）以及物理纹理参数与外部谱文件。
     xml << "</Object></Scene><Attribute><Optical>";
     for (const auto& item : project.spectra()) {
         const auto params = item.contains("params") ? item["params"] : ProjectJson::Json::object();
@@ -3252,11 +3658,14 @@ std::string facetInputView(const std::string& path)
             xml << "<spectral_file>" << xmlEscaped(project.resolve(ProjectJson::string(item, "fileName")).string()) << "</spectral_file>";
         xml << "</spectral>";
     }
+    // 步骤 5：热状态：受光/背光面的初始温度（缺省 305 K / 295 K）。
     xml << "</Optical><Thermal>";
     for (const auto& item : project.thermals())
         xml << "<thermal name=\"" << xmlEscaped(ProjectJson::string(item, "name", "temperature")) << "\"><sunlitTemperature>"
             << ProjectJson::number(item, "sunlitTemperature", 305) << "</sunlitTemperature><shadedTemperature>"
             << ProjectJson::number(item, "shadedTemperature", 295) << "</shadedTemperature></thermal>";
+    // 步骤 6：Biochemistry 段。先写土壤材料的 soilSet（rss、cs、rhos、lambdas、SMC，
+    //         method 优先取 control.soilTemperatureMethod）。
     xml << "</Thermal><Biochemistry>";
     for (const auto& item : project.materials()) {
         if (ProjectJson::string(item, "type", "Soil") != "Soil") continue;
@@ -3269,6 +3678,9 @@ std::string facetInputView(const std::string& path)
             << "</SMC></soilSet></property>";
     }
     for (const auto& item : project.materials()) {
+        // 步骤 7：逐材料写 surfaceEnergy（FacetEB 的能量平衡参数）。依材料类别分支：
+        //         光伏、叶片（光合/气孔参数）、水体、建筑墙体（wallMode = wall）、船体、车辆，
+        //         以及可选的集总热（lumpedThermal）参数。字段缺省时多数不写标签，保持旧 XML。
         const auto p=item.contains("params")?item["params"]:ProjectJson::Json::object();
         const bool pv=ProjectJson::string(item,"energyModel")=="photovoltaic";
         const bool leaf=ProjectJson::string(item,"type")=="Vegetation" && ProjectJson::string(item,"energyModel")!="wood";
@@ -3277,6 +3689,7 @@ std::string facetInputView(const std::string& path)
         // A water facet stores its mixed layer: heatCapacity (J m-3 K-1) x mixingDepth.
         const float waterCapacity = water
             ? ProjectJson::number(p,"heatCapacity",4186000.0f)*std::max(0.01f,ProjectJson::number(p,"mixingDepth",.5f)) : 0.0f;
+        // 缺省单位面积热容（J m-2 K-1）：光伏 12000、叶片 1000、水体按上式混合层热容、其余 60000。
         const float defaultHeatCapacity = pv ? 12000.0f : leaf ? 1000.0f : water ? waterCapacity : 60000.0f;
         xml << "<surfaceEnergy name=\"" << xmlEscaped(ProjectJson::string(item,"name")) << "\">"
             << "<photovoltaic>" << (pv?1:0) << "</photovoltaic>"
@@ -3410,6 +3823,8 @@ std::string facetInputView(const std::string& path)
                     xml << "<vcHeading>" << num("heading",0) << "</vcHeading><vcWindDirection>" << num("windDirection",0) << "</vcWindDirection>";
             }
         }
+        // 叶片光合与气孔参数（Vcmax、Ball-Berry 的 m 与截距、Type 等），缺省为 C3 叶片典型值；
+        // Tparam 缺省 "0.2,0.3,288,313,328"，写出时逗号换成空格（各项含义待核对）。
         if (leaf) {
             std::string tparam = p.contains("Tparam") && p["Tparam"].is_string()
                 ? p["Tparam"].get<std::string>() : std::string("0.2,0.3,288,313,328");
@@ -3428,6 +3843,8 @@ std::string facetInputView(const std::string& path)
                 << "<kNPQs>" << ProjectJson::number(p,"kNPQs",0) << "</kNPQs>"
                 << "<Tparam>" << xmlEscaped(tparam) << "</Tparam>";
         }
+        // 集总热（单节点热容）参数：capacityJPerK、conductanceWPerK、stopSeconds、group 为必填；
+        // 校验：group 非空、weight ∈ [0,1]、maxSurfaceK ∈ [initialK, 1500]，不满足则抛异常。
         if (p.contains("lumpedThermal")) {
             const auto& h=p.at("lumpedThermal");
             facetphysics::LumpedThermalParameters checked{
@@ -3455,9 +3872,11 @@ std::string facetInputView(const std::string& path)
         }
         xml << "</surfaceEnergy>";
     }
+    // 步骤 8：冠层空气动力参数（叶宽 leafwidth，缺省 0.1）。
     for (const auto& item : project.canopies())
         xml << "<canopyAero name=\"" << xmlEscaped(ProjectJson::string(item, "name")) << "\"><leafwidth>"
             << ProjectJson::number(item, "leafwidth", 0.1f) << "</leafwidth></canopyAero>";
+    // 步骤 9：可选的逐节点时间步长（秒）：个数必须等于 meteo.end，每个值须为 [1, 86400] 内的有限数。
     if(meteo.contains("timeStepSeconds")) {
         const auto& widths=meteo.at("timeStepSeconds");
         if(!widths.is_array() || widths.size()!=size_t(ProjectJson::integer(meteo,"end",1)))
@@ -3471,6 +3890,8 @@ std::string facetInputView(const std::string& path)
         }
         xml << "</nodeTimeStepsSeconds>";
     }
+    // 步骤 10：Meteorology 段：气象文件、参考高度、起止节点、时间步 dTime、经纬度、年份、时区；
+    //          缺省值（dTime 1800、纬度 40、经度 116、年 2019、时区 8）沿用旧工程设置。
     xml << "</Biochemistry></Attribute><Meteorology>"
         << "<filePath>" << xmlEscaped(project.meteorologyPath().string()) << "</filePath>"
         << "<referenceHeight>" << ProjectJson::number(meteo, "z", 10) << "</referenceHeight>";
@@ -3491,6 +3912,7 @@ std::string facetInputView(const std::string& path)
     return xml.str();
 }
 
+// 读取输入文本：.json 扩展名（不区分大小写）经 facetInputView 转成内存 XML，其余按原样读取。
 std::string readTextFile(const std::string& path)
 {
     std::filesystem::path inputPath(path);
@@ -3505,6 +3927,7 @@ std::string readTextFile(const std::string& path)
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
+// XML 实体解码（& < > " '），与 xmlEscaped 互逆。
 std::string decodeXmlText(std::string value)
 {
     const std::pair<const char*, const char*> entities[] = {
@@ -3521,6 +3944,9 @@ std::string decodeXmlText(std::string value)
     return value;
 }
 
+// 作用：取 xml 中第一个 <tag ...>内容</tag> 的内容（已解码实体）；找不到返回空串。
+// 说明：按前缀 "<tag" 查找，不检查标签名边界，也不处理嵌套同名标签（待核对：
+//       例如 ref_TIR 与 ref_TIR_wet 并存时依赖其书写顺序）。
 std::string firstXmlTag(const std::string& xml, const char* tag)
 {
     const std::string open = "<" + std::string(tag);
@@ -3540,6 +3966,7 @@ std::string firstXmlTag(const std::string& xml, const char* tag)
     return decodeXmlText(xml.substr(contentBegin + 1U, contentEnd - contentBegin - 1U));
 }
 
+// 去掉首尾空白字符（按 std::isspace）。
 std::string trim(std::string value)
 {
     const auto whitespace = [](unsigned char character) { return std::isspace(character) != 0; };
@@ -3551,6 +3978,7 @@ std::string trim(std::string value)
     return value;
 }
 
+// 读取标签内的浮点数；标签缺失、为空、无法解析或非有限值时返回 fallback。
 float xmlFloat(const std::string& xml, const char* tag, float fallback)
 {
     const std::string value = trim(firstXmlTag(xml, tag));
@@ -3567,6 +3995,7 @@ float xmlFloat(const std::string& xml, const char* tag, float fallback)
 
 std::vector<std::string> xmlObjectBlocks(const std::string& xml);
 
+// 解析数值列表：';' 与 ',' 都当作分隔符，片段内再按空白切分；非有限值丢弃。
 std::vector<float> numberList(const std::string& text)
 {
     std::vector<float> values;
@@ -3586,12 +4015,14 @@ std::vector<float> numberList(const std::string& text)
     return values;
 }
 
+// 取 ','/';' 分隔列表的第一个名字（去空白）。
 std::string firstListName(const std::string& text)
 {
     const size_t separator = text.find_first_of(",;");
     return trim(text.substr(0, separator));
 }
 
+// 解析名字列表：';' 与 ',' 分隔，去空白并丢弃空项。
 std::vector<std::string> nameList(const std::string& text)
 {
     std::vector<std::string> values;
@@ -3608,6 +4039,7 @@ std::vector<std::string> nameList(const std::string& text)
     return values;
 }
 
+// ASCII 大小写不敏感的字符串相等比较。
 bool equalIgnoringCase(const std::string& left, const std::string& right)
 {
     return left.size() == right.size() &&
@@ -3617,6 +4049,8 @@ bool equalIgnoringCase(const std::string& left, const std::string& right)
                    });
 }
 
+// 从起始标签文本中取属性值（支持单/双引号，属性名前必须是行首或空白），返回已解码的值；
+// 找不到返回空串。
 std::string xmlAttribute(const std::string& openingTag, const char* attribute)
 {
     const std::string prefix = std::string(attribute) + '=';
@@ -3640,6 +4074,8 @@ std::string xmlAttribute(const std::string& openingTag, const char* attribute)
     return {};
 }
 
+// 取第一个 <element ...>...</element> 整块文本，其 name 属性等于 name；name 为空则取第一块。
+// 找不到或标签不闭合时返回空串。不支持同名元素嵌套。
 std::string namedXmlBlock(const std::string& xml,
                           const char* element,
                           const std::string& name)
@@ -3676,6 +4112,9 @@ std::string namedXmlBlock(const std::string& xml,
 std::filesystem::path resolveProjectAsset(const std::filesystem::path& inputPath,
                                           const std::string& value);
 
+// 作用：读取叶片/土壤光谱模型（PROSPECT 等）所需的 optipar 系数表。
+// 来源：与 esunFileName 同目录的 optipar.txt，每行 18 列浮点数，列顺序见 columns 数组；
+//       列数不足的行跳过；没有 esunFileName 或文件打不开时返回空表。
 OptCoeff loadOpticalCoefficients(const std::string& xml,
                                  const std::filesystem::path& inputPath)
 {
@@ -3707,6 +4146,12 @@ OptCoeff loadOpticalCoefficients(const std::string& xml,
     return coefficients;
 }
 
+// 模块：按名字从 XML 读取一类表面的光谱与热状态参数，写入 surface。
+// 输入：xml（含 spectral/thermal 块）、spectralName、thermalName、成像波段 wavelengths、
+//       光谱模型系数 coefficients、inputPath（用于解析相对路径的外部谱/纹理文件）。
+// 输出：surface 的 reflectance/transmittance（成像波段）、energyReflectance/
+//       energyTransmittance（400–2400 nm、1 nm 间隔共 N1 = 2001 点，供能量平衡）、
+//       热红外反射/透射、物理纹理参数、受光/背光面温度。找不到对应块则保持原值。
 void loadSurfaceParameters(const std::string& xml,
                            const std::string& spectralName,
                            const std::string& thermalName,
@@ -3715,6 +4160,7 @@ void loadSurfaceParameters(const std::string& xml,
                            const std::filesystem::path& inputPath,
                            SurfaceParameters& surface)
 {
+    // 步骤 1：取名为 spectralName 的光谱材料块，并按 type 判定模型（Prospect/BSM/file/custom）。
     const std::string spectral =
         namedXmlBlock(xml, "spectral", spectralName);
     if (!spectral.empty()) {
@@ -3748,6 +4194,8 @@ void loadSurfaceParameters(const std::string& xml,
             const std::string fileName = trim(firstXmlTag(spectral, "spectral_file"));
             material.path = resolveProjectAsset(inputPath, fileName).string();
         }
+        // 步骤 2：用 Compo::resolveSpectrals 在成像波段上求反射/透射（自定义谱按波长插值，
+        //         Prospect/BSM 由模型生成）。
         Compo compo;
         const std::vector<Spectral> resolved = compo.resolveSpectrals(
             material, wavelengths, wavelengths, coefficients);
@@ -3757,6 +4205,7 @@ void loadSurfaceParameters(const std::string& xml,
             surface.reflectance.push_back(value.reflectance);
             surface.transmittance.push_back(value.transmittance);
         }
+        // 步骤 3：同一材料再在 400–2400 nm 的 1 nm 网格上求一次，作为能量平衡用的宽谱反射/透射。
         std::vector<float> energyWavelengths;
         energyWavelengths.reserve(N1);
         for (int index = 0; index < N1; ++index)
@@ -3779,6 +4228,7 @@ void loadSurfaceParameters(const std::string& xml,
         surface.tirTransmittance =
             xmlFloat(spectral, "tau_TIR", surface.tirTransmittance);
 
+        // 步骤 4：物理纹理（反射率方差纹理）：先复位，再按 physicalTextureEnabled 决定是否读取。
         surface.reflectanceTexture.reset();
         surface.reflectanceTextureStrength = 0.0f;
         surface.reflectanceTextureRelativeStd = 0.0f;
@@ -3789,6 +4239,8 @@ void loadSurfaceParameters(const std::string& xml,
             equalIgnoringCase(textureEnabled, "true") ||
             equalIgnoringCase(textureEnabled, "yes") ||
             equalIgnoringCase(textureEnabled, "on");
+        // 启用纹理必须给出文件，否则抛异常；限幅：strength ∈ [0,1]、relativeStd ∈ [0,0.5]、
+        // repeatSize ≥ 0.01（纹理重复尺寸）。
         if (useTexture) {
             const std::string textureFile = trim(
                 firstXmlTag(spectral, "physicalTextureFile"));
@@ -3810,6 +4262,7 @@ void loadSurfaceParameters(const std::string& xml,
         }
     }
 
+    // 步骤 5：热状态块：受光/背光面温度，缺省沿用 surface 当前值。
     const std::string thermal =
         namedXmlBlock(xml, "thermal", thermalName);
     if (!thermal.empty()) {
@@ -3823,6 +4276,9 @@ void loadSurfaceParameters(const std::string& xml,
 }
 
 
+// 作用：读取名为 soilName 的 soilSet 块，写入地面的热/水分参数；找不到则不改。
+// 限幅：method ∈ {0,1,2}；rss ≥ 0；cs（比热）、rhos（密度）≥ 1；lambdas（导热系数）≥ 0.001；
+//       SMC 大于 1 时视为百分数，乘 0.01 后限制到 [0,1]。
 void loadSoilParameters(const std::string& xml,
                         const std::string& soilName,
                         SurfaceParameters& surface)
@@ -3848,6 +4304,11 @@ void loadSoilParameters(const std::string& xml,
         moisture > 1.0f ? moisture * 0.01f : moisture, 0.0f, 1.0f);
 }
 
+// 模块：从输入 XML 组装 FacetRTParameters（波段、天空温度、求解器类型、地物与背景表面参数）。
+// 步骤：controlBand → 过滤非正/非有限波长（为空则默认 550 nm）；skyTemperature 限幅
+//       100–400 K（缺省 250）；radiationSolver == "accelerated" 选加速求解器；
+//       对象表面取第一个对象的首个 spectral/thermal 名；背景取 bgSpectral/bgThermal，
+//       再叠加 bgBioName 对应的土壤参数。
 FacetRTParameters facetRTParametersFromInput(const std::string& xml,
                                              const std::filesystem::path& inputPath)
 {
@@ -3891,6 +4352,8 @@ FacetRTParameters facetRTParametersFromInput(const std::string& xml,
     return parameters;
 }
 
+// 按顺序切出所有 <object ...>...</object> 块；标签名后必须是 '>' 或空白，
+// 以免误匹配 <objectPosition> 等标签。缺少结束标签时停止。
 std::vector<std::string> xmlObjectBlocks(const std::string& xml)
 {
     std::vector<std::string> blocks;
@@ -3914,6 +4377,7 @@ std::vector<std::string> xmlObjectBlocks(const std::string& xml)
     return blocks;
 }
 
+// 资源路径解析：绝对路径原样返回，相对路径相对于输入文件所在目录并规范化。
 std::filesystem::path resolveProjectAsset(const std::filesystem::path& inputPath,
                                           const std::string& value)
 {
@@ -3921,6 +4385,9 @@ std::filesystem::path resolveProjectAsset(const std::filesystem::path& inputPath
     return path.is_absolute() ? path : (inputPath.parent_path() / path).lexically_normal();
 }
 
+// 短波光谱形状：direct/diffuse 为 400 nm 起、1 nm 间隔的采样（每微米归一化，见 integrate）。
+// sample：波长 ≤ 2.5 视为 µm 并换算成 nm，下标 = round(波长 − 400) 并夹到有效范围；
+// integrate：梯形积分后乘 0.001，把 1 nm 间隔换算为 µm。
 struct ShortwaveSpectrum {
     std::vector<float> direct;
     std::vector<float> diffuse;
@@ -3986,6 +4453,7 @@ static float directHorizontalKeptFraction(float directNormalFactor,
     return std::clamp(directNormalFactor * std::max(cosineSolarZenith, 0.0f), 0.0f, 1.0f);
 }
 
+// 读取以空白分隔的标量谱文件；非有限值与负值记为 0，最多保留 N1（2001）个采样点。
 std::vector<float> readScalarSpectrum(const std::filesystem::path& path)
 {
     std::ifstream input(path);
@@ -3998,6 +4466,9 @@ std::vector<float> readScalarSpectrum(const std::filesystem::path& path)
     return values;
 }
 
+// 作用：读取 Esun（直射）/Esky（漫射）谱形，并按 directFraction 归一化直射/漫射积分。
+// 输入：xml 中的 esunFileName/eskyFileName；任一缺失或有效点数 < 2 时退回平谱。
+// 输出：direct 积分 = directFraction，diffuse 积分 = 1 − directFraction（积分按 µm 计，见 integrate）。
 ShortwaveSpectrum loadShortwaveSpectrum(
     const std::string& xml,
     const std::filesystem::path& inputPath,
@@ -4026,6 +4497,7 @@ ShortwaveSpectrum loadShortwaveSpectrum(
     // (The shapes were previously normalized jointly, so the split came from
     // the files, about 0.806 for the bundled Esun_/Esky_, and the setting was
     // ignored whenever the files existed.)
+    // 把一条谱缩放到指定积分值 fraction；积分非正或非有限时改用满足该积分的平谱。
     const auto normalizeShape = [count](std::vector<float>& values, float fraction) {
         double integral = 0.0;
         for (size_t index = 0; index + 1U < count; ++index)
@@ -4046,6 +4518,11 @@ ShortwaveSpectrum loadShortwaveSpectrum(
     return spectrum;
 }
 
+// 模块：把光照设置写入 scene 与 parameters（各光学波段的直射法向辐照与天空漫射辐照）。
+// 输入：xml（shortwaveIrradiance、directScatteringRatio、Esun/Esky 文件）、scene、parameters。
+// 输出：scene.shortwaveIrradiance（0–2000 W m-2，供 2.5–6 um 太阳项）、
+//       scene.beamNormalIrradiance / skyDiffuseIrradiance、逐波段 bandBeamNormal/bandSkyDiffuse
+//       （W m-2 nm-1；热红外波段保持 0，天空由 skyTemperature 给出）。
 // FacetRT illumination. Without light settings (OBJ input, or XML without
 // directScatteringRatio/Esun/Esky) the historical 700 W m-2 beam-normal and
 // 50 W m-2 sky are kept. Otherwise the same Esun/Esky shapes and
@@ -4073,10 +4550,13 @@ void configureFacetRTLight(const std::string& xml, const std::filesystem::path& 
     const size_t samples = spectrum.sampleCount();
     if (samples < 2U) return;
     const float cosine = std::max(0.0f, sunDirection(scene).y);
+    // 水平面总辐照：沿用历史取值 kBeamNormalIrradiance·cosθs + 0.5·kSkyDiffuseIrradiance；
+    // 光学输出已归一，因此只有直射/漫射比例与谱形有影响。
     const float total = kBeamNormalIrradiance * cosine + kSkyDiffuseIrradiance * 0.5f;
     const float directIntegral = spectrum.integrate(spectrum.direct, 0U, samples - 1U);
     const float diffuseIntegral = spectrum.integrate(spectrum.diffuse, 0U, samples - 1U);
     const float normalFactor = directHorizontalToNormal(total, directIntegral, cosine);
+    // lost：因低太阳高度或 1400 W m-2 上限而没有进入直射的那部分，并入天空漫射以保持水平面总量。
     const float lost = 1.0f - directHorizontalKeptFraction(normalFactor, cosine);
     scene.beamNormalIrradiance = total * directIntegral * normalFactor;
     scene.skyDiffuseIrradiance = total * (diffuseIntegral + directIntegral * lost);
@@ -4096,12 +4576,17 @@ void configureFacetRTLight(const std::string& xml, const std::filesystem::path& 
               << " W m-2, sky " << scene.skyDiffuseIrradiance << " W m-2" << std::endl;
 }
 
+// 模块：OBJ 几何读取
+// ObjGeometry：OBJ 的顶点（OBJ 本地坐标，未经摆放变换）、三角形顶点索引（0 起）以及
+// 每个三角形所属的 g/o/usemtl 组名（用于把网格名映射到材质，见 appendGeometry）。
 struct ObjGeometry {
     std::vector<Vec3> positions;
     std::vector<std::array<int, 3>> triangles;
     std::vector<std::string> triangleGroups;
 };
 
+// 作用：读取场景 OBJ，只解析 g/o/usemtl/v/f 记录；多边形面按扇形拆成三角形。
+// 说明：组名取最近的 g/o，若尚无 g/o 则用首个 usemtl 名；无顶点或无面时抛出异常。
 ObjGeometry readObjGeometry(const std::filesystem::path& path)
 {
     std::ifstream input(path);
@@ -4148,6 +4633,8 @@ ObjGeometry readObjGeometry(const std::filesystem::path& path)
     return geometry;
 }
 
+// Placement：对象的一次摆放（位置文件的一行）。x、y 为场景平面坐标（m；x 对应场景 x 轴/宽度方向，
+// y 对应场景 z 轴/深度方向，原点在域角），z 为抬升高度（m），scale 为缩放，rotation 为绕竖直轴转角（度）。
 struct Placement {
     float x{};
     float y{};
@@ -4156,6 +4643,9 @@ struct Placement {
     float rotation{};
 };
 
+// 模块：DEM 高程场
+// DemHeightField：把 DEM 栅格（行从北向南、列从西向东）保存为 float 数组，
+// 并以其中的有效最小值为基准，给出场景坐标处的双线性插值相对高度（m）。
 struct DemHeightField {
     int width{};
     int height{};
@@ -4190,6 +4680,9 @@ struct DemHeightField {
     }
 };
 
+// 作用：按工程 XML 的 isDEM/DEM 读取 GDAL 栅格第 1 波段为 Float32 高程。
+// 说明：未启用（isDEM 非空且不为 1）或未给 DEM 文件时返回无效（空）高程场；
+// NoData 与非有限值先不参与求最小值，随后被替换为最小值，使这些格点相对高度为 0。
 DemHeightField readDemHeightField(const std::string& xml,
                                   const std::filesystem::path& inputPath)
 {
@@ -4237,6 +4730,9 @@ DemHeightField readDemHeightField(const std::string& xml,
     return dem;
 }
 
+// 作用：读取 objectPosition 文件，每行 "x y z [scale [rotation]]"，得到摆放列表。
+// 说明：无法解析前三个数的行被跳过；缺省 scale=1、rotation=0；含非有限数或 scale<=0 的行丢弃；
+// 没有任何有效摆放时退化为在场景中心放一个对象（高度 0、缩放 1、不旋转）。
 std::vector<Placement> readPlacements(const std::filesystem::path& inputPath,
                                       const std::string& objectXml,
                                       float sceneWidth,
@@ -4277,6 +4773,9 @@ std::vector<Placement> readPlacements(const std::filesystem::path& inputPath,
     return placements;
 }
 
+// 作用：把 OBJ 本地顶点依次缩放、绕竖直（y）轴旋转并平移到场景坐标，
+// 场景域以中心为原点（x、z 范围 ±尺寸/2），y 为高度（m）。
+// 说明：旋转矩阵里对 rotation 取负号，转角正方向的几何含义（待核对）。
 Vec3 transformPosition(const Vec3& position,
                        const Placement& placement,
                        float sceneWidth,
@@ -4295,11 +4794,15 @@ Vec3 transformPosition(const Vec3& position,
     };
 }
 
+// ObjectMaterialBinding：对象内某个网格（OBJ 组名）到场景材质表索引的绑定。
 struct ObjectMaterialBinding {
     std::string meshName;
     uint32_t materialIndex{};
 };
 
+// 作用：把一个 OBJ 几何按给定摆放变换后逐三角形加入场景。
+// 说明：材质按三角形所属组名与绑定的 meshName 忽略大小写匹配；无匹配时用第一条绑定的材质
+// （无绑定则为 0）。超出场景域 [±宽/2, 高, ±深/2] 的部分由 appendTriangleInsideDomain 处理。
 void appendGeometry(Scene& scene,
                     const ObjGeometry& geometry,
                     const Placement& placement,
@@ -4339,6 +4842,8 @@ void appendGeometry(Scene& scene,
     }
 }
 
+// 作用：由 shapes 标签（"长,宽,高"）生成底面在 y=0 的长方体（12 个三角形），
+// 用于没有 OBJ 文件的简单对象；解析失败或尺寸非正时退化为 1 m 立方体。
 ObjGeometry cubeGeometry(const std::string& objectXml)
 {
     float length = 1.0f;
@@ -4368,6 +4873,11 @@ ObjGeometry cubeGeometry(const std::string& objectXml)
     return geometry;
 }
 
+// 作用：为工程场景生成地面三角网：在整个模拟域 [±宽/2, ±深/2] 上按 voxelSize 划分网格，
+// 每格 2 个三角形（法向朝上 +y），顶点高度取 DEM 相对最小值的双线性插值（无 DEM 时为 0）。
+// 说明：每边格数上限为 maximumGridResolution；DEM 被重采样到该网格，与 DEM 原始像素数无关。
+// 高度整体减 0.01 m，使地面略低于 y=0 的物体底面（与 loadTreeWithSoil 的 -0.01 一致，
+// 推测为避免共面，待核对）。
 void appendProjectGround(Scene& scene,
                          float sceneWidth,
                          float sceneDepth,
@@ -4392,6 +4902,7 @@ void appendProjectGround(Scene& scene,
     const float cellDepth = sceneDepth / static_cast<float>(rows);
     scene.vertices.reserve(
         scene.vertices.size() + static_cast<size_t>(columns) * rows * 6U);
+    // 最后一行/列的终点直接取域边界，避免浮点累积误差使地面与域边界之间留缝。
     for (uint32_t row = 0; row < rows; ++row) {
         const float za = z0 + cellDepth * static_cast<float>(row);
         const float zb = row + 1U == rows
@@ -4418,6 +4929,10 @@ void appendProjectGround(Scene& scene,
     }
 }
 
+// 作用：读取水体面元的初始温度模式，写入 material.waterInitialMode / waterInitialK。
+// 模式：firstAir 或空 = 0（取首个气象节点气温）；dailyMeanAir = 1（首日气温均值）；
+// fixed = 2（waterInitialTemperature，单位 °C，转为 K，须在 223–373 K 之间）。
+// 实际赋初值在逐步积分入口处按此模式完成。
 // Optional water start temperature (waterSet or surfaceEnergy block).
 void readWaterInitial(const std::string& block, SurfaceParameters& material)
 {
@@ -4432,16 +4947,21 @@ void readWaterInitial(const std::string& block, SurfaceParameters& material)
         throw std::runtime_error("waterInitialMode must be firstAir, dailyMeanAir or fixed");
 }
 
+// 模块：工程/XML 场景加载（FacetRT 与 FacetEB 共用）
+// 输入：工程 XML 文本；输出：Scene（域大小、周期邻域、太阳角、对象与地面三角形、材质表等）。
 Scene loadProjectScene(const std::string& inputFile)
 {
     const std::filesystem::path inputPath(inputFile);
     const std::string xml = readTextFile(inputFile);
+    // 步骤 1：读取域尺寸（宽 sceneSizeX、深 sceneSizeY、高 Height，m）与体元尺寸 voxelSize，
+    // 均限幅到不小于 0.01 m；读取 DEM（如有）。
     const float sceneWidth = std::max(0.01f, xmlFloat(xml, "sceneSizeX", 8.0f));
     const float sceneDepth = std::max(0.01f, xmlFloat(xml, "sceneSizeY", 8.0f));
     const float sceneHeight = std::max(0.01f, xmlFloat(xml, "Height", 4.0f));
     const float voxelSize = std::max(0.01f, xmlFloat(xml, "voxelSize", 1.0f));
     const DemHeightField dem = readDemHeightField(xml, inputPath);
     Scene scene;
+    // 步骤 2：周期邻域（在水平方向加入若干圈邻接副本参与遮挡），个数上限 20，并向上取整到完整环。
     const int requestedNeighbors = std::clamp(static_cast<int>(std::lround(
         xmlFloat(xml, "periodicNeighborCount", 0.0f))), 0, 20);
     // Tile offsets come in symmetric rings (4 edge, 4 corner, 4 second-edge,
@@ -4466,6 +4986,8 @@ Scene loadProjectScene(const std::string& inputFile)
         if (size >= 512 && size <= 8192 && (size & (size - 1)) == 0)
             scene.visibilityRasterSize = static_cast<uint32_t>(size);
     }
+    // 步骤 3：读取辐射参数（波段、对象/地面等缺省光学参数）与光学系数库；背景各向异性强度限幅 0–1，
+    // 仅 Hapke 模型保留，其他背景模型置 0。
     const FacetRTParameters radiativeParameters =
         facetRTParametersFromInput(xml, inputPath);
     scene.backgroundAngularStrength = std::clamp(
@@ -4478,6 +5000,7 @@ Scene loadProjectScene(const std::string& inputFile)
     }
     const OptCoeff opticalCoefficients = loadOpticalCoefficients(xml, inputPath);
 
+    // 步骤 4：读取太阳角 lightAngle = "天顶角,方位角"（度）；解析失败时缺省 30°、135°。
     std::string lightAngles = firstXmlTag(xml, "lightAngle");
     const size_t nestedTagEnd = lightAngles.find('>');
     if (nestedTagEnd != std::string::npos) {
@@ -4490,6 +5013,8 @@ Scene loadProjectScene(const std::string& inputFile)
         scene.sunAzimuth = 135.0f;
     }
 
+    // 步骤 5：逐个对象块，建立“网格名 → 材质”绑定（光学名、热学名、生理名按索引一一对应，
+    // 名字数量不足时沿用最后一个），再读取该对象的几何与摆放。
     for (const std::string& objectXml : xmlObjectBlocks(xml)) {
         const std::vector<std::string> meshNames =
             nameList(firstXmlTag(objectXml, "meshNames"));
@@ -4505,6 +5030,8 @@ Scene loadProjectScene(const std::string& inputFile)
         std::vector<ObjectMaterialBinding> bindings;
         bindings.reserve(bindingCount);
         for (size_t index = 0; index < bindingCount; ++index) {
+            // 对每个绑定：以对象缺省光学参数为底，按 componentType 标记输出分量
+            // （Soil=1、Vegetation=2、Building=3、Water=5，其余 0），再叠加光谱/热学/生理参数。
             SurfaceParameters material = radiativeParameters.object;
             const std::string componentType = trim(firstXmlTag(objectXml, "componentType"));
             material.outputComponent = componentType == "Soil" ? 1 : componentType == "Vegetation" ? 2
@@ -4521,6 +5048,7 @@ Scene loadProjectScene(const std::string& inputFile)
             const auto physicalName=physicalNames.empty()?std::string{}:physicalNames[std::min(index,physicalNames.size()-1U)];
             // An empty name would match the first surfaceEnergy block of any material.
             const auto physical=physicalName.empty()?std::string{}:namedXmlBlock(xml,"surfaceEnergy",physicalName);
+            // 无 surfaceEnergy 块时的兼容分支：按对象类型推断植被/水体（直接 XML 输入或对象材质缺失）。
             if(physical.empty()) {
                 // No explicit surface-energy block (direct XML input, or an object
                 // whose material is missing from the project): classify by the
@@ -4555,6 +5083,8 @@ Scene loadProjectScene(const std::string& inputFile)
                     readWaterInitial(waterBlock, material);
                 }
             }
+            // 有 surfaceEnergy 块时：读取光伏、植被、水体、集总热质量及叶片生化参数。
+            // 植被与光伏互斥，水体要求非植被非光伏；缺省值保持与旧工程一致。
             if(!physical.empty()) {
                 material.photovoltaic=xmlFloat(physical,"photovoltaic",0)>0.5f;
                 material.vegetation=xmlFloat(physical,"vegetation",1)>0.5f && !material.photovoltaic;
@@ -4609,6 +5139,7 @@ Scene loadProjectScene(const std::string& inputFile)
                     throw std::runtime_error("Photovoltaic surface must be opaque: "+physicalName);
             }
             {
+                // 以下三段共用同一参数块 wallBlock：墙/屋顶多层板、船体吃水线与内热源、车辆舱体参数。
                 // Wall/roof slab: surfaceEnergy (project JSON) or soilSet (direct XML).
                 const std::string wallBlock = !physical.empty() ? physical
                     : physicalName.empty() ? std::string{} : namedXmlBlock(xml, "soilSet", physicalName);
@@ -4644,6 +5175,8 @@ Scene loadProjectScene(const std::string& inputFile)
                     slab.validate();
                     material.wall = true;
                 }
+                // 船体选项：航速（0–100 m/s）、吃水线（固定高度或取场景水体）、水侧换热、航向与风向夹角、
+                // 内热源（flux W m-2 / power W）。吃水线以下面元的处理在后续时间步积分中完成。
                 // Ship hull options (same block as the wall tags).
                 if (!material.vegetation && !material.photovoltaic && !material.water) {
                     material.shipSpeed = xmlFloat(wallBlock, "shipSpeed", 0);
@@ -4679,6 +5212,9 @@ Scene loadProjectScene(const std::string& inputFile)
                     if (!std::isfinite(material.internalFlux) || !std::isfinite(material.internalPower) ||
                         std::abs(material.internalFlux) > 1.0e5f || std::abs(material.internalPower) > 1.0e9f)
                         throw std::runtime_error("Invalid internal heat source (|flux| <= 1e5 W/m2, |power| <= 1e9 W): " + physicalName);
+                    // 车辆热模型参数：vehiclePart（0–4，部件类别）；出现 vcSpeed 或 vcEnabled 标签才启用
+                    // 座舱参数（乘员、空调、发动机、通风等），均带范围检查，超界即抛异常。
+                    // 参数含义详见 docs/vehicle-thermal.md。
                     // Vehicle parts and cabin parameters (absent = old behaviour).
                     material.vehiclePart = static_cast<int>(xmlFloat(wallBlock, "vehiclePart", 0));
                     if (material.vehiclePart < 0 || material.vehiclePart > 4)
@@ -4784,6 +5320,7 @@ Scene loadProjectScene(const std::string& inputFile)
                 materialIndex
             });
         }
+        // 几何来源：优先 fileName，其次 objectfile；两者都为空时按 shapes 生成长方体。
         std::string modelFile = trim(firstXmlTag(objectXml, "fileName"));
         if (modelFile.empty()) {
             modelFile = trim(firstXmlTag(objectXml, "objectfile"));
@@ -4791,6 +5328,8 @@ Scene loadProjectScene(const std::string& inputFile)
         const ObjGeometry geometry = modelFile.empty()
             ? cubeGeometry(objectXml)
             : readObjGeometry(resolveProjectAsset(inputPath, modelFile));
+        // 若该对象有任一材质 vehiclePart > 0，则视为车辆对象：每个摆放实例登记名字（objName#序号），
+        // 并在 facetInstance 中记录面元所属实例编号（0 = 非车辆面元，实例编号从 1 起）。
         bool vehicleObject = false;
         for (const auto& binding : bindings)
             if (binding.materialIndex < scene.materials.size() && scene.materials[binding.materialIndex].vehiclePart > 0)
@@ -4798,6 +5337,7 @@ Scene loadProjectScene(const std::string& inputFile)
         size_t placementIndex = 0;
         for (Placement placement :
              readPlacements(inputPath, objectXml, sceneWidth, sceneDepth)) {
+            // 对象随地形抬升：摆放高度加上 DEM 在摆放点（场景坐标，未减域中心）处相对最低点的高度。
             placement.z += dem.heightAboveMinimum(
                 placement.x, placement.y, sceneWidth, sceneDepth);
             const uint32_t facetsBefore = scene.facetCount();
@@ -4812,6 +5352,8 @@ Scene loadProjectScene(const std::string& inputFile)
         }
     }
 
+    // 步骤 6：对象三角形全部加入后，其数目记为 leafFacetCount（对象面元数，地面在其后追加），
+    // 再追加地面材质与地面三角网。
     scene.leafFacetCount = scene.facetCount();
     const uint32_t groundMaterialIndex =
         static_cast<uint32_t>(scene.materials.size());
@@ -4819,6 +5361,8 @@ Scene loadProjectScene(const std::string& inputFile)
     appendProjectGround(scene, sceneWidth, sceneDepth, voxelSize,
                         scene.visibilityRasterSize / 4U,
                         groundMaterialIndex, dem);
+    // 步骤 7：确定可见性栅格（A-buffer）层数：先按场景自适应，再允许环境变量
+    // HISTREAM_FACET_RASTER_LAYERS 显式加深（仅 64/128/256，只升不降）。
     const uint32_t initialRasterLayers = scene.visibilityRasterLayers;
     // DEFERRED[中] 内存: 大场景先把层数降到 16 以控制 2048x2048 A-buffer 内存，但这里自适应又可把层数升回 64：CPU 端 Fragment(12B) 需 2048²×64×12≈3.2 GB，GPU 端 2 GB 片元缓冲；且估计基于全场平均深度，局部密集冠层仍可能溢出，溢出时 CPU/GPU 都直接抛错而无自动扩层重试；建议：按可用显存/内存给出层数上限，并在溢出时自动翻倍层数重建（类似边哈希表的重试）。
     scene.visibilityRasterLayers = adaptiveVisibilityRasterLayers(scene);
@@ -4840,6 +5384,7 @@ Scene loadProjectScene(const std::string& inputFile)
                   << scene.visibilityRasterLayers << " for "
                   << scene.facetCount() << " facets" << std::endl;
     }
+    // 步骤 8：统计全部顶点的包围盒，并完成反射率贴图因子的归一化。
     scene.minimum = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
                      std::numeric_limits<float>::max()};
     scene.maximum = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(),
@@ -4854,6 +5399,8 @@ Scene loadProjectScene(const std::string& inputFile)
     return scene;
 }
 
+// 作用：工程中没有任何 OBJ 时，按 shapes（"长,宽,高"）在临时目录写出一个长方体 OBJ 并返回路径，
+// 文件名由输入路径哈希决定；尺寸非法时为 1 m 立方体。面的绕向与 cubeGeometry 一致。
 std::string generatedCubeFromInput(const std::string& inputPath, const std::string& xml)
 {
     float length = 1.0f;
@@ -4895,6 +5442,8 @@ std::string generatedCubeFromInput(const std::string& inputPath, const std::stri
     return path.string();
 }
 
+// 作用：由输入文件得到场景 OBJ 路径：输入本身是 .obj 则直接用；
+// 否则取工程 XML 的 fileName/objectfile（相对路径按输入所在目录解析），都没有时生成默认长方体。
 std::string sceneFileFromInput(const std::string& inputPath)
 {
     const std::filesystem::path input(inputPath);
@@ -4915,6 +5464,7 @@ std::string sceneFileFromInput(const std::string& inputPath)
         (input.parent_path() / scenePath).lexically_normal().string();
 }
 
+// 作用：确定结果文件路径：显式指定的输出优先，否则取工程的 outDir（缺省为输入所在目录）加 defaultName。
 std::string outputFileFromInput(const std::string& inputPath,
                                 const std::string& requestedOutput,
                                 const char* defaultName)
@@ -4931,6 +5481,8 @@ std::string outputFileFromInput(const std::string& inputPath,
     return (std::filesystem::path(output) / defaultName).lexically_normal().string();
 }
 
+// 作用：选择 FacetRT 后端：环境变量 HISTREAM_FACET_BACKEND 优先，其次 facetBackend 标签；
+// 取值 cpu / auto，其他（含缺省）均为 gpu。auto = 先试 GPU，失败回退 CPU 光栅。
 std::string facetBackendFromInput(const std::string& xml)
 {
     const char* environment = std::getenv("HISTREAM_FACET_BACKEND");
@@ -4943,6 +5495,10 @@ std::string facetBackendFromInput(const std::string& xml)
 
 } // namespace
 
+// 模块：FacetRT（面元辐射）入口
+// 输入：project.json（或单个 .obj）、着色器目录、输出文件（可为空）；输出：facetrt.json，
+// 并向 stdout 输出 PROGRESS / RESULT 行供上层解析；返回 0 成功，1 失败（错误写 stderr）。
+// 流程：载入场景 → 读取辐射参数与光照 → 按后端运行（GPU / CPU / auto 回退）→ 写出结果。
 int runFacetRTCore(const std::string& inputPath,
                const std::string& shaderDirectory,
                const std::string& outputFile)
@@ -4965,6 +5521,7 @@ try {
     const Progress progress = [](int value, const std::string& stage) {
         std::cout << "PROGRESS\t" << value << '\t' << stage << std::endl;
     };
+    // 步骤：选择后端并运行；CPU 端遇到片元链表溢出时加深栅格层数并整体重跑。
     const std::string requestedBackend = facetBackendFromInput(xml);
     // The retained CPU rasterizer cannot resume after a full fragment list, so
     // repeat the whole run with a deeper A-buffer instead of failing.
@@ -5004,6 +5561,13 @@ try {
 }
 
 
+// 模块：FacetEB（面元能量平衡）入口
+// 输入：project.json（或单个 .obj）、着色器目录、输出文件；输出：faceteb.json 与过程文件，
+// faceteb_run.json 记录运行状态、收敛判据与已完成产物。返回 0 成功，1 失败。
+// 主要步骤：
+//   1. 载入场景并读取时间节点、迭代与收敛控制参数
+//   2. 读取辐射参数、短波光谱与气象驱动文件
+//   其后的可见性图、耦合迭代与结果输出各步骤见函数内部注释。
 int runFacetEBCore(const std::string& inputPath,
                    const std::string& shaderDirectory,
                    const std::string& outputFile)
@@ -5012,6 +5576,8 @@ try {
         throw std::invalid_argument("FacetEB requires project.json");
     }
 
+    // MeteoStep：一行气象驱动。单位：气温 °C、水汽压 hPa（待核对）、气压 hPa（待核对）、
+    // 风速 m s-1、短波/长波 W m-2；缺省值为文件缺列时的占位。
     struct MeteoStep {
         int node{};
         float julianTime{};
@@ -5037,6 +5603,8 @@ try {
         std::filesystem::path(resultFile).parent_path();
     std::filesystem::create_directories(outputDirectory);
 
+    // 步骤 1：时间节点控制。节点区间 [startTimeNode, endTimeNode)，至少含 1 个节点；
+    // dTime 为节点步长（s，至少 1，缺省 1800）；nodeTimeStepsSeconds 给出变步长时，个数须等于 endNode。
     const int startNode = std::max(0, static_cast<int>(
         std::lround(xmlFloat(xml, "startTimeNode", 0.0f))));
     const int endNode = std::max(startNode + 1, static_cast<int>(
@@ -5052,6 +5620,7 @@ try {
         }
         if(!values.eof() || nodeTimeSteps.size()!=size_t(endNode))throw std::runtime_error("Native node time-step count mismatch");
     }
+    // 过程输出开关：isRadiationProcess / isEnergyProcess；仅给旧开关 isProcess 时按能量过程处理（兼容旧工程）。
     bool saveRadiationProcess = trim(firstXmlTag(xml, "isRadiationProcess")) == "1";
     bool saveEnergyProcess = trim(firstXmlTag(xml, "isEnergyProcess")) == "1";
     if (!saveRadiationProcess && !saveEnergyProcess &&
@@ -5059,6 +5628,8 @@ try {
         saveEnergyProcess = true;
     }
     const bool saveProcess = saveRadiationProcess || saveEnergyProcess;
+    // 耦合迭代控制：stabilityCorrection（稳定度修正开关）、couplingIterations（1–100，缺省 60）、
+    // temperatureTolerance（K，缺省 0.05）、temperatureRelaxation（松弛系数 0.05–1，缺省 0.8）。
     const bool stabilityCorrection = xmlFloat(xml, "stabilityCorrection", 0.0f) > 0.5f;
     const uint32_t maximumCouplingIterations = static_cast<uint32_t>(std::clamp(
         static_cast<int>(std::lround(xmlFloat(xml, "couplingIterations", 60.0f))),
@@ -5067,6 +5638,8 @@ try {
         xmlFloat(xml, "temperatureTolerance", 0.05f), 0.001f, 10.0f);
     const float temperatureRelaxation = std::clamp(
         xmlFloat(xml, "temperatureRelaxation", 0.8f), 0.05f, 1.0f);
+    // 运行索引文件：先以 status=running 写出，记录请求区间与收敛判据，便于中途失败后检查；
+    // 判据为“能量残差 ≥ 2 W m-2 的面元占比 < 0.001 且残差折合温度不超过 0.5 K”。
     FacetRunIndex runIndex{outputDirectory / "faceteb_run.json", {
         {"kind", "faceteb-run"}, {"schemaVersion", 1}, {"status", "running"},
         {"startedAt", utcTimestamp()}, {"input", inputPath},
@@ -5089,6 +5662,8 @@ try {
         {"completed", ProjectJson::Json::array()}, {"products", ProjectJson::Json::array()}
     }};
     runIndex.write();
+    // 步骤 2：读取模型选项与地理/天空参数：光谱加速宽度（1–1000，缺省 100）、植被温度方法（0/1）、
+    // 土壤惯性历史、经纬度（°）、年份、时区（h）、天空温度（K，150–350，缺省 250）。
     const size_t spectralAccelerationWidth = static_cast<size_t>(std::clamp(
         static_cast<int>(std::lround(
             xmlFloat(xml, "spectralAccelerationWidth", 100.0f))),
@@ -5107,6 +5682,7 @@ try {
         xmlFloat(xml, "skyTemperature", 250.0f), 150.0f, 350.0f);
     const float directShortwaveFraction = std::clamp(
         xmlFloat(xml, "directScatteringRatio", 0.8f), 0.0f, 1.0f);
+    // 读取辐射参数与短波光谱；光谱直射/散射比例由 directScatteringRatio 给定（缺省 0.8）。
     const FacetRTParameters radiativeParameters =
         facetRTParametersFromInput(xml, input);
     const ShortwaveSpectrum configuredShortwaveSpectrum = loadShortwaveSpectrum(
@@ -5121,6 +5697,8 @@ try {
         unitDiffuseSpectrum = loadShortwaveSpectrum(xml, input, 0.0f);
     }
 
+    // 气象驱动：文件 filePath 首行为表头，之后每行 "儒略时 气温 水汽压 气压 风速 短波 长波 [直射 散射]"；
+    // 非有限值或列不足时抛异常；可选的第 8、9 列为水平面实测直射/散射（W m-2）。
     std::vector<MeteoStep> meteorology;
     const std::string meteoName = trim(firstXmlTag(xml, "filePath"));
     if (!meteoName.empty()) {
@@ -5166,6 +5744,8 @@ try {
             throw std::runtime_error("FacetEB meteorology has no data rows: " + meteoName);
         }
     }
+    // 未提供气象文件时：按 dTime 合成时间轴（儒略日从 1 起，每节点 dTime 秒），
+    // 其余气象量取 MeteoStep 的缺省值；随后检查时间范围不超过气象行数。
     if (meteoName.empty()) {
         meteorology.resize(static_cast<size_t>(endNode));
         for (int node = 0; node < endNode; ++node) {
@@ -5178,6 +5758,8 @@ try {
         throw std::runtime_error("FacetEB time range exceeds meteorology rows");
     }
 
+    // 作用：把儒略日（日序 + 日内小数）转为输出文件名用的时间标签 DOY<日序>_<时>-<分>，
+    // 按分钟四舍五入并处理进位到下一日。
     const auto timeToken = [](float julianTime) {
         int day = static_cast<int>(std::floor(julianTime));
         int minutes = static_cast<int>(std::lround(
@@ -5193,6 +5775,10 @@ try {
         return token.str();
     };
 
+    // 作用：用 NREL SPA 算法按该节点时刻、经纬度、时区、气压和气温计算太阳天顶角/方位角（度），
+    // 写入 scene.sunZenith / scene.sunAzimuth。
+    // 说明：秒数取最近整秒并封顶 86399，与 VoxelEB 一致，避免日期进位；海拔固定 100 m（SPA 输入，
+    // 其取值依据待核对）；气压下限 100。
     const auto updateSolarPosition = [&](const MeteoStep& step) {
         int month = 1;
         int day = 1;
@@ -5230,6 +5816,7 @@ try {
         scene.sunAzimuth = static_cast<float>(data.azimuth);
     };
 
+    // 步骤 3：配置 Vulkan 可见性模型（栅格尺寸、每像素片元层数、周期邻域、GPU 序号 GPU）。
     facetvk::Config config{};
     config.rasterWidth = scene.visibilityRasterSize;
     config.rasterHeight = scene.visibilityRasterSize;
@@ -5246,6 +5833,8 @@ try {
                       ? "Ball-Berry 经验法" : "Farquhar 机制法")
               << std::endl;
     const std::string requestedBackend = facetBackendFromInput(xml);
+    // 步骤 4：构建面元之间的可见性图（半球方向离散）：后端为 cpu 直接用 CPU 光栅；
+    // 否则先用 GPU，auto 时 GPU 失败回退到 CPU。可见性图在所有时间节点间共用（几何不变）。
     facetvk::FacetrtVulkan model;
     CpuGraph cpuGraph;
     bool useCpuBackend = requestedBackend == "cpu";
@@ -5282,6 +5871,9 @@ try {
         }
     }
     std::cout << "PROGRESS\t10\t" << groundEscapeLog(graph) << std::endl;
+    // 以下几个 lambda 统一封装 CPU / GPU 两种后端：solveRadiation 迭代求解面元间多次散射
+    // （返回各面元两侧的辐射量），incidentRadiation 由解求入射辐照，computeSunlit 求受晒面积比例
+    // （CPU 栅格溢出时加深层数重试）。
     const auto solveRadiation = [&](const std::vector<facetvk::SurfaceOptics>& optics,
                                     float skyRadiosity,
                                     uint32_t iterations,
@@ -5329,6 +5921,9 @@ try {
         }
     };
 
+    // 步骤 5：选择能量平衡后端。HISTREAM_FACET_ENERGY_BACKEND=cpu、含集总热质量，或 auto 且设备
+    // 不支持 GPU 能量内核时走 CPU 能量平衡（辐射仍可用 GPU）；否则用 GPU 能量内核。
+    // HISTREAM_FACET_VALIDATE_ENERGY=1/2 在 GPU 能量下并行跑 CPU 影子计算做逐项对比（审计/普查）。
     const char* energyBackend = std::getenv("HISTREAM_FACET_ENERGY_BACKEND");
     const bool hasLumpedThermal=std::any_of(scene.materials.begin(),scene.materials.end(),
         [](const SurfaceParameters& s){return !s.lumpedGroup.empty();});
@@ -5372,6 +5967,8 @@ try {
     runIndex.write();
     std::cout << "PROGRESS\t10\t" << (gpuEnergy ? "GPU 能量平衡/叶片生理，迭代状态驻留显存" : "CPU 能量平衡对照路径") << std::endl;
 
+    // 步骤 6：状态数组初始化。每个面元有两侧（正反面），共 facetCount×2 个表面；
+    // 温度初值为 NaN，表示尚未初始化（首节点由气温或配置的土壤温度给定）。
     const size_t surfaceCount = static_cast<size_t>(scene.facetCount()) * 2U;
     std::vector<float> temperature(
         surfaceCount, std::numeric_limits<float>::quiet_NaN());
@@ -5387,6 +5984,8 @@ try {
         float ground{std::numeric_limits<float>::infinity()};
         float lai{}, height{}, leafWidth{0.1f};
     };
+    // 参考高度 referenceHeight（m，下限 0.5，缺省 10）与大气 CO2 浓度 carbonDioxide（限幅 100–2000，缺省 380，
+    // 单位按 ppm，待核对）；initialSoilTemperature 仅在 150–400 K 内才采用，否则取首个气象气温。
     const float referenceHeight = std::max(0.5f, xmlFloat(xml, "referenceHeight", 10.0f));
     const float carbonDioxide = std::clamp(xmlFloat(xml, "carbonDioxide", 380.0f), 100.0f, 2000.0f);
     // Configured initial soil temperature Tsold [K]; ground surfaces start there.
@@ -5400,11 +5999,14 @@ try {
     const float columnExtentZ = std::max(1.0e-3f, scene.maximum[2] - scene.minimum[2]);
     const float columnSize = std::clamp(
         std::max(columnExtentX, columnExtentZ) / 256.0f, 1.0f, std::max(columnExtentX, columnExtentZ));
+    // 冠层柱网格：柱边长 = 场景最大水平尺寸/256，不小于 1 m、不大于该尺寸，故每边最多约 256 柱。
     const int columnsX = std::max(1, static_cast<int>(std::ceil(columnExtentX / columnSize)));
     const int columnsZ = std::max(1, static_cast<int>(std::ceil(columnExtentZ / columnSize)));
     std::vector<CanopyColumn> columns(static_cast<size_t>(columnsX) * columnsZ);
     std::vector<uint32_t> facetColumn(scene.facetCount());
     std::vector<float> facetHeight(scene.facetCount());
+    // 步骤 7：把每个面元按质心归入水平冠层柱，累积各柱的叶面积、叶宽加权面积、冠层顶和地面高度。
+    // 叶面元 = 对象面元中的植被且非光伏；地面面元（编号 ≥ leafFacetCount）用于取柱内最低地面高度。
     const auto isLeafFacet = [&](uint32_t facet) {
         const SurfaceParameters& surface = surfaceForFacet(scene, facet);
         return facet < scene.leafFacetCount && surface.vegetation && !surface.photovoltaic;
@@ -5432,6 +6034,8 @@ try {
             column.ground = std::min(column.ground, centroid[1]);
         }
     }
+    // 由累积量得到每柱 LAI（叶面积/柱底面积）、冠层高度（顶 - 地面）与面积加权叶宽；
+    // 没有地面面元的柱以场景最低点作地面。
     for (CanopyColumn& column : columns) {
         if (!std::isfinite(column.ground)) column.ground = scene.minimum[1];
         if (column.leafArea <= 0.0) continue;
@@ -5443,6 +6047,9 @@ try {
     std::vector<double> columnInverseL(columns.size(), 0.0);
     std::vector<double> facetAreas(scene.facetCount());
     for (uint32_t f = 0; f < scene.facetCount(); ++f) facetAreas[f] = facetArea(scene, f);
+    // 集总热质量体：同一 lumpedGroup 的所有面元共享一个内部节点温度（单一容量与导热系数），
+    // weightedArea 为按 lumpedWeight 加权的面积，用于把总导热 W K-1 分摊到各面元。
+    // 同组各面元参数必须完全一致，否则抛异常；集总面元必须是显式固体对象实例，不能是地面。
     struct LumpedBody {
         std::string id;facetphysics::LumpedThermalParameters p;
         double weightedArea{},temperatureK{};facetphysics::LumpedThermalStep step;
@@ -5546,6 +6153,11 @@ try {
         if (sceneWaterArea > 0) waterSurfaceHeight = heightSum / sceneWaterArea;
     }
     {
+        // 船体浸没判定：对每个带吃水线（waterline）的面元求湿润比例 wet。
+        //   - waterlineSource=water：水位 = 场景水面平均高度 + waterlineOffset，按三角形三个顶点高度
+        //     排序后求位于水位以下的面积占比（分段二次式，精确）；
+        //   - 固定 waterlineHeight：面元质心低于吃水线则 wet=1，否则 0。
+        // wet>0 的面元记入 submergedFacet / wetFraction，并统计浸没面积与湿润面积供运行索引记录。
         uint32_t submergedCount = 0;
         double submergedArea = 0, wettedArea = 0;
         for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
@@ -5634,12 +6246,16 @@ try {
         bool parts{false};                      // interior nodes and/or engine model of the body material
         std::map<std::string, double> maxWindowW; // peak transmitted power per window group (W)
     };
+    // 按场景中登记的车辆实例（facetInstance，从 1 起编号）建立运行时状态，
+    // 并在下面按 vehiclePart 归类面元：1 = 车身，2 = 车窗玻璃，3 = 底盘，4 = 发动机盖。
     std::vector<VehicleRuntime> vehicles(scene.vehicleNames.size());
     const auto vehicleOf = [&](uint32_t facet) -> uint32_t {
         return facet < scene.facetInstance.size() ? scene.facetInstance[facet] : 0U;
     };
     std::vector<int32_t> wallVehicle(wallFacets.size(), -1);
     for (size_t i = 0; i < vehicles.size(); ++i) vehicles[i].name = scene.vehicleNames[i];
+    // 归类各实例的面元与面积，建立墙板索引到车辆的映射 wallVehicle，
+    // 并把发动机热量按所选模型折算为底盘面元的附加内热源 internalHeat（W m-2）。
     if (!vehicles.empty()) {
         for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
             const uint32_t instance = vehicleOf(f);
@@ -5691,6 +6307,7 @@ try {
         }
         runIndex.value["vehicles"] = list;
     }
+    // 作用：若面元属于车速 > 0 的车辆实例，返回该车车身材质（供对流换热按行驶风修正），否则返回空。
     const auto facetConvectiveScaleVehicle = [&](uint32_t facet) -> const SurfaceParameters* {
         const uint32_t instance = vehicleOf(facet);
         return instance && vehicles[instance - 1U].body && vehicles[instance - 1U].body->vehicleSpeed > 0.0f
@@ -5704,6 +6321,8 @@ try {
         return slab;
     };
     runIndex.write();
+    // 地面表面（侧）的起始序号：对象面元占前 leafFacetCount×2 个表面，其后为地面；
+    // 土壤剖面、土壤历史等数组按 side - firstGroundSide 紧凑存储，各设受晒(0)与阴影(1)两套状态。
     const size_t firstGroundSide = static_cast<size_t>(scene.leafFacetCount) * 2U;
     const size_t groundSides = surfaceCount - firstGroundSide;
     // The soil-facing side of a ground facet (normal pointing down, as in
@@ -5757,6 +6376,8 @@ try {
         return heat;
     };
 
+    // 最近一个节点的结果汇总（后端名、可见性图诊断等）；下面的 latest* 摘要数组只保留最终状态，
+    // 收敛情况跨节点累积到 allNodesConverged。
     RunResult latest;
     latest.backend = useCpuBackend
         ? "CPU raster Facet RT-EB coupled"
@@ -5776,6 +6397,8 @@ try {
     bool allNodesConverged = true;
     std::string latestTime;
 
+    // 逐节点二进制中间结果目录 .facet_steps（与几何和节点记录同序）；
+    // 先写 components.bin：每个面元一字节的输出分量编号（地面固定为 1，对象面元取材质 outputComponent）。
     const std::filesystem::path stepDirectory = outputDirectory / ".facet_steps";
     std::filesystem::create_directories(stepDirectory);
     // Shared classification, in exactly the same order as geometry and node records.
@@ -5792,6 +6415,7 @@ try {
         std::filesystem::create_directories(outputDirectory / "process");
     }
 
+    // 光伏汇总 CSV：逐节点记录光伏面元的面积、温度、入射/吸收/发电功率等，并累计发电量（kWh）。
     std::ofstream pvSummary(outputDirectory/"photovoltaic_summary.csv");
     pvSummary << "node,time,area_m2,temperature_C,incident_W,absorbed_W,electric_W,net_longwave_W,sensible_W,storage_W,max_residual_W_m2,energy_kWh\n";
     double pvEnergyKwh=0;
@@ -5855,6 +6479,9 @@ try {
     // Hull-to-water heat of the preceding node (W m-2 of scene water area) that
     // warms the water facets of the next node (Ship waterFeedback).
     float waterFeedbackSource = 0.0f;
+    // 步骤 8：逐时间节点主循环 [startNode, endNode)。每个节点先更新太阳位置并计算受晒比例，
+    // 首节点初始化各表面温度，再处理受晒/阴影状态间的热历史转移等（其后部分见下）。
+    // 节点步长 dTime 优先取 nodeTimeStepsSeconds 的变步长；集总热质量累计经过的秒数。
     const auto totalBegin = Clock::now();
     double lumpedElapsedSeconds=0;
     for (int node = startNode; node < endNode; ++node) {
@@ -6007,6 +6634,10 @@ try {
                         move(wallProfiles[0][size_t(wallSide)][cell], wallProfiles[1][size_t(wallSide)][cell]);
             }
         }
+        // 步骤 9：保存转移后的上一节点状态温度，并滚动土壤表面温度历史 soilHistory（最新在前，
+        // 共 kSoilHistory = 8 个节点）：首节点用初始温度填满；之后整体后移一位并写入最新值。
+        // 土壤惯性历史为 full 时，被挤出显式求和的最老增量（history[6] - history[7]）进入指数模态 memory，
+        // 每节点按 decay 衰减。
         const std::array<std::vector<float>, 2> previousStateTemperature = stateTemperature;
         const SoilMemoryModes soilModes = soilMemoryModes(dTime, kSoilHistory);
         for (int state = 0; state < 2; ++state) {
@@ -6029,6 +6660,9 @@ try {
             }
         }
 
+        // 步骤 10：土壤方法 2（多层剖面）：首节点用上一状态表面温度均匀初始化剖面与底边界温度；
+        // 每节点按剖面、底边界温度、热导率、体积热容（比热×密度）和 dTime 求各状态的土壤响应 soilResponse，
+        // 供后面的表面能量平衡使用。
         std::array<std::vector<facetphysics::SoilResponse>, 2> soilResponses{
             std::vector<facetphysics::SoilResponse>(groundSides), std::vector<facetphysics::SoilResponse>(groundSides)};
         for (size_t g = 0; g < groundSides; ++g) {
@@ -6042,6 +6676,11 @@ try {
                     soil.thermalConductivity, soil.specificHeat * soil.density, dTime);
             }
         }
+        // 车辆实例的舱内温度初始化（先于下面的墙板响应）：首节点把舱内空气与内饰温度设为室外气温
+        // （220–340 K 限幅）；有部件模型时各内部节点与机舱同取气温，engineWarm 时发动机块起始为
+        // engineWarmC（°C 转 K），机舱空气取气温与块温之间 30% 处。
+        // 各墙板的室内侧温度 wallIndoor 取舱内空气（或部件模型的边界温度），机罩墙板取机舱空气温度。
+        // 下面一段注释对应其后的墙板响应循环。
         // Wall slabs: start from steady conduction between the seed surface
         // temperature and the indoor air; eliminate the interior once per node.
         for (auto& v : vehicles) {
@@ -6063,6 +6702,8 @@ try {
             for (size_t w : v.walls) wallIndoor[w] = v.parts ? v.boundaryK : v.airK;
             for (size_t w : v.hoodWalls) wallIndoor[w] = v.bayK;
         }
+        // 对每个墙/屋顶面元及受晒、阴影两个状态求墙板响应 wallResponse（含内热源 internalHeat）；
+        // 首节点先以种子表面温度对应的稳态剖面初始化，并记录初始储热 previousWallHeat。
         std::array<std::vector<facetphysics::WallResponse>, 2> wallResponses{
             std::vector<facetphysics::WallResponse>(wallFacets.size()), std::vector<facetphysics::WallResponse>(wallFacets.size())};
         for (size_t w = 0; w < wallFacets.size(); ++w) {
@@ -6078,6 +6719,9 @@ try {
             }
         }
 
+        // 步骤 11：本节点短波输入。totalShortwave 为水平面入射总短波（W m-2，负值截为 0）；
+        // shortwave_split 按 diffuseFractionMode（fixed / erbs）及可选实测直射/散射，
+        // 给出直射比例 directFraction（erbs 模式还给出晴空指数 kt）。
         const float totalShortwave = std::max(0.0f, meteo.shortwave);
         const float cosineSolarZenith =
             std::max(0.0f, sunDirection(scene).y);
@@ -6086,6 +6730,8 @@ try {
             diffuseFractionMode, directShortwaveFraction, meteo.shortwave,
             static_cast<float>(std::acos(std::clamp(sunDirection(scene).y, -1.0f, 1.0f)) * 180.0 / kPi),
             static_cast<int>(std::floor(meteo.julianTime)), meteo.measuredDirect, meteo.measuredDiffuse);
+        // erbs 模式：用直射比例为 1 / 0 的两条单位谱形状，按本节点直射比例重新缩放；
+        // fixed 模式直接使用配置好的光谱。随后在 stdout 输出一行 SHORTWAVE_SPLIT 记录本节点划分结果。
         ShortwaveSpectrum nodeShortwaveSpectrum;
         if (diffuseFractionMode == shortwave_split::kModeErbs) {
             nodeShortwaveSpectrum.direct = unitDirectSpectrum.direct;
@@ -6102,6 +6748,9 @@ try {
                   << "\trin=" << meteo.shortwave
                   << "\tkt=" << shortwaveSplit.clearnessIndex
                   << "\tdirectFraction=" << shortwaveSplit.directFraction << std::endl;
+        // 以下为本节点的短波累加器（均按面元“侧”索引，surfaceCount = 2 × 面元数）。
+        // absorbed*：吸收的短波（W m-2，宽波段累加）；incident*：入射；*Direct：其中的直射分量；
+        // *Par*：400–700 nm 光合有效辐射的光子通量（umol m-2 s-1）；transmitted：透过车窗的短波。
         std::vector<float> absorbedShortwave(surfaceCount, 0.0f);
         // Direct-beam parts of the side-mean fluxes; a sunlit point receives
         // them divided by the side's sunlit part, a shaded point none.
@@ -6116,6 +6765,9 @@ try {
         facetvk::SolveResult diffuseSolution;
         diffuseSolution.radiosity.assign(surfaceCount, 0.0f);
 
+        // 步骤 A：分窗口短波求解。把 1 nm 光谱样本按 spectralAccelerationWidth 分成若干窗口，
+        // 每个窗口用窗口平均光学量求一次辐射度，再把各窗口的吸收/入射累加成宽波段结果。
+        // 窗口总能量守恒：总短波 = 直射（折算为法向）+ 漫射，被丢弃的水平直射并入漫射。
         // FacetEB uses the same shortwave acceleration definition as VoxelEB:
         // integrate direct and diffuse irradiance inside each configured
         // wavelength window, solve once with the window-centre optics, then
@@ -6149,15 +6801,19 @@ try {
                 lastSample = std::min(
                     firstSample + spectralAccelerationWidth,
                     shortwaveSampleCount - 1U);
+                // 窗口在 700 nm（parLastSample）处截断，保证每个窗口要么完全在 PAR 内、要么完全在外。
                 if (firstSample < parLastSample) lastSample = std::min(lastSample, parLastSample);
                 const bool parWindow = lastSample <= parLastSample;
                 const float directFraction = shortwaveSpectrum.integrate(
                     shortwaveSpectrum.direct, firstSample, lastSample);
                 const float diffuseFraction = shortwaveSpectrum.integrate(
                     shortwaveSpectrum.diffuse, firstSample, lastSample);
+                // 该窗口光谱权重几乎为 0（例如光谱表末端），跳过以省去一次无意义的求解。
                 if (directFraction + diffuseFraction <= 1.0e-10f) {
                     continue;
                 }
+                // 窗口的法向直射与水平漫射辐照（W m-2）：直射按光谱份额分配并换算到垂直光线的平面；
+                // 漫射 = 天空散射份额 + 换算时丢弃的直射份额，使窗口总量与 Rin 一致。
                 const float windowDirectNormal =
                     totalShortwave * directFraction * directNormalFactor;
                 const float windowDiffuse =
@@ -6170,6 +6826,7 @@ try {
                 const float windowWavelength = windowBandValue(
                     wavelengthNm, firstSample, lastSample, spectralWeight,
                     400.0f + static_cast<float>(firstSample + lastSample) / 2.0f);
+                // 求解本窗口含直射的辐射度，再换算为各侧入射辐照度 windowIncident（W m-2）。
                 const facetvk::SolveResult windowSolution = solveShortwaveWindow(
                     windowOptics, windowDiffuse, windowDirectNormal + windowDiffuse);
                 const std::vector<float> windowIncident =
@@ -6186,6 +6843,8 @@ try {
                     windowDiffuseSolution.radiosity.assign(surfaceCount, 0.0f);
                 }
                 for (size_t side = 0; side < surfaceCount; ++side) {
+                    // 逐侧累加：吸收率 = 1 - ρ - τ（限幅 [0,1]），吸收 = 吸收率 × 入射；直射分量单独累计，
+                    // 供后续对“受光点”按受光比例放大；PAR 窗口再把 W m-2 换算为光子通量。
                     const float absorptance = std::clamp(
                         1.0f - windowOptics[side].reflectance -
                             windowOptics[side].transmittance,
@@ -6227,6 +6886,10 @@ try {
             }
         }
 
+        // 步骤 B：节点气象量。长波下行缺测（<=0）时用天空等效温度的黑体辐射代替；
+        // 气温限幅在 [220, 340] K；气压（hPa）下限 100；空气密度用理想气体 ρ = P/(287.05·T)。
+        // 空气动力学导热 = 5.8 + 4.1·sqrt(风速)（W m-2 K-1，风速下限 0.1 m s-1），
+        // 阻抗 ra = ρ·cp/导热（cp = 1005 J kg-1 K-1）。
         shortwaveDone = Clock::now();
         const float skyLongwave = meteo.longwave > 0.0f
             ? meteo.longwave
@@ -6240,6 +6903,9 @@ try {
             (287.05f * airTemperature);
         const float aerodynamicResistance = airDensity * 1005.0f /
             std::max(0.1f, aerodynamicConductance);
+        // 步骤 C：节点级对流/接触辅助量（下面 3 个 lambda）：objectConvectiveScale（船体相对风）、
+        // facetConvectiveScale（车辆面元用车速的相对风，否则同船体）、waterContact（浸没面元的
+        // 总显热导热与参考温度）。三者的结果都作为 GPU 参数 P[3]、P[30]、P[31] 的来源。
         // Ship hulls (energy.comp P[3]): the forced-convection coefficient at the
         // relative wind |u_wind - v_ship| as a multiplier of the material
         // convective scale; speed 0 keeps the material value. Without a heading
@@ -6289,12 +6955,15 @@ try {
             const float water = wet * s.waterCoefficient, dry = (2.0f - wet) * air, total = water + dry;
             return {total, (water * waterK + dry * airTemperature) / total};
         };
+        // 按冠层柱（高度、LAI、叶宽、当前 1/L）初始化每柱的空气动力学参数（叶片阻抗、土壤阻抗等）。
         for (size_t index = 0; index < columns.size(); ++index) {
             columnAerodynamics[index] = aerodynamics(
                 referenceHeight, meteo.windSpeed, columns[index].height,
                 columns[index].lai, columns[index].leafWidth, columnInverseL[index]);
         }
 
+        // 步骤 D：能量平衡的通量容器与收敛量。每个面元侧都有两个状态：state 0 = 受光点，
+        // state 1 = 阴影点；最终输出通量按 sunlitPart 在两态间加权混合。
         // Side fluxes for output: area-weighted sunlit/shaded combinations.
         std::vector<float> netRadiation(surfaceCount);
         std::vector<float> sensibleHeat(surfaceCount);
@@ -6305,6 +6974,11 @@ try {
         float maximumEnergyResidual = 0.0f;
         float maximumEnergyResidualEquivalent = 0.0f;
 
+        // 模块：单个状态（受光/阴影）下逐面侧的通量（W m-2）及其对温度的斜率（W m-2 K-1）。
+        // net 净辐射；sensible/latent/storage 显热/潜热/储热；photovoltaic 光伏取走的电功率；
+        // internal 集总体内部热传导；source 热源（船舶内热等）；*Slope 为各项对表面温度的导数；
+        // temperatureStep 叶片联立求解给出的温度更新量（K）；stomatalMismatch 气孔阻抗自洽失配；
+        // leafResistance 叶片气孔阻抗（s m-1）。
         struct StateFluxes {
             std::vector<float> net, sensible, sensibleSlope, latent, latentSlope,
                 storage, storageSlope, photovoltaic, photovoltaicSlope, temperatureStep, stomatalMismatch,internal,internalSlope,source,
@@ -6331,10 +7005,14 @@ try {
                 for (int state = 0; state < 2; ++state)
                     stateFlux[state].source[size_t(facet) * 2U] = stateFlux[state].source[size_t(facet) * 2U + 1U] = source;
             }
+        // 收敛诊断量：稳定度（1/L）最大变化、气孔阻抗自洽最大失配、叶片能量残差最大值、
+        // 能量残差超限的面元数、集总体表面最大残差。
         float maximumStabilityChange = 0.0f;
         float maximumStomatalMismatch = 0.0f, maximumLeafEnergyResidual = 0.0f;
         uint32_t failingEnergyFacets = 0;
         double lumpedSurfaceResidual=0;
+        // 能量平衡收敛判据：超限面元数与温度等效残差由 facetEnergyConverged 判定，
+        // 且集总体表面的最大残差 < 2 W m-2（阈值为经验取值，来源待核对）。
         const auto energyConverged = [&]() {
             return facetphysics::facetEnergyConverged(
                        failingEnergyFacets, scene.facetCount(),
@@ -6347,6 +7025,8 @@ try {
         const auto radiatingFaces = [&](uint32_t facet) {
             return facet < scene.leafFacetCount ? (wallIndex[facet] >= 0 ? 4.0f : 8.0f) : 4.0f;
         };
+        // 作用：统计能量残差超限（facetEnergyViolation）的面元数。残差 = 净辐射 + 内部传热 + 热源
+        // - 显热 - 潜热 - 储热 - 光伏（仅物体面元）；物体面元只检查第一侧，地面面元检查两侧。
         const auto countFailingEnergyFacets = [&]() {
             uint32_t count = 0;
             for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
@@ -6375,15 +7055,22 @@ try {
             return sunlitPart[side] > 1.0e-6f
                 ? diffuse + direct[side] / sunlitPart[side] : diffuse;
         };
+        // 作用：由受光/阴影两态温度按受光比例 sunlitPart 加权，得到每侧平均温度 temperature。
         const auto updateMeanTemperature = [&]() {
             for (size_t side = 0; side < surfaceCount; ++side) {
                 temperature[side] = sunlitPart[side] * stateTemperature[0][side] +
                     (1.0f - sunlitPart[side]) * stateTemperature[1][side];
             }
         };
+        // 作用：给定两态温度 stateTemperature、长波光学量与长波入射，计算所有面侧的净辐射、
+        // 显热、潜热、储热、光伏发电及其对温度的斜率，写入 stateFlux，并混合成输出通量。
+        // 输入：longwaveOptics（每侧 ρ/τ）、longwaveIncident（每侧入射长波，W m-2）。
+        // 步骤：1 集总体温度 → 2 每侧辐射净通量 → 3 并行逐面元通量（物体/地面两类）→ 4 受光比例混合。
         const auto evaluateEnergyFluxes =
             [&](const std::vector<facetvk::SurfaceOptics>& longwaveOptics,
                 const std::vector<float>& longwaveIncident) {
+                // 步骤 1：集总体（lumpedBodies，如车辆舱体/船体热容）：用其面元的面积×权重加权表面温度，
+                // 解集总体核心温度（solveLumpedCore），其结果在步骤 3 以内部传热项耦合回面元。
                 if(!lumpedBodies.empty()) {
                     std::vector<double> weighted(lumpedBodies.size(),0);
                     for(uint32_t f=0;f<scene.facetCount();++f)if(lumpedFacet[f]>=0) {
@@ -6398,6 +7085,8 @@ try {
                         b.temperatureK=b.step.temperatureK;
                     }
                 }
+                // 步骤 2（逐状态）：每侧辐射净通量 = 吸收短波 + ε·入射长波 - ε·σT⁴，其中 ε = 1-ρ-τ，
+                // T 限幅在 [1, 1000] K；受光态的直射短波按受光比例放大（见 stateValue）。
                 std::vector<float> radiativeNet(surfaceCount);
                 for (int state = 0; state < 2; ++state) {
                     const std::vector<float>& T = stateTemperature[state];
@@ -6416,6 +7105,7 @@ try {
                                 std::pow(std::clamp(T[side], 1.0f, 1000.0f), 4.0f);
                     }
                     });
+                    // 步骤 3：并行逐面元（grain 64）计算各项通量；每个面元只写自己的两个侧，无数据竞争。
                     // Each facet writes only its own two sides of `flux`.
                     parallelRanges(scene.facetCount(), 64U, [&](size_t begin, size_t end) {
                     for (uint32_t facet = static_cast<uint32_t>(begin);
@@ -6425,6 +7115,8 @@ try {
                         const SurfaceParameters& surface =
                             surfaceForFacet(scene, facet);
                         if (facet < scene.leafFacetCount) {
+                            // 分支 1：物体面元（叶片、薄壳、水面、墙体、光伏、船体等）。整片面元共用一组通量，
+                            // 最后对其两侧写入相同的值；净辐射取两侧之和（墙体只取室外侧）并乘遮蔽系数 shieldFraction。
                             // Wall slab: only the outdoor face is in the outdoor energy
                             // balance; the indoor face conducts through the slab to the room.
                             const int32_t wall = wallIndex[facet];
@@ -6443,6 +7135,9 @@ try {
                                 columnAerodynamics[facetColumn[facet]];
                             const std::array<float, 2> contact = leafExchange
                                 ? std::array<float, 2>{0.0f, airTemperature} : waterContact(facet, surface);
+                            // 显热导热（W m-2 K-1）：叶片 = ρ·cp·scale / 叶片阻抗；浸没面元用 waterContact 的总导热；
+                            // 其余 = 空气动力导热 × 对流缩放 × 换热面数（水面/墙体 1 个面，薄壳 2 个面）。
+                            // 显热 = 导热 × (T - 参考温度)，参考温度为气温或浸没时的水温。
                             const float facetSensibleConductance = leafExchange
                                 ? airDensity * 1005.0f * surface.convectiveScale /
                                     aerodynamics.leafResistance
@@ -6451,8 +7146,11 @@ try {
                             const float facetSensibleHeat = facetSensibleConductance *
                                 (T[side0] - contact[1]);
                             const CanopyColumn& column = columns[facetColumn[facet]];
+                            // 叶片在冠层柱内的相对深度 = -(柱顶 - 面元高度)/柱高：冠顶为 0，向下为负；
+                            // 供光合参数随深度衰减（vcmax25 等）。
                             const float relativeDepth = column.height > 0.0f
                                 ? -(column.top - facetHeight[facet]) / column.height : 0.0f;
+                            // 本状态下该面元两侧吸收的 PAR 光子通量之和（umol m-2 s-1），作为叶片光合输入。
                             const float statePar = std::max(0.0f,
                                 stateValue(absorbedParPhotons, absorbedParDirect, state, side0) +
                                 stateValue(absorbedParPhotons, absorbedParDirect, state, side0 + 1U));
@@ -6467,6 +7165,9 @@ try {
                                     static_cast<float>(wallResponses[state][size_t(wall)].flux(previousT[side0]))
                                 : facetStorageSlope *
                                 (T[side0] - previousT[side0]);
+                            // 光伏发电：有效入射 = 正面入射 + 双面系数 × 背面入射；效率 η = η25·(1 + γ·(T - 298.15))；
+                            // 发电功率限幅在 [0, 吸收的短波]，不超过可用能量；斜率 dP/dT = η25·γ·有效入射，
+                            // 仅在功率未触及限幅时非零。非光伏面元功率为 0。
                             const float effectiveIncident =
                                 stateValue(incidentShortwave, incidentDirect, state, side0) +
                                 surface.pvBifaciality *
@@ -6491,6 +7192,9 @@ try {
                                 facetLatentHeatSlope = surface.evaporationCoefficient * latentHeatFluxDerivative(T[side0],
                                     airDensity, airPressure, meteo.vaporPressure, waterResistance, surface.surfaceResistance);
                             }
+                            // 叶片：温度与气孔阻抗联立求解。thermal(rs) 在给定气孔阻抗下用牛顿法求能量平衡的叶温根；
+                            // physiology(T, rs) 在给定叶温下求气孔阻抗（Collatz 或 Farquhar，由 vegetationTemperatureMethod
+                            // 选择）；coupledLeaf 迭代二者至自洽。
                             if (leafExchange) {
                                 const double emissivitySum = std::clamp(1.0f - longwaveOptics[side0].reflectance - longwaveOptics[side0].transmittance, 0.0f, 1.0f) +
                                     std::clamp(1.0f - longwaveOptics[side0 + 1].reflectance - longwaveOptics[side0 + 1].transmittance, 0.0f, 1.0f);
@@ -6524,6 +7228,7 @@ try {
                                         return std::array<double, 2>{residual, response};
                                     });
                                 };
+                                // CPU/GPU 审计时可强加气孔阻抗（只解叶温）；正常情况联立求解 (T, rs)。
                                 const float imposedResistance = auditLeafResistance
                                     ? (*auditLeafResistance)[size_t(state) * surfaceCount + side0] : 0.0f;
                                 const auto coupled = imposedResistance > 0.0f
@@ -6540,6 +7245,7 @@ try {
                                 flux.stomatalMismatch[side0] = static_cast<float>(std::abs(std::log(
                                     coupled.resistance / physiology(T[side0], coupled.resistance))));
                             }
+                            // 把本面元的通量写入两侧（两侧相同）；有集总体时叠加内部传热 G·(T_body - T) 与斜率 G。
                             for (uint32_t localSide = 0;
                                  localSide < 2U; ++localSide) {
                                 const size_t side = side0 + localSide;
@@ -6559,6 +7265,10 @@ try {
                                 }
                             }
                         } else {
+                            // 分支 2：地面面元。逐侧计算，朝下（接触土壤）的一侧通量全部置 0；
+                            // 朝上一侧：显热用冠层/裸地阻抗，潜热在干土（含水率 < 0.03）时为 0，
+                            // 储热按 soilTemperatureMethod：0 = 0.35×净辐射的经验取值；1 = 半无限导热 + 表面温度历史；
+                            // 其余 = 多层土壤热响应 soilResponses。
                             // Ground under vegetation is sheltered by its column's
                             // canopy, (LAI+1)*(raa+rws+rbs); open ground uses raa;
                             // both add free convection (facetphysics::groundExchange).
@@ -6575,6 +7285,7 @@ try {
                                         (flux.*field)[side] = 0.0f;
                                     continue;
                                 }
+                                // 地面对流阻抗（可含自由对流并联与 MOST 稳定度修正，见 groundExchange）。
                                 // Free convection when the side is warmer than the
                                 // air (energy.comp: same rule, P[28] = 1 + MOST).
                                 const auto exchange = facetphysics::groundExchange(
@@ -6630,6 +7341,7 @@ try {
                     }
                     });
                 }
+                // 步骤 4：按受光比例 sunlitPart 把受光/阴影两态的通量混合成每侧的输出通量。
                 parallelRanges(surfaceCount, 4096U, [&](size_t begin, size_t end) {
                 for (size_t side = begin; side < end; ++side) {
                     const float sunlitWeight = sunlitPart[side];
@@ -6822,6 +7534,9 @@ try {
                     data[10] = initialOptics[side].transmittance;
                     data[11] = sunlitPart[side];
                 }
+            // 节点常量（EnergyPush）：面元数、物体面元数、植被温度方法、气温（K）、空气密度、气压、
+            // 水汽压、时间步 dTime、CO2、温度松弛系数、风速；第 4 项为 0（含义待核对）。
+            // 之后 beginEnergyNode 把参数 / 输入 / 初始温度一次性上传到 GPU 能量求解器。
             const facetvk::EnergyPush push{scene.facetCount(),
                                            scene.leafFacetCount,
                                            static_cast<uint32_t>(vegetationTemperatureMethod),
@@ -6835,6 +7550,8 @@ try {
                                            temperatureRelaxation,
                                            meteo.windSpeed};
             model.beginEnergyNode(push, gpuParameters, gpuInputs, gpuTemperatures);
+            // 作用：把 GPU 读回的快照导入主机：每态每侧的温度和 12 个通量槽（槽 0–10 依次为 fields
+            // 的各项，槽 11 为叶片气孔阻抗 r_s，仅供审计），再更新平均温度并按受光比例混合输出通量。
             const auto importGpuState = [&](const facetvk::EnergySnapshot &snapshot) {
                 const std::array<std::vector<float> StateFluxes::*, 11> fields{&StateFluxes::net,
                                                                                &StateFluxes::sensible,
@@ -6870,6 +7587,8 @@ try {
                     photovoltaicSlope[side] = mix(&StateFluxes::photovoltaicSlope);
                 }
             };
+            // 作用：导入 GPU 端归约出的统计量：最大能量残差、温度等效残差、气孔失配、叶片残差，
+            // 以及残差超限的面元数。
             const auto importGpuStatistics = [&](const facetvk::EnergyStatistics &statistics) {
                 maximumEnergyResidual = statistics.maxima[0];
                 maximumEnergyResidualEquivalent = statistics.maxima[1];
@@ -6877,6 +7596,9 @@ try {
                 maximumLeafEnergyResidual = statistics.maxima[3];
                 failingEnergyFacets = statistics.failingFacets;
             };
+            // 以下为可选的 CPU/GPU “影子”审计（shadowEnergy）：每次 GPU 评估后，用 CPU 实现复算入射、
+            // 通量与温度更新并和 GPU 结果比较；严格模式遇到首个不一致即抛异常，调查模式（shadowSurvey）只
+            // 按“类别/字段”计数。仅用于验证，不改变计算结果（导入的始终是 GPU 状态）。
             std::vector<float> shadowNextTemperature;
             // Surface class of a facet, for the mismatch report.
             const auto shadowClass = [&](uint32_t facet) -> std::string {
@@ -6906,6 +7628,9 @@ try {
             };
             const std::array<const char*, 9> shadowFieldNames{"net", "sensible", "sensibleSlope", "latent",
                 "latentSlope", "storage", "storageSlope", "photovoltaic", "photovoltaicSlope"};
+            // 作用：执行一次影子审计。步骤：1 比较长波入射辐照（容差 1e-4 W m-2）；
+            // 2 CPU 自由求解叶片并只松散比较气孔阻抗；3 强加 GPU 的气孔阻抗后严格比较各项通量；
+            // 4 用 CPU 通量预测下一步温度（供 evaluate 后与 GPU 的温度更新比较）。
             // Optional audit: compare both implementations inside one run so
             // stochastic coplanar raster ties cannot change their forcing.
             const auto verifyGpuEvaluation = [&]() {
@@ -7003,6 +7728,10 @@ try {
                 ++shadowEvaluations;
                 importGpuState(audit); // Auditing never substitutes CPU states.
             };
+            // 步骤 E（GPU 路径）：能量-辐射耦合迭代，最多 maximumCouplingIterations 轮。每轮：
+            // GPU 评估能量（含长波辐射度）→ 导入统计 → 可选审计 → 稳定度修正时检查稳定度变化 →
+            // 收敛则退出 → GPU 更新温度 → 稳定度修正时更新 1/L 并把新的叶片/土壤阻抗回传 GPU（I[4]、I[5]）。
+            // 主机与 GPU 每轮只交换少量归约标量。
             for (uint32_t coupling = 0; coupling < maximumCouplingIterations; ++coupling)
             {
                 importGpuStatistics(model.evaluateEnergy(skyLongwave));
@@ -7048,6 +7777,7 @@ try {
                 }
                 couplingIterations = coupling + 1;
             }
+            // 退出迭代后再评估一次，使最终报告的通量/温度/统计对应同一状态。
             importGpuStatistics(model.evaluateEnergy(skyLongwave));
             verifyGpuEvaluation();
             auto snapshot = model.readEnergyState(true);
@@ -7062,6 +7792,9 @@ try {
         }
         else
         {
+            // 步骤 E（CPU 路径）：同样的耦合迭代。每轮：按当前温度重解长波辐射度 → 入射 →
+            // evaluateEnergyFluxes → 残差诊断 → 收敛则退出 → 逐面侧阻尼牛顿更新温度 →
+            // 更新平均温度与稳定度（1/L）。
             for (uint32_t coupling = 0; coupling < maximumCouplingIterations; ++coupling)
             {
                 const std::vector<facetvk::SurfaceOptics> longwaveOptics =
@@ -7099,6 +7832,9 @@ try {
                                 radiatingFaces(facet) * emissivity * kStefanBoltzmann * std::pow(T[side], 3.0f) +
                                 flux.sensibleSlope[side] + flux.latentSlope[side] + flux.storageSlope[side] + flux.internalSlope[side] +
                                 (object ? flux.photovoltaicSlope[side] : 0.0f);
+                            // 阻尼牛顿更新：ΔT = 残差 / max(1, 斜率)，单步限幅 ±5 K；候选温度限幅在 [220 K, 上限]，
+                            // 上限默认 360 K，集总体表面用其 lumpedMaxSurfaceK。叶片直接采用联立求解的 temperatureStep，
+                            // 其余按 temperatureRelaxation 松弛。物体面元两侧同温；地面朝下一侧复制朝上一侧。
                             const float maximumSurfaceK=lumpedFacet[facet]>=0
                                 ? float(surfaceForFacet(scene,facet).lumpedMaxSurfaceK) : 360.0f;
                             const float candidate =
@@ -7130,6 +7866,8 @@ try {
             measureEnergyResidual(finalLongwaveOptics);
             updateStability(false);
         }
+        // 步骤 F：本节点耦合结束后的诊断与闭合检查。converged 为最终状态的收敛判定；
+        // diagnostic 汇总迭代信息、稳定度、气孔失配和下边界辐射，随后检查土壤/物体热量闭合。
         const bool converged = energyConverged();
         couplingDone = Clock::now();
         allNodesConverged = allNodesConverged && converged;
@@ -7148,6 +7886,10 @@ try {
         for (size_t i = 0; i < columns.size(); ++i)
             if (saveEnergyProcess) diagnostic["columns"].push_back({{"index", i}, {"inverseObukhovLength_m-1", columnInverseL[i]},
                 {"leafResistance_s_m", columnAerodynamics[i].leafResistance}, {"soilResistance_s_m", columnAerodynamics[i].soilResistance}});
+        // 步骤 G：土壤热量闭合检查（仅 soilTemperatureMethod == 2 的朝上地面侧；仅诊断，但有副作用）：
+        // 对受光/阴影两态按受光比例加权，求表面通量 topFlux、底部通量 bottomFlux 与层储热 storage，
+        // 闭合残差 = topFlux - bottomFlux - storage；同时把新土壤剖面写回 soilProfiles、
+        // 把土柱热含量写入 previousSoilHeat，供下一节点使用。
         double maxSoilClosure = 0;
         // Heat-content closure across nodes (W m-2): change of the stored heat
         // of the whole surface, sum over states of p*C*T, from the end of the
@@ -7204,6 +7946,7 @@ try {
                 columnCapacity += area * soil.specificHeat * soil.density * facetphysics::soilEdges.back();
             }
         }
+        // 土壤柱按面积加权的汇总（表面/底部通量、柱热量、平均温度），用于多日漂移与闭合检查。
         if (columnArea > 0) soilColumnSummary = {{"area_m2", columnArea},
             {"meanSurfaceTemperature_K", columnSurface / columnArea},
             {"meanSurfaceFlux_W_m2", columnTop / columnArea}, {"meanBottomFlux_W_m2", columnBottom / columnArea},
@@ -7211,6 +7954,8 @@ try {
             {"meanColumnTemperature_K", columnHeat / columnCapacity},
             {"meanBottomLayerTemperature_K", columnLastLayer / columnArea}};
         diagnostic["maximumSoilClosure_W_m2"] = maxSoilClosure;
+        // 物体面元（墙体除外）的热含量闭合：热含量 = 单位面积热容 × 受光/阴影加权温度，
+        // 残差 = Δ热含量/dTime - 储热通量；同时更新 previousObjectHeat（有副作用）。
         for (uint32_t facet = 0; facet < scene.leafFacetCount; ++facet) {
             if (wallIndex[facet] >= 0) continue; // slab heat: buildingWalls closure below
             const size_t side = static_cast<size_t>(facet) * 2U;
@@ -7225,11 +7970,19 @@ try {
             }
             previousObjectHeat[facet] = heat;
         }
+        // 步骤 H：车辆座舱（及发动机舱）的隐式热平衡，在每个节点的表面温度解出后进行。
+        // 流程：各车辆累计透射太阳功率 → 把壁板响应对室内温度线性化 → 解座舱空气/内饰
+        // （部件模型再含发动机块与舱内空气）→ 用新的室内温度推进壁板剖面。方程与参数见 docs/vehicle-thermal.md。
         // Vehicle cabins: implicit lumped air + interior-mass step. The wall inner
         // heat flux is linear in the cabin air temperature (backward Euler
         // response), q(Ta) = q0 - K (Ta - Ta0), so the walls are coupled to the
         // cabin without iterating the surface solution; the slab profiles are then
         // advanced with the new cabin temperature (exact energy closure per slab).
+        // 模块：一辆车在本节点的座舱计算数据。active 表示有壁板参与；parts 表示使用部件分建模。
+        // qTrans 透过车窗的太阳功率（W）；qSolar 内饰吸收的太阳功率；qOcc 乘员代谢；
+        // qWall0 / kWall 为壁板向室内传热的线性响应 q = q0 - K(T - Tref)（K 单位 W K-1）；
+        // gVent 通风导热（W K-1）；ach 换气次数（h-1）；qAc 空调制冷功率（W）；airCap / interiorCap 热容（J K-1）；
+        // *Old 为上一节点温度。其余为部件模型的节点数据（内饰 4 节点、发动机块与发动机舱）。
         struct CabinNode {
             bool active{false}, parts{false};
             double airOld{}, interiorOld{}, outdoor{}, qTrans{}, qSolar{}, qWall0{}, kWall{}, qOcc{}, gVent{}, ach{}, qAc{}, airCap{}, interiorCap{};
@@ -7250,7 +8003,10 @@ try {
             c.airOld = v.airK;
             c.interiorOld = v.interiorK;
             c.outdoor = airTemperature;
+            // 壁板线性化用的室内参考温度：部件模型取壳体边界温度 boundaryK，否则取座舱空气温度。
             const double indoorRef = v.parts ? v.boundaryK : v.airK;
+            // 步骤 1：累计透过车窗的太阳功率 qTrans（W）= Σ 面元面积 × 透射短波（取室外侧）；
+            // 部件模型再按车窗网格组分别累计，用于逐窗输出。
             for (uint32_t f : v.glassFacets) {
                 const int32_t gw = wallIndex[f];
                 const size_t gside = size_t(f) * 2U + (gw >= 0 ? wallOuter[size_t(gw)] : 0U);
@@ -7258,6 +8014,9 @@ try {
                 c.qTrans += watts;
                 if (v.parts) c.window[surfaceForFacet(scene, f).meshName] += watts;
             }
+            // 步骤 2：壁板线性化。对每块壁板把室内温度加 1 K 重新求一次壁板响应，得到向室内传热 q 对
+            // 室内温度的斜率 K = G·(1 - dT_inner/dT_room)；受光/阴影两态按受光比例加权。
+            // 这样壁板与座舱耦合时不需要迭代表面解。
             // Linear response of the slabs: q(T) = q0 - K (T - T_ref) for the cabin walls (T_ref = indoorRef)
             // and the bonnet slabs (T_ref = bay air).
             const auto linearize = [&](size_t w, double reference, double& q0, double& k) {
@@ -7281,6 +8040,9 @@ try {
                 }
             };
             for (size_t w : v.walls) linearize(w, indoorRef, c.qWall0, c.kWall);
+            // 步骤 3：座舱热容与通风。airCap = ρ·cp·V（J K-1）；ACH 取设定通风与开窗缝换气中较大者；
+            // 行驶时 ACH 不低于 clamp(8 + 1.2·v, 10, 30)；开空调时取内循环，ACH 上限 5；
+            // gVent = airCap·ACH/3600（W K-1）；qSolar = 内饰吸收比例 × 透射太阳；qOcc = 人数 × 人均代谢。
             c.airCap = double(airDensity) * 1005.0 * b.cabinVolume;
             c.interiorCap = b.interiorCapacity;
             c.ach = b.windowCracked ? std::max(b.ventilationAch, b.crackedAch) : b.ventilationAch;
@@ -7289,6 +8051,9 @@ try {
             c.gVent = c.airCap * c.ach / 3600.0;
             c.qSolar = b.absorbedFraction * c.qTrans;
             c.qOcc = double(b.occupants) * b.metabolicW;
+            // 步骤 4a：部件分建模。未知数 x = [T_air, 内饰节点 k = 0..m-1, (T_block, T_bay)]；
+            // 向后欧拉，稠密线性方程组（n <= 7）用部分主元高斯消元求解；phi 为壳体辐射份额，
+            // 把壁板得热的一部分分配给内饰节点而不是空气。求解后写回车辆状态并推进壁板剖面。
             if (v.parts) {
                 // Parts model: unknowns x = [T_air, T_interior k..., (T_block, T_bay)]; backward Euler, dense solve (n <= 7).
                 c.parts = true;
@@ -7315,6 +8080,9 @@ try {
                 c.qRadiator = c.qEngine * b.engineSplit[0] + (v.underArea > 0 ? 0.0 : c.qEngine * b.engineSplit[2]);
                 c.gBay = engine ? double(airDensity) * 1005.0 * (b.bayVent0 + b.bayVentK * double(b.vehicleSpeed)) : 0.0;
                 const double phi = c.phi, storeA = c.airCap / dTime, Tref = indoorRef;
+                // 作用：组装并求解部件模型的线性方程组。行 0 为空气节点，行 1..m 为内饰节点，
+                // iBlock / iBay 为发动机块与发动机舱空气；acGain·(acSet - T_air) 为比例空调项，
+                // acFixed 为定功率制冷（W）。返回 x（单位 K）。
                 const auto solve = [&](double acGain, double acSet, double acFixed) {
                     std::array<std::array<double, 8>, 8> a{};
                     std::array<double, 8> rhs{};
@@ -7362,6 +8130,9 @@ try {
                     }
                     return x;
                 };
+                // 空调逻辑：先按无空调求解；若座舱空气高于设定温度 setpoint，先试比例控制
+                // （增益 acPower/acBand），若结果仍高于 setpoint + acBand 则改为满功率 acPower；
+                // qAc 记录实际制冷功率（W）。
                 auto x = solve(0, 0, 0);
                 if (b.acOn && b.acPower > 0) {
                     const double setpoint = b.acSetpointC + 273.15;
@@ -7372,6 +8143,8 @@ try {
                         else { x = solve(0, 0, b.acPower); c.qAc = b.acPower; }
                     }
                 }
+                // 写回车辆状态：空气、各内饰节点、壳体边界温度 boundaryK = (1-phi)·T_air + phi·内饰辐射加权平均，
+                // 以及发动机块/舱内空气；随后用新的室内边界温度重算各壁板（和引擎盖壁板）的响应。
                 v.airK = x[0];
                 for (int k = 0; k < m; ++k) v.intK[k] = x[1 + k];
                 double radMean = 0;
@@ -7395,6 +8168,8 @@ try {
                 }
                 continue;
             }
+            // 步骤 4b：集总座舱（无部件分建模）。内饰为单个热容节点：先对内饰做向后欧拉并消去，
+            // 得到只含空气温度的单个方程 lhs·T_air = rhs；空调逻辑同上（比例控制 / 满功率）。
             const double conv = b.interiorH * b.interiorArea, storeI = c.interiorCap / dTime, storeA = c.airCap / dTime;
             const double total = storeI + conv, convEff = conv * storeI / total;
             const double rhs = storeA * v.airK + c.qWall0 + c.kWall * v.airK + c.qOcc + c.gVent * airTemperature +
@@ -7420,6 +8195,8 @@ try {
                         internalHeat.empty() ? 0.0 : double(internalHeat[wallFacets[w]]));
             }
         }
+        // 步骤 I：把建筑/车辆壁板（wallFacets）推进到已求解的表面温度。副作用：更新 wallProfiles、
+        // previousWallHeat、wallInnerK/OuterK/IndoorQ，并写入 diagnostic["buildingWalls"]（面积加权汇总与热量闭合）。
         if (!wallFacets.empty()) {
             // Advance the slabs to the solved surface temperatures. Closure per
             // facet: change of the area-weighted slab heat since the end of the
@@ -7460,6 +8237,9 @@ try {
                 {"heatClosureMean_W_m2", closureAvailable ? closureSum / area : 0.0},
                 {"heatClosureMaxAbs_W_m2", closureAvailable ? closureMax : 0.0}};
         }
+        // 步骤 J：输出车辆座舱诊断。每辆车一行 JSON（温度、能量平衡分项、相对闭合残差），
+        // 写入 diagnostics/vehicle_cabin_node=<n>.json 并打印 VEHICLE_PARTS / VEHICLE_CABIN 日志行；
+        // 同时更新各车的运行峰值（座舱最高温、内饰、发动机、最大相对闭合）供运行汇总使用。
         if (!vehicles.empty()) {
             // Cabin balance per vehicle (temperatures, no comfort indices):
             //   dE/dt = Q_wall + Q_occ + Q_solar - G_vent (Ta - Tout) - Q_ac.
@@ -7471,6 +8251,8 @@ try {
             for (size_t vi = 0; vi < vehicles.size(); ++vi) {
                 auto& v = vehicles[vi];
                 const CabinNode& c = cabinNodes[vi];
+                // mean(facets, which)：which = 0 为面元表面温度（受光/阴影加权）；1 / 2 对墙体面元分别取
+                // 室外 / 室内表面温度；结果按面积加权，无面元时返回 NaN。
                 // Area-weighted surface temperatures of the body / glass / underbody.
                 const auto mean = [&](const std::vector<uint32_t>& facets, int which) {
                     double sum = 0, a = 0;
@@ -7488,6 +8270,9 @@ try {
                     {"speed_m_s", v.body ? v.body->vehicleSpeed : 0.0f},
                     {"bodyOuterSurface_K", mean(v.bodyFacets, 0)}, {"glassOuterSurface_K", mean(v.glassFacets, 0)},
                     {"underbodySurface_K", mean(v.underFacets, 0)}};
+                // 部件模型的输出与闭合：每个内饰节点残差 = 储热 - (太阳吸收 - 对流到空气 + 壳体辐射得热)；
+                // 空气残差同理；总残差除以各分项最大绝对值得相对闭合（取历史最大值 maxClosure）。
+                // 发动机块 + 舱内空气另算一套闭合 engineResidual。
                 if (c.active && c.parts) {
                     // Parts model: air + interior nodes (+ engine block and bay), every node closes separately.
                     const auto& b = *v.body;
@@ -7574,6 +8359,7 @@ try {
                     std::cout << "\tqTrans=" << c.qTrans << std::endl;
                 } else if (c.active) {
                     const double airStore = c.airCap * (v.airK - c.airOld) / dTime;
+                    // 集总座舱的闭合：残差 = 空气与内饰储热 - (壁板 + 乘员 + 太阳 - 通风 - 空调)。
                     const double interiorStore = c.interiorCap * (v.interiorK - c.interiorOld) / dTime;
                     const double ventilation = c.gVent * (v.airK - airTemperature);
                     const double inputs = wallQ[vi] + c.qOcc + c.qSolar;
@@ -7606,6 +8392,8 @@ try {
             }
             diagnostic["vehicleCabin"] = rows;
             std::ofstream(outputDirectory / "diagnostics" / ("vehicle_cabin_node=" + std::to_string(node) + ".json")) << rows.dump(2);
+            // 运行汇总：每辆车的最高座舱空气温度及其节点/时间、最高内饰温度、最大相对闭合；
+            // 部件模型再含各内饰节点、各车窗透射、发动机块与舱内空气的峰值。
             ProjectJson::Json summary = ProjectJson::Json::array();
             for (const auto& v : vehicles) {
                 summary.push_back({{"name", v.name}, {"maxCabinAirTemperature_C", v.maxAirK - 273.15}, {"maxCabinNode", v.maxAirNode},
@@ -7630,6 +8418,8 @@ try {
             runIndex.value["vehicleCabinSummary"] = summary;
             runIndex.write();
         }
+        // 步骤 K：船体向水体的热反馈（滞后一个节点）：本节点湿润船体面元传给水体的热量，
+        // 按水面面积摊成下一节点的水面热源 waterFeedbackSource（W m-2）。
         if (anyWaterFeedback && nodeWaterK >= 0) {
             // Heat the wetted hull gives the water this node (W): area-weighted
             // water-side flux of the solved surface temperatures, spread over the
@@ -7648,6 +8438,9 @@ try {
             diagnostic["shipWater"] = {{"heatToWater_W", heatToWater}, {"waterSource_W_m2", heatToWater / sceneWaterArea}};
         }
         {
+            // 热历史与热量闭合诊断：thermalHistoryMode、受光/阴影状态转移的状态温差、legacy* 为旧算法
+            // （状态切换时热量不守恒）下的热量跳变（J，仅作对照）；object/soil 闭合给出面积、均值、
+            // 平均绝对值、最大绝对值（W m-2），均来自上面的步骤 G。
             const auto perArea = [](double value, double area) { return area > 0 ? value / area : 0.0; };
             diagnostic["thermalHistory"] = {
                 {"mode", thermalHistoryMode}, {"changedSides", historyChangedSides},
@@ -7663,7 +8456,11 @@ try {
                 {"soilHeatClosureMeanAbs_W_m2", perArea(soilClosureAbs, soilClosureArea)},
                 {"soilHeatClosureMaxAbs_W_m2", soilClosureMax}};
         }
+        // 保存本节点的受光比例，下一节点据此做受光/阴影状态之间的温度与热量转移。
         previousSunlitPart = sunlitPart;
+        // 集总热体（lumpedBodies）诊断：核心温度、输入功率、传到表皮的功率、空气损失、储热和核心残差；
+        // 并比较“核心导出的热量 conductedW”与“各表皮面元收到的热量 exchanged”，得最大失配。
+        // 最后把 diagnostic 写入 diagnostics/facet_physics_node=<n>.json。
         diagnostic["timeStepSeconds"]=dTime;
         diagnostic["elapsedSeconds"]=lumpedElapsedSeconds;
         diagnostic["lumpedThermal"]=ProjectJson::Json::array();
@@ -7688,6 +8485,9 @@ try {
         std::ofstream(outputDirectory / "diagnostics" / ("facet_physics_node=" + std::to_string(node) + ".json")) << diagnostic.dump(2);
 
 
+        // 步骤 L：光伏输出。逐光伏面元写 photovoltaic_node_<n>.csv（面积 m2、温度 °C、入射/吸收/发电/
+        // 残差/潜热/有效入射/净长波/显热/储热，W m-2），并累计面积加权汇总写入 photovoltaic_summary.csv；
+        // pvEnergyKwh 累计发电量 = Σ 功率(W) × dTime / 3.6e6（kWh）。残差 = 净辐射 - 显热 - 潜热 - 储热 - 发电。
         std::ofstream pvCsv(outputDirectory/("photovoltaic_node_"+std::to_string(node)+".csv"));
         pvCsv << "area_m2,temperature_C,incident_W_m2,absorbed_W_m2,electric_W_m2,residual_W_m2,latent_W_m2,effective_W_m2,net_longwave_W_m2,sensible_W_m2,storage_W_m2,facet_index\n";
         double pa=0,pt=0,pg=0,pabs=0,pp=0,plw=0,ph=0,ps=0,pres=0;
@@ -7701,9 +8501,13 @@ try {
             pa+=a;pt+=a*(temperature[k]-273.15f);pg+=a*inc;pabs+=a*ab;pp+=a*power;plw+=a*lw;ph+=a*sensibleHeat[k];ps+=a*storageHeat[k];pres=std::max(pres,double(std::abs(res)));
         }
         if(pa>0){pvEnergyKwh+=pp*dTime/3600000.;pvSummary << node << ',' << token << ',' << pa << ',' << pt/pa << ',' << pg << ',' << pabs << ',' << pp << ',' << plw << ',' << ph << ',' << ps << ',' << pres << ',' << pvEnergyKwh << '\n';}
+        // 合并短波与长波辐射度（逐侧相加）为总辐射度，供输出产品与最终节点结果使用。
         const facetvk::SolveResult radiativeSolution =
             combineRadiativeSolutions(
                 shortwaveSolution, finalLongwaveSolution);
+        // 步骤 M：成像波段（传感器产品）。对 radiativeParameters.wavelengths 的每个波段独立求解，
+        // 不使用能量平衡的宽带结果：光学波段用分谱短波辐照，热红外波段用 Planck 天空辐射 +
+        // 2.5–6 um 的反射太阳；每个面侧输出（受光点、阴影点）两个状态值（见 appendSurfaceStates）。
         // Image bands must remain spectral even though the energy balance uses
         // broadband shortwave/longwave fluxes. Optical bands are normalized to
         // apparent reflectance; thermal bands retain spectral radiance. As in
@@ -7718,6 +8522,8 @@ try {
         for (size_t band = 0; band < bandCount; ++band) {
             const float wavelength = radiativeParameters.wavelengths[band];
             const bool optical = isOpticalWavelength(wavelength);
+            // 步骤 M1：本波段的照度。光学波段：直射/漫射 = Rin × 光谱表在该波长的值 × 0.001
+            // （单位换算因子 0.001 的含义待核对）；漫射再加上换算中丢弃的直射份额 lostDirectFraction。
             const float directSpectralIrradiance = optical
                 ? totalShortwave * shortwaveSpectrum.directAt(wavelength) * 0.001f
                 : 0.0f;
@@ -7743,6 +8549,8 @@ try {
             const float directNormalSpectralIrradiance = optical
                 ? directSpectralIrradiance * directNormalFactor
                 : mwirDirect * directNormalFactor / kPi;
+            // 步骤 M2：按两态温度与受光比例生成该波段的光学量与发射（stateEmission 为每侧受光/阴影两态
+            // 的发射），spectralImage 保存图像产品所需的反射量；随后求解辐射度。
             std::vector<std::array<float, 2>> stateEmission;
             std::vector<ImageReflection> spectralImage;
             const std::vector<facetvk::SurfaceOptics> spectralOptics =
@@ -7750,6 +8558,8 @@ try {
                     scene, sunlit, radiativeParameters, band,
                     stateTemperature, sunlitPart,
                     directNormalSpectralIrradiance, stateEmission, &spectralImage);
+            // 天空项：光学波段为漫射辐照（W m-2）；热红外波段为 Planck(skyTemperature) + 2.5–6 um 反射太阳的
+            // 天空份额（W m-2 sr-1 um-1）。
             const float skySpectralRadiance = optical
                 ? diffuseSpectralIrradiance
                 // DEFERRED[低] 物理: 热红外图像的天空辐射用固定 skyTemperature 的普朗克辐射，而能量平衡用的是气象驱动 meteo.longwave（Rli）；两者不一致会使热红外图像与求得的温度场不自洽；建议：由 Rli 反推等效天空亮温 (Rli/σ)^(1/4) 用于光谱天空辐射。
@@ -7781,6 +8591,9 @@ try {
             }
         }
 
+        // 步骤 N：写节点二进制 .facet_steps/energy_T=<token>.bin。按面侧交错，每侧 11 个 float：
+        // 平均温度、总/短波/长波辐射度、净辐射、显热、潜热、储热、受光比例、受光点温度、阴影点温度，
+        // 其后依次接各成像波段的（受光点, 阴影点）两个值。
         const std::filesystem::path binaryPath =
             stepDirectory / ("energy_T=" + token + ".bin");
         std::ofstream binary(binaryPath, std::ios::binary | std::ios::trunc);
@@ -7810,6 +8623,10 @@ try {
             }
         }
 
+        // 作用：写过程产品 process/<model>_T=<token>.bin 与 .json 并登记到 runIndex。type：
+        // radiation（短波/长波辐射度、净辐射）、energy（潜热、显热、表面热通量、温度、净辐射、受光点/阴影点温度，
+        // 每侧 7 个 float）、photovoltaic（发电功率、温度、吸收短波）；前两者之外只写每侧 3 个 float。
+        // JSON 记录字段表与本节点的收敛信息（迭代数、温差、能量残差，W m-2）。
         const auto writeProcessMetadata = [&](const std::string& type) {
             // Radiation in FacetEB is a time sequence of FacetRT fields;
             // energy fluxes retain the FacetEB model name.
@@ -7896,6 +8713,8 @@ try {
                             "{\"id\":\"shadedTemperature\",\"label\":\"阴影部分温度 [K]\",\"offset\":6}]\n}\n";
             }
         };
+        // 过程输出开关：radiation（saveRadiationProcess，另附 PAR 光子通量产品 facetpar：每侧入射/吸收
+        // 各 1 个 float，umol m-2 s-1）、energy（saveEnergyProcess）、photovoltaic（存在光伏面元时）。
         if (saveRadiationProcess) {
             writeProcessMetadata("radiation");
             // Keep the existing radiation record layout stable. PAR is a
@@ -7943,6 +8762,7 @@ try {
         }
         runIndex.value["products"].push_back(".facet_steps/energy_T=" + token + ".bin");
         runIndex.value["products"].push_back("photovoltaic_node_" + std::to_string(node) + ".csv");
+        // 把 CPU/GPU 影子审计汇总写入 run index（energyVerification：PASS/MISMATCH 与各类最大差）。
         if (shadowEnergy) {
             ProjectJson::Json mismatches = ProjectJson::Json::array();
             for (const auto& [label, entry] : shadowMismatches)
@@ -7959,6 +8779,8 @@ try {
                 {"maxLeafResistanceDifference_ln", shadowResistanceMaximum},
                 {"auditedFacetsByClass", shadowClassFacets}, {"mismatches", mismatches}};
         }
+        // 登记本节点完成记录（收敛、迭代数、残差等）并写 run index；中断的运行可能留有旧节点文件，
+        // 是否完成以此处记录为准。
         runIndex.value["completed"].push_back({
             {"node", node}, {"token", token}, {"julianTime", meteo.julianTime},
             {"solarZenith", scene.sunZenith}, {"solarAzimuth", scene.sunAzimuth},
@@ -7974,6 +8796,8 @@ try {
         if (!soilColumnSummary.is_null()) runIndex.value["completed"].back()["soilColumn"] = soilColumnSummary;
         runIndex.write();
 
+        // 步骤 O：最后一个节点的结果保留为 latest（用于总结果 faceteb.json 的图层）；
+        // 用 std::move 取走通量数组，此后本节点不再使用它们。
         if (node == endNode - 1) {
             latest.sunlit = sunlit;
             latest.solution = radiativeSolution;
@@ -7991,6 +8815,8 @@ try {
             latestTime = token;
         }
 
+        // 进度从 10% 线性推进到 96%，并打印 PROGRESS / FACET_CONVERGENCE / FACET_TIMING 日志行
+        // （三段耗时：短波窗口、RT-EB 耦合、波段图像与产品，单位 s），由服务端解析。
         const int progress = 10 + static_cast<int>(
             86.0 * (node - startNode + 1) / (endNode - startNode));
         std::cout << "PROGRESS\t" << progress
@@ -8015,6 +8841,8 @@ try {
                       << seconds(couplingDone, nodeEnd) << std::endl;
         }
         }
+        // 步骤 P：逐节点输出同步。打印 FACET_STEP 后阻塞等待父进程回复 FACET_ACK，
+        // 以免下一节点的 GPU 求解与当前节点的 CPU 图像缓冲重叠（背压）。
         if (synchronizeStepOutput) {
             // Backpressure: never overlap the next GPU solve with the current
             // node's CPU image buffers. EOF/error aborts instead of hanging.
@@ -8029,6 +8857,9 @@ try {
         }
     }
 
+    // 步骤 Q：全部节点结束后写总结果 resultFile（JSON，手写流式输出）。内容：顶点坐标、
+    // 可见性图诊断与下边界、迭代/收敛信息（最后一个节点），以及最后一个节点的逐面侧场。
+    // allNodesConverged 为所有节点收敛的与；能量残差单位 W m-2。
     latest.totalMs = milliseconds(totalBegin, Clock::now());
     latest.solveMs = latest.totalMs;
 
@@ -8067,6 +8898,7 @@ try {
            << "  \"temperatureTolerance\": " << temperatureTolerance << ",\n"
            << "  \"iterationBudget\": " << maximumCouplingIterations << ",\n";
 
+    // 作用：把逐面侧 float 数组写成一个 JSON 数组字段；comma 指示末尾是否加逗号。
     const auto writeArray = [&output](
         const char* name, const std::vector<float>& values, bool comma) {
         output << "  \"" << name << "\": [";
@@ -8077,10 +8909,13 @@ try {
         }
         output << ']' << (comma ? "," : "") << '\n';
     };
+    // 以下逐面侧数组长度均为 surfaceCount（= 2 × 面元数）：温度为 K，通量为 W m-2，
+    // 其中 temperature* 为最终状态，其余通量取最后一个节点。
     // Actual engine band list and per-side record width of the node files
     // (11 scalars + lit/shaded per band), so readers need not rebuild them.
     writeArray("wavelengths", radiativeParameters.wavelengths, true);
     output << "  \"stepRecordFloats\": " << (11U + 2U * radiativeParameters.wavelengths.size()) << ",\n";
+    // （wavelengths 为波段列表，不是逐面侧数组；从 sunlit 起才是逐面侧数组。）
     writeArray("sunlit", latest.sunlit, true);
     writeArray("radiosity", latest.solution.radiosity, true);
     writeArray("lightEnhancement", latest.lightEnhancement, true);
@@ -8094,6 +8929,8 @@ try {
     writeArray("photovoltaicPower", latestPhotovoltaicPower, false);
     output << "}\n";
 
+    // 收尾：关闭结果文件，登记产品，状态记为 completed / non_converged，写完成时间；
+    // 开启影子审计时把审计汇总打印到标准错误。
     output.close();
     if (!output) throw std::runtime_error("FacetEB cannot finish result output");
     runIndex.value["products"].push_back(std::filesystem::path(resultFile).filename().generic_string());
@@ -8114,6 +8951,8 @@ try {
     }
     std::cout << "PROGRESS\t100\t" << (allNodesConverged ? "面元辐射传输与能量平衡耦合收敛" : "面元计算结束：存在未收敛节点，结果已保留") << std::endl;
     std::cout << "RESULT\t" << resultFile << std::endl;
+    // 退出码：3 = CPU/GPU 影子审计有不一致；0 = 全部节点收敛；2 = 存在未收敛节点（结果已保留）；
+    // 异常时由下面的 catch 返回 1。
     return !shadowMismatches.empty() ? 3 : allNodesConverged ? 0 : 2;
 } catch (const std::exception& error) {
     std::cerr << "faceteb: " << error.what() << '\n';

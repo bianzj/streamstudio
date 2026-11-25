@@ -1,3 +1,22 @@
+// ==========================================================================
+// 文件：voxelrtio.h
+// 功能：VoxelRT（体元辐射）模式的运行时数据容器 VoxelrtIO，集中保存场景尺寸、气象、几何、
+//   运行设置、Vulkan 句柄、描述符与管线对象，在 Voxelrt 及其子模块之间共享。
+// 主要模块：
+//   1. Allocator 类型选择（DMA / VMA / 专用分配，由编译宏 ALLOC_DMA、ALLOC_VMA 决定）
+//   2. class VoxelrtIO：
+//      - 场景与体元网格尺寸（sceneSize_XYZ、voxelSize_XZY、stepsize_*）
+//      - 气象 Meteo、传感器 SensorMatrix、光源 LightSet、观测角 angles、波长 waves
+//      - 运行设置（波段/视角/航点数、采样数、碰撞阶数、周期边界、天空盒等开关）
+//      - 各子 IO（mesh / instance / virtual / voxel / surf / defined）与 GPU 缓冲
+//      - Vulkan 设备、队列、同步对象、描述符集与计算管线
+// 数据流：voxelrt.cpp 的 uploadSetting 等函数填充本对象 → buffer/descriptor/pipeline 创建
+//   GPU 对象 → command.cpp 使用它们派发计算着色器。
+// 约定：voxelSize_XZY 的分量顺序为（x、竖直、y），其 .y 为竖直层数（见 voxelrt.cpp updateSetting，待核对）；
+//   m_pipelineLayout_* / m_pipelines_rt/et/eb / m_pipeline_aero/bio 以及 SBT 相关成员沿用
+//   其他模式，VoxelRT 只使用 m_pipelines 与 m_pipelineLayout。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/26.
 //
@@ -42,6 +61,7 @@ typedef nvvk::ResourceAllocatorDedicated Allocator;
 
 
 
+// 模块：VoxelRT 运行时状态（纯数据 + 构造时创建各子 IO 对象），无业务逻辑。
 class VoxelrtIO {
 public:
 VoxelrtIO(){
@@ -56,6 +76,8 @@ VoxelrtIO(){
 };
 
 
+    // 以下分组：工程路径、场景尺寸、气象、几何、设置、子 IO、Vulkan 初始化、
+    // 描述符/管线、SBT。
     // system info
     std::string projectDir;
     std::string definedDir;
@@ -65,6 +87,8 @@ VoxelrtIO(){
     glm::ivec3 voxelSize_XZY;  // sceneSize_XYZ / stepsize; (5,5,0) with height = 0
     glm::vec3 sceneOrigin_XYZ;
     glm::vec3 voxelOrigin_XZY;
+    // 体元边长（m）：stepsize_surface 为水平/体元边长，stepsize_height 为竖直步长，
+    // stepsize_atmosphere 为大气层步长（用途待核对）；体元化要求前两者相等（见 scene.cpp）。
     float stepsize_surface;
     float stepsize_height;
     float stepsize_atmosphere;
@@ -96,6 +120,8 @@ VoxelrtIO(){
     std::vector<float> waves;
 
 
+    // 运行设置：n_wave 波段数，n_angle 观测角数，n_pos UAV 航点数；
+    // k_angle / k_pos / k_node 为当前循环序号（k_node = -1 表示无时间节点）。
     // setting infor
     int n_pipeline = 3;
     int n_wave;
@@ -114,6 +140,9 @@ VoxelrtIO(){
     bool isImage;
     bool isRadiationProcess;
     bool isAlbedo;
+    // 开关：heterogeneousVoxel 非均质体元；acceleratedRadiationSolver 加速求解器（多波段批处理）；
+    // collisionOrders 体元间碰撞（散射）阶数；periodicNeighborCount 周期边界邻域数（0 = 关闭）；
+    // skyboxEnabled 天空盒光照。
     bool heterogeneousVoxel{false};
     bool acceleratedRadiationSolver{false};
     int collisionOrders{2};
@@ -128,6 +157,7 @@ VoxelrtIO(){
     std::shared_ptr<SurfIO> m_surfio;
     std::shared_ptr<DefinedIO> m_defined;
 
+    // GPU 推送常量，由 Voxelrt::updateSetting 填写，command.cpp 每次派发前推送。
     VoxelRTSetting setting;
 
     std::shared_ptr<nvvk::Buffer> m_pBufferWave;
@@ -138,6 +168,7 @@ VoxelrtIO(){
 
     //std::shared_ptr<
 
+    // Vulkan 对象：设备、队列、栅栏/信号量。
     // initialization
     VkDevice                       m_device;
     VkPhysicalDevice               m_physicalDevice;
@@ -162,6 +193,7 @@ VoxelrtIO(){
     VkDescriptorSet m_descSet{ VK_NULL_HANDLE };
     VkDescriptorSetLayout m_descSetLayout{ VK_NULL_HANDLE };
 
+    // 以下 *_rt/_et/_eb/_aero/_bio 管线句柄沿用其他模式，VoxelRT 并不使用（待核对）。
     VkPipelineLayout m_pipelineLayout_rt{ VK_NULL_HANDLE };
     VkPipelineLayout m_pipelineLayout_et{ VK_NULL_HANDLE };
     VkPipelineLayout m_pipelineLayout_eb{ VK_NULL_HANDLE };
@@ -171,6 +203,7 @@ VoxelrtIO(){
     std::vector<VkPipeline> m_pipelines_et;
     std::vector<VkPipeline> m_pipelines_eb;
 
+    // VoxelRT 实际使用的管线与布局：按阶段（gap / diffuse / out）索引，由 Pipeline::createPipeline 创建。
     std::map<VoxelRTStage, VkPipeline> m_pipelines;
     VkPipelineLayout m_pipelineLayout { VK_NULL_HANDLE };
 
@@ -178,6 +211,7 @@ VoxelrtIO(){
     VkPipeline m_pipeline_bio;
 
 
+    // 光追着色器绑定表（SBT）相关成员，同样沿用自光追模式；VoxelRT 计算管线不依赖。
     bool useSBTWrapper{ true };
     bool useDeferred{ false };
     nvvk::SBTWrapper m_sbtWrapper;

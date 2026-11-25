@@ -1,3 +1,25 @@
+// ==========================================================================
+// 文件：raytracing.cpp
+// 功能：RayTracing 模式（Vulkan 光线追踪的离线反射率/亮温观测）的总控类 Raytracing 的实现：
+//       初始化 Vulkan 资源、读取场景与观测设置、逐观测角（或 UAV 航点）运行光追并输出结果。
+// 主要模块：
+//   1. buildPhysicalTextureFactors  物理纹理：逐三角形的短波反射率缩放因子（与 FacetRT 一致）
+//   2. raytracingBandNames / sceneTopHeight  输出波段名；场景最高点（周期边界遍历用）
+//   3. setup / upload / create      设备与分配器初始化；读取场景；创建缓冲/描述符/管线/命令
+//   4. uploadSetting / updateSetting  XML 设置 → RaytracingIO → 推送常量 RayRTSetting
+//   5. run                          逐观测角（或 UAV 航点）发射光追，输出 TIFF / albedo.txt
+//   6. outputOrth / output / outputAlbedo  读回 GPU 结果、大气校正并写出
+//   7. destroy                      按相反顺序释放 Vulkan 资源
+// 数据流：FileIO（RaytracingXml）→ upload 填充 RaytracingIO 的网格/实例/光学参数 →
+//         create 建 GPU 资源 → run 逐角度 Command::run 追踪 → m_virtualio 存储缓冲读回 CPU →
+//         大气校正（base/atmosphere_lut.h）→ FileIO::writeTIFData 写 TIFF。
+// 关系：raytracing.h 声明；pipeline.cpp 创建管线；其余子模块（buffer/descriptor/command）
+//       在同目录；几何/传感器更新在 base/geometry.cpp。
+// 约定：波长 > 50 视为 nm，否则视为 μm；≤ 2.5 μm 为短波（输出反射因子 [-]），
+//       更长波长输出亮温 [K] 或光谱辐亮度 [W m-2 sr-1 um-1]；角度单位为度。
+//       标准输出里的 PROGRESS / OBSERVATION 行供前端（src/renderer/src/main.js）解析进度。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/24.
 //
@@ -11,8 +33,16 @@
 #include "src/base/atmosphere_lut.h"
 #include "src/base/reflectance_texture.h"
 
+// 匿名命名空间：只在本文件内使用的辅助函数。
 namespace {
 
+// 模块：物理纹理因子 buildPhysicalTextureFactors（与 FacetRT 的做法一致）。
+// 输入：fileio 里的光谱材质（纹理路径/强度/相对标准差/重复尺寸）、io 里的网格与实例；
+// 输出：io.instanceTextureOffsets（每个实例在因子数组中的起点，无纹理为 kNoTextureOffset）
+//       与 io.textureFactors（按 实例×三角形 排列的无量纲因子，用于缩放短波反射率）。
+// 步骤：1 加载各材质的纹理；2 逐实例逐三角形在世界坐标质心处三平面采样；
+//       3 按纹理所属材质扣除面积加权均值；4 由短波波段上限求缩放系数；5 因子 = 1 + 系数×偏差。
+// 说明：因子数组第 0 个元素固定为 1，保证没有纹理时着色器也能安全访问。
 // Mirrors FacetRT: one triplanar sample at each world-space triangle centroid,
 // per-spectrum area-weighted mean removed, then factor = 1 + scale * deviation
 // with scale capped by the strength, by factor > 0 and by R * factor <= 1 - T
@@ -27,6 +57,8 @@ void buildPhysicalTextureFactors(const std::shared_ptr<FileIO>& fileio, Raytraci
     io.instanceTextureOffsets.assign(std::max<size_t>(1, instances.size()), kNoTextureOffset);
     io.textureFactors.assign(1, 1.0f);
 
+    // 步骤 1：逐材质加载纹理。textureSourceName 非空时，该材质借用另一材质的纹理与统计
+    //         （textureOwners 记录统计归属）；未启用或强度/相对标准差都为 0 的材质不加载。
     std::vector<std::shared_ptr<const ReflectanceVarianceTexture>> textures(spectra.size());
     std::vector<size_t> textureOwners(spectra.size());
     bool anyTexture = false;
@@ -44,6 +76,7 @@ void buildPhysicalTextureFactors(const std::shared_ptr<FileIO>& fileio, Raytraci
     }
     if (!anyTexture) return;
 
+    // 步骤 2：按纹理所属材质累计面积与面积加权采样值，供后面扣均值和换算缩放系数。
     struct Statistics {
         double area{};
         double areaWeightedSample{};
@@ -66,6 +99,7 @@ void buildPhysicalTextureFactors(const std::shared_ptr<FileIO>& fileio, Raytraci
         const size_t textureOwner = textureOwners[spectralId];
         const ObjMesh& mesh = objMeshes[meshId];
         const glm::mat4& toWorld = instances[instance].object2worldMatrix;
+        // 偏移以 uint32 存放，0xFFFFFFFF 保留作“无纹理”标记，因此三角形总数必须小于该值。
         if (samples.size() + mesh.indices.size() / 3 >= kNoTextureOffset)
             throw std::runtime_error("Physical texture factors exceed 2^32 instance triangles");
         io.instanceTextureOffsets[instance] = static_cast<uint32_t>(samples.size());
@@ -77,6 +111,7 @@ void buildPhysicalTextureFactors(const std::shared_ptr<FileIO>& fileio, Raytraci
             const glm::vec3 normal = glm::cross(b - a, c - a);
             const float doubleArea = glm::length(normal);
             const glm::vec3 center = (a + b + c) / 3.0f;
+            // 三平面权重取法线各分量的绝对值；退化（零面积）三角形退化为只用 Y 平面（地面）。
             const glm::vec3 weights = doubleArea > 0.0f ? glm::abs(normal / doubleArea) : glm::vec3(0.0f, 1.0f, 0.0f);
             const float sample = sampleReflectanceVarianceTriplanar(
                 *textures[spectralId], {center.x, center.y, center.z}, {weights.x, weights.y, weights.z},
@@ -91,6 +126,8 @@ void buildPhysicalTextureFactors(const std::shared_ptr<FileIO>& fileio, Raytraci
     }
     if (samples.empty()) return;
 
+    // 步骤 3：按材质扣除面积加权均值，使纹理只改变空间分布而不改变材质平均反射率；
+    //         同时累计偏差的面积加权平方和与极值（用于后面限制因子范围）。
     for (size_t k = 0; k < samples.size(); ++k) {
         Statistics& stats = statistics[owners[k]];
         const float mean = stats.area > 0.0 ? static_cast<float>(stats.areaWeightedSample / stats.area) : 0.0f;
@@ -100,12 +137,15 @@ void buildPhysicalTextureFactors(const std::shared_ptr<FileIO>& fileio, Raytraci
         stats.deviation.minimumDeviation = std::min(stats.deviation.minimumDeviation, samples[k]);
         stats.deviation.maximumDeviation = std::max(stats.deviation.maximumDeviation, samples[k]);
     }
+    // 步骤 4：对每个材质，在所有短波（≤ 2.5 μm）波段上求允许的最大因子：
+    //         因子 × R + T ≤ 1，即因子 ≤ (1 - T)/R；热红外波段不被纹理调制。
     const size_t bandCount = waves.size();
     for (size_t s = 0; s < statistics.size(); ++s) {
         Statistics& stats = statistics[s];
         if (!(stats.area > 0.0)) continue;
         float maximumFactor = std::numeric_limits<float>::infinity();
         for (size_t band = 0; band < bandCount; ++band) {
+            // 波长单位判别：> 50 视为 nm（换算成 μm），否则已经是 μm。
             const float micrometres = waves[band] > 50.0f ? waves[band] / 1000.0f : waves[band];
             if (micrometres > 2.5f) continue;
             const Spectral& value = io.m_meshio->spectrals[s * bandCount + band];
@@ -116,6 +156,7 @@ void buildPhysicalTextureFactors(const std::shared_ptr<FileIO>& fileio, Raytraci
         }
         stats.scale = physicalTextureScale(spectra[s].physicalTextureStrength, spectra[s].physicalTextureRelativeStd, stats.deviation, maximumFactor);
     }
+    // 步骤 5：生成最终因子 = 1 + scale × 偏差，并统计均值、变异系数 cv 与范围用于日志。
     io.textureFactors.resize(samples.size());
     for (size_t k = 0; k < samples.size(); ++k) {
         Statistics& stats = statistics[owners[k]];
@@ -137,6 +178,8 @@ void buildPhysicalTextureFactors(const std::shared_ptr<FileIO>& fileio, Raytraci
     }
 }
 
+// 作用：生成输出 TIFF 的各波段名称（波长单位判别同上：> 50 为 nm）。
+// 说明：≤ 2.5 μm 标为反射因子 [-]；更长波段按 temperatureOutput 标为亮温 [K] 或辐亮度。
 std::vector<std::string> raytracingBandNames(const std::vector<float>& waves,
                                              bool temperatureOutput)
 {
@@ -156,6 +199,10 @@ std::vector<std::string> raytracingBandNames(const std::vector<float>& waves,
     return names;
 }
 
+// 作用：sceneTopHeight——求所有实例化几何的世界坐标最高点（y 向上，单位 m）。
+// 做法：对每个网格求局部包围盒，再把 8 个角点变换到世界系取最大 y（保守上界）。
+// 说明：没有几何时返回 1.0e30（相当于不限制）；有几何时加 max(0.01, 1e-4·|top|) 的余量。
+//       结果写入推送常量 sceneTop（见 updateSetting）。
 // Highest world y of all instanced geometry. Periodic traversal (offline.rgen)
 // starts descending rays at this height and stops rays above it that do not
 // descend, so wraps are never spent in empty space above the scene.
@@ -194,9 +241,15 @@ float sceneTopHeight(const RaytracingIO& io)
 }
 
 
+// 模块：setup——初始化设备相关对象。
+// 输入：appsetting（Vulkan 上下文与队列）；输出：raytracingio 里的设备/队列/命令池/分配器/
+//       光追属性（m_rtProperties）/SBT 包装器/加速结构构建器均就绪；返回 true。
+// 步骤：1 复制设备句柄与图形队列；2 初始化命令池；3 创建资源分配器；
+//       4 查询光追管线属性；5 初始化 SBTWrapper 与加速结构构建器。
 bool Raytracing::setup( AppSetting &appsetting, std::shared_ptr<RaytracingIO> &raytracingio){
 
 
+    // 步骤 1：取设备句柄和 eGCT（图形/计算/传输）队列及其族索引。
     raytracingio->m_device = appsetting.m_context.m_device;
     raytracingio->m_physicalDevice = appsetting.m_context.m_physicalDevice;
     raytracingio->m_instance = appsetting.m_context.m_instance;
@@ -213,16 +266,19 @@ bool Raytracing::setup( AppSetting &appsetting, std::shared_ptr<RaytracingIO> &r
 //    poolCreateInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 //    vkCreateCommandPool(raytracingio->m_device, &poolCreateInfo, nullptr, &raytracingio->m_cmdPool);
 
+    // 步骤 2：初始化一次性命令缓冲所用的命令池。
     raytracingio->m_genCmdBuf.init(raytracingio->m_device,raytracingio->m_queueIndex);
 
 
 //    VkPipelineCacheCreateInfo pipelineCacheInfo{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
 //    vkCreatePipelineCache(raytracingio->m_device, &pipelineCacheInfo, nullptr, &raytracingio->m_pipelineCache);
 
+    // 步骤 3：创建显存资源分配器并绑定调试名工具。
     raytracingio->m_pAlloc  = std::make_shared<Allocator>();
     raytracingio->m_pAlloc->init(raytracingio->m_instance, raytracingio->m_device, raytracingio->m_physicalDevice);
     raytracingio->m_debug.setup(raytracingio->m_device);
 
+    // 步骤 4：查询设备的光追管线属性（SBT 句柄大小/对齐等），后面 SBT 构建要用。
     /// requesting ray tracing properties. from physical device.
     VkPhysicalDeviceProperties2 rayTracingProperties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
     rayTracingProperties.pNext = &(raytracingio->m_rtProperties);
@@ -233,6 +289,7 @@ bool Raytracing::setup( AppSetting &appsetting, std::shared_ptr<RaytracingIO> &r
         raytracingio->m_sbtWrapper.setup(raytracingio->m_device, raytracingio->m_queueIndex, raytracingio->m_pAlloc.get(), raytracingio->m_rtProperties);
     }
 
+    // 步骤 5：初始化加速结构（BLAS/TLAS）构建器。
     raytracingio->m_pAccelStruct->m_rtBuilder.setup(raytracingio->m_device, raytracingio->m_pAlloc.get(),raytracingio->m_queueIndex);
 
     return true;
@@ -242,6 +299,9 @@ bool Raytracing::setup( AppSetting &appsetting, std::shared_ptr<RaytracingIO> &r
 
 
 
+// 模块：upload——读入场景与观测设置（纯 CPU 侧，不创建 GPU 资源）。
+// 顺序有依赖：先读 defined 配置，再生成光学参数、场景网格/实例、观测与光源几何，
+// 最后读设置并计算物理纹理因子（因子依赖已建好的 meshLinks 与光谱参数）。
 bool Raytracing::upload(std::shared_ptr<FileIO> &fileio,std::shared_ptr<RaytracingIO> &raytracingio){
 
    // auto & fileio = raytracingio->m_fileio;
@@ -259,6 +319,8 @@ bool Raytracing::upload(std::shared_ptr<FileIO> &fileio,std::shared_ptr<Raytraci
     return true;
 }
 
+// 模块：create——创建 GPU 资源。顺序：缓冲 → 描述符（管线布局要用其 layout）→
+// 管线（含 SBT）→ 命令 → 把设置写入推送常量。
 bool Raytracing::create(std::shared_ptr<RaytracingIO> &raytracingio) {
 
 
@@ -286,6 +348,8 @@ bool Raytracing::create(std::shared_ptr<RaytracingIO> &raytracingio) {
 //
 //}
 
+// 模块：uploadSetting——把 RaytracingXml 中的传感器/设置/场景参数复制到 RaytracingIO。
+// 说明：sceneSize 取自 scenexml.background.sceneSize，用作周期边界的水平域尺寸。
 bool Raytracing::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<RaytracingIO> &raytracingio) {
 
     raytracingio->n_wave = fileio->m_pRaytracingXml->sensorxml.waves.size();
@@ -308,6 +372,9 @@ bool Raytracing::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
     return true;
 }
 
+// 模块：updateSetting——把 RaytracingIO 中的设置写入推送常量结构 RayRTSetting。
+// 说明：sceneSize 的 x/y 下限取 0.01 m，避免周期域尺寸为 0（待核对）；
+//       sceneTop 由 sceneTopHeight 求得；周期边界启用（遍历次数 > 0）时打印参数日志。
 bool Raytracing::updateSetting(std::shared_ptr<RaytracingIO> &raytracingio){
 
    // auto &opo = raytracingio->m_opo;
@@ -336,10 +403,15 @@ bool Raytracing::updateSetting(std::shared_ptr<RaytracingIO> &raytracingio){
 }
 
 
+// 模块：run——主循环。两种观测方式：
+//   - UAV 巡航（isUAVTrave 且 n_pos > 0）：逐航点更新传感器位置，运行并输出（中心投影）；
+//   - 常规：逐观测角 kangle 更新角度，运行并按投影类型输出 TIFF，必要时输出 albedo.txt。
+// 输出：标准输出的 PROGRESS（百分比 5→10→…→100）与 OBSERVATION 行，结果文件由 output* 写出。
 bool Raytracing::run(std::shared_ptr<RaytracingIO> &raytracingio, std::shared_ptr<FileIO> &fileio) {
 
     std::cout << "PROGRESS\t5\t加载光线追踪场景与观测参数" << std::endl;
 
+    // 步骤 1：若要输出 albedo，先清空旧的 albedo.txt（outputAlbedo 之后以追加方式写）。
     /// 清除txt文件信息
     if (raytracingio->isAlbedo)
     {
@@ -354,6 +426,7 @@ bool Raytracing::run(std::shared_ptr<RaytracingIO> &raytracingio, std::shared_pt
     }
 
 
+    // 步骤 2：按观测方式循环；进度条 10%~95% 之间按航点/观测角均分。
     if (raytracingio->isUAVTrave && raytracingio->n_pos > 0)
     {
         raytracingio->kangle = 0;
@@ -408,6 +481,13 @@ bool Raytracing::run(std::shared_ptr<RaytracingIO> &raytracingio, std::shared_pt
 
 
 
+// 模块：outputOrth——正射投影（isOrth / 非透视）输出：读回渲染结果，按拟合映射重采样到
+//       正射栅格，做大气校正后写 TIFF。
+// 输入：modelio（GPU 存储缓冲，布局 [波段][行][列] 的 float，单位同 raygen 输出：
+//       反射因子 [-] / 亮温 [K] / 辐亮度）、kangle（观测角序号）、kpos（航点序号，-1 为无）。
+// 步骤：1 GPU→主机可见缓冲→CPU 副本；2 取观测角并求校正系数 cx、cy；
+//       3 逐输出像元用映射定位源位置并做双线性插值；4 大气校正；5 写 TIFF 并释放内存。
+// 说明：覆盖区之外的输出像元保持 0（不写数据）。
 void Raytracing::outputOrth(std::shared_ptr<RaytracingIO> &modelio, std::shared_ptr<FileIO> &fileio, int kangle, int kpos) {
 VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     int width = modelio->imageSize.x;
@@ -418,6 +498,7 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
     size_t total_elements = (size_t)width * height * n_wave;
     VkDeviceSize bufferSize = total_elements * sizeof(float);
 
+    // 步骤 1：分配主机可见缓冲，把 GPU 存储缓冲拷贝进来，再深拷贝为 CPU 数组（见下方修正说明）。
     nvvk::Buffer pixelBuffer = modelio->m_pAlloc->createBuffer(bufferSize, usage,
                                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
@@ -450,6 +531,7 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
     std::vector<float> waves = modelio->waves;
     glm::vec2 resolution = modelio->imageSize;
 
+    // 步骤 2：取观测角（vza/vaa，度），由 Geometry::orthcorrect 求 x、y 两个方向的映射系数。
     // 计算校正参数
     Eigen::VectorXd cx;
     Eigen::VectorXd cy;
@@ -459,6 +541,7 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
     float *pData_orth = new float[total_elements];
     std::memset(pData_orth, 0, bufferSize);
 
+    // 步骤 3：遍历输出栅格 (i 列, j 行)，按映射在原始渲染图中取 4 邻点做双线性插值。
     // --- 正射校正循环 (已优化健壮性) ---
     for(int i = 0; i < width; i++)
     {
@@ -467,6 +550,8 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
             // 目标图像索引 (使用 long long 防止溢出)
             long long old = (long long)j * width + i;
 
+            // 映射形式：源坐标 = a·c[0] + b·c[1] + a·b·c[2] + c[3]（cx 给源列，cy 给源行；
+            // a=输出列、b=输出行，系数由 Geometry::orthcorrect 拟合）。
             // The fitted mapping yields raster-edge coordinates (pixel k spans
             // [k, k+1]); shift to sample-centre indices before interpolating.
             const auto mapped = [&](const Eigen::VectorXd& c, double a, double b) {
@@ -487,6 +572,7 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
             {
                 continue;
             }
+            // 把采样位置限制在完全被场景覆盖的原始像元范围内，避免边缘像元与背景混合。
             sourceX = std::clamp(sourceX, std::max(0.0, coveredX0), std::min(width - 1.0, coveredX1));
             sourceY = std::clamp(sourceY, std::max(0.0, coveredY0), std::min(height - 1.0, coveredY1));
             const int x0 = static_cast<int>(std::floor(sourceX));
@@ -516,6 +602,7 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
                         + sampleX[sample];
                     valueSum += sampleWeight[sample] * pCpuData[source];
                 }
+                // 步骤 4：对插值结果做大气校正（传感器高度取 sensorxml.position.z，观测天顶角 vza）。
                 pData_orth[oldd] = atmosphereCorrectOutputValue(
                     static_cast<float>(valueSum),
                     fileio->m_pRaytracingXml->atmospherexml,
@@ -527,6 +614,7 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
     }
 
 
+    // 步骤 5：写多波段 TIFF；启用大气校正时模型后缀为 "_a"，波段名见 raytracingBandNames。
     fileio->writeTIFData(
         modelio->projectDir, pData_orth, width, height, n_wave,
         angle, -1.0f, fileio->m_pRaytracingXml->atmospherexml.enabled ? "_a" : "", kpos, false,
@@ -537,6 +625,10 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
     delete[] pData_orth;  // 释放结果数据
 }
 
+// 模块：output——透视投影（含 UAV 航点）输出：读回渲染结果，处理天空像元与大气校正，写 TIFF。
+// 输入：modelio（GPU 存储缓冲 [波段][行][列]）、kangle、kpos（UAV 航点序号，-1 为常规观测）。
+// 步骤：1 GPU→CPU 副本；2 取观测角（航点用自身航向）；3 求天空像元的天顶角；
+//       4 逐波段逐像元：天空像元用天空辐射值，其余做大气校正；5 写 TIFF 并释放内存。
 void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<FileIO>& fileio, int kangle, int kpos)
 {
     VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -548,6 +640,7 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
     size_t total_elements = (size_t)width * height * n_wave;
     VkDeviceSize bufferSize = total_elements * sizeof(float);
 
+    // 步骤 1：GPU 存储缓冲 → 主机可见缓冲 → CPU 副本（同 outputOrth）。
     nvvk::Buffer pixelBuffer = modelio->m_pAlloc->createBuffer(bufferSize, usage,
                                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
@@ -576,6 +669,7 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
     modelio->m_pAlloc->unmap(pixelBuffer);
     modelio->m_pAlloc->destroy(pixelBuffer);
 
+    // 步骤 2：取观测角；UAV 航点的方位角 vaa 以该航点航向为准（见下方英文说明）。
     Angle angle = modelio->angles[kangle];
     // Cruise (UAV) waypoints each have their own heading.  Geometry::updateSensorPos
     // already writes it into angles.front(), but take it explicitly from the waypoint
@@ -585,6 +679,8 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
     std::vector<float> waves = modelio->waves;
     glm::vec2 resolution = modelio->imageSize;
 
+    // 步骤 3：确定传感器高度（航点用 uavposes[kpos].z，否则用 XML 中的 position.z），
+    //         并逐像元判断是否为天空像元：是则记录其天顶角，否则记 -1。
     const size_t imageElements = static_cast<size_t>(width) * height;
     const float sensorHeight = kpos >= 0 && kpos < static_cast<int>(modelio->uavposes.size())
         ? modelio->uavposes[kpos].z : fileio->m_pRaytracingXml->sensorxml.position.z;
@@ -600,6 +696,8 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
             }
         }
     }
+    // 步骤 4：逐波段逐像元处理。值为 0 或非有限（光线未命中场景，天空盒关闭时输出 0）且
+    //         属于天空像元 → 用天空输出值（含天空温度）；其余像元 → 大气校正。
     for (int band = 0; band < n_wave; ++band) {
         const size_t offset = static_cast<size_t>(band) * imageElements;
         for (size_t pixel = 0; pixel < imageElements; ++pixel) {
@@ -619,6 +717,7 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
         }
     }
 
+    // 步骤 5：写多波段 TIFF（参数同 outputOrth）。
     fileio->writeTIFData(
         modelio->projectDir, pCpuData, width, height, n_wave,
         angle, -1.0f, fileio->m_pRaytracingXml->atmospherexml.enabled ? "_a" : "", kpos, false,
@@ -628,6 +727,10 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
     delete[] pCpuData;    // 记得释放拷贝的源数据
 }
 
+// 模块：outputAlbedo——把每个波段的平均反射率追加写入工程目录下的 albedo.txt。
+// 输入：modelio（GPU 存储缓冲）、kangle；每个波段一行：
+//       波长 sza saa vza vaa 平均值（角度单位为度；run 开始时已清空该文件）。
+// 步骤：1 读回 GPU 结果；2 逐波段求 >0 像元的均值；3 释放缓冲；4 追加写文本。
 void Raytracing::outputAlbedo(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<FileIO>& fileio, int kangle)
 {
     VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -635,6 +738,7 @@ void Raytracing::outputAlbedo(std::shared_ptr<RaytracingIO>& modelio, std::share
     int height = modelio->imageSize.y;
     int n_wave = modelio->n_wave;
     VkDeviceSize bufferSize = static_cast<VkDeviceSize>(width) * height * n_wave * sizeof(float);
+    // 步骤 1：GPU 存储缓冲 → 主机可见缓冲（此处直接在映射内存上统计，不做 CPU 副本）。
     nvvk::Buffer pixelBuffer = modelio->m_pAlloc->createBuffer(bufferSize, usage,
                                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
@@ -672,6 +776,7 @@ void Raytracing::outputAlbedo(std::shared_ptr<RaytracingIO>& modelio, std::share
     Angle angle = modelio->angles[kangle];
     std::vector<float> waves = modelio->waves;
 
+    // 步骤 4：以追加方式写 albedo.txt（下面的 1~4 序号是原作者自己的流程说明）。
     // 1. 打开文件（追加模式：std::ios::app）
     std::ofstream outfile(modelio->projectDir + "\\albedo.txt", std::ios::app);  // 如果文件不存在会自动创建
 
@@ -693,6 +798,8 @@ void Raytracing::outputAlbedo(std::shared_ptr<RaytracingIO>& modelio, std::share
 }
 
 
+// 模块：destroy——释放 Vulkan 资源：先各子模块（缓冲/描述符/管线/命令），
+// 再 SBT 包装器与加速结构构建器；等待设备空闲后释放命令池与分配器。
 bool Raytracing::destroy( std::shared_ptr<RaytracingIO> &raytracingio)
 {
 

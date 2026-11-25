@@ -1,3 +1,26 @@
+// ==========================================================================
+// 文件：histream_usd.cpp
+// 功能：独立命令行工具 histream-usd：用 OpenUSD 读取任意 USD 场景（usd/usda/usdc/usdz），
+//       把几何导出为 HiStream 可用的 OBJ 文件，并生成 JSON 导入清单 usd-import.json。
+// 用法：histream-usd read <scene.usd|usda|usdc|usdz> <输出目录>；成功时向标准输出打印
+//       一行 "HISTREAM_USD<TAB><清单路径>"，返回 0；参数错误返回 2，异常返回 1。
+// 主要模块：
+//   1. JSON/属性工具：jsonString、jsonNumber、histreamAttributes、attributesJson、stringAttribute
+//   2. 数据结构：Group（同材质网格组）、Geometry（可复用几何）、Placement（放置变换）
+//   3. 网格读取：readRawMesh（Mesh/Cube/Sphere）、appendGprim（按 materialBind 子集拆分）
+//   4. 去重与放置：geometryHash、decompose（矩阵 → 平移/Y 旋转/均匀缩放）
+//   5. 对象归并与输出：objectRoot、objectName、fileStem、writeObj
+//   6. read：遍历舞台 → 归并对象 → 几何复用/放置/烘焙 → 写 OBJ 与清单
+//   7. 入口：Windows 用 wmain（UTF-8 路径转换），其他平台用 main
+// 数据流：USD 舞台 →（轴/单位转换）→ OBJ + usd-import.json →
+//         由 server.mjs 的 runUsdReader 读取并导入工程。
+// 约定：输出坐标为 HiStream 轴（Y 向上、单位 m）；Z-up 的舞台按 (x, y, z) → (x, z, -y) 转换；
+//       OBJ 中顶点 y 已减去该几何的最低点 minimumY（物体落在 y=0），放置里再补回；
+//       旋转角单位为度；只取最早时间码（kTime），不处理动画；
+//       带 histream:* 前缀的属性（含 Blender 的 userProperties:histream:*）原样写入清单。
+//       角色为 ground 的地面网格不导出，只记入清单的 skipped。
+// ==========================================================================
+
 // histream-usd: reads any OpenUSD stage and writes HiStream-ready OBJ files plus a JSON manifest.
 #include <pxr/pxr.h>
 #include <pxr/base/gf/matrix4d.h>
@@ -40,12 +63,15 @@
 
 PXR_NAMESPACE_USING_DIRECTIVE
 
+// 匿名命名空间：本文件的全部辅助函数与 read 都在其中，入口函数在命名空间之外。
 namespace {
 
+// kFormat：清单格式版本标识；kTime：统一取最早时间码读取所有属性（不支持动画）。
 constexpr const char* kFormat = "histream-usd-read-v1";
 constexpr double kPi = 3.14159265358979323846;
 const UsdTimeCode kTime = UsdTimeCode::EarliestTime();
 
+// 作用：把字符串转成带引号的 JSON 字符串（转义 " \ 换行/回车/制表符与 <0x20 的控制符）。
 std::string jsonString(const std::string& text)
 {
     std::string result = "\"";
@@ -60,6 +86,7 @@ std::string jsonString(const std::string& text)
     return result + "\"";
 }
 
+// 作用：把数值写成 JSON 数字，9 位有效数字；NaN/Inf 被写成 0（见 histreamAttributes 的说明）。
 std::string jsonNumber(double value)
 {
     if (!std::isfinite(value)) return "0";
@@ -71,6 +98,9 @@ std::string jsonNumber(double value)
 // histream:* attributes in any namespace (Blender re-exports them as userProperties:histream:*).
 using Attributes = std::map<std::string, std::string>;
 
+// 作用：收集 prim 上名称含 "histream:" 的属性，键为去掉前缀后的名称，值为已序列化的 JSON 片段。
+// 支持的类型：string/token/bool/int/float/double/GfVec3d（写成三元数组）；其余类型丢弃
+// （见下方 DEFERRED 说明）。
 Attributes histreamAttributes(const UsdPrim& prim)
 {
     Attributes result;
@@ -96,6 +126,7 @@ Attributes histreamAttributes(const UsdPrim& prim)
     return result;
 }
 
+// 作用：把属性表写成 JSON 对象字符串（按键名排序）。
 std::string attributesJson(const Attributes& attributes)
 {
     std::string result = "{";
@@ -107,6 +138,8 @@ std::string attributesJson(const Attributes& attributes)
     return result + "}";
 }
 
+// 作用：取字符串属性的原值：去掉引号并还原 \n \t \r 与被转义的字符；
+//       键不存在或值不是 JSON 字符串时返回空串。
 std::string stringAttribute(const Attributes& attributes, const std::string& key)
 {
     const auto found = attributes.find(key);
@@ -122,6 +155,9 @@ std::string stringAttribute(const Attributes& attributes, const std::string& key
     return result;
 }
 
+// 结构：Group——一个“网格组”，对应 OBJ 里的一个 g 段（同一网格同一材质/子集）。
+// points 已变换到对象根局部坐标（HiStream 轴、m）；counts 为每面顶点数，
+// indices 为组内局部顶点序号（0 起）；colors 非空时与 points 一一对应（displayColor）。
 struct Group {
     std::string name, material;
     Attributes attributes;
@@ -130,6 +166,8 @@ struct Group {
     std::vector<int> counts, indices;
 };
 
+// 结构：Geometry——一个可被多个放置复用的几何（多个 Group + 对应的 OBJ 文件）。
+// minimumY：全部顶点的最低 y（m），写 OBJ 时减去，使几何底面落在 y=0。
 struct Geometry {
     std::string name;
     Attributes attributes;
@@ -138,6 +176,8 @@ struct Geometry {
     std::string objFile;
 };
 
+// 结构：Placement——一次放置：引用 Geometry，平移（HiStream 轴，m）、
+// 绕 Y 旋转 rotation（度）与均匀缩放 scale（无量纲）。
 struct Placement {
     size_t geometry{};
     std::string path;
@@ -146,6 +186,7 @@ struct Placement {
     double scale{1.0}, rotation{0.0};
 };
 
+// 作用：返回 prim 绑定材质的名称（取 prim 名而非路径）；没有绑定时返回空串。
 std::string boundMaterialName(const UsdPrim& prim)
 {
     const UsdShadeMaterial material = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
@@ -160,6 +201,11 @@ struct RawMesh {
     bool leftHanded{false};
 };
 
+// 作用：读取 Mesh / Cube / Sphere 的原始几何（prim 自身坐标系，未做变换）。
+// 输出：raw（点、每面顶点数、顶点索引、可选的顶点 displayColor、左手系标记）；
+//       返回 false 表示不是支持的类型或没有有效几何。
+// 说明：Mesh 只在 displayColor 为 vertex 插值且数量与点数一致时才保留颜色；
+//       Cube 缺省边长 2，展开为 6 个四边形；Sphere 缺省半径 1，用 16 段 × 10 环细分的四边形网格。
 bool readRawMesh(const UsdPrim& prim, RawMesh& raw)
 {
     if (const UsdGeomMesh mesh{prim}) {
@@ -213,6 +259,11 @@ bool readRawMesh(const UsdPrim& prim, RawMesh& raw)
 }
 
 // Splits a gprim by its materialBind GeomSubsets and appends the parts, transformed by toRoot.
+// 输入：toRoot——把该 gprim 点变换到对象根局部坐标（含轴/单位转换）的矩阵；
+// 输出：向 groups 追加若干 Group（基础网格一组，每个 materialBind 子集再各一组）。
+// 步骤：1 累计各面在索引数组中的起点（索引数组与面数不一致则放弃该 gprim）；
+//       2 把子集中的面划到各自的部分；3 判断是否需要反转绕序；
+//       4 逐部分收集用到的顶点（remap 重编号）、变换并保存。
 void appendGprim(const UsdPrim& prim, const GfMatrix4d& toRoot, std::vector<Group>& groups)
 {
     RawMesh raw;
@@ -240,7 +291,10 @@ void appendGprim(const UsdPrim& prim, const GfMatrix4d& toRoot, std::vector<Grou
             for (const int face : faces) if (face >= 0 && static_cast<size_t>(face) < faceGroup.size()) faceGroup[face] = part;
         }
     }
+    // 步骤 3：左手系网格与镜像变换（行列式 < 0）各翻转一次绕序，两者同时出现则抵消；
+    //         需要翻转时保持第一个顶点不动，其余顶点倒序。
     const bool reverse = raw.leftHanded != (toRoot.GetDeterminant3() < 0.0);
+    // 步骤 4：逐部分重建面：remap 把原始顶点号映射到该组内的新顶点号（处理完后复位为 -1）。
     std::vector<int> remap(raw.points.size(), -1);
     for (size_t part = 0; part < parts.size(); ++part) {
         Group group;
@@ -271,6 +325,9 @@ void appendGprim(const UsdPrim& prim, const GfMatrix4d& toRoot, std::vector<Grou
     }
 }
 
+// 作用：对几何做 64 位 FNV-1a 哈希，用于识别相同几何并复用。
+// 输入：组名、材质名、面拓扑和顶点坐标（量化到 1e-5 m）；不含 histream:* 属性
+//       （这一局限见 read 中的 DEFERRED 说明）。
 uint64_t geometryHash(const std::vector<Group>& groups)
 {
     uint64_t hash = 1469598103934665603ULL;
@@ -285,6 +342,10 @@ uint64_t geometryHash(const std::vector<Group>& groups)
     return hash;
 }
 
+// 作用：decompose——把 4×4 变换（行向量约定，HiStream 轴）分解成放置参数。
+// 输出：placement 的 translation（取第 4 行）、scale、rotation（度）；
+//       变换若含倾斜、镜像（行列式 ≤ 0）、非均匀缩放或非 Y 轴旋转则返回 false，
+//       调用方此时改为把变换烘焙进单独的 OBJ。容差为 1e-4×scale。
 // HiStream placements are translate * rotateY * uniform scale.
 bool decompose(const GfMatrix4d& matrix, Placement& placement)
 {
@@ -306,6 +367,10 @@ bool decompose(const GfMatrix4d& matrix, Placement& placement)
     return true;
 }
 
+// 作用：确定 gprim 所属“对象”的根 prim：
+//   1) 若祖先中有实例（instance）则取最近的那个实例；
+//   2) 否则取其父 prim（要求是 Xformable，且不是伪根/defaultPrim）；
+//   3) 都不满足时 gprim 自己就是对象根。
 UsdPrim objectRoot(const UsdPrim& gprim, const UsdPrim& defaultPrim)
 {
     for (UsdPrim prim = gprim.GetParent(); prim && !prim.IsPseudoRoot(); prim = prim.GetParent())
@@ -315,6 +380,7 @@ UsdPrim objectRoot(const UsdPrim& gprim, const UsdPrim& defaultPrim)
     return parent;
 }
 
+// 作用：决定几何名称：优先用 histream:objectName，否则用 prim 名并去掉 _001 这类数字后缀。
 std::string objectName(const UsdPrim& root, const Attributes& attributes)
 {
     std::string name = stringAttribute(attributes, "objectName");
@@ -325,6 +391,8 @@ std::string objectName(const UsdPrim& root, const Attributes& attributes)
     return stripped.empty() ? name : stripped;
 }
 
+// 作用：由名称生成不重名的 OBJ 文件主干名：非字母数字/下划线/连字符的字符换成 _，
+//       重名时追加 _1、_2……；空名用 "object"。
 std::string fileStem(const std::string& name, std::set<std::string>& used)
 {
     std::string stem;
@@ -336,6 +404,8 @@ std::string fileStem(const std::string& name, std::set<std::string>& used)
     return candidate;
 }
 
+// 作用：把一个 Geometry 写成 OBJ。每个 Group 写一个 g 段；顶点 y 减去 minimumY；
+//       有颜色时用扩展写法 "v x y z r g b"；面索引 1 起，跨组累加偏移 base。
 void writeObj(const std::filesystem::path& path, const Geometry& geometry, const std::string& source)
 {
     std::ofstream out(path, std::ios::binary);
@@ -368,12 +438,18 @@ void writeObj(const std::filesystem::path& path, const Geometry& geometry, const
     if (!out) throw std::runtime_error("cannot write " + path.u8string());
 }
 
+// 模块：read——工具主流程。输入：USD 文件路径 input、输出目录；输出：若干 .obj 与 usd-import.json。
+// 步骤：1 打开舞台；2 建立轴/单位转换矩阵；3 读取层级自定义数据 histream；
+//       4 遍历舞台，筛出几何并按对象归并；5 逐对象构建几何（实例/哈希复用）；
+//       6 求放置，不能分解时烘焙变换；7 写 OBJ；8 写清单并打印 HISTREAM_USD 行。
+//       失败时抛出异常，由入口函数捕获。
 int read(const std::string& input, const std::filesystem::path& outputDirectory)
 {
     const UsdStageRefPtr stage = UsdStage::Open(input);
     if (!stage) throw std::runtime_error("cannot open USD stage: " + input);
     std::filesystem::create_directories(outputDirectory);
 
+    // 步骤 2：转换矩阵 convert：Z-up 转为 Y-up，并乘以每单位米数（metersPerUnit ≤ 0 时按 1 处理）。
     const TfToken upAxis = UsdGeomGetStageUpAxis(stage);
     const double metersPerUnit = UsdGeomGetStageMetersPerUnit(stage);
     // Row-vector conversion into HiStream axes (Y-up, metres): Z-up (x, y, z) -> (x, z, -y).
@@ -390,6 +466,8 @@ int read(const std::string& input, const std::filesystem::path& outputDirectory)
     convert = convert * units;
     const GfMatrix4d convertInverse = convert.GetInverse();
 
+    // 步骤 3：读取根层 customLayerData["histream"] 中的 project（工程 JSON 字符串）与 format，
+    //         原样放进清单供前端恢复工程设置。
     std::string projectJson, layerFormat;
     const VtDictionary layerData = stage->GetRootLayer()->GetCustomLayerData();
     const VtValue* entry = layerData.GetValueAtPath("histream");
@@ -401,6 +479,9 @@ int read(const std::string& input, const std::filesystem::path& outputDirectory)
             layerFormat = found->second.UncheckedGet<std::string>();
     }
 
+    // 步骤 4：遍历舞台（含实例代理）：跳过 guide/proxy 用途与不可见的子树；只取 Mesh/Cube/Sphere；
+    //         角色为 ground 的（histream:role，或 defaultPrim 下名为 ground 的根 prim）记入 skipped；
+    //         其余按 objectRoot 归并为 Object。
     const UsdPrim defaultPrim = stage->GetDefaultPrim();
     UsdGeomXformCache cache(kTime);
     std::vector<std::string> skipped;
@@ -433,6 +514,8 @@ int read(const std::string& input, const std::filesystem::path& outputDirectory)
         objects[found->second].gprims.push_back(prim);
     }
 
+    // 步骤 5：逐对象构建几何。同一实例原型（prototype）共用一份几何；
+    //         非实例对象按 geometryHash 去重；几何坐标为相对对象根、已转 HiStream 轴的局部坐标。
     std::vector<Geometry> geometries;
     std::vector<Placement> placements;
     std::unordered_map<std::string, size_t> prototypeGeometry;
@@ -475,6 +558,8 @@ int read(const std::string& input, const std::filesystem::path& outputDirectory)
             geometries.push_back(std::move(built));
         }
 
+        // 步骤 6：对象根 → 世界的变换（HiStream 轴下）；先平移 minimumY 补回 OBJ 里减去的底面高度，
+        //         再尝试分解为 平移/绕 Y 旋转/均匀缩放；失败则走下面的烘焙分支。
         const GfMatrix4d local = convertInverse * rootToWorld * convert;
         GfMatrix4d grounded(1.0);
         grounded.SetTranslate(GfVec3d(0.0, geometries[geometryIndex].minimumY, 0.0));
@@ -522,6 +607,7 @@ int read(const std::string& input, const std::filesystem::path& outputDirectory)
         placements.push_back(std::move(placement));
     }
 
+    // 步骤 7：为每个几何生成不重名的文件名并写 OBJ。
     std::set<std::string> usedStems;
     for (Geometry& geometry : geometries) {
         const std::filesystem::path objPath =
@@ -530,6 +616,9 @@ int read(const std::string& input, const std::filesystem::path& outputDirectory)
         writeObj(objPath, geometry, input);
     }
 
+    // 步骤 8：拼装 usd-import.json：format/source/upAxis/metersPerUnit/histream，
+    //         geometries（含各网格组的材质、面数、属性）、placements（north/y/east/scale/rotation）、
+    //         skipped；字段 north、east 对应 translation[0]、translation[2]（轴约定见 DEFERRED 说明）。
     std::ostringstream json;
     json << "{\"format\":" << jsonString(kFormat) << ",\"source\":" << jsonString(input)
          << ",\"upAxis\":" << jsonString(upAxis.GetString()) << ",\"metersPerUnit\":" << jsonNumber(metersPerUnit)
@@ -577,6 +666,7 @@ int read(const std::string& input, const std::filesystem::path& outputDirectory)
 
 }
 
+// 入口：histream-usd read <场景> <输出目录>。返回值：0 成功，2 用法错误，1 运行时异常。
 // Paths cross the process boundary as UTF-8 (OpenUSD and server.mjs both expect it);
 // on Windows the narrow argv is the ANSI code page, so read the wide one instead.
 #ifdef _WIN32

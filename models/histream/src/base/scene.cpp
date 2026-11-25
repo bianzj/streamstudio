@@ -1,3 +1,30 @@
+// ==========================================================================
+// 文件：scene.cpp
+// 功能：HiStream 的场景构建——把工程中的背景、基元（树冠/建筑/水体等）和 OBJ 对象
+//       转换为 RayTracing 的网格/实例，或 VoxelRT/VoxelEB 的体元（NanoVDB 索引 + VoxelLink）。
+// 主要模块：
+//   1. 匿名命名空间：DEM 高程场读取与插值（demHeightField/demHeightAboveMinimum）、
+//      DEM 体元地表网格（createVoxelDemBackground）、火焰/雾体元筛选（keepParticipatingMediumVoxel）
+//   2. OBJ 体元化：三角形-体元裁剪求面积、SolidClosureIndex（建筑法向朝外）、voxelizeObjSurface
+//   3. 绑定名称到 id 的辅助模板（requiredId/mappedId/requiredMappedId/idOrZero）
+//      与 preparePrimitiveBuilding
+//   4. 异质性体元（HEX）：实例旋转、世界体元累加、finalizeHexMixtures（描述符与混合材质）
+//   5. createObjFilledVoxels：OBJ 实体 → 体元场景（逆映射填格、世界对齐代理网格）
+//   6. Scene::createObjScene：RayTracing 模式的背景与 OBJ 网格/实例
+//   7. Scene::createPrimObjScene 及 createPrimObj_Crown/Crowns/Building/Background：
+//      VoxelEB（VoxelebIO）与 VoxelRT（VoxelrtIO）各一套基元体元化实现
+//   8. Scene::XYZ2XZY（坐标轴重排）、Scene::outputObjMesh（导出 OBJ）
+// 数据流：FileIO 解析出的场景配置（RaytracingXml/VoxelebXml 等）→ 本文件 → 各模式的 IO 对象
+//   （meshio：网格与 MeshLink；instanceio：实例与 InstanceLink；voxelio：NanoVDB 句柄与 VoxelLink）
+//   → 随后上传 GPU 供光线追踪/能量平衡使用。
+// 与其他文件的关系：scene.h 声明 Scene；ObjLoader/VoxelDesigner 负责 OBJ 读取与基元三角化；
+//   hexvoxel.h、hexneighbors.h、hexprojection.h 提供异质体元的投影与邻域相关量。
+// 重要约定：体元/OBJ/Three.js 世界坐标为 +X 北、+Y 上、+Z 东；配置与位置文件中的
+//   (x,y,z) = (北, 东, 高)；传统基元用 X/Z/Y（Z 为高度），经 XYZ2XZY 换到 Y 向上；
+//   长度单位 m；体元坐标以 stepsize_surface（体元边长）为单位；旋转角单位为度，
+//   实例矩阵用绕 y 轴 -angle 的旋转。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/24.
 //
@@ -30,6 +57,8 @@
 
 namespace {
 
+// DEM 高程场缓存：path 为请求的文件路径；values 为 width×height 的行主序高程（m，
+// 无效像元已替换为最小值）；minimum 为有效高程的最小值；valid 表示读取成功。
 struct DemHeightField {
     std::string path;
     int width{0};
@@ -39,6 +68,10 @@ struct DemHeightField {
     bool valid{false};
 };
 
+// 作用：按背景的 DEM 文件读取高程栅格，并缓存最近一次读取的结果（同路径不重复读）。
+// 输入：background（isDEM 为假时视为无 DEM，返回 valid=false 的空场）。
+// 说明：读取波段 1 为 float32；nodata/非有限像元统一替换为有效高程最小值，
+//       使其落在“基准面”上；少于 2×2 个像元、打不开或全无效都抛异常。
 const DemHeightField& demHeightField(const Background& background)
 {
     static DemHeightField cached;
@@ -84,6 +117,9 @@ const DemHeightField& demHeightField(const Background& background)
     return cached;
 }
 
+// 作用：求场景平面位置 (x, z) 处 DEM 相对其最小高程的高度（m，非负），用于抬升地形。
+// 说明：把场景范围 sceneSize 线性拉伸到整幅 DEM 后做双线性插值；
+//       x 映射为行（翻转，x 大者靠图像上方）、z 映射为列。无 DEM 时返回 0。
 float demHeightAboveMinimum(const Background& background, float x, float z)
 {
     const DemHeightField& dem = demHeightField(background);
@@ -105,6 +141,10 @@ float demHeightAboveMinimum(const Background& background, float x, float z)
     return std::max(0.0f, top * (1.0f - (v - y0)) + bottom * (v - y0) - dem.minimum);
 }
 
+// 作用：判断参与介质（雾/火焰）体元是否保留。structureType 非 2（雾）整块保留；
+//       structureType==2（火焰）把基元当作包围盒，在其中雕刻出向上收窄的确定性火焰形。
+// 输入：canopy、体元在基元内的局部索引 localVoxel、基元 shape、体元边长 stepSize（m）。
+// 说明：形状完全由体元位置决定（无随机数），保证多次运行及 VoxelRT/VoxelEB 一致。
 bool keepParticipatingMediumVoxel(const Canopy& canopy,
                                   const glm::ivec3& localVoxel,
                                   const Shape& shape,
@@ -114,6 +154,7 @@ bool keepParticipatingMediumVoxel(const Canopy& canopy,
     // bounding volume and is narrowed into a deterministic, upward flame.
     if (canopy.structureType != 2) return true;
 
+    // 步骤 1：把体元索引换算为基元内归一化坐标：x、z ∈ [-0.5,0.5] 以中心为 0，y ∈ [0,1] 自下而上。
     const int sizeX = std::max(1, static_cast<int>(std::ceil(shape.length / stepSize)));
     const int sizeY = std::max(1, static_cast<int>(std::ceil(shape.height / stepSize)));
     const int sizeZ = std::max(1, static_cast<int>(std::ceil(shape.width / stepSize)));
@@ -123,6 +164,9 @@ bool keepParticipatingMediumVoxel(const Canopy& canopy,
 
     // A small height-dependent displacement makes the flame asymmetric while
     // keeping it reproducible between runs and between VoxelRT/VoxelEB.
+    // 步骤 2：火焰截面为圆：中心随高度正弦漂移，半径随高度由 0.56 缩到 0.08，
+    //       再叠加边缘扰动；距离不超过 radius+edgeNoise 的体元保留。
+    //       各系数是外观经验值（无物理依据）。
     constexpr float pi = 3.14159265358979323846f;
     const float centreX = 0.075f * y * std::sin(2.0f * pi * (1.35f * y + 0.11f));
     const float centreZ = 0.055f * y * std::sin(2.0f * pi * (1.85f * y + 0.37f));
@@ -134,6 +178,11 @@ bool keepParticipatingMediumVoxel(const Canopy& canopy,
     return radialDistance <= radius + edgeNoise;
 }
 
+// 作用：把 DEM 背景做成“阶梯状”的体元地表网格（每个 stepSize 方形格一个柱体顶面）。
+// 输入：background（范围 sceneSize 与 DEM）、stepSize（体元边长，m）。
+// 输出：PrimMesh——顶点位置以体元为单位（x=列、y=行、z=柱顶高度的体元数），
+//       voxelIds 为每格的 (column,row,top-1)，即每格地表体元。
+// 说明：相邻格高度不同时补竖直侧壁，避免地形出现裂缝；每格一个顶面保持“一格一状态”。
 PrimMesh createVoxelDemBackground(const Background& background, float stepSize)
 {
     PrimMesh mesh;
@@ -143,6 +192,7 @@ PrimMesh createVoxelDemBackground(const Background& background, float stepSize)
     if (!(stepSize > 0.0f) || !std::isfinite(stepSize))
         throw std::runtime_error("DEM background step size must be a finite positive value: " +
                                  std::to_string(stepSize));
+    // 步骤 1：格数取场景边长除以体元边长并向下取整（至少 1 格）；尾部不足一格的部分被舍去。
     const int columns = std::max(1, static_cast<int>(std::floor(background.sceneSize.x / stepSize)));
     const int rows = std::max(1, static_cast<int>(std::floor(background.sceneSize.y / stepSize)));
     std::vector<float> tops(static_cast<size_t>(columns) * rows);
@@ -151,6 +201,7 @@ PrimMesh createVoxelDemBackground(const Background& background, float stepSize)
     };
     for (int column = 0; column < columns; ++column) {
         for (int row = 0; row < rows; ++row) {
+            // 步骤 2：取每格中心处的 DEM 相对高度，除以 stepSize 向下取整，得到柱顶高度（体元数）。
             const float x0 = column * stepSize;
             const float x1 = std::min(background.sceneSize.x, (column + 1) * stepSize);
             const float y0 = row * stepSize;
@@ -159,6 +210,7 @@ PrimMesh createVoxelDemBackground(const Background& background, float stepSize)
                 background, (x0 + x1) * 0.5f, (y0 + y1) * 0.5f) / stepSize);
         }
     }
+    // 步骤 3：生成网格——appendTriangle/appendQuad 追加无共享顶点的三角形（四边形拆为两个三角形）。
     const auto appendTriangle = [&mesh](const glm::vec3& a,
                                         const glm::vec3& b,
                                         const glm::vec3& c) {
@@ -184,6 +236,7 @@ PrimMesh createVoxelDemBackground(const Background& background, float stepSize)
             const float y0 = static_cast<float>(row);
             const float y1 = static_cast<float>(row + 1);
             // Keep the terrain surface and its NanoVDB state in the same cell.
+            // 步骤 4：每格输出一个水平顶面，高度为柱顶体元数。
             const float surfaceTop = topAt(column, row);
             appendQuad({x0, y0, surfaceTop}, {x0, y1, surfaceTop},
                        {x1, y1, surfaceTop}, {x1, y0, surfaceTop});
@@ -216,6 +269,7 @@ PrimMesh createVoxelDemBackground(const Background& background, float stepSize)
     return mesh;
 }
 
+// 整数体元坐标及其哈希，作为 OBJ 体元化时 unordered_map/unordered_set 的键。
 struct ObjVoxelCoord {
     int x;
     int y;
@@ -235,6 +289,9 @@ struct ObjVoxelCoordHash {
     }
 };
 
+// 作用：用轴对齐平面 point[axis]=plane 裁剪凸多边形（Sutherland–Hodgman，单平面）。
+// 输入：keepGreater 为真保留 ≥ plane 一侧，否则保留 ≤ plane 一侧（含 1e-6 容差）。
+// 输出：裁剪后的多边形顶点（可能为空）；与平面近平行（|分母|≤1e-8）的边不求交点。
 std::vector<glm::vec3> clipVoxelPolygon(const std::vector<glm::vec3>& source,
                                         int axis, float plane, bool keepGreater)
 {
@@ -265,6 +322,8 @@ std::vector<glm::vec3> clipVoxelPolygon(const std::vector<glm::vec3>& source,
     return result;
 }
 
+// 作用：求三角形落在单位体元 [voxel, voxel+1]³ 内的面积（体元单位²）。
+// 做法：依次用六个体元面裁剪三角形，再按扇形三角剖分求面积。
 float triangleAreaInsideVoxel(const glm::vec3& a, const glm::vec3& b,
                               const glm::vec3& c, const ObjVoxelCoord& voxel)
 {
@@ -297,6 +356,10 @@ float triangleAreaInsideVoxel(const glm::vec3& a, const glm::vec3& b,
 // do not cancel. Coordinates are in voxel units.
 class SolidClosureIndex {
 public:
+    // 构造：meshes 为同一建筑群的 OBJ 网格，inverseVoxelSize 为 1/体元边长（m 换算为体元单位）。
+    // 步骤 1：顶点按 1/1024 体元量化焊接，并查集合并同一三角形的三个顶点，得到连通壳。
+    // 步骤 2：丢弃 xz 投影面积≈0 的竖直三角形（只参与连通，不参与竖直射线求交）。
+    // 步骤 3：记录三角形所属壳，并在 xz 平面建立桶网格以加速射线查询。
     SolidClosureIndex(const std::vector<const ObjMesh*>& meshes, float inverseVoxelSize)
     {
         std::unordered_map<ObjVoxelCoord, uint32_t, ObjVoxelCoordHash> vertexIds;
@@ -338,6 +401,7 @@ public:
                 }
             }
         }
+        // 步骤 3：桶边长至少 4 个体元且使每轴不超过约 1024 桶；每个三角形登记到其 xz 包围盒覆盖的桶。
         if (tris_.empty()) return;
         for (size_t index = 0; index < tris_.size(); ++index)
             tris_[index].shell = find(firstVertex[index]);
@@ -362,6 +426,9 @@ public:
 
     bool empty() const { return tris_.empty(); }
 
+    // 作用：判断点 p（体元单位）是否在任一壳内——自 p 向 +y 发射竖直射线，
+    //       统计其穿过各壳三角形的次数，任一壳为奇数即在内部（开底建筑也适用）。
+    // 说明：重心坐标 u/v/w 在 xz 平面内判定命中，height 为命中点 y。
     bool inside(glm::vec3 p) const
     {
         if (tris_.empty()) return false;
@@ -398,6 +465,9 @@ public:
     // Returns the facet normal pointing out of the solid. When both sides test
     // alike (hidden faces inside overlapping volumes, open sheets) a mostly
     // horizontal facet is taken as a roof facing up; others keep their winding.
+    // 作用：返回朝向实体外部的面元法向。沿 ±normal 偏移 0.02 体元探测内外：
+    //       两侧结果不同则据此取向；相同（重叠体内部面、敞开片面）则仅把朝下且
+    //       接近水平（|ny|≥0.5）的面翻成朝上（视为屋顶），其余保持原绕序。
     glm::vec3 outward(const glm::vec3& centroid, const glm::vec3& normal) const
     {
         constexpr float offset = 0.02f; // voxel units
@@ -434,6 +504,13 @@ private:
     int nz_ = 0;
 };
 
+// 作用：把 OBJ 表面网格体元化，返回被表面占据的体元整数坐标（按 x,y,z 字典序排序）。
+// 输入：mesh、voxelSize（m）、fillThreshold（体元内表面覆盖比下限，0..1）；
+//       rejectedVoxelCount 输出被阈值剔除的体元数；
+//       leafDensities（可选）输出每体元的面积密度（表面积/体元体积，m-1 即 m2 m-3）；
+//       surfaceNormals（可选）输出每体元面积加权外法向（抵消时为零向量）；
+//       closure（可选）用于按几何而非绕序统一法向朝外。
+// 说明：覆盖比 = min(1, 体元内表面积 / 体元一个面的面积)。
 std::vector<glm::ivec3> voxelizeObjSurface(const ObjMesh& mesh, float voxelSize,
                                            float fillThreshold,
                                            size_t& rejectedVoxelCount,
@@ -447,6 +524,7 @@ std::vector<glm::ivec3> voxelizeObjSurface(const ObjMesh& mesh, float voxelSize,
 
     std::unordered_map<ObjVoxelCoord, float, ObjVoxelCoordHash> coveredArea;
     std::unordered_map<ObjVoxelCoord, glm::vec3, ObjVoxelCoordHash> weightedNormal;
+    // 步骤 1：逐三角形累计其落入各体元的面积（及面积加权法向）；坐标先换算为体元单位。
     const float inverseVoxelSize = 1.0f / voxelSize;
     const size_t triangleCount = mesh.indices.size() / 3;
 
@@ -470,6 +548,7 @@ std::vector<glm::ivec3> voxelizeObjSurface(const ObjMesh& mesh, float voxelSize,
         if (surfaceNormals && closure && !closure->empty())
             faceNormal = closure->outward((a + b + c) / 3.0f, faceNormal);
 
+        // 步骤 2：遍历三角形包围盒内的体元，逐个体元裁剪求面积并累加。
         const glm::vec3 minimum = glm::min(a, glm::min(b, c));
         const glm::vec3 maximum = glm::max(a, glm::max(b, c));
         const int minX = static_cast<int>(std::floor(minimum.x));
@@ -494,6 +573,7 @@ std::vector<glm::ivec3> voxelizeObjSurface(const ObjMesh& mesh, float voxelSize,
         }
     }
 
+    // 步骤 3：按覆盖比阈值筛选体元（容差 1e-6），统计被剔除的数量。
     std::vector<glm::ivec3> activeVoxels;
     activeVoxels.reserve(coveredArea.size());
     rejectedVoxelCount = 0;
@@ -507,6 +587,7 @@ std::vector<glm::ivec3> voxelizeObjSurface(const ObjMesh& mesh, float voxelSize,
         activeVoxels.emplace_back(entry.first.x, entry.first.y, entry.first.z);
     }
 
+    // 步骤 4：排序保证输出顺序确定，与 unordered_map 的遍历顺序无关。
     std::sort(activeVoxels.begin(), activeVoxels.end(),
               [](const glm::ivec3& left, const glm::ivec3& right) {
                   if (left.x != right.x) return left.x < right.x;
@@ -538,6 +619,7 @@ std::vector<glm::ivec3> voxelizeObjSurface(const ObjMesh& mesh, float voxelSize,
     return activeVoxels;
 }
 
+// 作用：按名称查表取 id，名称不存在则抛异常（用于必填绑定）。kind 仅用于报错文字。
 template <typename MapType>
 int requiredId(const MapType& values, const std::string& name, const char* kind)
 {
@@ -549,6 +631,8 @@ int requiredId(const MapType& values, const std::string& name, const char* kind)
 
 // Optional bindings (thermal, canopy, material) keep id 0 when the name is
 // unknown, but no longer silently.
+// 作用：可选绑定（热/冠层/材质）按实例序号取名称对应的 id；名称列表比实例数短时沿用最后一项；
+//       名称未知时返回 0 并（每个名称只）向 stderr 警告一次；占位表（__default_ 开头）直接用其唯一项。
 template <typename MapType>
 int mappedId(const MapType& values, const std::vector<std::string>& names,
              size_t index, const char* kind)
@@ -569,6 +653,7 @@ int mappedId(const MapType& values, const std::vector<std::string>& names,
 }
 
 // Spectral bindings are required, as in RayTracing.
+// 作用：必填绑定（光谱）按实例序号取 id；缺绑定或名称未知都抛异常。
 template <typename MapType>
 int requiredMappedId(const MapType& values, const std::vector<std::string>& names,
                      size_t index, const char* kind)
@@ -577,6 +662,7 @@ int requiredMappedId(const MapType& values, const std::vector<std::string>& name
     return requiredId(values, names[std::min(index, names.size() - 1)], kind);
 }
 
+// 作用：按名称查 id，不存在时返回 0（不报错、不警告）。
 template <typename MapType>
 int idOrZero(const MapType& values, const std::string& name)
 {
@@ -586,6 +672,11 @@ int idOrZero(const MapType& values, const std::string& name)
 
 // A primitive building always creates wall and roof meshes. A single schema
 // binding applies to both; the optional second binding overrides the roof.
+// 作用：规整基元建筑实体——把墙/屋顶双绑定补齐为两项，并在需要时从位置文件读取实例。
+// 位置文件每行 3–5 个数：x y z [scale [rotation]]，缺省 scale=1、rotation=0
+// （rotation 单位待核对）；非法行、scale≤0 或无实例都抛异常。
+// 副作用：重写 entity 的 meshNames/spectralNames/canopyNames/propNames 及
+// primDistributions/scales/rotations（后两者与实例数对齐，缺省补 1 与 0）。
 void preparePrimitiveBuilding(PrimEntity& entity)
 {
     if (entity.meshNames.empty() || entity.meshNames.size() > 2)
@@ -625,6 +716,12 @@ void preparePrimitiveBuilding(PrimEntity& entity)
     entity.rotations.resize(entity.primDistributions.size(), 0.0f);
 }
 
+// 以下四个结构用于“异质性体元（HEX）”的世界体元混合累加：
+//   RotatedHexContribution：单个实例（已按实例旋转）对一个世界体元的贡献——三个轴向的
+//     投影面积、投影覆盖位掩码（sampleN×sampleN 像素，每像素 1 位）、rho、采样分辨率；
+//   HexCategoryAccum：同一世界体元内按（类型、光谱、热属性）分类累加的投影面积/掩码/rho；
+//   HexWorldAccum：一个世界体元的汇总（各类别 + 三轴联合掩码 + 关联的体元链接下标）；
+//   HexMixAccumulator：世界体元坐标 → HexWorldAccum 的表，由 finalizeHexMixtures 消费。
 struct RotatedHexContribution {
     std::array<float, 3> projectedArea{{0.0f, 0.0f, 0.0f}};
     std::array<std::vector<std::uint64_t>, 3> coverMask;
@@ -653,6 +750,7 @@ struct HexMixAccumulator {
     std::unordered_map<ObjVoxelCoord, HexWorldAccum, ObjVoxelCoordHash> cells;
 };
 
+// 作用：把 source 位掩码按位或并入 destination（必要时扩容，扩出部分补 0）。
 void orMask(std::vector<std::uint64_t>& destination,
             const std::vector<std::uint64_t>& source)
 {
@@ -660,6 +758,7 @@ void orMask(std::vector<std::uint64_t>& destination,
     for (std::size_t i = 0; i < source.size(); ++i) destination[i] |= source[i];
 }
 
+// 作用：统计位掩码中置 1 的位数（即被投影覆盖的像素数）。
 std::uint64_t maskPopulation(const std::vector<std::uint64_t>& mask)
 {
     std::uint64_t result = 0;
@@ -672,6 +771,7 @@ std::uint64_t maskPopulation(const std::vector<std::uint64_t>& mask)
     return result;
 }
 
+// 作用：把第 pixel 个像素置 1；掩码为空时按 pixelCount 一次性分配（64 像素/字）。
 void setMaskPixel(std::vector<std::uint64_t>& mask, std::size_t pixel,
                   std::size_t pixelCount)
 {
@@ -679,6 +779,10 @@ void setMaskPixel(std::vector<std::uint64_t>& mask, std::size_t pixel,
     mask[pixel / 64U] |= std::uint64_t{1} << (pixel % 64U);
 }
 
+// 作用：把 OBJ 体元化得到的一个异质体元结果绕竖直轴（y）旋转 90° 的整数倍，
+//       以匹配建筑等实例的旋转。输入：source（三轴投影面积与覆盖掩码）、sampleN（投影
+//       掩码边长）、rotationDegrees（度）；输出：旋转后的三轴面积、掩码与 rho。
+// 说明：每转 90° 做 (x,z)→(z,N-1-x)；奇数次转动使 x、z 两个轴向的投影互换，y 向不变。
 RotatedHexContribution rotateHexContribution(const hexvoxel::VoxelResult& source,
                                               int sampleN, float rotationDegrees)
 {
@@ -686,6 +790,7 @@ RotatedHexContribution rotateHexContribution(const hexvoxel::VoxelResult& source
     result.rho = source.hex.rho;
     result.sampleN = sampleN;
     // DEFERRED[中] 物理: 旋转角被四舍五入到 90° 的整数倍，非 90° 倍数的实例旋转（如 30°、45°）在异质体元投影掩膜/消光系数中被静默当作 0° 或 90°，而几何本身按真实角度旋转，二者不一致；建议：非 90° 倍数时报警告/错误，或对任意角度重新投影。
+    // 转动次数取负号（与几何旋转方向一致）并折回 0..3。
     const int turns = static_cast<int>(std::llround(-rotationDegrees / 90.0f)) & 3;
     const std::size_t pixelCount = static_cast<std::size_t>(sampleN) * sampleN;
 
@@ -699,6 +804,8 @@ RotatedHexContribution rotateHexContribution(const hexvoxel::VoxelResult& source
         return std::array<int, 2>{{x, z}};
     };
 
+    // 对每个投影轴：面积搬到旋转后对应的轴；掩码逐像素还原为体元内 (x,y,z) 平面坐标，
+    // 旋转 (x,z) 后再投影到目标轴的 (u,v) 平面。轴 0/1/2 的像素坐标分别为 (y,z)/(x,z)/(x,y)。
     for (int sourceAxis = 0; sourceAxis < 3; ++sourceAxis) {
         const int destinationAxis = (turns & 1) != 0
             ? (sourceAxis == 0 ? 2 : (sourceAxis == 2 ? 0 : 1))
@@ -730,6 +837,9 @@ RotatedHexContribution rotateHexContribution(const hexvoxel::VoxelResult& source
     return result;
 }
 
+// 作用：把一个实例的贡献并入世界体元 coord 的累加器。
+// 说明：类别键为（类型、光谱 id、热属性 id）；面积与 rho 直接相加，覆盖掩码按位或
+//       （同类别、以及三轴联合 unionMask），所以重叠的遮挡不会被重复计数。
 void addHexContribution(HexMixAccumulator& accumulator, const ObjVoxelCoord& coord,
                         const std::vector<int>& linkIndices,
                         const RotatedHexContribution& contribution,
@@ -764,6 +874,14 @@ void addHexContribution(HexMixAccumulator& accumulator, const ObjVoxelCoord& coo
     }
 }
 
+// 作用：把累加结果落成 GPU 使用的异质体元描述符（VoxelHex）及混合材质，写入 modelio。
+// 输入：accumulator（各世界体元的类别累加）、modelio（含 meshio/instanceio/voxelio）。
+// 输出（副作用）：voxelio->voxelHexs 追加描述符；对应 voxellinks 写入 hexId；
+//       多类别体元追加合成光谱/热属性/MeshLink/InstanceLink 并改写 voxellinks.instanceId。
+// 步骤：1 按坐标排序（确定性）；2 可选读取 HEX LOD 表（环境变量 HISTREAM_HEX_LOD_TABLE）；
+//       3 逐体元计算三轴覆盖、rho、消光系数 CI 与邻居间隙相关量；
+//       4 多类别体元取贡献最大的两类，按 1/1024 量化权重合成光谱与热属性。
+// 说明：体元边长须各向同性（stepsize_surface == stepsize_height）。
 template <typename ModelIO>
 void finalizeHexMixtures(HexMixAccumulator& accumulator,
                          const std::shared_ptr<ModelIO>& modelio)
@@ -778,6 +896,7 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
     const std::size_t fixedBands = baseMaterialCount > 0
         ? meshio->fixedSpectrals.size() / baseMaterialCount : 0U;
 
+    // 步骤 1：unordered_map 遍历顺序不确定，按体元坐标排序后处理，保证输出可复现。
     std::vector<HexWorldAccum*> ordered;
     ordered.reserve(accumulator.cells.size());
     for (auto& entry : accumulator.cells) ordered.push_back(&entry.second);
@@ -787,6 +906,7 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
         return left->coord.z < right->coord.z;
     });
 
+    // 统计量：含多个类别、需要合成材质的世界体元个数（最后打印）。
     std::size_t mixedCategoryCells = 0;
     // VoxelEB has 2002 fixed bands. Quantising the two-class weight permits
     // identical mixtures to share one material instead of duplicating a full
@@ -795,6 +915,11 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
 
     // Optional HEX mipmap hierarchy.  Each table contains all levels for
     // every parent voxel; level 0 is 1^3 and each following level doubles.
+    // 步骤 2：可选读取 LOD 表。文件格式 HEX_LOD_V1：
+    //   头：magic、parentSize（须等于体元边长）、levelCount（1..6）、rootCount；
+    //   然后 levelCount 个每边细分数 n（首层 1，之后每层翻倍，≤32）；
+    //   然后每个根体元：坐标 x y z，及 Σ n³ 个细胞，每个细胞 4 个非负数 {ax,ay,az,rho}。
+    //   根体元数必须与场景中的异质体元数一致；总条目数需小于 1600 万（GPU 索引容量）。
     std::map<std::tuple<int, int, int>, std::vector<hexprojection::Cell>> hierarchy;
     std::vector<int> lodDivisions;
     if (const char* path = std::getenv("HISTREAM_HEX_LOD_TABLE")) {
@@ -850,6 +975,7 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
             throw std::runtime_error("HEX LOD root count does not match scene");
         }
     }
+    // 环境变量 HISTREAM_HEX_CONE 目前只支持 "lod"，且必须同时提供 LOD 表。
     if (const char* cone = std::getenv("HISTREAM_HEX_CONE")) {
         if (std::string(cone) != "lod") {
             throw std::runtime_error("HISTREAM_HEX_CONE currently supports lod");
@@ -859,11 +985,15 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
                 "HISTREAM_HEX_CONE=lod requires HISTREAM_HEX_LOD_TABLE");
         }
     }
+    // 步骤 3：逐世界体元生成描述符。
     for (HexWorldAccum* world : ordered) {
         if (world->categories.empty() || world->linkIndices.empty()) continue;
         const double pixelCount = static_cast<double>(world->sampleN) * world->sampleN;
         std::array<double, 3> totalCover{{0.0, 0.0, 0.0}};
         std::array<double, 3> totalProjected{{0.0, 0.0, 0.0}};
+        // 3a：按轴统计联合覆盖率 totalCover（像素占比）、各类别覆盖率与投影面积；
+        //     类别的“光学贡献”= 联合覆盖 × 该类别覆盖占各类别覆盖之和的比例（三轴累加），
+        //     用于后面混合多类别的光谱权重。
         std::vector<double> opticalContribution(world->categories.size(), 0.0);
         double rho = 0.0;
 
@@ -893,6 +1023,9 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
         }
         for (const HexCategoryAccum& category : world->categories) rho += category.rho;
 
+        // 3b：消光系数 CI 初值（Beer–Lambert：-ln(间隙)/投影面积，间隙下限 0.5/像素数 以避免 log(0)）。
+        //     model=10 为该描述符的类型编号（含义待核对）；rho 为各类别 rho 之和。
+        //     未使用 LOD 表时 CI 随后由 hexneighbors::axisQ 重新计算覆盖。
         VoxelHex mixed{};
         mixed.model = 10;
         mixed.rho = static_cast<float>(std::max(rho, 0.0));
@@ -911,6 +1044,9 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
         // Use the same discrete projection that produced the masks for the
         // current-scale descriptor, then retain pairwise gap correlation at
         // each of the six voxel faces.
+        // 3c：无 LOD 表时：用位掩码计算沿轴消光系数 axisQ，并对六个面各求与相邻体元的间隙
+        //     相关量 beta，写入 children 的前两行（face = axis*2+sign，存于 children[face/3][face%3]）；
+        //     相邻体元的采样分辨率 sampleN 必须一致，否则抛异常。
         const float cellSize = modelio->stepsize_surface;
         if (std::abs(cellSize - modelio->stepsize_height) > 1.0e-5f) {
             throw std::runtime_error("Heterogeneous HEX requires cubic voxels");
@@ -944,6 +1080,7 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
             }
         }
 
+        // 3d：登记描述符；之后有 LOD 表时把它改写为 LOD 根节点并追加各层子节点。
         const int hexId = static_cast<int>(voxelio->voxelHexs.size());
         voxelio->voxelHexs.emplace_back(mixed);
 
@@ -953,6 +1090,9 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
             if (found == hierarchy.end()) {
                 throw std::runtime_error("HEX LOD table missing parent voxel");
             }
+            // LOD 根节点（model=5）：a=最细层索引、b=层数（含义待核对）；
+            // 各层子细胞为 model=6 的节点，ax/ay/az/rho 取自 LOD 表；
+            // 六个面的 beta 存于 children[6]、children[7]（由 overlapLogRatio 用最细层网格计算）。
             auto& root = voxelio->voxelHexs[hexId];
             root.model = 5;
             root.a = static_cast<float>(lodDivisions.size() - 1);
@@ -1005,6 +1145,7 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
                 }
             }
 
+            // 逐层写子节点：children[level] = {该层首节点的下标, 每边细分数 n, 1/n, 0}。
             std::size_t source = 0;
             for (std::size_t level = 0; level < lodDivisions.size(); ++level) {
                 const int n = lodDivisions[level];
@@ -1024,6 +1165,7 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
                 }
             }
         }
+        // 把描述符 id 回写给该世界体元对应的体元链接（越界下标忽略）。
         for (int linkIndex : world->linkIndices) {
             if (linkIndex >= 0
                 && linkIndex < static_cast<int>(voxelio->voxellinks.size())) {
@@ -1031,6 +1173,8 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
             }
         }
 
+        // 步骤 4：多类别体元合成材质。单类别无需合成；以下只保留贡献最大的两个类别。
+        // 4a：优先使用光学贡献；其和≈0 时退回投影面积，仍≈0 则等权。
         if (world->categories.size() == 1U || sensorBands == 0U) continue;
         ++mixedCategoryCells;
         double contributionSum = 0.0;
@@ -1048,6 +1192,8 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
             contributionSum = static_cast<double>(opticalContribution.size());
         }
 
+        // 4b：取贡献最大的两类（stable_sort 保证并列时顺序稳定），主类权重量化为 n/1024，
+        //     副类为 1024-n；单类时副类即主类。
         std::vector<std::size_t> retained(world->categories.size());
         std::iota(retained.begin(), retained.end(), 0U);
         std::stable_sort(retained.begin(), retained.end(),
@@ -1070,6 +1216,8 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
         opticalContribution[dominant] = static_cast<double>(firstWeight);
         opticalContribution[secondary] = static_cast<double>(1024 - firstWeight);
         contributionSum = 1024.0;
+        // 4c：相同（主/副光谱、主/副热属性、量化权重）的混合共用一个合成材质，避免为每个世界体元
+        //     复制一整条光谱。
         const auto cacheKey = std::make_tuple(
             world->categories[dominant].spectralId,
             world->categories[secondary].spectralId,
@@ -1083,6 +1231,8 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
             compositeSpectralId = cached->second.first;
             compositeThermalId = cached->second.second;
         } else {
+            // 4d：按权重混合各波段的反射率/透射率；反射率限幅 [0,1]，透射率限幅 [0,1-反射率]
+            //     以保证能量守恒。随后对固定波段 fixedSpectrals 做同样处理。
             compositeSpectralId = static_cast<int>(
                 meshio->spectrals.size() / sensorBands);
             for (std::size_t band = 0; band < sensorBands; ++band) {
@@ -1118,6 +1268,7 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
                     meshio->fixedSpectrals.push_back(Spectral{refl, trans});
                 }
             }
+            // 4e：混合热属性（向阳/背阴温度）；只有至少一个类别有有效热属性时才创建。
             if (!meshio->thermals.empty()) {
                 double sunlit = 0.0, shaded = 0.0, thermalWeight = 0.0;
                 for (std::size_t i : retained) {
@@ -1142,6 +1293,7 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
                                                   compositeThermalId));
         }
 
+        // 4f：以主类为模板创建合成 MeshLink 与 InstanceLink，并把体元链接改指向合成实例。
         MeshLink composite = world->categories[dominant].prototype;
         composite.spectralId = compositeSpectralId;
         if (compositeThermalId >= 0) {
@@ -1161,12 +1313,23 @@ void finalizeHexMixtures(HexMixAccumulator& accumulator,
         }
     }
 
+    // 汇总日志：世界体元数、混合类别体元数、共享的混合材质数、描述符总数。
     std::cout << "Heterogeneous voxel merge: cells=" << ordered.size()
               << " mixed-categories=" << mixedCategoryCells
               << " shared-mixtures=" << compositeCache.size()
               << " descriptors=" << voxelio->voxelHexs.size() << std::endl;
 }
 
+// 作用：把一个 OBJ 实体（PrimEntity）体元化并按放置点写入体元场景（VoxelRT/VoxelEB 共用）。
+// 输入：entity（OBJ 文件、网格名、类型、光谱/热/冠层绑定、放置点/缩放/旋转）、
+//       nanoBuilder（NanoVDB 体元索引）、modelio、background（DEM 地形）、
+//       mixAccumulator（非空时累加异质体元贡献）。
+// 输出：true；副作用——meshio 追加代理网格与 MeshLink，instanceio 追加实例，
+//       voxelio 追加 VoxelLink，NanoVDB 写入“世界格 → VoxelLink 下标”。
+// 坐标：OBJ、体元、Three.js 一致为 +X 北、+Y 上、+Z 东；位置文件的 (x,y,z) 为
+//       (北, 东, 高)，对应体元 (x, z, y)。
+// 步骤：1 读 OBJ、按属性网格体元化；2 可选提取异质体元；3 登记网格与链接；
+//       4 逐放置点用逆映射填世界格；5 为旋转/缩放放置点重建世界对齐代理网格。
 template <typename ModelIO>
 bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
                            nanovdb::GridBuilder<int32_t>& nanoBuilder,
@@ -1185,6 +1348,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
         throw std::runtime_error("OBJ has no triangles for voxelization: " + entity.objFile);
     }
 
+    // 步骤 1：属性网格（propertyMesh）划分。meshNames 多于 1 个时每个名字是独立网格，各自绑定
+    // 光谱/热/冠层；否则整份 OBJ 作为一个网格（旧版单绑定建筑预留两个槽，放置阶段只用第 1 个，待核对）。
     const bool separateMeshes = entity.meshNames.size() > 1U;
     const bool legacyBuildingFaces = !separateMeshes
         && entity.type == Type::BUILDING;
@@ -1217,11 +1382,14 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             && (separateMeshes || buildingShell.empty()))
             buildingShell.push_back(&sourceMeshes[meshIndex]);
     }
+    // 所有建筑网格合成一个封闭实体索引，用于统一表面法向朝外（墙体单独时没有屋顶封闭）。
     const SolidClosureIndex buildingClosure(buildingShell, 1.0f / modelio->stepsize_surface);
     for (size_t meshIndex = 0; meshIndex < propertyMeshCount; ++meshIndex) {
         const ObjMesh& sourceMesh = sourceMeshes[meshIndex];
         if (sourceMesh.indices.empty()) continue;
 
+        // 逐属性网格体元化：建筑/土壤/水体为不透明（输出面元法向）；土壤与水体为“地面”。
+        // 只有建筑使用封闭实体索引定向法向。
         size_t rejectedVoxelCount = 0;
         const Type propertyType = meshIndex < entity.types.size() ? entity.types[meshIndex] : entity.type;
         const bool opaque = propertyType == Type::BUILDING || propertyType == Type::SOIL || propertyType == Type::WATER;
@@ -1262,6 +1430,9 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
         }
     }
 
+    // 步骤 2：异质性体元（HEX）提取。读取完整 OBJ 的面元，按网格名切出各属性网格的三角形，
+    // 用 hexvoxel::compute 得到每个体元的三轴投影与覆盖掩码；lookup 为扁平格下标 → 结果下标。
+    // 提取失败只打印错误，退回均质体元。
     struct HexMeshSource {
         hexvoxel::HexScene scene;
         hexvoxel::HexResult result;
@@ -1336,6 +1507,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
         }
     }
 
+    // 作用：把属性网格 meshIndex 的局部体元 localVoxel 映射到 HEX 结果格（减去网格原点），
+    //       取其投影并按实例旋转后写入 output；该格不存在或未提取则返回 false。
     auto heterogeneousContribution = [&](size_t meshIndex,
                                          const glm::ivec3& localVoxel,
                                          float rotationDegrees,
@@ -1375,6 +1548,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
     // OBJ、体素和 Three.js 均使用 +X 北、+Y 上、+Z 东。
     // 传统的 createTriEntity 使用 X/Z/Y（Z 为高度），不能再调用
     // XYZ2XZY，否则会把 OBJ 的高度轴 Y 换到水平轴 Z。
+    // 步骤 3：为每个非空属性网格登记 PrimMesh 与 MeshLink（光谱必填；热/冠层/生化属性可选，
+    // 水体不设冠层；生化属性表按类型取叶片、水或土壤）。
     std::vector<int> meshIdByProperty(propertyMeshCount, -1);
     int addedMeshCount = 0;
     for (const size_t meshIndex : activeMeshIndices) {
@@ -1405,6 +1580,7 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
     }
 
     if (entity.isdisFromFile) {
+        // 放置点来自文件时，覆盖实体上的位置/缩放/旋转。
         const auto records = Utils::readPositionFile(entity.distributefile);
         entity.primDistributions.resize(records.size());
         entity.scales.resize(records.size());
@@ -1419,6 +1595,7 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
     // Placed instances map world cells back into the object's voxelization
     // (inverse mapping): a rotated or scaled object fills every cell it
     // covers instead of scattering its unit-scale voxels with gaps.
+    // 步骤 4 准备：每个属性网格建“局部体元坐标 → 局部下标”表及局部包围盒。
     std::vector<std::unordered_map<ObjVoxelCoord, size_t, ObjVoxelCoordHash>>
         localVoxelLookup(propertyMeshCount);
     std::vector<std::pair<glm::vec3, glm::vec3>> localBounds(propertyMeshCount);
@@ -1441,6 +1618,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
         localBounds[meshIndex] = {lower, upper};
     }
 
+    // sceneHalf：场景水平半尺寸（体元数，四舍五入），实例变换平移 -sceneHalf 使场景中心在原点；
+    // sceneVoxelHeight：场景高度方向的体元层数，用于越界裁剪。
     const glm::ivec3 sceneHalf{
         static_cast<int>(std::floor(modelio->voxelSize_XZY.x / 2.0f + 0.5f)),
         0,
@@ -1464,6 +1643,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
     std::vector<std::vector<glm::ivec3>> worldProxyOrder(propertyMeshCount);
     size_t worldProxyPlacements = 0;
 
+    // 步骤 4：逐放置点（placement）处理。gridShift 为放置点所在世界格（x=北、y=高度+地形抬升、
+    // z=东）；地形抬升取放置点处 DEM 相对高度并取整到体元数。
     for (size_t placementIndex = 0;
          placementIndex < entity.primDistributions.size(); ++placementIndex) {
         const glm::vec3 placement = entity.primDistributions[placementIndex];
@@ -1479,6 +1660,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             static_cast<int>(std::floor(placement.z / modelio->stepsize_surface)) + terrainHeight,
             static_cast<int>(std::floor(placement.y / modelio->stepsize_surface))};
 
+        // 实例变换 = 平移 × 绕 y 轴旋转（-rotation 度，与 createObjScene 一致）× 均匀缩放。
+        // 旋转或缩放过的放置点（worldAlignedProxy）不使用共享的局部代理网格（meshId=-1）。
         const glm::mat4 unit(1.0f);
         const glm::mat4 rotation = glm::rotate(
             unit, glm::radians(-rotationValue), glm::vec3(0.0f, 1.0f, 0.0f));
@@ -1508,6 +1691,7 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             ++addedInstanceCount;
         }
 
+        // 4a：统计量——新写入格数、与已有格重叠数、被场景边界裁掉的格数。
         size_t insertedForPlacement = 0;
         size_t overlappedForPlacement = 0;
         size_t clippedForPlacement = 0;
@@ -1518,6 +1702,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             const std::vector<float>& leafDensities = propertyLeafDensities[meshIndex];
             const auto& lookup = localVoxelLookup[meshIndex];
             if (lookup.empty()) continue;
+            // 4b：逆映射。把局部包围盒的 8 个角变换到世界格范围，再遍历范围内每个世界格，
+            //     由格中心反变换回局部体元坐标，查表得到对应局部体元。
             const glm::mat4 localToGrid = rotation * scale;
             const glm::mat4 gridToLocal = glm::inverse(localToGrid);
             glm::vec3 gridLower(std::numeric_limits<float>::max());
@@ -1534,6 +1720,7 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             const glm::ivec3 cellLower(glm::floor(gridLower));
             const glm::ivec3 cellUpper(glm::ceil(gridUpper));
             // DEFERRED[中] 物理: 植被（介质）逆映射只取世界格中心对应的单个局部体元；对非 90° 旋转或 scale<1 的实例，单体元厚的叶片层会因中心点落在相邻空格而出现漏格，scale<1 时多个局部体元合并为一格也只计其中一个的叶面积；建议：按叶面积守恒做多点超采样或正向光栅化三角形到世界网格。（不透明网格的对角缝已闭合，见下。）
+            // 作用：把世界格内一点反变换到局部坐标，返回其所在局部体元（找不到则 end()）。
             auto findLocal = [&](const glm::vec3& gridPoint) {
                 const glm::vec3 localPoint(gridToLocal * glm::vec4(gridPoint, 1.0f));
                 return lookup.find(ObjVoxelCoord{
@@ -1543,6 +1730,7 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             };
             // Centre test: the world cell takes the local voxel its centre
             // maps into.
+            // picks：被选中的（世界格, 局部体元下标）列表。
             std::vector<std::pair<glm::ivec3, size_t>> picks;
             for (int cellY = cellLower.y; cellY < cellUpper.y; ++cellY)
             for (int cellZ = cellLower.z; cellZ < cellUpper.z; ++cellZ)
@@ -1561,6 +1749,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
             // the object), so the shell stays face-connected and opaque, as
             // the unrotated shell is. Unrotated, unscaled placements keep the
             // centre test.
+            // 4c：不透明网格补缝（原因见上文）：对只沿棱相接的对角台阶格，在两个相邻面格中
+            //     挑 2×2×2 子采样点落入物体更多的一个补上，使外壳保持面连通。
             if (worldAlignedProxy && propertyOpaque[meshIndex] && !picks.empty()) {
                 std::unordered_map<ObjVoxelCoord, size_t, ObjVoxelCoordHash> picked;
                 picked.reserve(picks.size() * 2);
@@ -1608,6 +1798,10 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
                     }
                 }
             }
+            // 4d：把选中的世界格写入体元场景。越出场景范围的格计入 clipped 并跳过。
+            //     leafDensity 随实例缩放 k 除以 k（面元面积 ×k²，分布到 k³ 个世界格）；
+            //     格子尚无体元则新建 VoxelLink（法向仅不透明网格有，地面法向不允许朝下），
+            //     已被占用则只累加叶面积密度（先写入者的类型保持不变）。
             for (const auto& pick : picks) {
                 const glm::ivec3 cell = pick.first;
                 const size_t localIndex = pick.second;
@@ -1676,6 +1870,7 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
                     }
                 }
 
+                // 异质体元：把该实例的 HEX 贡献并入世界格累加器（稍后由 finalizeHexMixtures 汇总）。
                 if (hasContribution && !linkIndices.empty()) {
                     addHexContribution(
                         *mixAccumulator, worldCoord, linkIndices, contribution,
@@ -1699,6 +1894,8 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
     for (const size_t meshIndex : activeMeshIndices) {
         const auto& cells = worldProxyOrder[meshIndex];
         if (cells.empty()) continue;
+        // 步骤 5：为每个属性网格由实际填充的世界格重建一个平移变换的代理网格，
+        //     并合并共享顶点（角点坐标 ×2 取整作为键）；对应的实例只含这一个网格。
         PrimMesh proxy = designer.createTriVoxels(cells, propertyOpaque[meshIndex]);
         if (proxy.indices.empty()) continue;
         {
@@ -1755,6 +1952,14 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
 
 } // namespace
 
+// 模块：RayTracing 模式的 OBJ 场景构建。
+// 作用：生成背景网格（平地、网格化平地或 DEM 地形）与各 OBJ 对象的网格、实例，
+//       写入 raytracingio 的 meshio（objMeshes/meshLinks）与 instanceio（instances/instanceLinks）。
+// 输入：fileio 中的 RaytracingXml 场景配置（背景、objEntities 及其放置点/缩放/旋转）。
+// 坐标：配置里场景尺寸 (x,y,z) = (长, 宽, 高)；实例世界坐标取 (x-X/2, 高度, y-Y/2)，
+//       即水平居中、y 向上；旋转为绕 y 轴 -angle 度。
+// 步骤：1 记录场景尺寸；2 建背景网格/链接/实例；3 逐 OBJ 实体读放置点；
+//       4 逐网格建 MeshLink，逐放置点建实例与实例链接。
 bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<RaytracingIO> &raytracingio) {
 
 
@@ -1763,6 +1968,7 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
     float z = fileio->m_pRaytracingXml->scenexml.background.sceneSize.z; // height
 /*    raytracingio->sMin = glm::vec3(-x / 2.0, 0, -y / 2.0);
     raytracingio->sMax = glm::vec3(x / 2.0, z, y / 2.0);*/
+    // 步骤 1：sceneSize 为 (长, 宽, 高)；voxelSize 此处借用为 (x, 高, y) 的顺序（XZY）。
     raytracingio->sceneSize = glm::vec3(x,y,z);
     raytracingio->sceneOrigin = fileio->m_pRaytracingXml->scenexml.background.sceneOrigin;
 
@@ -1782,6 +1988,9 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
     //-------------------------
     //-- Background Mesh
     //-------------------------
+    // 步骤 2：背景网格。有 DEM 时由 DEM 生成地形网格并导出 dem.obj 到工程目录，
+    // 后续放置点的高度将插值到该地形（isInterp）；否则按背景光谱是否启用物理纹理，
+    // 选择细分网格背景（纹理需要）或单个平面。
     if(scenexml.background.isDEM) {
         loader.creatBackgroundFromDEM(
             scenexml.background.DEMFile,
@@ -1802,6 +2011,7 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
             loader.createBackground(scenexml.background.sceneSize);
     }
     //n_modelmesh = 0;
+    // n_modelmesh：已登记的网格计数，同时是下一个网格的 meshId（背景为 0）。
     int & n_modelmesh = raytracingio->n_modelmesh;
     loader.m_objmesh.meshId = n_modelmesh;
     meshio->objMeshes.emplace_back(loader.m_objmesh);
@@ -1862,6 +2072,8 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
     //-------------------------
     //-- Obj Models
     //-------------------------
+    // 步骤 3：逐 OBJ 实体处理放置点——来自文件、或缺省的场景中心单个实例；
+    // 有 DEM 时把放置点高度（z）插值到地形上。位置约定：x=北、y=东、z=高。
     int n_obj = fileio->m_pRaytracingXml->scenexml.objEntities.size();
     for (int kobj = 0; kobj < n_obj; kobj++)
     {
@@ -1904,6 +2116,8 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
             }
         }
 
+        // 步骤 4：逐网格名加载网格（空网格跳过）、建 MeshLink（光谱必填；热属性名找不到则取 0），
+        // 再为每个放置点生成实例：变换 = 平移 × 绕 y 轴旋转 × 缩放，实例链接指向同一网格。
         std::string fileName = objEntity.filePath;
         std::string objName = objEntity.objName;
         int n_mesh = objEntity.meshNames.size();
@@ -2008,6 +2222,13 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
 //--- primMeshes, meshlink, instance, instanceLink, nanovdb, voxellink
 //------------------------------------------------------------
 
+// 模块：VoxelEB（体元能量平衡）场景构建入口。
+// 输入：fileio->m_pVoxelebXml 中的背景（Background）与基元实体列表（primEntities）；
+// 输出：voxellstio 中的 primMeshes / meshLinks / instances / instanceLinks / voxellinks，
+//       以及把体元编号写入的 NanoVDB 稀疏网格（nanoHandle，空体元值 -1，其余为 voxel 序号）。
+// 步骤：1) 建背景（地面/DEM）体元；2) 逐实体按类型分派：OBJ 体素化、树冠（单个形状或文件
+//       形状）、建筑、水体；3) 异质体元模式下合并同一网格的多类别混合（HexMix）；4) 导出网格句柄。
+// 说明：VoxelRT 版本（下文同名重载）流程相同，只是 IO 类型不同。
 bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &voxellstio) {
 
 
@@ -2024,6 +2245,7 @@ bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
     /// ------------------------------------
     /// Background
     ///-------------------------------------
+    // 步骤 1：先建背景体元，使后续实体可用 NanoVDB 网格判断占用并叠加在地面之上。
     createPrimObj_Background(background, nanoBuilder, voxellstio);
 
     /// ------------------------------------
@@ -2031,6 +2253,7 @@ bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
     ///-------------------------------------
     for (int kVoxelModel = 0; kVoxelModel < scenexml.primEntities.size(); kVoxelModel++)
     {
+        // 步骤 2：逐基元实体建体元；voxelizeFromObj 的实体走 OBJ 三角网体素化路径，其余按类型处理。
         auto &voxelEntity = scenexml.primEntities[kVoxelModel];
 
         if (voxelEntity.voxelizeFromObj) {
@@ -2058,6 +2281,7 @@ bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
         }
 
     }
+    // 步骤 3：异质体元模式下，把各实体累积的体元内多类别混合信息写入 meshLink / 体元数据。
     if (voxellstio->heterogeneousVoxel) {
         finalizeHexMixtures(hexMixtures, voxellstio);
     }
@@ -2067,6 +2291,14 @@ bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
     return true;
 }
 
+// 模块：VoxelEB 基元“单一形状”实体（树冠/水体/火雾等）的体元化。
+// 作用：由 voxelEntity.shape 生成基元网格（VoxelDesigner::createTriEntity），登记网格与材质绑定，
+//       再对每个放置点生成实例，把形状内的体元写入 NanoVDB 网格（值 = 体元序号，-1 表示空）。
+// 输入：基元实体（形状、放置位置/文件、缩放、旋转、各类绑定名）、背景（DEM 取地面高度）；
+// 输出：modelio 的 primMeshes/meshLinks/instances/instanceLinks/voxellinks 与计数器
+//       n_modelmesh / n_instance / n_voxel；返回 true。
+// 坐标：形状先由 XYZ 转为 XZY（第二轴为高度，见 XYZ2XZY）；体元索引为整数格点，
+//       步长 stepsize_surface（水平）；放置点单位为米（待核对：与 DEM 同一坐标系）。
 bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<int32_t> &nanoBuilder,std::shared_ptr<VoxelebIO> &modelio, const Background& background){
 
     auto acc = nanoBuilder.getAccessor();
@@ -2088,6 +2320,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
     // std::string aeroName = voxelEntity.aeroNames[0];
 
 
+    // 步骤 1：生成形状网格并转为 XZY 轴序，登记为新的 primMesh（meshId = 当前 n_modelmesh）。
     PrimMesh currentVoxelModelXYZ1;
     currentVoxelModelXYZ1 = loader.createTriEntity(shape, modelio->stepsize_surface);
     PrimMesh currentVoxelModel1 = XYZ2XZY(currentVoxelModelXYZ1, 0); // (1,1,0) => (1,0,1) with  height = 0
@@ -2096,6 +2329,8 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
 
     currentVoxelModel1.meshId = n_modelmesh;
     meshio->primMeshes.emplace_back(currentVoxelModel1); //xzy
+    // 步骤 2：建立 MeshLink：光谱绑定必须存在（缺失抛异常），热/冠层/生化绑定缺失时回退到 0 号条目；
+    //       水体不使用冠层；bioId 按类型分别指向叶生化、土壤或水体参数集。
     MeshLink meshlink1{};
     meshlink1.spectralId = requiredMappedId(meshio->spectralNames,
                                     voxelEntity.spectralNames, 0, "spectral");
@@ -2117,6 +2352,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
     meshlink1.type = (int) type;
     meshio->meshLinks.emplace_back(meshlink1);
 
+    // 火/雾等“参与介质”由冠层 structureType 为 2 或 3 标识（待核对：各编号含义见 Canopy 定义）。
     const Canopy* mediumCanopy = meshlink1.canopyId >= 0 &&
         static_cast<size_t>(meshlink1.canopyId) < meshio->canopies.size()
         ? &meshio->canopies[meshlink1.canopyId] : nullptr;
@@ -2125,6 +2361,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
 
 
 
+    // 步骤 3：放置点来自文件时读入位置记录；基元树冠不支持逐点缩放/旋转，统一为 1 / 0。
     if(voxelEntity.isdisFromFile == true){
         // Primitive crowns are placed unscaled and unrotated.
         const auto records = Utils::readPositionFile(voxelEntity.distributefile);
@@ -2141,6 +2378,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
 
     voxelEntity.scales.resize(voxelEntity.primDistributions.size(), 1.0f);
     voxelEntity.rotations.resize(voxelEntity.primDistributions.size(), 0.0f);
+    // 步骤 4：逐放置点建实例并插入体元；没有新增任何体元的实例会在循环内被撤销。
     for (int kinstance = 0; kinstance < voxelEntity.primDistributions.size(); kinstance++) {
         // voxel instance1��change postion,
 
@@ -2151,6 +2389,8 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
             (isParticipatingMedium ? shape.length * 0.5f : 0.0f);
         const float originGroundY = placement.y -
             (isParticipatingMedium ? shape.width * 0.5f : 0.0f);
+        // 火/雾等参与介质的放置点是水平中心，需减去半个形状尺寸得到最小角点；
+        // 其他基元的放置点本身即最小角点。shift0 为 XZY 轴序的整数格点位移（水平、高度、水平）。
         glm::ivec3 shift0;
         // DEFERRED[中] 数值: float→int 隐式截断是向零取整，负坐标（如火/雾中心减半宽后 originX<0）会偏移一格，与 OBJ 路径使用的 std::floor 不一致；且 placement.z 与 DEM 高度相加后按 stepsize_surface 而非 stepsize_height 换算；建议：显式 std::floor，高度轴使用 stepsize_height。
         shift0 = {originX / modelio->stepsize_surface,
@@ -2161,6 +2401,8 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
         ///-----------------------------------------------------------------------------
         ///
         ///------------------------------------------------------------------------------
+        // semiRange：场景水平半宽（体元数，四舍五入），实例矩阵的平移由此移到以场景中心为原点
+        // （待核对：与 NanoVDB 索引原点的对应关系）。
         glm::ivec3 semiRange = glm::vec3{floor(modelio->voxelSize_XZY.x / 2.0+0.5), 0,
                                          floor(modelio->voxelSize_XZY.z / 2.0+0.5)};;
 
@@ -2191,6 +2433,8 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
         int occupiedVoxelCount = 0;
         int mediumVoxelCount = 0;
 
+        // 逐体元写入 NanoVDB：网格值 < 0 表示该格尚未被占用，写入新体元序号 n_voxel 并登记 VoxelLink；
+        // 已被占用的格保持原值（先到先得，不覆盖）。参与介质只保留落在介质形状内的体元。
         for (int kvoxel = 0; kvoxel < currentVoxelModel1.voxelIds.size(); kvoxel++) {
             // this is what we did in the shader;
             // glm::ivec3 pos =  mat * glm::vec4(currentVoxelModel.voxelIds[kvoxel],1.0);
@@ -2233,6 +2477,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
                       << " inserted=" << insertedVoxelCount
                       << " occupied=" << occupiedVoxelCount << '\n';
         }
+        // 该放置点没有写入任何新体元（全部被占用或被裁掉）：撤销刚创建的实例，不计入 n_instance。
         if (isValid == 0) {
             instanceio->instances.pop_back();
             instanceio->instanceLinks.pop_back();
@@ -2249,6 +2494,15 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
     return true;
 }
 
+// 模块：VoxelEB 基元“形状文件”实体（逐行一棵树冠/一个形状）的体元化。
+// 作用：读 voxelEntity.shapefile，每行定义一个形状，各自生成基元网格、MeshLink 和一个实例，
+//       并把形状内体元写入 NanoVDB 网格（值 = 体元序号，-1 表示空；先到先得，不覆盖）。
+// 输入：形状文件行 = 形状类型 高 宽 长 x y z（至少 7 列，多余列忽略），位置单位为米；
+//       背景（用于叠加 DEM 地面高度）；输出：modelio 的 primMeshes/meshLinks/instances/
+//       instanceLinks/voxellinks 与计数器 n_modelmesh/n_instance/n_voxel；返回 true。
+// 约定：形状类型只允许 0、1、2（ShapeType 编号）；非数值行、列数不足、类型越界或
+//       高/宽/长为负/非有限值都抛 runtime_error，不静默跳过。与单形状版本（Crown）相比：
+//       不缩放不旋转，热属性固定用 0 号条目，不区分水体。
 bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<int32_t> &nanoBuilder,std::shared_ptr<VoxelebIO> &modelio, const Background& background){
 
     auto acc = nanoBuilder.getAccessor();
@@ -2272,6 +2526,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
 
     // Rows: shapeType height width length x y z [scale rotation (unused)].
     size_t skippedShapeRows = 0;
+    // 步骤 1：读入并校验形状文件；有非数值行或列数不足时立即报错。
     const auto shapeRows = Utils::readNumericRows(voxelEntity.shapefile, "crown shape file", skippedShapeRows);
     if (skippedShapeRows > 0)
         throw std::runtime_error("Crown shape file has non-numeric rows: " + voxelEntity.shapefile);
@@ -2280,6 +2535,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
             throw std::runtime_error("Crown shape rows need 7 columns (type height width length x y z): " + voxelEntity.shapefile);
     }
 
+    // 步骤 2：逐行建形状：校验字段 → 生成网格 → 登记 MeshLink → 放置实例并写体元。
     for (size_t k = 0; k < shapeRows.size(); k++) {
         const auto& row = shapeRows[k];
 
@@ -2293,6 +2549,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
 
         PrimMesh currentVoxelModelXYZ1;
         currentVoxelModelXYZ1 = loader.createTriEntity(shape, modelio->stepsize_surface);
+        // mark = 1：轴序转换时同时保留逐体元的 isValids / faceIds（单形状版本用 mark = 0）。
         PrimMesh currentVoxelModel1 = XYZ2XZY(currentVoxelModelXYZ1, 1); // (1,1,0) => (1,0,1) with  height = 0
         currentVoxelModel1.meshId = n_modelmesh;
         meshio->primMeshes.emplace_back(currentVoxelModel1); //xzy
@@ -2300,6 +2557,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
             ? voxelEntity.primitiveName : voxelEntity.meshNames.front();
         MeshLink meshlink1{};
         meshlink1.spectralId = requiredMappedId(meshio->spectralNames, voxelEntity.spectralNames, 0, "spectral");
+        // 形状文件路径不读取热属性绑定，固定使用 0 号热属性条目。
         meshlink1.thermalId = 0;
         meshlink1.canopyId = mappedId(meshio->canopyNames, voxelEntity.canopyNames, 0, "canopy");
         if (type == Type::VEGETATION) {
@@ -2316,6 +2574,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
         // instance
 
 
+        // 步骤 3：每个形状只有一个实例（位置取自形状行的 x y z，水平位置叠加 DEM 地面高度）。
         for (int kinstance = 0; kinstance < 1; kinstance++) {
             // voxel instance1��change postion,
 
@@ -2330,6 +2589,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
             glm::ivec3 semiRange = glm::vec3{floor(modelio->voxelSize_XZY.x / 2.0+0.5), 0,
                                              floor(modelio->voxelSize_XZY.z / 2.0+0.5)};;
 
+            // 形状文件不支持缩放/旋转（第 8、9 列即使存在也不使用）。
             float scale0 = 1;
             float angle0 = 0;
             glm::vec3 shift = glm::vec3(shift0) - glm::vec3(semiRange);  // (5,0,5)
@@ -2395,7 +2655,18 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
     return true;
 }
 
+// 模块：VoxelEB 基元建筑的体元化（墙体 + 屋顶两套网格）。
+// 作用：生成墙体网格与屋顶网格（形状来自 shape 或高度栅格 heightfile），登记为两个 MeshLink
+//       （绑定序号 0 = 墙，1 = 屋顶），再对每个放置点创建墙/屋顶两个实例，并把建筑占据的体元
+//       写入 NanoVDB 网格。
+// 输入：基元建筑实体（shape 或 heightfile、放置点 primDistributions、缩放、旋转、绑定名）、背景；
+// 输出：modelio 的 primMeshes/meshLinks/instances/instanceLinks/voxellinks 与计数器；返回 true。
+// 约定：每个有建筑的体元在 voxellinks 中占连续 5 项：faceId 1..4 为墙面（属墙体实例），
+//       faceId 5 为屋顶（属屋顶实例，instanceId = 墙体实例 + 1）；每项的 isValid 取自网格的
+//       逐体元面有效标志；NanoVDB 中该格的值为这 5 项的首个序号。
+//       每个放置点占用 2 个实例编号，n_modelmesh 一次增加 2（所有放置点共用同一对网格）。
 bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder<int32_t> &nanoBuilder, std::shared_ptr<VoxelebIO> &modelio, const Background& background) {
+    // 步骤 1：规整绑定：单个绑定同时用于墙和屋顶，第二个绑定（如有）覆盖屋顶；位置来自文件（isdisFromFile）时读入并校验。
     preparePrimitiveBuilding(voxelEntity);
 
     auto acc = nanoBuilder.getAccessor();
@@ -2418,6 +2689,8 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
 
     PrimMesh currentVoxelModelXYZ1;
+    // 步骤 2：墙体网格：有高度栅格（TIF）时按栅格逐格建墙，否则按 shape 建长方体墙；
+    //       随后转为 XZY 轴序（mark = 1 保留逐体元的面有效标志）。
     if (voxelEntity.isheightFromFile == 1) {
         currentVoxelModelXYZ1 = loader.createTriEntitiesFromTif_wall(voxelEntity.heightfile, modelio->voxelSize_XZY,modelio->stepsize_height);
     } else {
@@ -2444,6 +2717,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
     PrimMesh currentVoxelModel2{};
     PrimMesh currentVoxelModelXYZ2;
+    // 步骤 3：屋顶网格，来源规则同墙体；meshId = n_modelmesh + 1，MeshLink 用第 2 个绑定。
     if (voxelEntity.isheightFromFile == 1) {
         currentVoxelModelXYZ2 = loader.createTriEntitiesFromTif_roof(voxelEntity.heightfile, modelio->voxelSize_XZY,modelio->stepsize_height);
     } else {
@@ -2477,6 +2751,8 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
     voxelEntity.scales.resize(voxelEntity.primDistributions.size(), 1.0f);
     voxelEntity.rotations.resize(voxelEntity.primDistributions.size(), 0.0f);
+    // 步骤 4：逐放置点建墙/屋顶实例（共用同一变换矩阵）并写体元。位置单位为米，
+    //       水平坐标除以 stepsize_surface 得格点，高度 = 放置高度 + DEM 地面高度。
     for (int kinstance = 0; kinstance < voxelEntity.primDistributions.size(); kinstance++) {
         // voxel instance1��change postion,
 
@@ -2526,9 +2802,11 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
         instanceio->instanceLinks.emplace_back(instancelink2);
 
 
+        // 保证每个体元都有面有效标志（缺失的补默认值），避免下面按下标访问越界。
         if (currentVoxelModel1.isValids.size() < currentVoxelModel1.voxelIds.size())
             currentVoxelModel1.isValids.resize(currentVoxelModel1.voxelIds.size());
         int isValid = 0;
+        // 仅当墙/屋顶两个网格绑定齐全的建筑才写体元（preparePrimitiveBuilding 已保证 meshNames 为 2 项）。
         if ((voxelEntity.meshNames.size() == 2) && (voxelEntity.type == Type::BUILDING)) {
 
             for (int kvoxel = 0; kvoxel < currentVoxelModel1.voxelIds.size(); kvoxel++) {
@@ -2548,6 +2826,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
                     glm::ivec3 voxelPos = glm::ivec3(Id.x * 1.0, Id.y * 1.0, Id.z * 1.0);  //(5,0,5) with height = 0
 
 
+                    // 面 1..4：墙面，登记到墙体实例（n_instance）。
                     for (int kf = 0; kf < 4; kf++) {
                         VoxelLink voxelLink{};
                         voxelLink.voxelId = voxelPos;          //(5,0,5) with height = 0
@@ -2561,6 +2840,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
                         isValid = 1;
                     }
 
+                    // 面 5：屋顶，登记到屋顶实例（n_instance + 1）。
                     for (int kf = 4; kf < 5; kf++) {
                         VoxelLink voxelLink{};
                         voxelLink.voxelId = voxelPos;          //(5,0,5) with height = 0
@@ -2579,6 +2859,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
             }
 
+            // 墙体与屋顶各占一个实例编号。注意：该自增位于 if 条件内，条件不成立时实例已创建但编号不前进（疑似问题，待核对）。
             n_instance += 2;
 
         }
@@ -2594,6 +2875,15 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
     return true;
 }
 
+// 模块：VoxelEB 背景（地面/水面，可带 DEM）体元化，同时把场景尺寸等全局参数写入 modelio。
+// 作用：1) 由 Background 填充 modelio 的场景尺寸/原点、体元网格尺寸（XZY 轴序）、步长、经纬度、
+//       年份和时区；2) 生成背景网格（DEM 或平面）、MeshLink 与实例；3) 把背景体元写入 NanoVDB；
+//       4) 读取叶面积密度（LAD）栅格。
+// 输入：background（sceneSize 水平尺寸 m、stepsize_surface 水平步长 m、DEM/LAD 文件、绑定名）；
+// 输出：modelio 全局参数，primMeshes/meshLinks/instances/instanceLinks/voxellinks，
+//       surfio->lads；n_modelmesh/n_instance 各加 1；返回 true。
+// 约定：体元坐标 XZY：第二轴为高度；背景体元位于高度格 0（DEM 时由网格给出），faceId = 5。
+// 注意：该函数必须最先调用，后续实体依赖其写入的 voxelSize_XZY / stepsize_surface。
 bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilder<int32_t> &nanoBuilder, std::shared_ptr<VoxelebIO> &modelio){
 
     auto acc = nanoBuilder.getAccessor();
@@ -2603,6 +2893,8 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     auto &surfio = modelio->m_surfio;
 
 
+    // 步骤 1：写入场景全局参数；水平步长必须为有限正数，否则抛异常（避免除零）。
+    //       体元数 = 场景尺寸 / 步长（整数截断），高度方向的体元数此处置 0，由实体决定。
     modelio->sceneSize_XYZ =  background.sceneSize;
     modelio->sceneOrigin_XYZ = background.sceneOrigin;
     if (!(background.stepsize_surface > 0.0f) || !std::isfinite(background.stepsize_surface))
@@ -2637,6 +2929,7 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     ///-------------------------------------
 
     VoxelDesigner loader;
+    // 步骤 2：生成背景网格：有 DEM 文件时按 DEM 建高程体元面，否则建平面背景；再转为 XZY 轴序。
     PrimMesh bgModelXYZ;
     if ((background.isDEM == true) && (background.DEMFile != "")) {
         bgModelXYZ = createVoxelDemBackground(background, modelio->stepsize_surface);
@@ -2650,6 +2943,8 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     meshio->primMeshes.emplace_back(bgModel);
 
     // background model link
+    // 背景 MeshLink：光谱必须存在；热属性缺失时回退 0 号（与实体路径不同，不告警）；
+    // 冠层固定 0；bioId 水面用水体参数集，其余用土壤参数集。
     MeshLink bgMeshLink{};
     // DEFERRED[低] 错误处理: 背景热属性名未找到时静默取 0 号，与基元/OBJ 路径的 mappedId（会告警）不一致；建议：改用 mappedId。
     const auto thermalIt = meshio->thermalNames.find(background.bgThermalName);
@@ -2685,6 +2980,8 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     /// Voxelsize is XZY
     /// iN cg space: (voxelsize.x - voxelsize.x/2, voxelsize.y, voxelsize.z - voxelsize.z/2)
     ///-------------------------------------
+    // 步骤 3：背景实例：水平方向平移半个场景（四舍五入）使场景中心落在原点，
+    // 高度方向减去 loader.minElevation（待核对：DEM 路径下该值是否被赋值）。
     Instance bgInstance{};
     bgInstance.meshId = static_cast<uint32_t>(n_modelmesh);
     glm::mat4 bgunit = glm::mat4(1.0f);
@@ -2709,6 +3006,7 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     //--------------------------------------------
     // background voxelLink
     //--------------------------------------------
+    // 步骤 4：背景体元写入 NanoVDB（仅写尚未占用的格）；每格一个 VoxelLink，faceId = 5。
     for (int kvoxel = 0; kvoxel < bgModel.voxelIds.size(); kvoxel++) {
         glm::ivec3 voxelId = glm::ivec3(bgModel.voxelIds[kvoxel]);// + nvmath::vec3i(bgShift);
         int test = acc.getValue(nanovdb::Coord(voxelId.x, voxelId.y, voxelId.z)); //(1,0,1)
@@ -2731,6 +3029,7 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     n_modelmesh++;
 
 
+    // 步骤 5：读取地表叶面积密度 LAD 栅格（读失败或为空则抛异常）；未启用时放入单个 0 占位。
     if(background.isLad==true){
         // read lad tif
         int width = 0,height = 0, nband = 1;
@@ -2757,6 +3056,11 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
 //--- primMeshes, meshlink, instance, instanceLink, nanovdb, voxellink
 //------------------------------------------------------------
 
+// 模块：VoxelRT（体元辐射传输）场景构建入口，流程与 VoxelEB 重载相同，数据来自 m_pVoxelrtXml。
+// 输入：背景与基元实体列表；输出：voxellstio 中的 primMeshes / meshLinks / instances /
+//       instanceLinks / voxellinks，以及写入体元序号的 NanoVDB 网格（空体元值 -1）。
+// 区别：只分派植被（单形状/形状文件）与建筑；没有 VoxelEB 版本中的水体（Type::WATER）分支，
+//       基元的 bioId（叶生化/土壤/水体参数集）也不在此处绑定。
 bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelrtIO> &voxellstio) {
 
 
@@ -2773,6 +3077,7 @@ bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
     /// ------------------------------------
     /// Background
     ///-------------------------------------
+    // 步骤 1：先建背景体元（同时写入场景尺寸、步长等全局参数）。
     createPrimObj_Background(background, nanoBuilder, voxellstio);
 
     /// ------------------------------------
@@ -2780,6 +3085,7 @@ bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
     ///-------------------------------------
     for (int kVoxelModel = 0; kVoxelModel < scenexml.primEntities.size(); kVoxelModel++)
     {
+        // 步骤 2：逐基元实体建体元；voxelizeFromObj 的实体走 OBJ 三角网体素化路径，其余按类型处理。
         auto &voxelEntity = scenexml.primEntities[kVoxelModel];
 
         if (voxelEntity.voxelizeFromObj) {
@@ -2805,6 +3111,7 @@ bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
         }
 
     }
+    // 步骤 3：异质体元模式下，合并各实体累积的体元内多类别混合信息，最后导出 NanoVDB 网格句柄。
     if (voxellstio->heterogeneousVoxel) {
         finalizeHexMixtures(hexMixtures, voxellstio);
     }
@@ -2814,6 +3121,10 @@ bool Scene::createPrimObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
     return true;
 }
 
+// 模块：VoxelRT 基元“单一形状”实体（树冠/火雾等）的体元化，逻辑与 VoxelEB 的 Crown 相同。
+// 作用：由 voxelEntity.shape 生成基元网格，登记网格与 MeshLink，对每个放置点生成实例并把
+//       形状内体元写入 NanoVDB 网格（值 = 体元序号，-1 表示空；先到先得，不覆盖）。
+// 输入/输出/坐标约定：同 VoxelEB 版本；区别是此处不设置 MeshLink 的 bioId（见入口说明）。
 bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<int32_t> &nanoBuilder,std::shared_ptr<VoxelrtIO> &modelio, const Background& background){
 
     auto acc = nanoBuilder.getAccessor();
@@ -2835,6 +3146,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
     // std::string aeroName = voxelEntity.aeroNames[0];
 
 
+    // 步骤 1：生成形状网格并转为 XZY 轴序，登记为新的 primMesh 与 MeshLink（绑定缺失的规则同 VoxelEB）。
     PrimMesh currentVoxelModelXYZ1;
     currentVoxelModelXYZ1 = loader.createTriEntity(shape, modelio->stepsize_surface);
     PrimMesh currentVoxelModel1 = XYZ2XZY(currentVoxelModelXYZ1, 0); // (1,1,0) => (1,0,1) with  height = 0
@@ -2858,6 +3170,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
     meshlink1.type = (int) type;
     meshio->meshLinks.emplace_back(meshlink1);
 
+    // 火/雾等“参与介质”由冠层 structureType 为 2 或 3 标识（待核对：各编号含义见 Canopy 定义）。
     const Canopy* mediumCanopy = meshlink1.canopyId >= 0 &&
         static_cast<size_t>(meshlink1.canopyId) < meshio->canopies.size()
         ? &meshio->canopies[meshlink1.canopyId] : nullptr;
@@ -2866,6 +3179,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
 
 
 
+    // 步骤 2：放置点来自文件时读入位置记录；基元树冠统一不缩放（1）不旋转（0）。
     if(voxelEntity.isdisFromFile == true){
         // Primitive crowns are placed unscaled and unrotated.
         const auto records = Utils::readPositionFile(voxelEntity.distributefile);
@@ -2882,6 +3196,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
 
     voxelEntity.scales.resize(voxelEntity.primDistributions.size(), 1.0f);
     voxelEntity.rotations.resize(voxelEntity.primDistributions.size(), 0.0f);
+    // 步骤 3：逐放置点建实例并插入体元；没有新增任何体元的实例随后被撤销。
     for (int kinstance = 0; kinstance < voxelEntity.primDistributions.size(); kinstance++) {
         // voxel instance1��change postion,
 
@@ -2892,6 +3207,8 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
             (isParticipatingMedium ? shape.length * 0.5f : 0.0f);
         const float originGroundY = placement.y -
             (isParticipatingMedium ? shape.width * 0.5f : 0.0f);
+        // 参与介质的放置点是水平中心，需减去半个形状尺寸得到最小角点；其他基元放置点即最小角点。
+        // shift0 为 XZY 轴序的整数格点位移（水平、高度、水平）。
         glm::ivec3 shift0;
         // DEFERRED[中] 数值: float→int 隐式截断是向零取整，负坐标（如火/雾中心减半宽后 originX<0）会偏移一格，与 OBJ 路径使用的 std::floor 不一致；且 placement.z 与 DEM 高度相加后按 stepsize_surface 而非 stepsize_height 换算；建议：显式 std::floor，高度轴使用 stepsize_height。
         shift0 = {originX / modelio->stepsize_surface,
@@ -2902,6 +3219,8 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
         ///-----------------------------------------------------------------------------
         ///
         ///------------------------------------------------------------------------------
+        // semiRange：场景水平半宽（体元数，四舍五入），实例矩阵的平移由此移到以场景中心为原点
+        // （待核对：与 NanoVDB 索引原点的对应关系）。
         glm::ivec3 semiRange = glm::vec3{floor(modelio->voxelSize_XZY.x / 2.0+0.5), 0,
                                          floor(modelio->voxelSize_XZY.z / 2.0+0.5)};;
 
@@ -2932,6 +3251,8 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
         int occupiedVoxelCount = 0;
         int mediumVoxelCount = 0;
 
+        // 逐体元写入 NanoVDB：网格值 < 0 表示该格尚未被占用，写入新体元序号 n_voxel 并登记 VoxelLink；
+        // 已被占用的格保持原值。参与介质只保留落在介质形状内的体元。
         for (int kvoxel = 0; kvoxel < currentVoxelModel1.voxelIds.size(); kvoxel++) {
             // this is what we did in the shader;
             // glm::ivec3 pos =  mat * glm::vec4(currentVoxelModel.voxelIds[kvoxel],1.0);
@@ -2974,6 +3295,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
                       << " inserted=" << insertedVoxelCount
                       << " occupied=" << occupiedVoxelCount << '\n';
         }
+        // 该放置点没有写入任何新体元（全部被占用或被裁掉）：撤销刚创建的实例，不计入 n_instance。
         if (isValid == 0) {
             instanceio->instances.pop_back();
             instanceio->instanceLinks.pop_back();
@@ -2990,6 +3312,11 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
     return true;
 }
 
+// 模块：VoxelRT 基元“形状文件”实体（逐行一棵树冠/一个形状）的体元化，逻辑与 VoxelEB 的 Crowns 相同。
+// 作用：读 voxelEntity.shapefile，每行定义一个形状，各自生成基元网格、MeshLink 和一个实例，
+//       并把形状内体元写入 NanoVDB 网格（值 = 体元序号，-1 表示空；先到先得，不覆盖）。
+// 输入：形状文件行 = 形状类型 高 宽 长 x y z（至少 7 列），位置单位为米；输出与约定同 VoxelEB 版本。
+// 区别：不设置 MeshLink 的 bioId（相关代码已被注释掉）。
 bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<int32_t> &nanoBuilder,std::shared_ptr<VoxelrtIO> &modelio, const Background& background){
 
     auto acc = nanoBuilder.getAccessor();
@@ -3013,6 +3340,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
 
     // Rows: shapeType height width length x y z [scale rotation (unused)].
     size_t skippedShapeRows = 0;
+    // 步骤 1：读入并校验形状文件；有非数值行或列数不足时立即报错。
     const auto shapeRows = Utils::readNumericRows(voxelEntity.shapefile, "crown shape file", skippedShapeRows);
     if (skippedShapeRows > 0)
         throw std::runtime_error("Crown shape file has non-numeric rows: " + voxelEntity.shapefile);
@@ -3021,6 +3349,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
             throw std::runtime_error("Crown shape rows need 7 columns (type height width length x y z): " + voxelEntity.shapefile);
     }
 
+    // 步骤 2：逐行建形状：校验字段 → 生成网格 → 登记 MeshLink → 放置实例并写体元。
     for (size_t k = 0; k < shapeRows.size(); k++) {
         const auto& row = shapeRows[k];
 
@@ -3043,6 +3372,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
             ? std::string() : voxelEntity.propNames.front();
         MeshLink meshlink1{};
         meshlink1.spectralId = requiredMappedId(meshio->spectralNames, voxelEntity.spectralNames, 0, "spectral");
+        // 形状文件路径不读取热属性绑定，固定使用 0 号热属性条目。
         meshlink1.thermalId = 0;
         meshlink1.canopyId = mappedId(meshio->canopyNames, voxelEntity.canopyNames, 0, "canopy");
 //        if (type == Type::VEGETATION) {
@@ -3059,6 +3389,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
         // instance
 
 
+        // 步骤 3：每个形状只有一个实例（位置取自形状行的 x y z，水平位置叠加 DEM 地面高度）。
         for (int kinstance = 0; kinstance < 1; kinstance++) {
             // voxel instance1��change postion,
 
@@ -3073,6 +3404,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
             glm::ivec3 semiRange = glm::vec3{floor(modelio->voxelSize_XZY.x / 2.0+0.5), 0,
                                              floor(modelio->voxelSize_XZY.z / 2.0+0.5)};;
 
+            // 形状文件不支持缩放/旋转（第 8、9 列即使存在也不使用）。
             float scale0 = 1;
             float angle0 = 0;
             glm::vec3 shift = glm::vec3(shift0) - glm::vec3(semiRange);  // (5,0,5)
@@ -3138,7 +3470,15 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
     return true;
 }
 
+// 模块：VoxelRT 基元建筑的体元化（墙体 + 屋顶两套网格），逻辑与 VoxelEB 的 Building 相同。
+// 作用：生成墙体/屋顶网格（形状来自 shape 或高度栅格 heightfile），登记两个 MeshLink
+//       （绑定序号 0 = 墙，1 = 屋顶），对每个放置点创建墙/屋顶两个实例并写 NanoVDB 体元。
+// 约定：每个有建筑的体元在 voxellinks 中占连续 5 项：faceId 1..4 为墙面（墙体实例），
+//       faceId 5 为屋顶（实例 = 墙体实例 + 1）；NanoVDB 中该格的值为这 5 项的首个序号；
+//       每个放置点占用 2 个实例编号，n_modelmesh 一次增加 2。区别：不设置 MeshLink 的 bioId。
 bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder<int32_t> &nanoBuilder, std::shared_ptr<VoxelrtIO> &modelio, const Background& background) {
+    // 步骤 1：规整绑定：单个绑定同时用于墙和屋顶，第二个绑定（如有）覆盖屋顶；
+    //       位置来自文件（isdisFromFile）时读入并校验。
     preparePrimitiveBuilding(voxelEntity);
 
     auto acc = nanoBuilder.getAccessor();
@@ -3161,6 +3501,8 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
 
     PrimMesh currentVoxelModelXYZ1;
+    // 步骤 2：墙体网格：有高度栅格（TIF）时按栅格逐格建墙，否则按 shape 建长方体墙；
+    //       随后转为 XZY 轴序（mark = 1 保留逐体元的面有效标志）。
     if (voxelEntity.isheightFromFile == 1) {
         currentVoxelModelXYZ1 = loader.createTriEntitiesFromTif_wall(voxelEntity.heightfile, modelio->voxelSize_XZY,modelio->stepsize_height);
     } else {
@@ -3180,6 +3522,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
     PrimMesh currentVoxelModel2{};
     PrimMesh currentVoxelModelXYZ2;
+    // 步骤 3：屋顶网格，来源规则同墙体；meshId = n_modelmesh + 1，MeshLink 用第 2 个绑定。
     if (voxelEntity.isheightFromFile == 1) {
         currentVoxelModelXYZ2 = loader.createTriEntitiesFromTif_roof(voxelEntity.heightfile, modelio->voxelSize_XZY,modelio->stepsize_height);
     } else {
@@ -3206,6 +3549,8 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
     voxelEntity.scales.resize(voxelEntity.primDistributions.size(), 1.0f);
     voxelEntity.rotations.resize(voxelEntity.primDistributions.size(), 0.0f);
+    // 步骤 4：逐放置点建墙/屋顶实例（共用同一变换矩阵）并写体元。位置单位为米，
+    //       水平坐标除以 stepsize_surface 得格点，高度 = 放置高度 + DEM 地面高度。
     for (int kinstance = 0; kinstance < voxelEntity.primDistributions.size(); kinstance++) {
         // voxel instance1��change postion,
 
@@ -3255,9 +3600,11 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
         instanceio->instanceLinks.emplace_back(instancelink2);
 
 
+        // 保证每个体元都有面有效标志（缺失的补默认值），避免下面按下标访问越界。
         if (currentVoxelModel1.isValids.size() < currentVoxelModel1.voxelIds.size())
             currentVoxelModel1.isValids.resize(currentVoxelModel1.voxelIds.size());
         int isValid = 0;
+        // 仅当墙/屋顶两个网格绑定齐全的建筑才写体元（preparePrimitiveBuilding 已保证 meshNames 为 2 项）。
         if ((voxelEntity.meshNames.size() == 2) && (voxelEntity.type == Type::BUILDING)) {
 
             for (int kvoxel = 0; kvoxel < currentVoxelModel1.voxelIds.size(); kvoxel++) {
@@ -3277,6 +3624,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
                     glm::ivec3 voxelPos = glm::ivec3(Id.x * 1.0, Id.y * 1.0, Id.z * 1.0);  //(5,0,5) with height = 0
 
 
+                    // 面 1..4：墙面，登记到墙体实例（n_instance）。
                     for (int kf = 0; kf < 4; kf++) {
                         VoxelLink voxelLink{};
                         voxelLink.voxelId = voxelPos;          //(5,0,5) with height = 0
@@ -3290,6 +3638,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
                         isValid = 1;
                     }
 
+                    // 面 5：屋顶，登记到屋顶实例（n_instance + 1）。
                     for (int kf = 4; kf < 5; kf++) {
                         VoxelLink voxelLink{};
                         voxelLink.voxelId = voxelPos;          //(5,0,5) with height = 0
@@ -3308,6 +3657,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
             }
 
+            // 墙体与屋顶各占一个实例编号。注意：该自增位于 if 条件内，条件不成立时实例已创建但编号不前进（疑似问题，待核对）。
             n_instance += 2;
 
         }
@@ -3323,6 +3673,11 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
     return true;
 }
 
+// 模块：VoxelRT 背景（地面/水面，可带 DEM）体元化，同时把场景尺寸等全局参数写入 modelio。
+// 作用与 VoxelEB 的 createPrimObj_Background 相同：写全局参数、建背景网格/MeshLink/实例、
+//       把背景体元写入 NanoVDB（faceId = 5）、读取 LAD 栅格；n_modelmesh/n_instance 各加 1。
+// 区别：热属性和 bioId（水体/土壤参数集）名称找不到时静默取 0 号，而 VoxelEB 版本对 bioId
+//       缺失会抛异常。必须在其他实体之前调用。
 bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilder<int32_t> &nanoBuilder, std::shared_ptr<VoxelrtIO> &modelio){
 
     auto acc = nanoBuilder.getAccessor();
@@ -3332,6 +3687,8 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     auto &surfio = modelio->m_surfio;
 
 
+    // 步骤 1：写入场景全局参数；水平步长必须为有限正数，否则抛异常（避免除零）。
+    //       体元数 = 场景尺寸 / 步长（整数截断），高度方向的体元数此处置 0，由实体决定。
     modelio->sceneSize_XYZ =  background.sceneSize;
     modelio->sceneOrigin_XYZ = background.sceneOrigin;
     if (!(background.stepsize_surface > 0.0f) || !std::isfinite(background.stepsize_surface))
@@ -3366,6 +3723,7 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     ///-------------------------------------
 
     VoxelDesigner loader;
+    // 步骤 2：生成背景网格：有 DEM 文件时按 DEM 建高程体元面，否则建平面背景；再转为 XZY 轴序。
     PrimMesh bgModelXYZ;
     if ((background.isDEM == true) && (background.DEMFile != "")) {
         bgModelXYZ = createVoxelDemBackground(background, modelio->stepsize_surface);
@@ -3379,6 +3737,7 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     meshio->primMeshes.emplace_back(bgModel);
 
     // background model link
+    // 背景 MeshLink：光谱必须存在；热属性、水体/土壤参数集缺失时回退 0 号（不告警）；冠层固定 0。
     MeshLink bgMeshLink{};
     std::string bgThermalName = background.bgThermalName;
     bgMeshLink.thermalId =  idOrZero(meshio->thermalNames, bgThermalName);
@@ -3415,6 +3774,8 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     /// Voxelsize is XZY
     /// iN cg space: (voxelsize.x - voxelsize.x/2, voxelsize.y, voxelsize.z - voxelsize.z/2)
     ///-------------------------------------
+    // 步骤 3：背景实例：水平方向平移半个场景（四舍五入）使场景中心落在原点，
+    // 高度方向减去 loader.minElevation（待核对：DEM 路径下该值是否被赋值）。
     Instance bgInstance{};
     bgInstance.meshId = static_cast<uint32_t>(n_modelmesh);
     glm::mat4 bgunit = glm::mat4(1.0f);
@@ -3439,6 +3800,7 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     //--------------------------------------------
     // background voxelLink
     //--------------------------------------------
+    // 步骤 4：背景体元写入 NanoVDB（仅写尚未占用的格）；每格一个 VoxelLink，faceId = 5。
     for (int kvoxel = 0; kvoxel < bgModel.voxelIds.size(); kvoxel++) {
         glm::ivec3 voxelId = glm::ivec3(bgModel.voxelIds[kvoxel]);// + nvmath::vec3i(bgShift);
         int test = acc.getValue(nanovdb::Coord(voxelId.x, voxelId.y, voxelId.z)); //(1,0,1)
@@ -3461,6 +3823,7 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     n_modelmesh++;
 
 
+    // 步骤 5：读取地表叶面积密度 LAD 栅格（读失败或为空则抛异常）；未启用时放入单个 0 占位。
     if(background.isLad==true){
         // read lad tif
         int width = 0,height = 0, nband = 1;
@@ -3484,6 +3847,10 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
 
 
 
+// 作用：把基元网格由 XYZ（Z 向上，VoxelDesigner 的设计坐标）转为 XZY 轴序（第二轴为高度）。
+// 输入：PrimMesh model（顶点位置、体元中心 voxelIds）；mark = 1 时额外保留 isValids / faceIds。
+// 输出：新网格；顶点位置与体元坐标交换 y、z；法向、颜色、纹理坐标原样拷贝。
+// 副作用：model.indices 被移动（move）走，调用方传入的是按值拷贝的网格。
 PrimMesh Scene::XYZ2XZY(PrimMesh model,int mark){
     PrimMesh temp;
     temp.meshId = model.meshId;
@@ -3524,6 +3891,7 @@ PrimMesh Scene::XYZ2XZY(PrimMesh model,int mark){
 }
 
 
+// 作用：与上面的 PrimMesh 版本相同的 y/z 交换，用于 OBJ 网格；只按 nVertices 与实际顶点数的较小者拷贝。
 ObjMesh Scene::XYZ2XZY(ObjMesh model){
     ObjMesh temp;
     temp.meshId = model.meshId;
@@ -3548,6 +3916,8 @@ ObjMesh Scene::XYZ2XZY(ObjMesh model){
     return temp;
 }
 
+// 作用：把 ObjMesh 写成最简 Wavefront OBJ（只有 v 与 f，无法向/纹理），用于调试导出（如 dem.obj）。
+// 说明：面索引从 0 起，写出时 +1；打开文件失败时不输出也不报错。
 void Scene::outputObjMesh(ObjMesh model, std::string &fileName) {
     // DEFERRED[低] 错误处理: 窄字符路径打开（中文 projectDir 失败）且打开失败时静默不输出；ObjMesh 按值传入复制整个 DEM 网格；默认 6 位有效数字输出坐标，大场景（>1e5 m 量级或 UTM 坐标）精度丢失；建议：u8path 打开并报错，const 引用传参，设置 std::setprecision(9)。
     std::ofstream outfile(fileName);

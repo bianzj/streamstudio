@@ -1,8 +1,26 @@
+// ==========================================================================
+// 文件：xmlexamples.cpp
+// 功能：实现 XmlExamples（声明见 xmlexamples.h）：内置示例工程的路径解析、惰性构造入口，
+//       以及三个旧式（开发机硬编码路径）示例 createVoxelebxml / createRaytracingxml / createVoxelrtxml。
+// 主要模块：
+//   1. rootDirectory / exampleDirectory：定位 histream 根目录，给出 examples/<name> 目录
+//   2. raytracing / voxelrt / voxeleb / watereb：首次调用时调用 createMinimal*（头文件内联实现），
+//      然后 create_directories(projectDir) 并返回共享的配置指针
+//   3. 旧式 createVoxelebxml / createRaytracingxml / createVoxelrtxml（src 中未发现调用）
+//   4. 文件末尾（HEAD 行号约 417–2143）为旧版 createVoxelebxml 的整段注释备份（不参与编译）
+// 数据流：FileIO::readXml（路径为空）→ XmlExamples::xxx() → *Xml 结构。
+// 约定：旧式示例中的尺寸为 m，温度为 K，波段 waves 为 nm（10500 = 10.5 µm 热红外），
+//   太阳/观测角为 {天顶, 方位}（单位待核对，推测为度）。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/26.
 //
 #include "xmlexamples.h"
 
+// 作用：确定 histream 根目录（内置示例的 defined 目录与 examples 输出目录的基准）。
+// 说明：依次检查 <cwd>/models/histream 与 <cwd> 下是否存在 defined/meteo.txt，找到即返回；
+//   都没有则回落到 cwd。
 std::filesystem::path XmlExamples::rootDirectory()
 {
     // DEFERRED[低] Bug: 头文件注释说还会查找“可执行文件所在目录”，实现只查 current_path 与 <cwd>/models/histream；从其他工作目录启动时找不到 defined/meteo.txt，静默回落到 cwd，示例的 meteo/Esky/Esun 路径全部失效；建议：增加 GetModuleFileNameW 得到的 exe 目录作为候选，全部找不到时报错。
@@ -13,12 +31,16 @@ std::filesystem::path XmlExamples::rootDirectory()
     return current;
 }
 
+// 作用：返回 <根目录>/examples/<name> 字符串，作为最小示例的 projectDir（此处不创建目录）。
 std::string XmlExamples::exampleDirectory(const char* name)
 {
     // DEFERRED[中] 安全: path::string() 在 Windows 上按 ANSI 代码页转换，工作目录含代码页外字符时抛 std::system_error；随后 create_directories(std::string) 又按窄字符解释，并且会在 cwd 下静默创建 examples 目录（副作用），失败时抛 filesystem_error 无上下文；建议：以 std::filesystem::path 保存 projectDir，create_directories 使用 error_code 重载并给出明确报错。
     return (rootDirectory() / "examples" / name).string();
 }
 
+// 模块：raytracing / voxelrt / voxeleb / watereb 四个入口。
+// 说明：配置对象只在首次调用时构造并缓存；每次都会确保 projectDir 目录存在（副作用：
+//   可能在根目录下创建 examples/minimal_*）；返回的是同一份共享配置，调用方修改会互相可见。
 std::shared_ptr<RaytracingXml> XmlExamples::raytracing()
 {
     if (!m_pRaytracingXml) createMinimalRaytracingxml();
@@ -40,6 +62,7 @@ std::shared_ptr<VoxelEBXml> XmlExamples::voxeleb()
     return m_pVoxelebXml;
 }
 
+// 说明：水体 EB 示例；该入口在 src 中未发现调用（待核对，可能供回归/测试工具使用）。
 std::shared_ptr<VoxelEBXml> XmlExamples::watereb()
 {
     if (!m_pWaterEBXml) createMinimalWaterEBxml();
@@ -47,8 +70,15 @@ std::shared_ptr<VoxelEBXml> XmlExamples::watereb()
     return m_pWaterEBXml;
 }
 
+// 作用：旧式 VoxelEB 示例（均质场景与 SCOPE 对比的时间序列观测，注释称 LAI=2）。
+// 说明：使用开发机绝对路径（C:\cases\histream\ 等），当前实现未被调用；
+//   下方步骤：1 工程/设置；2 光源；3 传感器；4 背景；5 实体；6 光谱；7 热参数与属性；
+//   8 冠层/空气动力学；9 气象与大气文件。
+//   注意：只有 primEntity2（树）被放入 primEntities；spectralxmls 只含 soil/leaf，
+//   wall/roof、building 相关的光谱/属性虽定义但未加入（待核对是否有意）。
 void XmlExamples::createVoxelebxml(){
     // DEFERRED[低] 可维护性: createVoxelebxml/createRaytracingxml/createVoxelrtxml 在 src 中无任何调用，且硬编码开发机绝对路径（C:\cases、F:\work）；若被误调用将直接因文件不存在失败，其中还含下面标出的参数错误；建议：删除或改为基于 rootDirectory() 的可运行示例。
+    // 步骤 1：创建配置对象，设定工程目录、定义目录与采样/递归深度（n_sample = 32，maxDepth = 32）。
     m_pVoxelebXml=std::make_shared<VoxelEBXml>();
 
     m_pVoxelebXml->projectDir = R"(C:\cases\histream\)";            // 均质场景与SCOPE对比的时间序列观测：LAI=2
@@ -59,6 +89,8 @@ void XmlExamples::createVoxelebxml(){
     m_pVoxelebXml->settingxml.theGPU = 0;
 
 
+    // 步骤 2/3：光源（太阳角 {40, 30}，直射 0.9 / 散射 0.1，天空 250 K，太阳 6000 K）
+    //   与传感器（UAV，50×50 像元，平行投影，天顶 0° 单视角，10500 nm）。
     m_pVoxelebXml->lightxml.name = "Solar";
     m_pVoxelebXml->lightxml.solarAngle = {40, 30};
     m_pVoxelebXml->lightxml.direct = 0.9;
@@ -76,6 +108,7 @@ void XmlExamples::createVoxelebxml(){
     m_pVoxelebXml->sensorxml.waves = {10500};
     m_pVoxelebXml->sensorxml.projection = Projection::PARALLAL;
 
+    // 步骤 4：背景场景 100×100×50 m，水平/垂直体元 0.3 m，土壤背景，纬度 40.3574、经度 115.7923。
     m_pVoxelebXml->scenexml.background.sceneSize={100, 100, 50}; // length, width, height
     m_pVoxelebXml->scenexml.background.sceneOrigin={0, 0, 0};
 /*    m_pVoxelebXml->scenexml.background.sMin={0,0,0};
@@ -94,6 +127,7 @@ void XmlExamples::createVoxelebxml(){
     m_pVoxelebXml->scenexml.background.lon = 115.7923;
 
 
+    // 步骤 5：基元实体（建筑 primEntity1 与树 primEntity2）；最终只启用 primEntity2。
     PrimEntity primEntity1;
     primEntity1= PrimEntity{"building",
                             {"wall","roof"},
@@ -126,6 +160,7 @@ void XmlExamples::createVoxelebxml(){
 
 
 
+    // 步骤 6：光谱：土壤取自文件的 OTHER 型光谱，叶片用 PROSPECT 型；墙/屋顶光谱定义但未加入列表。
     SpectralXml spectralXml1;
     spectralXml1.spectralName="soil";
     spectralXml1.type = spectralType::OTHER;
@@ -167,6 +202,8 @@ void XmlExamples::createVoxelebxml(){
     m_pVoxelebXml->spectralxmls = {spectralXml1, spectralXml2};
 
 
+    // 步骤 7：热参数（名称、受光温度、阴影温度，K）与材质属性（土壤 SoilSet、叶片 LeafBio；
+    //   BuildUp 已定义但未加入 propxmls）。
     m_pVoxelebXml->thermalxmls = {{"K310", 320, 300},
                                   {"K300", 305, 295}};
 
@@ -195,11 +232,14 @@ void XmlExamples::createVoxelebxml(){
 
     m_pVoxelebXml->propxmls ={propertyXml1, propertyXml2};
 
+    // 步骤 8：冠层参数（Canopy：lai = 2.0, density, height = 3, width, G, LIDFa, LIDFb, hspot, leafwidth）
+    //   与空气动力学条件。
     m_pVoxelebXml->canopyxmls ={{"crown", {2.0, 0.666, 3, 1, 0.5, -0.35, -0.15, 0.2, 0.2}}};
 
     // DEFERRED[中] 数值: AeroCond 只给出前 5 个字段（type=1, L=0, ustar=10, hc_veg=3, hc_build=12），lai/leafwidth/cover 被值初始化为 0；leafwidth=0 时叶片边界层阻抗 ∝ sqrt(w/u) 为 0（热交换无穷大），L=0 使稳定度函数 z/L 除零；ustar=10 m/s 也远超常见值（0.1–1）；建议：补全全部字段并给出物理合理值。
     m_pVoxelebXml->aerocondxml = {AeroType::ONE, {1, 0, 10, 3, 12.}, "", 1000};
 
+    // 步骤 9：气象文件与大气辐射文件（Esky_/Esun_）路径。
     m_pVoxelebXml->meteoxml.meteofile =  R"(C:\cases\histream\15m_meteo.txt)";
     m_pVoxelebXml->atomcondxml.rlifile =  m_pVoxelebXml->definedDir + "\\defined\\Esky_.dat";
     m_pVoxelebXml->atomcondxml.rinfile =  m_pVoxelebXml->definedDir + "\\defined\\Esun_.dat";
@@ -207,7 +247,12 @@ void XmlExamples::createVoxelebxml(){
 }
 
 
+// 作用：旧式 RayTracing 示例（aoyun 区域（待核对含义），OBJ 建筑 + 单树）。
+// 说明：路径为开发机硬编码（F:\work\...），当前实现未被调用。
+//   步骤：1 工程/设置；2 传感器（1024×1024，两个视角，650/850/10500 nm）；3 光源；
+//   4 场景范围 5715×5081×10 m；5 OBJ 实体；6 光谱（逐波段反射/透射）；7 热参数。
 void XmlExamples::createRaytracingxml(){
+    // 步骤 1：创建配置对象并设定工程/定义目录与采样设置（n_sample = 32，maxDepth = 32）。
     m_pRaytracingXml=std::make_shared<RaytracingXml>();
 
     m_pRaytracingXml->projectDir = "F:\\work\\field_aoyunlst\\field_data\\aoyun\\";
@@ -247,6 +292,8 @@ void XmlExamples::createRaytracingxml(){
     m_pRaytracingXml->scenexml.background.DEMFile = "";
     m_pRaytracingXml->scenexml.background.stepsize_surface = 1;
 
+    // 步骤 5：OBJ 实体：研究区（studyarea.obj）建筑（wall/roof，位置 {2857.5, 2540.7, 0}）与单棵树 OBJ（Crown，
+    //   位置来自 entity_1_position.txt）。
     ObjEntity objEntity1 = ObjEntity{"aoyun","F:\\work\\field_aoyun\\field_data\\aoyun\\studyarea.obj",
                                      {"wall","roof"},{Type::BUILDING,Type::BUILDING},{"soil","soil"},{"K310","K310"},
                                      {{2857.5,2540.7,0}},{1},{0},false};
@@ -265,6 +312,8 @@ void XmlExamples::createRaytracingxml(){
     m_pRaytracingXml->scenexml.primEntities = {primEntity};
 
 
+    // 步骤 6：光谱：reflectances / transmittance 与 sensorxml.waves 的三个波段（650、850、10500 nm）
+    //   一一对应；10500 nm 的反射率为 TIR 值。
     SpectralXml spectralXml1;
     spectralXml1.spectralName="soil";
     spectralXml1.type = spectralType::CUSTOM;
@@ -279,10 +328,16 @@ void XmlExamples::createRaytracingxml(){
     m_pRaytracingXml->spectralxmls = {spectralXml1,spectralXml2};
 
 
+    // 步骤 7：热参数：K310 = 受光 320 K / 阴影 300 K；K300 = 305 K / 295 K。
     m_pRaytracingXml->thermalxmls = {{"K310",320,300},{"K300",305,295}};
 }
 
+// 作用：旧式 VoxelRT 示例（aoyun 区域，2888×2890×10 m）。
+// 说明：路径为开发机硬编码（F:\work\...），当前实现未被调用。
+//   步骤：1 工程/设置；2 光源；3 传感器（含 3 个 UAV 位姿）；4 背景；5 实体；6 光谱；
+//   7 热参数；8 冠层。材质属性（PropertyXml）原写法已被注释，propxmls 未设置。
 void XmlExamples::createVoxelrtxml(){
+    // 步骤 1：创建配置对象并设定目录与采样设置（n_sample = 32，maxDepth = 32，isUAVtrave = false）。
     m_pVoxelrtXml=std::make_shared<VoxelRTXml>();
 
     m_pVoxelrtXml->projectDir = "F:\\work\\field_aoyunlst\\field_data\\aoyun\\";
@@ -312,6 +367,7 @@ void XmlExamples::createVoxelrtxml(){
     m_pVoxelrtXml->sensorxml.projection = Projection::PARALLAL;
     m_pVoxelrtXml->sensorxml.uavPoses = {glm::vec3(0,1000,0),glm::vec3(100,1000,0),glm::vec3(200,1000,0)};
 
+    // 步骤 4：背景场景（体元 1 m，纬度 40、经度 120，非 DEM）。
     m_pVoxelrtXml->scenexml.background.sceneSize={2888, 2890, 10}; // length, width, height
     m_pVoxelrtXml->scenexml.background.sceneOrigin={0, 0, 0};
 /*    m_pVoxelrtXml->scenexml.background.sMin={0,0,0};
@@ -330,6 +386,8 @@ void XmlExamples::createVoxelrtxml(){
     m_pVoxelrtXml->scenexml.background.lon = 120;
 
 
+    // 步骤 5：基元实体：建筑（高度来自 tif，beijing_zhong_height_normal.tif）与树；
+    //   最终只启用 primEntity1（建筑）。
     PrimEntity primEntity1;
     primEntity1= PrimEntity{"building",{"wall","roof"},{"wall","roof"},{"K300","K300"},
                             {"crown","crown"},{"soilset","soilset"},Type::BUILDING,
@@ -350,6 +408,8 @@ void XmlExamples::createVoxelrtxml(){
 
 
 
+    // 步骤 6：光谱：soil/wall/roof 为 CUSTOM（文件路径），leaf 带 fluspect 参数 fp；
+    //   tau_tir / refl_tir 分别为热红外透射率与反射率。
     SpectralXml spectralXml1;
     spectralXml1.spectralName="soil";
     spectralXml1.type = spectralType::CUSTOM;
@@ -391,6 +451,7 @@ void XmlExamples::createVoxelrtxml(){
     m_pVoxelrtXml->spectralxmls = {spectralXml1, spectralXml2, spectralXml3, spectralXml4};
 
 
+    // 步骤 7：热参数（受光/阴影温度，K）。
     m_pVoxelrtXml->thermalxmls = {{"K310", 320, 300}, {"K300", 305, 295}};
 
 
@@ -414,6 +475,11 @@ void XmlExamples::createVoxelrtxml(){
 
 
 
+// 以下至文件末尾（HEAD 行号 417–2143）是旧版 createVoxelebxml 的整段注释备份，不参与编译。
+// 按 caseName 切换：timeSeries（多时相垂直观测）、multiangle（多角度）、forest（不同植被覆盖度）、
+// satellite（均质卫星尺度）、forest_satellite（静止卫星多角度）、forest_TRGMEB（TRGMEB 对比）、
+// diff_season / diff_height / diff_LAI / diff_SMC / diff_wind（季节、高度、LAI、土壤水、风速对比）。
+// 路径均为开发机 D: 盘，仅作历史参考。
 // void XmlExamples::createVoxelebxml(){
 //     m_pVoxelebXml=std::make_shared<VoxelEBXml>();
 //

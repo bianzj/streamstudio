@@ -1,3 +1,20 @@
+// ==========================================================================
+// 文件：command.cpp
+// 功能：VoxelRT 模式的计算命令录制、提交与同步
+// 主要模块/步骤：
+//   1. create：创建围栏与信号量
+//   2. runRT：逐波段、逐碰撞阶数分次派发 diffuse 阶段，再派发 out 阶段
+//   3. runRTAccelerated：按光谱批（最多 4 个波段）合并 diffuse 派发的加速版本
+//   4. submit / recordCommandBuffer：录制单次派发（内存屏障、管线、描述符集、推送常量）并提交
+//   5. waitFence / destroy：等待围栏、回收命令缓冲、销毁围栏与信号量
+// 数据流：VoxelrtIO 中的 setting（VoxelRTSetting，作为推送常量）、m_pipelines、m_descSet
+//   → vkCmdDispatch → 计算着色器读写 buffer.cpp 创建的缓冲
+// 与其他文件的关系：声明见 command.h；阶段枚举 VoxelRTStage（gap/diffuse/out）与
+//   GROUP_SIZEX(64)/GROUP_SIZEXY(8) 在 base/structs.h；描述符见 descriptor.cpp
+// 约定：1D 派发按体元（每组 GROUP_SIZEX 个），2D 派发按影像像素（每组 GROUP_SIZEXY²）；
+//   每次提交后立即 waitFence，阶段之间串行
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/26.
 //
@@ -9,6 +26,8 @@
 
 
 
+// 模块：创建同步对象。输出：modelio->m_fence 与 m_semaphores（n_pipeline + 1 个）。
+// 说明：当前 submit 中信号量相关代码已被注释，信号量实际未参与同步，同步靠围栏。
 bool Command::create(std::shared_ptr<VoxelrtIO> &modelio){
     // for the firest init
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -31,6 +50,10 @@ bool Command::create(std::shared_ptr<VoxelrtIO> &modelio){
 }
 
 
+// 模块：VoxelRT 主流程（逐波段、逐碰撞阶数分次提交）。
+// 输入：reuseTransport 为 true 表示太阳方向未变，gap 与 diffuse 结果（与视角无关）仍有效，
+//   只重跑 out 阶段；输出：写入 m_pBufferStorage 等缓冲，返回 true。
+// 阶段：gap（体元间隙/透过率相关，待核对）→ diffuse（多次碰撞的漫射辐射）→ out（成像）。
 bool Command::runRT(std::shared_ptr<VoxelrtIO> &modelio, bool reuseTransport){
 
     modelio->m_currentSemaphore = 1;
@@ -42,6 +65,7 @@ bool Command::runRT(std::shared_ptr<VoxelrtIO> &modelio, bool reuseTransport){
     auto & descSet = modelio->m_descSet;
     auto & setting = modelio->setting;
 
+    // 步骤 1：复用上次的传输结果，只做成像。
     if (reuseTransport) {
         submit(modelio, VoxelRTStage::out, voxelSize2D, std::nullopt, std::nullopt);
         waitFence(modelio);
@@ -54,9 +78,11 @@ bool Command::runRT(std::shared_ptr<VoxelrtIO> &modelio, bool reuseTransport){
     //                                    (m_setting.size.y + (GROUP_SIZEXY - 1)) / GROUP_SIZEXY, 1);
 
 
+    // 步骤 2：gap 阶段，按体元 1D 派发。
     submit(modelio, VoxelRTStage::gap, voxelSize1D, std::nullopt, std::nullopt);
     waitFence(modelio);
 
+    // 步骤 3：diffuse 阶段，循环 波段(n_jump) × 碰撞阶数(collisionOrder)，每次单独提交并等待。
     // A wavelength is independent at this stage. Dispatch it separately so
     // dense hyperspectral jobs do not become one long GPU command and trip
     // the Windows TDR watchdog.
@@ -70,6 +96,7 @@ bool Command::runRT(std::shared_ptr<VoxelrtIO> &modelio, bool reuseTransport){
             waitFence(modelio);
         }
     }
+    // 步骤 4：恢复推送常量缺省值（n_jump = 0、collisionOrder = 1），再做 out 阶段（2D 派发）。
     setting.n_jump = 0;
     setting.collisionOrder = 1;
 
@@ -81,10 +108,13 @@ bool Command::runRT(std::shared_ptr<VoxelrtIO> &modelio, bool reuseTransport){
     return true;
 }
 
+// 模块：VoxelRT 加速版主流程。与 runRT 的区别：diffuse 阶段每次提交处理一批波段
+//   （spectralBatchSize，限制在 1..4），减少提交次数；其余阶段相同。
 bool Command::runRTAccelerated(std::shared_ptr<VoxelrtIO>& modelio,
                                int spectralBatchSize, bool reuseTransport)
 {
     modelio->m_currentSemaphore = 1;
+    // 批大小限幅到 1..4（上限与着色器一次处理的波段数有关，待核对）。
     spectralBatchSize = std::clamp(spectralBatchSize, 1, 4);
 
     const glm::ivec3 voxelSize2D(
@@ -94,6 +124,7 @@ bool Command::runRTAccelerated(std::shared_ptr<VoxelrtIO>& modelio,
     const glm::ivec3 voxelSize1D(
         (modelio->n_voxel + (GROUP_SIZEX - 1)) / GROUP_SIZEX, 1, 1);
 
+    // 步骤 1：复用上次的传输结果，只做成像。
     if (reuseTransport) {
         submit(modelio, VoxelRTStage::out, voxelSize2D,
                std::nullopt, std::nullopt);
@@ -101,10 +132,13 @@ bool Command::runRTAccelerated(std::shared_ptr<VoxelrtIO>& modelio,
         return true;
     }
 
+    // 步骤 2：gap 阶段，按体元 1D 派发。
     submit(modelio, VoxelRTStage::gap, voxelSize1D,
            std::nullopt, std::nullopt);
     waitFence(modelio);
 
+    // 步骤 3：按批遍历波段；n_jump = 本批第一个波段，最后一批可能不足 spectralBatchSize。
+    //   同一批内每个碰撞阶数各提交一次，需读上一阶全部体元，因此阶数之间串行。
     for (int firstBand = 0; firstBand < modelio->n_wave;
          firstBand += spectralBatchSize) {
       for (int order = 1; order <= modelio->setting.collisionOrders; ++order) {
@@ -132,6 +166,7 @@ bool Command::runRTAccelerated(std::shared_ptr<VoxelrtIO>& modelio,
         waitFence(modelio);
       }
     }
+    // 步骤 4：恢复推送常量缺省值，再做 out 阶段。
     modelio->setting.n_jump = 0;
     modelio->setting.collisionOrder = 1;
     modelio->setting.spectralBatchSize = 1;
@@ -143,6 +178,9 @@ bool Command::runRTAccelerated(std::shared_ptr<VoxelrtIO>& modelio,
 }
 
 
+// 模块：录制并提交某阶段的一次计算派发（不等待，需随后 waitFence）。
+// 输入：stage 选择管线，dispatchSize 为工作组数；inSemaphores/outSemaphore 当前未使用。
+// 副作用：命令缓冲记入 m_inFlight，待 waitFence 回收；m_currentSemaphore 自增。
 void Command::submit(std::shared_ptr<VoxelrtIO> &modelio, VoxelRTStage stage, glm::ivec3 dispatchSize,
                      const std::optional<std::vector<VkSemaphore>> &inSemaphores, const std::optional<VkSemaphore> &outSemaphore)
 {
@@ -187,6 +225,8 @@ void Command::submit(std::shared_ptr<VoxelrtIO> &modelio, VoxelRTStage stage, gl
 }
 
 
+// 模块：向 cmdBuf 录制一次派发前的公共命令（不含 vkCmdDispatch 与提交）。
+// 输入：管线、描述符集、推送常量 setting（VoxelRTSetting，按值传入）。
 void Command::recordCommandBuffer(VkCommandBuffer cmdBuf, VkDescriptorSet descSet, VkPipelineLayout pipelineLayout,
                                   VkPipeline pipeline,  VoxelRTSetting setting)
 {
@@ -206,6 +246,7 @@ void Command::recordCommandBuffer(VkCommandBuffer cmdBuf, VkDescriptorSet descSe
 
 
 
+// 模块：等待最近一次提交完成，重置围栏并回收 m_inFlight 中的命令缓冲。
 void Command::waitFence(std::shared_ptr<VoxelrtIO> &modelio)
 {
     vkCheck(vkWaitForFences(modelio->m_device, 1, &(modelio->m_fence), VK_TRUE, UINT64_MAX), "VoxelRT GPU execution");
@@ -215,6 +256,7 @@ void Command::waitFence(std::shared_ptr<VoxelrtIO> &modelio)
 }
 
 
+// 模块：销毁；若仍有未回收的命令缓冲，先 vkDeviceWaitIdle 再释放，然后销毁围栏与信号量。
 void Command::destroy(std::shared_ptr<VoxelrtIO> &modelio) {
 
     if (!m_inFlight.empty()) {

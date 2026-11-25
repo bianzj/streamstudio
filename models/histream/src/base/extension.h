@@ -1,3 +1,16 @@
+// ==========================================================================
+// 文件：extension.h
+// 功能：histream 的“树外扩展”注册机制：声明扩展模式描述 ExtensionMode、注册表 ExtensionRegistry，
+//       以及由 CMake 生成的 registerExtensions() 和取可执行文件路径的 executablePath()。
+// 主要模块：
+//   1. ExtensionMode：扩展模式名、用法行、运行回调
+//   2. ExtensionRegistry：顺序保存模式，按名称查找
+//   3. registerExtensions / executablePath 声明
+// 与其他文件关系：extension.cpp 实现 executablePath；registerExtensions 由配置期生成的
+//       build/generated/histream_extensions.cpp 提供；主程序启动时调用，核心求解器不依赖扩展代码。
+// 约定：没有扩展时注册表为空；find 找不到返回 nullptr。
+// ==========================================================================
+
 #pragma once
 // Out-of-tree HiStream extensions.
 //
@@ -15,6 +28,8 @@
 
 namespace histream {
 
+// 一个扩展模式：name 为命令行第一个参数；usage 为用法提示；run 接收完整命令行与可执行文件路径，
+// 返回进程退出码。
 struct ExtensionMode {
     // First command-line argument that selects this mode, e.g. "eExample".
     std::string name;
@@ -24,6 +39,7 @@ struct ExtensionMode {
     std::function<int(int argc, char** argv, const std::filesystem::path& executable)> run;
 };
 
+// 扩展注册表：add 追加模式（不检查重名），find 返回第一个同名模式，modes 返回全部。
 class ExtensionRegistry {
 public:
     void add(ExtensionMode mode) { modes_.push_back(std::move(mode)); }

@@ -1,3 +1,15 @@
+// ==========================================================================
+// 文件：raytracing.h
+// 功能：RayTracing 模式总控类 Raytracing 的声明；聚合几何、场景、光学参数、缓冲、描述符、
+//       管线、命令等子模块（均以 shared_ptr 持有，构造时创建）。
+// 主要模块：
+//   1. 生命周期：setup → upload → create → run → destroy
+//   2. 输出：output（透视）、outputOrth（正射）、outputAlbedo（平均反射率文本）
+//   3. 设置：uploadSetting（XML → RaytracingIO）、updateSetting（→ 推送常量）
+// 数据流：运行状态全部保存在 RaytracingIO（raytracingio.h）；本类只持有子模块对象。
+// 关系：实现见 raytracing.cpp；由 base/engine.cpp 创建并按模式调用。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/24.
 //
@@ -20,6 +32,8 @@
 #include "src/raytracing/command.h"
 #include "src/base/utils.h"
 
+// 类：Raytracing——RayTracing 模式的总控。调用顺序：setup（设备）→ upload（读场景）→
+// create（GPU 资源）→ run（逐观测角追踪并输出）→ destroy。
 class Raytracing {
 public:
     Raytracing(){
@@ -36,11 +50,13 @@ public:
 
     };
 
+    // 生命周期接口（详见 raytracing.cpp 中各函数的说明）。
     bool setup(AppSetting &appsetting, std::shared_ptr<RaytracingIO> &raytracingio);
     bool upload(std::shared_ptr<FileIO> &fileio, std::shared_ptr<RaytracingIO> &raytracingio);
     bool create(std::shared_ptr<RaytracingIO> &raytracingio);
     bool run(std::shared_ptr<RaytracingIO> &raytracingio, std::shared_ptr<FileIO> &fileio);
     bool destroy( std::shared_ptr<RaytracingIO> &raytracingio);
+    // 输出接口：kangle 为观测角序号；kpos 为 UAV 航点序号（-1 表示非航点观测）。
     void outputOrth(std::shared_ptr<RaytracingIO> &modelio, std::shared_ptr<FileIO> &fileio, int kangle, int kpos = -1);
     void output(std::shared_ptr<RaytracingIO> &modelio, std::shared_ptr<FileIO> &fileio, int kangle, int kpos = -1);
    // bool recordCommandBuffer();
@@ -48,12 +64,14 @@ public:
 
 
 
+    // 设置接口：uploadSetting 读 XML 到 RaytracingIO；updateSetting 写推送常量。
     bool uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<RaytracingIO> &raytracingio);
     bool updateSetting(std::shared_ptr<RaytracingIO> &raytracingio);
 
 
   //  bool defineOPO(std::shared_ptr<RaytracingIO> &raytracingio);
 
+    // 子模块：几何（观测/光源）、场景、光学参数、管线、虚拟屏幕、缓冲、描述符、命令。
     std::shared_ptr<Geometry> m_pGeometry;
     std::shared_ptr<Scene> m_pScene;
     std::shared_ptr<Compo> m_pCompo;

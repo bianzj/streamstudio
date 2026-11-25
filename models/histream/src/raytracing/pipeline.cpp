@@ -1,3 +1,22 @@
+// ==========================================================================
+// 文件：pipeline.cpp
+// 功能：创建 RayTracing 模式使用的 Vulkan 光线追踪管线（VK_KHR_ray_tracing_pipeline）
+//       及其着色器绑定表（SBT）。
+// 主要模块：
+//   1. createShaderBindingTable  手工计算 SBT 各区域的步长/大小并写入着色器组句柄
+//   2. createPipeline            管线布局（含推送常量 RayRTSetting）、4 个着色器阶段、
+//                                4 个着色器组、管线创建（可选 deferred operation）、SBT 创建
+//   3. destroy                   销毁管线和管线布局
+// 着色器（由 RaytracingIO::definedDir + /shader/raytracing/ 加载，SPIR-V）：
+//   offline.rgen（raygen）、rmiss.rmiss（miss）、shadow.rmiss（阴影 miss）、
+//   closestHit.rchit（三角形最近命中）
+// 数据流：RaytracingIO 提供 m_device、m_descSetLayout、m_pAlloc、m_rtProperties 等；
+//         本文件写回 m_pipeline、m_pipelineLayout、m_rtSBTBuffer 及 m_*Region。
+// 关系：raytracing.cpp 调用 createPipeline；着色器组枚举（eRaygen/eMiss/eMiss2/eClosestHit/
+//       eShaderGroupCount）定义在 base/structs.h。
+// 约定：SBT 布局依次为 raygen(1) | miss(missCount=2) | hit(hitCount=1)，无 callable 区域。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/25.
 //
@@ -10,6 +29,11 @@
 #include "base/vkcheck.h"
 
 
+// 模块：手工构建着色器绑定表（SBT），仅在 useSBTWrapper=false 时被 createPipeline 调用。
+// 输入：raytracingio（读 m_pipeline、missCount、hitCount、m_rtProperties）；
+// 输出：写 m_rtSBTBuffer 以及 m_rgenRegion / m_missRegion / m_hitRegion 的 stride、size、地址。
+// 说明：句柄大小与对齐取自设备属性；raygen 区 stride 必须按 shaderGroupBaseAlignment 对齐，
+//       且 size 必须等于 stride（Vulkan 规范要求）；缓冲为主机可见，直接映射写入。
 void Pipeline::createShaderBindingTable(std::shared_ptr<RaytracingIO> &raytracingio)
 {
     auto & m_device = raytracingio->m_device;
@@ -31,6 +55,7 @@ void Pipeline::createShaderBindingTable(std::shared_ptr<RaytracingIO> &raytracin
     auto & m_callRegion = raytracingio->m_callRegion;
     auto & m_rtProperties = raytracingio->m_rtProperties;
 
+    // 步骤 1：计算各区域的 stride/size（句柄数 = raygen 1 个 + miss + hit）。
     auto handleCount = 1 + missCount + hitCount;
     uint32_t handleSize = m_rtProperties.shaderGroupHandleSize;
     // the SBT need to have starting groups to be aligned and handles in the group to be aligned.
@@ -43,12 +68,14 @@ void Pipeline::createShaderBindingTable(std::shared_ptr<RaytracingIO> &raytracin
     m_hitRegion.stride = handleSizeAligned;
     m_hitRegion.size = nvh::align_up(hitCount * handleSizeAligned, m_rtProperties.shaderGroupBaseAlignment);
 
+    // 步骤 2：从管线取出全部着色器组句柄（顺序与 createPipeline 里 groups 的顺序一致）。
     // Get the shader group handles
     uint32_t dataSize = handleCount * handleSize;
     std::vector<uint8_t> handles(dataSize);
     auto result = vkGetRayTracingShaderGroupHandlesKHR(m_device, m_pipeline, 0, handleCount, dataSize, handles.data());
     assert(result == VK_SUCCESS);
 
+    // 步骤 3：分配 SBT 缓冲并取设备地址，各区域按 raygen → miss → hit 顺序首尾相接。
     // Allocate a buffer for storing the SBT.
     VkDeviceSize sbtSize = m_rgenRegion.size + m_missRegion.size + m_hitRegion.size + m_callRegion.size;
     m_rtSBTBuffer = m_pAlloc->createBuffer(sbtSize,
@@ -67,6 +94,7 @@ void Pipeline::createShaderBindingTable(std::shared_ptr<RaytracingIO> &raytracin
     auto getHandle = [&](int i)
     { return handles.data() + i * handleSize; };
 
+    // 步骤 4：映射缓冲，把句柄按各区域 stride 依次写入后解除映射。
     // Map the SBT buffer and write in the handles.
     auto* pSBTBuffer = reinterpret_cast<uint8_t*>(m_pAlloc->map(m_rtSBTBuffer));
     uint8_t* pData{ nullptr };
@@ -93,6 +121,12 @@ void Pipeline::createShaderBindingTable(std::shared_ptr<RaytracingIO> &raytracin
     m_pAlloc->finalizeAndReleaseStaging();
 }
 
+// 模块：创建光线追踪管线（含管线布局、着色器阶段/组、SBT）。
+// 输入：raytracingio（读 m_device、m_descSetLayout、definedDir、useDeferred、useSBTWrapper）；
+// 输出：写 m_pipelineLayout、m_pipeline 以及 SBT；返回 true（失败时由 vkCheck 或异常抛出）。
+// 副作用：先销毁已有的管线布局与管线再重建，因此可在重新加载场景时重复调用；
+//         着色器文件缺失时抛出 std::runtime_error。
+// 步骤：1 管线布局 → 2 着色器阶段 → 3 着色器组 → 4 创建管线 → 5 创建 SBT → 6 释放着色器模块。
 bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
 {
 
@@ -105,6 +139,8 @@ bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
     auto & useDeferred = raytracingio->useDeferred;
     auto & useSBTWrapper = raytracingio->useSBTWrapper;
 
+    // 步骤 1：重建管线布局：一个描述符集 + 一段推送常量（RayRTSetting），
+    //         三个着色器阶段（raygen / closest hit / miss）都能读取该推送常量。
     vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
     VkPushConstantRange pushConstantRange{VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR,
                                           0, sizeof(RayRTSetting) };
@@ -115,6 +151,7 @@ bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
     pipelineLayoutCreateInfo.pSetLayouts = &m_descSetLayout;
     vkCheck(vkCreatePipelineLayout(m_device, &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout), "Raytracing vkCreatePipelineLayout");
 
+    // 步骤 2：加载 SPIR-V 并建立 4 个着色器阶段（先检查文件是否存在，缺失即报错）。
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// <summary>
     /// stages in pipeline
@@ -147,6 +184,8 @@ bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
     stage.stage = VK_SHADER_STAGE_MISS_BIT_KHR;
     stages[eMiss] = stage;
 
+    // 说明：stages 下标须与下面 groups 里的 generalShader / closestHitShader 取值一致
+    //       （eRaygen、eMiss、eMiss2、eClosestHit）。
     // emiss2;
     /// the second miss shader is invoked when a shadow ray misses the geometry.
     /// it simply indicates that no occlusion has been found
@@ -159,6 +198,9 @@ bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
     stage.stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     stages[eClosestHit] = stage;
 
+    // 步骤 3：建立着色器组：raygen、miss、shadow miss 为 GENERAL 组，
+    //         最近命中为 TRIANGLES_HIT_GROUP 组（没有 any-hit 与 intersection）。
+    //         组顺序决定 SBT 里句柄顺序，须与 missCount=2、hitCount=1 对应。
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// <summary>
     /// groups
@@ -187,6 +229,8 @@ bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
     group.closestHitShader = eClosestHit;
     groups.push_back(group);
 
+    // 步骤 4：创建光线追踪管线；useDeferred 为真时用 deferred operation 并行编译
+    //         （最多 8 个线程加入），默认关闭（useDeferred=false）。
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// <summary>
     /// pipeline
@@ -234,6 +278,7 @@ bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
         vkDestroyDeferredOperationKHR(m_device, deferredOp, nullptr);
     }
 
+    // 步骤 5：创建 SBT：默认使用 nvvk::SBTWrapper，否则用上面手工实现的版本。
     if (useSBTWrapper)
     {
         m_sbtWrapper.create(m_pipeline, rayPipelineInfo);
@@ -243,6 +288,7 @@ bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
         createShaderBindingTable(raytracingio);
     }
 
+    // 步骤 6：管线创建完成后着色器模块不再需要，统一销毁。
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     for (auto& s : stages)
     {
@@ -254,6 +300,8 @@ bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
 }
 
 
+// 模块：销毁管线与管线布局，并把句柄置为空。
+// 说明：SBT 缓冲/SBTWrapper 的释放被注释掉了，未在此处销毁（待核对：是否在别处释放）。
 void Pipeline::destroy(std::shared_ptr<RaytracingIO> &raytracingio) {
 
    // raytracingio->m_sbtWrapper.destroy();

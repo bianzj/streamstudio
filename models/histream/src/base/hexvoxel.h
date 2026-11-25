@@ -1,3 +1,18 @@
+// ==========================================================================
+// 文件：hexvoxel.h
+// 功能：异质性体元（hex voxel）方法的公共接口：数据结构 + OBJ 加载 + 逐体元计算 + 结果输出声明。
+// 主要模块：
+//   1. 数据结构：Tri3 / ObjInfo / HexScene（体元坐标下的面元场景）
+//   2. HexVoxelCg（CIx, CIy, CIz, rho，16 字节可直接上传 GPU）与 aExtrap（任意方向外推）
+//   3. HexConfig（采样参数）、VoxelResult / DirStats / HexResult（计算结果）
+//   4. 函数：loadObj（读 OBJ）、compute（逐体元计算）、toTsv / toJson（序列化输出）
+// 数据流：OBJ → loadObj → HexScene（体元坐标）→ compute → HexResult（非空体元的 CI 与 rho）
+//   → 主工程 scene.cpp 的 OBJ 体素化链路消费；或由独立 CLI（src/tools/hexvoxel）输出 TSV/JSON。
+// 与其他文件：实现见 hexvoxel.cpp；objloader.cpp 等主工程代码复用本文件的结构。
+// 约定：loadObj 之后坐标 = 世界坐标 / voxelSize（单位体元边长为 1）；gridOrigin 为平移量；
+//   rho 单位 m2/m3；CI 无量纲。文件顶部原作者注释保留，其中的公式说明是方法定义。
+// ==========================================================================
+
 //
 // hexvoxel.h
 //
@@ -35,6 +50,7 @@ namespace hexvoxel {
 // 数据结构 (体元坐标 = 世界坐标 / voxelSize, 单位体元边长 = 1)
 // ---------------------------------------------------------------------------
 
+// 单个三角面元：三个顶点的体元坐标（float，单位 = 体元边长）。
 struct Tri3 {
     float p0[3];
     float p1[3];
@@ -49,6 +65,8 @@ struct ObjInfo {
     std::uint32_t triCount{0};
 };
 
+// loadObj 的输出：体元坐标下的全部三角形、对象分组及包围盒，供 compute 使用。
+// minPos/maxPos 是平移到原点之后的包围盒；gridOrigin 记录平移量，用于恢复体元网格下标。
 struct HexScene {
     std::vector<Tri3> tris;
     std::vector<ObjInfo> objects;
@@ -70,6 +88,9 @@ struct HexVoxelCg {
 };
 
 // 由正交指数外推任意单位方向的聚集指数
+// 作用：由三个正交方向指数按 |d| 分量加权外推方向 d 的聚集指数 CI(d)。
+// 说明：权重按 |dx|+|dy|+|dz| 归一，因此对非单位向量也得到加权平均；
+//   方向长度近 0 时返回 1（不聚集）；结果限幅为不小于 0。
 inline float aExtrap(const HexVoxelCg& h, float dx, float dy, float dz) {
     const float wx = std::abs(dx), wy = std::abs(dy), wz = std::abs(dz);
     const float weight = wx + wy + wz;
@@ -78,6 +99,8 @@ inline float aExtrap(const HexVoxelCg& h, float dx, float dy, float dz) {
         (wx * h.ax + wy * h.ay + wz * h.az) / weight);
 }
 
+// compute 的采样参数：sampleN 为截面 N x N 网格；colM 为沿投影方向每列的采样点数；
+// volK 为体积采样 K^3；includeInteriors 决定封闭固体内部体元是否也记为 FULL。
 struct HexConfig {
     int sampleN{64};  // 投影并集覆盖率的截面采样网格 N x N
     int colM{4};      // 每列 (沿投影方向) 采样点数
@@ -86,6 +109,7 @@ struct HexConfig {
 };
 
 // 体元状态
+// 体元状态：EMPTY 无面元；FULL 封闭固体内部（A=1, rho=1）；MIXED 含面元的异质体元。
 enum class VoxelKind : unsigned char { EMPTY = 0, FULL = 1, MIXED = 2 };
 
 struct VoxelResult {

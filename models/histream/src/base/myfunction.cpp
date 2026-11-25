@@ -1,3 +1,14 @@
+// ==========================================================================
+// 文件：myfunction.cpp
+// 功能：myFunction 工具类的实现（声明见 myfunction.h）。
+// 主要模块：
+//   1. generateRandomFloat：区间 [min, max) 的均匀随机数
+//   2. mySplitStr / mySplitInt / mySplitFloat：按“分隔符字符集合”切分并转换字符串
+//   3. 文件中被注释掉的 sensorNameExist、GetListNodeLen 为遗留代码，当前不参与编译
+// 数据流：调用方（主要是 fileio.cpp）传入 XML 文本节点内容，得到 vector 结果。
+// 约定：delim 的每个字符都是分隔符；连续/首尾分隔符产生的空项被跳过。
+// ==========================================================================
+
 //
 // Created by zhongsy on 2024/8/9.
 //
@@ -15,6 +26,9 @@
 //    return false;
 //}
 
+// 作用：返回 [min, max) 内均匀分布的随机 float。
+// 说明：每次调用都用 std::random_device 重新播种 mt19937；min、max 为 int，
+//   因此无法直接表示小数区间端点。
 float myFunction::generateRandomFloat(int min, int max)
 {
     // DEFERRED[中] 性能: 每次调用都构造 std::random_device 和 mt19937（约 5 KB 状态并读取系统熵源），循环中调用极慢，且 random_device 在部分实现上可能是确定性的；参数为 int 无法生成 [0,0.5) 这类小数区间；理由：改 thread_local 引擎与 float 版签名会改变现有随机数序列/调用点语义，且不属本轮允许的缺陷类别，未改。
@@ -27,6 +41,9 @@ float myFunction::generateRandomFloat(int min, int max)
     return offx;
 }
 
+// 作用：把 str 按 delim 中的任一字符切成子串数组（不去除子串内部空白）。
+// 输入：str、delim；输出：非空子串序列，空串或全为分隔符时返回空数组。
+// 说明：以下三个切分函数循环结构相同：找下一个非分隔符起点 → 找其后第一个分隔符 → 取子串。
 std::vector<std::string> myFunction::mySplitStr(const std::string& str, const std::string& delim)
 {
     std::vector<std::string> res;
@@ -40,6 +57,7 @@ std::vector<std::string> myFunction::mySplitStr(const std::string& str, const st
     return res;
 }
 
+// 作用：同 mySplitStr，但把每个子串用 atoi 转为 int。
 std::vector<int> myFunction::mySplitInt(const std::string& str, const std::string& delim)
 {
     std::vector<int> res;
@@ -55,6 +73,8 @@ std::vector<int> myFunction::mySplitInt(const std::string& str, const std::strin
     return res;
 }
 
+// 作用：同 mySplitStr，但把每个子串用 atof（double）转换后存为 float。
+// 说明：非法数字静默得 0；fileio.cpp 用它解析逗号分隔的波段、角度等数值列表。
 std::vector<float> myFunction::mySplitFloat(const std::string& str, const std::string& delim)
 {
     std::vector<float> res;

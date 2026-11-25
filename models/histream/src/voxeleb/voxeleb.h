@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：voxeleb.h
+// 功能：VoxelEB 模式（体元能量平衡）的顶层控制类 Voxeleb 声明
+// 主要模块：
+//   1. 组件成员：几何、场景、成分、管线、虚拟屏幕、缓冲、描述符、命令（各为独立类的共享指针）
+//   2. 生命周期接口：setup / upload / create / run / runObserver / destroy
+//   3. 输入上传：设置、气溶胶、气象、defined 参数；节点级更新 updateMeteo、applyShortwaveSplit
+//   4. 输出接口：output / outputTxt / outputVoxel / outputFluidSlices
+// 数据流：FileIO（工程文件）→ upload* → VoxelebIO（CPU 数据与 Vulkan 句柄）
+//   → create（缓冲/描述符/管线）→ run（逐时间节点、逐角度求解）→ output*
+// 与其他文件的关系：实现在 voxeleb.cpp；全部状态存放于 voxelebio.h 的 VoxelebIO；
+//   GPU 资源由 voxeleb/ 目录下的 buffer、descriptor、command、pipeline 管理（待核对）
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/26.
 //
@@ -22,6 +36,7 @@
 #include "src/voxeleb/command.h"
 #include "src/base/utils.h"
 
+// 类：VoxelEB 的驱动入口。自身只持有各组件对象，运行状态都保存在 VoxelebIO 中。
 class Voxeleb {
 public:
     Voxeleb(){
@@ -37,6 +52,8 @@ public:
     };
 
 
+    // 生命周期：setup（初始化 Vulkan 设备等，待核对）→ upload（读入工程数据）→
+    //   create（建 GPU 资源）→ run / runObserver（求解）→ destroy（释放）。
     bool setup(AppSetting &appsetting, std::shared_ptr<VoxelebIO> &voxellstio);
     bool upload(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &voxellstio);
     bool create(std::shared_ptr<VoxelebIO> & modelio);
@@ -47,6 +64,7 @@ public:
 
 
 
+    // 设置与外部输入：运行参数、气溶胶、气象、defined 参数的读入与更新。
     bool updateSetting(std::shared_ptr<VoxelebIO> &voxellstio);
     bool uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &voxellstio);
 
@@ -60,6 +78,7 @@ public:
     // SHORTWAVE_SPLIT and, in erbs mode, re-uploads LightSet and atomconds.
     void applyShortwaveSplit(std::shared_ptr<VoxelebIO> &modelio, int knode);
 
+    // 输出：按时间节点/角度（/位置）写结果；体元量、流体切片等另有专用接口。
     void output(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &fileio, int knode, int kangle, int kpos = -1);
     void outputTxt(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &fileio, int kangle);
     void outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<FileIO> &fileio);

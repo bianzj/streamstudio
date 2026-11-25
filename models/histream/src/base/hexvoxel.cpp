@@ -1,3 +1,23 @@
+// ==========================================================================
+// 文件：hexvoxel.cpp
+// 功能：异质性体元（hex voxel）核心计算的实现：把三角面元投影聚合为每个体元的聚集指数 CI 与
+//   叶面积密度 rho。方法定义见 hexvoxel.h 顶部注释（CI = -ln(1-C)/P，CI(d) 由三正交方向外推）。
+// 主要模块：
+//   1. 基础几何（匿名命名空间）：V3 运算、线段-三角相交（含 x 扫描半开规则）、线段-线段/线段-三角距离
+//   2. OBJ 解析 loadObj：顶点缩放到体元坐标、n-gon 扇形剖分、按 o/g 分对象、平移到网格原点、
+//      按有向边净计数判定对象是否封闭
+//   3. 体元内几何：多边形裁剪到立方体、面积、2D 凸多边形包含、轴向投影并集覆盖率
+//   4. 体元中心奇偶性 buildParity 与点内部判定 pointInside；列遮挡判定 columnBlockedAxis / Dir
+//   5. compute：并行逐体元求 FULL / EMPTY / MIXED 状态、(CIx, CIy, CIz, rho)，统计外推误差
+//   6. 输出：toTsv / toJson
+// 数据流：OBJ 文件 → loadObj → HexScene → compute → HexResult（非空体元列表）。
+// 与其他文件：接口见 hexvoxel.h；被主工程 OBJ 体素化链路与 src/tools/hexvoxel 命令行复用。
+// 约定：全部几何在体元坐标（世界坐标 / voxelSize，体元边长 = 1）下进行；
+//   rho = 体元内叶片面积 / voxelSize（m2/m3，voxelSize 的单位待核对）；
+//   “封闭”对象的内部体元可记为 FULL；开放面（如地面）只通过投影与距离判定产生遮挡；
+//   环境变量 HEXDBG_BASE / HEXDBG_ROW / HEXDBG_CELL 仅用于调试输出。
+// ==========================================================================
+
 //
 // hexvoxel.cpp
 //
@@ -26,6 +46,7 @@ namespace {
 // 基础几何
 // ---------------------------------------------------------------------------
 
+// 三维向量及其基本运算（仅本文件使用；坐标单位 = 体元边长，见 hexvoxel.h）。
 struct V3 {
     float x{0}, y{0}, z{0};
 };
@@ -43,6 +64,8 @@ inline V3 normalize(const V3& a) {
     return l > 1.0e-20f ? V3{a.x / l, a.y / l, a.z / l} : V3{0, 0, 1};
 }
 
+// 三角面元的几何缓存：顶点、未归一化法向 n（叉积，长度 = 2 倍面积）及 AABB，
+// 避免在逐体元的相交/距离测试里重复计算。
 struct TriGeom {
     V3 p0, p1, p2;
     V3 n;      // 未归一化法向
@@ -52,6 +75,8 @@ struct TriGeom {
 // x 方向扫描奇偶的半开规则: 交点恰在三角边界 (投影到 (y,z) 的边上) 时,
 // 仅当该边在 (y,z) 平面中"向上" (b.z>a.z, 平则 b.y>a.y) 才计一次穿越。
 // 扇形剖分的共享对角线被两个三角以相反方向遍历, 恰好一个向上 => 只计一次。
+// 作用：交点 p 恰好落在三角形投影边界上时的“半开”判定，避免奇偶计数重复或遗漏。
+// 输入：p 为射线与三角面的交点；a、b、c 为三角形顶点。输出：该交点是否计为一次穿越。
 bool xScanBoundaryRule(const V3& p, const V3& a, const V3& b, const V3& c)
 {
     const V3 pts[3] = {a, b, c};
@@ -72,6 +97,8 @@ bool xScanBoundaryRule(const V3& p, const V3& a, const V3& b, const V3& c)
 
 // 段 AB 是否穿过三角面 (平面符号翻转 + 重心坐标包含测试)。
 // 用于奇偶 (inside/outside) 判定; 交点恰在边界时按 xScanBoundaryRule 半开规则计一次。
+// 步骤：1) 用 a、b 到三角面平面的有符号距离判断严格穿越；
+//   2) 求交点并用重心坐标 (u, v) 做包含测试，eps 为边界容差；3) 交点在边界上时交给半开规则。
 bool segmentHitsTriangle(const V3& a, const V3& b, const TriGeom& t, float eps = 1.0e-5f)
 {
     const float fa = dot(t.n, {a.x - t.p0.x, a.y - t.p0.y, a.z - t.p0.z});
@@ -180,6 +207,7 @@ struct RawFace {
 
 } // namespace
 
+// 作用：由三角下标反查所属对象下标（线性查找）；查不到时返回 0。
 std::uint32_t HexScene::objectOfTri(std::uint32_t triIndex) const
 {
     for (std::size_t o = 0; o < objects.size(); ++o) {
@@ -191,6 +219,11 @@ std::uint32_t HexScene::objectOfTri(std::uint32_t triIndex) const
     return 0;
 }
 
+// 模块：OBJ 加载。输入：path、voxelSize（物理体元边长，必须 > 0）；输出：out（体元坐标）。
+// 步骤：1) 逐行解析 v / f / o / g，顶点乘 1/voxelSize 转体元坐标；同时保存按 1e5 量化的整数坐标
+//      （仅用于封闭性判定时合并重复顶点）；2) 面按扇形剖分为三角形，记录所属对象；
+//   3) 建立对象列表；4) 计算 AABB 并平移到网格原点；5) 逐对象判定是否封闭。
+// 失败（文件打不开、voxelSize 非法、没有面）时返回 false 并通过 err 说明原因。
 bool loadObj(const std::string& path, float voxelSize, HexScene& out, std::string* err)
 {
     // DEFERRED[中] 安全: 窄字符 std::ifstream(path) 在 Windows 上按 ANSI 代码页解释，UTF-8 中文路径的 OBJ 打不开；建议：用 std::filesystem::u8path(path) 构造流。
@@ -305,6 +338,7 @@ bool loadObj(const std::string& path, float voxelSize, HexScene& out, std::strin
         return false;
     }
 
+    // 注意：同一对象的三角在 faces 中连续存放，故用“每个对象首个三角下标”即可得到 triOffset/triCount。
     // 建立对象列表与三角连续存储
     out.tris.resize(faces.size());
     out.objects.clear();
@@ -361,6 +395,7 @@ bool loadObj(const std::string& path, float voxelSize, HexScene& out, std::strin
     for (std::size_t o = 0; o < out.objects.size(); ++o) {
         auto& ob = out.objects[o];
         if (ob.triCount == 0) { ob.closed = false; continue; }
+        // 边的键：两个量化顶点（字典序较小者在前），保证同一条几何边的正反两个方向落到同一个键。
         struct QKey {
             long long a[3], b[3];
             bool operator<(const QKey& other) const {
@@ -414,10 +449,13 @@ bool loadObj(const std::string& path, float voxelSize, HexScene& out, std::strin
 
 namespace {
 
+// 计算上下文中的单个体元：只保存与其 AABB 相交的三角下标（用于加速后续所有测试）。
 struct Cell {
     std::vector<std::uint32_t> tris; // 与该体元 AABB 相交的三角下标
 };
 
+// compute() 的工作上下文：场景、三角几何缓存、对象封闭标志、网格尺寸、体元中心奇偶性、
+// 每体元的三角列表。cells / parity 的索引由 cellIndex() 按 [x][y][z] 展开（z 变化最快）。
 struct Ctx {
     const HexScene* scene;
     std::vector<TriGeom> geom; // 与 scene->tris 对齐
@@ -449,6 +487,9 @@ float component(const V3& p, int axis)
     return axis == 0 ? p.x : (axis == 1 ? p.y : p.z);
 }
 
+// 作用：用单个轴向平面裁剪凸多边形（Sutherland–Hodgman 的一步）。
+// 输入：source 多边形、axis（0/1/2 = x/y/z）、plane 位置、keepGreater（保留大于/小于一侧）；
+// 输出：裁剪后的多边形（可能为空）。边界处有 1e-6 的容差，使恰好落在平面上的点算作内部。
 std::vector<V3> clipCellPolygon(const std::vector<V3>& source,
                                 int axis, float plane, bool keepGreater)
 {
@@ -481,6 +522,7 @@ std::vector<V3> clipCellPolygon(const std::vector<V3>& source,
     return result;
 }
 
+// 作用：把三角形依次用体元立方体的 6 个面裁剪，得到落在体元 (x,y,z) 内的多边形（可能为空）。
 std::vector<V3> trianglePolygonInsideCell(const TriGeom& triangle,
                                           int x, int y, int z)
 {
@@ -495,6 +537,7 @@ std::vector<V3> trianglePolygonInsideCell(const TriGeom& triangle,
     return polygon;
 }
 
+// 作用：凸多边形面积（以顶点 0 为扇心的三角形叉积之和）；顶点数 < 3 返回 0。
 float polygonArea(const std::vector<V3>& polygon)
 {
     if (polygon.size() < 3) return 0.0f;
@@ -508,6 +551,7 @@ float polygonArea(const std::vector<V3>& polygon)
     return area;
 }
 
+// 作用：三角形落在体元 (x,y,z) 内部分的面积（体元坐标下，单位 = 体元边长^2）。
 float triangleAreaInsideCell(const TriGeom& triangle, int x, int y, int z)
 {
     return polygonArea(trianglePolygonInsideCell(triangle, x, y, z));
@@ -517,6 +561,8 @@ struct V2 {
     float x{0}, y{0};
 };
 
+// 作用：点是否在凸多边形内：所有边的叉积符号一致即内部；叉积近 0（点在边上）的边被忽略，
+// 因此边界点算内部；顶点逆时针或顺时针均可。
 bool pointInConvexPolygon2D(const std::vector<V2>& polygon, float x, float y)
 {
     int sign = 0;
@@ -533,6 +579,12 @@ bool pointInConvexPolygon2D(const std::vector<V2>& polygon, float x, float y)
     return sign != 0;
 }
 
+// 作用：沿轴 axis 把体元内的面元投影到截面，用 sampleN x sampleN 的像素中心采样计算“并集覆盖率”C。
+// 输入：体元 (cellX, cellY, cellZ)、axis（0/1/2）、sampleN；outputMask 非空时同时输出覆盖掩膜
+//   （每像素 1 位，按 64 位字打包，行优先 v*n+u），供世界体元合并多个实例时求联合遮挡。
+// 输出：被覆盖像素数 / (n*n)，范围 [0, 1]。
+// 步骤：1) 对体元内每个三角，先裁剪到体元立方体内；2) 取另外两个坐标做 2D 投影并限幅到 [0,1]；
+//   3) 在投影多边形的像素包围盒内逐个像素中心做凸多边形包含测试；已覆盖像素跳过（求并集）。
 float projectionCoverageAxis(const Ctx& c, int cellX, int cellY, int cellZ,
                              int axis, int sampleN,
                              std::vector<std::uint64_t>* outputMask = nullptr)
@@ -592,6 +644,13 @@ float projectionCoverageAxis(const Ctx& c, int cellX, int cellY, int cellZ,
     }
     return static_cast<float>(blocked) / static_cast<float>(n * n);
 }
+// 作用：计算每个体元中心是否位于封闭对象内部（奇偶性 parity：1 = 内部），写入 c.parity。
+// 只统计封闭对象 (closedObj) 的三角；开放面（如地面）不参与奇偶判定。
+// 输入/输出：c.cells、c.geom 已建好；c.parity 被赋值。每个 (y,z) 行用 OpenMP 并行。
+// 步骤：1) 基准：x=0 体元中心向 -x 外侧（x=-0.5，网格外部）连一条短线段，穿过封闭面的次数奇偶即
+//      x=0 处的 parity；2) 沿 x 方向逐对相邻体元中心：parity[x+1] = parity[x] XOR 中心间线段穿面次数；
+//      线段可能跨越两个体元，故合并两个体元的三角表，并用 hits 去重避免同一三角计两次。
+// 说明：环境变量 HEXDBG_BASE="y,z" 为调试开关，仅对指定行向 stderr 输出基准射线的命中信息。
 // 体元中心奇偶性: 先对每个 (y,z) 行做 -x 方向基准射线, 再沿 x 扫描线传播
 void buildParity(Ctx& c)
 {
@@ -673,6 +732,7 @@ void buildParity(Ctx& c)
 
 // 点 p (在体元 (x,y,z) 内部) 是否位于封闭材料内部:
 // parity(center) XOR (center->p 段穿过的封闭面数), 段在体元内 => 只查本胞三角
+// （上方注释的补充）输入 p 必须位于体元 (x,y,z) 内；输出：p 是否在封闭对象内部。
 bool pointInside(const Ctx& c, int x, int y, int z, const V3& p)
 {
     const V3 center{static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, static_cast<float>(z) + 0.5f};
@@ -688,6 +748,12 @@ bool pointInside(const Ctx& c, int x, int y, int z, const V3& p)
 
 // 沿轴 a 的列: 截面点 (x,y,z 中另两轴取 u,v), 列上 M 个采样点。
 // 封闭: 任一样点内部 => 遮挡; 开放: 列段与开放面相交 => 遮挡。
+// 作用：判断沿轴 axis 的一根“列”是否被面元遮挡（用于体积/列采样）。
+// 输入：体元；u、v 为截面像素下标（虽声明为 float，实际按整数下标用），n 为截面分辨率，
+//   m 为列上的采样点数。输出：true = 该列被遮挡。
+// 步骤：1) 列上取 m 个等距采样点，任一点位于封闭对象内部即遮挡；
+//   2) 否则把整根列当线段，与体元内所有三角（封闭/开放均可）求最短距离，距离 <= distEps(0.02 体元)
+//      视为遮挡 —— 用于零厚度的开放面（地面、单层叶片）以及恰好位于体元边界上的面。
 bool columnBlockedAxis(const Ctx& c, int cellX, int cellY, int cellZ, int axis,
                        float u, float v, int n, int m)
 {
@@ -731,6 +797,12 @@ bool columnBlockedAxis(const Ctx& c, int cellX, int cellY, int cellZ, int axis,
 // 任意方向 d (单位) 的面元基准真值 A_true:
 // 过体元中心、垂直于 d 的截面方 (半边长 0.5) 内采样, 每列沿 d 走 ±diagR 采样;
 // 只统计落在体元立方体内部的截面点。
+// （上方注释的补充）输入：d 为单位方向，u、v 为垂直于 d 的两个截面基向量，su、sv 为截面内偏移
+//   （体元单位）；n 为截面分辨率，m 为列上采样点数。输出：返回是否遮挡；inCube 返回截面点是否在体元内
+//   （不在立方体内的截面点不计入统计）。
+// 步骤：1) 截面点 base = 体元中心 + u*su + v*sv，要求落在立方体内；2) 沿 ±d 取半对角线 sqrt(3)/2 的线段，
+//   m 个采样点，位于立方体内且在封闭对象内部者遮挡；3) 否则线段到体元内任一三角的距离 <= 0.02 也算遮挡
+//   （与 columnBlockedAxis 的开放面处理一致；该距离测试使用未裁剪的整条线段）。
 bool columnBlockedDir(const Ctx& c, int cellX, int cellY, int cellZ, const V3& d,
                       const V3& u, const V3& v, float su, float sv,
                       int n, int m, bool& inCube)
@@ -772,6 +844,15 @@ bool columnBlockedDir(const Ctx& c, int cellX, int cellY, int cellZ, const V3& d
 
 } // namespace
 
+// 模块：逐体元计算异质性体元描述符（CIx, CIy, CIz, rho）并按需统计外推误差。
+// 输入：scene（loadObj 输出，体元坐标）、cfg（采样参数）、extraDirs（nExtraDirs 个单位方向，xyz 连续
+//   存放，可为空）、dirLabels（方向名称，可为 nullptr）。
+// 输出：HexResult —— 仅非空体元（FULL + MIXED，按 ix, iy, iz 排序）、网格尺寸、均值/最大值统计、
+//   各额外方向上 A_est(d) 与面元基准 A_true(d) 的误差统计、耗时（毫秒）。
+// 步骤：1) 确定网格并建立三角几何缓存与体元-三角表；2) 计算体元中心奇偶性（内部/外部）；
+//   3) 准备额外方向的正交基；4) OpenMP 并行逐体元：无三角 → 按奇偶判 FULL/EMPTY，
+//      有三角 → MIXED，计算 rho 与三方向 CI，并与基准真值比较；5) 合并线程累加器、压实、排序。
+// 副作用：读取环境变量 HEXDBG_ROW / HEXDBG_CELL 时向 stderr 打印调试信息（仅调试用）。
 HexResult compute(const HexScene& scene, const HexConfig& cfg,
                   const float* extraDirs, int nExtraDirs,
                   const char* const* dirLabels)
@@ -780,6 +861,7 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
     HexResult result;
     result.voxelSize = scene.voxelSize;
 
+    // 步骤 1：确定体元网格尺寸并建立几何缓存与体元-三角表。
     // 网格范围 (体元坐标)
     // loadObj() 已将坐标平移到 gridOrigin，网格必须覆盖 [0, floor(maxPos)]。
     // 再减一次 minPos 会在 minPos 非整数时丢掉最高一层体元。
@@ -814,6 +896,7 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
         g.maxZ = std::max(g.p0.z, std::max(g.p1.z, g.p2.z));
     }
 
+    // 说明：cells[idx] 为与该体元 AABB 相交的三角列表；一个三角会登记到其 AABB 覆盖的所有体元。
     // 体元空间哈希
     // DEFERRED[中] 内存: 每个体元一个 std::vector（24 B 空壳 + 堆分配），大场景（如 1000×1000×100 = 1e8 体元）仅空壳就需 2.4 GB，且 gx/gy/gz 由场景 AABB 推出、未设任何上限，离群顶点即可导致数十 GB 分配；建议：只为非空体元建立稀疏哈希（unordered_map 或按列 CSR），并在入口限制网格总数。
     c.cells.resize(static_cast<std::size_t>(gx) * gy * gz);
@@ -834,13 +917,18 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
                     c.cells[cellIndex(c, x, y, z)].tris.push_back(static_cast<std::uint32_t>(t));
     }
 
+    // 步骤 2：计算每个体元中心是否位于封闭对象内部（奇偶性）。
     buildParity(c);
 
+    // 采样参数缺省值：sampleN=64、colM=4、volK=4（cfg 中取值 <= 0 时回退）。
+    // volK 在本函数中读取后没有再被使用（疑似遗留参数，只报告）。
     const int n = cfg.sampleN > 0 ? cfg.sampleN : 64;
     const int m = cfg.colM > 0 ? cfg.colM : 4;
     const int k = cfg.volK > 0 ? cfg.volK : 4;
     result.sampleN = n;
 
+    // 步骤 3：为每个额外方向 d 归一化并构造与之正交的 (u, v) 基；长度近 0 的方向被丢弃。
+    //   参考向量在 d 接近 y 轴（|dy| >= 0.9）时改用 x 轴，避免叉积退化。
     // 准备方向基准
     struct DirBasis { V3 d, u, v; };
     std::vector<DirBasis> bases;
@@ -883,6 +971,8 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
         }
     }
 
+    // 步骤 4：并行逐体元计算。每个线程用自己的累加器，结束时在 critical 段合并；
+    //   体元结果先写入按 cellIndex 定位的临时网格，最后再压实为只含非空体元的列表。
     // 逐方向累加器
     struct DirAcc { double sumEst{0}, sumTrue{0}, sumAbs{0}, sumSq{0}; int cnt{0}; };
     std::vector<DirAcc> dirAcc(bases.size());
@@ -915,6 +1005,8 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
                     const auto idx = cellIndex(c, x, y, z);
                     const auto& cell = c.cells[idx];
 
+                    // 情形 A：体元内没有任何三角。中心位于封闭对象内部且 includeInteriors 时记为 FULL
+                    //   （CI 三向均为 1、rho=1、投影面积与覆盖率为 1、覆盖掩膜全 1）；否则为 EMPTY。
                     // ---- 无相交三角: 由中心奇偶判 FULL / EMPTY ----
                     if (cell.tris.empty()) {
                         const bool inside = c.parity[idx] == 1;
@@ -944,6 +1036,9 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
                         continue;
                     }
 
+                    // 情形 B：体元内有三角，记为 MIXED。
+                    //   B1) 累计体元内三角裁剪面积（叶面积）与三个轴向的投影面积 P_axis = Σ area·|n_axis|/|n|；
+                    //   B2) 对每个轴计算并集覆盖率 C，再得到 CI；B3) 对额外方向比较外推值与基准真值。
                     // ---- 有相交三角: MIXED, 采样计算 ----
                     VoxelResult vr;
                     vr.ix = x; vr.iy = y; vr.iz = z;
@@ -979,6 +1074,9 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
                         vr.cover[axis] = cover;
                         float ci = 1.0f;
                         // DEFERRED[低] 数值: 覆盖率饱和（C=1）时 gap 被钳到 0.5/N²，CI=-ln(gap)/P 的值完全由采样分辨率 N 决定（N=64 时约 9/P），不同 sampleN 的结果不可比；P 很小而 C>0（掠射面）时 CI 可达极大值；建议：对 CI 设物理上限（如 ≤ 1/P·ln(N²) 并注明），或对饱和体元单独标记。
+                        // 投影面积过小或完全无覆盖时保持 CI=1（缺省不聚集）。
+                        // 空隙率下限 minimumGap = 0.5/N^2：覆盖率饱和（C 接近 1）时避免 log(0)，相当于半个采样像素的空隙；
+                        // CI 再限幅为不小于 0。
                         if (projectedArea[axis] > 1.0e-8 && cover > 0.0f) {
                             const float minimumGap = 0.5f / static_cast<float>(n * n);
                             const float gap = std::max(1.0f - cover, minimumGap);
@@ -991,6 +1089,9 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
                         else vr.hex.az = ci;
                     }
 
+                    // B3：对每个额外方向 d，在垂直于 d 的 N x N 截面格点上逐列判定遮挡，
+                    //   A_true = 被遮挡列数 / 落在体元立方体内的列数；A_est = aExtrap(CIx, CIy, CIz; d)；
+                    //   累加 A_est、A_true、绝对误差与平方误差，供 rms / 平均误差统计。
                     // 任意方向: 外推估计 vs 面元基准真值
                     for (std::size_t bi = 0; bi < bases.size(); ++bi) {
                         const auto& bb = bases[bi];
@@ -1027,6 +1128,7 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
             }
         }
 
+        // 步骤 5：合并各线程累加器 → 压实非空体元 → 计算全局均值 / 最大值 / 方向误差 → 排序。
         // 合并线程累加器
         #pragma omp critical
         {
@@ -1057,6 +1159,8 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
     result.nMixed = nMixed;
     const long long total = static_cast<long long>(gx) * gy * gz;
     const long long active = nFull + nMixed;
+    // meanRhoAll 对全部网格体元（含空）取平均；meanRhoActive 只对非空体元；
+    // meanA 为非空体元三个方向 CI 的总平均（sumA 对每体元累加 CIx+CIy+CIz，故除以 3*active）。
     result.meanRhoAll = total > 0 ? static_cast<float>(sumRhoAll / total) : 0.0f;
     result.meanRhoActive = active > 0 ? static_cast<float>(sumRhoActive / active) : 0.0f;
     result.meanA = active > 0 ? static_cast<float>(sumA / (3.0 * active)) : 0.0f;
@@ -1095,6 +1199,7 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
 // 输出
 // ---------------------------------------------------------------------------
 
+// 作用：把非空体元输出为 TSV 文本，列为 ix、iy、iz、kind（0 空 / 1 FULL / 2 MIXED）、ax、ay、az、rho。
 std::string toTsv(const HexResult& r)
 {
     std::ostringstream os;
@@ -1108,6 +1213,8 @@ std::string toTsv(const HexResult& r)
     return os.str();
 }
 
+// 作用：输出汇总统计与各方向误差的 JSON 文本（不含逐体元数据）；objPath 经转义后写入。
+// 疑似问题（只报告）："grid" 字段被写成单个字符串元素 ["gx, gy, gz"] 而不是三个数字组成的数组。
 std::string toJson(const HexResult& r, const std::string& objPath)
 {
     std::ostringstream os;

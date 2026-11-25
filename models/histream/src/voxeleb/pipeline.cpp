@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：pipeline.cpp
+// 功能：创建/销毁 VoxelEB（体元能量平衡）的全部计算管线（compute pipeline）
+// 主要模块/步骤：
+//   1. createPipeline：重建管线布局（push constant = VoxelLstSetting + 描述符集布局）
+//   2. 按 VoxelEBStage 枚举为每个阶段定位 .spv 着色器（shader/voxeleb/*.comp.spv）
+//   3. 设置特化常量（周期边界开关与穿越次数上限），逐阶段创建 VkPipeline
+//   4. destroy：销毁所有阶段的管线与管线布局
+//   （其余 createRT/ET/EB/Aero/BioPipeline 为旧版分管线实现，已整体注释掉，仅作历史保留）
+// 数据流：输入 modelio->definedDir（着色器所在根目录）、m_descSetLayout（由 descriptor.cpp
+//         创建）、stabilityCorrection / vegetationTemperatureMethod / periodicNeighborCount；
+//         输出 modelio->m_pipelineLayout 与 m_pipelines[stage]
+// 与其他文件的关系：command.cpp 用 m_pipelines[stage] 与 m_pipelineLayout 录制/提交各阶段；
+//   所有阶段共用同一管线布局与描述符集
+// 注意：stabilityCorrection 开启时 budget/evapo/aeresist 换用 *_most 版本（Monin-Obukhov
+//   稳定度修正）；生化阶段按 vegetationTemperatureMethod 选择 biochemical 或 biochemical_m12
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/26.
 //
@@ -10,6 +28,7 @@
 
 
 
+// 作用：RT 管线 SBT（着色器绑定表）的占位实现。VoxelEB 全为计算管线，无需 SBT，函数体为空。
 void Pipeline::createShaderBindingTable(std::shared_ptr<VoxelebIO> &modelio)
 {
 
@@ -18,6 +37,11 @@ void Pipeline::createShaderBindingTable(std::shared_ptr<VoxelebIO> &modelio)
 
 }
 
+// 作用：创建 VoxelEB 所有阶段（VoxelEBStage）的计算管线。
+// 输入：modelio（definedDir、m_descSetLayout、m_device 及若干开关，见文件头）；
+// 输出：modelio->m_pipelineLayout、modelio->m_pipelines[stage]；全部成功返回 true，
+//       任一阶段创建失败则记录错误并返回 false（此前已建的管线保留，由 destroy 清理）。
+// 说明：每次调用先销毁旧的管线布局，因此可在更改开关后重建管线。
 bool Pipeline::createPipeline(std::shared_ptr<VoxelebIO> &modelio)
 {
 
@@ -34,6 +58,8 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelebIO> &modelio)
     auto & m_debug = modelio->m_debug;
 
 
+    // 步骤 1：重建管线布局。push constant 范围覆盖整个 VoxelLstSetting（128 字节，仅计算阶段），
+    // 描述符集布局只有一个集（descriptor.cpp 创建）。
     vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
 
     VkPushConstantRange pushConstant{VK_SHADER_STAGE_COMPUTE_BIT,
@@ -46,11 +72,19 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelebIO> &modelio)
     vkCreatePipelineLayout(m_device, &pipelineLayoutCreateInfo, nullptr, &m_pipelineLayout);
 
 
+    // 步骤 2：确定每个阶段对应的 SPIR-V 文件（相对 definedDir）。
+    // stabilityCorrection（Monin-Obukhov 稳定度修正）只影响 budget / evapo / aeresist 三个着色器，
+    // 用 _most 后缀选择同一源码以 -DVOXELEB_MOST=1 编译的版本（见 CMakeLists.txt）；其余模块不变。
     std::string baseDirectory = modelio->definedDir;
     // control.stabilityCorrection selects the Monin-Obukhov builds of the
     // exchange shaders (-DVOXELEB_MOST); the neutral modules are unchanged.
     const std::string most = modelio->stabilityCorrection ? "_most" : "";
     std::map<VoxelEBStage, std::string> VoxellstPaths{
+            // 阶段与着色器对应：gap=体元太阳可见度（voxelrad_solar）、directVNIR/directTIR=直射项、
+            // scatteringVNIR / scatteringTrace=VNIR 多次散射（scatteringTrace 是同一份 voxelrad_scattering_VNIR.comp
+            // 以 -DSCATTER_TRACE_STAGE=1 另行编译，见 CMakeLists.txt）、diffuseTIR=热红外漫射、budget=能量收支、
+            // evapo=蒸散与热储、updateTp=提交温度历史、updateL=Monin-Obukhov 长度 L（旧版）、aero=空气动力阻抗、
+            // bio=叶片生化、fluidLbm/fluidCommit=LBM 流体步进与提交、out=传感器成像输出。
             {VoxelEBStage::gap,         baseDirectory + "/shader/voxeleb/voxelrad_solar.comp.spv"},
             {VoxelEBStage::directVNIR,  baseDirectory + "/shader/voxeleb/voxelrad_direct_VNIR.comp.spv"},
             {VoxelEBStage::directTIR,   baseDirectory + "/shader/voxeleb/voxelrad_direct_TIR.comp.spv"},
@@ -62,6 +96,7 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelebIO> &modelio)
             {VoxelEBStage::updateTp,    baseDirectory + "/shader/voxeleb/updateTp.comp.spv"},
             {VoxelEBStage::updateL,     baseDirectory + "/shader/voxeleb/updateL.comp.spv"},
             {VoxelEBStage::aero,        baseDirectory + "/shader/voxeleb/aeresist" + most + ".comp.spv"},
+             // 植被温度方法 0 用 biochemical.comp，其余取值用 biochemical_m12.comp（方法编号含义待核对）。
              {VoxelEBStage::bio,         baseDirectory + (modelio->vegetationTemperatureMethod == 0
                  ? "/shader/voxeleb/biochemical.comp.spv"
                  : "/shader/voxeleb/biochemical_m12.comp.spv")},
@@ -70,6 +105,8 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelebIO> &modelio)
             {VoxelEBStage::out,         baseDirectory + "/shader/voxeleb/voxelrad_image.comp.spv"}};
 
 
+    // 仅以 gap 阶段的 .spv 为代表检查着色器目录是否存在；缺失只打印日志，不中断
+    // （后续 loadFile 对缺失文件的行为由 nvh 决定，待核对）。
     if (_access(VoxellstPaths[VoxelEBStage::gap].c_str(), 0) == -1)
     {
         std::string error = "Error: no shader file (.spv) found in " + baseDirectory + "\n";
@@ -81,6 +118,9 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelebIO> &modelio)
     // drops every periodic branch; with them the crossing limit is a
     // compile-time constant, so the periodic and non-periodic code paths of
     // a call site are no longer both kept.
+    // 步骤 3：特化常量，编号与 shader/periodic_walk.glsl 的 constant_id 对应：
+    // 0 = PERIODIC_BOUNDARY_ENABLED（周期边界开关），1 = PERIODIC_CROSSING_LIMIT（穿越次数上限，
+    // 此处限幅到 [0, 20]）。
     struct PeriodicSpecData { VkBool32 enabled; int32_t limit; };
     const PeriodicSpecData periodicData{
         modelio->periodicNeighborCount > 0 ? VK_TRUE : VK_FALSE,
@@ -90,6 +130,8 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelebIO> &modelio)
         {1, offsetof(PeriodicSpecData, limit), sizeof(int32_t)}};
     const VkSpecializationInfo periodicSpecialization{2, periodicEntries, sizeof(PeriodicSpecData), &periodicData};
 
+    // 步骤 4：逐阶段加载 SPIR-V、创建计算管线；着色器模块在管线创建后立即销毁（管线已持有副本）。
+    // 任一阶段失败即中止并返回 false。
     for (const auto &stage : magic_enum::enum_values<VoxelEBStage>())
     {
         //int stageInt = (int)stage;
@@ -339,6 +381,8 @@ bool Pipeline::createPipeline(std::shared_ptr<VoxelebIO> &modelio)
 
 
 
+// 作用：销毁 createPipeline 创建的所有阶段管线与管线布局，并把句柄复位为空。
+// 说明：其余被注释掉的行是旧版分管线（RT/ET/EB/Aero/Bio）的销毁逻辑，已不使用。
 void Pipeline::destroy(std::shared_ptr<VoxelebIO> &modelio) {
 
     // modelio->m_sbtWrapper.destroy();

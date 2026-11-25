@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：command.cpp（raytracing）
+// 功能：实现 RayTracing 模式的命令阶段：创建同步对象，按行分块提交 vkCmdTraceRaysKHR，等待并回收命令缓冲。
+// 主要模块：
+//   1. Command::create：创建 fence 与 2 个信号量
+//   2. Command::run：按 GPU 实测耗时自适应调整每次提交的行数，直到覆盖整幅图像
+//   3. Command::submit：记录命令缓冲（含全局内存屏障）并提交，用 fence 同步
+//   4. Command::recordCommandBuffer：绑定管线/描述符集、推送 RayRTSetting、追踪射线
+//   5. Command::waitFence / destroy：等待完成并回收；销毁同步对象
+// 数据流：raytracingio->setting（推送常量，含 imageOffsetY）与 dispatchRowCount 决定每块追踪的行范围；
+//   结果写入 virtualio 的输出存储缓冲，由 raytracing.cpp 读回。
+// 注意：分块是为了避免单次提交过长触发 Windows 的 GPU 超时恢复（TDR，约 2 s）。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/26.
 //
@@ -15,6 +29,8 @@ Command::Command()
 }
 
 
+// 作用：创建 fence 与 2 个信号量。信号量只为旧的信号量同步方案保留（提交代码已注释），当前仅用 fence。
+// 返回值恒为 false，调用方忽略（返回约定待核对）。
 bool Command::create(std::shared_ptr<RaytracingIO> &raytracingio){
     // for the firest init
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -34,12 +50,15 @@ bool Command::create(std::shared_ptr<RaytracingIO> &raytracingio){
     return false;
 }
 
+// 作用：把整幅图像按行分块追踪。每块：设置 setting.imageOffsetY（起始行）和 dispatchRowCount（行数）
+// → submit → waitFence，并按实测耗时调整下一块的行数。结束后把两者复位为 0。返回 true。
 bool Command::run(std::shared_ptr<RaytracingIO> &raytracingio){
 
     raytracingio->m_currentSemaphore = 1;
 
     const int imageHeight = std::max(1, raytracingio->imageSize.y);
     const int imageWidth = std::max(1, raytracingio->imageSize.x);
+    // 步骤 1：确定图像尺寸（至少 1）。初始每块约 65536 像素（(1<<16)/宽 行），以后按耗时自适应。
     // Each submission is sized by measured GPU time, not by a fixed row
     // count. The old rule (2048 threads per submission whenever periodic
     // traversal was on, the whole image otherwise) left the GPU mostly idle
@@ -48,6 +67,8 @@ bool Command::run(std::shared_ptr<RaytracingIO> &raytracingio){
     // the slab towards ~120 ms per submission.
     constexpr double targetMilliseconds = 120.0;
     int rowsPerSubmit = std::clamp((1 << 16) / imageWidth, 1, imageHeight);
+    // 步骤 2：逐块提交并同步。目标耗时 120 ms/块：下一块行数 = 本块行数 × clamp(120/实测毫秒, 0.25, 4)，
+    // 并限制在 [1, imageHeight]；单块耗时下限取 1 ms 防止除零。
     for (int row = 0; row < imageHeight;) {
         const int rows = std::min(rowsPerSubmit, imageHeight - row);
         raytracingio->setting.imageOffsetY = row;
@@ -63,6 +84,7 @@ bool Command::run(std::shared_ptr<RaytracingIO> &raytracingio){
         rowsPerSubmit = std::clamp(
             static_cast<int>(rows * scale), 1, imageHeight);
     }
+    // 步骤 3：复位分块参数，使 dispatchRowCount = 0 表示“整幅图像”（见 recordCommandBuffer）。
     raytracingio->setting.imageOffsetY = 0;
     raytracingio->dispatchRowCount = 0;
 
@@ -96,6 +118,9 @@ bool Command::run(std::shared_ptr<RaytracingIO> &raytracingio){
 //    m_currentSemaphore++;
 //}
 
+// 作用：创建并记录一个命令缓冲后提交到 m_queue，用 m_fence 同步。步骤：1 创建命令缓冲并登记到 m_inFlight；
+// 2 记录全局内存屏障；3 recordCommandBuffer；4 vkEndCommandBuffer + vkQueueSubmit。
+// inSemaphore / outSemaphore 参数当前未使用（旧信号量方案已注释），m_currentSemaphore 仅作计数。
 void Command::submit(std::shared_ptr<RaytracingIO> &raytracingio,
                      const std::optional<VkSemaphore> &inSemaphore, const std::optional<VkSemaphore> &outSemaphore)
 {
@@ -145,6 +170,9 @@ void Command::submit(std::shared_ptr<RaytracingIO> &raytracingio,
     m_currentSemaphore++;
 }
 
+// 作用：记录一次光线追踪。追踪尺寸 = 图像宽 × 本块行数（dispatchRowCount > 0 时）或整幅图像高；
+// 行偏移通过推送常量 setting.imageOffsetY 传给着色器（着色器侧用法待核对）。
+// SBT 区域来自 m_sbtWrapper（useSBTWrapper）或手工构造的 raygen/miss/hit/callable 区域。
 void Command::recordCommandBuffer(const VkCommandBuffer& cmdBuf, std::shared_ptr<RaytracingIO> &raytracingio)
 {
     auto &m_pipeline = raytracingio->m_pipeline;
@@ -188,6 +216,7 @@ void Command::recordCommandBuffer(const VkCommandBuffer& cmdBuf, std::shared_ptr
 //    vkCmdPushConstants(cmdBuf, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(VoxelLstSetting), &m_setting);
 }
 
+// 作用：等待本次提交完成（无超时），重置 fence，并销毁已完成的命令缓冲。
 void Command::waitFence(std::shared_ptr<RaytracingIO> &raytracingio)
 {
     vkCheck(vkWaitForFences(raytracingio->m_device, 1, &(raytracingio->m_fence), VK_TRUE, UINT64_MAX), "Raytracing GPU execution");
@@ -197,6 +226,7 @@ void Command::waitFence(std::shared_ptr<RaytracingIO> &raytracingio)
 }
 
 
+// 作用：若仍有在途命令缓冲，先等待设备空闲再回收；然后销毁 fence 与全部信号量。
 void Command::destroy(std::shared_ptr<RaytracingIO> &raytracingio) {
 
     if (!m_inFlight.empty()) {

@@ -1,3 +1,18 @@
+// ==========================================================================
+// 文件：buffer.cpp
+// 功能：VoxelRT 模式（体元辐射）的 GPU 缓冲区创建与销毁
+// 主要模块/步骤：
+//   1. createBuffer：逐类上传缓冲（均同步 submitAndWait），数据为空时上传 1 元素占位
+//      光谱/热/冠层/水体参数 → 网格顶点与索引 → mesh/instance/voxel 链接表与 NanoVDB
+//      → 加速结构 → 传感器/光源/波长 → 体元温度/方向/辐射/净辐射 → 输出影像与 LAD
+//   2. destroy：按指针判空依次释放缓冲与网格顶点/索引缓冲
+// 数据流：VoxelrtIO 中 meshio/instanceio/voxelio/surfio/virtualio 的 CPU 数据 → nvvk::Buffer
+//   → descriptor.cpp 写入描述符集 → 计算着色器
+// 与其他文件的关系：声明见 buffer.h；binding 序号见 descriptor.h；输出缓冲大小检查见
+//   base/outputsize.h；VoxelRTSetting 与 VoxelRad 等结构见 base/structs*.h
+// 约定：占位缓冲只为保证描述符与析构的解引用有效，内容为零值；温度单位 K（待核对）
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/28.
 //
@@ -7,6 +22,11 @@
 
 
 
+// 模块：创建 VoxelRT 全部 GPU 缓冲。
+// 输入：voxellstio 中的场景/体元/传感器数据；输出：各子结构中的 nvvk::Buffer 智能指针。
+// 说明：每个缓冲都用 cmdGen 录制上传并 submitAndWait，简单但串行；
+//   数据为空时（spectral/canopy/instanceLink/voxel 链接表/waves）上传占位，保证绑定有效。
+// 返回值：成功路径当前返回 false（见函数末尾说明）。
 bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
 
     VkDevice & m_device = voxellstio->m_device;
@@ -23,6 +43,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
 
     nvvk::CommandPool cmdGen(m_device, m_queue.familyIndex);
 
+    // 步骤 1：光谱参数缓冲（meshio->spectrals）；为空时上传 1 个零元素占位。
     // spectral
     if (meshio->spectrals.size() > 0)
     {
@@ -51,6 +72,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
 //        cmdGen.submitAndWait(cmdBufSpectral);
 //    }
 
+    // 步骤 2：热参数缓冲（meshio->thermals）；仅在非空时创建，不上传占位（见下方 DEFERRED）。
     // DEFERRED[中] Bug: thermal 为空时既不创建缓冲、createDescriptor 也不写该绑定，着色器静态使用该 binding 属未定义行为；但补占位会改变 voxelrt.cpp 中 thermalId < thermals.size() 的回退语义（空 thermal 从"无效索引"变为有效索引 0），需先确认物理语义，本轮不改。
     if (meshio->thermals.size() > 0)
     {
@@ -63,6 +85,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
 
 
 
+    // 步骤 3：冠层参数缓冲（meshio->canopies）；为空时上传占位。
     // canopy
     if (meshio->canopies.size() > 0)
     {
@@ -88,6 +111,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     cmdGen.submitAndWait(cmdBufWaterSet);
 
+    // 步骤 4：逐体元温度缓冲，初值向阳 305、背阴 295（单位 K，待核对）；
+    //   带 TRANSFER_SRC，便于回读。
     // tempe
     VkCommandBuffer cmdBufTempe = cmdGen.createCommandBuffer();
     std::vector<VoxelTempe> voxelTempes(n_voxel, VoxelTempe{305, 295});
@@ -100,6 +125,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
     ///--------------------------------------------------------------------
     ///  Scene properties
     ///--------------------------------------------------------------------
+    // 步骤 5：逐网格上传顶点/索引缓冲；带 SHADER_DEVICE_ADDRESS 与加速结构构建输入标志，
+    //   既供构建 BLAS，也供着色器经设备地址访问。
     // obj models buffer
     for (int kmodel = 0; kmodel < meshio->primMeshes.size(); kmodel++)
     {
@@ -124,6 +151,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
         meshio->m_bufferMeshes.emplace_back(model);
     }
 
+    // 步骤 6：把各网格顶点/索引缓冲的设备地址写入 meshLinks 并上传（着色器据此取几何）。
     // modelLink
     VkCommandBuffer cmdBufModelLink = cmdGen.createCommandBuffer();
     for (int kmodel = 0; kmodel < meshio->primMeshes.size(); kmodel++)
@@ -135,6 +163,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
     cmdGen.submitAndWait(cmdBufModelLink);
 
 
+    // 步骤 7：实例链接表；为空时上传 1 元素占位。
     // instance link
     if (instanceio->instanceLinks.size() > 0)
     {
@@ -153,6 +182,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
         cmdGen.submitAndWait(cmdBufInstanceLink);
     }
 
+    // 步骤 8：体元链接表、hex 表与 NanoVDB 网格数据；
+    //   nanoHandle 为空时三者都上传占位（见 else 分支说明）。
     // voxelLink and nano
     if (voxelio->nanoHandle.size() > 0)
     {
@@ -202,11 +233,14 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
     ///--------------------------------------------------------------------
     ///  Accelerate properties
     ///--------------------------------------------------------------------
+    // 步骤 9：依据网格与实例构建加速结构（BLAS/TLAS）。
     m_pAccelStruct->createAccelStruct(m_device,meshio,instanceio);
 
     ///--------------------------------------------------------------------
     ///  geometry properties
     ///--------------------------------------------------------------------
+    // 步骤 10：传感器矩阵与光源作为 UNIFORM 缓冲（设备本地 + HOST_COHERENT，
+    //   便于后续更新，待核对），随后上传波长表（为空时占位）。
     VkCommandBuffer cmdBufSensor = cmdGen.createCommandBuffer();
     voxellstio->m_pBufferSensor = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufSensor, sizeof(SensorMatrix), &voxellstio->sensor,
                                                                                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
@@ -236,6 +270,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
 
     // meteo and aero
 
+    // 步骤 11：逐体元 VoxelDir（solar、skyDiffuse）缓冲，初值全 0。
     // dir
     VkCommandBuffer cmdBufDir = cmdGen.createCommandBuffer();
     std::vector<VoxelDir> voxelDirs(n_voxel, VoxelDir{0, 0});
@@ -244,6 +279,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
                                                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufDir);
 
+    // 步骤 12：辐射场缓冲 VoxelRad，总条数 n_voxel × (DIFFUSENUM + 2·n_wave)，全零初始化；
+    //   条目的具体索引顺序以着色器为准（待核对）。
     // rads
     VkCommandBuffer cmdBufRads = cmdGen.createCommandBuffer();
     // Keep the directional integration scratch space separate from the
@@ -260,6 +297,7 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
                                                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufRads);
 
+    // 步骤 13：逐体元 VoxelNetRad（VNIR/TIR 直射与散射辐亮度）缓冲，初值全 0。
     // netRad
     VkCommandBuffer cmdBufNetRad = cmdGen.createCommandBuffer();
     std::vector<VoxelNetRad> voxelNetRads(n_voxel, VoxelNetRad{0, 0, 0, 0});
@@ -272,6 +310,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
     ///  Virtual Sceen properties
     ///--------------------------------------------------------------------
     /// storage
+    // 步骤 14：输出影像缓冲，元素数由 checkedOutputImageElements 按影像尺寸与波段数给出
+    //   （含上限检查，细节见 base/outputsize.h），全零初始化；随后上传 LAD 数组（surfio->lads）。
     VkCommandBuffer cmdBufStorage = cmdGen.createCommandBuffer();
     const size_t outputSize = checkedOutputImageElements(voxellstio->m_physicalDevice, voxellstio->imageSize.x, voxellstio->imageSize.y, voxellstio->n_wave);
     std::vector<float> outputImage(outputSize, 0.0);
@@ -295,6 +335,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
 
 
 
+// 模块：释放 createBuffer 创建的全部缓冲。
+// 说明：除热参数与网格缓冲外均按指针判空；热参数仅在 thermals 非空时才被创建。
 void Buffer::destroy(std::shared_ptr<VoxelrtIO> &voxellstio){
 
     VkDevice & m_device = voxellstio->m_device;

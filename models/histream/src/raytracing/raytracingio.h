@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：raytracingio.h
+// 功能：RayTracing 模式的“数据总线”类 RaytracingIO：把场景/观测/设置数据与全部 Vulkan 句柄
+//       集中在一个对象里，供 Raytracing 及其子模块（buffer、descriptor、pipeline、command）
+//       通过 shared_ptr 共享读写（成员均为 public，没有逻辑）。
+// 主要内容：
+//   1. 通用 IO 容器：m_meshio、m_instanceio、m_virtualio、m_defined、m_pAccelStruct
+//   2. 场景/观测几何：场景尺寸与原点、sensor/light、角度与波长列表、UAV 航点
+//   3. 设置：日期时间、波段/角度数、图像尺寸、采样数、最大深度、周期边界、天空盒、输出开关
+//   4. GPU 缓冲：波长、传感器、光源、物理纹理偏移与因子
+//   5. Vulkan 对象：设备/队列/命令池/描述符/管线布局/管线
+//   6. SBT 相关：SBTWrapper 或手工 SBT 的缓冲与各区域
+// 数据流：Raytracing::upload/uploadSetting 填充 2、3 → buffer.cpp 建 4 → descriptor 与 pipeline
+//         建 5、6 → Command::run 使用全部。着色器读取的推送常量为 RayRTSetting（structs_cg.h）。
+// 约定：kNoTextureOffset 须与 offline.rgen 中的 NO_TEXTURE_OFFSET 一致；
+//       Allocator 类型由编译宏 ALLOC_DMA / ALLOC_VMA 选择，缺省为 Dedicated。
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/24.
 //
@@ -42,9 +60,12 @@ typedef nvvk::ResourceAllocatorDedicated Allocator;
 
 
 
+// 常量：物理纹理偏移的“无纹理”标记（uint32 最大值）。
 // Must match NO_TEXTURE_OFFSET in offline.rgen.
 constexpr uint32_t kNoTextureOffset = 0xFFFFFFFFu;
 
+// 类：RaytracingIO——RayTracing 模式的共享状态。构造时创建网格/实例/虚拟屏幕/defined/
+// 加速结构等子 IO 对象；其余成员由 Raytracing 的各步骤填充（见文件头的数据流）。
 class RaytracingIO {
 
 
@@ -68,6 +89,8 @@ public:
 //    void updateLight(LightSet light);
 //    void destroy();
     //
+    // projectDir：工程输出目录（TIFF、albedo.txt 写在此处）；
+    // definedDir：histream 资源根目录，着色器按 definedDir + "/shader/raytracing/" 查找。
     std::string projectDir;
     std::string definedDir;
 
@@ -78,12 +101,14 @@ public:
    // std::vector<Angle>         m_pGeometry;
 
 
+    // 通用 IO 容器：网格（含材质链接/光谱参数）、实例、虚拟屏幕（输出存储缓冲）、defined 配置。
     std::shared_ptr<MeshIO> m_meshio;
     std::shared_ptr<InstanceIO> m_instanceio;
     std::shared_ptr<VirtualIO> m_virtualio;
     std::shared_ptr<DefinedIO> m_defined;
 
 
+   // kangle：当前正在处理的观测角序号（run 的循环变量写入）。
    int kangle = 0;
    //int n_wave = 0;
 
@@ -93,6 +118,8 @@ public:
     int n_instance = 0;
     glm::vec3 sceneSize{1.0f, 1.0f, 1.0f};
     glm::vec3 sceneOrigin{0.0f, 0.0f, 0.0f};
+    // voxelSize / voxelOrigin：场景水平范围与原点，由 base/scene.cpp 建场景时写入，
+    // Geometry::orthcorrect 用它确定正射校正的地面范围（单位 m）。
     glm::vec3 voxelSize;
     glm::vec3 voxelOrigin;
     float stepsize_surface;
@@ -100,6 +127,9 @@ public:
     glm::vec3 sMax;*/
 
     //Geometry info
+    // 观测/光源几何：每个观测角一个 Angle（sza/saa/vza/vaa，度），waves 为波长列表（nm 或 μm）。
+    // UAV 巡航模式：uavposes 为航点位置（x、y、z=高度），uavViewAzimuths 为各航点航向，
+    // n_pos 为航点数，k_pos 为当前航点。
     SensorMatrix sensor;   // original sensor become the angular sensor and spectral wavesets
     LightSet     light;
     std::vector<Angle> angles;
@@ -111,6 +141,8 @@ public:
     int k_pos{0};
 
     // Setting info
+    // 设置信息：datestr / timestr 缺省 "000000"（istime 为真时使用 timestr 缺省值，见下方原注释）；
+    // 以下由 Raytracing::uploadSetting 从 XML 填充。
     std::string datestr="000000";
     std::string timestr="000000";
     bool istime;  // if true using timestr default "000000"
@@ -122,6 +154,8 @@ public:
     glm::ivec2 imageSize;
     int n_sample;
     int maxDepth;
+    // periodicNeighborCount：周期边界的邻域遍历次数（0 表示不启用）；
+    // skyboxEnabled：未命中的光线是否取天空盒；dispatchRowCount：Command::run 每次提交的图像行数（0 表示整幅）。
     int periodicNeighborCount{0};
     bool skyboxEnabled{false};
     int dispatchRowCount{0};
@@ -133,12 +167,14 @@ public:
     bool isOrth;
 
 
+    // setting：推送常量副本（updateSetting 写入）；下面三个缓冲分别存放波长、传感器、光源。
     RayRTSetting setting;
     std::shared_ptr<nvvk::Buffer> m_pBufferWave;
     std::shared_ptr<nvvk::Buffer> m_pBufferSensor;
     std::shared_ptr<nvvk::Buffer> m_pBufferLight;
     std::shared_ptr<AccelStruct>  m_pAccelStruct;
 
+    // 物理纹理数据（由 buildPhysicalTextureFactors 生成，上传为两个 GPU 缓冲）：
     // Physical texture: per-instance offset into textureFactors (kNoTextureOffset = none);
     // factors are stored per (instance, triangle) and scale shortwave reflectance.
     std::vector<uint32_t> instanceTextureOffsets;
@@ -174,6 +210,9 @@ public:
 
 
 
+    // SBT：缺省使用 nvvk::SBTWrapper；useSBTWrapper=false 时用 Pipeline::createShaderBindingTable
+    // 手工构建（m_rtSBTBuffer + 各区域）。missCount=2（普通 miss + 阴影 miss），hitCount=1。
+    // useDeferred 为真时用 deferred operation 并行编译管线（缺省关闭）。
     bool useSBTWrapper{ true };
     bool useDeferred{ false };
     nvvk::SBTWrapper m_sbtWrapper;

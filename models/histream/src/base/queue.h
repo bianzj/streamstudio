@@ -1,3 +1,15 @@
+// ==========================================================================
+// 文件：queue.h
+// 功能：定义 nvvk::Queue，保存 Vulkan 队列句柄及其队列族下标、队列下标。
+// 主要模块：
+//   1. NVIDIA 许可证声明（Apache-2.0，原作者文件，保持不动）
+//   2. nvvk::Queue 结构体
+// 与其他文件的关系：被 appsetting.h 包含，AppSetting::m_queues 以及各模式的 IO 类
+//   （raytracingio.h、voxelrtio.h、voxelebio.h）持有 std::vector<nvvk::Queue>，
+//   buffer.cpp 等通过 m_queues[eGCT] 取用图形/计算/传输队列。
+// 注意：familyIndex/queueIndex 缺省为 ~0u，表示未初始化（无效）。
+// ==========================================================================
+
 /*
  * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -24,6 +36,7 @@
 
 namespace nvvk {
 	// Holding the queue created at Vulkan context creation, using nvvk::Context
+	// 结构体：一个 Vulkan 队列的句柄与索引；两个索引缺省为 ~0u（无效值）。
 	struct Queue
 	{
 		VkQueue  queue{ VK_NULL_HANDLE };

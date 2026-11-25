@@ -1,3 +1,23 @@
+// ==========================================================================
+// 文件：geometry.cpp
+// 功能：Geometry 类实现。把工程配置（FileIO）里的场景、太阳、传感器参数转成 GPU 渲染所需的
+//       相机矩阵（SensorMatrix）与光源（LightSet），并写入 RayTracing / VoxelEB / VoxelRT
+//       三类模型 IO 对象；同时提供正射（天底）影像的像素—场景坐标校正系数
+// 主要模块：
+//   1. 匿名命名空间工具：相机 up 向量（正射 / 透视）、缓冲区屏障、天底映射系数求解
+//   2. createLight：由太阳天顶角/方位角构造 LightSet
+//   3. createSensor（两个重载）：平行（正射）传感器与透视传感器的视图/投影逆矩阵
+//   4. 传感器配置（configureSensor / createConfiguredSensor / createPerspectiveSensor）
+//   5. 三套模型的 createGeometry / updateAngle / updateSensorPos / updateSensor /
+//      updateLight / orthcorrect（RayTracing、VoxelEB、VoxelRT 各一份，逻辑相近）
+// 数据流：FileIO（projectjson 解析结果）→ createGeometry 取角度表与传感器位置 →
+//         update* 写入各模型 IO 的 sensor / light → 渲染 → orthcorrect 给出输出栅格校正
+// 与其他文件的关系：geometry.h 声明；fileio_json.cpp 负责读取工程 JSON；structs.h 定义常量
+// 约定：场景坐标系 +X 为正北、+Z 为正东、+Y 向上（XZY 后缀表示 X/Z/Y 顺序的向量）；
+//       方位角自北顺时针；角度单位为度（内部乘 DEG2RAD 转弧度）；
+//       SENSOR_HEIGHT=3000（传感器距原点的距离，场景单位）、ANGLE_COR=0.1（度）
+// ==========================================================================
+
 //
 // Created by admin on 2024/1/24.
 //
@@ -13,8 +33,13 @@
 
 namespace {
 
+// 天底正射映射的缩放系数，固定为 1.0（保持真实场景长宽比，不再使用旧版 0.707 缩小）。
 constexpr double kOrthographicScale = 1.0;
 
+// 作用：正射/观测相机的 up 向量，使输出影像“上北右东”。
+// 输入：观测天顶角、方位角（度）；输出：与视线正交的单位 up 向量。
+// 说明：把正北（+X）投影到像面作 up；视线几乎沿北方向（退化）时改用世界 +Y；
+//       right 退化时退回 +Z。
 glm::vec3 observationCameraUp(float zenithDegrees, float azimuthDegrees)
 {
     const float zenith = zenithDegrees * DEG2RAD;
@@ -39,6 +64,8 @@ glm::vec3 observationCameraUp(float zenithDegrees, float azimuthDegrees)
     return glm::normalize(glm::cross(right, forward));
 }
 
+// 作用：透视相机的 up 向量，保持地平线水平（类似前视相机）。
+// 说明：优先把世界 +Y 投影到像面；天底（视线与 +Y 平行）时 up 退化，改用正北。
 glm::vec3 perspectiveCameraUp(float zenithDegrees, float azimuthDegrees)
 {
     const float zenith = zenithDegrees * DEG2RAD;
@@ -63,6 +90,8 @@ glm::vec3 perspectiveCameraUp(float zenithDegrees, float azimuthDegrees)
     return glm::normalize(glm::cross(right, forward));
 }
 
+// 作用：在命令缓冲中插入缓冲区内存屏障，保证传输（拷贝）写入对随后
+//       compute 着色器读取可见。
 void transferToComputeBarrier(vk::CommandBuffer command, VkBuffer buffer, VkDeviceSize size)
 {
     VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -78,6 +107,10 @@ void transferToComputeBarrier(vk::CommandBuffer command, VkBuffer buffer, VkDevi
                          0, nullptr, 1, &barrier, 0, nullptr);
 }
 
+// 作用：求天底正射输出栅格的像素坐标 (x, y) → 源坐标的双线性映射系数。
+// 输入：影像宽高（像素）、场景宽/深、源图上场景四角的坐标（左上/左下/右上/右下）；
+// 输出：cx、cy（各 4 项），源坐标 = c0·x + c1·y + c2·x·y + c3。
+// 说明：由 4 个角点解 4×4 线性方程（SVD 最小二乘）；栅格边界取 -0.5 与 size-0.5。
 void solveNadirMapping(float imageWidth, float imageHeight,
                        float sceneWidth, float sceneDepth,
                        const glm::vec2& leftUpper, const glm::vec2& leftBottom,
@@ -90,6 +123,8 @@ void solveNadirMapping(float imageWidth, float imageHeight,
     // lie at -0.5 and size-0.5.  Fitting scene corners to 0 and size-1 puts
     // the outer samples exactly on triangle boundaries and creates a ring of
     // false zero/no-hit pixels, most visibly as a nadir-angle dip.
+    // 步骤 1：按场景长宽比等比缩放进栅格，求每像素对应的地面尺寸 groundPerPixel，
+    //       并得到场景在栅格中居中的目标矩形 [x0, x1] × [y0, y1]。
     const double rasterWidth = std::max(1.0, static_cast<double>(imageWidth));
     const double rasterHeight = std::max(1.0, static_cast<double>(imageHeight));
     const double groundPerPixel = std::max(
@@ -104,6 +139,7 @@ void solveNadirMapping(float imageWidth, float imageHeight,
     const double y0 = (rasterHeight - targetHeight) * 0.5 - 0.5;
     const double y1 = y0 + targetHeight;
 
+    // 步骤 2：用四个角点建立设计矩阵（行：x, y, x·y, 1），分别对 X、Y 方向求解系数。
     Eigen::MatrixXd design(4, 4);
     design << x1, y0, x1 * y0, 1.0,
               x1, y1, x1 * y1, 1.0,
@@ -120,6 +156,12 @@ void solveNadirMapping(float imageWidth, float imageHeight,
 } // namespace
 
 
+// 作用：由太阳角度与辐射量构造光源。
+// 输入：sza/saa 太阳天顶角/方位角（度）；direct/diffuse 直射/散射辐射；
+//       solarT/skyT 太阳/天空等效温度；shortwave 水平面全球短波（RayTracing/VoxelRT 的 Rin）。
+// 输出：LightSet，direction 为指向太阳、长度 SENSOR_HEIGHT 的向量。
+// 说明：sza 恰为 0° 或 45°、saa 贴近 45° 倍数（<0.05°）时做 ANGLE_COR 偏移，
+//       避开与体元面对齐的退化方向（原因待核对）。
 LightSet Geometry::createLight(float sza, float saa, float direct, float diffuse,float solarT,float skyT, float shortwave)
 {
     LightSet light;
@@ -136,6 +178,7 @@ LightSet Geometry::createLight(float sza, float saa, float direct, float diffuse
     float r = SENSOR_HEIGHT;
     float rd = DEG2RAD;
     glm::vec3 origin = glm::vec3(0, 0, 0);
+    // 步骤：球坐标转笛卡尔，Y 为天顶方向。
     // Azimuth is clockwise from north: +X is north and +Z is east.
     glm::vec3 lightPos = glm::vec3(r * std::sin(sza * rd) * std::cos(saa * rd),
                                    r * std::cos(sza * rd),
@@ -155,6 +198,10 @@ LightSet Geometry::createLight(float sza, float saa, float direct, float diffuse
     return light;
 }
 
+// 作用：创建平行（正射）传感器：相机置于观测方向 SENSOR_HEIGHT 处，窄视场（SENSOR_FOV），
+//       并把相机拟合到整个场景范围（乘 ratio）。
+// 输入：size 场景尺寸，origen 场景中心，vza/vaa 观测天顶/方位角（度），ratio 范围放大系数。
+// 输出：SensorMatrix（视图/投影逆矩阵、焦距、视线方向）。aperture 恒为 0（针孔）。
 SensorMatrix Geometry::createSensor(glm::vec3 size, glm::vec3 origen, float vza, float vaa, float ratio) {
 
     // auto & sceneio = modelio->m_sceneio;
@@ -175,6 +222,7 @@ SensorMatrix Geometry::createSensor(glm::vec3 size, glm::vec3 origen, float vza,
                                     r * std::cos(vza * rd),
                                     r * std::sin(vza * rd) * std::sin(vaa * rd));
 
+    // 步骤 1：设置极小视场角以近似平行投影，并看向原点；up 取使影像上北的方向。
     CameraManip.setFov(SENSOR_FOV);
     CameraManip.setLookat(sensorPos, origin, observationCameraUp(vza, vaa));
     float fovv = CameraManip.getFov();
@@ -183,12 +231,14 @@ SensorMatrix Geometry::createSensor(glm::vec3 size, glm::vec3 origen, float vza,
 
 
     //CameraManip.fit(dimensionMin * ratio / scale, dimensionMax * ratio / scale); // the sensor position height is changed.
+    // 步骤 2：按场景包围盒拟合相机（会改变传感器高度）。
     CameraManip.fit(dimensionMin * ratio, dimensionMax * ratio); // the sensor position height is changed.
 
 
     float width = CameraManip.getWidth();
     float height = CameraManip.getHeight();
     const float aspectRatio = CameraManip.getWidth() / static_cast<float>(CameraManip.getHeight());
+    // 步骤 3：由相机矩阵与 Vulkan 约定的投影矩阵求逆（proj[1][1] 取反以翻转 Y）。
     glm::mat4 view = CameraManip.getMatrix();
     nvmath::mat4f projj = nvmath::perspectiveVK(CameraManip.getFov(), aspectRatio, 0.0001f, 10000.0f);
     // glm::mat4 proj = projglm::perspective(glm::radians(CameraManip.getFov()), aspectRatio, 0.01f, 1000.0f);
@@ -214,6 +264,11 @@ SensorMatrix Geometry::createSensor(glm::vec3 size, glm::vec3 origen, float vza,
     return sensor;
 }
 
+// 作用：创建透视传感器。
+// 输入：sensorPos_XZY 相机位置，center_XZY 注视点，sceneSize_XZY 场景尺寸，
+//       fovDegrees 视场角（≤0 时自动拟合到场景外接球），up 相机上方向。
+// 输出：SensorMatrix。说明：自动视场 = 2·atan(半高/距离)·1.02，限幅 [0.1°, 120°]；
+//       远裁剪面取 max(10000, 距离 + 4·半径)。
 SensorMatrix Geometry::createSensor(glm::vec3 sensorPos_XZY, glm::vec3 center_XZY,
                                     glm::vec3 sceneSize_XZY, float fovDegrees,
                                     glm::vec3 up) {
@@ -266,6 +321,13 @@ SensorMatrix Geometry::createSensor(glm::vec3 sensorPos_XZY, glm::vec3 center_XZ
     return sensor;
 }
 
+// 作用：把工程配置里的传感器（投影类型、视场、位置）换算到渲染场景单位并缓存到成员变量。
+// 输入：sensor 配置；sceneSize_XYZ 场景尺寸（配置坐标，Z 为高度）；
+//       metresPerUnit 每个场景单位对应的米数（RayTracing 传 1，体元模型传体元步长）。
+// 输出：写 m_sensorProjection / m_sensorFov / m_sensorSceneSize_XZY /
+//       m_sensorPosition_XZY / m_sensorTarget_XZY（均为 X、Z(高)、Y 顺序的 XZY 坐标）。
+// 说明：水平位置以场景中心为原点；注视点取场景中心的高度一半处；
+//       视场限幅 [0.1°, 120°]，米/单位下限 0.0001 以防除零。
 void Geometry::configureSensor(const SensorXml& sensor, glm::vec3 sceneSize_XYZ,
                                float metresPerUnit) {
     const float scale = std::max(0.0001f, metresPerUnit);
@@ -280,10 +342,18 @@ void Geometry::configureSensor(const SensorXml& sensor, glm::vec3 sceneSize_XYZ,
     m_sensorTarget_XZY = {0.0f, sceneSize_XYZ.z * 0.5f / scale, 0.0f};
 }
 
+// 作用：按工程配置选择传感器构造方式（外部相机文件 / 透视 / 平行），
+//       供 createGeometry 与 updateAngle 统一调用。
+// 输入：场景尺寸与原点（XZY）、观测天顶角 vza / 方位角 vaa（度）、拟合范围系数 ratio。
+// 输出：SensorMatrix。
 SensorMatrix Geometry::createConfiguredSensor(glm::vec3 size_XZY, glm::vec3 origin_XZY,
                                                float vza, float vaa, float ratio) {
     // The Stream3D bridge supplies the exact sensor frame, including orthographic
     // footprint and roll. Existing project cameras retain their normal behaviour.
+    // 分支 1：环境变量 HISTREAM_SENSOR_CAMERA 指向 JSON 时，直接使用其中给出的
+    //       viewInverse / projInverse（各 16 个列主序数），忽略工程里的传感器角度。
+    //       focalDist 用 ∓1 作为标记：orthographic 为真时取 -1，否则 +1（含义待核对）；
+    //       direction 取 viewInverse 第 3 列。
     if (const char* cameraPath = std::getenv("HISTREAM_SENSOR_CAMERA")) {
         // DEFERRED[低] 安全: getenv 返回 ANSI 代码页字符串，窄字符 ifstream 无法打开含代码页外字符的中文路径；错误信息也未带上路径；JSON 中缺 "viewInverse" 等字段时 at() 抛出的 nlohmann 异常信息难以定位；建议：用 _wgetenv + std::filesystem::path 打开，报错时附带路径与字段名。
         std::ifstream input(cameraPath);
@@ -308,6 +378,9 @@ SensorMatrix Geometry::createConfiguredSensor(glm::vec3 size_XZY, glm::vec3 orig
         sensor.direction = glm::vec3(sensor.viewInverse[2]);
         return sensor;
     }
+    // 分支 2：透视投影，相机位置为配置的传感器位置。
+    //       HISTREAM_HEX_CONE=lod 时把 aperture 置为 -4 作为 HEX LOD 锥体追踪的标记
+    //       （含义待核对，仅支持 lod）。
     if (m_sensorProjection == Projection::PERSPECTIVE) {
         SensorMatrix sensor = createPerspectiveSensor(m_sensorPosition_XZY, vza, vaa);
         if (const char* cone = std::getenv("HISTREAM_HEX_CONE")) {
@@ -319,6 +392,7 @@ SensorMatrix Geometry::createConfiguredSensor(glm::vec3 size_XZY, glm::vec3 orig
         }
         return sensor;
     }
+    // 分支 3：默认的平行（正射）传感器，同样受 HISTREAM_HEX_CONE 标记影响。
     SensorMatrix sensor = createSensor(size_XZY, origin_XZY, vza, vaa, ratio);
     if (const char* cone = std::getenv("HISTREAM_HEX_CONE")) {
         if (std::string(cone) != "lod") {
@@ -330,6 +404,8 @@ SensorMatrix Geometry::createConfiguredSensor(glm::vec3 size_XZY, glm::vec3 orig
     return sensor;
 }
 
+// 作用：以 position_XZY 为相机位置、vza/vaa 为视线方向（相机看向 -cameraOut）创建透视传感器。
+// 说明：vza 限幅到 [0, 89.999]° 避免水平视线；注视点距离取场景对角线长度（至少 1）。
 SensorMatrix Geometry::createPerspectiveSensor(glm::vec3 position_XZY, float vza, float vaa) {
     const float zenith = std::clamp(vza, 0.0f, 89.999f) * DEG2RAD;
     const float azimuth = vaa * DEG2RAD;
@@ -343,6 +419,8 @@ SensorMatrix Geometry::createPerspectiveSensor(glm::vec3 position_XZY, float vza
                         perspectiveCameraUp(vza, vaa));
 }
 
+// 作用：把 UAV 位姿（配置坐标 X/Y 水平、Z 高度，单位米）换算为场景 XZY 坐标，
+//       水平原点移到场景中心，并除以米/单位。依赖 configureSensor 已调用。
 glm::vec3 Geometry::sensorWorldToXzy(glm::vec3 position_XYZ) const {
     return {
         position_XYZ.x / m_sensorMetresPerUnit - m_sensorSceneSize_XZY.x * 0.5f,
@@ -351,6 +429,11 @@ glm::vec3 Geometry::sensorWorldToXzy(glm::vec3 position_XYZ) const {
 }
 
 
+// 模块：RayTracing 的几何初始化（影像尺寸、角度表、UAV 位姿、初始传感器与光源）。
+// 输入：fileio 工程配置；modelio 输出对象。结果写入 modelio 的 imageSize/angles/waves/
+//       sensor/light 等。返回 true。
+// 步骤：1 设置分辨率；2 读取太阳角与观测角表；3 读取波段与 UAV 信息；
+//       4 用第 0 个角度创建初始传感器和光源（角度表为空时用天顶观测）。
 bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<RaytracingIO> &modelio){
 
 //    auto & sceneio = modelio->m_sceneio;
@@ -414,6 +497,8 @@ bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<R
 
 }
 
+// 作用：切换到第 kangle 个角度：重建传感器并更新 GPU 缓冲，同时按该角度的太阳角重建光源。
+// 说明：光源的直射/散射/温度/短波沿用 modelio->light 中的现有值。
 void Geometry::updateAngle(std::shared_ptr<RaytracingIO> &modelio, int kangle){
 
     Angle &angle = modelio->angles[kangle];
@@ -434,6 +519,8 @@ void Geometry::updateAngle(std::shared_ptr<RaytracingIO> &modelio, int kangle){
 
 }
 
+// 作用：UAV 飞行模式下切换到第 kpos 个位姿，用透视传感器更新 GPU 缓冲。
+// 说明：越界或无角度表时直接返回；若给出每位姿的视方位角则覆盖第 0 个角度的 vaa。
 void Geometry::updateSensorPos(std::shared_ptr<RaytracingIO> &modelio, int kpos) {
     if (kpos < 0 || kpos >= static_cast<int>(modelio->uavposes.size()) || modelio->angles.empty()) return;
     Angle& angle = modelio->angles.front();
@@ -443,6 +530,7 @@ void Geometry::updateSensorPos(std::shared_ptr<RaytracingIO> &modelio, int kpos)
     updateSensor(modelio, sensor);
 }
 
+// 作用：同步把传感器矩阵写入 GPU 传感器缓冲（vkCmdUpdateBuffer）并插入 transfer→compute 屏障。
 void Geometry::updateSensor( std::shared_ptr<RaytracingIO> &modelio, SensorMatrix &sensor){
 
 
@@ -457,6 +545,7 @@ void Geometry::updateSensor( std::shared_ptr<RaytracingIO> &modelio, SensorMatri
     cmdBufGet.submitAndWait(cmdBuf);
 }
 
+// 作用：同步把光源写入 GPU 光源缓冲，并插入 transfer→compute 屏障。
 void Geometry::updateLight(std::shared_ptr<RaytracingIO> &modelio, LightSet &light){
 
 
@@ -472,6 +561,10 @@ void Geometry::updateLight(std::shared_ptr<RaytracingIO> &modelio, LightSet &lig
 }
 
 
+// 作用：计算 RayTracing 天底/斜视正射输出的栅格校正系数 cx、cy。
+// 输入：vza/vaa 观测角（度）；输出：cx、cy（见 solveNadirMapping）。
+// 步骤：1 求场景水平范围；2 用与 createSensor 相同的相机拟合；
+//       3 把场景地面四角投影到像素坐标；4 solveNadirMapping 求双线性系数。
 void Geometry::orthcorrect(std::shared_ptr<RaytracingIO> &modelio,float vza, float vaa,
                            Eigen::VectorXd &cx, Eigen::VectorXd &cy) {
 
@@ -511,6 +604,8 @@ void Geometry::orthcorrect(std::shared_ptr<RaytracingIO> &modelio,float vza, flo
     glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(CameraManip.getFov()), aspectRatio, 0.1f, 1000.0f);
     proj[1][1] *= -1;
 
+    // 步骤 3：场景地面（y=0）四角的世界坐标，经 proj·view 后做透视除法，
+    //       再由 NDC 换算为像素坐标（宽 width、高 height）。
     glm::vec4 leftupper,leftbottom,rightupper,rightbottom;
     leftupper = glm::vec4(dimensionMax.x,0,dimensionMin.z,1);
     leftbottom = glm::vec4(dimensionMin.x,0,dimensionMin.z,1);
@@ -549,6 +644,9 @@ void Geometry::orthcorrect(std::shared_ptr<RaytracingIO> &modelio,float vza, flo
 
 
 
+// 模块：VoxelEB 的几何初始化，流程同 RayTracing 版本。
+// 说明：configureSensor 使用体元步长作米/单位；createLight 不传短波，
+//       因为 VoxelEB 使用气象强迫 meteo 中的辐射，而非 LightSet.Rin。
 bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &modelio){
 
 //    auto & sceneio = modelio->m_sceneio;
@@ -611,6 +709,8 @@ bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<V
 
 }
 
+// 作用：切换到第 kangle 个角度。VoxelEB 的太阳角由气象时间经 SPA 算法重新求得
+//       （updateSolarAngle 覆盖 angle.sza/saa），再更新传感器与光源。
 void Geometry::updateAngle(std::shared_ptr<VoxelebIO> &modelio, int kangle){
 
     Angle &angle = modelio->angles[kangle];
@@ -634,6 +734,7 @@ void Geometry::updateAngle(std::shared_ptr<VoxelebIO> &modelio, int kangle){
 
 }
 
+// 作用：UAV 模式切换到第 kpos 个位姿（同 RayTracing 版本）。
 void Geometry::updateSensorPos(std::shared_ptr<VoxelebIO> &modelio, int kpos) {
     if (kpos < 0 || kpos >= static_cast<int>(modelio->uavposes.size()) || modelio->angles.empty()) return;
     Angle& angle = modelio->angles.front();
@@ -643,6 +744,7 @@ void Geometry::updateSensorPos(std::shared_ptr<VoxelebIO> &modelio, int kpos) {
     updateSensor(modelio, sensor);
 }
 
+// 作用：把传感器矩阵写入 VoxelEB 的 GPU 传感器缓冲，并加 transfer→compute 屏障。
 void Geometry::updateSensor( std::shared_ptr<VoxelebIO> &modelio, SensorMatrix &sensor){
 
 
@@ -657,6 +759,7 @@ void Geometry::updateSensor( std::shared_ptr<VoxelebIO> &modelio, SensorMatrix &
     cmdBufGet.submitAndWait(cmdBuf);
 }
 
+// 作用：把光源写入 VoxelEB 的 GPU 光源缓冲，并加 transfer→compute 屏障。
 void Geometry::updateLight(std::shared_ptr<VoxelebIO> &modelio, LightSet &light){
 
 
@@ -671,6 +774,10 @@ void Geometry::updateLight(std::shared_ptr<VoxelebIO> &modelio, LightSet &light)
     cmdBufGet.submitAndWait(cmdBuf);
 }
 
+// 作用：由气象时间 meteo.t（年内日序，含日小数）、年份、时区、经纬度、气压和气温，
+//       用 SPA 太阳位置算法求太阳天顶角和方位角（度），写入 angle。
+// 说明：时间化整到秒（最多 86399 秒，防止进位到下一年）；气压下限 100；
+//       大气折射 0.5667°；失败时抛异常。方位角约定见 SPA 输出（待核对是否自北顺时针）。
 void Geometry::updateSolarAngle(std::shared_ptr<VoxelebIO> &modelio, Angle &angle) {
     SPACalc spa;
     spa_data data{};
@@ -681,12 +788,14 @@ void Geometry::updateSolarAngle(std::shared_ptr<VoxelebIO> &modelio, Angle &angl
     const int kdoy = static_cast<int>(std::floor(t));
     // Round the day fraction to the nearest second; the last second of the
     // day is kept so rounding never moves past the end of the year.
+    // 步骤 1：把日序小数拆成日序号、时、分、秒，再换算月、日。
     const long long secondOfDay = std::min(86399LL, std::llround((t - kdoy) * 86400.0));
     const int h = static_cast<int>(secondOfDay / 3600);
     const int m = static_cast<int>((secondOfDay % 3600) / 60);
     const int s = static_cast<int>(secondOfDay % 60);
     Utils::calculateMonthAndDay(modelio->m_year, kdoy, &kmonth, &kday);
 
+    // 步骤 2：填充 SPA 输入，求 SPA_ZA（仅天顶角与方位角）。
     data.year = modelio->m_year;
     data.month = kmonth;
     data.day = kday;
@@ -714,6 +823,7 @@ void Geometry::updateSolarAngle(std::shared_ptr<VoxelebIO> &modelio, Angle &angl
 
 }
 
+// 作用：VoxelEB 的正射校正系数 cx、cy，算法同 RayTracing 版本（场景范围取 XZY 尺寸）。
 void Geometry::orthcorrect(std::shared_ptr<VoxelebIO> &modelio,float vza, float vaa,
                            Eigen::VectorXd &cx, Eigen::VectorXd &cy) {
 
@@ -751,6 +861,7 @@ void Geometry::orthcorrect(std::shared_ptr<VoxelebIO> &modelio,float vza, float 
     glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(CameraManip.getFov()), aspectRatio, 0.1f, 1000.0f);
     proj[1][1] *= -1;
 
+    // 步骤 3：场景四角投影到像素坐标（同 RayTracing 版本）。
     glm::vec4 leftupper,leftbottom,rightupper,rightbottom;
     leftupper = glm::vec4(dimensionMax.x,0,dimensionMin.z,1);
     leftbottom = glm::vec4(dimensionMin.x,0,dimensionMin.z,1);
@@ -788,6 +899,8 @@ void Geometry::orthcorrect(std::shared_ptr<VoxelebIO> &modelio,float vza, float 
 }
 
 
+// 模块：VoxelRT 的几何初始化，流程同 RayTracing 版本，差别：
+//       体元尺寸/原点用 XZY 坐标；createLight 传入 shortwaveIrradiance 作为 Rin。
 bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelrtIO> &modelio){
 
 //    auto & sceneio = modelio->m_sceneio;
@@ -859,6 +972,8 @@ bool Geometry::createGeometry(std::shared_ptr<FileIO> &fileio, std::shared_ptr<V
 
 }
 
+// 作用：切换到第 kangle 个角度。UAV 模式下使用固定相机（见下方 DEFERRED 说明），
+//       否则按配置创建传感器；再按该角度太阳角更新光源。
 void Geometry::updateAngle(std::shared_ptr<VoxelrtIO> &modelio, int kangle){
 
     Angle &angle = modelio->angles[kangle];
@@ -886,6 +1001,7 @@ void Geometry::updateAngle(std::shared_ptr<VoxelrtIO> &modelio, int kangle){
 
 }
 
+// 作用：UAV 模式切换到第 kpos 个位姿，并同时按当前角度重建光源（其余同 RayTracing 版本）。
 void Geometry::updateSensorPos(std::shared_ptr<VoxelrtIO> &modelio, int kpos){
     if (kpos < 0 || kpos >= static_cast<int>(modelio->uavposes.size()) || modelio->angles.empty()) return;
     Angle& angle = modelio->angles.front();
@@ -902,6 +1018,7 @@ void Geometry::updateSensorPos(std::shared_ptr<VoxelrtIO> &modelio, int kpos){
 
 }
 
+// 作用：把传感器矩阵写入 VoxelRT 的 GPU 传感器缓冲（本版本不加屏障，见下方 DEFERRED 说明）。
 void Geometry::updateSensor( std::shared_ptr<VoxelrtIO> &modelio, SensorMatrix &sensor){
 
 
@@ -916,6 +1033,7 @@ void Geometry::updateSensor( std::shared_ptr<VoxelrtIO> &modelio, SensorMatrix &
     cmdBufGet.submitAndWait(cmdBuf);
 }
 
+// 作用：把光源写入 VoxelRT 的 GPU 光源缓冲（同样不加屏障）。
 void Geometry::updateLight(std::shared_ptr<VoxelrtIO> &modelio, LightSet &light){
 
 
@@ -929,6 +1047,7 @@ void Geometry::updateLight(std::shared_ptr<VoxelrtIO> &modelio, LightSet &light)
     cmdBufGet.submitAndWait(cmdBuf);
 }
 
+// 作用：VoxelRT 的正射校正系数 cx、cy，算法同 RayTracing 版本。
 void Geometry::orthcorrect(std::shared_ptr<VoxelrtIO> &modelio,float vza, float vaa,
                            Eigen::VectorXd &cx, Eigen::VectorXd &cy) {
 
@@ -966,6 +1085,7 @@ void Geometry::orthcorrect(std::shared_ptr<VoxelrtIO> &modelio,float vza, float 
     glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(CameraManip.getFov()), aspectRatio, 0.1f, 1000.0f);
     proj[1][1] *= -1;
 
+    // 步骤 3：场景四角投影到像素坐标（同 RayTracing 版本）。
     glm::vec4 leftupper,leftbottom,rightupper,rightbottom;
     leftupper = glm::vec4(dimensionMax.x,0,dimensionMin.z,1);
     leftbottom = glm::vec4(dimensionMin.x,0,dimensionMin.z,1);

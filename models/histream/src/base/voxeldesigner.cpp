@@ -1,9 +1,31 @@
+// ==========================================================================
+// 文件：voxeldesigner.cpp
+// 功能：VoxelDesigner 的实现——把参数化形状（长方体/椭球/背景平面）和高度栅格（tif）
+//       离散成整数体元坐标，并生成体元模式使用的三角网格 PrimMesh。
+// 主要模块：
+//   1. 体元离散：loadModel 分派；createEllipsoid / createCube / createBackground
+//   2. 体元集合 → 网格：createTriVoxels（介质：三张中心正交面；实体：外表面）
+//   3. 参数化形状网格：createTriCube、createTriCube_wall / _roof（建筑墙体与屋顶）、
+//      createTriEllipsoid、createTriBackground、createTriEntity（按类型分派）
+//   4. 工具：outputPrimMesh（导出 OBJ 调试）、isInPloy（点在凸四边形内判定）
+//   5. 高度栅格：createTriEntitiesFromTif、_roof、_wall（表层体元 + 地表/墙面面片）
+//      （文件中间一段被注释掉的 DEM 背景实现已停用，仅作历史参考）
+// 数据流：scene.cpp 传入 Shape / 高度图路径与 stepSize → 本文件离散并生成 PrimMesh →
+//         scene.cpp 把 PrimMesh 并入场景（体元 id 写入 NanoVDB、顶点建 BLAS）。
+// 约定：体元坐标 (i, j, k) 为整数，x/y/z 分别对应 length/width/height，z 向上；
+//       体元的 id 是其最小角（左下）坐标，体元 AABB 为 [id, id+1]；网格顶点单位是体元（不是米），
+//       输入尺寸与 stepSize 的单位为米；meshcenter 个别函数以米计，见 DEFERRED 说明。
+// ==========================================================================
+
 #include "voxeldesigner.h"
 #include "voxel_boundary.h"
 #include <nvh/gltfscene.cpp>
 //#include "autogen/VoxelDesigner.comp.h"
 // using BufferT = nanovdb::HostBuffer;
 
+// 模块：按形状类型体元化并写入 m_voxelModel。
+// 输入：shapeType（CUBE / ELLIPSOID / PLANE，其余按 CUBE）、shape 尺寸（米）、stepSize（体元边长，米）。
+// 输出：无返回值；m_voxelModel.centerPoints / aabbs 被覆盖（各 create* 函数的副作用）。
 void VoxelDesigner::loadModel(ShapeType shapeType, Shape shape, float stepSize)
 {
     // 填充m_voxelModel内部的aabbs
@@ -24,6 +46,11 @@ void VoxelDesigner::loadModel(ShapeType shapeType, Shape shape, float stepSize)
     }
 }
 
+// 模块：椭球体元化（体元坐标 ivec3，单位为体元个数）。
+// 输入：height（z 向）、width（同时用作 x 向 length，即水平截面为圆）、stepSize，均为米。
+// 输出：返回落在椭球内的体元整数坐标，同时写入 m_voxelModel.centerPoints 与 aabbs
+//       （aabb = [coord, coord+1]，坐标为体元左下角，不是体元中心）。
+// 说明：参数非正或非有限时清空 m_voxelModel 并返回空集合，避免除零与超大循环。
 // 均为xyz坐标
 std::vector<glm::ivec3> VoxelDesigner::createEllipsoid(float height, float width, float stepSize) // Shape.length...
 {
@@ -36,6 +63,7 @@ std::vector<glm::ivec3> VoxelDesigner::createEllipsoid(float height, float width
         m_voxelModel.aabbs.clear();
         return discreteCoord;
     }
+    // 步骤 1：各方向体元数取 ceil，保证覆盖完整尺寸；椭球中心取体元数的一半。
     int widthSize = std::ceil(width / stepSize);
     int heightSize = std::ceil(height / stepSize);
     int lengthSize = std::ceil(width / stepSize);
@@ -44,6 +72,7 @@ std::vector<glm::ivec3> VoxelDesigner::createEllipsoid(float height, float width
     float heightCenter = heightSize / 2.0;
     float lengthCenter = lengthSize / 2.0;
 
+    // 步骤 2：遍历外接长方体内全部体元，用椭球方程 (x/a)^2+(y/b)^2+(z/c)^2 <= 1 判定是否保留。
     for (int i = 0; i < lengthSize; i++)
     {
         for (int j = 0; j < widthSize; j++)
@@ -81,6 +110,10 @@ std::vector<glm::ivec3> VoxelDesigner::createEllipsoid(float height, float width
 }
 
 
+// 模块：长方体体元化。
+// 输入：length（x）、width（y）、height（z），单位米；stepSize 体元边长（米）。
+// 输出：返回 ceil(size/step) 个方向的全部体元整数坐标，并写入 m_voxelModel（同 createEllipsoid）。
+// 说明：参数非正或非有限时清空 m_voxelModel 并返回空集合。
 std::vector<glm::ivec3> VoxelDesigner::createCube(float length, float width, float height, float stepSize)
 {
     std::vector<glm::ivec3> discreteCoord;
@@ -123,11 +156,19 @@ std::vector<glm::ivec3> VoxelDesigner::createCube(float length, float width, flo
     return discreteCoord;
 }
 
+// 模块：由体元坐标集合生成三角网格。
+// 输入：voxelIds（体元整数坐标）；solidBoundary 为 true 表示不透明实体（建筑/地表等），
+//       false 表示参与介质（如树冠湍流体元）。
+// 输出：PrimMesh（顶点单位为体元；voxelIds / faceIds / isValids 逐体元一条；
+//       meshcenter 为体元中心的平均位置）。
+// 说明：实体只输出集合外表面（voxel_boundary::emit）；介质则每个体元输出三张正交的
+//       中心面（z+0.5、x+0.5、y+0.5），用于射线与体元的积分。
 PrimMesh VoxelDesigner::createTriVoxels(const std::vector<glm::ivec3>& voxelIds, bool solidBoundary)
 {
     PrimMesh mesh{};
     mesh.meshId = 0;
 
+    // 步骤 1：四边形追加辅助函数，按 (0,1,2)(0,2,3) 拆成两个三角形，顶点不共享。
     auto appendQuad = [&mesh](const glm::vec3& p0, const glm::vec3& p1,
                               const glm::vec3& p2, const glm::vec3& p3) {
         const glm::vec3 points[4] = {p0, p1, p2, p3};
@@ -177,6 +218,10 @@ PrimMesh VoxelDesigner::createTriVoxels(const std::vector<glm::ivec3>& voxelIds,
     return mesh;
 }
 
+// 模块：长方体的三角网格（体元内部切面 + 外表面），顶点单位为体元。
+// 输入：shape（length/width/height，米）、stepSize（米）；输出：PrimMesh（参数非法时返回空网格）。
+// 说明：每个体元生成三张过其最小角的面（z=k、x=i、y=j），再补顶面与两个最大面；
+//       voxelIds 只在第三个（x-z 平面）循环里追加，每个体元一条。
 PrimMesh VoxelDesigner::createTriCube(Shape shape, float stepSize)
 {
     PrimMesh voxelTriModel;
@@ -190,6 +235,7 @@ PrimMesh VoxelDesigner::createTriCube(Shape shape, float stepSize)
     }
 
     // DEFERRED[中] Bug: 层数循环 k < height/stepSize 等价于 ceil（非整数倍时多出一层），而顶面/最大面位置用 round(height/stepSize)；例如 height=10、step=3 时体元到 z=4，顶面却在 z=3，盒子不封闭且顶面穿过体元内部；同时 voxelIds 只在 x-z 平面循环中追加；meshcenter 以米为单位而顶点以体元为单位，stepSize≠1 时中心错误；建议：统一用 n=ceil(size/step) 作为层数与外表面位置，meshcenter 用 n/2。
+    // 步骤 1：每个体元一张 z=k 的水平面（x-y 平面）；以下三个循环依次生成三个方向的面。
     // 绘制每一层x,y平面
     for (int k = 0; k < shape.height / stepSize; k++) //height,绘制每一层的面
     {
@@ -311,6 +357,7 @@ PrimMesh VoxelDesigner::createTriCube(Shape shape, float stepSize)
         }
     }
 
+    // 步骤 2：补三个正方向外表面（顶面 z、x 最大面、y 最大面），位置取 round(尺寸/stepSize)。
     // 绘制顶面(x,y)
     for (int i = 0; i < shape.length / stepSize; i++)
     {
@@ -429,6 +476,11 @@ PrimMesh VoxelDesigner::createTriCube(Shape shape, float stepSize)
     return voxelTriModel;
 }
 
+// 模块：建筑墙体网格（长方体去掉最顶一层）。顶点单位为体元。
+// 输入：shape（length/width/height，米）、stepSize（米）；输出：PrimMesh（参数非法时为空网格）。
+// 说明：层循环为 k < height/stepSize - 1，即只生成下面的 H-1 层，最顶层交给 createTriCube_roof；
+//       每个体元三张面（z=k、x=i、y=j），再补 x/y 方向最大面；voxelIds / isValids / faceIds
+//       在 x-z 面循环里逐体元追加；meshcenter 为米单位的水平中心（与顶点单位不同，见 DEFERRED）。
 PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
 {
     PrimMesh voxelTriModel;
@@ -441,6 +493,7 @@ PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
         return voxelTriModel;
     }
 
+    // 步骤 1：依次生成每个体元的 z=k（x-y）、x=i（y-z）、y=j（x-z）三个方向的面。
     // 绘制每一层x,y平面
     for (int k = 0; k < shape.height / stepSize-1; k++) //height,绘制每一层的面
     {
@@ -565,6 +618,7 @@ PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
     }
 
 
+    // 步骤 2：补 x 最大面（y-z 平面）与 y 最大面（x-z 平面），使墙体外表面封闭（见下方 DEFERRED）。
     // 绘制y,z最大面
     // DEFERRED[中] Bug: 外侧最大面直接放在 shape.length/stepSize（未取整的浮点），而 i/j 循环按 ceil 生成格子；尺寸不是步长整数倍时外墙落在最后一列体元内部（如 2.5），墙面不封闭且与 voxelIds 错位；墙体各层 k < height/step-1 也与 roof 的 k=int(height/step)-1 取整规则不同，可能缺层或重叠；建议：统一用 n=ceil(size/step)（或 round）作为格数与外表面坐标。
     for (int k = 0; k < shape.height / stepSize-1; k++) //height,绘制每一层的面
@@ -647,6 +701,9 @@ PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
     return voxelTriModel;
 }
 
+// 模块：建筑屋顶网格——只含最顶一层（k = height/stepSize - 1）的顶面，与 createTriCube_wall 配合。
+// 输入：shape（米）、stepSize（米）；输出：PrimMesh，顶面位于 z = k+1，voxelIds 的 z 为 k。
+// 说明：顶点单位为体元；meshcenter 为米单位的水平中心（与顶点单位不一致，待核对）。
 PrimMesh VoxelDesigner::createTriCube_roof(Shape shape, float stepSize)
 {
     PrimMesh voxelTriModel;
@@ -659,6 +716,7 @@ PrimMesh VoxelDesigner::createTriCube_roof(Shape shape, float stepSize)
         return voxelTriModel;
     }
 
+    // 步骤 1：为最顶层每个 (i, j) 体元生成一张水平顶面，并登记该体元的 voxelId。
     // 绘制顶面(x,y)
     // DEFERRED[中] 数值: float→int 截断；height<stepSize 时 k=-1，屋顶 voxelIds 的 z 为负（插入 NanoVDB 时落在地面以下/越界），height 不是步长整数倍时屋顶高度被向下取整而墙体按 ceil 计层；建议：k=max(0, (int)std::ceil(height/step)-1) 并与墙体统一取整。
     int k = shape.height/stepSize - 1;
@@ -707,6 +765,10 @@ PrimMesh VoxelDesigner::createTriCube_roof(Shape shape, float stepSize)
     return voxelTriModel;
 }
 
+// 模块：把 PrimMesh 导出为 OBJ 文本，用于调试查看。
+// 输入：path 输出文件路径；mesh 网格。输出：成功返回 true，文件无法打开返回 false。
+// 说明：写出时交换 y 与 z（v x z y），即把本类的 z-up 坐标转成常见 OBJ 的 y-up；
+//       面索引按 OBJ 从 1 开始；m_indicesBase 为局部变量，对单个网格恒为 0。
 bool VoxelDesigner::outputPrimMesh(std::string path, PrimMesh mesh)
 {
     std::ofstream outfile(path);
@@ -730,6 +792,9 @@ bool VoxelDesigner::outputPrimMesh(std::string path, PrimMesh mesh)
 }
 
 
+// 模块：椭球的三角网格。顶点单位为体元。
+// 输入：shape（length/width/height，米）、stepSize（米）；输出：PrimMesh（参数非法时为空网格）。
+// 说明：体元中心 (i+0.5, j+0.5, k+0.5) 落在椭球内的体元被保留；每个体元输出的面片见下。
 PrimMesh VoxelDesigner::createTriEllipsoid(Shape shape, float stepSize)
 {
     PrimMesh voxelTriModel;
@@ -760,9 +825,13 @@ PrimMesh VoxelDesigner::createTriEllipsoid(Shape shape, float stepSize)
         {
             for (int k = 0; k < heightSize; k++)
             {
+                // 步骤 1：以体元中心 (i+0.5, j+0.5, k+0.5) 到椭球中心的归一化距离判定体元是否在椭球内。
                 float dist = (i - lengthCenter + 0.5) * (i - lengthCenter + 0.5) / (lengthCenter * lengthCenter) +
                              (j - widthCenter + 0.5) * (j - widthCenter + 0.5) / (widthCenter * widthCenter) +
                              (k - heightCenter + 0.5) * (k - heightCenter + 0.5) / (heightCenter * heightCenter);
+                // 步骤 2：体元在椭球内时，输出 8 个角点和 -z（bottom）、-x（left，x=i）、-y（forward，y=j）
+                // 三个面；这三个面对所有保留体元都生成（含内部体元，见下方 DEFERRED），voxelIds 同时登记。
+                //       正方向 +z/+y/+x 面见下面三步，只在相邻体元中心落在椭球外时才生成。
                 // left, forward and bottom face
                 // DEFERRED[低] 性能: 每个内部体元都生成 -x/-y/-z 三个面（含 8 个不共享顶点，其中部分未被引用），而 +x/+y/+z 只在边界生成，内部面数约为表面面数的 O(n) 倍，大椭球冠层三角形数量与 BLAS 大小显著膨胀；若内部面仅作为积分平面是有意设计，也应注明；建议：内部面复用共享顶点，或像 createTriVoxels 一样明确区分介质/实体模式。
                 if (dist <= 1.0)
@@ -802,6 +871,7 @@ PrimMesh VoxelDesigner::createTriEllipsoid(Shape shape, float stepSize)
                     point[7].y = voxel.y;
                     point[7].z = (voxel.z + 1) ;
 
+                    // 顶点顺序：0-3 为底面 (z=k) 四角，4-7 为顶面 (z=k+1) 对应角点。
                     // All eight cell corners are shared by the initial faces.
                     for (int vi = 0; vi < 8; vi++)
                     {
@@ -840,6 +910,7 @@ PrimMesh VoxelDesigner::createTriEllipsoid(Shape shape, float stepSize)
                    voxelTriModel.voxelIds.emplace_back(glm::vec3{i, j, k});
                 }
 
+                // 步骤 3：+z 邻体元中心在椭球外时，补上顶面（z=k+1）。
                 // up face
                 float upDist = (i - lengthCenter + 0.5) * (i - lengthCenter + 0.5) / (lengthCenter * lengthCenter) +
                                (j - widthCenter + 0.5) * (j - widthCenter + 0.5) / (widthCenter * widthCenter) +
@@ -884,6 +955,7 @@ PrimMesh VoxelDesigner::createTriEllipsoid(Shape shape, float stepSize)
                     voxelTriModel.nIndices += 2 * 3;
                 }
 
+                // 步骤 4：+y 邻体元中心在椭球外时，补上 y=j+1 的面。
                 // backward face
                 float backwardDist = (i - lengthCenter + 0.5) * (i - lengthCenter + 0.5) / (lengthCenter * lengthCenter) +
                                      (j - widthCenter + 1.5) * (j - widthCenter + 1.5) / (widthCenter * widthCenter) +
@@ -928,6 +1000,7 @@ PrimMesh VoxelDesigner::createTriEllipsoid(Shape shape, float stepSize)
                     voxelTriModel.nIndices += 2 * 3;
                 }
 
+                // 步骤 5：+x 邻体元中心在椭球外时，补上 x=i+1 的面。
                 // right face
                 float rightDist = (i - lengthCenter + 1.5) * (i - lengthCenter + 1.5) / (lengthCenter * lengthCenter) +
                                   (j - widthCenter + 0.5) * (j - widthCenter + 0.5) / (widthCenter * widthCenter) +
@@ -981,6 +1054,9 @@ PrimMesh VoxelDesigner::createTriEllipsoid(Shape shape, float stepSize)
     return voxelTriModel;
 }
 
+// 模块：判断整数点是否严格落在由前 4 个顶点围成的凸四边形内（ploys 少于 4 个点返回 false）。
+// 方法：对四条边依次求叉积，四个符号全正或全负则在内部；点在边上（符号为 0）视为在外。
+// 说明：叉积结果被赋给 int，浮点顶点坐标会被截断（待核对是否有意）。
 bool VoxelDesigner::isInPloy(nvmath::vec2i testPoint, std::vector<nvmath::vec2f> ploys)
 {
     if (ploys.size() < 4) return false;
@@ -1004,6 +1080,10 @@ bool VoxelDesigner::isInPloy(nvmath::vec2i testPoint, std::vector<nvmath::vec2f>
 
 
 
+// 模块：背景平面体元化（z=0 的一层，j、k 分别对应 x、y 方向）。
+// 输入：sceneLength、sceneWidth（米）、stepSize（米）；输出：体元整数坐标 (j, k, 0)。
+// 说明：格数用 int 截断（不是 ceil）；与 createCube 不同，这里不写入 m_voxelModel
+//       （对应赋值已被注释），所以 loadModel(PLANE) 不会更新 m_voxelModel。
 std::vector<glm::ivec3> VoxelDesigner::createBackground(float sceneLength, float sceneWidth, float stepSize)
 {
     std::vector<glm::ivec3> discreteCoord;
@@ -1033,6 +1113,9 @@ std::vector<glm::ivec3> VoxelDesigner::createBackground(float sceneLength, float
     return discreteCoord;
 }
 
+// 模块：背景平面三角网格（原有 doxygen 说明见下）。
+// 说明：bgZ = -1，网格位于 z = bgZ+1 = 0 的平面；体元 id 记在 (i, j, -1)，即背景体元层在
+//       z=-1；每个格子 6 个顶点；meshcenter、faceIds、isValids 均未设置（调用方如需使用，待核对）。
 /// Create a triangle background
 /// \param sceneLength
 /// \param sceneWidth
@@ -1092,6 +1175,8 @@ PrimMesh VoxelDesigner::createTriBackground(float sceneLength, float sceneWidth,
     return mesh;
 }
 
+// 模块：按 shape.shapetype 分派到 createTriCube / createTriEllipsoid 生成实体网格。
+// 说明：其他形状类型不生成任何网格，返回的 PrimMesh 未初始化（meshId 等无默认值，见 structs.h）。
 PrimMesh VoxelDesigner::createTriEntity(Shape shape, float stepSize)
 {
     PrimMesh voxelTriModel;
@@ -1263,6 +1348,15 @@ PrimMesh VoxelDesigner::createTriEntity(Shape shape, float stepSize)
 //    return voxelTriModel;
 //}
 
+// 模块：由高度栅格（tif，单位米）生成表层体元与地表三角网格（用于地形/建筑高度图实体）。
+// 输入：heightPath 高度图路径（GDAL 读第 1 波段，单位米）；stepSize 体元边长（米）。
+// 输出：PrimMesh——vertices/indices 为表面面片（顶点单位为体元，z 向上）；
+//       voxelIds 为表层体元左下角整数坐标，faceIds / isValids 与 voxelIds 一一对应。
+// 说明：像元高度先换成体元层数 round(h/stepSize)。为节省内存只保留“表层”体元：
+//       本像元不高于四邻时只留最顶一层，否则保留从最低邻居高度到本像元顶的竖向体元；
+//       网格只加顶面和邻居更低一侧的侧面（不为体元建六面体）。
+//       图像坐标：x 向右、y 向下，像元 (i, j) 对应数组下标 j*nImgSizeX+i；
+//       循环只遍历内部像元（1..n-2），最外一圈不生成体元与面片。
 PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float stepSize) {
     PrimMesh voxelTriModel;
     voxelTriModel.nVertices=0;
@@ -1274,6 +1368,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float s
     //===================================================================
     /*! height map
      */
+    // 步骤 1：用 GDAL 读高度图第 1 波段到 heightScanline（float）；打开/读取失败时返回空网格。
     CPLSetConfigOption("gdal_filename_is_utf8", "no");
     GDALAllRegister();
 
@@ -1325,9 +1420,12 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float s
      *      y
      */
 
+    // 步骤 2：minReHeightScanline 保存每个像元与四邻的最小层数；本函数内只写入、未被读取，
+    // 函数末尾释放（待核对其用途）。
     FLOAT* minReHeightScanline = new FLOAT[static_cast<std::size_t>(nImgSizeX) * static_cast<std::size_t>(nImgSizeY)];
 
     float minReHeight, rightReHeight, leftReHeight, upReHeight, downReHeight;
+    // 步骤 3：逐内部像元（跳过边缘一圈）处理：取本像元与上下左右邻居的层数，生成体元与面片。
     for (int i = 1; i < nImgSizeX - 1; i++)
     {
         for (int j = 1; j < nImgSizeY - 1; j++)
@@ -1343,6 +1441,8 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float s
             // resized height
             minReHeight = std::min({ curReHeight, leftReHeight, rightReHeight, upReHeight, downReHeight });
 
+            // faceId：记录最低点所在方向，后面的 if 覆盖前面的，优先级为 up(本像元) > right > left >
+            // backward(图像上方) > forward(图像下方)；取值 1 forward、2 right、3 left、4 backward、5 up。
             int faceId = 0;
             if (downReHeight == minReHeight) faceId = 1;    // forward
             if (upReHeight == minReHeight) faceId = 4;      // backward
@@ -1355,6 +1455,9 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float s
             /*! save [voxelIds: left-down point] and [faceIds] values: NanoVDB attribution location
              * {}
              */
+            // 步骤 4：登记体元：本像元为局部最低时只留顶层体元 (i, j, cur-1)（高度为 0 的像元直接跳过）；
+            // 否则保留 minReHeight..cur-1 的竖向体元，并按各侧邻居高度设置 isValids（前/后/左/右/上）。
+            // 说明：isValids 的侧面判据用 “体元层号 > 邻居层数”，层号等于邻居层数的体元不算（待核对）。
             if (curReHeight == minReHeight)
             {
                 if (curReHeight == 0) continue;
@@ -1392,6 +1495,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float s
             {
                 if (curReHeight == 0) continue;
             }
+            // 步骤 5：本像元顶面（z = curReHeight），2 个三角形；顶点不共享，按 0,1,2,0,2,3 排序。
             // current pixel face
             glm::vec3 points[4];
             points[0] = { i, j, curReHeight };  // left and down point
@@ -1409,6 +1513,8 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float s
             voxelTriModel.nVertices += 6;
             voxelTriModel.nIndices += 6;
 
+            // 步骤 6：四个侧面（left / right / up / down），仅当该侧邻居层数低于本像元时生成，
+            // 面片范围从邻居高度到本像元高度；up 侧的索引顺序为 0,2,1,0,3,2（法向朝外，待核对）。
             // left pixel
             if (leftReHeight < curReHeight)
             {
@@ -1507,6 +1613,13 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif(std::string heightPath, float s
 }
 
 
+// 模块：屋顶——由高度栅格生成每个像元最顶层体元及其顶面三角形（建筑的屋顶部分）。
+// 输入：heightPath 高度图路径（米）；targetSize 目标网格尺寸，其 x 和 z 被当作重采样后的
+//       图像宽、高（体元数；y 未使用，待核对）；stepSize 体元边长（米）。
+// 输出：PrimMesh——只含顶面网格，voxelIds 为 (i, j, cur-1) 顶层体元，faceIds / isValids 同序。
+// 说明：与 createTriEntitiesFromTif 的区别是先用 cv::resize 重采样到 targetSize，
+//       且只登记最顶层体元；墙体由 createTriEntitiesFromTif_wall 配套生成。
+//       同样只遍历内部像元（1..n-2）。
 PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, glm::vec3 targetSize, float stepSize) {
     // DEFERRED[中] 错误处理: targetSize.x/z 被 float→int 截断，<3 时下方循环为空静默返回空网格，且非正时（或 readImageinout1 读取失败后）cv::resize 会抛异常（_roof/_wall 的 readImageinout1 返回值检查已在本轮补上，见下方 FIXED）；resize 默认 INTER_LINEAR 会在建筑边缘插出中间高度，产生虚假台阶，属结果变化本轮不改；建议：targetSize 取整校验，按 round 取格数，高度图重采样用 INTER_NEAREST（_wall 同理）。
     PrimMesh voxelTriModel;
@@ -1532,6 +1645,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, gl
 //    FLOAT* heightScanline = new FLOAT[nImgSizeX * nImgSizeY];
 //    heightDataset->RasterIO(GF_Read, 0, 0, nImgSizeX, nImgSizeY, heightScanline, nImgSizeX, nImgSizeY, GDT_Float32, bandcount, 0, 0, 0, 0);
 
+    // 步骤 1：用 Utils::readImageinout1 读高度图；失败或尺寸不符时返回空网格。
     std::vector<float> heightScanline0;
     int width,height, nband;
     if (!Utils::readImageinout1(heightPath,heightScanline0,width,height,nband) ||
@@ -1543,6 +1657,8 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, gl
     cv::Mat heightScanline0_cv = Utils::convertVector2Mat<float>(heightScanline0,1,height);
     cv::Mat heightScanline_cv;
 
+    // 步骤 2：把高度图 cv::resize 到 targetSize.x × targetSize.z（线性插值，边缘可能插出中间高度，
+    // 见上方 DEFERRED），再转回 vector<float> 供后续按行主序读取。
     int nImgSizeX = targetSize.x;
     int nImgSizeY = targetSize.z;
     cv::resize(heightScanline0_cv,heightScanline_cv,cv::Size(nImgSizeX,nImgSizeY));
@@ -1574,6 +1690,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, gl
      *      y
      */
 
+    // 步骤 3：minReHeightScanline 只写不读（待核对）；下面逐内部像元处理。
     FLOAT* minReHeightScanline = new FLOAT[static_cast<std::size_t>(nImgSizeX) * static_cast<std::size_t>(nImgSizeY)];
 
     float minReHeight, rightReHeight, leftReHeight, upReHeight, downReHeight;
@@ -1592,6 +1709,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, gl
             // resized height
             minReHeight = std::min({ curReHeight, leftReHeight, rightReHeight, upReHeight, downReHeight });
 
+            // faceId 取值同 createTriEntitiesFromTif：1 forward、2 right、3 left、4 backward、5 up。
             int faceId = 0;
             if (downReHeight == minReHeight) faceId = 1;    // forward
             if (upReHeight == minReHeight) faceId = 4;      // backward
@@ -1604,6 +1722,8 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, gl
             /*! save [voxelIds: left-down point] and [faceIds] values: NanoVDB attribution location
              * {}
              */
+            // 步骤 4：登记体元：局部最低像元登记顶层体元；其余像元也只登记最顶一层 (i, j, cur-1)，
+            // 侧面标志按邻居高度设置（见下方 DEFERRED）。
             if (curReHeight == minReHeight)
             {
                 if (curReHeight == 0) continue;
@@ -1643,6 +1763,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, gl
             {
                 if (curReHeight == 0) continue;
             }
+            // 步骤 5：只生成本像元顶面（z = curReHeight），不生成侧面。
             // current pixel face
             glm::vec3 points[4];
             points[0] = { i, j, curReHeight };  // left and down point
@@ -1673,6 +1794,10 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_roof(std::string heightPath, gl
     return voxelTriModel;
 }
 
+// 模块：墙体——由高度栅格生成竖向体元及侧面三角形（建筑的墙面部分，不含顶面）。
+// 输入/输出与重采样方式同 createTriEntitiesFromTif_roof；voxelIds 为 minReHeight..cur-1 的竖向体元，
+//       网格只含邻居更低一侧的侧面。
+// 说明：顶层体元在 roof 与 wall 中都会登记（见 roof 中的 DEFERRED）。
 PrimMesh VoxelDesigner::createTriEntitiesFromTif_wall(std::string heightPath, glm::vec3 targetSize, float stepSize) {
     PrimMesh voxelTriModel;
     voxelTriModel.nVertices=0;
@@ -1698,6 +1823,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_wall(std::string heightPath, gl
 //    heightDataset->RasterIO(GF_Read, 0, 0, nImgSizeX, nImgSizeY, heightScanline, nImgSizeX, nImgSizeY, GDT_Float32, bandcount, 0, 0, 0, 0);
 
 
+     // 步骤 1：读高度图并 cv::resize 到 targetSize.x × targetSize.z（同 roof）。
      std::vector<float> heightScanline0;
      int width,height, nband;
      if (!Utils::readImageinout1(heightPath,heightScanline0,width,height,nband) ||
@@ -1742,6 +1868,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_wall(std::string heightPath, gl
      *      y
      */
 
+    // 步骤 2：minReHeightScanline 只写不读（待核对）；下面逐内部像元处理。
     FLOAT* minReHeightScanline = new FLOAT[static_cast<std::size_t>(nImgSizeX) * static_cast<std::size_t>(nImgSizeY)];
 
     float minReHeight, rightReHeight, leftReHeight, upReHeight, downReHeight;
@@ -1764,6 +1891,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_wall(std::string heightPath, gl
             // resized height
             minReHeight = std::min({ curReHeight, leftReHeight, rightReHeight, upReHeight, downReHeight });
 
+            // faceId 取值同 createTriEntitiesFromTif：1 forward、2 right、3 left、4 backward、5 up。
             int faceId = 0;
             if (downReHeight == minReHeight) faceId = 1;    // forward
             if (upReHeight == minReHeight) faceId = 4;      // backward
@@ -1776,6 +1904,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_wall(std::string heightPath, gl
             /*! save [voxelIds: left-down point] and [faceIds] values: NanoVDB attribution location
              * {}
              */
+            // 步骤 3：登记体元：局部最低像元登记顶层体元，其余登记 minReHeight..cur-1 的竖向体元。
             if (curReHeight == minReHeight)
             {
                 if (curReHeight == 0) continue;
@@ -1815,6 +1944,7 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_wall(std::string heightPath, gl
             }
 
 
+            // 步骤 4：四个侧面（left / right / up / down），仅当邻居层数更低时生成；不生成顶面。
             // left pixel
             if (leftReHeight < curReHeight)
             {

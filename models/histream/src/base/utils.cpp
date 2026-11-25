@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：utils.cpp
+// 功能：Utils 命名空间的通用工具实现：文本数值表读取、GDAL 栅格读写、字符串/路径处理、
+//       指数积分 E1、儒略历相关的 ΔT 与日序换算。声明见 utils.h。
+// 主要模块：
+//   1. 数值表解析：readNumericRows / readPositionFile / readascfileinout / infile2num
+//   2. 路径与字符串：getDirectoryPath / getFileName / splitt / findnum / getMapIndex
+//   3. GDAL 栅格读取：readImageinout1（单波段）/ readImageinout（多波段）/ readImage
+//   4. GDAL 栅格写出：saveImage1（单波段）/ saveImage（多波段），均写 Float32 GTiff
+//   5. 数学函数：expint（指数积分 E1，供 PROSPECT 叶片光学模型使用）
+//   6. 时间函数：calculateDeltaT（ΔT 多项式）/ isLeapYear / calculateMonthAndDay
+// 数据流：场景/气象/地形等文件 → 本文件读入为 float 数组 → 各模式引擎（上传 GPU 或 CPU 计算）；
+//         结果影像经 saveImage* 写回 GTiff。
+// 约定：栅格数据按行优先存放，下标 = 行 * width + 列；读取一律转换为 float。
+// 注意：多处直接用 std::cout 输出错误并以返回 0 表示失败，调用方需检查返回值；
+//       saveImage/saveImage1 的 proj、trans 参数当前未被使用（待核对是否有意）。
+// ==========================================================================
+
 #include "utils.h"
 #include <algorithm>
 #include <cmath>
@@ -9,6 +27,8 @@
 
 
 namespace {
+// 模块：数值表文本解析的内部辅助函数（匿名命名空间）。
+// tableContent：去掉 '#' 之后的内容与首尾空白；以 "//" 开头的整行视为注释，返回空串。
 std::string tableContent(std::string line)
 {
     const size_t comment = line.find('#');
@@ -22,6 +42,9 @@ std::string tableContent(std::string line)
     return line;
 }
 
+// 作用：把一行按空格/制表符/逗号切分并逐字段用 strtof 解析为 float。
+// 返回：全部字段均为有限数值且至少一个字段时为 true；任何字段无法完整解析（含 nan/inf）即 false。
+// 副作用：先清空 values。
 bool parseNumericFields(const std::string& line, std::vector<float>& values)
 {
     values.clear();
@@ -41,6 +64,10 @@ bool parseNumericFields(const std::string& line, std::vector<float>& values)
 }
 }
 
+// 作用：读取数值表文本文件，每个有效行返回一个 float 向量。
+// 输入：path 文件路径；description 用于报错信息；输出 skippedRows 为含非数值字段而被跳过的行数。
+// 说明：空行与注释行（# 或行首 //）不计入 skippedRows；会去掉文件开头的 UTF-8 BOM；
+//       无法打开文件时抛 std::runtime_error。
 std::vector<std::vector<float>> Utils::readNumericRows(const std::string& path,
                                                        const std::string& description,
                                                        size_t& skippedRows)
@@ -54,6 +81,7 @@ std::vector<std::vector<float>> Utils::readNumericRows(const std::string& path,
     std::string line;
     bool firstLine = true;
     while (std::getline(input, line)) {
+        // 步骤：仅首行检查并剔除 UTF-8 BOM，避免 BOM 使第一个数值解析失败。
         if (firstLine && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
         firstLine = false;
         const std::string content = tableContent(line);
@@ -67,6 +95,9 @@ std::vector<std::vector<float>> Utils::readNumericRows(const std::string& path,
     return rows;
 }
 
+// 作用：读取对象实例位置文件，每行格式 "x y z [scale] [rotation]"。
+// 说明：缺省 scale=1、rotation=0（PositionRecord 默认值）；少于 3 列，或给出 scale 但 scale<=0（含 NaN）
+//       的行被丢弃并计入警告；没有任何有效实例时抛异常。rotation 单位（待核对，按调用方约定）。
 std::vector<Utils::PositionRecord> Utils::readPositionFile(const std::string& path)
 {
     size_t skipped = 0;
@@ -96,6 +127,10 @@ std::vector<Utils::PositionRecord> Utils::readPositionFile(const std::string& pa
 }
 
 
+// 作用：读取以空格分隔的文本文件的第 col 列（0 起）到 data，先跳过前 skip 行。
+// 返回：打开文件成功为 1，否则为 0（此时 num=0、data 为空）。
+// 说明：num 是第一遍扫描中“至少有 1 个字段的行数”，而 data 仅收集字段数 > col 的行，
+//       两者可能不相等；字段用 atof 转换，无法解析时得到 0。
 int Utils::readascfileinout(std::string infileName, int skip, int col, std::vector<float> &data, int &num)
 {
     std::string line;
@@ -162,6 +197,7 @@ int Utils::readascfileinout(std::string infileName, int skip, int col, std::vect
 
 
 
+// 作用：返回最后一个 '/' 或 '\' 之前的目录部分（不含分隔符）；无分隔符时返回空串。
 std::string Utils::getDirectoryPath(const std::string& fullPath)
 {
     size_t lastSlash = fullPath.find_last_of("/\\");
@@ -173,6 +209,7 @@ std::string Utils::getDirectoryPath(const std::string& fullPath)
     }
 }
 
+// 作用：返回最后一个 '/' 或 '\' 之后的文件名；无分隔符时返回原字符串。
 std::string Utils::getFileName(const std::string& fullPath)
 {
     size_t lastSlash = fullPath.find_last_of("/\\");
@@ -184,6 +221,11 @@ std::string Utils::getFileName(const std::string& fullPath)
     }
 }
 
+// 作用：用 GDAL 读取栅格影像的第 1 个波段，转换为 float 并按行优先存入 collected。
+// 输出：width、height、nband 为影像尺寸与波段总数（其余波段不读取）。
+// 返回：成功 1；文件无法打开、尺寸/波段数无效、内存或读取失败返回 0。
+// 说明：GDAL_FILENAME_IS_UTF8=NO 表示文件名按本地编码而非 UTF-8 传给 GDAL；
+//       collected 被整体覆盖（assign）。
 int Utils::readImageinout1(std::string infilename,std::vector<float> &collected,
                            int &width, int &height, int &nband) {
 
@@ -247,6 +289,9 @@ int Utils::readImageinout1(std::string infilename,std::vector<float> &collected,
     return 1;
 }
 
+// 作用：用 GDAL 读取影像全部波段为 float，每个波段一个向量（行优先，大小 width*height）。
+// 返回：成功 1，失败 0（打开失败、尺寸无效、像素数溢出、读取失败）。
+// 注意：结果以 push_back 追加到 collected，调用前需保证其为空，否则会混入旧数据。
 int Utils::readImageinout(std::string infilename,std::vector<std::vector<float>> &collected,
                           int &width, int &height, int &nband) {
 
@@ -327,6 +372,7 @@ int Utils::readImageinout(std::string infilename,std::vector<std::vector<float>>
     return 1;
 }
 
+// 作用：与 readImageinout 类似，返回全部波段（每波段一个 float 向量）；失败时返回空结果。
 std::vector<std::vector<float>> Utils::readImage(std::string infilename) {
 
 
@@ -406,6 +452,11 @@ std::vector<std::vector<float>> Utils::readImage(std::string infilename) {
 }
 
 
+// 作用：把单个 float 数组写成单波段 Float32 GTiff。
+// 输入：c 为 width*height 的行优先数据（长度不足则失败）；band、proj、trans 当前未使用，
+//       因此输出文件不含地理参考信息（待核对是否有意）。
+// 返回：成功 1；GTiff 驱动缺失、尺寸不符或创建失败返回 0。
+// 注意：RasterIO 的返回值未检查，写入失败时仍返回 1。
 int Utils::saveImage1(std::string outfilepath, std::vector<float> &c,
                      int width, int height,int band, std::string proj, double trans[6]) {
 
@@ -439,6 +490,9 @@ int Utils::saveImage1(std::string outfilepath, std::vector<float> &c,
     return 1;
 }
 
+// 作用：把 band 个 float 数组写成多波段 Float32 GTiff（c[k] 对应第 k+1 个波段）。
+// 返回：成功 1；驱动缺失、波段数或每个波段大小与 width*height 不符、创建失败返回 0。
+// 说明：proj、trans 当前未使用，输出不含地理参考（待核对是否有意）；RasterIO 返回值未检查。
 int Utils::saveImage(std::string outfilepath, std::vector<std::vector<float>> &c,
                       int width, int height,int band, std::string proj, double trans[6]) {
 
@@ -479,6 +533,8 @@ int Utils::saveImage(std::string outfilepath, std::vector<std::vector<float>> &c
     return 1;
 }
 
+// 作用：按 deli 中的任一字符切分 s，连续分隔符与首尾空字段被跳过。
+// 例：以 " " 切分 "a  b" 得 {a, b}。
 std::vector<std::string> Utils::splitt(std::string& s, std::string& deli)
 {
     // Delimiters are a set of characters; retain the existing empty-field
@@ -495,6 +551,9 @@ std::vector<std::string> Utils::splitt(std::string& s, std::string& deli)
     return fields;
 }
 
+// 作用：指数积分 E1(x) = ∫_1^∞ exp(-x t)/t dt，内部用 double 计算。
+// 说明：x <= 0（或 NaN）返回 +inf；x <= 1 用幂级数，x > 1 用 Lentz 连分式（均最多 200 项），
+//       收敛判据见各循环内的 eps。算法选择的原因见函数内的原注释。
 float Utils::expint(float x)
 {
 	// Exponential integral E1(x) = int_1^inf exp(-x t)/t dt (MATLAB expint),
@@ -507,6 +566,7 @@ float Utils::expint(float x)
 	if (!(v > 0.0)) return std::numeric_limits<float>::infinity();
 	constexpr double euler = 0.57721566490153286061;
 	constexpr double eps = 1.0e-15;
+	// 步骤 1：x <= 1 用幂级数 E1 = -γ - ln x - Σ (-x)^k/(k·k!)，γ 为欧拉常数。
 	if (v <= 1.0) {
 		double sum = 0.0;
 		double term = 1.0;
@@ -518,6 +578,7 @@ float Utils::expint(float x)
 		}
 		return static_cast<float>(-euler - std::log(v) - sum);
 	}
+	// 步骤 2：x > 1 用修正 Lentz 连分式求 E1 = exp(-x)·h；c 的初值取极大数以避免除零。
 	double b = v + 1.0;
 	double c = 1.0 / 1.0e-300;
 	double d = 1.0 / b;
@@ -534,6 +595,10 @@ float Utils::expint(float x)
 	return static_cast<float>(h * std::exp(-v));
 }
 
+// 作用：与 readascfileinout 类似，读取空格分隔文本第 col 列（0 起）为 new[] 分配的 float 数组。
+// 输入：skip 为跳过的行数；输出 num 为“至少含 1 个字段的行数”（即数组长度）。
+// 返回：文件无法打开或 num <= 0 时返回 nullptr；否则调用方负责 delete[]。
+// 说明：字段数不足 col+1 的行不写入，数组尾部保持 0（new float[num]() 零初始化）。
 float* Utils::infile2num(std::string infileName, int skip, int col, int& num)
 {
 	std::string line;
@@ -597,6 +662,7 @@ float* Utils::infile2num(std::string infileName, int skip, int col, int& num)
 	return mydata;
 }
 
+// 作用：按名称在 maps 中查找索引值；找不到时返回 0（调用方无法区分“找不到”与“索引 0”）。
 int Utils::getMapIndex(std::map<std::string, int> maps, std::string name)
 {
 	// DEFERRED[中] 错误处理: 名称不存在时静默返回 0，拼写错误的材质/属性名会被映射到第一个条目，产生错误的光学/热属性而不报错；且 map 按值传入，每次调用整表复制；建议：未找到时抛异常或返回 -1 由调用方处理，参数改为 const 引用。
@@ -609,10 +675,13 @@ int Utils::getMapIndex(std::map<std::string, int> maps, std::string name)
 	return 0;
 }
 
+// 内部辅助（全局函数，非 Utils 成员）：判断字符是否为十进制数字。
 bool isnum(char n)
 {
 	return (n >= '0' && n <= '9');
 }
+// 作用：提取字符串中所有连续数字串并依次转为 int（如 "a12b3" → {12, 3}）。
+// 说明：不处理负号与小数点；过长的数字串会发生 int 溢出（未做保护）。
 std::vector <int> Utils::findnum(std::string& ch)
 {
 	std::vector <int> numVec;
@@ -635,6 +704,9 @@ std::vector <int> Utils::findnum(std::string& ch)
 
 
 
+// 作用：计算 ΔT = TT - UT（单位 s），按年份分段采用 Espenak & Meeus 多项式。
+// 输入：year（年）、month（1..12）；内部用 y = year + (month - 0.5)/12 作为十进制年。
+// 说明：分段边界按整数 year 判断，各段多项式的参考年（如 1820、1900、2000）见各分支。
 // Espenak & Meeus polynomial expressions (NASA "Polynomial Expressions for Delta T").
 double Utils::calculateDeltaT(int year, int month) {
     double deltaT = 0.0;
@@ -675,10 +747,13 @@ double Utils::calculateDeltaT(int year, int month) {
     return deltaT;
 }
 
+// 作用：格里高利历闰年判断（四年一闰，百年不闰，四百年再闰）。
 bool Utils::isLeapYear(int year) {
     return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
 }
 
+// 作用：把年内日序 kdoy（1 起）换算为月（1..12）和日；闰年 2 月按 29 天。
+// 输入越界（平年 >365、闰年 >366 或 <1）时抛 std::runtime_error。
 void Utils::calculateMonthAndDay(int kyear, int kdoy, int *kmonth, int *kday) {
     // 各个月的天数（平年）
     int daysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
