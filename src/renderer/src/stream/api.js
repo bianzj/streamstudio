@@ -1,4 +1,16 @@
+// ==========================================================================
+// 文件：stream/api.js
+// 功能：STREAM 影像工作区的 HTTP 客户端与服务端事件通道（/api/stream/*）
+// 主要模块：
+//   1. request/post：封装 fetch，统一把网络错误、非 JSON 响应、HTTP 错误转成 Error
+//   2. streamApi：运行/停止、文件选择与检查、栅格读取、工程、ERA5、气象强迫元数据等接口
+//   3. streamApi.onEvent：订阅 /api/stream/events（SSE），返回取消订阅函数
+// 数据流：stream/*.js 界面模块 → streamApi → 本地服务 server/stream/index.mjs
+// 关系：与 web-api.js 中的 request/post 实现重复（该处有 DEFERRED 说明）
+// ==========================================================================
+
 // HTTP client and event channel of the STREAM image workspace (/api/stream/*).
+// 作用：发起请求并解析 JSON；失败时抛出带中文提示的 Error（服务端 error 字段优先）。
 async function request(path, options) {
   let response
   try {
@@ -17,6 +29,7 @@ async function request(path, options) {
 
 const post = (path, value = {}) => request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
 
+// 模块：streamApi 接口表。除 status 与 forcingPresets 为 GET 外，其余均为 POST + JSON。
 export const streamApi = {
   status: () => request('/api/stream/status'),
   run: (scene) => post('/api/stream/run', { scene }),

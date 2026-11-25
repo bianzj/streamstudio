@@ -1,3 +1,20 @@
+// ==========================================================================
+// 文件：project-unified.js
+// 功能：统一工程（stream-studio-project）的数据模型与格式转换：一个 project.json 同时承载
+//   HiStream（三维）与 STREAM（遥感影像）两个引擎的输入，两侧在读写边界上互相转换。
+// 主要模块：
+//   1. 常量、通用小工具与格式识别（projectFormatOf）
+//   2. 缺省结构与规范化（defaultStreamScene、defaultHistreamEngine、normalizeUnified、merge*）
+//   3. HiStream 旧工程 <-> 统一工程（histreamProjectToUnified / unifiedToHistreamProject）
+//   4. STREAM 影像工程 <-> 统一工程（streamProjectToUnified / unifiedToStreamScene）
+//   5. 便捷入口：createUnifiedProject、parseUnifiedProject、stringifyUnifiedProject
+// 数据流：旧工程 → *ToUnified（shared 层 + engines.*）→ 保存；读取时 unifiedTo* → 旧结构 → 引擎/GUI。
+// 与其他文件：依赖 project-schema.js（HiStream 工程缺省与规范化）；被 GUI、server.mjs、
+//   server/stream 引用。
+// 重要约定：纯函数，不引入 fs 或 DOM（浏览器与 Node 共用）；共享层只放两个引擎语义一致的字段，
+//   光谱波段刻意留在各自引擎段中（详见下方原有说明）。
+// ==========================================================================
+
 // Unified Stream Studio project file ("stream-studio-project").
 //
 // 一个 project.json 同时承载两个引擎的输入：
@@ -19,12 +36,16 @@
 
 import { createDefaultProject, isProjectFormat, normalizeProject, PROJECT_FORMAT, PROJECT_SCHEMA_VERSION } from './project-schema.js'
 
+// 统一工程格式常量：UNIFIED_FORMAT 为 format 字段取值，IMAGE_FOLDER 为 STREAM 影像子目录名。
 export const UNIFIED_FORMAT = 'stream-studio-project'
 export const UNIFIED_SCHEMA_VERSION = 1
 export const IMAGE_FOLDER = 'images'
 
+// STREAM 温度分量的四个键：受光土壤、阴影土壤、受光叶片、阴影叶片。
 const COMPONENT_KEYS = ['soilSunlit', 'soilShaded', 'leafSunlit', 'leafShaded']
 
+// 通用小工具：object/array 把非对象/非数组值替换为空对象/空数组；clone 做 JSON 深拷贝；
+//   numeric/text 把 null、空串视为缺失并取 fallback；cleanNumber 保留 6 位小数；trimPath 去首尾空白与引号。
 const object = (value) => (value && typeof value === 'object' && !Array.isArray(value) ? value : {})
 const array = (value) => (Array.isArray(value) ? value : [])
 const clone = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)))
@@ -37,9 +58,12 @@ const text = (value, fallback = '') => (value === null || value === undefined ||
 const cleanNumber = (value, fallback) => Number(numeric(value, fallback).toFixed(6))
 const trimPath = (value) => String(value ?? '').trim().replace(/^"|"$/g, '')
 
+// 判断对象是否为统一工程（format === UNIFIED_FORMAT）。
 export const isUnifiedProject = (value) =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value) && value.format === UNIFIED_FORMAT
 
+// 作用：识别工程文件格式，返回值见下一行；无法识别返回空串。
+// 说明：旧 HiStream 工程以 format 或存在 configuration 字段判断。
 // 'unified' | 'histream' | 'stream-image' | 'stream-scene' | ''
 export function projectFormatOf(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
@@ -54,6 +78,8 @@ export function projectFormatOf(value) {
 // STREAM 影像工程（scene）默认值。与 src/stream/workspace.js 的 defaults() 保持一致，
 // 差别只在于这里两个波段开关默认关闭（未配置时不要伪造波段）。
 // ---------------------------------------------------------------------------
+// 作用：生成 STREAM 影像工程（scene）的缺省对象；过境时刻缺省为今天 03:00 UTC，显示时区 8。
+// 输入：options.name 工程名；输出：含 surface/view/region/optical/thermal/temperature 的对象。
 export function defaultStreamScene(options = {}) {
   const today = new Date().toISOString().slice(0, 10)
   return {
@@ -81,6 +107,8 @@ export function defaultStreamScene(options = {}) {
 // ---------------------------------------------------------------------------
 // 默认结构
 // ---------------------------------------------------------------------------
+// 作用：由 HiStream 新工程缺省生成 engines.histream 的缺省段。
+// 说明：地理/观测/计算设备/气象站位置等字段属共享层，这里从引擎段中删除（见 normalizeUnified 的 shared）。
 function defaultHistreamEngine() {
   const configuration = createDefaultProject().configuration
   const scene = { ...configuration.scene }
@@ -114,6 +142,10 @@ function defaultHistreamEngine() {
   }
 }
 
+// 作用：把任意输入规范化为完整的统一工程：shared（两个引擎共读）+ engines.histream + engines.stream。
+// 输入：value 解析后的统一工程（可缺字段）；输出：补全缺省值后的新对象。
+// 步骤：1) 取各子对象并生成两个引擎的缺省；2) 逐项规范化 shared；3) 合并两个引擎段（mergeXxxEngine）。
+// 说明：缺省值取自 HiStream 新工程缺省（经纬度、时区、年份、天空、传感器角度等）。
 export function normalizeUnified(value = {}) {
   const source = object(value)
   const defaults = createDefaultProject()
@@ -128,6 +160,7 @@ export function normalizeUnified(value = {}) {
   const compute = object(shared.compute)
   const dem = object(location.dem)
 
+  // 步骤 1：生成两个引擎的缺省，作为合并的底。
   const histreamDefaults = defaultHistreamEngine()
   const sourceHistream = object(engines.histream)
   const streamDefaults = defaultStreamScene({ name: text(source.name, defaults.name) })
@@ -141,6 +174,8 @@ export function normalizeUnified(value = {}) {
     createdAt: text(source.createdAt, defaults.createdAt),
     updatedAt: text(source.updatedAt, new Date().toISOString()),
     folders: { ...defaults.folders, images: IMAGE_FOLDER, ...object(source.folders) },
+    // 步骤 2：共享层。location 地理（°、DEM）、time 过境时刻与年份、sky 天空/太阳几何、
+    //   atmosphere 大气、observation 观测角 vza/vaa（°）、output 输出根目录、compute 计算设备、bands 共享波段。
     shared: {
       location: {
         latitude: cleanNumber(location.latitude, configuration.meteo.latitude),
@@ -176,6 +211,7 @@ export function normalizeUnified(value = {}) {
       },
       bands: { optical: clone(array(object(shared.bands).optical)), thermal: clone(array(object(shared.bands).thermal)) }
     },
+    // 步骤 3：引擎段：用缺省值打底，再叠加输入。
     engines: {
       histream: mergeHistreamEngine(histreamDefaults, sourceHistream),
       stream: mergeStreamEngine(streamDefaults, sourceStream)
@@ -183,6 +219,8 @@ export function normalizeUnified(value = {}) {
   }
 }
 
+// 作用：把输入的 HiStream 引擎段合并到缺省上；非法 mode 回退缺省，spectra/canopies/thermals/materials
+//   整个数组替换（输入不是数组时取缺省），其余各节浅合并。
 function mergeHistreamEngine(base, source) {
   const input = clone(object(source))
   const next = { ...base, ...input }
@@ -200,6 +238,7 @@ function mergeHistreamEngine(base, source) {
   return next
 }
 
+// 作用：把输入的 STREAM 引擎段合并到缺省上；enabled 缺省为 false；temperature 下三个子对象各自合并。
 function mergeStreamEngine(base, source) {
   const next = { ...base, ...source }
   next.enabled = source.enabled === undefined ? false : Boolean(source.enabled)
@@ -222,6 +261,8 @@ function mergeStreamEngine(base, source) {
 // ---------------------------------------------------------------------------
 // HiStream 旧工程  <->  统一工程
 // ---------------------------------------------------------------------------
+// 作用：由 HiStream 旧工程取出 engines.histream 段（与 defaultHistreamEngine 相同地删去共享层字段）。
+// 输入：project 旧工程；输出：{ enabled, mode, scene, sensor, control, fluid, objects, spectra, ... }。
 function histreamEngineSection(project) {
   const configuration = clone(object(project.configuration))
   const scene = { ...object(configuration.scene) }
@@ -253,6 +294,8 @@ function histreamEngineSection(project) {
   }
 }
 
+// 作用：由 HiStream 旧工程生成统一工程的 shared 层；previous 为之前的统一工程，
+//   用于保留 HiStream 没有对应字段的内容（STREAM 侧写入的过境时刻等）。
 function sharedFromHistream(project, previous = {}) {
   const configuration = object(project.configuration)
   const meteo = object(configuration.meteo)
@@ -304,6 +347,8 @@ function sharedFromHistream(project, previous = {}) {
   }
 }
 
+// 步骤：1) normalizeProject 规范化旧工程；2) sharedFromHistream 生成共享层；
+//   3) histreamEngineSection 生成 histream 段；4) STREAM 段沿用 previous；最后统一 normalizeUnified。
 // 旧 HiStream 工程 -> 统一工程。previous 用于保留另一个引擎的内容（保存时合并）。
 export function histreamProjectToUnified(legacy, previous = {}) {
   const project = normalizeProject(legacy || {})
@@ -327,6 +372,9 @@ export function histreamProjectToUnified(legacy, previous = {}) {
 // 已有统一工程被 HiStream 侧保存时调用：只更新共享层里 HiStream 拥有的字段和 engines.histream。
 export const applyHistreamToUnified = (unified, legacy) => histreamProjectToUnified(legacy, unified)
 
+// 步骤：1) normalizeUnified 补全；2) 以 engines.histream 为底，把共享层字段写回旧工程对应节：
+//   输出根目录 → outDir，DEM → scene，天空 → light，观测角 → sensor.vza/vaa，计算设备 → control，
+//   经纬度/年份/时区 → meteo，大气 → atmosphere；3) 交给 normalizeProject 补全旧工程缺省。
 // 统一工程 -> 旧 HiStream 工程（交给引擎与现有 GUI 代码的形态）。
 export function unifiedToHistreamProject(unified) {
   const project = normalizeUnified(unified)
@@ -392,6 +440,8 @@ export function unifiedToHistreamProject(unified) {
 // ---------------------------------------------------------------------------
 // STREAM 影像工程（scene）  <->  统一工程
 // ---------------------------------------------------------------------------
+// STREAM 影像字段（surface.*、view.*）有两种形态：常数 { value } 或栅格文件 { file, band }。
+//   hasValue/hasFile 判断是哪一种，fieldValue 读取常数（缺失时取 fallback）。
 const hasValue = (field) => {
   const source = object(field)
   return source.value !== undefined && source.value !== null && String(source.value).trim() !== ''
@@ -404,6 +454,8 @@ const fieldValue = (field, fallback) => (hasValue(field) ? numeric(object(field)
 // outputRoot / threads 刻意留在这一段：STREAM 的影像输出根目录（默认在“文档”下）
 // 与三维工程的 output/runs 不是同一个概念，线程数 0 也表示“用满全部核心”，
 // 合并进共享层会静默改掉三维工程的输出位置与线程数。
+// （上方说明的补充）输出的 engines.stream 段：surface 中 DEM 为文件或空时删除（已提升到共享层）、
+//   经纬度非栅格文件时删除；view 只保留栅格文件形态的 vza/vaa。
 export function streamSceneToEngine(scene) {
   const source = normalizeStreamScene(scene)
   const surface = { ...source.surface }
@@ -427,6 +479,8 @@ export function streamSceneToEngine(scene) {
   }
 }
 
+// 作用：规范化 STREAM 影像工程（scene）：补全缺省，波段数组深拷贝；
+//   兼容旧字段 temperature.componentsPackage.file，迁移为 temperature.components.file。
 export function normalizeStreamScene(value = {}) {
   const scene = object(value)
   const base = defaultStreamScene({ name: text(scene.name, 'image01') })
@@ -454,6 +508,9 @@ export function normalizeStreamScene(value = {}) {
   }
 }
 
+// 作用：由 STREAM scene 生成统一工程的 shared 层；previous 提供 STREAM 没有对应字段的共享内容。
+// 说明：只有 DEM 文件、常数经纬度、常数观测角、过境时刻和显示时区进入共享层；
+//   DEM 文件变化时清空 demInfo（三维侧重新读取）。
 function sharedFromStream(scene, previous = {}) {
   const previousShared = object(previous.shared)
   const previousLocation = object(previousShared.location)
@@ -517,6 +574,8 @@ export function streamProjectToUnified(legacyScene, previous = {}) {
 
 export const applyStreamToUnified = (unified, legacyScene) => streamProjectToUnified(legacyScene, unified)
 
+// 步骤：1) 规范化统一工程；2) 共享层的 DEM、经纬度、观测角、过境时刻、时区写回 scene；
+//   3) 引擎段里已有栅格文件的字段优先于共享层常数；4) normalizeStreamScene 补全。
 // 统一工程 -> 旧 STREAM 影像工程（scene），交给 buildEngineConfig 与 STREAM 工作台。
 export function unifiedToStreamScene(unified) {
   const project = normalizeUnified(unified)
@@ -530,6 +589,7 @@ export function unifiedToStreamScene(unified) {
     else delete next.band
     return next
   }
+  // 引擎段中该字段是栅格文件时沿用栅格（去掉 band = 0），否则退回共享层的常数值。
   const surfaceField = (field, sharedValue) => (hasFile(field) ? rasterField(field) : sharedValue)
   const scene = normalizeStreamScene({
     ...engine,
@@ -560,6 +620,7 @@ export function unifiedToStreamScene(unified) {
 // ---------------------------------------------------------------------------
 // 便捷入口
 // ---------------------------------------------------------------------------
+// 作用：新建统一工程；options.histream === false 关闭三维引擎段，options.stream 为真时启用 STREAM 段。
 export function createUnifiedProject(options = {}) {
   const histream = options.histream === false ? { enabled: false } : {}
   const stream = options.stream ? { enabled: true, name: text(options.name, 'image01') } : { enabled: false }
@@ -572,10 +633,12 @@ export function createUnifiedProject(options = {}) {
   })
 }
 
+// 作用：规范化后序列化为 2 空格缩进、末尾换行的 JSON 文本。
 export function stringifyUnifiedProject(value) {
   return `${JSON.stringify(normalizeUnified(value), null, 2)}\n`
 }
 
+// 作用：解析统一工程 JSON 文本；非 JSON 或缺少 format: stream-studio-project 时抛错。
 export function parseUnifiedProject(content) {
   let value
   try {

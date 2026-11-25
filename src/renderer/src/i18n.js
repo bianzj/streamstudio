@@ -1,9 +1,36 @@
+// ==========================================================================
+// 文件：i18n.js
+// 功能：前端界面的中英文切换。源文案是中文（缺省语言 zh-CN），切到 en-US 时把 DOM 中的
+//       文本节点和 title / placeholder / aria-label 属性就地翻译为英文，切回中文时还原。
+// 主要模块：
+//   1. 常量与语言状态：存储键、缺省语言、language / observer 等模块级状态
+//   2. ENGLISH_MESSAGES：整句精确匹配词典（中文原文 → 英文），约 850 行，只放数据
+//   3. skipSelector：不参与翻译的元素（输入框、日志、路径等）
+//   4. PHRASE_REPLACEMENTS：短语子串替换表（按长度降序后逐个 replaceAll）
+//   5. DYNAMIC_TRANSLATIONS：带数字/名称的动态文案，用正则 + 模板翻译
+//   6. 翻译函数：normalizeLanguage / translateDynamic / t / getLocale
+//   7. DOM 本地化：isSkipped / localizeTextNode / localizeAttributes / localizeElement
+//   8. 语言切换与启动：setLanguage / updateToggle / startLocalization（MutationObserver）
+// 数据流：t(source) 先查 ENGLISH_MESSAGES 整句 → 再 translateDynamic（动态正则 → ' · ' 分段
+//       → 短语替换）；DOM 侧只处理含中日韩文字的文本节点，并缓存原文以便切回中文。
+// 与其他文件的关系：main.js 导入 t、getLocale、startLocalization；语言保存到 storage.js
+//       的 appStorage；切换时派发 window 事件 streamstudio:languagechange。
+// 约定：t() 在中文模式下原样返回；没有英文词条的文案原样保留（不报错）。
+//       新增界面文案时在 ENGLISH_MESSAGES 里补词条；带变量的句子加到 DYNAMIC_TRANSLATIONS。
+// ==========================================================================
+
 import { appStorage } from './storage.js'
 
+// 模块 1：语言存储键与缺省语言
+// LEGACY_STORAGE_KEYS 是旧版（histream Studio）使用过的存储键，仅用于读取旧偏好；
+// 写入只用 STORAGE_KEY。
 const STORAGE_KEY = 'streamStudioLanguage'
 const LEGACY_STORAGE_KEYS = ['histreamStudioLanguage']
 const DEFAULT_LANGUAGE = 'zh-CN'
 
+// 模块 2：整句词典（中文原文 → 英文译文）。
+// 键必须与界面中出现的中文文本（去掉首尾空白后）完全一致；按功能分组追加，
+// 不保证排序。含变量的文案不要放这里，应放到下面的 DYNAMIC_TRANSLATIONS。
 const ENGLISH_MESSAGES = Object.freeze({
   '背景使用镜面反射': 'Use specular reflection on background',
   '按结果中的实际观测方位角分组；未将这些方向标为太阳主平面': 'Grouped by the recorded viewing azimuth; these directions are not labelled as the solar principal plane.',
@@ -861,12 +888,19 @@ const ENGLISH_MESSAGES = Object.freeze({
   '无法打开选择窗口': 'Unable to open the chooser'
 })
 
+// 模块 1（续）：模块级状态。
+// originalText / originalAttributes 缓存节点或元素的中文原文，切换语言时以原文为准重新翻译，
+// 避免对已翻译的英文再次翻译；language 初始值取自本地存储（无则 zh-CN）。
+// observer 与 listenersBound 保证 startLocalization 重复调用时只绑定一次。
 const originalText = new WeakMap()
 const originalAttributes = new WeakMap()
 let language = normalizeLanguage([STORAGE_KEY, ...LEGACY_STORAGE_KEYS].map((key) => appStorage.getItem(key)).find(Boolean))
 let observer = null
 let listenersBound = false
 
+// 模块 3：不参与翻译的元素选择器（用户输入、代码/日志输出、路径与工程名等）。
+// 可在元素上加 data-i18n-ignore 属性单独排除；
+// 但文本恰好是词典整句时仍会翻译（见 localizeTextNode）。
 const skipSelector = [
   'textarea', 'pre', 'code', '.console-output', '.path-input', '#resultFiles',
   '#projectName', '#enginePath', '#xmlStatus', '#resultDirectory',
@@ -874,6 +908,9 @@ const skipSelector = [
   '[data-i18n-ignore]'
 ].join(',')
 
+// 模块 4：短语子串替换表 [中文片段, 英文片段]。
+// 用于词典未命中、又不符合任何动态正则的文案（如拼接出来的标签）。
+// 部分英文片段末尾带空格（如 'Reflectance '），是为了与后面紧跟的内容拼接。
 const PHRASE_REPLACEMENTS = [
   ['X 最小值（南）', 'Minimum X (South)'], ['X 最大值（北）', 'Maximum X (North)'],
   ['Z 最小值（西）', 'Minimum Z (West)'], ['Z 最大值（东）', 'Maximum Z (East)'],
@@ -922,6 +959,9 @@ const PHRASE_REPLACEMENTS = [
   ['热容', 'Heat Capacity '], ['辐射模型', 'Radiative Model: '], ['折射率', 'Refractive Index ']
 ]
 
+// 模块 5：动态文案表 [正则, 替换]。
+// 替换可以是带 $1、$2 的字符串，也可以是函数（需要再次调用 t() 或做单复数时）。
+// 按顺序匹配，首个命中的生效，因此更具体的规则要放在更宽泛的规则之前。
 const DYNAMIC_TRANSLATIONS = [
   [/^元数据：(.+?)（(.+?)，(?:步长 (.+?) h|步长自动检测)）$/u, (_, name, form, step) => `Metadata: ${name} (${t(form)}, ${step ? `step ${step} h` : 'step auto-detected'})`],
   [/^(气温|湿度|气压|风速|向下短波|向下长波)：(.+?)（(.*)）$/u, (_, label, source, rest) => `${t(label)}: ${source} (${rest.split('，').map((part) => t(part)).join(', ')})`],
@@ -975,14 +1015,23 @@ const DYNAMIC_TRANSLATIONS = [
   [/^(.+?)（(Facet ?EB|Facet ?RT|Voxel ?EB|Voxel ?RT)）$/u, (_, name, mode) => `${t(name)} (${mode})`]
 ]
 
+// 按中文片段长度降序排序，保证较长短语先于其子串被替换。
 // Longest first, so a phrase is never pre-empted by one of its own prefixes.
 PHRASE_REPLACEMENTS.sort((a, b) => b[0].length - a[0].length)
 
+// 模块 6：语言规范化。
+// 输入：任意值（本地存储读出的字符串或 undefined）；输出：'en-US' 或缺省 'zh-CN'。
+// 以 en 开头（不区分大小写）的都视为英文，其余一律回退到中文。
 function normalizeLanguage(value) {
   const normalized = String(value || '').toLowerCase()
   return value === 'en-US' || normalized.startsWith('en') ? 'en-US' : DEFAULT_LANGUAGE
 }
 
+// 作用：整句词典未命中时的兜底翻译。
+// 步骤：1) 依次尝试 DYNAMIC_TRANSLATIONS，命中即返回；
+//       2) 含 ' · ' 分隔的组合文案，逐段调用 t() 再拼回；
+//       3) 最后做 PHRASE_REPLACEMENTS 的子串替换。
+// 无任何匹配时原样返回（结果可能是中英混排）。
 function translateDynamic(source) {
   for (const [pattern, replacement] of DYNAMIC_TRANSLATIONS) {
     if (pattern.test(source)) return source.replace(pattern, replacement)
@@ -995,20 +1044,29 @@ function translateDynamic(source) {
   return translated
 }
 
+// 作用：返回当前语言（'zh-CN' 或 'en-US'），供数字格式化等按语言区域处理的代码使用。
 export function getLocale() {
   return language
 }
 
+// 作用：翻译一段文案。null / undefined 视为空串；中文模式原样返回，
+// 英文模式先查 ENGLISH_MESSAGES 整句，未命中再走 translateDynamic。
 export function t(source) {
   const value = String(source ?? '')
   if (language === DEFAULT_LANGUAGE) return value
   return ENGLISH_MESSAGES[value] || translateDynamic(value)
 }
 
+// 模块 7：DOM 本地化。
+// 作用：判断元素是否位于 skipSelector 排除范围内（仅元素节点；其他节点返回 false）。
 function isSkipped(element) {
   return element?.nodeType === Node.ELEMENT_NODE && Boolean(element.closest(skipSelector))
 }
 
+// 作用：翻译（或还原）单个文本节点。
+// 说明：首次遇到节点时缓存原文；没有汉字的文本不翻译，只在回到中文时还原；
+// 排除区内的节点只有当原文恰好是词典整句时才翻译；保留原文首尾空白；
+// 按钮上的“关闭”特判译为 Close（词典中“关闭”译为开关语义的 Off）。
 function localizeTextNode(node) {
   const parent = node.parentElement
   if (!parent) return
@@ -1026,6 +1084,8 @@ function localizeTextNode(node) {
   node.nodeValue = language === DEFAULT_LANGUAGE ? source : `${leading}${translated}${trailing}`
 }
 
+// 作用：翻译（或还原）元素的 title、placeholder、aria-label 属性。
+// 同样先缓存中文原文；排除区内的元素整体跳过（属性不走“词典整句例外”）。
 function localizeAttributes(element) {
   if (isSkipped(element)) return
   const names = ['title', 'placeholder', 'aria-label']
@@ -1039,6 +1099,10 @@ function localizeAttributes(element) {
   }
 }
 
+// 作用：本地化一棵子树。root 可以是文本节点、元素、document 或文档片段。
+// 步骤：1) 文本节点直接处理；2) 元素自身属性；3) TreeWalker 遍历所有文本节点；
+//       4) 子树内带 title / placeholder / aria-label 的元素；5) 更新 <html lang>。
+// 其他类型节点（如注释）直接忽略。
 export function localizeElement(root = document.body) {
   if (!root) return
   if (root.nodeType === Node.TEXT_NODE) {
@@ -1058,6 +1122,10 @@ export function localizeElement(root = document.body) {
   document.documentElement.lang = language
 }
 
+// 模块 8：切换语言。
+// 作用：规范化后写入本地存储，更新 <html lang>，并派发 streamstudio:languagechange 事件；
+// 实际的重新翻译由 startLocalization 注册的监听器完成。语言未变化时不做任何事。
+// 输出：当前语言。
 export function setLanguage(nextLanguage) {
   const next = normalizeLanguage(nextLanguage)
   if (next === language) return language
@@ -1068,6 +1136,8 @@ export function setLanguage(nextLanguage) {
   return language
 }
 
+// 作用：刷新语言切换按钮的显示：中文模式显示 EN，英文模式显示“中文”，
+// title / aria-label 提示切换目标。只在值变化时才写 DOM，避免触发无谓的变更观察。
 function updateToggle(button) {
   if (!button) return
   const label = button.querySelector('[data-language-label]') || button
@@ -1078,6 +1148,11 @@ function updateToggle(button) {
   if (button.getAttribute('aria-label') !== nextTitle) button.setAttribute('aria-label', nextTitle)
 }
 
+// 作用：启动本地化，由 main.js 在界面初始化时调用一次。
+// 输入：onChange(language) 在语言切换后回调，用于让调用方重绘依赖 t() 的动态内容。
+// 步骤：1) 首次调用时绑定 #languageToggle 点击与语言切换事件；
+//       2) 立即本地化整个 body 并刷新按钮；
+//       3) 创建 MutationObserver，之后新增到 body 下的节点自动本地化。
 export function startLocalization({ onChange } = {}) {
   const button = document.querySelector('#languageToggle')
   if (!listenersBound) {

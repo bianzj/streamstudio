@@ -1,5 +1,29 @@
+// ==========================================================================
+// 文件：project-schema.js
+// 功能：HiStream 工程（project.json）的数据模型：常量、默认值、规范化/迁移、校验，
+//   以及转换为引擎读取的场景 XML。前端界面、server.mjs 和 tools 脚本共用本文件。
+// 主要模块：
+//   1. 工程格式常量、模式列表与基础数值工具（number 把 null/空串视为缺失值）
+//   2. 地形环境缺省值、CPU 线程数、运行质量档位预设（qualityPreset*）
+//   3. 传感器：波段（sensorBandValues）、观测角（sensorViewAngles）、巡航航点
+//   4. 光谱与表面：旧光伏光谱清理、纹理规范化、开孔率（穿孔板）光学
+//   5. 车辆部件：光谱、座舱/发动机缺省、OBJ 组名自动绑定与前挡/侧窗/后窗/引擎盖拆分
+//   6. 内置预设库（createMaterialPresets）与新工程缺省（createDefaultProject）
+//   7. normalizeProject / parseProjectJson / stringifyProject：规范化、迁移旧工程
+//   8. validateProject：工程合法性校验，返回错误文本列表
+//   9. projectToXml 及 objectXml/spectrumXml/materialXml 等：导出引擎使用的 XML
+// 数据流：project.json → parseProjectJson/normalizeProject → validateProject → projectToXml → 引擎。
+// 与其他文件：依赖 material-specular.js（镜面项）；被 main.js、project-unified.js、server.mjs、
+//   tools/ 下的脚本引用；车辆与地形环境的说明见 docs/vehicle-thermal.md、
+//   docs/histream-terrain-environment.md；引擎侧解析在 models/histream/src/base。
+// 重要约定：旧工程缺字段时尽量保持旧行为，新工程使用新缺省（见各处“旧工程”说明）；
+//   长度 m；气象 Tsold 为 K，材质 Tsoil、室内温度为 ℃；角度为度（见各字段说明）。
+// ==========================================================================
+
 import { normalizeSpecular, meshSpecular } from './material-specular.js'
 
+// 模块：工程格式常量与模式列表。
+// PROJECT_SCHEMA_VERSION 为当前工程 schema 版本；PROJECT_MODES 为工程支持的计算模式（带 e 前缀的内部名）。
 export const PROJECT_SCHEMA_VERSION = 6
 export const PROJECT_FORMAT = 'histream-project'
 export const isProjectFormat = (format) => format === PROJECT_FORMAT
@@ -15,12 +39,19 @@ const number = (value, fallback) => {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+// 模块：地形环境（空气/土壤沿高度的外推）参数缺省值。
+// referenceHeight：温湿度参考高度（m，相对场景零面）；temperatureLapseRate：K m-1；
+// vaporScaleHeight：水汽压指数尺度高度（m）；drainageHeight：沟谷基准面高度（m）；
+// soilDry/soilValley：干燥/沟谷处土壤含水量（m3 m-3）；soilScaleHeight：土壤水衰减尺度（m）。
+// 公式与引擎侧实现见 docs/histream-terrain-environment.md、terrain_environment.h。
 export const TERRAIN_ENVIRONMENT_DEFAULTS = Object.freeze({
   airEnabled: false, soilEnabled: false,
   referenceHeight: 2, temperatureLapseRate: 0.0065, vaporScaleHeight: 2000,
   drainageHeight: 0, soilDry: 0.08, soilValley: 0.35, soilScaleHeight: 30
 })
 
+// 作用：把用户/旧工程的地形环境配置补全为完整对象（缺省取 TERRAIN_ENVIRONMENT_DEFAULTS）。
+// 说明：布尔项（airEnabled/soilEnabled）借 normalizeSpecular 的 enabled 解析；其余项转为有限数，否则取缺省。
 export function normalizeTerrainEnvironment(source = {}) {
   const result = { ...TERRAIN_ENVIRONMENT_DEFAULTS, ...source }
   for (const [key, fallback] of Object.entries(TERRAIN_ENVIRONMENT_DEFAULTS)) {
@@ -48,6 +79,7 @@ export const normalizeCpuThreads = (value) => {
 //   - FacetEB 的耦合迭代是上限，收敛即停止：标定算例 16–19 次（松弛 0.5）或约 11 次（松弛 0.8）收敛。
 export const QUALITY_PRESETS = ['fast', 'standard', 'high', 'custom']
 export const QUALITY_PRESET_LABELS = { fast: '快速预览', standard: '标准', high: '高精度', custom: '自定义' }
+// 各档位的通用参数值；radiationMaxSteps 为随场景尺寸计算的函数（见 autoRadiationMaxSteps）。
 const QUALITY_PRESET_VALUES = {
   fast: { samples: 16, raytracingDepth: 8, voxelCollisionOrders: 2, shortwaveScatteringOrders: 1, radiationMaxSteps: () => 64, couplingIterations: 20 },
   standard: { samples: 32, raytracingDepth: 16, voxelCollisionOrders: 3, shortwaveScatteringOrders: 2, radiationMaxSteps: (scene) => autoRadiationMaxSteps(scene), couplingIterations: 60 },
@@ -57,6 +89,7 @@ const QUALITY_PRESET_VALUES = {
 const QUALITY_PRESET_MODE_VALUES = {
   fast: { eVoxelEB: { samples: 32 } }
 }
+// 各模式受档位管理的 control 字段（与文件上方档位说明一致）。
 const QUALITY_PRESET_FIELDS = {
   eRaytracing: ['samples', 'raytracingDepth'],
   eVoxelRT: ['samples', 'voxelCollisionOrders'],
@@ -81,6 +114,7 @@ export function qualityPresetValues(preset, mode, scene = {}) {
   return Object.fromEntries(qualityPresetFields(mode).map((key) => [key, typeof merged[key] === 'function' ? merged[key](scene) : merged[key]]))
 }
 
+// 作用：判断 control 中受管字段是否与某档位在该模式下的取值完全一致（用于推断当前档位）。
 export function qualityPresetMatches(preset, mode, control = {}, scene = {}) {
   if (!QUALITY_PRESET_VALUES[preset]) return false
   return Object.entries(qualityPresetValues(preset, mode, scene)).every(([key, value]) => Number(control[key]) === value)
@@ -92,9 +126,14 @@ export function normalizeRunTimeoutMinutes(value) {
   return minutes >= 1 ? Math.min(1440, minutes) : 0
 }
 
+// 数值工具：cleanNumber 保留 6 位小数以去除浮点噪声；normalizedAzimuth 把方位角归一到 [0, 360)。
 const cleanNumber = (value) => Number(Number(value).toFixed(6))
 const normalizedAzimuth = (value) => ((Number(value) % 360) + 360) % 360
 
+// 作用：生成传感器巡航（多位置观测）的位置序列，路线为 line（往返直线）/rectangle（矩形环绕）/random（随机游走）。
+// 输入：sensor 巡航参数（positionX/Y 起点、height、cruiseHeading 航向角 °、cruiseStep 步长 m、cruiseCount 点数）、scene 场景尺寸（x/y，m）。
+// 输出：[{x, y, z, heading}]，x/y 对场景范围取模（周期边界），z ≥ 0.01 m，heading 为 [0, 360) 度。
+// 说明：随机路线用固定种子的线性同余发生器，同一工程每次生成的轨迹可复现。
 export function sensorCruisePositions(sensor = {}, scene = {}) {
   const width = Math.max(0.000001, number(scene.x, 60))
   const depth = Math.max(0.000001, number(scene.y, 60))
@@ -106,8 +145,10 @@ export function sensorCruisePositions(sensor = {}, scene = {}) {
   const count = Math.max(1, Math.min(10000, Math.round(number(sensor.cruiseCount, 20))))
   const route = ['line', 'rectangle', 'random'].includes(sensor.cruiseRoute) ? sensor.cruiseRoute : 'line'
   const wrap = (value, extent) => ((value % extent) + extent) % extent
+  // 生成一个航点：x/y 周期回绕到场景范围内，z 下限 0.01 m，heading 归一到 [0, 360)。
   const point = (x, y, heading, z = height) => ({ x: cleanNumber(wrap(x, width)), y: cleanNumber(wrap(y, depth)), z: cleanNumber(Math.max(0.01, z)), heading: cleanNumber(normalizedAzimuth(heading)) })
 
+  // 矩形路线：以起点为中心、沿周长按 cruiseStep 等弧长取点，依次走上边、右边、下边、左边（航向 0/90/180/270）。
   if (route === 'rectangle') {
     const rectangleWidth = Math.max(step, Math.min(width, number(sensor.cruiseRectangleWidth, Math.min(width * 0.25, 500))))
     const rectangleHeight = Math.max(step, Math.min(depth, number(sensor.cruiseRectangleHeight, Math.min(depth * 0.25, 500))))
@@ -121,6 +162,7 @@ export function sensorCruisePositions(sensor = {}, scene = {}) {
     })
   }
 
+  // 随机路线：每步随机取航向（最后一点保持上一航向），按 cruiseStep 前进，固定种子保证可复现（LCG 常数 1664525/1013904223）。
   if (route === 'random') {
     let seed = Math.max(1, Math.round(number(sensor.cruiseRandomSeed, 1))) >>> 0
     const random = () => {
@@ -139,11 +181,14 @@ export function sensorCruisePositions(sensor = {}, scene = {}) {
     return result
   }
 
+  // 直线路线（缺省）：起点到目标点（缺省为沿航向走 count-1 步）之间往返，按 cruiseStep 等距取点，
+  // 到端点后折返（周期 2·length），折返段航向反向 180°。
   const targetX = number(sensor.cruiseTargetX, startX + Math.cos(headingDegrees * Math.PI / 180) * step * Math.max(1, count - 1))
   const targetY = number(sensor.cruiseTargetY, startY + Math.sin(headingDegrees * Math.PI / 180) * step * Math.max(1, count - 1))
   const targetZ = Math.max(0.01, number(sensor.cruiseTargetZ, height))
   let deltaX = targetX - startX, deltaY = targetY - startY, deltaZ = targetZ - height
   let length = Math.hypot(deltaX, deltaY, deltaZ)
+  // 起点与目标重合时退化为沿 cruiseHeading 方向的水平直线，避免除以 0。
   if (length < 0.000001) {
     const heading = headingDegrees * Math.PI / 180
     deltaX = Math.cos(heading) * step
@@ -162,8 +207,10 @@ export function sensorCruisePositions(sensor = {}, scene = {}) {
   })
 }
 
+// 可移动对象类型（人、车辆、船）。
 const isMobileAgentType = (type) => type === 'Human' || type === 'Vehicle' || type === 'Ship'
 
+// 贴地对象：目前只有车辆，其放置高度由地形接触点决定（见 groundedPlacementHeight）。
 export const isGroundedObject = (item = {}) => item.type === 'Vehicle'
 
 // Height above the terrain at the placement centre at which an untilted rigid
@@ -184,7 +231,9 @@ export function groundedPlacementHeight(footprint, placement, heightAt) {
   }
   return top - centre
 }
+// 兼容旧工程：把标签里的“火焰/烟羽”改为“火焰”。
 const withoutSmokeLabel = (item = {}) => ({ ...item, label: String(item.label || '').replaceAll('火焰/烟羽', '火焰') })
+// 水体预设的旧名称 → 规范名称映射，用于读取旧工程时统一名称。
 const WATER_PRESET_ALIASES = {
   water_radiation: 'water_surface',
   water_temperature_model: 'water_temperature',
@@ -193,6 +242,7 @@ const WATER_PRESET_ALIASES = {
 
 const canonicalPresetName = (name) => WATER_PRESET_ALIASES[name] || name
 
+// 作用：按规范名合并预设条目；同名冲突时规范名条目优先，同优先级后者覆盖前者。
 function canonicalPresetItems(items = []) {
   const merged = new Map()
   for (const item of items) {
@@ -206,6 +256,8 @@ function canonicalPresetItems(items = []) {
   return [...merged.values()].map(({ item }) => item)
 }
 
+// 作用：规范化单个材质条目（统一别名）；木质（wood）材质补全 Vegetation 类型和默认参数，
+// 若缺少固体热容 cs/specificHeat 则取内置预设的 cs。
 function normalizeMaterialItem(item = {}) {
   const name = canonicalPresetName(item.name)
   const wood = item.energyModel === 'wood' || name === 'tree_branch_wood' || name === 'tree_trunk_wood'
@@ -224,6 +276,7 @@ function normalizeMaterialItem(item = {}) {
   }
 }
 
+// 作用：补全对象的随机运动参数（缺省按车辆/船与行人区分；speed m s-1，range 活动范围 m（待核对），turnInterval s）。
 function normalizeMovement(item = {}) {
   const vehicle = item.type === 'Vehicle' || item.type === 'Ship'
   const defaults = {
@@ -279,6 +332,10 @@ export function sensorBandValues(sensor = {}) {
   return unique.sort((a, b) => a - b).slice(0, MAX_SENSOR_BANDS)
 }
 
+// 作用：生成传感器的观测方向列表 [[VZA, VAA], ...]（度），并去重。
+// 输入：sensor（vza/vaa 单方向，principalPlane 主平面/垂直主平面扫描，hemisphere 半球采样）、
+//   sunAzimuth 太阳方位角（度，主平面方位以它为基准）。
+// 说明：三种方式可叠加；天顶角限制在 [0, 89.999]；所有 VZA=0 的方向只保留第一个。
 export function sensorViewAngles(sensor = {}, sunAzimuth = 0) {
   const angles = []
   const keys = new Set()
@@ -296,6 +353,8 @@ export function sensorViewAngles(sensor = {}, sunAzimuth = 0) {
   if (!sensor.principalPlane && !sensor.hemisphere) {
     add(number(sensor.vza, 0), number(sensor.vaa, 0))
   }
+  // 主平面扫描：沿太阳方位平面（offset 0）和垂直平面（offset 90），VZA 从 -75° 到 75° 每 5° 一个；
+  // 负的带符号天顶角表示对侧，方位角加 180°。
   if (sensor.principalPlane) {
     for (const offset of [0, 90]) {
       for (let signedZenith = -75; signedZenith <= 75; signedZenith += 5) {
@@ -303,6 +362,7 @@ export function sensorViewAngles(sensor = {}, sunAzimuth = 0) {
       }
     }
   }
+  // 半球采样：128 个等面积方向，用黄金角螺旋分布方位角，cosZenith 在 [cos75°, 1] 上均匀。
   if (sensor.hemisphere) {
     const goldenAngle = Math.PI * (3 - Math.sqrt(5))
     const minimumCosZenith = Math.cos(75 * Math.PI / 180)
@@ -316,6 +376,9 @@ export function sensorViewAngles(sensor = {}, sunAzimuth = 0) {
   return angles
 }
 
+// 作用：从光谱库中剔除旧版内置、且未被引用也未被改动的光伏光谱（单晶/多晶/双面），
+//   并把 pv_opaque 的旧标签统一改为“太阳能板光谱”；被工程引用或被用户改过的条目一律保留。
+// 输入：spectra 光谱条目数组，configuration 整个工程配置（用于收集被引用的 spectralName）。
 // Retain bound or edited legacy spectra so existing simulations do not change.
 export function simplifySolarSpectra(spectra, configuration = {}) {
   const references = new Set([configuration.scene?.background?.spectralName])
@@ -331,6 +394,7 @@ export function simplifySolarSpectra(spectra, configuration = {}) {
   return spectra.filter((item) => {
     const old = retired[item.name]
     if (!old || references.has(item.name)) return true
+    // 仅当条目的标签、文件、反/透射率、TIR 参数、纹理、镜面项都与旧版内置值完全一致时才视为“未改动”。
     const unchanged = item.label === old[0] && item.model === 'file'
       && item.fileName === `assets/spectral-library/${old[1]}`
       && Number(item.reflectance) === old[2] && Number(item.transmittance) === 0
@@ -345,8 +409,12 @@ export function simplifySolarSpectra(spectra, configuration = {}) {
     ? { ...item, label: '太阳能板光谱' } : item)
 }
 
+// 穿孔板开孔率（孔洞面积占比）的上限；surfaceOpenness 与纹理开孔率均以此限幅。
 export const MAX_SURFACE_OPENNESS = 0.95
 
+// 作用：规范化面元表面纹理配置 classTexture（分类纹理）与 opennessTexture（开孔率纹理）。
+// 输出：只包含源对象中存在的纹理项；分类颜色限 #rrggbb 且最多 16 类，开孔率分级 2–32 级，
+//   minOpenness ≤ maxOpenness ≤ MAX_SURFACE_OPENNESS；repeatSize 为纹理重复尺寸（单位待核对）。
 // Class texture: PNG whose colours select a spectrum per face. Openness
 // texture: grey PNG whose brightness selects an openness level per face.
 // Both are applied when a run is staged (tools/surface-textures.mjs).
@@ -379,6 +447,7 @@ function normalizeSurfaceTextures(item = {}) {
   return result
 }
 
+// 读取光谱条目的开孔率 openness，限幅到 [0, MAX_SURFACE_OPENNESS]，缺省 0（实心面）。
 export function surfaceOpenness(spectrum = {}) {
   return Math.max(0, Math.min(MAX_SURFACE_OPENNESS, number(spectrum.openness, 0)))
 }
@@ -393,6 +462,8 @@ export function porousOptics(reflectance, transmittance, openness) {
   return { reflectance: (1 - o) * r, transmittance: o + (1 - o) * t }
 }
 
+// 作用：对逐波段的反射率/透射率列表（空格、逗号或分号分隔的字符串）逐项应用 porousOptics。
+// 说明：两个列表长度不同时，长度为 1 的列表对所有波段广播；输出为逗号分隔的 6 位小数字符串。
 function porousList(reflectance, transmittance, openness) {
   const split = (value) => String(value ?? '').split(/[\s,;]+/).filter(Boolean).map(Number)
   const r = split(reflectance), t = split(transmittance)
@@ -406,11 +477,15 @@ function porousList(reflectance, transmittance, openness) {
   }
 }
 
+// 作用：把带开孔率的光谱条目转换为求解器实际使用的等效光谱（openness 为 0 时原样返回）。
+// 步骤：1) 对反/透射率应用孔洞公式；2) 对热红外 refTir/tauTir 同样处理；
+//   3) model 为 file 时读入光谱文件，转换后写成新文件并替换 fileName。
 // Returns the solver spectrum for a porous sheet; `readSpectrumFile` returns
 // the 2-3 row TXT for model "file" and `writeSpectrumFile` stores the result.
 export function effectivePorousSpectrum(spectrum, { readSpectrumFile, writeSpectrumFile } = {}) {
   const openness = surfaceOpenness(spectrum)
   if (!(openness > 0)) return spectrum
+  // 热红外：refTir 缺省 0.05、tauTir 缺省 0。
   const tir = porousOptics(spectrum.refTir ?? 0.05, spectrum.tauTir ?? 0, openness)
   const round = (value) => Number(value.toFixed(6))
   const result = { ...spectrum, ...porousList(spectrum.reflectance, spectrum.transmittance, openness), refTir: round(tir.reflectance), tauTir: round(tir.transmittance) }
@@ -418,6 +493,7 @@ export function effectivePorousSpectrum(spectrum, { readSpectrumFile, writeSpect
   if (spectrum.model === 'file' && readSpectrumFile && writeSpectrumFile) {
     const rows = String(readSpectrumFile(spectrum.fileName)).replace(/^\uFEFF/, '').split(/\r?\n/)
       .map((line) => line.replace(/#.*$/, '').trim()).filter(Boolean)
+    // 光谱文件格式：第 1 行波长，第 2 行反射率，第 3 行透射率（缺省 0）；# 之后为注释。
     const wavelengths = rows[0] || ''
     const converted = porousList(rows[1] || '0', rows[2] || '0', openness)
     result.fileName = writeSpectrumFile(`# porous sheet, openness ${openness}\n${wavelengths}\n${converted.reflectance.replaceAll(',', ' ')}\n${converted.transmittance.replaceAll(',', ' ')}\n`)
@@ -439,7 +515,10 @@ export const VEHICLE_PAINT_COLORS = [
   { id: 'red', label: '红', reflectance: 0.30 }, { id: 'blue', label: '蓝', reflectance: 0.22 }, { id: 'grey', label: '灰', reflectance: 0.30 },
   { id: 'black_cool', label: '黑（近红外冷漆）', reflectance: 0.25 }
 ]
+// 车漆颜色 id → 光谱预设名；未知颜色回退为 white。
 export const vehiclePaintSpectrumName = (color) => `vehicle_paint_${VEHICLE_PAINT_COLORS.some((entry) => entry.id === color) ? color : 'white'}`
+// 车辆部件光谱预设：7 种车漆 + 前/侧/后挡风玻璃与隔热膜、灯具、轮胎、饰件、裸露金属。
+// 各数值均为典型值，待核对（见上方说明与 docs/vehicle-thermal.md）。
 export const VEHICLE_SPECTRA = [
   ...VEHICLE_PAINT_COLORS.map((entry) => vehicleSpectrum(vehiclePaintSpectrumName(entry.id), `车漆·${entry.label}（ρ_sol≈${entry.reflectance}，ε≈0.88）`, entry.reflectance, 0, 0.12)),
   // Windshield: laminated solar-control glass tau 0.60, rho 0.25 -> absorptance 0.15. Side: tempered tau 0.70 (rho 0.08, abs 0.22).
@@ -493,6 +572,7 @@ export const VEHICLE_BINDING_RULES = [
 export function vehicleMeshBinding(meshName, { paint = 'white', film = false, bodyMaterial = 'vehicle_material' } = {}) {
   const rule = VEHICLE_BINDING_RULES.find((entry) => entry.pattern.test(String(meshName || ''))) || VEHICLE_BINDING_RULES[VEHICLE_BINDING_RULES.length - 1]
   let spectralName = rule.spectral === 'paint' ? vehiclePaintSpectrumName(paint) : rule.spectral === 'keep' ? null : rule.spectral
+  // 开启隔热膜时，前挡风换为前膜光谱，侧窗/后窗换为侧/后膜光谱。
   if (film && spectralName === 'vehicle_glass_front') spectralName = 'vehicle_glass_front_film'
   else if (film && (spectralName === 'vehicle_glass_side' || spectralName === 'vehicle_glass_rear')) spectralName = 'vehicle_glass_side_film'
   return { rule: rule.id, spectralName, materialName: rule.material === 'body' ? bodyMaterial : rule.material }
@@ -506,7 +586,10 @@ export function vehiclePresetNames() {
 // and adds <paint>_hood to the paint group, by facet orientation in the vehicle frame. Forward = tail-light group
 // centroid -> headlight group centroid (horizontal; y is up). Without both light groups nothing is split.
 // Returns { content, split: { Windows: ['Windows_front', ...] }, forward, counts } (content unchanged if no split).
+// 步骤（函数内部）：1) 解析 OBJ，按 g/o 分组；2) 用前/尾灯组质心定车头方向 forward；
+//   3) 玻璃面元按法线和位置分前/侧/后；4) 车漆组中取引擎盖面元；5) 重新输出各组。
 export function splitVehicleObj(content, { glassRule = VEHICLE_BINDING_RULES.find((r) => r.id === 'glass'), paintRule = VEHICLE_BINDING_RULES.find((r) => r.id === 'paint') } = {}) {
+  // 步骤 1：解析 OBJ 文本：收集顶点坐标（用于面元几何）、按 g/o 行分组，顶点类数据提到文件头 head。
   const lines = String(content).split(/\r?\n/)
   const vertices = []
   const groups = []                       // { name, lines: [] }; faces keep order
@@ -537,6 +620,8 @@ export function splitVehicleObj(content, { glassRule = VEHICLE_BINDING_RULES.fin
     return points.length ? centroid(points) : null
   }
   const find = (re) => groups.find((group) => re.test(group.name))
+  // 步骤 2：用前灯组与尾灯组的质心确定车头方向 forward（水平，y 轴向上）。
+  //   缺任一灯组、或两灯质心水平距离不足 0.5（OBJ 坐标单位，视为 m，待核对）时不拆分。
   const headGroup = find(/head[_\s-]*(light|lamp)/i), tailGroup = find(/tail[_\s-]*(light|lamp)/i)
   const none = { content, split: {}, forward: null, counts: {} }
   if (!headGroup || !tailGroup) return none
@@ -546,6 +631,7 @@ export function splitVehicleObj(content, { glassRule = VEHICLE_BINDING_RULES.fin
   const forwardLength = Math.hypot(...forward)
   if (!(forwardLength > 0.5)) return none
   forward = forward.map((value) => value / forwardLength)
+  // lateral：水平且垂直于 forward 的车辆侧向单位向量。
   const lateral = [-forward[2], 0, forward[0]]        // up (0,1,0) x forward: horizontal, to the vehicle's side
   const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
   const glassGroups = groups.filter((group) => glassRule.pattern.test(group.name) && !/head|tail|light|lamp/i.test(group.name) && group.lines.some((l) => l.startsWith('f ')))
@@ -553,6 +639,9 @@ export function splitVehicleObj(content, { glassRule = VEHICLE_BINDING_RULES.fin
   const emitted = []
   let windshieldBase = null
   const glassInfo = new Map()
+  // 步骤 3：玻璃面元分类：法线与 lateral 的夹角余弦绝对值 > 0.6 为侧窗；
+  //   其余按面元质心沿 forward 的位置相对玻璃组中点分为前挡/后窗。
+  //   同时记录最靠前的前挡点 windshieldBase，供引擎盖判定使用。
   for (const group of glassGroups) {
     const faces = group.lines.filter((l) => l.startsWith('f '))
     const all = faces.flatMap(faceOf)
@@ -570,6 +659,7 @@ export function splitVehicleObj(content, { glassRule = VEHICLE_BINDING_RULES.fin
       if (!windshieldBase || dot(base, forward) > dot(windshieldBase, forward)) windshieldBase = base
     }
   }
+  // 步骤 4：逐组输出；玻璃组按分类拆成 _front/_side/_rear；车漆组中满足引擎盖条件的面元拆成 _hood。
   for (const group of groups) {
     const classes = glassInfo.get(group)
     if (classes) {
@@ -601,12 +691,16 @@ export function splitVehicleObj(content, { glassRule = VEHICLE_BINDING_RULES.fin
     }
     emitted.push({ header: group.header, lines: group.lines })
   }
+  // 步骤 5：没有任何组被拆分则原样返回；否则按 head + 各组顺序重新拼接 OBJ。
   if (!Object.keys(split).length) return none
   const out = [...head]
   for (const group of emitted) out.push(group.header, ...group.lines)
   return { content: out.join('\n'), split, forward, counts }
 }
+// splitVehicleObj 产生的组名后缀 → VEHICLE_BINDING_RULES 的规则 id。
 export const VEHICLE_SPLIT_BINDINGS = { _front: 'windshield', _side: 'sideWindow', _rear: 'rearWindow', _hood: 'hood' }
+// 作用：基于 vehicle_material 预设生成一辆车专属的车身材质（座舱/行驶/发动机状态写入 params.cabin）。
+// 说明：窗微开/全开的换气次数 crackedACH 取 10/30（单位待核对）；interior/engine 为 false 时删除对应子项。
 // Body material of one vehicle (the vehicle_material preset with this car's cabin / driving / engine state).
 // vent: 'closed' | 'crack' | 'open'; speed > 0 = driving; heading and windDirection together (degrees) or both absent.
 export function createVehicleBodyMaterial(name, { volume = 2.8, occupants = 0, speed = 0, heading, windDirection, vent = 'closed', engineOn = false, enginePower = 15000,
@@ -620,6 +714,13 @@ export function createVehicleBodyMaterial(name, { volume = 2.8, occupants = 0, s
   return { ...base, name, label: `${name} 车身（座舱）`, params: { ...base.params, cabin } }
 }
 
+// 模块：内置预设库（新工程的初始内容，也是 normalizeProject 补全缺失预设的来源）。
+// 输出：{ spectra, canopies, thermals, materials }：
+//   spectra 光谱（反/透射率、热红外 refTir/tauTir，model 为 custom/Prospect/BSM/file）；
+//   canopies 冠层/结构（LAI、叶倾角分布参数、刚体、火焰/雾等参与介质）；
+//   thermals 光照面/阴影面的固定表面温度（K）；
+//   materials 物化参数（建筑多层墙体、光伏、土壤、植被生理、木质、车辆、船舶、水体）。
+// 说明：数值多为典型值，用户可在界面编辑；注释中的文献/规范出处为原作者标注。
 export function createMaterialPresets() {
   return {
     spectra: [
@@ -650,6 +751,8 @@ export function createMaterialPresets() {
       ,{ name: 'fire_medium', label: '火焰介质', model: 'custom', reflectance: '0.0', transmittance: '0.0', refTir: 0, tauTir: 0, params: {} }
       ,{ name: 'fog_medium', label: '雾介质', model: 'custom', reflectance: '0.0', transmittance: '0.0', refTir: 0, tauTir: 0, params: {} }
     ],
+    // 冠层/结构预设：structureType 为 canopy（混沌介质）、rigid（刚体）、fire/fog（参与介质，
+    //   extinction 消光、scatteringAlbedo 散射反照率、asymmetry 不对称因子、fixedTemperature 固定温度 K）。
     canopies: [
       { name: 'canopy_default', label: '混沌介质（多孔透射）', structureType: 'canopy', lai: 3, density: 1, hc: 2, G: 0.5, LIDFa: -0.35, LIDFb: -0.15, hspot: 0.2, leafwidth: 0.1 },
       { name: 'tree_leaf_canopy', label: '树叶（多孔透射）', structureType: 'canopy', lai: 3, density: 1, hc: 2, G: 0.5, LIDFa: -0.35, LIDFb: -0.15, hspot: 0.2, leafwidth: 0.08 },
@@ -659,6 +762,7 @@ export function createMaterialPresets() {
       { name: 'fire_medium', label: '火焰（参与介质）', structureType: 'fire', lai: 0, density: 0, hc: 3, G: 0, LIDFa: 0, LIDFb: 0, hspot: 0, leafwidth: 0, extinction: 1.2, scatteringAlbedo: 0.72, asymmetry: 0.55, emissionScale: 1, fixedTemperature: 1100 },
       { name: 'fog_medium', label: '雾（参与介质）', structureType: 'fog', lai: 0, density: 0, hc: 10, G: 0, LIDFa: 0, LIDFb: 0, hspot: 0, leafwidth: 0, extinction: 0.08, scatteringAlbedo: 0.95, asymmetry: 0.85, emissionScale: 1, fixedTemperature: 288 }
     ],
+    // 表面温度预设：sunlitTemperature/shadedTemperature 分别为受光面/阴影面温度（K，用途待核对）。
     thermals: [
       { name: 'soil_temperature', label: '土壤温度', sunlitTemperature: 305, shadedTemperature: 295 },
       { name: 'vegetation_temperature', label: '植被温度', sunlitTemperature: 300, shadedTemperature: 296 },
@@ -673,6 +777,8 @@ export function createMaterialPresets() {
       ,{ name: 'fire_temperature', label: '火焰固定温度', sunlitTemperature: 1100, shadedTemperature: 1100 }
       ,{ name: 'fog_temperature', label: '雾介质温度', sunlitTemperature: 288, shadedTemperature: 288 }
     ],
+    // 物化参数预设：type 为 Building/Vegetation/Soil/Vehicle/Ship/Water；
+    //   wallMode 为 wall 的条目按 layers（由外到内）逐层求解导热，厚度 m、λ W m-1 K-1、ρ kg m-3、cp J kg-1 K-1。
     materials: [
       // Representative dry concrete surface; users can edit these thermal properties.
       // wallMode 'wall': FacetEB solves the layered wall (params.layers, outer to inner) with a 22 °C
@@ -769,6 +875,10 @@ export function createMaterialPresets() {
   }
 }
 
+// 作用：生成新工程的完整缺省对象（schemaVersion、folders 与 configuration 各节的缺省值）。
+// 输入：options（mode、name、sceneX/Y/Height、offset、voxelSize 等；缺省场景 60×60×15 m，体元 1 m）。
+// 说明：新工程缺省与旧工程缺字段时的处理不同——旧工程的缺省在 normalizeProject 中单独处理，
+//   以保证旧工程结果不变（见下方 diffuseFractionMode、stabilityCorrection 等字段说明）。
 export function createDefaultProject(options = {}) {
   const mode = PROJECT_MODES.includes(options.mode) ? options.mode : 'eVoxelEB'
   const now = new Date().toISOString()
@@ -790,6 +900,8 @@ export function createDefaultProject(options = {}) {
     },
     configuration: {
       outDir: 'output',
+      // 场景节：x/y/height 为场景范围（m），offset 为偏移（m），voxel 为体元边长（m），
+      //   terrain/demFile/demInfo/terrainEnvironment 为地形，background 为场景背景的光谱/热/物化绑定。
       scene: {
         x: number(options.sceneX, 60),
         y: number(options.sceneY, 60),
@@ -813,6 +925,9 @@ export function createDefaultProject(options = {}) {
       // diffuseFractionMode：VoxelEB/FacetEB 气象短波的直散拆分。新工程默认 'erbs'（逐节点按实测直射/散射列或
       // Erbs 晴空指数模型）；旧工程缺字段在 normalizeProject 中按 'fixed'（全时段直射比例）处理，结果不变。
       light: { zenith: 30, azimuth: 135, direct: 0.8, diffuse: 0.2, skyTemperature: 250, shortwaveIrradiance: 0, diffuseFractionMode: 'erbs' },
+      // 传感器节：x/y 为影像尺寸（像元数，待核对）；bands 为空格分隔的波段中心波长（nm）；
+      //   continuousBands 开启时按 bandStart/bandEnd/bandStep 生成连续波段；
+      //   positionX/Y/height 为传感器位置（m）；cruise* 为巡航路线参数（见 sensorCruisePositions）。
       sensor: {
         x: 512, y: 512, bands: DEFAULT_SENSOR_BANDS.join(' '), projection: 'parallel',
         vza: 0, vaa: 0,
@@ -835,6 +950,7 @@ export function createDefaultProject(options = {}) {
         cruiseCount: 20,
         image: true, process: false, radiationProcess: false, energyProcess: false, temperature: true, albedo: false
       },
+      // 运行控制节：采样数、深度、计算后端（gpu/cpu）、线程数、质量档位及各模式的迭代/步数上限。
       control: {
         depth: 4, raytracingDepth: 16, samples: 32, gpu: 0, specularEnabled: true,
         facetBackend: 'gpu',
@@ -869,6 +985,7 @@ export function createDefaultProject(options = {}) {
         soilInertiaHistory: 'full',
         vegetationTemperatureMethod: 0
       },
+      // 流体（风场/烟羽）节：默认关闭；voxelSize 不小于 0.1 m，timeStep 单位 s（待核对）。
       fluid: {
         enabled: false,
         voxelSize: Math.max(0.1, number(options.voxelSize, 1)),
@@ -890,6 +1007,8 @@ export function createDefaultProject(options = {}) {
       canopies: presets.canopies,
       thermals: presets.thermals,
       materials: presets.materials,
+      // 气象节：path 为气象文件，start/end 为使用的时间节点范围，dTime 为时间步长（s），
+      //   latitude/longitude 为站点经纬度（°），year/timezone 供太阳几何使用（气象文件按当地时间存日序）。
       meteo: {
         path: 'defined/meteo.txt', start: 1, end: 48,
         z: 15, Tsold: 300, SatWater: 0.45, dTime: 1800, Ca: 380,
@@ -897,6 +1016,7 @@ export function createDefaultProject(options = {}) {
         // Meteo files store day-of-year in local time; solar geometry needs both.
         year: 2019, timezone: 8
       },
+      // 大气节：默认关闭；启用时按 model/waterVapor/aerosol/visibility 查 lutFile 查找表（单位待核对）。
       atmosphere: {
         enabled: false,
         model: 'midlatitude-summer',
@@ -909,6 +1029,11 @@ export function createDefaultProject(options = {}) {
   }
 }
 
+// 作用：把任意版本的工程对象（含旧工程）规范化为当前 schema 的完整工程；不修改传入对象。
+// 输入：value 解析后的 project.json 对象；输出：补全默认值、统一预设别名、限幅后的新对象。
+// 步骤：1) 深拷贝输入并取默认工程；2) 预算传感器/光照/气象派生量；3) 规范化光谱；
+//   4) 规范化对象（别名、分布密度、火/雾介质、移动参数）；5) 逐节合并默认值与输入并限幅。
+// 约定：旧工程缺字段时尽量保持旧行为（缺省值与新工程不同的字段在下面逐处说明）。
 export function normalizeProject(value = {}) {
   // 注意：server.mjs 也会在系统 Node 下调用本函数，而 package.json 未声明 engines；
   // structuredClone 需要 Node>=17。工程对象本身就是 JSON 可序列化数据，这里回退到 JSON 往返，
@@ -917,6 +1042,7 @@ export function normalizeProject(value = {}) {
     typeof structuredClone === 'function' ? structuredClone(value) : JSON.parse(JSON.stringify(value))
   const defaults = createDefaultProject(input)
   const { inputFile: _legacyInputFile, ...source } = input
+  // 步骤 2：取出各节输入，并预先算出传感器位置、巡航参数、直射比例、气象起止节点等派生量。
   const configuration = input.configuration || {}
   const sourceSensor = configuration.sensor || {}
   const normalizedSceneX = Math.max(0.1, number(configuration.scene?.x, defaults.configuration.scene.x))
@@ -933,10 +1059,15 @@ export function normalizeProject(value = {}) {
   const meteoStart = Math.max(0, Math.round(number(sourceMeteo.start, defaults.configuration.meteo.start)))
   const meteoEnd = Math.max(meteoStart + 1, Math.round(number(sourceMeteo.end, defaults.configuration.meteo.end)))
   const energyMode = input.mode === 'eFacetEB' || input.mode === 'eVoxelEB'
+  // 旧工程只有 sensor.process 一个过程输出开关；后面按模式把它拆给 radiationProcess/energyProcess。
   const legacyProcess = Boolean(sourceSensor.process)
+  // 步骤 3：光谱规范化。先合并别名条目、剔除旧版内置且未使用的光伏光谱；
+  //   工程没有光谱时用默认预设。
   const sourceSpectra = simplifySolarSpectra(canonicalPresetItems(Array.isArray(configuration.spectra) && configuration.spectra.length
     ? configuration.spectra : defaults.configuration.spectra
   ), configuration)
+  // 逐条光谱：补全开孔率、表面纹理、镜面项、预览/物理纹理；内置的混凝土/沥青/红砖/载具缺预览纹理时补内置值；
+  //   BSM 土壤光谱补全 SMC/BSMBrightness/BSMlat/BSMlon。
   const spectra = sourceSpectra.map((item) => {
     const { openness: _openness, classTexture: _classTexture, opennessTexture: _opennessTexture, ...withoutOpenness } = withoutSmokeLabel(item)
     const openness = surfaceOpenness(item)
@@ -988,6 +1119,7 @@ export function normalizeProject(value = {}) {
     configuration.fluid?.outputHeight,
     defaults.configuration.fluid.outputHeight
   )
+  // 步骤 4：对象规范化：预设名转规范名、网格绑定补全、分布密度迁移、火/雾介质坐标迁移、移动参数。
   const sourceObjects = configuration.objects || {}
   const objectItems = (Array.isArray(sourceObjects.items) ? sourceObjects.items : defaults.configuration.objects.items)
     .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
@@ -1014,6 +1146,9 @@ export function normalizeProject(value = {}) {
           }
         }) : item.meshes
       }
+      // 分布密度迁移：统一换算为“每公顷”（densityUnit = 'hectare'）。
+      //   旧工程密度按 ×10000 换算（推断为每平方米，待核对）；basis 为 count 时由总数除以分布面积；
+      //   squareKilometer 单位的值除以 100。
       if (item.distribution && typeof item.distribution === 'object' && !Array.isArray(item.distribution)) {
         const densityUnit = item.distribution.densityUnit
         const legacyDensity = !['hectare', 'squareKilometer'].includes(densityUnit)
@@ -1034,6 +1169,8 @@ export function normalizeProject(value = {}) {
           densityUnit: 'hectare'
         }
       }
+      // 火/雾介质：统一为 XYZ 坐标次序（coordinateOrder）并标记仅参与辐射；
+      //   旧工程不是 XYZ 次序时交换 Y/Z 轴（尺寸、生成参数 sizeY/Z、positionY/Z）。
       if (item.type === 'Fire' || item.type === 'Fog') {
         const fog = item.type === 'Fog' || item.medium?.kind === 'fog'
         const standardAxes = item.medium?.coordinateOrder === 'XYZ'
@@ -1048,10 +1185,12 @@ export function normalizeProject(value = {}) {
         normalized.medium = { ...(item.medium || {}), kind: fog ? 'fog' : 'fire', radiationOnly: true, coordinateOrder: 'XYZ' }
         normalized.generation = { ...(item.generation || {}), type: fog ? '雾' : '火焰', parameters }
       }
+      // 可移动类型（人/车/船）补全 movement 参数，其余类型删除 movement。
       if (isMobileAgentType(item.type)) normalized.movement = normalizeMovement(item)
       else delete normalized.movement
       return normalized
     })
+  // 步骤 5：以默认工程为底，依次覆盖 input 的顶层字段与各配置节，逐节规范化并限幅。
   // DEFERRED[低] 兼容性: normalizeProject/parseProjectJson 不检查 value.schemaVersion（只有 validateProject 检查），高于 PROJECT_SCHEMA_VERSION 的工程被直接改写为 6 并在保存时降级（未知字段虽经 ...source 保留，但新语义可能被这里的迁移规则误改）；未修复：拒绝/只读打开更高版本涉及 schema 兼容策略，按要求保留待决策
   return {
     ...defaults,
@@ -1063,6 +1202,7 @@ export function normalizeProject(value = {}) {
     configuration: {
       ...defaults.configuration,
       ...configuration,
+      // 场景节：展开输入后规范化偏移、terrainEnvironment 与 background（预设名转规范名，镜面开关由 meshSpecular 判定）。
       scene: {
         ...defaults.configuration.scene,
         // DEFERRED[中] 数据一致性: scene.x/y/height/voxel/voxelFillThreshold 原样展开，不做 number()/下限校验；上方算出的 normalizedSceneX/Y 只用于传感器，场景本身仍可能是 0、负数、NaN 或字符串并写回 project.json 交给引擎（light.zenith/azimuth、sensor.x/y/vza/vaa、control.depth/samples 同样未校验）；未修复：各字段的合法范围/取整规则属产品与引擎语义，未定义统一规则前不擅自夹紧
@@ -1093,6 +1233,8 @@ export function normalizeProject(value = {}) {
       light: { ...defaults.configuration.light, ...sourceLight, direct: directFraction, diffuse: 1 - directFraction,
         shortwaveIrradiance: Math.max(0, Math.min(2000, number(sourceLight.shortwaveIrradiance, 0))),
         diffuseFractionMode: sourceLight.diffuseFractionMode === 'erbs' ? 'erbs' : 'fixed' },
+      // 传感器节：缺少巡航目标时按航向与步长×(点数-1) 推算；矩形巡航宽高缺省为场景尺寸的 1/4（≤500 m）；
+      //   视场角限制在 0.1–120°；radiationProcess/energyProcess 缺字段时由旧 process 开关按模式推断。
       sensor: {
         ...defaults.configuration.sensor,
         ...sourceSensor,
@@ -1119,6 +1261,8 @@ export function normalizeProject(value = {}) {
         radiationProcess: sourceSensor.radiationProcess ?? (!energyMode && legacyProcess),
         energyProcess: sourceSensor.energyProcess ?? (energyMode && legacyProcess)
       },
+      // 运行控制节：默认值 + 输入，再逐项取整限幅；缺字段的旧工程沿用旧值
+      //   （碰撞阶 2 / 散射阶 1 / 步数 64），并记为 custom 档位，不改动已有参数。
       control: {
         ...defaults.configuration.control,
         ...(configuration.control || {}),
@@ -1172,6 +1316,8 @@ export function normalizeProject(value = {}) {
           configuration.control?.vegetationTemperatureMethod, 0
         ))))
       },
+      // 流体节：voxelSize 缺省沿用场景体元；timeStep ≥ 0.1、pressureIterations 取 2–100；
+      //   windDirection 归一到 [0, 360)；其余物理系数下限为 0；outputHeight 必须 > 0，否则回退默认值。
       fluid: {
         ...defaults.configuration.fluid,
         ...(configuration.fluid || {}),
@@ -1196,6 +1342,8 @@ export function normalizeProject(value = {}) {
           ? configuredFluidOutputHeight
           : defaults.configuration.fluid.outputHeight
       },
+      // 大气节：model 仅允许 tropical/midlatitude-summer/midlatitude-winter，aerosol 仅 rural/urban；
+      //   waterVapor 限幅 0.5–5，visibility 限幅 10–50（单位待核对）。
       atmosphere: {
         ...defaults.configuration.atmosphere,
         ...(configuration.atmosphere || {}),
@@ -1213,12 +1361,15 @@ export function normalizeProject(value = {}) {
           defaults.configuration.atmosphere.visibility
         )))
       },
+      // 对象节：用规范化后的 objectItems 覆盖 items，并同步 count 与 names。
       objects: {
         ...defaults.configuration.objects, ...sourceObjects, items: objectItems,
         count: objectItems.length,
         names: objectItems.map((item) => item.name)
       },
       spectra,
+      // 冠层预设：structureType 兼容数字写法（1=rigid，2=fire，3=fog，其余为 canopy）；
+      //   火焰/雾的消光、散射反照率、不对称因子、发射比例与固定温度按类型取缺省并限幅。
       canopies: (Array.isArray(configuration.canopies) && configuration.canopies.length ? configuration.canopies : defaults.configuration.canopies)
         .map((item) => {
           const rawType = String(item.structureType ?? 'canopy').toLowerCase()
@@ -1234,9 +1385,13 @@ export function normalizeProject(value = {}) {
             fixedTemperature: Math.max(0, number(item.fixedTemperature, structureType === 'fire' ? 1100 : structureType === 'fog' ? 288 : 0))
           }
         }),
+      // 热预设与物化预设：统一别名（canonicalPresetItems）；材质另经 normalizeMaterialItem 补全木质参数。
       thermals: canonicalPresetItems(Array.isArray(configuration.thermals) && configuration.thermals.length ? configuration.thermals : defaults.configuration.thermals)
         .map(withoutSmokeLabel),
       materials: canonicalPresetItems(Array.isArray(configuration.materials) && configuration.materials.length ? configuration.materials : defaults.configuration.materials).map(normalizeMaterialItem),
+      // 气象节：start/end 取整且 end > start；Tsold 初始土温（K，限幅 150–400）；SatWater 0–1；
+      //   dTime 为时间步长（s，≥ 1）；Ca 为大气 CO2 浓度（限幅 100–2000，单位待核对）；
+      //   latitude/longitude 为 ° ；timezone 为小时。
       meteo: {
         ...defaults.configuration.meteo,
         ...sourceMeteo,
@@ -1257,6 +1412,7 @@ export function normalizeProject(value = {}) {
   }
 }
 
+// 作用：解析 project.json 文本并规范化；非 JSON、非对象根节点、非本格式的 format 会抛错。
 export function parseProjectJson(content) {
   let value
   try {
@@ -1269,16 +1425,22 @@ export function parseProjectJson(content) {
   return normalizeProject(value)
 }
 
+// 作用：规范化后序列化为 2 空格缩进、末尾换行的 JSON 文本（写回 project.json）。
 export function stringifyProject(value) {
   return `${JSON.stringify(normalizeProject(value), null, 2)}\n`
 }
 
+// 作用：校验工程并返回 { valid, errors, project }，project 为规范化后的工程。
+// 步骤：1) 根节点/format/schemaVersion/mode 检查；2) 规范化后检查场景、传感器、地形环境；
+//   3) 光伏与薄膜材质的模式限制；4) 墙体、车辆、船舶、水体材质参数范围；5) 光谱的开孔率与纹理。
+// 说明：只收集错误文本，不抛异常；各数值范围来自引擎能稳定求解的区间（待核对）。
 export function validateProject(value) {
   const errors = []
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { valid: false, errors: ['project.json 根节点必须是对象'], project: normalizeProject() }
   }
   if (value.format && !isProjectFormat(value.format)) errors.push(`format 必须是 ${PROJECT_FORMAT}`)
+  // 步骤 1：schemaVersion 缺省视为 1；高于当前版本或非整数则报错。
   const sourceVersion = Number(value.schemaVersion ?? 1)
   if (!Number.isInteger(sourceVersion) || sourceVersion < 1 || sourceVersion > PROJECT_SCHEMA_VERSION) {
     errors.push(`schemaVersion 仅支持 1-${PROJECT_SCHEMA_VERSION}`)
@@ -1287,11 +1449,13 @@ export function validateProject(value) {
   if (!value.configuration || typeof value.configuration !== 'object' || Array.isArray(value.configuration)) {
     errors.push('configuration 必须是对象')
   }
+  // 步骤 2：以下检查都针对规范化后的工程 c = project.configuration。
   const project = normalizeProject(value)
   const c = project.configuration
   if (!(c.scene.x > 0) || !(c.scene.y > 0) || !(c.scene.height >= 0)) errors.push('场景尺寸无效')
   if (![c.scene.offsetX, c.scene.offsetY, c.scene.offsetZ].every(Number.isFinite)) errors.push('场景 XYZ 偏移必须为有效数值')
   if (!(c.scene.voxel > 0)) errors.push('体素尺寸必须大于 0')
+  // 地形水热经验场：仅 VoxelEB 支持；尺度高度必须 > 0，含水量满足 0 ≤ soilDry ≤ soilValley ≤ 1。
   const environment = c.scene.terrainEnvironment
   if ((environment.airEnabled || environment.soilEnabled) && project.mode !== 'eVoxelEB')
     errors.push('地形水热经验场仅支持 VoxelEB')
@@ -1302,6 +1466,7 @@ export function validateProject(value) {
   if (!sensorBandValues(c.sensor).length) errors.push('至少需要一个有效波段')
   if (!sensorViewAngles(c.sensor, c.light.azimuth).length) errors.push('至少需要一个有效观测角')
   if (!Array.isArray(c.objects.items)) errors.push('objects.items 必须是数组')
+  // 步骤 3：光伏材质检查（参数范围；不能作背景地面；使用光伏时需 eFacetEB，VoxelEB 不支持热电耦合）。
   const pv = c.materials.filter(m => m.energyModel === 'photovoltaic')
   for (const m of pv) {
     const p = m.params || {}
@@ -1311,6 +1476,7 @@ export function validateProject(value) {
   if (names.has(c.scene.background.materialName)) errors.push('光伏板请作为场景对象添加，背景地面不支持光伏材质')
   const used = c.objects.items.some(o => (o.meshes?.length ? o.meshes : [o]).some(m=>names.has(m.materialName || o.materialName)))
   if (used && project.mode === 'eVoxelEB') errors.push('光伏热电耦合请选择 eFacetEB 模式')
+  // 薄膜（篷布/遮阳网）材质检查：面热容与对流倍率 > 0；不能作背景地面；热平衡需 eFacetEB。
   const membranes = c.materials.filter(m => m.energyModel === 'membrane')
   for (const m of membranes) {
     const p = m.params || {}
@@ -1321,6 +1487,8 @@ export function validateProject(value) {
   const membraneUsed = c.objects.items.some(o => (o.meshes?.length ? o.meshes : [o]).some(m => membraneNames.has(m.materialName || o.materialName)))
   // VoxelEB treats every non-leaf solid as semi-infinite, so a thin sheet would be wrong there.
   if (membraneUsed && project.mode === 'eVoxelEB') errors.push('篷布/薄膜热平衡请选择 eFacetEB 模式')
+  // 步骤 4：多层墙体（wallMode = 'wall'）检查：厚度 ≤ 5 m、室内温度/换热系数合法，
+  //   layers 为 1–6 层且总厚度 ≤ 5 m、每层 λ/ρ/cp 大于 0。
   for (const m of c.materials.filter((item) => item.params?.wallMode === 'wall' && !item.energyModel && item.type !== 'Water' && item.type !== 'Vegetation')) {
     const p = m.params
     const thickness = Number(p.thickness ?? 0.2), indoor = Number(p.indoorTemperature ?? 22), h = Number(p.indoorHeatTransferCoefficient ?? 8)
@@ -1333,13 +1501,16 @@ export function validateProject(value) {
         errors.push('墙体构造层无效（1–6 层，每层厚度、λ、ρ、cp 大于 0，总厚度 ≤ 5 m）：' + m.name)
     }
   }
+  // 车辆材质检查：vehiclePart 取值，body 材质的座舱（cabin）、内饰（interior）、发动机（engine）参数范围。
   for (const m of c.materials.filter((item) => item.type === 'Vehicle' && !item.energyModel)) {
     const p = m.params || {}
     if (p.vehiclePart !== undefined && p.vehiclePart !== '' && !['body', 'glass', 'underbody', 'hood'].includes(p.vehiclePart))
       errors.push('载具部件应为 body、glass、underbody 或 hood：' + m.name)
     const k = p.cabin
     if (k && p.vehiclePart === 'body') {
+      // inRange：值缺省（undefined/null/空串）时用 fallback，再判断是否为有限数且在 [lo, hi] 内。
       const inRange = (value, lo, hi, fallback) => { const v = value === undefined || value === null || value === '' ? fallback : Number(value); return Number.isFinite(v) && v >= lo && v <= hi }
+      // 内饰四个节点（仪表台/座椅/方向盘/顶棚车门）的受光份额之和必须为 1，热容、hA、辐射面积需在范围内。
       if (k.interior?.enabled) {
         const it = k.interior, nodes = ['dashboard', 'seat', 'wheel', 'lining'].map((id) => it[id] || {})
         const shares = nodes.reduce((sum, node) => sum + (Number(node.share) || 0), 0)
@@ -1347,6 +1518,7 @@ export function validateProject(value) {
             nodes.some((node) => !inRange(node.share, 0, 1, 0.25) || !inRange(node.capacity, 10, 1e8, 10000) || !inRange(node.hcA, 0.01, 1e4, 4) || !inRange(node.radArea, 0, 1e3, 1)))
           errors.push('车辆内饰节点参数无效（份额之和 = 1，热容 ≥ 10 J/K，hA > 0）：' + m.name)
       }
+      // 发动机：散热器/机体/排气三份额之和必须为 1；热容、换热与舱通风系数需在范围内。
       if (k.engine?.enabled) {
         const en = k.engine
         const split = (Number(en.radiatorShare ?? 0.5)) + (Number(en.blockShare ?? 0.3)) + (Number(en.exhaustShare ?? 0.2))
@@ -1364,6 +1536,7 @@ export function validateProject(value) {
       if (given(k.heading) !== given(k.windDirection)) errors.push('车辆航向与风向需同时给出：' + m.name)
     }
   }
+  // 船舶材质检查：航速、水线（高度或水面吃水）、水侧换热系数与水温、航向/风向（罗经方位）、内热源功率。
   for (const m of c.materials.filter((item) => item.type === 'Ship' && !item.energyModel)) {
     const p = m.params || {}
     const given = (value) => value !== undefined && value !== null && value !== ''
@@ -1385,11 +1558,13 @@ export function validateProject(value) {
     if (given(p.internalHeatFlux) && !(Math.abs(Number(p.internalHeatFlux)) <= 1e5)) errors.push('船舶内热源面功率无效（|q| ≤ 1e5 W/m²）：' + m.name)
     if (given(p.internalHeatPower) && !(Math.abs(Number(p.internalHeatPower)) <= 1e9)) errors.push('船舶内热源总功率无效（|P| ≤ 1e9 W）：' + m.name)
   }
+  // 水体材质检查：初始水温模式只能是 firstAir/dailyMeanAir/fixed，fixed 时水温需在 -50–100 ℃ 内。
   for (const m of c.materials.filter((item) => item.type === 'Water' && item.params?.initialTemperatureMode !== undefined)) {
     const p = m.params
     if (!['firstAir', 'dailyMeanAir', 'fixed'].includes(p.initialTemperatureMode) || (p.initialTemperatureMode === 'fixed' && !(Number(p.initialTemperature ?? 20) > -50 && Number(p.initialTemperature ?? 20) < 100)))
       errors.push('初始水温设置无效（首节点气温 / 起始 24 h 平均气温 / -50–100 ℃ 指定值）：' + m.name)
   }
+  // 步骤 5：光谱检查：开孔率与纹理仅支持 custom/TXT 光谱；分类纹理需 PNG、类别光谱存在且不能嵌套分类纹理。
   for (const s of c.spectra) {
     if (surfaceOpenness(s) > 0 && (s.model === 'Prospect' || s.model === 'BSM')) errors.push('开孔率仅支持自定义或导入 TXT 光谱：' + s.name)
     const classTexture = s.classTexture
@@ -1412,6 +1587,7 @@ export function validateProject(value) {
   return { valid: errors.length === 0, errors, project }
 }
 
+// XML 文本转义（& < > " '）；null/undefined 视为空串。
 const xmlEscape = (value) => String(value ?? '')
   .replaceAll('&', '&amp;')
   .replaceAll('<', '&lt;')
@@ -1419,6 +1595,9 @@ const xmlEscape = (value) => String(value ?? '')
   .replaceAll('"', '&quot;')
   .replaceAll("'", '&apos;')
 
+// 作用：生成场景 XML 中一个 <object> 节点（对象的网格、光谱、热、冠层、物化名称以及模型/位置文件）。
+// 输入：item 工程对象，index 序号（无名称时生成 object_n），resolvePath 把工程内相对路径转为运行用路径。
+// 说明：有 meshes 时按网格逐项用逗号拼接名称；未指定的光谱/热/材质/冠层名取缺省预设。
 function objectXml(item, index, resolvePath = (value) => value) {
   const rawName = item.name || `object_${index + 1}`
   const name = xmlEscape(rawName)
@@ -1427,6 +1606,7 @@ function objectXml(item, index, resolvePath = (value) => value) {
   const meshNames = meshes.length ? meshes.map((mesh) => mesh.name).join(',') : (item.meshNames || rawName)
   const spectralNames = meshes.length ? meshes.map((mesh) => mesh.spectralName).join(',') : (item.spectralName || 'soil')
   const thermalNames = meshes.length ? meshes.map((mesh) => mesh.thermalName).join(',') : (item.thermalName || 'soil_temperature')
+  // 引擎侧对象类型：火/雾等参与介质写成 Vegetation；人/车/船写成 Building；其余沿用 item.type。
   const mediumObject = item.type === 'Fire' || item.type === 'Fog' || Boolean(item.medium)
   const engineType = mediumObject ? 'Vegetation' : isMobileAgentType(item.type) ? 'Building' : (item.type || 'Vegetation')
   const defaultMaterial = engineType === 'Vegetation' ? 'leaf_c3' : engineType === 'Water' ? 'water_set' : 'soilset'
@@ -1456,6 +1636,9 @@ function objectXml(item, index, resolvePath = (value) => value) {
       </object>`
 }
 
+// 作用：生成一条光谱的 XML（model 为 custom/Prospect/BSM/file，非法值回退 custom）。
+// 说明：common 为所有类型共用的镜面、反/透射率、热红外（tau_TIR/ref_TIR）和物理纹理字段；
+//   反/透射率可为空格或逗号分隔的逐波段字符串，缺省 0.20 / 0.0；Prospect/BSM 各自追加模型参数。
 function spectrumXml(item, index, resolvePath = (value) => value) {
   const model = ['custom', 'Prospect', 'BSM', 'file'].includes(item.model) ? item.model : 'custom'
   const texture = item.physicalTexture || {}
@@ -1470,16 +1653,21 @@ function spectrumXml(item, index, resolvePath = (value) => value) {
   return `<spectral id="${index + 1}" name="${xmlEscape(item.name)}" type="custom">\n        ${common}<spectral_file>${xmlEscape(resolvePath(item.fileName || ''))}</spectral_file>\n      </spectral>`
 }
 
+// 作用：生成一条冠层/结构预设的 XML；structureType 非法时回退 canopy，
+//   消光、散射反照率、不对称因子等参与介质参数限幅（下限 0、反照率 0–1、不对称 ±0.99）。
 function canopyXml(item) {
   const structureType = ['canopy', 'rigid', 'fire', 'fog'].includes(item.structureType) ? item.structureType : 'canopy'
   return `<canopy name="${xmlEscape(item.name)}"><structureType>${structureType}</structureType><lai>${number(item.lai, 3)}</lai><density>${number(item.density, 1)}</density><hc>${number(item.hc, 2)}</hc><G>${number(item.G, 0.5)}</G><LIDFa>${number(item.LIDFa, -0.35)}</LIDFa><LIDFb>${number(item.LIDFb, -0.15)}</LIDFb><hspot>${number(item.hspot, 0.2)}</hspot><leafwidth>${number(item.leafwidth, 0.1)}</leafwidth><extinction>${Math.max(0, number(item.extinction, 0))}</extinction><scatteringAlbedo>${Math.max(0, Math.min(1, number(item.scatteringAlbedo, 0)))}</scatteringAlbedo><asymmetry>${Math.max(-0.99, Math.min(0.99, number(item.asymmetry, 0)))}</asymmetry><emissionScale>${Math.max(0, number(item.emissionScale, 0))}</emissionScale><fixedTemperature>${Math.max(0, number(item.fixedTemperature, 0))}</fixedTemperature></canopy>`
 }
 
+// 作用：生成一条固定表面温度预设的 XML（受光/阴影温度，缺省 305 K / 295 K）。
 // DEFERRED[低] 数据一致性: 温度预设以 K 计，但 thermals 在 normalizeProject 中没有任何数值/范围校验，用户按 ℃ 填写 30 会被当作 30 K 静默导出；未修复：温度区间/单位换算属物理约定，按禁止项保留待决策
 function thermalXml(item, index) {
   return `<thermal id="${index + 1}" name="${xmlEscape(item.name)}"><sunlitTemperature>${number(item.sunlitTemperature, 305)}</sunlitTemperature><shadedTemperature>${number(item.shadedTemperature, 295)}</shadedTemperature></thermal>`
 }
 
+// 下面三个函数生成 FacetEB 的可选 XML 片段：waterInitialXml 水体初始水温模式，
+//   wallLayersXml 墙体层（每层“厚度 λ ρ cp”，层间用分号），materialXml 内再组合船舶/车辆等片段。
 // FacetEB optional tags; absent fields write nothing, so old XML stays unchanged.
 function waterInitialXml(params) {
   if (params.initialTemperatureMode === 'dailyMeanAir') return '<waterInitialMode>dailyMeanAir</waterInitialMode>'
@@ -1492,6 +1680,10 @@ function wallLayersXml(layers) {
   return `<wallLayers>${layers.map((layer) => [layer?.thickness, layer?.lambda, layer?.rho, layer?.cp].map((value) => number(value, 0)).join(' ')).join(';')}</wallLayers>`
 }
 
+// 作用：生成一条物化参数（<property>）的 XML，按类型分派：
+//   光伏 → surfaceEnergy（参数键值直接展开）；Vegetation → leafBio（光合/气孔参数）；
+//   Water → waterSet；其余（Soil/Building/Vehicle/Ship/木质/薄膜）→ soilSet 并追加墙体/船舶/车辆片段。
+// 说明：可选片段缺省时不写，保证旧工程导出的 XML 不变。
 function materialXml(item) {
   const params = item.params || {}
   const name = xmlEscape(item.name)
@@ -1499,6 +1691,7 @@ function materialXml(item) {
   if (item.energyModel === 'photovoltaic') return '<property><surfaceEnergy name="'+name+'"><photovoltaic>1</photovoltaic><vegetation>0</vegetation>'+Object.entries(params).filter(([k])=>typeof k === 'string' && /^[A-Za-z_][\w.-]*$/.test(k)).map(([k,v])=>'<'+k+'>'+xmlEscape(v)+'</'+k+'>').join('')+'</surfaceEnergy></property>'
   if (item.type === 'Vegetation') return `<property><leafBio name="${name}"><Vcmax>${number(params.Vcmax, 80)}</Vcmax><m>${number(params.m, 9)}</m><BallBerry>${number(params.BallBerry, 0.01)}</BallBerry><Type>${number(params.Type, 3)}</Type><kV>${number(params.kV, 0.6396)}</kV><Rdparam>${number(params.Rdparam, 0.015)}</Rdparam><Tparam>${xmlEscape(params.Tparam || '0.2,0.3,288,313,328')}</Tparam><Tyear>${number(params.Tyear, 25)}</Tyear><beta>${number(params.beta, 0.507)}</beta><kNPQs>${number(params.kNPQs, 0)}</kNPQs><qLs>${number(params.qLs, 1)}</qLs><stressfactor>${number(params.stressfactor, 1)}</stressfactor><Tcor>${number(params.Tcor, 0)}</Tcor></leafBio></property>`
   if (item.type === 'Water') return `<property><waterSet name="${name}"><rss>${number(params.rss, 0)}</rss><heatCapacity>${number(params.heatCapacity, 4186000)}</heatCapacity><mixingDepth>${number(params.mixingDepth, 0.5)}</mixingDepth><evaporationCoefficient>${number(params.evaporationCoefficient, 1)}</evaporationCoefficient><brdfModel>${number(params.brdfModel, 1) ? 'CoxMunk' : 'Lambert'}</brdfModel><refractiveIndex>${number(params.refractiveIndex, 1.333)}</refractiveIndex><slopeVariance>${Math.max(0, number(params.slopeVariance, 0))}</slopeVariance><diffuseFraction>${Math.max(0, Math.min(1, number(params.diffuseFraction, 0.02)))}</diffuseFraction>${waterInitialXml(params)}</waterSet></property>`
+  // soilSet 分支：下面先组装可选的墙体（wall）、船舶（ship）、车辆（vehicle）片段，最后拼成 soilSet。
   // DEFERRED[低] Bug: Tsoil 缺省值写成 0.25，其余位置（预设材质）均为 25 ℃，缺字段时初温相差两个数量级；未修复：默认数值常量属禁止修改项，需产品确认单位后统一
   // FacetEB wall/roof slab (wallMode 'wall'); absent = thin shell, so old XML stays unchanged.
   const wall = params.wallMode === 'wall' && !item.energyModel
@@ -1526,6 +1719,7 @@ function materialXml(item) {
   const vehiclePartCode = { body: 1, glass: 2, underbody: 3, hood: 4 }[params.vehiclePart]
   const cabin = params.cabin || {}
   // Parts model (optional; absent = lumped interior / engine heat on the underbody, old XML unchanged).
+  // csv：按 ids 顺序取 source[id][key]（缺省 fallback），用逗号拼接成列表。
   const csv = (source, key, ids, fallback) => ids.map((id) => number(source?.[id]?.[key], fallback)).join(',')
   const interiorXml = (it) => it && it.enabled
     ? `<vcIntModel>1</vcIntModel><vcIntShares>${csv(it, 'share', ['dashboard', 'seat', 'wheel', 'lining'], 0.25)}</vcIntShares><vcIntCapacities>${csv(it, 'capacity', ['dashboard', 'seat', 'wheel', 'lining'], 10000)}</vcIntCapacities><vcIntHcA>${csv(it, 'hcA', ['dashboard', 'seat', 'wheel', 'lining'], 4)}</vcIntHcA><vcIntRadArea>${csv(it, 'radArea', ['dashboard', 'seat', 'wheel', 'lining'], 1)}</vcIntRadArea><vcShellRadFraction>${number(it.shellRadFraction, 0.45)}</vcShellRadFraction><vcSeatEffusivity>${number(it.seatEffusivity, 300)}</vcSeatEffusivity>`
@@ -1540,31 +1734,43 @@ function materialXml(item) {
     : ''
   // 土壤方法 1 远期热历史（control.soilInertiaHistory = 'full'）；缺省不写，旧 XML 不变。
   const inertia = params.inertiaHistory === 'full' ? '<inertiaHistory>full</inertiaHistory>' : ''
+  // soilSet 缺省值 cs 1180、rhos 1800、lambdas 1.55 为引擎回退值（见 soilset 预设处说明）；
+  //   Soil 材质的 method/inertiaHistory 由 projectToXml 按 control 覆盖。
   return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 0.25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${inertia}${wall}${ship}${vehicle}</soilSet></property>`
 }
 
+// 作用：把工程转换为 HiStream 引擎读取的场景 XML 文本（<HiStreamProject>）。
+// 输入：value 工程对象；paths 可选 { outputDir, definedDir, resolveProjectPath, atmosphereLutPath }，
+//   用于改写输出目录、defined 目录、相对路径和大气查找表路径。
+// 步骤：1) 规范化并取过程输出开关；2) 解析路径；3) 生成 objects/spectra/canopies/thermals/materials；
+//   4) 解析背景与 DEM；5) 计算传感器波段、观测角与巡航航点；6) 拼接 Control/Geometry/Atmosphere/Scene/Attribute。
 export function projectToXml(value, paths = {}) {
   const project = normalizeProject(value)
   const c = project.configuration
+  // 步骤 1：能量平衡模式下，过程输出开关为辐射过程或能量过程任一开启；辐射模式只看 radiationProcess。
   const energyMode = project.mode === 'eFacetEB' || project.mode === 'eVoxelEB'
   const radiationProcess = Boolean(c.sensor.radiationProcess)
   const energyProcess = Boolean(c.sensor.energyProcess)
   const activeProcess = energyMode ? (radiationProcess || energyProcess) : radiationProcess
+  // 步骤 2：输出/defined 目录与路径解析；defined 文件沿用 definedDir 中已有的路径分隔符风格。
   const outputDir = paths.outputDir || c.outDir || 'output'
   const definedDir = paths.definedDir || 'defined'
   const resolveProjectPath = paths.resolveProjectPath || ((value) => value)
   const slash = String(definedDir).includes('\\') ? '\\' : '/'
   const definedFile = (name) => `${String(definedDir).replace(/[\\/]$/, '')}${slash}${name}`
+  // 步骤 3：对象 XML：只有 VoxelRT/VoxelEB 支持火/雾等参与介质对象，其他模式过滤掉。
   const objects = (c.objects.items || [])
     .filter((item) => project.mode === 'eVoxelRT' || project.mode === 'eVoxelEB' || !(item.type === 'Fire' || item.type === 'Fog' || item.medium))
     .map((item, index) => objectXml(item, index, resolveProjectPath)).join('\n')
   const spectra = c.spectra.map((item, index) => spectrumXml(item, index, resolveProjectPath)).join('\n      ')
   const canopies = c.canopies.map(canopyXml).join('\n      ')
   const thermals = c.thermals.map(thermalXml).join('\n      ')
+  // 土壤材质的 method 与远期热历史由 control.soilTemperatureMethod/soilInertiaHistory 统一覆盖。
   const materials = c.materials.map((item) => materialXml(item.type === 'Soil' ? {
     ...item,
     params: { ...(item.params || {}), method: c.control.soilTemperatureMethod, inertiaHistory: c.control.soilInertiaHistory }
   } : item)).join('\n      ')
+  // 步骤 4：背景材质类型取其材质条目的 type，找不到时用 background.materialType，再缺省 Soil。
   const background = c.scene.background || {}
   const backgroundMaterial = c.materials.find((item) => item.name === background.materialName)
   const backgroundType = backgroundMaterial?.type || background.materialType || 'Soil'
@@ -1572,10 +1778,12 @@ export function projectToXml(value, paths = {}) {
   // whether terrain and object elevation offsets are applied.
   const demFile = c.scene.demFile
     ? `\n    <DEM>${xmlEscape(resolveProjectPath(c.scene.demFile))}</DEM>` : ''
+  // 步骤 5：传感器：波段列表、透视/平行投影、巡航航点与观测角（与 sensorBandValues 等函数保持一致）。
   const bands = sensorBandValues(c.sensor)
   const perspective = c.sensor.projection === 'perspective'
   const cruiseEnabled = perspective && Boolean(c.sensor.cruiseEnabled)
   const cruisePositions = cruiseEnabled ? sensorCruisePositions(c.sensor, c.scene) : []
+  // 透视相机的方位角：有巡航时取首个航点航向 + vaa + 180°（含义待核对），否则直接用 vaa。
   const effectivePerspectiveAzimuth = cruiseEnabled
     ? normalizedAzimuth(number(cruisePositions[0]?.heading, c.sensor.cruiseHeading) + number(c.sensor.vaa, 0) + 180)
     : number(c.sensor.vaa, 0)
@@ -1583,11 +1791,14 @@ export function projectToXml(value, paths = {}) {
     ? [[number(c.sensor.vza, 0), effectivePerspectiveAzimuth]]
     : sensorViewAngles(c.sensor, c.light.azimuth)
   const viewAngleXml = viewAngles.map((angle) => `<viewAngles>${angle[0]},${angle[1]}</viewAngles>`).join('')
+  // 巡航航点 XML：uavPositions 记录路线参数，每个 <position> 为 x,y,z（m），heading 为航向（°）。
   const cruiseXml = cruisePositions.length
     ? `\n        <uavPositions enabled="1" route="${xmlEscape(c.sensor.cruiseRoute || 'line')}" heading="${normalizedAzimuth(number(c.sensor.cruiseHeading, 90))}" step="${number(c.sensor.cruiseStep, 25)}" count="${cruisePositions.length}" targetX="${number(c.sensor.cruiseTargetX, c.sensor.positionX)}" targetY="${number(c.sensor.cruiseTargetY, c.sensor.positionY)}" targetZ="${number(c.sensor.cruiseTargetZ, c.sensor.height)}">${cruisePositions.map((position) => `<position heading="${number(position.heading, 0)}">${position.x},${position.y},${position.z}</position>`).join('')}</uavPositions>`
     : ''
   const atmosphere = c.atmosphere || {}
   const atmosphereLut = paths.atmosphereLutPath || atmosphere.lutFile || 'assets/atmosphere/simple_modtran_lut.csv'
+  // 步骤 6：拼接 XML。Control 为运行控制（含各 is* 输出开关），Geometry 含光照与传感器，
+  //   Atmosphere 为大气，Scene 为场景尺寸、背景与对象，之后为 Attribute（光谱/冠层/热/物化）。
   return `<?xml version="1.0" encoding="UTF-8"?>
 <HiStreamProject schemaVersion="${PROJECT_SCHEMA_VERSION}" mode="${xmlEscape(project.mode)}">
   <Control>

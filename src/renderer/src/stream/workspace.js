@@ -1,5 +1,34 @@
+// ==========================================================================
+// 文件：workspace.js
+// 功能：STREAM 遥感影像模拟工作台（Vite + 原生 JS 前端）。一个工程对应一个过境时刻的影像模拟：
+//       RT 模式直接给定四组分温度（Tss/Tsh/Tcs/Tch）；EB 模式由逐小时气象强迫求解能量平衡；
+//       同化模式用观测（亮温/地表温度/组分温度）更新背景场。本文件只负责界面、表单规范化与校验、
+//       与服务端交互和结果查看，不含物理计算（物理在 models/stream 引擎中）。
+// 主要模块：
+//   1. 常量与预设：传感器波段预设、IGBP 地类、产品显示信息、波段名映射、色带、输入字段声明表
+//   2. 表单规范化与导出：旧版单景表单迁移、normalizeScene / exportScene、同化设置规范化
+//   3. EB 起转计划与气象数据包校验：ebPlan、packProblems、packWarnings（规则与引擎一致）
+//   4. 坐标与绘图小工具：UTM 反算、色带查找表、比例尺取整、float32 解码、草稿读取
+//   5. createStreamWorkspace 闭包：布局与参数面板 → 运行方式（同化）→ 输入事件、栅格探测与校验
+//      → 工程保存/打开 → 运行控制 → 结果查看器（产品、色带、拉伸、直方图、统计、读数）
+//      → 日志 → 事件绑定 → 气象数据包登记管理 → 引擎事件处理 → 对外命令
+// 数据流：表单 form → exportScene / runPayload → streamApi（./api.js，对应服务端 /api/stream/*，
+//       由 server/stream/config.mjs 生成 stream-image-config）→ STREAM 引擎（models/stream）
+//       → 输出目录中的 GeoTIFF 与摘要 → 事件通道 handleEvent → showRun → 查看器读取栅格并显示。
+// 与其他文件：./api.js（HTTP 与 SSE 客户端）；../storage.js（appStorage 本地存储）；
+//       ./forcing-panel.js（气象强迫元数据面板，EB 模式使用）；
+//       main.js 调用 createStreamWorkspace({ toast }) 创建，并使用返回的 open/openProject/command。
+// 重要约定：温度单位 K（界面可切换为 °C，仅用于显示）；过境时刻为 ISO UTC 字符串，
+//       displayTimezone 仅用于显示当地时间；角度单位度，方位角自正北顺时针；
+//       光学波段中心波长/半高宽单位 nm，热红外单位 μm；栅格行列从 0 开始；
+//       气象强迫节点均为整点时次（EB 起转规则见 ebPlan）。
+// ==========================================================================
+
 // STREAM remote-sensing image workspace: one overpass per image, with component temperatures either
 // given (RT) or solved by a forcing-driven energy balance (EB). Independent of the HiStream 3-D project.
+// 模块：依赖与本地存储键。
+// STORAGE_KEY 保存表单草稿，PROJECT_KEY 保存当前工程；LEGACY_STORAGE_KEYS 为旧版本使用的键，
+// 读取草稿时若新键为空则回退到旧键（见 loadDraft）。
 import { streamApi } from './api.js'
 import { appStorage } from '../storage.js'
 import { createForcingPanel } from './forcing-panel.js'
@@ -8,6 +37,8 @@ const STORAGE_KEY = 'streamStudioImage'
 const LEGACY_STORAGE_KEYS = ['streamStudioScene', 'histreamStreamScene']
 const PROJECT_KEY = 'streamStudioImageProject'
 
+// 模块：传感器波段预设。光学条目为 [波段名, 中心波长 nm, 半高宽 nm]；
+// 热红外条目为 [波段名, 中心波长 μm, 半高宽 μm]。用户选“自定义”时不使用这些预设。
 const OPTICAL_PRESETS = {
   sentinel2: { label: 'Sentinel-2 MSI', bands: [['B02', 490, 65], ['B03', 560, 35], ['B04', 665, 30], ['B05', 705, 15], ['B06', 740, 15], ['B07', 783, 20], ['B08', 842, 115], ['B8A', 865, 20], ['B11', 1610, 90], ['B12', 2190, 180]] },
   landsat: { label: 'Landsat 8/9 OLI', bands: [['B1', 443, 16], ['B2', 482, 60], ['B3', 561, 57], ['B4', 655, 37], ['B5', 865, 28], ['B6', 1609, 85], ['B7', 2201, 187]] },
@@ -20,6 +51,7 @@ const THERMAL_PRESETS = {
   slstr: { label: 'Sentinel-3 SLSTR S8/S9', bands: [['S8', 10.85, 0.9], ['S9', 12.0, 1.0]] },
   broadband: { label: '单波段 10.5 μm', bands: [['TIR', 10.5, 0]] }
 }
+// 模块：运行模式与同化观测类型的显示名（键即写入配置的取值）。
 const RUN_MODES = { simulate: '直接模拟', assimilate: '同化' }
 const ASSIMILATION_OBSERVATIONS = { brightness: '亮温', lst: '地表温度', components: '组分温度' }
 // "file path or constant" text inputs of the run-mode panel.
@@ -29,11 +61,15 @@ const parseSource = (text) => {
   return /^[-+]?\d+(\.\d+)?$/.test(value) ? { value: Number(value) } : { file: value }
 }
 const sourceText = (source) => source?.file ? source.file : source?.value !== undefined && source?.value !== '' ? String(source.value) : ''
+// 模块：IGBP 地类编码 → 中文名，用于分地类统计与地表类型提示；18 与 255 均按“填充值”处理。
 const IGBP = {
   0: '未分类', 1: '常绿针叶林', 2: '常绿阔叶林', 3: '落叶针叶林', 4: '落叶阔叶林', 5: '混交林', 6: '郁闭灌丛', 7: '稀疏灌丛',
   8: '木本稀树草原', 9: '稀树草原', 10: '草地', 11: '永久湿地', 12: '农田', 13: '城市与建成区', 14: '农田与自然植被镶嵌',
   15: '冰雪', 16: '裸地', 17: '水体', 18: '填充值', 255: '填充值'
 }
+// 模块：引擎输出文件（GeoTIFF）的显示元数据。键为输出文件名；
+// label 为界面显示名，kind 为产品类别（光学/热红外/通量/不确定度等），
+// unit 为单位，digits 为读数小数位，colormap 为该产品的缺省色带。
 const PRODUCTS = {
   'optical_reflectance.tif': { label: '光学反射率', kind: 'optical', unit: '', digits: 4, colormap: 'gray' },
   'tir_brightness_temperature.tif': { label: '热红外亮温', kind: 'thermal', unit: 'K', digits: 2, colormap: 'inferno' },
@@ -58,6 +94,8 @@ const PRODUCTS = {
   'background_controls.tif': { label: '同化 · 背景控制变量', kind: 'forcing', unit: '', digits: 3, colormap: 'viridis' },
   'analysis_fluxes.tif': { label: '同化 · 分析能量通量', kind: 'flux', unit: 'W m⁻²', digits: 1, colormap: 'rdylbu' }
 }
+// 模块：波段描述 → 中文显示名。左侧正则匹配引擎写入 GeoTIFF 的英文波段描述，
+// 右侧为界面显示名；bandLabel() 按顺序取第一个匹配项，未匹配时做简单英译中替换。
 const BAND_LABELS = [
   [/^Tss sunlit soil temperature \(K\)$/, '光照土壤 Tss'], [/^Tsh shaded soil temperature \(K\)$/, '阴影土壤 Tsh'],
   [/^Tcs sunlit leaf temperature \(K\)$/, '光照叶片 Tcs'], [/^Tch shaded leaf temperature \(K\)$/, '阴影叶片 Tch'],
@@ -84,11 +122,13 @@ const BAND_LABELS = [
   [/^background soil moisture/, '背景土壤水分'], [/^background Vcmax25/, '背景 Vcmax'], [/^background LAI$/, '背景 LAI'],
   [/^analysis net radiation/, '分析净辐射 Rn'], [/^analysis sensible heat/, '分析显热 H'], [/^analysis latent heat/, '分析潜热 LE'], [/^analysis ground heat/, '分析土壤热通量 G']
 ]
+// 模块：多波段合成方案。targets 为三个目标波长（nm），依次对应 R、G、B 通道。
 const COMPOSITES = [
   { key: 'true', label: '真彩色', targets: [655, 560, 482] },
   { key: 'cir', label: '标准假彩色', targets: [865, 655, 560] },
   { key: 'swir', label: '短波红外合成', targets: [2200, 865, 655] }
 ]
+// 模块：色带定义。stops 为等间距的颜色节点，buildLut() 把它们插值成 256 级查找表。
 const COLORMAPS = {
   gray: { label: '灰度', stops: ['#000000', '#ffffff'] },
   viridis: { label: 'Viridis', stops: ['#440154', '#482878', '#3e4989', '#31688e', '#26828e', '#1f9e89', '#35b779', '#6ece58', '#b5de2b', '#fde725'] },
@@ -96,8 +136,13 @@ const COLORMAPS = {
   turbo: { label: 'Turbo', stops: ['#30123b', '#4145ab', '#4675ed', '#39a2fc', '#1bcfd4', '#24eca6', '#61fc6c', '#a4fc3b', '#d1e834', '#f3c63a', '#fe9b2d', '#f36315', '#d93806', '#b11901', '#7a0403'] },
   rdylbu: { label: '冷暖', stops: ['#313695', '#4575b4', '#74add1', '#abd9e9', '#e0f3f8', '#ffffbf', '#fee090', '#fdae61', '#f46d43', '#d73027', '#a50026'] }
 }
+// 模块：显示拉伸方式（p2/p1 为按分位数截断的线性拉伸，manual 用手动上下限）。
 const STRETCHES = { p2: '2% 线性', p1: '1% 线性', minmax: '最小–最大', manual: '手动' }
 
+// 模块：表单输入字段的声明表。每项的 path 是表单对象里的点分路径；
+// mode 为缺省取值方式（file=栅格文件，value=常数）；constant:false 表示只能用文件；
+// band:true 表示可额外指定波段序号。几组字段合并为 ALL_FIELDS，
+// 供 normalizeScene / exportScene 统一做规范化与导出。
 const SURFACE_FIELDS = [
   { path: 'surface.type', label: '地表类型', unit: 'IGBP', required: true, constant: false, mode: 'file' },
   { path: 'surface.lai', label: '叶面积指数', unit: 'm²/m²', required: true, mode: 'file' },
@@ -121,6 +166,8 @@ const COMPONENT_FIELDS = [
 const PACKAGE_FIELD = { path: 'temperature.componentsPackage', label: '组分温度文件', unit: '4 波段 K', required: true, constant: false, mode: 'file' }
 const ALL_FIELDS = [...SURFACE_FIELDS, ...LOCATION_FIELDS, ...GEOMETRY_FIELDS, ...COMPONENT_FIELDS, PACKAGE_FIELD]
 
+// 模块：通用小工具（HTML 转义、点分路径读写、文件名/波段名解析）。
+// wavelengthOf 从波段描述中提取形如“@ 665 nm”的中心波长，失败返回 NaN。
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 const presetBands = (preset) => preset.bands.map(([name, center, fwhm]) => ({ name, center, fwhm }))
 const getPath = (object, path) => path.split('.').reduce((value, key) => value?.[key], object)
@@ -140,6 +187,8 @@ const bandLabel = (name) => {
 }
 const pad = (value) => String(value).padStart(2, '0')
 
+// 作用：把任意保存值规范成 {mode, file, value, band} 的字段对象。
+// 说明：已有文件路径则视为 file 模式，有数值则视为 value 模式，否则用字段缺省模式。
 function normalizeField(value, mode) {
   const source = value && typeof value === 'object' ? value : {}
   const file = String(source.file ?? '')
@@ -158,6 +207,9 @@ function localToUtc(date, time, timezone) {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
 }
 
+// 作用：把旧版“单场景表单”（有 inputs/time 字段、无 surface/overpass）迁移为当前表单结构。
+// 说明：旧版热红外组分温度来自 thermal.components，迁移后按 RT 模式（temperature.mode='rt'）处理；
+// 已含 surface 或 overpass 的新格式原样返回。
 function migrateLegacy(scene) {
   if (!scene || typeof scene !== 'object' || scene.surface || scene.overpass) return scene
   const inputs = scene.inputs || {}
@@ -172,6 +224,8 @@ function migrateLegacy(scene) {
   }
 }
 
+// 作用：生成表单的缺省值。缺省过境时刻为当天 03:00 UTC，显示时区 UTC+8；
+// 缺省组分温度（K）：光照土壤 315、阴影土壤 303、光照叶片 305、阴影叶片 300。
 function defaults() {
   const today = new Date().toISOString().slice(0, 10)
   return {
@@ -191,6 +245,11 @@ function defaults() {
   }
 }
 
+// 作用：把保存的草稿/工程（可能是旧版本）规范成完整表单，缺项用 defaults() 补齐。
+// 步骤 1：旧格式迁移；步骤 2：逐层与缺省值合并；
+// 步骤 3：旧的 temperature.components.file 转成组分温度文件字段；
+// 步骤 4：过境时刻不合法则回退缺省，缺秒补“:00”；
+// 步骤 5：统一规范化所有输入字段、波段列表与同化设置。
 function normalizeScene(saved) {
   const base = defaults()
   const scene = migrateLegacy(saved && typeof saved === 'object' ? saved : {}) || {}
@@ -217,6 +276,7 @@ function defaultAssimilation() {
   return { mode: 'simulate', observation: 'brightness', data: '', optical: '', views: [] }
 }
 
+// 作用：把字段对象转成引擎配置的“来源对象”：有文件则 {file[, band]}，有有限数值则 {value}，否则 {}。
 const sourceObject = (value) => {
   if (!value || typeof value !== 'object') return {}
   if (String(value.file || '').trim()) return { file: String(value.file).trim(), ...(Number(value.band) > 0 ? { band: Number(value.band) } : {}) }
@@ -244,11 +304,14 @@ function normalizeAssimilation(saved, legacyInversion) {
   return base
 }
 
+// 作用：把表单字段导出为配置里的来源对象（file 模式输出 {file[, band]}，value 模式输出 {value}，空值输出 {}）。
 function exportField(field) {
   if (field.mode === 'file') return field.file.trim() ? { file: field.file.trim(), ...(Number(field.band) > 0 ? { band: Number(field.band) } : {}) } : {}
   return field.value !== '' && field.value !== null ? { value: Number(field.value) } : {}
 }
 
+// 作用：把表单深拷贝并转成提交给服务端的场景配置；输入字段改为来源对象，
+// 组分温度文件移到 temperature.components.file，并删除仅界面使用的 componentsPackage。
 function exportScene(form) {
   const scene = structuredClone(form)
   for (const field of ALL_FIELDS) setPath(scene, field.path, exportField(getPath(form, field.path)))
@@ -264,6 +327,7 @@ function exportScene(form) {
 // whole-hour forcing nodes before the overpass (default 7, 0–240, non-integers round up). The march starts at the
 // spinupHours-th whole hour counted backwards from the last whole hour that is more than 5 min before the overpass
 // (never a fixed clock time); a pack that does not cover it starts at its earliest covered hour (warning only).
+// 常量：EB 起转节点缺省数（个整点时次）与一小时的毫秒数。
 const DEFAULT_SPINUP_NODES = 7
 const HOUR_MS = 3600000
 
@@ -275,8 +339,18 @@ function spinupNodes(value) {
   return Math.ceil(number - 1e-9)
 }
 
+// 作用：毫秒时间戳 → 不带毫秒的 ISO UTC 字符串。
 const isoHour = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
 
+// 模块：EB 逐时推进（起转）计划，规则与引擎 models/stream/app/image.cpp 保持一致。
+// 输入：overpass（ISO UTC 字符串）、nodesValue（起转节点数，空则用缺省 7）、pack（数据包索引，可缺）。
+// 输出：null（输入非法）或对象，其中小时量均为“自 1970-01-01T00Z 起的整小时数”：
+//   requested=要求的起转节点数；usable=过境前实际可用的整点节点数；nodeCount=usable+1（含过境节点）；
+//   desiredStart=按要求应起算的整点；start=按数据包起点截断后的实际起点；
+//   lastNodeHour=过境前最后一个整点（须早于过境时刻 5 分钟以上）；lastHour=引擎读取的最后一个整点；
+//   firstHour=引擎读取的第一个整点（ERA5-Land 需再早一小时）；marchStart=起算时刻（ms）；
+//   startsLate=数据包不够长而被迫晚起算。
+// 说明：整年数据包且年份与过境年相同（yearEdge）时不按包起点截断（原因待核对）。
 // Plan of the EB march for an overpass and pack: requested / usable nodes, first node, hours the engine reads.
 // `pack` may be missing (only the requested window is described). Hours are integer hours since the epoch.
 function ebPlan(overpass, nodesValue, pack) {
@@ -329,6 +403,9 @@ function packPeriodLabel(pack) {
   return start === end ? `${start}（${pack.period.hours || ''} 时次）` : `${start} – ${end}`
 }
 
+// 作用：WGS84 的 UTM 平面坐标 → 经纬度（横轴墨卡托反算的级数展开，k0=0.9996）。
+// 输入：x 东坐标（m，含 500000 假东）、y 北坐标（m，南半球含 10000000 假北）、带号 zone、south 是否南半球。
+// 输出：[纬度°, 经度°]；中央经线 = (zone-1)*6-177°。用于由影像地理参考换算像元经纬度（光标读数）。
 function utmToGeographic(x, y, zone, south) {
   const a = 6378137, f = 1 / 298.257223563, k0 = 0.9996
   const e2 = f * (2 - f), ep2 = e2 / (1 - e2)
@@ -358,12 +435,14 @@ function utmZone(crs) {
 const isGeographic = (crs) => /EPSG:4326/.test(String(crs || ''))
 const crsLabel = (crs) => String(crs || '').split('|')[0].trim()
 
+// 作用：由栅格坐标系和坐标 (x, y) 求 [纬度°, 经度°]；EPSG:4326 直接换序，WGS84/UTM 走反算，其他返回 null。
 function geographic(crs, x, y) {
   if (isGeographic(crs)) return [y, x]
   const utm = utmZone(crs)
   return utm ? utmToGeographic(x, y, utm.zone, utm.south) : null
 }
 
+// 作用：把等间距的颜色节点（#rrggbb）线性插值为 256 级 RGB 查找表（长度 256×3）。
 function buildLut(stops) {
   const colors = stops.map((hex) => [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16)))
   const lut = new Uint8ClampedArray(256 * 3)
@@ -376,11 +455,13 @@ function buildLut(stops) {
 }
 const LUTS = Object.fromEntries(Object.entries(COLORMAPS).map(([key, map]) => [key, buildLut(map.stops)]))
 
+// 作用：取不超过 target 的“整齐”长度（1/2/5/10 × 10^n），用于比例尺。
 function niceLength(target) {
   const power = 10 ** Math.floor(Math.log10(target))
   return [1, 2, 5, 10].map((step) => step * power).reverse().find((value) => value <= target) || power
 }
 
+// 作用：把 base64 编码的小端 float32 数组解码为 Float32Array；末尾不足 4 字节的残余丢弃。
 function decodeFloat32(base64) {
   const binary = atob(base64 || '')
   const length = binary.length - (binary.length % 4)
@@ -389,6 +470,7 @@ function decodeFloat32(base64) {
   return new Float32Array(bytes.buffer)
 }
 
+// 作用：读取本地保存的表单草稿（新键优先，其次旧键），解析失败则返回缺省表单。
 function loadDraft() {
   try {
     const saved = appStorage.getItem(STORAGE_KEY) ?? LEGACY_STORAGE_KEYS.map((key) => appStorage.getItem(key)).find(Boolean)
@@ -396,10 +478,21 @@ function loadDraft() {
   } catch { return normalizeScene(null) }
 }
 
+// 模块：STREAM 遥感影像模拟工作台的入口。
+// 输入：toast（消息提示回调）、onClose（返回三维场景工作台的回调）；输出：{ open, openProject, close, command, isOpen }。
+// 说明：工作台的状态（表单、工程、运行任务、栅格缓存、显示参数）都封装在本闭包内，
+// 界面以 innerHTML 重绘 + 事件委托的方式更新，不依赖框架。
 export function createStreamWorkspace({ toast, onClose = () => {} }) {
   const api = streamApi
   const root = document.getElementById('streamWorkspace')
   const $ = (selector) => root.querySelector(selector)
+  // 状态：form=当前表单（初值为本地草稿）；project=当前工程 {path,name,description}；dirty=有未保存修改；
+  // editRevision=每次编辑加 1，保存时据此判断保存期间表单是否又被改动；
+  // projectGeneration=切换/新建/打开工程时加 1，jobGeneration=每次提交运行或切换工程时加 1，
+  // 异步回调靠它们判断结果是否已过期（见各处 isCurrent）；
+  // running/starting=任务运行中/正在提交；currentJob=当前任务 id（'pending' 表示请求尚未返回）；
+  // pendingEvents=任务 id 尚未确定时先缓存的事件；packs=已登记的气象数据包；
+  // inspections=栅格探测结果（路径 → 信息）；rasterCache=已读取的结果栅格缓存；view=影像查看器状态。
   let form = loadDraft()
   let project = (() => { try { return JSON.parse(appStorage.getItem(PROJECT_KEY) || 'null') } catch { return null } })()
   let dirty = false
@@ -428,7 +521,10 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
   const view = { product: '', display: '', colormap: 'gray', stretch: 'p2', manual: null, celsius: false,
     interpolation: 'smooth', layers: [], image: null, scale: 1, x: 0, y: 0, fitted: '', typeLayer: null, token: 0 }
 
+  // 模块：整体布局（顶部栏 / 左侧参数栏 / 中间影像与日志 / 右侧运行与统计）。
   // ---------- layout ----------
+  // 作用：一次性写入工作台的 HTML 骨架（含气象强迫数据包登记对话框），然后
+  // bind() 绑定事件、renderParams() 填充左侧参数栏、renderHeader() 刷新标题与未保存标记。
   function render() {
     root.innerHTML = `
       <header class="sw-header">
@@ -506,6 +602,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     renderHeader()
   }
 
+  // 作用：生成一个输入字段行。constant!==false 的字段可在“栅格 / 常数”间切换，
+  // 否则只能填 GeoTIFF 路径；spec.band 为真时附带波段序号输入。输入：字段声明 spec（见 SURFACE_FIELDS）。
   function fieldRow(spec) {
     const value = getPath(form, spec.path)
     const constant = spec.constant !== false
@@ -524,6 +622,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     </div>`
   }
 
+  // 作用：生成光学（nm）或热红外（μm）波段表：名称、中心波长、半高宽，可逐行删除。
   function bandTable(kind) {
     const unit = kind === 'optical' ? 'nm' : 'μm'
     return `<table class="sw-bands"><thead><tr><th>波段</th><th>中心 ${unit}</th><th>半高宽 ${unit}</th><th></th></tr></thead>
@@ -534,11 +633,13 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
         <td><button class="icon-button" type="button" data-remove-band title="删除波段">×</button></td></tr>`).join('')}</tbody></table>`
   }
 
+  // 作用：生成传感器预设下拉框，当前选中项取 form[kind].preset，末项为“自定义”。
   function presetSelect(kind) {
     const presets = kind === 'optical' ? OPTICAL_PRESETS : THERMAL_PRESETS
     return `<select class="select" data-preset="${kind}">${Object.entries(presets).map(([key, preset]) => `<option value="${key}"${key === form[kind].preset ? ' selected' : ''}>${escapeHtml(preset.label)}</option>`).join('')}<option value="custom"${form[kind].preset === 'custom' ? ' selected' : ''}>自定义</option></select>`
   }
 
+  // 作用：生成一个可折叠的参数分组；toggle 非空时在标题栏放启用开关（绑定到该表单路径，如 optical.enabled）。
   function group(id, title, body, { toggle = '', open = true } = {}) {
     return `<section class="sw-group${open ? ' open' : ''}" data-group="${id}">
       <div class="sw-group-head">
@@ -550,9 +651,12 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     </section>`
   }
 
+  // 模块：运行方式（直接模拟 / 同化）。同化模式下选择观测类型（亮温/地表温度/组分温度）与观测文件，
+  // 亮温同化可再附加其他观测视角（每个视角一个亮温 GeoTIFF 加天顶角、方位角，最多 16 个）。
   // ---------- run mode: 直接模拟 / 同化 ----------
   // Only the data and what they are is asked for; observation / background errors, iteration and the controls
   // (RT: four component temperatures, EB: soil moisture + Vcmax, + LAI with reflectances) are engine defaults.
+  // 作用：生成第 index 个附加观测视角的编辑卡片（亮温文件、天顶角 °、方位角 °；后两者可填常数或栅格）。
   function viewCard(item, index) {
     const text = (name, value, placeholder) => `<input class="input" data-view-field="${name}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" spellcheck="false">`
     return `<div class="sw-obs" data-view="${index}">
@@ -565,6 +669,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     </div>`
   }
 
+  // 作用：生成“运行方式”分组：模式切换、观测类型、观测数据与可选光学反射率路径、附加视角列表。
   function assimilationGroup() {
     const as = form.assimilation
     const modeButton = (value, label) => `<button type="button" data-run-mode="${value}"${as.mode === value ? ' class="active"' : ''}>${label}</button>`
@@ -592,6 +697,10 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
 
   const assimilating = () => form.assimilation.mode === 'assimilate'
 
+  // 作用：按当前表单刷新运行方式相关的界面状态（不重绘整个参数栏）。
+  // 步骤 1：显隐同化面板与附加视角；步骤 2：按观测类型改写观测文件框的占位提示；
+  // 步骤 3：生成同化摘要说明（背景场为 EB 或 RT；更新哪些控制变量）；
+  // 步骤 4：改写温度分组标题与运行按钮文案，并按引擎/数据是否就绪启停按钮。
   function syncAssimilationUI() {
     const summary = $('#swAssimSummary')
     const button = $('#swRun')
@@ -623,6 +732,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (element) element.textContent = on ? `同化 · ${ASSIMILATION_OBSERVATIONS[as.observation]}` : '直接模拟'
   }
 
+  // 作用：处理运行方式面板内的 input 事件（观测路径、视角字段）；返回值表示事件是否已被本面板消费。
   // Returns true when the event belonged to the run-mode panel.
   function onAssimilationInput(event) {
     const target = event.target
@@ -641,6 +751,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return true
   }
 
+  // 作用：处理运行方式面板内的点击（切换模式/观测类型、添加或删除视角、浏览文件）；返回值表示是否已消费。
+  // 说明：附加视角上限 16 个，与 normalizeAssimilation 的截断一致。
   async function onAssimilationClick(button) {
     if (button.dataset.runMode) {
       form.assimilation.mode = button.dataset.runMode
@@ -690,10 +802,12 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     const toggle = root.querySelector('[data-path="thermal.enabled"]')
     if (toggle) { toggle.checked = true; toggle.dispatchEvent(new Event('change', { bubbles: true })) }
   }
+  // 作用：把表单中的 ISO UTC 过境时刻拆成日期（YYYY-MM-DD）和时间（HH:MM:SS，缺秒补 :00），供日期/时间输入框使用。
   function overpassParts() {    const text = String(form.overpass || '')
     return { date: text.slice(0, 10), time: text.slice(11, 19).padEnd(8, ':00').slice(0, 8) }
   }
 
+  // 作用：按“显示时区”（小时，可为小数）把 UTC 过境时刻换成当地时间字符串，仅用于界面提示。
   function localOverpass() {
     const time = Date.parse(form.overpass)
     if (!Number.isFinite(time)) return ''
@@ -702,6 +816,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return `${local.getUTCFullYear()}-${pad(local.getUTCMonth() + 1)}-${pad(local.getUTCDate())} ${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())}:${pad(local.getUTCSeconds())}`
   }
 
+  // 作用：生成气象数据包下拉选项；已选但索引读不到的包保留一个“无法读取”选项，避免静默丢失。
   function packOptions() {
     const selected = form.temperature.era5.pack
     const known = packs.some((pack) => pack.path === selected)
@@ -710,6 +825,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       (selected && !known ? `<option value="${escapeHtml(selected)}" selected>${escapeHtml(fileName(selected))}（无法读取）</option>` : '')
   }
 
+  // 作用：生成“温度来源”分组：RT 模式（四组分分别输入，或 4 波段组分温度文件）与
+  // EB 模式（气象强迫元数据、数据包、土壤水分来源、DEM 订正、起转节点数）。
   function temperatureGroup() {
     const t = form.temperature
     const segment = (attribute, value, label, current) => `<button type="button" data-${attribute}="${value}"${current === value ? ' class="active"' : ''}>${label}</button>`
@@ -741,6 +858,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       </div>`)
   }
 
+  // 作用：重绘左侧参数栏，各分组顺序：模拟模式 → 运行方式 → 位置与过境时刻 → 观测几何 → 地表输入
+  // → 温度来源 → 光学波段 → 热红外波段 → 计算范围；随后同步各分组状态与提示。
   function renderParams() {
     const { date, time } = overpassParts()
     // STREAM 工程独立：所有输入只属于本影像模拟工程，不读取三维工程的 shared 段。
@@ -799,6 +918,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     forcing.afterRender()
   }
 
+  // 作用：表单变化后同步各派生界面，不重绘整个参数栏：分组启用状态、土壤水分行显隐、
+  // 气象数据包提示与告警、起转窗口说明、当地时间提示、各分组标题栏的摘要文字。
+  // 输入：当前 form、数据包列表 packs、栅格探测结果 inspections；无返回值。
   function syncGroups() {
     for (const kind of ['optical', 'thermal']) {
       $(`[data-group="${kind}"]`)?.classList.toggle('disabled', !form[kind].enabled)
@@ -817,6 +939,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
     const warning = $('#swEbWarn')
     if (warning) { warning.textContent = warnings.join('；'); warning.dataset.level = warnings.length ? 'warning' : '' }
+    // 步骤：显示 EB 起转窗口说明（起点、时次数与引擎规则一致，数值来自 ebPlan）。
     const window = $('#swEbWindow')
     if (window) {
       const { time } = overpassParts()
@@ -827,6 +950,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
     const localTime = $('#swLocalTime')
     if (localTime) localTime.textContent = `显示时区 UTC${Number(form.displayTimezone) >= 0 ? '+' : ''}${Number(form.displayTimezone) || 0} 的当地时间：${localOverpass() || '—'}`
+    // 步骤：刷新各分组标题栏右侧的一行摘要。
     const typeInfo = inspections.get(form.surface.type.file.trim())
     const summaries = {
       task: form.name || '',
@@ -845,6 +969,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     syncAssimilationUI()
   }
 
+  // 作用：刷新顶部工程名、工程路径与“未保存”标记。
   function renderHeader() {
     if (!rendered) return
     const name = form.name || project?.name || '影像模拟工程'
@@ -853,7 +978,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     $('#swDirty').hidden = !dirty
   }
 
+  // 模块：参数输入的事件处理、栅格探测与校验。
   // ---------- inputs ----------
+  // 作用：表单被修改后的统一入口：标记未保存、递增 editRevision、把草稿写入本地存储并刷新派生界面。
   function markDirty() {
     dirty = true
     editRevision += 1
@@ -862,11 +989,14 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     syncGroups()
   }
 
+  // 作用：输入路径变化后延迟 350 ms 再探测栅格，合并连续输入。
   function scheduleInspect() {
     clearTimeout(inspectTimer)
     inspectTimer = setTimeout(inspectInputs, 350)
   }
 
+  // 作用：向服务端探测所有已填写的栅格文件（尺寸、坐标系、波段数、数据类型），结果存入 inspections。
+  // 说明：用 inspectToken 丢弃过期响应，避免慢请求覆盖新的结果；失败时清空探测结果而不报错。
   async function inspectInputs() {
     const token = ++inspectToken
     const paths = [...new Set(ALL_FIELDS.map((spec) => getPath(form, spec.path)).filter((field) => field.mode === 'file' && field.file.trim()).map((field) => field.file.trim()))]
@@ -883,6 +1013,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     syncGroups()
   }
 
+  // 作用：把栅格探测结果转成界面提示 { text, level }，level 为 ''、ok、warning 或 error。
+  // 输入：info 为该文件的探测结果；reference 为地表类型栅格的探测结果（要求其余栅格与之同网格）。
   function describeRaster(info, reference) {
     if (!info) return { text: '', level: '' }
     if (!info.exists) return { text: info.error || '文件不存在', level: 'error' }
@@ -896,6 +1028,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return { text, level: 'ok' }
   }
 
+  // 作用：把探测提示写入各输入字段行，并清除上一次校验留下的 invalid 标记。
   function renderInspections() {
     if (!rendered) return
     const reference = inspections.get(form.surface.type.file.trim())
@@ -911,6 +1044,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
   }
 
+  // 作用：左侧参数栏的 input 事件委托。按优先级依次分派：气象强迫面板 → 运行方式面板 →
+  // 过境日期/时间 → 带 data-path 的通用字段 → 栅格/常数字段行 → 波段表单元格。
+  // 说明：手改波段表会把对应传感器预设切到“自定义”。
   function onParamInput(event) {
     const target = event.target
     if (forcing.onInput(event)) return
@@ -955,6 +1091,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
   }
 
+  // 作用：左侧参数栏的 click 事件委托：分组折叠、栅格/常数切换、位置来源、温度模式/组分来源/土壤水分来源、
+  // 浏览文件或目录、添加/删除波段。
   async function onParamClick(event) {
     if (forcing.onClick(event)) return
     const button = event.target.closest('button')
@@ -1029,12 +1167,14 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
   }
 
+  // 作用：只重绘某类波段表并同步预设下拉框的选中值。
   function rerenderBands(kind) {
     const groupBody = $(`[data-group="${kind}"] .sw-group-body`)
     groupBody.querySelector('table.sw-bands').outerHTML = bandTable(kind)
     groupBody.querySelector('[data-preset]').value = form[kind].preset
   }
 
+  // 作用：左侧参数栏的 change 事件委托：气象强迫面板、气象数据包选择、传感器预设（选预设时整体替换波段表）。
   function onParamChange(event) {
     if (forcing.onChange(event)) return
     if (event.target.dataset.era5Pack !== undefined) {
@@ -1051,6 +1191,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     markDirty()
   }
 
+  // 作用：返回当前配置下实际参与运行的输入字段声明，供 validate 检查必填项。
+  // 说明：EB 且土壤水分取自气象强迫时不再要求地表土壤水分；仅 RT 且启用热红外或同化时才需要组分温度输入；
+  // 经纬度仅在“输入经纬度”时必填。
   function fieldsInUse() {
     const t = form.temperature
     const fields = [...SURFACE_FIELDS.filter((spec) => spec.path !== 'surface.soilMoisture' || !(t.mode === 'eb' && t.soilMoisture.source === 'era5')),
@@ -1059,6 +1202,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return fields
   }
 
+  // 作用：运行前校验表单，返回问题文本数组（空数组表示通过），并给缺失字段行加 invalid 标记。
+  // 步骤 1：必填输入与文件是否存在；步骤 2：波段与同化观测配置；步骤 3：EB 的起转节点数与气象数据包。
   function validate() {
     const problems = []
     const flag = (path, message) => { problems.push(message); $(`[data-field="${path}"]`)?.classList.add('invalid') }
@@ -1099,6 +1244,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return problems
   }
 
+  // 作用：由表单生成提交给服务端的运行负载（场景配置 + projectPath）。
+  // 说明：非“输入经纬度”时去掉经纬度字段；输出根目录有工程时取工程文件所在目录下的 output；
+  // 删除仅界面使用的预设名与旧的 inversion；非同化模式不带 assimilation。
   function runPayload() {
     const scene = exportScene(form)
     if (scene.locationSource !== 'input') { delete scene.surface.latitude; delete scene.surface.longitude }
@@ -1116,7 +1264,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return { ...scene, projectPath }
   }
 
+  // 模块：工程的新建、保存、打开。工程存放场景配置（stream-project.json），运行输出放在工程目录下的 output。
   // ---------- project ----------
+  // 作用：设置当前工程并同步到本地存储（next 为 null 表示未保存工程）。
   function setProject(next) {
     project = next
     if (next) appStorage.setItem(PROJECT_KEY, JSON.stringify(next))
@@ -1127,6 +1277,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return !dirty || window.confirm('当前影像模拟配置有未保存的修改，继续将放弃这些修改。')
   }
 
+  // 作用：切换工程前使所有进行中的异步结果失效：递增各代号与探测令牌、取消探测计时、丢弃当前任务与缓存事件。
+  // 说明：不会停止服务端已提交的任务，只是不再让界面接收其结果。
   function invalidateProject() {
     projectGeneration += 1
     jobGeneration += 1
@@ -1139,6 +1291,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     setRunning(false)
   }
 
+  // 作用：新建空白工程。mode 为 'rt' 或 'eb' 时预设温度模式（EB 同时启用热红外波段）；其他值保持缺省。
+  // 说明：有未保存修改时先确认；新工程尚无路径，首次运行时会先要求保存。
   function newProject(mode) {
     if (!confirmDiscard()) return
     invalidateProject()
@@ -1156,6 +1310,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     show()
   }
 
+  // 作用：保存工程。已有路径且非另存为时直接覆盖保存；否则选择目录，目标已有工程时询问是否覆盖。
+  // 说明：保存是异步的，用 generation/revision 快照处理竞态：保存期间若切换了工程则丢弃结果；
+  // 若保存期间表单又被修改，则保存后仍保持“未保存”状态。
   async function saveProject(saveAs = false) {
     const generation = projectGeneration
     const revision = editRevision
@@ -1191,6 +1348,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     } catch (error) { toast('保存失败', error.message, 'error') }
   }
 
+  // 作用：打开服务端读出的工程：规范化场景、重置查看器与探测结果、刷新数据包列表。
+  // 说明：migrated 为真表示读到的是旧版单景工程，已换算为 UTC 过境时刻，标为未保存，保存时另写新格式文件。
   async function openProject({ path, name, description, scene, migrated }) {
     if (rendered && !confirmDiscard()) return
     invalidateProject()
@@ -1212,6 +1371,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (description) addLog(description)
   }
 
+  // 作用：弹出工程选择窗口并打开所选工程。
   async function pickProject() {
     try {
       const picked = await api.pick('project')
@@ -1220,7 +1380,12 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     } catch (error) { toast('无法打开工程', error.message, 'error') }
   }
 
+  // 模块：运行控制（提交任务、状态刷新、结果展示）。
   // ---------- run ----------
+  // 作用：校验并提交一次运行。
+  // 步骤 1：占位，防止重复提交；步骤 2：工程未保存则先保存（输出目录依赖工程路径）；
+  // 步骤 3：重新探测输入并校验，不通过则提示并终止；步骤 4：提交任务，记下任务 id 与输出目录；
+  // 步骤 5：回放任务 id 确定前缓存的事件。每个异步步骤后都检查 isCurrent，避免切换工程后串扰。
   async function startRun() {
     // Reserve this project's submission before any asynchronous preparation.
     if (running || starting) return
@@ -1268,6 +1433,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     } finally { if (isCurrent()) starting = false }
   }
 
+  // 作用：设置运行中标记，并联动“运行/停止”按钮（引擎或参数目录未就绪时运行按钮保持禁用）。
   function setRunning(value) {
     running = value
     if (!rendered) return
@@ -1275,6 +1441,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     $('#swStop').disabled = !value
   }
 
+  // 作用：更新右侧“运行”卡片的状态点、主文案、细节和进度条（progress 为 0–100 的百分数，非数值时保持不变）。
   function setRunState(state, text, progress, detail = '') {
     const element = $('#swRunState')
     element.dataset.state = state
@@ -1283,6 +1450,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (Number.isFinite(progress)) $('#swProgress').style.width = `${Math.max(0, Math.min(100, progress))}%`
   }
 
+  // 作用：向服务端查询引擎与任务队列状态，更新“引擎就绪”指示与运行态。
+  // 说明：事件流可能中断，因此这里兜底：若本工程的任务已不在队列中但仍未收到结束事件，
+  // 就当作已结束并读取其输出目录里的运行结果。
   async function refreshStatus() {
     const generation = projectGeneration
     const jobToken = jobGeneration
@@ -1325,6 +1495,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
   }
 
+  // 作用：重新读取已登记的气象数据包列表（读取失败视为空），并刷新下拉框、提示与登记对话框。
   async function refreshPacks() {
     try { packs = (await api.era5Packs(form.temperature.era5.pack ? [form.temperature.era5.pack] : [])).packs || [] } catch { packs = [] }
     const select = $('[data-era5-pack]')
@@ -1333,6 +1504,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     renderEra5List()
   }
 
+  // 作用：展示一次运行结果（next 为 null 则清空）：重置查看器令牌与分类统计缓存，
+  // 刷新输出目录、状态、像元统计和结果列表；运行完成后异步加载分地类统计。
   function showRun(next) {
     view.token += 1
     run = next
@@ -1358,6 +1531,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (run.status === 'completed') void loadClassStats(run.outputDir)
   }
 
+  // 作用：把运行摘要 summary 渲染成“像元”卡片的键值表（过境时刻、温度来源、EB/反演/同化统计、网格、各类像元数）。
+  // 说明：summary.inversion 为旧版反演摘要，仍保留显示以兼容旧结果。
   function renderCounts(summary) {
     const counts = summary?.counts
     const grid = summary?.grid
@@ -1393,9 +1568,12 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     $('#swCounts').innerHTML = rows.map(([label, value]) => `<div><dt>${label}</dt><dd>${typeof value === 'number' ? value.toLocaleString('en-US') : escapeHtml(value ?? '—')}</dd></div>`).join('')
   }
 
+  // 模块：结果影像查看器（产品与波段选择、色带与拉伸、缩放平移、直方图、像元读数、统计）。
   // ---------- viewer ----------
+  // 作用：按文件名取产品显示信息（见 PRODUCTS），未登记的产品用默认值（4 位小数、viridis）。
   function productInfo(path = view.product) { return PRODUCTS[fileName(path)] || { label: fileName(path), kind: 'other', unit: '', digits: 4, colormap: 'viridis' } }
 
+  // 作用：按 PRODUCTS 中的顺序列出结果 GeoTIFF；没有结果时重置查看器与提示文字。
   function renderProducts(products) {
     const tiffs = products.filter((path) => /\.tif$/i.test(path))
       .sort((a, b) => Object.keys(PRODUCTS).indexOf(fileName(a)) - Object.keys(PRODUCTS).indexOf(fileName(b)))
@@ -1428,11 +1606,15 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     void selectProduct(keep, Boolean(sameFile))
   }
 
+  // 作用：读取产品第 1 波段以取得全部波段描述（波段名列表）；该栅格随后留在缓存中。
   async function bandNamesOf(path) {
     const first = await raster(path, 0)
     return first.bandNames || []
   }
 
+  // 作用：为合成方案的三个目标波长，在波段名里（用 wavelengthOf 取“@ 波长 nm”）各找最近的波段。
+  // 判据：偏差不超过 max(60 nm, 6% 目标波长)，且三个波段互不相同，否则返回 null（不提供该合成）。
+  // 输出：三个波段下标（对应 R、G、B）或 null。
   function compositeBands(names, composite) {
     const picks = composite.targets.map((target) => {
       let best = -1, distance = Infinity
@@ -1445,6 +1627,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return picks.every((index) => index >= 0) && new Set(picks).size === 3 ? picks : null
   }
 
+  // 作用：切换要查看的结果产品，并重建“显示”下拉框（光学产品先列出可用合成，再逐波段列出）。
+  // 说明：keepDisplay 为真且原显示项仍存在时保持不变；换产品时恢复该产品的缺省色带并清除手动拉伸；
+  // 用 view.token 丢弃过期的异步结果；仅热红外类产品显示 K/°C 切换。
   async function selectProduct(path, keepDisplay = false) {
     const token = ++view.token
     const changed = fileName(view.product) !== fileName(path)
@@ -1474,6 +1659,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     await showView()
   }
 
+  // 作用：栅格缓存（键为“路径#波段”，值为 Promise）。超过 24 条时按插入顺序淘汰最早的条目。
   // DEFERRED[中] 性能: 缓存按条目数（24）而不是字节数限制，每条最多是 2048×2048 的 Float32（约 16 MB）加上直方图/统计，最坏情况常驻约 400 MB 渲染进程内存；缓存键只有路径和波段，同一路径的输入文件（如 typeFile）被改写后仍显示旧数据；建议：按总字节数做 LRU（例如 128 MB），切换运行时清空，键里加入文件 mtime/size —— 需要引入新的容量上限常量并改缓存键（要额外请求文件 mtime/size 字段），属数值常量与接口契约变更，本轮不动
   function rememberRaster(key, promise) {
     rasterCache.set(key, promise)
@@ -1481,6 +1667,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return promise
   }
 
+  // 作用：读取某产品某波段的栅格（带缓存）：服务端返回 base64 的 float32，解码为 data（Float32Array，无数据像元按非有限值处理），
+  // 同时携带宽高、统计量（minimum/maximum 与 p1/p2/p98/p99 分位数）、直方图、波段名、坐标系和像元大小。
+  // 说明：读取失败时撤销缓存项，便于重试。
   function raster(path, band) {
     const key = `${path}#${band}`
     if (rasterCache.has(key)) return rasterCache.get(key)
@@ -1488,6 +1677,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       .catch((error) => { rasterCache.delete(key); throw error }))
   }
 
+  // 作用：解析显示下拉框的取值：'rgb:<合成键>' 为三波段合成，'band:<下标>' 为单波段。
   function displayBands() {
     if (view.display.startsWith('rgb:')) {
       const composite = COMPOSITES.find((item) => item.key === view.display.slice(4))
@@ -1496,6 +1686,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return { rgb: false, band: Number(view.display.slice(5)) || 0 }
   }
 
+  // 作用：按当前产品与显示项读取所需栅格（合成取三个），然后建图、适应窗口或重绘，并刷新图例、统计和直方图。
+  // 说明：每次调用递增 view.token，读取返回后若令牌已变说明用户又做了新选择，丢弃本次结果。
   async function showView() {
     const token = ++view.token
     const path = view.product
@@ -1525,10 +1717,13 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
   }
 
+  // 说明：栅格内部以 K 存温度；仅热红外类产品在“°C”模式下换算显示（toDisplay：K→显示值，fromDisplay：显示值→K），
+  // unitLabel 给出当前单位文字。
   const toDisplay = (value) => view.celsius && productInfo().kind === 'thermal' ? value - 273.15 : value
   const fromDisplay = (value) => view.celsius && productInfo().kind === 'thermal' ? value + 273.15 : value
   const unitLabel = () => productInfo().kind === 'thermal' ? (view.celsius ? '°C' : 'K') : productInfo().unit
 
+  // 作用：求某图层的拉伸区间 [低, 高]：手动（仅单波段）、最小–最大、p1–p99 或缺省的 p2–p98 分位数。
   function stretchRange(layer) {
     const stats = layer.stats
     if (view.stretch === 'manual' && view.manual && view.layers.length === 1) return [view.manual[0], view.manual[1]]
@@ -1537,6 +1732,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return [stats.p2, stats.p98]
   }
 
+  // 作用：把当前图层按拉伸区间转成屏幕用的离屏画布 view.image（每个栅格像元对应一个画布像素）。
+  // 说明：单波段经色带查找表着色；三个图层视为 R/G/B，各通道独立线性拉伸；
+  // 非有限值（NaN，即无数据）像元设为全透明；区间宽度为 0 时用 1 防止除零。
   function buildImage() {
     const layers = view.layers
     if (!layers.length) { view.image = null; return }
@@ -1571,11 +1769,13 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     view.image = canvas
   }
 
+  // 作用：返回影像区的显示尺寸 [宽, 高]（CSS 像素）。
   function canvasSize() {
     const map = $('#swMap')
     return [map.clientWidth, map.clientHeight]
   }
 
+  // 作用：缩放并居中使整幅影像适应窗口（四周留 24 px 边距）。
   function fit() {
     if (!view.image) { draw(); return }
     const [width, height] = canvasSize()
@@ -1585,6 +1785,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     draw()
   }
 
+  // 作用：以画布坐标 (cx, cy) 为中心缩放，使光标下的像元位置保持不动；缩放倍数限制在 0.05–64。
   function zoomAt(factor, cx, cy) {
     if (!view.image) return
     const next = Math.max(0.05, Math.min(64, view.scale * factor))
@@ -1594,6 +1795,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     draw()
   }
 
+  // 作用：按当前平移/缩放把 view.image 画到画布，并按设备像素比提高清晰度；
+  // “平滑/像素”由 view.interpolation 决定，并在影像外缘画一圈淡色边框。
   function draw() {
     if (!rendered) return
     const canvas = $('#swCanvas')
@@ -1615,6 +1818,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     renderScale()
   }
 
+  // 作用：刷新比例尺和指北针。仅当栅格有像元大小且坐标系为 WGS84/UTM 或 EPSG:3857 时显示比例尺；
+  // 比例尺目标长度约 140 屏幕像素，取整齐的长度（见 niceLength）。
+  // 说明：layer.step 为服务端返回数据相对原栅格的抽样步长（待核对）。
   function renderScale() {
     const layer = view.layers[0]
     const scaleElement = $('#swScale')
@@ -1629,11 +1835,13 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     scaleElement.querySelector('span').textContent = length >= 1000 ? `${length / 1000} km` : `${length} m`
   }
 
+  // 作用：把栅格值按当前单位格式化（非有限值显示“—”）。
   function formatValue(value, digits) {
     if (!Number.isFinite(value)) return '—'
     return toDisplay(value).toFixed(digits)
   }
 
+  // 作用：刷新图例：三波段合成显示各通道的波段名与拉伸区间；单波段显示色带与低/中/高三个刻度。
   function renderLegend() {
     const legend = $('#swLegend')
     const layers = view.layers
@@ -1654,6 +1862,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       <div class="sw-ramp-labels"><span>${formatValue(low, info.digits)}</span><span>${formatValue((low + high) / 2, info.digits)}</span><span>${formatValue(high, info.digits)}</span></div>`
   }
 
+  // 作用：绘制直方图。单波段：柱高取计数的平方根（压缩动态范围），红线标出当前拉伸的上下限，
+  // 并同步手动上下限输入框（输入框有焦点时不覆盖）；三波段合成：三条折线叠加，横轴取三者的共同范围。
   function drawHistogram() {
     if (!rendered) return
     const canvas = $('#swHistogram')
@@ -1715,6 +1925,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (document.activeElement !== $('#swMax')) $('#swMax').value = Number.isFinite(high) ? toDisplay(high).toFixed(digits) : ''
   }
 
+  // 作用：为“波段统计”表选出对应当前产品的统计行（来自运行摘要 run.summary），无对应摘要则为空。
+  // 说明：行下标与波段下标一一对应，用于高亮当前显示的波段；热红外两个产品按波段名区分亮温/方向温度。
   function summaryRows() {
     const summary = run?.summary
     if (!summary) return []
@@ -1736,6 +1948,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     return []
   }
 
+  // 作用：渲染“波段统计”表（最小/平均/最大），并高亮正在显示的波段；点击某行可切换显示该波段（见 bind）。
   function renderBandStats() {
     const rows = summaryRows()
     const info = productInfo()
@@ -1748,6 +1961,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       ${unit ? `<tfoot><tr><td colspan="4">单位：${unit}</td></tr></tfoot>` : ''}` : ''
   }
 
+  // 作用：向服务端请求按 IGBP 地类的统计；返回时若已切换到其他运行结果则丢弃。
   async function loadClassStats(outputDir) {
     const owner = run
     $('#swClassNote').textContent = '正在按地类统计…'
@@ -1761,6 +1975,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
   }
 
+  // 作用：渲染“分地类统计”表：每个地类的面积（km²）与当前显示波段的均值（单波段另给标准差），按有效像元数降序。
+  // 说明：面积优先取服务端给出的 areaKm2，否则用像元数 × 单像元面积 pixelAreaKm2 估算。
   function renderClassStats() {
     const table = $('#swClassStats')
     const note = $('#swClassNote')
@@ -1788,6 +2004,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       }).join('')}</tbody>`
   }
 
+  // 作用：读取本次运行的地表类型栅格（运行时 typeBand 从 1 起计，故减 1），供光标读数显示地类；失败静默忽略。
   async function loadTypeLayer() {
     const owner = run
     const typeFile = run?.typeFile
@@ -1798,6 +2015,9 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     } catch {}
   }
 
+  // 作用：光标读数：由光标位置反算像元行列，显示原栅格行列、投影坐标 X/Y（米）、经纬度、地类和各波段取值。
+  // 步骤 1：屏幕坐标 → 查看器像元（减平移、除缩放）；步骤 2：乘抽样步长 layer.step 还原到原栅格行列；
+  // 步骤 3：用原点与像元大小求像元中心坐标（北向上，y 向下递减），再换算经纬度。
   function readout(event) {
     const layer = view.layers[0]
     const element = $('#swReadout')
@@ -1828,6 +2048,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     element.innerHTML = parts.join('')
   }
 
+  // 模块：运行日志。普通行最多保留 500 条；GDAL/PROJ 库提示合并成一个可折叠块并计数。
   // ---------- log ----------
   function timestamp() { return new Date().toLocaleTimeString('zh-CN', { hour12: false }) }
 
@@ -1863,7 +2084,12 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     $('#swLogCount').textContent = '0'
   }
 
+  // 模块：界面事件绑定。全局级监听（全屏变化、快捷键、关闭前保存草稿）只绑定一次（globalBound）。
   // ---------- events ----------
+  // 作用：渲染后一次性绑定各类事件。
+  // 步骤 1：根节点按钮委托（返回、运行/停止、数据包登记、适应窗口、全屏、1:1、打开输出目录、清空日志）；
+  // 步骤 2：左侧参数栏的 input/change/click/toggle；步骤 3：查看器控件（产品、显示、色带、拉伸、手动上下限、单位、插值）；
+  // 步骤 4：影像区交互（滚轮缩放、拖动平移、双击适应、光标读数、尺寸变化重绘）；步骤 5：全局快捷键与关闭前保存草稿。
   function bind() {
     root.addEventListener('click', (event) => {
       const action = event.target.closest('[data-action]')?.dataset.action
@@ -1938,6 +2164,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       view.manual = null
       void showView()
     })
+    // 步骤 4：影像区交互。滚轮每格缩放 1.2 倍；左键拖动平移；移动时同时刷新光标读数。
     const map = $('#swMap')
     let drag = null
     map.addEventListener('wheel', (event) => {
@@ -1960,6 +2187,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     map.addEventListener('pointercancel', endDrag)
     map.addEventListener('dblclick', fit)
     new ResizeObserver(() => { if (!root.hidden) draw() }).observe(map)
+    // 步骤 5：快捷键（捕获阶段，工作台显示时才响应）：Ctrl/⌘+S 保存，Ctrl/⌘+Shift+S 另存为，F5 运行。
     if (!globalBound) window.addEventListener('keydown', (event) => {
       if (root.hidden) return
       const key = event.key.toLowerCase()
@@ -1970,10 +2198,12 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     globalBound = true
   }
 
+  // 作用：拉伸或色带变化后，不重新读取栅格，只重建图像并刷新图例与直方图。
   function refreshDisplay() {
     buildImage(); draw(); renderLegend(); drawHistogram()
   }
 
+  // 作用：显示工作台：必要时先渲染，订阅服务端事件（只订阅一次），并刷新引擎状态、数据包列表与栅格探测。
   function show() {
     if (!rendered) render()
     root.hidden = false
@@ -1989,13 +2219,17 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     show()
   }
 
+  // 作用：隐藏工作台并通知外部（返回三维场景工作台）；不会停止正在运行的任务。
   function close() {
     root.hidden = true
     document.body.classList.remove('scene-workspace-open')
     onClose()
   }
 
+  // 模块：气象强迫数据包的登记、列出与移除。数据包只是对 NetCDF 文件的索引，不复制数据；
+  // 为兼容旧工程与引擎接口，字段与接口名仍沿用 era5 命名，实际也可用于其他逐时气象强迫。
   // ---------- forcing packs (project/engine field name: era5) ----------
+  // 作用：渲染已登记数据包列表（名称、产品/时段、文件数、是否完整可用，以及选用/移除操作）。
   function renderEra5List() {
     if (!rendered) return
     const list = $('#swEra5List')
@@ -2013,6 +2247,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }).join('')}</tbody></table>`
   }
 
+  // 作用：打开“气象强迫数据”对话框并刷新列表。
   function openEra5() {
     if (!rendered) render()
     show()
@@ -2020,6 +2255,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     void refreshPacks()
   }
 
+  // 作用：选择 NetCDF 文件并提交登记任务（登记进度经事件通道回到 handleEvent）。
+  // 说明：产品选“按当前面板里的元数据”时，改用强迫面板当前的自定义元数据（需为网格类来源）。
   async function registerEra5() {
     try {
       const picked = await api.pick('era5')
@@ -2040,6 +2277,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     } catch (error) { toast('无法登记气象数据包', error.message, 'error') }
   }
 
+  // 作用：移除数据包索引（不删除原始气象数据）；若它正被当前表单选用则同时清空选择。
   async function removeEra5(path) {
     if (!window.confirm(`移除气象数据包索引？\n${path}\n只删除索引文件，不删除原始气象数据。`)) return
     try {
@@ -2049,7 +2287,13 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     } catch (error) { toast('无法移除', error.message, 'error') }
   }
 
+  // 模块：服务端事件（SSE）处理。事件类型：status、job-queued、job-started、job-progress、job-log、job-closed。
   // ---------- engine events (/api/stream/events) ----------
+  // 作用：处理服务端事件。
+  // 步骤 1：status 事件触发状态刷新；步骤 2：数据包登记任务（kind='era5'）的进度、日志与结束，
+  // 结束后刷新列表，若当前尚未选包且新包完整则自动选用；
+  // 步骤 3：影像任务事件——任务 id 还没返回时先缓存（见 startRun），非当前任务的事件忽略；
+  // 步骤 4：开始/排队/进度/日志更新界面；步骤 5：结束时读取运行结果展示，读取失败则用事件携带的结果兜底。
   function handleEvent(event) {
     if (!rendered) return
     if (event.type === 'status') { if (status) void refreshStatus(); return }
@@ -2078,6 +2322,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     } else if (event.type === 'job-queued') setRunState('running', '等待中', 0, '等待前一次运行完成')
     else if (event.type === 'job-progress') setRunState('running', job.stage || '运行中', job.progress, `${Math.round(job.progress)}%`)
     else if (event.type === 'job-log') addLog(event.text, event.level || '')
+    // 步骤 5：任务结束：清除当前任务，写日志，异步读取输出目录的运行信息并展示。
     else if (event.type === 'job-closed') {
       const generation = projectGeneration
       const jobToken = jobGeneration
@@ -2100,6 +2345,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     }
   }
 
+  // 作用：供外部（菜单/主界面）调用的命令入口：new/new-rt/new-eb 新建工程，mode-rt/mode-eb 切换温度模式，
+  // open/save/save-as 工程操作，era5 打开数据包对话框，run 运行。
   function command(name) {
     if (name === 'new' || name === 'new-rt') newProject('rt')
     else if (name === 'new-eb') newProject('eb')

@@ -1,9 +1,31 @@
+// ==========================================================================
+// 文件：scene-loader.js
+// 功能：把 project.json 描述的场景对象加载成 Three.js 预览场景（编辑器 3D 视图），
+//       并驱动预览动画（水面、火焰、随机游走物体）。预览只用于所见即所得，不参与计算。
+// 主要模块：
+//   1. 位置文件解析与抽样：positionsFromText、samplePlacements（上限 PREVIEW_INSTANCE_LIMIT）
+//   2. 程序化预览纹理（createPreviewTexture）与工程图片纹理缓存（loadImageTexture、invalidateImageTextures）
+//   3. 材质与 UV：sceneMaterial、opaqueMaterial、applyProjectedUvs、previewSpectrum
+//   4. 水面与火焰着色器：waterMaterial、ellipseWaterGeometry、generatedWaterPreview、fireVolume
+//   5. 基本体与 DEM 地形：primitive、terrainHeight、groundedPreviewPlacement
+//   6. 随机游走：attachRandomMovement、updateSceneDynamics（每帧）
+//   7. 场景加载入口 loadXmlScene（读位置/OBJ → 建对象 → 摆放到世界）
+// 数据流：config（工程配置）+ api.readText（位置文件、OBJ）→ loadXmlScene → world（THREE.Group）
+// 关系：依赖 project-schema.js 的 isGroundedObject/groundedPlacementHeight；api 由 web-api.js 提供
+// 约定：位置文件 x = 北向、y = 东向、z = 高度（m），角度为度；Three.js 世界 X ← x、Z ← y、Y 向上；
+//       场景整体缩放到不超过 45 个世界单位（sceneScale）
+// ==========================================================================
+
 import * as THREE from 'three'
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js'
 import { groundedPlacementHeight, isGroundedObject } from './project-schema.js'
 
+// 预览中每个实例化物体最多绘制的实例数（超出时由 samplePlacements 均匀抽样）
 const PREVIEW_INSTANCE_LIMIT = 5000
 
+// 作用：解析位置文本，每行 "x y z [scale [rotation]]"（空白或逗号分隔），忽略空行与 #、// 注释行。
+// 输出：{ x, y, z, scale, rotation, sourceIndex }；缺省 scale = 1、rotation = 0，坐标缺省为 0。
+// 说明：sourceIndex 是过滤注释/空行之后的序号；rotation 的单位未在此处声明（待核对）。
 function positionsFromText(content) {
   return String(content).replace(/^\uFEFF/, '').split(/\r?\n/)
     .map((line) => line.trim())
@@ -14,6 +36,7 @@ function positionsFromText(content) {
     })
 }
 
+// 作用：位置过多时按等间隔取样到 limit 个（取每段中点），保持预览分布均匀、数量可控。
 function samplePlacements(placements, limit = PREVIEW_INSTANCE_LIMIT) {
   if (placements.length <= limit) return placements
   const step = placements.length / limit
@@ -21,6 +44,7 @@ function samplePlacements(placements, limit = PREVIEW_INSTANCE_LIMIT) {
     placements[Math.min(placements.length - 1, Math.floor((index + 0.5) * step))])
 }
 
+// 作用：递归释放 three.js 对象树的几何体与材质（GPU 资源），纹理由各自缓存管理。
 function dispose(root) {
   root.traverse((child) => {
     child.geometry?.dispose?.()
@@ -29,6 +53,7 @@ function dispose(root) {
   })
 }
 
+// 作用：按物体类型名（子串匹配，不区分大小写）返回预览用的缺省颜色（0xRRGGBB）；默认为植被绿。
 function colorFor(type) {
   const value = String(type || '').toLowerCase()
   if (value.includes('fire')) return 0xff6a18
@@ -42,8 +67,11 @@ function colorFor(type) {
   return 0x3f9568
 }
 
+// 程序化预览纹理缓存：键为纹理预设名，同一预设只生成一次 512×512 画布纹理
 const previewTextureCache = new Map()
 
+// 作用：带种子的伪随机数发生器（mulberry32 风格），返回 [0,1) 的生成函数。
+// 目的：同一预设每次生成的纹理图案一致，预览不随刷新抖动。
 function seededTextureRandom(seed) {
   let value = seed >>> 0
   return () => {
@@ -55,6 +83,7 @@ function seededTextureRandom(seed) {
   }
 }
 
+// 作用：在 512×512 画布上随机撒 count 个小椭圆斑点（颜色从 colors 中取），用于纹理的颗粒感。
 function drawNoise(ctx, random, count, colors, radius = 2) {
   for (let index = 0; index < count; index += 1) {
     ctx.fillStyle = colors[Math.floor(random() * colors.length)]
@@ -65,6 +94,10 @@ function drawNoise(ctx, random, count, colors, radius = 2) {
   }
 }
 
+// 作用：按预设名程序化绘制 512×512 的预览纹理，并包装为可重复平铺的 CanvasTexture。
+// 输入：preset（如 solar-panel、red-brick、gravel、stone-wall、roof-tile、wood、grass、canvas、
+//       camouflage-*、stripes、shade-net、metal；其余按 plaster/混凝土类缺省绘制）。
+// 说明：这只是视觉预览，不参与辐射/能量平衡计算；种子由预设名哈希得到，结果可复现。
 function createPreviewTexture(preset) {
   if (previewTextureCache.has(preset)) return previewTextureCache.get(preset)
   const canvas = document.createElement('canvas')
@@ -72,6 +105,7 @@ function createPreviewTexture(preset) {
   const ctx = canvas.getContext('2d')
   const random = seededTextureRandom([...preset].reduce((sum, char) => sum * 31 + char.charCodeAt(0), 2166136261))
 
+  // 步骤 1：按预设名分支绘制底色与图案（各分支只用 canvas 2D API，随机数来自固定种子）
   if (preset === 'solar-panel') {
     const gradient = ctx.createLinearGradient(0, 0, 512, 512)
     gradient.addColorStop(0, '#071a32'); gradient.addColorStop(.5, '#0d3159'); gradient.addColorStop(1, '#061528')
@@ -208,6 +242,7 @@ function createPreviewTexture(preset) {
     }
   }
 
+  // 步骤 2：转成 sRGB、可重复平铺的纹理并缓存；anisotropy = 4 改善斜视角下的清晰度
   const texture = new THREE.CanvasTexture(canvas)
   texture.colorSpace = THREE.SRGBColorSpace
   texture.wrapS = texture.wrapT = THREE.RepeatWrapping
@@ -217,6 +252,7 @@ function createPreviewTexture(preset) {
   return texture
 }
 
+// 图片纹理缓存：键为工程相对路径，值为 THREE.Texture（用于类别纹理等预览）
 const imageTextureCache = new Map()
 
 // Keys are project-relative paths, so the cache must be dropped whenever the
@@ -248,6 +284,9 @@ function loadImageTexture(fileName) {
   return imageTextureCache.get(fileName)
 }
 
+// 作用：为预览找到网格对应的光谱配置。
+// 匹配：先按 mesh/父节点/材质名（小写）在 item.meshes 里找绑定的 spectralName，
+//       找不到则用 item.spectralName，再到 config.spectra 里按名字取；找不到返回 undefined。
 function previewSpectrum(item, mesh, config) {
   const names = [mesh.name, mesh.parent?.name, mesh.material?.name].filter(Boolean).map((name) => String(name).toLowerCase())
   const binding = (item.meshes || []).find((candidate) => names.includes(String(candidate.name || '').toLowerCase()))
@@ -255,6 +294,11 @@ function previewSpectrum(item, mesh, config) {
   return (config?.spectra || []).find((spectrum) => spectrum.name === spectralName)
 }
 
+// 作用：给几何体生成“三向投影”UV（triplanar 式的盒投影），使纹理按世界尺寸平铺。
+// 输入：repeatSize 为纹理重复一次对应的几何长度（与场景长度单位相同），缺省 2，下限 0.05；
+// 输出：非索引几何体（顶点按三角形独立），uv = 投影坐标 / repeatSize。
+// 说明：每个三角形按法向分量最大的轴选投影面（x 主导用 z-y，y 主导用 x-z，否则 x-y），
+//       因此同一三角形的三个顶点用同一投影面，不会在三角形内部撕裂。
 function applyProjectedUvs(geometry, repeatSize) {
   if (!geometry?.attributes?.position) return geometry
   let result = geometry
@@ -285,6 +329,8 @@ function applyProjectedUvs(geometry, repeatSize) {
   return result
 }
 
+// 作用：创建强制不透明的标准材质（关闭混合/alphaToCoverage，开启深度读写），
+//       保证预览中的遮挡关系正确；alphaTest 可由调用方指定（镂空叶片等）。
 function opaqueMaterial(parameters = {}) {
   return new THREE.MeshStandardMaterial({
     ...parameters,
@@ -297,6 +343,9 @@ function opaqueMaterial(parameters = {}) {
   })
 }
 
+// 作用：按物体类型创建预览材质：Fog 为固定 0.22 不透明度的双面半透明；
+//       有 openness（镂空度）或 net 时为双面半透明，不透明度 = max(0.25, 1 - openness)；
+//       其余为不透明材质（opaqueMaterial）。半透明材质都不写深度，避免遮挡后方物体。
 // Nets take their holes from the texture alpha, so they always blend; an alpha
 // cutoff would discard them once mipmaps average the strands below it.
 function sceneMaterial(item, parameters = {}, openness = 0, net = false) {
@@ -311,6 +360,14 @@ function sceneMaterial(item, parameters = {}, openness = 0, net = false) {
   return opaqueMaterial(parameters)
 }
 
+// 作用：创建水面预览用的 ShaderMaterial（纯视觉效果，不参与辐射/能量平衡计算）。
+// 波形参数：
+//   - 波长 wavelength = 水体较短边 × 0.18，限制在 1.2–12（场景长度单位，一般为 m）；
+//   - 风速取 config.fluid.windSpeed（缺省 2）；风向取 config.fluid.windDirection（度）。
+//   - 振幅：材料参数 slopeVariance > 0 时按 sqrt(slopeVariance) × 波长 × 0.12，限幅 0.015–0.28；
+//     否则按风速 0.025 + 0.012 × 风速，限幅 0.025–0.22。
+// 着色器：顶点着色器叠加 3 个不同方向/频率的正弦波（权重 0.56/0.29/0.15），解析求梯度得到法线；
+//   片元着色器用固定方向光做漫反射 + 高光 + 菲涅耳混色，最后做 1/2.2 伽马。uTime 由动画循环更新。
 function waterMaterial(item, config) {
   const [sizeX = 1, , sizeZ = 1] = item.dimensions || []
   const waterProperties = (config?.materials || []).find((entry) => entry.name === item.materialName)?.params || {}
@@ -393,6 +450,9 @@ function waterMaterial(item, config) {
   })
 }
 
+// 作用：生成位于 XZ 平面（y = 0）的椭圆水面网格，半轴为 sizeX/2、sizeZ/2，中心在原点。
+// 结构：中心一个顶点 + radialSegments 圈同心环（每圈 angularSegments 个顶点）；
+//       最内圈与中心连成扇形，其余相邻两圈之间用两个三角形填充。
 function ellipseWaterGeometry(sizeX, sizeZ, radialSegments, angularSegments) {
   const positions = [0, 0, 0]
   const indices = []
@@ -422,6 +482,10 @@ function ellipseWaterGeometry(sizeX, sizeZ, radialSegments, angularSegments) {
   return geometry
 }
 
+// 作用：为“生成式水体”物体创建预览：带波浪着色器的水面，包在 THREE.Group 里。
+// 细分：平面按尺寸 × 1.5 取分段数，限制在 16–96；椭球形（shape 含 ellipsoid）改用同心环网格，
+//       环数 6–24、每环 48–192 段。平面几何需绕 X 轴旋转 -90° 才能落在 XZ 平面。
+// 说明：mesh.userData.waterSurface 标记水面，动画循环据此累加 uTime。
 function generatedWaterPreview(item, config) {
   const [sizeX = 1, , sizeZ = 1] = item.dimensions || []
   const segmentsX = Math.max(16, Math.min(96, Math.round(sizeX * 1.5)))
@@ -445,6 +509,14 @@ function generatedWaterPreview(item, config) {
   return group
 }
 
+// 作用：创建火焰的体渲染预览（纯视觉）：单位立方体 [-0.5, 0.5]^3 内做射线步进。
+// 参数：seed（generation.parameters.seed 或 medium.seed，缺省 1）；
+//       风向/风响应 windResponse（限幅 0–2）使火焰中心随高度向下风向偏移。
+// 着色器：相机位置变换到局部坐标求射线；与立方体求交后步进 56 步，起点加抖动以减轻条带；
+//   用分形噪声（fbm）扰动火焰半径，半径随高度由 0.36 收窄到 0.035；
+//   按“热度”在红 → 橙 → 浅黄之间取色，用 1 - exp(-density × 步长 × 8.5) 做前到后合成，
+//   累计不透明度超过 0.985 提前结束。立方体用 BackSide 渲染，相机在体内时也能显示。
+// 附带：同一立方体的橙色线框边界（bounds），便于看出体积范围。
 function fireVolume(item, config) {
   const parameters = item.generation?.parameters || {}
   const seed = Number(parameters.seed ?? item.medium?.seed ?? 1) || 1
@@ -580,6 +652,7 @@ function fireVolume(item, config) {
   })
 
   const group = new THREE.Group()
+  // 步骤：组装火焰体积网格（renderOrder 4）与边界线框（renderOrder 3），返回 Group
   const volume = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), material)
   volume.renderOrder = 4
   volume.frustumCulled = true
@@ -598,6 +671,10 @@ function fireVolume(item, config) {
   return group
 }
 
+// 作用：为没有 OBJ 网格的物体（植被/建筑等基本体、Fire、Fog）创建单位尺寸的几何体并按 dimensions 缩放。
+// 形状：shape 含 ellipsoid 用球体，否则用长方体；Fire 用火焰体渲染（fireVolume），Fog 用半透明体。
+// 坐标：普通物体的 dimensions 已是 Three.js 顺序（X、Y 向上、Z）；
+//       Fire/Fog 若 medium.coordinateOrder 为 'XYZ'（Z 向上的工程顺序），则交换第 2、3 个尺寸。
 function primitive(item, config) {
   const [sizeX = 1, sizeY = 1, sizeZ = 1] = item.dimensions
   if (item.type === 'Fire') {
@@ -625,6 +702,8 @@ function primitive(item, config) {
   return mesh
 }
 
+// 作用：对“贴地”物体（isGroundedObject）按其底面轮廓在 DEM 上的高度重新计算放置高度 z；
+//       非贴地物体原样返回。north/east 对应位置文件的 x/y（场景坐标，单位 m）。
 function groundedPreviewPlacement(item, placement, footprint, config) {
   if (!isGroundedObject(item)) return placement
   const z = groundedPlacementHeight(footprint,
@@ -633,6 +712,10 @@ function groundedPreviewPlacement(item, placement, footprint, config) {
   return { ...placement, z }
 }
 
+// 作用：在场景坐标 (x = 北向, z = 东向，单位 m) 处对 DEM 做双线性插值，返回相对 DEM 最小值的高度（m）。
+// 输入：config.scene.demInfo 的 terrainWidth/terrainHeight/terrainValues（行优先栅格）。
+// 降级：未启用地形、栅格尺寸与数据长度不符时返回 0；缺失/非有限值用 DEM 最小值（高度 0）代替。
+// 结果限制为不小于 0。
 function terrainHeight(config, x, z) {
   if (!config.scene.terrain) return 0
   const dem = config.scene.demInfo
@@ -655,11 +738,15 @@ function terrainHeight(config, x, z) {
   return Math.max(0, THREE.MathUtils.lerp(top, bottom, v - y0) - fallback)
 }
 
+// 作用：每个运动体独立的线性同余随机数（a = 1664525, c = 1013904223, 模 2^32），返回 [0,1)。
+//       种子由 movement.seed 与实例序号混合而来，因此预览中的随机游走可重复。
 function nextMovementRandom(movement) {
   movement.randomState = (Math.imul(movement.randomState, 1664525) + 1013904223) >>> 0
   return movement.randomState / 4294967296
 }
 
+// 作用：随机选一个新的水平行进方向，并重新抽取速度（均值 speed ± speedVariation）
+//       与下一次转向的剩余时间（turnInterval 的 0.5–1.5 倍）。
 function chooseMovementDirection(movement) {
   const angle = nextMovementRandom(movement) * Math.PI * 2
   movement.directionX = Math.cos(angle)
@@ -668,6 +755,10 @@ function chooseMovementDirection(movement) {
   movement.turnRemaining = movement.turnInterval * (.5 + nextMovementRandom(movement))
 }
 
+// 作用：仅对启用了 movement 的 Human/Vehicle/Ship 在预览中挂随机游走状态（userData.randomMovement）。
+// 参数：range 为相对出生点的最大游走半径（场景单位 × sceneScale）；min/max 为世界边界；
+//       heightOffset 记录物体相对地形的初始抬升，地形上起伏时保持不变。
+// 说明：这只是编辑器预览动画；真实的运动轨迹以引擎/工程文件为准（待核对）。
 function attachRandomMovement(object, item, placementIndex, config, sceneScale, worldWidth, worldDepth) {
   if ((item.type !== 'Human' && item.type !== 'Vehicle' && item.type !== 'Ship') || !item.movement?.enabled) return
   const movement = {
@@ -690,6 +781,12 @@ function attachRandomMovement(object, item, placementIndex, config, sceneScale, 
   object.userData.randomMovement = movement
 }
 
+// 作用：每帧推进预览动态：火焰体积/水面着色器的 uTime，以及随机游走物体的位置与朝向。
+// 输入：deltaSeconds 为帧间隔，限幅到 [0, 0.1] s，避免切后台后一步跳太远。
+// 步骤：1) 累加着色器时间（共享材质的水面每帧只累加一次）；
+//       2) 到转向时间则换方向；3) 沿当前方向前进；超出游走半径时朝出生点调头（±30° 抖动）；
+//       4) 触到世界边界反向并限位；5) 朝向跟随运动方向；
+//       6) 高度 = 地形高度 + 贴地抬升（贴地物体按底面轮廓重算，否则沿用初始抬升）。
 export function updateSceneDynamics(world, deltaSeconds, config) {
   const elapsed = Math.min(.1, Math.max(0, Number(deltaSeconds) || 0))
   if (!elapsed || !config?.scene) return
@@ -739,6 +836,16 @@ export function updateSceneDynamics(world, deltaSeconds, config) {
   })
 }
 
+// 作用：把 project.json 中的对象列表加载为 Three.js 预览场景，返回实际创建的实例数；
+//       若加载过程中被更新的一次加载取代（isCurrent() 为 false）则返回 null。
+// 输入：api.readText 读位置文件与 OBJ；config.scene（x/y 为场景尺寸 m，offsetX/Y/Z 为原点偏移）。
+// 坐标约定：位置文件 x = 北向、y = 东向、z = 高度（m）；Three.js 世界中 X ← x、Z ← y、Y ← z；
+//       世界整体按 sceneScale = min(1, 45 / max(x, y)) 缩放并以场景中心为原点；
+//       rotation 为度，绕 Y 轴取负号旋转。
+// 步骤：1) 清掉上次加载的物体；2) 逐对象读取位置并抽样；
+//       3) 有 OBJ 文件的物体：解析（按文件缓存）、克隆、落地、设置材质，再按位置实例化；
+//       4) 无 OBJ 或属于参与介质（Fire/Fog/medium）的物体：用 primitive 基本体按位置实例化；
+//       5) 单个对象失败只记日志，不中断其余对象；6) 输出汇总日志。
 // isCurrent() turns false when a newer load has started; that load owns the scene.
 export async function loadXmlScene({ api, world, config, log, isCurrent = () => true }) {
   for (const child of [...world.children]) {
@@ -748,6 +855,7 @@ export async function loadXmlScene({ api, world, config, log, isCurrent = () => 
     }
   }
 
+  // 步骤 2 准备：取对象列表，计算世界缩放 sceneScale 与场景原点偏移（offsetX/Y/Z）
   const items = config.objects.items || []
   const sceneScale = Math.min(1, 45 / Math.max(config.scene.x, config.scene.y, 1))
   const worldWidth = config.scene.x * sceneScale
@@ -766,6 +874,7 @@ export async function loadXmlScene({ api, world, config, log, isCurrent = () => 
       if (item.positionFile) {
         const result = await api.readText(item.positionFile)
         if (!isCurrent()) return null
+        // 读取位置文件（未配置 positionFile 的对象放在场景中心、高度 0）
         placements = positionsFromText(result.content)
         sourceInstanceCount += placements.length
         // Preview the complete source scene. Offsets only move the calculation
@@ -781,6 +890,7 @@ export async function loadXmlScene({ api, world, config, log, isCurrent = () => 
       }
       placements = samplePlacements(placements)
 
+      // 步骤 3：参与介质（Fire/Fog/medium）不使用 OBJ，直接走下面的基本体分支
       const participatingMedium = item.type === 'Fire' || item.type === 'Fog' || Boolean(item.medium)
       if (item.fileName && !participatingMedium) {
         let source
@@ -796,6 +906,7 @@ export async function loadXmlScene({ api, world, config, log, isCurrent = () => 
           source = cached.clone(true)
           source.traverse((child) => { if (child.geometry) child.geometry = child.geometry.clone() })
         }
+        // 把源模型抬到底面 y = 0，便于按 placement.z 与地形高度落地
         const sourceBounds = new THREE.Box3().setFromObject(source)
         if (Number.isFinite(sourceBounds.min.y)) source.position.y -= sourceBounds.min.y
         source.traverse((child) => {
@@ -810,6 +921,8 @@ export async function loadXmlScene({ api, world, config, log, isCurrent = () => 
             child.userData.waterSurface = true
             child.renderOrder = 2
           } else {
+            // 非水体网格：按光谱配置选择类别纹理（优先）/程序化预览纹理/顶点色，并确定镂空度 openness；
+            // 镂空度取 opennessTexture 的 (min + max) / 2，否则取 spectrum.openness（仅用于预览透明度）。
             const hasVertexColors = child.geometry?.hasAttribute('color')
             const spectrum = previewSpectrum(item, child, config)
             const preview = spectrum?.previewTexture
@@ -837,6 +950,7 @@ export async function loadXmlScene({ api, world, config, log, isCurrent = () => 
             }, openness, net)
           }
         })
+        // 贴地用的底面轮廓：优先用工程给出的 groundFootprint，否则取源模型包围盒在 XZ 面的范围
         const groundFootprint = item.groundFootprint || { minX: sourceBounds.min.x, maxX: sourceBounds.max.x, minZ: sourceBounds.min.z, maxZ: sourceBounds.max.z }
         for (const [placementIndex, sourcePlacement] of placements.entries()) {
           const placement = groundedPreviewPlacement(item, sourcePlacement, groundFootprint, config)
@@ -857,6 +971,7 @@ export async function loadXmlScene({ api, world, config, log, isCurrent = () => 
           instanceCount += 1
         }
       } else {
+        // 步骤 4：基本体分支；放置时抬高 scale.y / 2，使以中心为原点的基本体底面落在地面上
         const dimensions = Array.isArray(item.dimensions) ? item.dimensions.map(Number) : [1, 1, 1]
         const groundFootprint = item.groundFootprint || { minX: -dimensions[0] / 2, maxX: dimensions[0] / 2, minZ: -dimensions[2] / 2, maxZ: dimensions[2] / 2 }
         for (const [placementIndex, sourcePlacement] of placements.entries()) {
@@ -885,6 +1000,7 @@ export async function loadXmlScene({ api, world, config, log, isCurrent = () => 
       log(`预览对象 ${item.name} 失败：${error.message}`, 'error')
     }
   }
+  // 步骤 6：汇总日志；实例数被 PREVIEW_INSTANCE_LIMIT 抽样时同时显示实际总数
   const sampleLabel = instanceCount < sourceInstanceCount
     ? `，从 ${sourceInstanceCount} 个实际实例中抽样预览 ${instanceCount} 个`
     : `、${instanceCount} 个场景对象`

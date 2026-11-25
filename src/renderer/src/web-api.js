@@ -1,3 +1,15 @@
+// ==========================================================================
+// 文件：web-api.js
+// 功能：主界面（非 STREAM 工作区）访问本地服务 /api/* 的统一客户端 webApi
+// 主要模块：
+//   1. 二进制结果解码 decodeBinaryResult（SSR1 格式，见 server/result-cache.mjs）
+//   2. request/post：fetch 封装与错误转换
+//   3. chooseFile：浏览器文件选择对话框，读取文本内容
+//   4. webApi：工程/示例/导入/保存/结果读取与对比/运行控制/仿真事件订阅
+// 数据流：界面模块 → webApi → server.mjs 中的 HTTP 接口；仿真进度经 SSE（/api/events）推回
+// 关系：自定义引擎路径通过 storage.js 的 appStorage 保存（键 histreamExecutable）
+// ==========================================================================
+
 import { appStorage } from './storage.js'
 
 // 结果读取接口的二进制格式（见 server/result-cache.mjs）：
@@ -5,11 +17,14 @@ import { appStorage } from './storage.js'
 // 头 JSON 里的 { $ssBuffer: i } 换成对应的类型化数组；其余字段与 JSON 响应完全相同。
 const BINARY_RESULT_TYPE = 'application/vnd.stream-studio.result-v1'
 
+// 作用：解码 SSR1 二进制响应（小端）：魔数、头长度、头 JSON、8 字节对齐的数据区。
+// 输出：与 JSON 响应同构的对象，其中 { $ssBuffer: i } 被替换为对应类型化数组（零拷贝视图）。
 function decodeBinaryResult(buffer) {
   const bytes = new Uint8Array(buffer)
   if (String.fromCharCode(...bytes.subarray(0, 4)) !== 'SSR1') throw new Error('二进制结果格式无效')
   const headerLength = new DataView(buffer).getUint32(4, true)
   const header = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + headerLength)))
+  // 数据区起点向上对齐到 8 字节，Float64Array 要求偏移按 8 字节对齐
   const dataStart = Math.ceil((8 + headerLength) / 8) * 8
   const arrays = header.buffers.map(({ type, offset, length }) => type === 'f64'
     ? new Float64Array(buffer, dataStart + offset, length)
@@ -25,6 +40,8 @@ function decodeBinaryResult(buffer) {
   return revive(header.value)
 }
 
+// 作用：发起请求；响应为二进制结果类型时走 decodeBinaryResult，否则按 JSON 解析。
+// 失败时抛出带中文提示的 Error（服务端 error 字段优先）。
 async function request(path, options) {
   const response = await fetch(path, options)
   if (response.ok && (response.headers.get('Content-Type') || '').startsWith(BINARY_RESULT_TYPE)) {
@@ -43,6 +60,8 @@ function post(path, value = {}) {
   return request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
 }
 
+// 作用：弹出浏览器文件选择框，返回 { path: 文件名, content: 文本 }；取消或读取失败返回 null。
+// 注意：浏览器拿不到真实路径，path 只是文件名。
 function chooseFile(accept) {
   return new Promise((resolve) => {
     const input = document.createElement('input')
@@ -63,6 +82,7 @@ function chooseFile(accept) {
   })
 }
 
+// 模块：webApi 接口表。多数为 POST + JSON；readResult 通过 Accept 头请求二进制格式。
 export const webApi = {
   // DEFERRED[低] 可维护性: request/post 与 stream/api.js 中的实现完全重复，错误处理、超时等改进需要改两处；建议：抽成共享的 http.js —— 抽出共享模块属于跨文件重构/改名，本轮明确禁止，保留待确认
   defaults: () => request('/api/defaults'),
@@ -70,6 +90,7 @@ export const webApi = {
   openProject: (path, mode) => post('/api/project/open', { path, mode }),
   listExamples: () => request('/api/examples'),
   openExample: (id, directory) => post('/api/examples/open', { id, directory }),
+  // 说明：用 window.prompt 输入自定义引擎路径并存入 appStorage；留空则清除；取消返回 null。
   chooseExecutable: async (message) => {
     let value
     try { value = window.prompt(message, appStorage.getItem('histreamExecutable') || '') }
@@ -114,6 +135,7 @@ export const webApi = {
   preflight: (data) => post('/api/run/preflight', data),
   stop: () => post('/api/stop'),
   reset: () => post('/api/reset'),
+  // 说明：订阅仿真事件流（SSE），忽略无法解析的消息；返回关闭连接的函数。
   onSimulationEvent: (callback) => {
     const events = new EventSource('/api/events')
     events.onmessage = (event) => {

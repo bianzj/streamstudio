@@ -1,3 +1,33 @@
+// ==========================================================================
+// 文件：main.js
+// 功能：StreamStudio 渲染进程（Vite + 原生 JS）的主入口。管理工程状态 state、Three.js 三维场景预览、
+//       右侧属性面板（inspector）、各类对话框（物体/材质/预设/几何生成）、模拟运行与结果查看。
+// 主要模块（按文件中出现的先后顺序）：
+//   1. 导入与全局常量：纹理预设列表、全局 state（模式、工程路径、运行进度、结果视图等）
+//   2. 预设合并与配置解析：ensureMaterialPresets、parseMaterialNode、parseXml（旧 XML 兼容，
+//      新工程为 project.json，由 project-schema.js 解析）
+//   3. 工程文本同步、toast / 日志 / 运行进度条（setRunning 等）
+//   4. 三维场景交互：几何绘制（geometryDraw）、物体选取与变换编辑（objectEdit）
+//   5. 三维场景构建：天空盒、场景边界引导、巡航/卫星观测可视化、generateWorld、updateSun、
+//      体元预览 buildVoxelPreview、相机与渲染循环 animate
+//   6. 属性面板：renderInspector 生成 HTML，bindInspector 绑定输入；质量预设与计算设备选择
+//   7. 工程读写：loadXml / saveXml、示例工程、气象与 DEM 导入
+//   8. 目标分布（distribution）与运动（movement）的表单与采样生成
+//   9. 物体 / 材质 / 物化参数 / 纹理 / 预设对话框及 OBJ 几何生成与导入
+//  10. 运行模拟：预检、启动、事件处理、引擎日志质量统计（runQuality）
+//  11. 结果查看：ENVI/TIFF/图像/风场预览，面元/体元/土壤剖面三维视图，统计分析图表，变化分析
+//  12. 工程对话框（新建/另存为/参考/HiStream 代理）、帮助、菜单栏与 STREAM 工作台接入
+//  13. init()：读取桌面桥接默认值、重新打开上次工程；启动本地化
+// 数据流：用户操作 → 修改 state.config（工程配置）→ markXmlDirty/syncProjectText 同步工程文本
+//       → refreshFromState 重建三维预览；运行时通过 webApi 调用服务端，服务端事件回到
+//       handleSimulationEvent 更新进度与日志，结果文件由 refreshResults/openResultFile 读取显示。
+// 与其他文件的关系：web-api.js（与服务端通信）、project-schema.js（工程结构、默认值与质量预设）、
+//       scene-loader.js（把配置转为 Three.js 场景）、i18n.js（界面本地化 t()）、
+//       stream/workspace.js（STREAM 工作台）、menubar.js（菜单栏）、material-specular.js。
+// 约定：模式名为 eRaytracing / eVoxelRT / eVoxelEB / eFacetRT / eFacetEB；
+//       场景尺寸、距离以米计（待核对）；角度以度计（天顶角 VZA、方位角 VAA）。
+// ==========================================================================
+
 import { webApi } from './web-api.js'
 import { appStorage } from './storage.js'
 import { getLocale, startLocalization, t } from './i18n.js'
@@ -13,11 +43,18 @@ import { TransformControls } from 'three/addons/controls/TransformControls.js'
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js'
 import './styles.css'
 
+// 模块：DOM 简写与全局句柄。$ 取单个元素，$$ 取元素数组；api 为与服务端通信的 webApi；
+// histreamProxyState 缓存 HiStream 代理对话框的信息与最近一次结果（见 openHistreamProxyDialog）。
 const $ = (selector) => document.querySelector(selector)
 const $$ = (selector) => [...document.querySelectorAll(selector)]
 const api = webApi
 const histreamProxyState = { info: null, result: null }
 
+// 模块：纹理预设清单。每项为 [资源相对路径或内置键, 界面显示名]，供各纹理下拉框使用。
+//   PHYSICAL_TEXTURE_PRESETS：物理纹理（*_variance.jpg，用于调制材质参数的空间变化，待核对）
+//   CLASS_TEXTURE_PRESETS：分类纹理（按类别索引给不同参数）
+//   OPENNESS_TEXTURE_PRESETS：开度纹理（遮阳网等的疏密/破损）
+//   PREVIEW_TEXTURE_PRESETS：三维预览外观纹理（只影响预览，键名由 scene-loader 解释，待核对）
 const PHYSICAL_TEXTURE_PRESETS = [
   ['assets/texture-library/concrete_variance.jpg', '混凝土 · Concrete034'],
   ['assets/texture-library/brick_variance.jpg', '砖墙 · Bricks075A'],
@@ -63,6 +100,14 @@ const PREVIEW_TEXTURE_PRESETS = [
   ['shade-net', '遮阳网']
 ]
 
+// 模块：渲染进程全局状态（单例）。
+//   - mode / config：当前计算模式与工程配置（project.configuration 的引用）；
+//   - inputPath / projectPath / xmlText / xmlDirty / editRevision：工程文件路径、
+//     序列化文本、未保存标记与修改版本号（用于判断保存期间是否又被编辑）；
+//   - running / progress / progressStage：模拟运行状态；
+//   - pendingObject / editingObjectIndex / selectedObjectIndex 等：对象对话框与三维选取；
+//   - resultFiles / selectedResult / resultView / analysis*：结果查看器状态；
+//   - result*Request：异步请求计数，用于丢弃过期的预览/打开结果。
 const state = {
   mode: 'eVoxelEB',
   executable: '',
@@ -106,6 +151,9 @@ const state = {
   resultOpenRequest: 0
 }
 
+// 作用：把工程中已有的命名预设 values 合并到内置预设 presets 上，同名项逐字段覆盖。
+// 输入：内置预设数组、工程预设数组（均含 name）；输出：合并后的新数组（内置顺序在前）。
+// 说明：params / previewTexture / physicalTexture 做浅合并，使旧工程缺失的新字段保留内置缺省。
 function mergeNamedPresets(presets, values) {
   const merged = new Map(presets.map((item) => [item.name, item]))
   for (const item of values || []) {
@@ -115,6 +163,7 @@ function mergeNamedPresets(presets, values) {
   return [...merged.values()]
 }
 
+// 作用：把标签中的“Canopy / 冠层”统一显示为“混沌介质”（结构类型改名后的兼容显示）。
 function structureLabel(value) {
   return String(value || '')
     .replace(/Canopy\s*冠层/gi, '混沌介质')
@@ -122,6 +171,11 @@ function structureLabel(value) {
     .replace(/冠层/g, '混沌介质')
 }
 
+// 作用：打开/新建工程后，把内置的光谱、结构（canopy）、热、材质预设合并进 config，并规范化。
+// 输入：config（原地修改并返回）；副作用：改写 config.spectra/canopies/thermals/materials 及
+//   objects.count/names。
+// 说明：旧标签“火焰/烟羽”统一改为“火焰”；BSM 光谱的 BSMlat/BSMlon 同为 0 时视为未设置，
+//   改回缺省 25/45；所有 Soil 材质的 method 与 control.soilTemperatureMethod 对齐（限幅 0..2，缺省 2）。
 function ensureMaterialPresets(config) {
   const presets = createMaterialPresets()
   config.spectra = simplifySolarSpectra(mergeNamedPresets(presets.spectra, config.spectra), config)
@@ -152,20 +206,24 @@ function ensureMaterialPresets(config) {
   return config
 }
 
+// 作用：返回一份新的缺省工程配置；气象路径指向“HiStream 内置气象数据”。
 const defaultConfig = () => {
   const config = createDefaultProject().configuration
   config.meteo.path = 'HiStream 内置气象数据'
   return config
 }
 
+// 作用：转义 & < > ' " ，用于把文本安全拼入 innerHTML 模板。
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char])
 }
 
+// 作用：读取旧 XML 工程中 selector 对应元素的文本（去空白），缺失或为空时返回 fallback。
 function xmlValue(doc, selector, fallback = '') {
   return doc?.querySelector(selector)?.textContent?.trim() || fallback
 }
 
+// 作用：解析 “a,b” 形式的数值对；元素不足 2 个或含非数时返回 fallback。parseTriple 同理取前 3 个。
 function parsePair(value, fallback) {
   const parts = String(value).split(',').map(Number)
   return parts.length >= 2 && parts.every(Number.isFinite) ? parts : fallback
@@ -176,6 +234,8 @@ function parseTriple(value, fallback) {
   return parts.length >= 3 && parts.slice(0, 3).every(Number.isFinite) ? parts.slice(0, 3) : fallback
 }
 
+// 作用：从工程文本中识别计算模式。优先按 project.json 解析；失败再按旧 XML 根元素 mode 属性；
+//   都不认识时返回 fallback。
 function projectModeFromXml(content, fallback = state.mode) {
   try {
     const project = parseProjectJson(content)
@@ -186,6 +246,11 @@ function projectModeFromXml(content, fallback = state.mode) {
   return ['eVoxelEB', 'eFacetEB', 'eFacetRT', 'eVoxelRT', 'eRaytracing'].includes(mode) ? mode : fallback
 }
 
+// 作用：把旧 XML 的材质节点解析为工程材质 {name, type, params}。
+// 输入：节点标签 leafBio→Vegetation（叶片光合/气孔参数）、waterSet→Water、其余（soilSet）→Soil。
+// 说明：soilSet 还承载 FacetEB 的扩展参数：墙体（wallMode / 分层）、船体（吃水线、航速、
+//   航向风向）、车辆部件（vehiclePart）及座舱/发动机参数；各项仅在对应标签存在时才写入 params，
+//   以保持旧工程的缺省行为；含 vehiclePart 的材质类型记为 Vehicle。
 function parseMaterialNode(node) {
   const type = node.tagName === 'leafBio' ? 'Vegetation' : node.tagName === 'waterSet' ? 'Water' : 'Soil'
   let params
@@ -206,6 +271,7 @@ function parseMaterialNode(node) {
       refractiveIndex: Number(xmlValue(node, 'refractiveIndex', 1.333)), slopeVariance: Number(xmlValue(node, 'slopeVariance', 0)),
       diffuseFraction: Number(xmlValue(node, 'diffuseFraction', 0.02))
     }
+    // 水体初始温度模式：dailyMeanAir（取日均气温）或 fixed（固定值，另读 waterInitialTemperature）。
     const waterInitial = xmlValue(node, 'waterInitialMode', '')
     if (waterInitial === 'dailyMeanAir' || waterInitial === 'fixed') params.initialTemperatureMode = waterInitial
     if (waterInitial === 'fixed') params.initialTemperature = Number(xmlValue(node, 'waterInitialTemperature', 20))
@@ -279,16 +345,24 @@ function parseMaterialNode(node) {
   return { name: node.getAttribute('name') || 'material', type: params.vehiclePart ? 'Vehicle' : type, params }
 }
 
+// 作用：把工程文本解析为 configuration 对象（旧 XML 兼容路径；JSON 工程直接走 parseProjectJson）。
+// 输入：content（project.json 文本或旧 XML）、mode（决定能量平衡模式下的过程开关缺省）。
+// 输出：与 createDefaultProject().configuration 同构的配置；缺失字段用 defaultConfig() 补齐。
+// 说明：XML 解析错误抛出中文异常；各数值字段的限幅/兼容缺省见函数内注释。
+// 步骤：1 解析 DOM 与缺省值；2 预处理光照/传感器/地形；3 解析对象；4 解析光谱/热/材质/结构；
+//   5 组装返回的 scene / light / sensor / control / meteo / atmosphere。
 function parseXml(content, mode = state.mode) {
   if (String(content || '').trimStart().startsWith('{')) return parseProjectJson(content).configuration
   const doc = new DOMParser().parseFromString(content, 'application/xml')
   if (doc.querySelector('parsererror')) throw new Error('XML 格式错误，请检查标签是否闭合')
+  // 步骤 1：以缺省配置为底，XML 里缺失的字段逐项回退到 base。
   const base = defaultConfig()
   const energyMode = mode === 'eFacetEB' || mode === 'eVoxelEB'
   const lightPair = parsePair(xmlValue(doc, 'Geometry Light light lightAngle lightAngle', '30,135'), [30, 135])
   const samplingNode = doc.querySelector('Geometry Sensor sensor observationSampling')
   const continuousNode = doc.querySelector('Geometry Sensor sensor continuousBand')
   const generatedViewPair = parsePair(xmlValue(doc, 'Geometry Sensor sensor viewAngle viewAngle[type="custom"] viewAngles', '0,0'), [0, 0])
+  // 步骤 2：传感器观测角（VZA, VAA）优先取 observationSampling 的 custom 属性，否则取 viewAngles。
   const viewPair = [
     Number(samplingNode?.getAttribute('customVza') ?? generatedViewPair[0]),
     Number(samplingNode?.getAttribute('customVaa') ?? generatedViewPair[1])
@@ -296,6 +370,7 @@ function parseXml(content, mode = state.mode) {
   const sceneX = Number(xmlValue(doc, 'Scene sceneSizeX', base.scene.x))
   const sceneY = Number(xmlValue(doc, 'Scene sceneSizeY', base.scene.y))
   const projectionText = xmlValue(doc, 'Geometry Sensor sensor projection', 'parallel').toLowerCase()
+  // 传感器位置缺省：场景中心上方 3000 m（透视/巡航模式使用，待核对单位）。
   const sensorPosition = parseTriple(
     xmlValue(doc, 'Geometry Sensor sensor sensorPosition', ''),
     [sceneX / 2, sceneY / 2, 3000]
@@ -307,10 +382,12 @@ function parseXml(content, mode = state.mode) {
     const firstHeading = Number(cruiseNode.querySelector('position')?.getAttribute('heading'))
     if (Number.isFinite(firstHeading) && Number.isFinite(viewPair[1])) viewPair[1] = (((viewPair[1] - firstHeading - 180) % 360) + 360) % 360
   }
+  // 直射比例：优先读 directScatteringRatio，旧字段 direct 作后备；限幅到 [0, 1]，散射比 = 1 - 直射比。
   const directFraction = Math.max(0, Math.min(1, finiteNumber(xmlValue(
     doc, 'Geometry Light light directScatteringRatio',
     xmlValue(doc, 'Geometry Light light direct', base.light.direct)
   ), base.light.direct)))
+  // 地形开关：有 Control isDEM 时以其值为准；旧工程没有该元素时，只要写了 DEM 文件就视为启用。
   const demFile = xmlValue(doc, 'Scene DEM', '')
   const demSwitchNode = doc.querySelector('Control isDEM')
   const terrainEnabled = demSwitchNode
@@ -321,6 +398,9 @@ function parseXml(content, mode = state.mode) {
     Object.keys(base.scene.terrainEnvironment).filter((key) => environmentNode?.hasAttribute(key))
       .map((key) => [key, environmentNode.getAttribute(key)])
   ))
+  // 步骤 3：解析场景对象。多网格对象的 meshNames / spectralNames / thermalNames / bioNames /
+  //   canopyNames 是逗号分隔、按网格序号对齐的列表；某一网格缺项时回退到列表首项。
+  //   mediumKind 为 fire / fog 的对象按介质（Fire / Fog）处理，仅参与辐射。
   const objectNodes = [...doc.querySelectorAll('Scene Object object')]
   const names = objectNodes.map((node) => node.getAttribute('objName') || node.getAttribute('name') || `对象 ${node.getAttribute('id') || ''}`)
   const items = objectNodes.map((node) => {
@@ -350,6 +430,7 @@ function parseXml(content, mode = state.mode) {
       ...(mediumKind ? { medium: { kind: mediumKind, radiationOnly: true, coordinateOrder: 'XYZ' }, sourceKind: 'prim', generation: { type: mediumKind === 'fog' ? '雾' : '火焰', shape: xmlValue(node, 'shapeTypes', 'cube') } } : {})
     }
   })
+  // 步骤 4：解析光谱预设（PROSPECT/BSM 等模型参数、TIR 反射率/透射率、镜面与物理纹理参数）。
   const spectra = [...doc.querySelectorAll('Attribute Spectral spectral')].map((node) => ({
     name: node.getAttribute('name') || 'spectral', model: node.getAttribute('type') || 'custom',
     reflectance: xmlValue(node, 'reflectance', '0.20'), transmittance: xmlValue(node, 'transmittance', '0.0'),
@@ -364,10 +445,13 @@ function parseXml(content, mode = state.mode) {
     },
     params: { Cab: Number(xmlValue(node, 'Cab', 40)), Cw: Number(xmlValue(node, 'Cw', 0.01)), Cdm: Number(xmlValue(node, 'Cdm', 0.01)), Cs: Number(xmlValue(node, 'Cs', 0)), N: Number(xmlValue(node, 'N', 1.5)), SMC: Number(xmlValue(node, 'SMC', 25)), BSMBrightness: Number(xmlValue(node, 'BSMBrightness', 0.5)), BSMlat: Number(xmlValue(node, 'BSMlat', 25)), BSMlon: Number(xmlValue(node, 'BSMlon', 45)) }
   }))
+  // 热预设：给定向阳/背阴温度（缺省 305 / 295，单位推测为 K，待核对）。
   const thermals = [...doc.querySelectorAll('Attribute Thermal thermal')].map((node) => ({ name: node.getAttribute('name') || 'temperature', sunlitTemperature: Number(xmlValue(node, 'sunlitTemperature', 305)), shadedTemperature: Number(xmlValue(node, 'shadedTemperature', 295)) }))
+  // 材质：叶片 / 土壤(含墙体、船、车辆) / 水体；名为 unused_leaf 的占位叶片不读入。
   const materials = [...doc.querySelectorAll('Attribute Biochemistry leafBio, Attribute Biochemistry soilSet, Attribute Biochemistry waterSet')]
     .filter((node) => node.getAttribute('name') !== 'unused_leaf')
     .map(parseMaterialNode)
+  // 结构（canopy）预设：structureType 1/rigid、2/fire、3/fog，其余按 canopy 处理。
   const canopies = [...doc.querySelectorAll('Attribute Canopy canopy')].map((node) => ({
     name: node.getAttribute('name') || 'canopy_default',
     structureType: (() => {
@@ -382,6 +466,7 @@ function parseXml(content, mode = state.mode) {
     asymmetry: Number(xmlValue(node, 'asymmetry', 0)), emissionScale: Number(xmlValue(node, 'emissionScale', 0)),
     fixedTemperature: Number(xmlValue(node, 'fixedTemperature', 0))
   }))
+  // 步骤 5：组装配置对象。以下各段缺失字段均回退到 base，数值段对越界值限幅。
   return {
     outDir: xmlValue(doc, 'Control outDir', ''),
     scene: {
@@ -445,11 +530,16 @@ function parseXml(content, mode = state.mode) {
       image: xmlValue(doc, 'Control isImage', '1') === '1',
       temperature: xmlValue(doc, 'Control isTemperature', '1') === '1',
       process: xmlValue(doc, 'Control isProcess', '0') === '1',
+      // 兼容旧工程：旧版只有 isProcess。能量平衡模式下它表示能量过程输出，其余模式表示辐射过程输出；
+      //   新工程分别写 isRadiationProcess / isEnergyProcess。
       radiationProcess: xmlValue(doc, 'Control isRadiationProcess', energyMode ? '0' : xmlValue(doc, 'Control isProcess', '0')) === '1',
       energyProcess: xmlValue(doc, 'Control isEnergyProcess', energyMode ? xmlValue(doc, 'Control isProcess', '0') : '0') === '1',
       albedo: xmlValue(doc, 'Control isAlbedo', '0') === '1'
     },
     control: {
+      // 控制参数段：periodicTraversalCount 限幅 0..20；voxelCollisionOrders 限幅 2..5；
+      //   facetBackend / computeBackend 只认 cpu、auto，其余一律回到 gpu；
+      //   soilTemperatureMethod 限幅 0..2，缺失时取首个 Soil 材质的 method。
       specularEnabled: xmlValue(doc, 'Control specularReflectionEnabled', '1') === '1',
       depth: Number(xmlValue(doc, 'Control rayTracingDepth', base.control.depth)),
       samples: Number(xmlValue(doc, 'Control sampleCount', base.control.samples)),
@@ -500,6 +590,8 @@ function parseXml(content, mode = state.mode) {
       year: Number(xmlValue(doc, 'Meteorology Year', base.meteo.year)),
       timezone: Number(xmlValue(doc, 'Meteorology TimeZone', base.meteo.timezone))
     },
+    // 大气参数：模型/气溶胶不在白名单内时回到 midlatitude-summer / rural；
+    //   waterVapor 限幅 0.5..5，visibility 限幅 10..50（单位待核对）。
     atmosphere: {
       enabled: xmlValue(doc, 'Atmosphere enabled', '0') === '1',
       model: ['tropical', 'midlatitude-summer', 'midlatitude-winter'].includes(xmlValue(doc, 'Atmosphere model', 'midlatitude-summer'))
@@ -513,11 +605,14 @@ function parseXml(content, mode = state.mode) {
   }
 }
 
+// 作用：标记工程文本已被修改，并递增 editRevision（保存流程据此判断保存期间是否有新编辑）。
 function markXmlDirty() {
   state.xmlDirty = true
   state.editRevision += 1
 }
 
+// 作用：把当前 state.config / state.mode 写回 state.project，规范化后序列化为 project.json 文本，
+//   同步到文本编辑框并显示“有未保存的修改”。副作用：取消待执行的防抖定时器。
 function syncProjectText() {
   if (projectTextSyncTimer) { clearTimeout(projectTextSyncTimer); projectTextSyncTimer = null }
   if (!state.project || !state.config) return
@@ -547,6 +642,7 @@ function flushProjectTextSync() {
 }
 
 const pendingFramePreviews = new Map()
+// 作用：同一 key 的预览刷新在下一帧只执行最后一次提交的 render，避免输入过程中重复重建场景。
 function previewOnNextFrame(key, render) {
   if (!pendingFramePreviews.has(key)) requestAnimationFrame(() => {
     const latest = pendingFramePreviews.get(key)
@@ -556,6 +652,7 @@ function previewOnNextFrame(key, render) {
   pendingFramePreviews.set(key, render)
 }
 
+// 兼容旧名：updateXml 即 syncProjectText（工程已改为 JSON，名称沿用）。
 function updateXml() { syncProjectText() }
 
 function fileName(path) {
@@ -563,6 +660,8 @@ function fileName(path) {
   return path.replaceAll('\\', '/').split('/').pop()
 }
 
+// 对象分类：isPrimObject 为程序生成的基元几何（sourceKind=prim 或带 generation）；
+//   isMediumObject 为火焰/雾等介质对象。
 function isPrimObject(item = {}) {
   return item.sourceKind === 'prim' || Boolean(item.generation)
 }
@@ -571,6 +670,7 @@ function isMediumObject(item = {}) {
   return item.type === 'Fire' || item.type === 'Fog' || Boolean(item.medium)
 }
 
+// 作用：在右下角（toastStack）弹出提示，约 4.2 秒后自动移除；kind 控制样式（如 error）。
 function toast(title, message, kind = '') {
   const item = document.createElement('div')
   item.className = `toast ${kind}`
@@ -579,6 +679,7 @@ function toast(title, message, kind = '') {
   setTimeout(() => item.remove(), 4200)
 }
 
+// 控制台日志最多保留 2000 行，超出时从最旧的开始删除（见 addLog）。
 const MAX_LOG_ROWS = 2000
 
 function addLog(text, kind = '') {
@@ -597,12 +698,14 @@ function addLog(text, kind = '') {
   output.scrollTop = output.scrollHeight
 }
 
+// 作用：更新底部状态栏的引擎状态：标题、详情（路径/PID）和状态点样式（ready / running / 空）。
 function setEngineState(label, detail, css = 'ready') {
   $('#engineState').textContent = label
   $('#enginePath').textContent = detail
   $('#engineDot').className = css
 }
 
+// 作用：把毫秒格式化为 [HH:]MM:SS.t（t 为十分之一秒；不足 1 小时不显示小时）。
 function runElapsedText(milliseconds = 0) {
   const seconds = Math.max(0, milliseconds) / 1000
   const hours = Math.floor(seconds / 3600)
@@ -612,6 +715,9 @@ function runElapsedText(milliseconds = 0) {
   return `${hours ? `${String(hours).padStart(2, '0')}:` : ''}${String(minutes).padStart(2, '0')}:${String(remaining).padStart(2, '0')}.${tenths}`
 }
 
+// 作用：刷新运行进度条（10 个分块，每块 10%）、阶段文字、已运行/耗时与预计剩余时间。
+// 输入：finalElapsed 为结束后固定的耗时（毫秒）；为空时按当前时间 - state.startedAt 实时计算。
+// 说明：预计剩余时间按引擎自报进度线性外推，仅在进度 5%~100% 且已运行 3 秒以上时显示。
 function renderRunProgress(finalElapsed = null) {
   const percent = Math.max(0, Math.min(100, Math.round(Number(state.progress) || 0)))
   const elapsed = finalElapsed == null ? Date.now() - state.startedAt : finalElapsed
@@ -636,12 +742,15 @@ function renderRunProgress(finalElapsed = null) {
   }
 }
 
+// 作用：更新进度百分比与阶段名。进度只增不减（取已有进度与新值的较大者），上限 100。
 function setSimulationProgress(percent, stage = state.progressStage) {
   state.progress = Math.max(state.progress, Math.min(100, Math.max(0, Number(percent) || 0)))
   state.progressStage = stage || state.progressStage
   renderRunProgress()
 }
 
+// 作用：切换“运行中/待命”状态：运行中禁用运行按钮、模式切换、绘制/编辑工具与计算设备选项，
+//   并关闭正在进行的几何绘制和对象编辑；待命时恢复引擎状态栏（Facet 模式显示 Facet 待命）。
 function setRunning(running) {
   state.running = running
   $('#runBtn').disabled = running
@@ -672,6 +781,10 @@ function setRunning(running) {
 }
 
 // Three.js 场景
+// 模块：Three.js 场景、相机、渲染器与全局三维对象。
+// 约定：三维预览以场景中心为原点；北向（config.scene.x 方向）对应 Three 的 x 轴，
+//   东向（config.scene.y 方向）对应 z 轴，y 轴向上；world.userData.displayScale 为
+//   “场景米 → 预览单位”的缩放（见 generateWorld）。
 const viewport = $('#viewport')
 const scene = new THREE.Scene()
 const defaultSceneBackground = new THREE.Color(0xf3f6fa)
@@ -709,6 +822,8 @@ sun.shadow.bias = -0.0005
 scene.add(sun)
 const world = new THREE.Group()
 scene.add(world)
+// 以下为预览中可被重建/释放的对象句柄：地面网格、体元预览、场景边界引导、偏移预览定时器、
+//   巡航可视化、太阳可视化、当前显示风格、结果查看器与典型天空盒贴图。
 let grid = null
 let voxelPreview = null
 let sceneBoundsGuide = null
@@ -718,6 +833,8 @@ let sunVisualization = null
 let currentStyle = 'solid'
 let resultViewer = null
 let typicalSkyboxTexture = null
+// 状态：视口内“绘制区域 / 绘制立方体”交互。phase：idle → ready（已选工具）→ base（拖拽底面）
+//   → height（仅立方体，移动鼠标定高度）；start/current 为地面点，height 为当前高度（米）。
 const geometryDraw = {
   mode: null,
   phase: 'idle',
@@ -733,6 +850,8 @@ const geometryDrawRaycaster = new THREE.Raycaster()
 const geometryDrawPointer = new THREE.Vector2()
 const objectEditRaycaster = new THREE.Raycaster()
 const objectEditPointer = new THREE.Vector2()
+// 状态：视口内对象选取与变换编辑（TransformControls）。selected 为选中的三维对象，
+//   pointerStart 用于区分点击与拖动，saving/savePending 用于串行化保存变换。
 const objectEdit = {
   enabled: false,
   selected: null,
@@ -743,12 +862,14 @@ const objectEdit = {
   savePending: false
 }
 
+// 作用：在视口上显示/隐藏绘制提示文字（空串则隐藏）。
 function geometryDrawHint(text = '') {
   const hint = $('#viewportDrawHint')
   hint.hidden = !text
   hint.textContent = text
 }
 
+// 作用：关闭“场景对象工具”菜单及其“修改/添加”子菜单，并复位 aria-expanded 与 open 样式。
 function closeSceneObjectToolsMenu() {
   const menu = $('#sceneObjectToolsMenu')
   const button = $('#sceneObjectToolsBtn')
@@ -763,6 +884,7 @@ function closeSceneObjectToolsMenu() {
   }
 }
 
+// 作用：展开/收起“修改”或“添加”子菜单（kind = Modify / Add），同一时刻只展开一个。
 function toggleSceneObjectSubmenu(kind) {
   const selectedTrigger = $(`#sceneObject${kind}Btn`)
   const selectedMenu = $(`#sceneObject${kind}Menu`)
@@ -781,6 +903,7 @@ function updateSceneObjectToolsButton() {
   $('#sceneObjectToolsBtn')?.classList.toggle('active', Boolean(objectEdit.enabled || geometryDraw.mode))
 }
 
+// 作用：移除并释放绘制过程中的半透明预览盒。
 function clearGeometryDrawPreview() {
   if (!geometryDraw.preview) return
   scene.remove(geometryDraw.preview)
@@ -788,6 +911,9 @@ function clearGeometryDrawPreview() {
   geometryDraw.preview = null
 }
 
+// 作用：由拖拽起点/当前点求绘制矩形的尺寸与中心。
+// 输出：sizeX/sizeZ（米，北向/东向边长）、centerX/centerZ（场景坐标，含 offset）、
+//   worldX/worldZ/worldY（预览坐标，worldY 取两点较高者）；尚未拖出时返回 null。
 function geometryDrawSize() {
   if (!geometryDraw.start || !geometryDraw.current) return null
   return {
@@ -801,6 +927,9 @@ function geometryDrawSize() {
   }
 }
 
+// 作用：按当前拖拽范围（和立方体高度）重建半透明预览盒与棱线，并更新尺寸提示。
+// 说明：区域模式只画很薄的一层；立方体模式使用 geometryDraw.height；
+//   预览单位由 displayScale 缩放，提示中的尺寸仍为米。
 function renderGeometryDrawPreview() {
   clearGeometryDrawPreview()
   const size = geometryDrawSize()
@@ -833,6 +962,7 @@ function renderGeometryDrawPreview() {
     : `尺寸 ${dimensions}；拖动确定范围，Esc 或右键取消`)
 }
 
+// 作用：退出绘制模式，恢复轨道相机控制与按钮状态，可选弹出提示 message。
 function cancelGeometryDraw(message = '') {
   clearGeometryDrawPreview()
   geometryDraw.mode = null
@@ -849,6 +979,8 @@ function cancelGeometryDraw(message = '') {
   if (message) toast('场景绘制', message)
 }
 
+// 作用：进入绘制模式 mode（'region' 地面矩形 / 'box' 立方体）。再次点同一工具则取消。
+// 说明：需已打开工程且未在运行；绘制期间禁用相机旋转以免与拖拽冲突，并关闭对象编辑。
 function startGeometryDraw(mode) {
   if (!state.inputPath) { toast('无法绘制对象', '请先新建或打开工程', 'error'); return }
   if (state.running) { toast('无法绘制对象', '请先停止当前模拟', 'error'); return }
@@ -867,6 +999,10 @@ function startGeometryDraw(mode) {
     : '在地面按住左键拖出矩形区域；松开后直接生成 OBJ')
 }
 
+// 作用：把鼠标位置射线投到地面，返回吸附到体元网格的地面点。
+// 输出：north/east 为场景坐标（含 offsetX/offsetZ，米），worldX/worldZ/worldY 为预览坐标；
+//   未命中地面返回 null。
+// 说明：吸附步长取 scene.voxel（至少 0.01 m），并限制在场景范围 [0, scene.x/y] 内。
 function geometryPointFromPointer(event) {
   const bounds = renderer.domElement.getBoundingClientRect()
   if (!bounds.width || !bounds.height) return null
@@ -897,6 +1033,10 @@ function geometryPointFromPointer(event) {
   }
 }
 
+// 作用：绘制完成：把范围/高度填入“几何生成”表单并直接提交。
+//   box 模式生成立方体表面几何（surface），位置记入 state.drawPlacement；
+//   region 模式生成一层水体几何（water），位置/偏移填入水体表单项。
+// 说明：范围过小（边长 ≤ 0）时提示重新拖动。
 function finishGeometryDraw() {
   const size = geometryDrawSize()
   const mode = geometryDraw.mode
@@ -932,6 +1072,8 @@ function finishGeometryDraw() {
   form.requestSubmit()
 }
 
+// 作用：绘制交互的指针事件。按下（左键）开始拖拽底面，立方体在 height 阶段再次按下即确认；
+//   移动更新范围或高度；抬起结束底面：region 直接完成，box 进入定高阶段。
 function onGeometryDrawPointerDown(event) {
   if (!geometryDraw.mode || event.button !== 0) return
   event.preventDefault()
@@ -947,6 +1089,8 @@ function onGeometryDrawPointerDown(event) {
   renderGeometryDrawPreview()
 }
 
+// 定高阶段：鼠标每向上移动一个像素，高度按 sceneHeight / max(120, 视口高度) 增加，
+//   再吸附到体元步长并限制在 [snap, scene.height]（height 缺省 20 m）。
 function onGeometryDrawPointerMove(event) {
   if (!geometryDraw.mode) return
   if (geometryDraw.phase === 'height') {
@@ -964,6 +1108,7 @@ function onGeometryDrawPointerMove(event) {
   renderGeometryDrawPreview()
 }
 
+// 初始高度取底面较长边的一半，同样吸附到体元步长并限制在 [snap, scene.height]。
 function onGeometryDrawPointerUp(event) {
   if (!geometryDraw.mode || geometryDraw.phase !== 'base' || geometryDraw.pointerId !== event.pointerId) return
   event.preventDefault()
@@ -989,6 +1134,10 @@ function onGeometryDrawPointerUp(event) {
   renderGeometryDrawPreview()
 }
 
+// 模块：对象选取与变换编辑（objectEdit）。
+//   updateObjectSelectionBox 刷新选择框；clearObjectSelection 取消选择并卸下 TransformControls；
+//   setObjectTransformMode 切换移动/旋转/缩放；setObjectEditEnabled 开关编辑模式；
+//   objectAtPointer 用射线找到点击处的工程对象；selectObjectForEditing 选中并显示手柄。
 function updateObjectSelectionBox() {
   if (!objectEdit.selectionBox || !objectEdit.selected) return
   objectEdit.selectionBox.setFromObject(objectEdit.selected)
@@ -1006,6 +1155,7 @@ function clearObjectSelection(showHint = true) {
   if (objectEdit.enabled && showHint) geometryDrawHint('单击选择 OBJ；双击修改物化属性；W/E/R 切换移动、旋转、缩放')
 }
 
+// 作用：切换变换手柄模式。旋转模式只显示 Y 轴手柄（对象只绕竖直轴旋转，与 editedPlacement 一致）。
 function setObjectTransformMode(mode) {
   if (!['translate', 'rotate', 'scale'].includes(mode)) return
   transformControls.setMode(mode)
@@ -1015,6 +1165,8 @@ function setObjectTransformMode(mode) {
   $$('#transformModeButtons button').forEach((button) => button.classList.toggle('active', button.dataset.transformMode === mode))
 }
 
+// 作用：开启/关闭对象编辑模式。开启前要求已打开工程且未运行；开启时先取消几何绘制，
+//   关闭时清除选择。会同步按钮、视口样式与提示文字。
 function setObjectEditEnabled(enabled) {
   if (enabled && !state.inputPath) { toast('无法编辑 OBJ', '请先新建或打开工程', 'error'); return }
   if (enabled && state.running) { toast('无法编辑 OBJ', '请先停止当前模拟', 'error'); return }
@@ -1033,6 +1185,7 @@ function setObjectEditEnabled(enabled) {
   updateSceneObjectToolsButton()
 }
 
+// 作用：由射线交点沿父节点向上，找到带 userData.projectObject 标记的对象根（world 的直接子级）。
 function projectObjectFromIntersection(intersection) {
   let object = intersection?.object || null
   while (object && object !== world) {
@@ -1058,6 +1211,8 @@ function objectAtPointer(event) {
   return null
 }
 
+// 作用：选中一个工程对象实例：加高亮 BoxHelper 与 TransformControls，记录 selectedObjectIndex。
+// 说明：启用了随机移动（movement.enabled）的对象位置由运动轨迹决定，不允许手动拖动。
 function selectObjectForEditing(object) {
   if (!object) { clearObjectSelection(); return }
   const itemIndex = Number(object.userData.projectObjectIndex)
@@ -1081,6 +1236,11 @@ function selectObjectForEditing(object) {
   geometryDrawHint(`${item.name} · 第 ${placementIndex} 个实例；拖动手柄编辑，双击修改物化属性`)
 }
 
+// 作用：在 DEM 地形上双线性插值，返回 (north, east) 处相对 DEM 最低值的高度（米，≥ 0）。
+// 输入：north/east 为场景局部坐标（不含 offset）；config.scene.demInfo 提供 terrainWidth/
+//   terrainHeight/terrainValues（按行存储）和 minimum。
+// 说明：地形未启用或采样数与尺寸不符时返回 0；图像行方向与北向相反（v = 1 - north/x），
+//   缺失/非有限采样值用 minimum 代替（待核对：DEM 采样行列方向约定）。
 function sceneTerrainHeight(config, north, east) {
   if (!config?.scene?.terrain) return 0
   const dem = config.scene.demInfo
@@ -1102,6 +1262,11 @@ function sceneTerrainHeight(config, north, east) {
   return Math.max(0, THREE.MathUtils.lerp(top, bottom, v - y0) - fallback)
 }
 
+// 作用：把拖动后的三维对象位姿换算回工程中的实例位置记录。
+// 输出：x/y（北/东，含 offsetX/offsetZ）、z（离地高度，含 offsetY）、scale、rotation（度，
+//   取 [0, 360)，Three 的 rotation.y 取负号后得到），均保留 6 位小数。
+// 说明：缩放因子由对象当前缩放与初始缩放之比得到（下限 0.01）；若对象贴地（有
+//   projectGroundFootprint）则按足迹重新求贴地高度，否则按对象 y 减去竖向锚点与地形高度。
 function editedPlacement(object) {
   const config = state.config
   const displayScale = Number(world.userData.displayScale) || 1
@@ -1130,6 +1295,7 @@ function editedPlacement(object) {
   }
 }
 
+// 作用：贴地对象（有足迹）在水平拖动/缩放后，按新位置的地形高度把 y 重新吸附到地面。
 function snapGroundedObject(object) {
   if (!object?.userData?.projectGroundFootprint) return
   const config = state.config
@@ -1140,6 +1306,11 @@ function snapGroundedObject(object) {
   object.position.y = (sceneTerrainHeight(config, north, east) + placement.z - (Number(config.scene.offsetY) || 0)) * displayScale
 }
 
+// 作用：把拖动编辑后的实例位姿保存到工程。
+// 步骤：1 读出该对象现有的实例位置表（positionFile 或由 distribution 生成）；
+//   2 用 editedPlacement 覆盖对应实例；3 经 api.saveDistribution 写回位置文件，并把分布改为
+//   manual；4 更新对象的初始缩放/竖向锚点缓存，标脏并调用 saveXml 保存工程。
+// 说明：saving/savePending 保证同时只有一次保存，保存期间又有编辑则结束后再保存一次。
 async function saveEditedObjectTransform(object) {
   if (!object?.userData?.projectObject || objectEdit.saving) {
     if (objectEdit.saving) objectEdit.savePending = true
@@ -1185,6 +1356,8 @@ async function saveEditedObjectTransform(object) {
   }
 }
 
+// 作用：对象编辑的指针事件。按下记录起点；抬起时若位移 ≤ 5 像素视为点击并选中，
+//   否则视为相机拖动；双击则选中并打开对象物化属性对话框。
 function onObjectEditPointerDown(event) {
   if (!objectEdit.enabled || geometryDraw.mode || event.button !== 0 || transformControls.axis || transformControls.dragging) return
   objectEdit.pointerStart = { x: event.clientX, y: event.clientY }
@@ -1205,6 +1378,8 @@ function onObjectEditDoubleClick(event) {
   showObjectAttributeDialog(Number(object.userData.projectObjectIndex))
 }
 
+// 作用：用 2D canvas 程序化生成 1024×512 的“典型天空”等距柱状贴图（蓝色渐变 + 若干云团），
+//   仅用于预览背景，与辐射计算无关。
 function createTypicalSkyboxTexture() {
   const canvas = document.createElement('canvas')
   canvas.width = 1024
@@ -1238,6 +1413,7 @@ function createTypicalSkyboxTexture() {
   return texture
 }
 
+// 作用：按 control.skyboxEnabled 切换预览背景：典型天空盒（懒创建并缓存）或默认纯色。
 function updateSceneSkybox(config) {
   if (config?.control?.skyboxEnabled) {
     typicalSkyboxTexture ||= createTypicalSkyboxTexture()
@@ -1247,6 +1423,7 @@ function updateSceneSkybox(config) {
   }
 }
 
+// 作用：递归释放对象的几何、材质及其纹理 / uniform 纹理，避免 GPU 内存泄漏。
 function disposeObject(object) {
   object.traverse((child) => {
     child.geometry?.dispose?.()
@@ -1260,6 +1437,7 @@ function disposeObject(object) {
   })
 }
 
+// 作用：清空 world 下的全部三维对象并释放资源，同时清除各类可视化句柄与选择状态。
 function clearWorld() {
   clearObjectSelection(false)
   while (world.children.length) {
@@ -1272,11 +1450,15 @@ function clearWorld() {
   cruiseVisualization = null
 }
 
+// 作用：格式化尺寸标注：≥ 100 取整，否则保留最多 1 位小数，并带中文千分位。
 function formatSceneDimension(value) {
   const number = Math.max(0, Number(value) || 0)
   return number >= 100 ? Math.round(number).toLocaleString('zh-CN') : Number(number.toFixed(1)).toLocaleString('zh-CN')
 }
 
+// 作用：用 canvas 绘制带圆角边框的文字标签并返回 THREE.Sprite（始终面向相机、不做深度测试）。
+// 输入：text（经 t() 本地化）、width 为 320 px 宽标签对应的世界宽度（预览单位）；
+//   文字更长时画布变宽，Sprite 同比例变宽。
 function createDimensionLabel(text, width) {
   const label = t(text)
   const font = '700 34px "Segoe UI", "Microsoft YaHei", sans-serif'
@@ -1314,6 +1496,7 @@ function createDimensionLabel(text, width) {
   return sprite
 }
 
+// 作用：在 start→end 之间放一根细圆柱作为边框线（比 WebGL 线宽更醒目），加入 group。
 function addSceneBoundsEdge(group, start, end, radius, material) {
   const direction = end.clone().sub(start)
   const geometry = new THREE.CylinderGeometry(radius, radius, direction.length(), 6, 1, false)
@@ -1324,6 +1507,10 @@ function addSceneBoundsEdge(group, start, end, radius, material) {
   group.add(edge)
 }
 
+// 作用：重建“计算域”引导框：蓝色线框盒 + 三轴范围标签 + 正北箭头，并更新底部尺寸摘要。
+// 说明：框体只反映配置的仿真域（scene.x/y/height），不随网格包围盒变化；标签 X/Z/Y 依次为
+//   北向、东向、竖向范围（均含 offset，单位 m）。预览坐标中 Three 的 +X 即正北。
+//   所有引导物体关闭深度测试，使稠密城市几何不会遮住参考框和指北针。
 function updateSceneBoundsGuide(config) {
   if (sceneBoundsGuide) {
     world.remove(sceneBoundsGuide)
@@ -1430,6 +1617,10 @@ function updateSceneBoundsGuide(config) {
   if (summary) summary.textContent = `计算域 X ${formatSceneDimension(offsetX)}–${formatSceneDimension(offsetX + sceneX)} · Y ${formatSceneDimension(offsetY)}–${formatSceneDimension(offsetY + sceneHeight)} · Z ${formatSceneDimension(offsetZ)}–${formatSceneDimension(offsetZ + sceneY)} m`
 }
 
+// 模块：传感器/巡航可视化（平行观测的卫星、透视成像的飞机与航线、视场足迹）。
+// 作用：把传感器位置点（场景坐标：x 北、y 东、z 高度，米）换算为预览坐标 Vector3。
+//   预览 x = (x - scene.x/2)·displayScale，预览 y = z·displayScale（竖直向上），
+//   预览 z = (y - scene.y/2)·displayScale；高度下限为 0。
 function cruisePointToWorld(point, config) {
   const sceneX = Math.max(0.1, Number(config?.scene?.x) || 60)
   const sceneY = Math.max(0.1, Number(config?.scene?.y) || 60)
@@ -1441,6 +1632,10 @@ function cruisePointToWorld(point, config) {
   )
 }
 
+// 作用：用基本几何体拼一架简化飞机（机身、机头、机翼、尾翼、座舱）并带一个朝向相机的图标。
+// 输入：size 为机身尺度（预览单位）、headingDegrees 为航向（度，北为 0，向东增大）。
+// 说明：真实尺寸在公里级场景里会小到看不见，因此额外保留一个始终面向相机的 ✈ 圆形标记；
+//   材质 userData.baseColor 记录原色，供显示风格切换时恢复。
 function createCruiseAircraft(size, headingDegrees) {
   const aircraft = new THREE.Group()
   aircraft.name = 'cruise-aircraft'
@@ -1507,6 +1702,8 @@ function createCruiseAircraft(size, headingDegrees) {
   return aircraft
 }
 
+// 作用：用基本几何体拼一颗简化卫星（本体、太阳能板、相机镜头、天线），用于平行投影观测示意。
+// 说明：相机镜头朝本地 -Y，调用方负责按观测方向旋转整星（见 createParallelObservationVisualization）。
 function createObservationSatellite(size) {
   const satellite = new THREE.Group()
   satellite.name = 'parallel-observation-satellite'
@@ -1556,6 +1753,13 @@ function createObservationSatellite(size) {
   return satellite
 }
 
+// 作用：平行（非透视）观测的示意图：卫星位于观测半球上、箭头指向场景目标，并画天顶线、
+//   天顶角弧线、方位角箭头和“卫星观测 Z…° A…°”标签。
+// 输入：config.sensor 的观测角（经 sensorViewAngles 展开后取第一组代表方向）与光照方位；
+//   天顶角限制在 [0, 89.999]°，方位角取模到 [0, 360)。
+// 步骤：1 由天顶角/方位角求指向卫星的单位向量；2 在半径 clamp(0.63·extent, 13, 31) 处放卫星并
+//   朝向目标；3 添加视线箭头、天顶参考虚线、天顶角弧线与方位箭头；4 添加文字标签。
+// 约定：方位角从北（预览 +X）起，向东（预览 +Z）增大；批量观测时标签注明“代表方向 1/n”。
 function createParallelObservationVisualization(config) {
   const sensor = config.sensor
   const sceneX = Math.max(0.1, Number(config.scene?.x) || 60)
@@ -1671,6 +1875,8 @@ function createParallelObservationVisualization(config) {
   return group
 }
 
+// 作用：创建透视成像的视场足迹对象（地面四边形填充、轮廓线、相机到四角的锥线），
+//   几何顶点先留空，由 updateObservationFootprint 每帧写入。
 function createObservationFootprint() {
   const group = new THREE.Group()
   group.name = 'sensor-observation-footprint'
@@ -1715,6 +1921,11 @@ function createObservationFootprint() {
   return { group, fillGeometry, outlineGeometry, coneGeometry, label: null }
 }
 
+// 作用：按相机位置 origin 与航向，把视场四个角射线投到地面，更新足迹的填充、轮廓和锥线。
+// 输入：data 为 cruiseVisualization.userData（含 verticalFov、aspect、zenith、relativeVaa 等）。
+// 说明：水平半视场角由垂直半视场角与宽高比求得（verticalFov 限制在 0.1°~120°）；
+//   射线不朝下或离地太远时取场景尺寸 4 倍的远距离；交点限制在场景范围内，所以足迹
+//   不会超出场景边界。尺寸标签只在首次创建，显示“视场约 宽 × 长 m”（由四角距离平均得到）。
 function updateObservationFootprint(data, origin, headingDegrees) {
   const footprint = data.footprint
   if (!footprint) return
@@ -1778,6 +1989,13 @@ function updateObservationFootprint(data, origin, headingDegrees) {
   footprint.label.position.y = groundY + Math.max(0.12, data.aircraftSize * 0.14)
 }
 
+// 作用：重建传感器可视化：平行投影用卫星示意；透视成像则画飞机、航线、观测箭头与视场足迹。
+// 步骤：1 移除旧可视化；2 求巡航点（开启巡航时用 sensorCruisePositions，否则单点：
+//   传感器位置，航向取 vaa）；3 画航线段与标记点；4 创建飞机、观测方向箭头与足迹；
+//   5 把动画所需数据存入 group.userData，供 updateCruiseAnimation 使用。
+// 说明：相邻两点在 x 或 y 上跳变超过场景一半视为周期边界回绕（待核对），不画连线；标记点最多约 512 个；
+//   动画周期 = clamp((点数-1)·0.5, 2.5, 12) 秒；巡航时 vaa 为相对航向的方位角，
+//   固定位置时 vaa 即绝对航向（relativeVaa 取 0）。
 function updateCruiseVisualization(config) {
   if (cruiseVisualization) {
     world.remove(cruiseVisualization)
@@ -1874,6 +2092,9 @@ function updateCruiseVisualization(config) {
   world.add(group)
 }
 
+// 作用：每帧推进飞机沿巡航点循环飞行，并同步观测箭头与足迹。now 为毫秒时间戳。
+// 说明：在相邻两点间线性插值；x/y 用“环绕插值”（wrappedLerp）按周期边界走最短路径；
+//   航向取当前线段起点的航向；巡航时叠加一个微小上下起伏（0.035·机身尺度）。
 function updateCruiseAnimation(now) {
   const data = cruiseVisualization?.userData
   if (!data?.aircraft || !data.positions?.length) return
@@ -1916,6 +2137,8 @@ function updateCruiseAnimation(now) {
   updateObservationFootprint(data, worldPoint, currentHeading)
 }
 
+// 作用：创建场景预览用的不透明 MeshStandardMaterial，并在 userData.baseColor 记录原色，
+//   以便 applyViewStyle 在不同显示风格间切换后恢复。
 function material(color, roughness = .82) {
   const result = new THREE.MeshStandardMaterial({
     color,
@@ -1932,6 +2155,13 @@ function material(color, roughness = .82) {
   return result
 }
 
+// 作用：按配置重建基础场景：地面（可带 DEM 起伏）、地面网格，并刷新边界引导、传感器可视化。
+// 输入：config.scene（x/y 为北向/东向尺寸，米；voxel 体元尺寸；terrain/demInfo 地形）。
+// 副作用：清空 world；设置 world.userData.extent / displayScale。
+// 步骤：1 求预览缩放 displayScale = min(1, 45 / 场景最大边长)，使大场景缩到约 45 个预览单位；
+//   2 创建地面网格：有 DEM 时按体元尺寸取网格密度（最多约 128 格），否则固定 36×36；
+//   3 逐顶点采样 DEM 设置高度（相对 DEM 最小值，≥ 0）；4 加网格、边界框与传感器可视化。
+// 约定：DEM 列向东增大、第 0 行为北边缘；预览中 +X 为北、+Z 为东。
 function generateWorld(config = defaultConfig()) {
   clearWorld()
   const sx = Math.max(0.1, Number(config.scene.x) || 60)
@@ -1971,6 +2201,8 @@ function generateWorld(config = defaultConfig()) {
     const bottom = THREE.MathUtils.lerp(at(x0, y1), at(x1, y1), imageX - x0)
     return THREE.MathUtils.lerp(top, bottom, imageY - y0)
   }
+  // 地面平面旋转 -90° 绕 X 之前，平面局部 Y 对应预览 -Z（东向反向）。因此 u = 0.5 - y/depth
+  //   给出东向列比例，v = 0.5 - x/width 给出自北向南的行比例；局部 z 即抬升高度。
   for (let i = 0; i < positions.count; i++) {
     // After the -90° X rotation, world +X is north and world +Z is east.
     // GeoTIFF columns grow eastward and row zero is the northern edge.
@@ -1998,6 +2230,11 @@ function generateWorld(config = defaultConfig()) {
   updateStats()
 }
 
+// 作用：按光照配置更新预览太阳：平行光方向/强度，以及示意用的太阳球、光晕、入射箭头与标签。
+// 输入：config.light 的 zenith（限制在 [0, 90]°）、azimuth（北为 0 向东增大，取模到 [0, 360)）、
+//   direct（直射比例）；平行光强度 = 1.2 + 2.5·direct（仅预览亮度，不参与辐射计算）。
+// 说明：太阳示意位置在以场景为中心、半径 clamp(0.54·extent, 11, 28) 的球面上；
+//   调用前需已更新 world.userData.extent / boundsHeight（由 generateWorld 与边界引导设置）。
 function updateSun(config) {
   const zenithDegrees = THREE.MathUtils.clamp(Number(config.light.zenith) || 0, 0, 90)
   const azimuthDegrees = ((Number(config.light.azimuth) || 0) % 360 + 360) % 360
@@ -2073,6 +2310,7 @@ function updateSun(config) {
   scene.add(group)
 }
 
+// 热力视图（applyViewStyle 的 'thermal'）用：缓存材质原始颜色，切回其他视图时据此恢复。
 const thermalBaseColors = new WeakMap()
 
 // Approximate voxelization of the previewed scene objects at the configured
@@ -2081,6 +2319,11 @@ const thermalBaseColors = new WeakMap()
 // structures survive voxelization before running VoxelRT/VoxelEB. The engine
 // additionally applies the fill threshold, so counts are an upper estimate.
 // Very large cell counts are shown at a coarser display resolution.
+// 作用：把预览场景中的对象近似体元化，生成半透明实例化方块（voxelPreview）加入 world。
+// 输入：state.config.scene（voxel 体元边长 m；x/y/height 场景尺寸 m）；world 中的网格。
+// 输出：返回提示文字（网格尺寸、占用体元数，是否粗化显示）；无可显示对象时返回空串。
+// 单位：显示坐标 = 米 × world.userData.displayScale，故 cellSize 以显示单位计，提示时再除回。
+// 说明：纯预览，不参与引擎计算；单元数上限 150000，超限则 cellSize 翻倍重试（最多 8 次）。
 function buildVoxelPreview() {
   const c = state.config
   if (!c) return ''
@@ -2092,6 +2335,7 @@ function buildVoxelPreview() {
     voxelPreview = null
   }
   world.updateMatrixWorld(true)
+  // 步骤 1：收集参与体元化的网格；排除地面、传感器、辅助线框（网格/边界/巡航）和精灵材质。
   const meshes = []
   const helperRoots = new Set([grid, sceneBoundsGuide, cruiseVisualization].filter(Boolean))
   const isHelper = (object) => {
@@ -2106,6 +2350,7 @@ function buildVoxelPreview() {
     meshes.push(child)
   })
   if (!meshes.length) return ''
+  // 显示单元数上限与总采样点预算：防止大场景/小体元时卡顿或内存暴涨。
   const maximumCells = 150000
   const sampleBudget = 6e6
   const inverseWorld = new THREE.Matrix4().copy(world.matrixWorld).invert()
@@ -2114,6 +2359,8 @@ function buildVoxelPreview() {
   const a = new THREE.Vector3(), b = new THREE.Vector3(), d = new THREE.Vector3()
   let cellSize = voxelMeters * scale
   let cells = null
+  // 步骤 2：把三角形按重心坐标加密采样，落入的网格单元记入 cells；
+  // 超过 maximumCells 时放弃本轮，cellSize 翻倍后重试。
   for (let attempt = 0; attempt < 8; attempt += 1) {
     cells = new Set()
     let overflow = false
@@ -2123,10 +2370,12 @@ function buildVoxelPreview() {
       const index = mesh.geometry.index
       const triangleCount = Math.floor((index ? index.count : position.count) / 3)
       const instances = mesh.isInstancedMesh ? mesh.count : 1
+      // 三角形总数过大时按步长 stride 隔点抽样以限制耗时，占用结果可能偏少，仅作预览。
       const stride = Math.max(1, Math.ceil(triangleCount * instances / 400000))
       for (let instance = 0; instance < instances && !overflow; instance += 1) {
         transform.copy(mesh.matrixWorld)
         if (mesh.isInstancedMesh) { mesh.getMatrixAt(instance, instanceMatrix); transform.multiply(instanceMatrix) }
+        // 变换到 world 局部坐标，使体元网格与 world 对齐（含实例矩阵）。
         transform.premultiply(inverseWorld)
         for (let triangle = 0; triangle < triangleCount; triangle += stride) {
           const i0 = index ? index.getX(3 * triangle) : 3 * triangle
@@ -2136,6 +2385,7 @@ function buildVoxelPreview() {
           b.fromBufferAttribute(position, i1).applyMatrix4(transform)
           d.fromBufferAttribute(position, i2).applyMatrix4(transform)
           const edge = Math.max(a.distanceTo(b), b.distanceTo(d), d.distanceTo(a))
+          // 按最长边确定每边细分数：采样间距约半个体元，单个三角形最多 48 段。
           const steps = Math.min(48, Math.max(1, Math.ceil(edge / (cellSize * 0.5))))
           for (let u = 0; u <= steps; u += 1) {
             for (let v = 0; v <= steps - u; v += 1) {
@@ -2148,6 +2398,7 @@ function buildVoxelPreview() {
           }
           samples += (steps + 1) * (steps + 2) / 2
           if (cells.size > maximumCells) { overflow = true; break }
+          // 超出采样预算：中止当前实例的三角形遍历（不触发粗化重试）。
           if (samples > sampleBudget) break
         }
       }
@@ -2157,6 +2408,7 @@ function buildVoxelPreview() {
     cellSize *= 2
   }
   if (!cells?.size) return ''
+  // 步骤 3：每个占用单元画一个略小（0.94 倍）的方块，避免相邻方块边界重叠闪烁。
   const box = new THREE.BoxGeometry(cellSize * 0.94, cellSize * 0.94, cellSize * 0.94)
   const material = new THREE.MeshBasicMaterial({ color: 0x2f7fe0, transparent: true, opacity: 0.32, depthWrite: false })
   const mesh = new THREE.InstancedMesh(box, material, cells.size)
@@ -2173,6 +2425,7 @@ function buildVoxelPreview() {
   mesh.instanceMatrix.needsUpdate = true
   voxelPreview = mesh
   world.add(mesh)
+  // 步骤 4：生成状态栏文字；网格数按场景尺寸 / 体元边长向上取整。
   const nx = Math.ceil((Number(c.scene?.x) || 0) / voxelMeters)
   const ny = Math.ceil((Number(c.scene?.y) || 0) / voxelMeters)
   const nz = Math.ceil((Number(c.scene?.height) || 0) / voxelMeters)
@@ -2181,6 +2434,9 @@ function buildVoxelPreview() {
   return `网格 ${nx}×${ny}×${nz}（体元 ${voxelMeters} m），对象占用约 ${coarse ? '（按 ' + Number(shownMeters.toFixed(2)) + ' m 粗化显示）' : ''}${cells.size.toLocaleString('zh-CN')} 个${coarse ? '显示单元' : '体元'}；引擎还会按填充阈值剔除低占比体元`
 }
 
+// 作用：切换视口显示样式。style = 'wireframe' 时线框；'thermal' 时按对象类别着示意色
+// （非真实温度，仅区分植被/建筑/地面/传感器）；其他值恢复原始颜色。
+// 说明：进入 thermal 前把原色存入 thermalBaseColors，离开时还原；体元预览网格不受影响。
 function applyViewStyle(style) {
   currentStyle = style
   world.traverse((child) => {
@@ -2201,6 +2457,7 @@ function applyViewStyle(style) {
   })
 }
 
+// 作用：按场景范围 extent 与高度 boundsHeight，把相机放到斜上方，轨道控制器目标取场景中心偏下处。
 function fitCamera() {
   const extent = world.userData.extent || 20
   const height = world.userData.boundsHeight || 2
@@ -2209,6 +2466,7 @@ function fitCamera() {
   controls.update()
 }
 
+// 作用：统计 world 中所有网格的三角形数（含实例化网格的实例数），显示为 K TRI（千三角形）。
 function updateStats() {
   let triangles = 0
   world.traverse((object) => {
@@ -2219,12 +2477,14 @@ function updateStats() {
   $('#triangles').textContent = `${Math.round(triangles / 100) / 10}K TRI`
 }
 
+// 作用：视口尺寸变化时同步渲染器尺寸与相机宽高比（由下面的 ResizeObserver 触发）。
 function resize() {
   renderer.setSize(viewport.clientWidth, viewport.clientHeight, false)
   camera.aspect = viewport.clientWidth / Math.max(1, viewport.clientHeight)
   camera.updateProjectionMatrix()
 }
 new ResizeObserver(resize).observe(viewport)
+// 渲染循环状态：frameCount/lastFps 用于每 750 ms 刷新一次 FPS 显示；lastAnimationTime 用于动画步长。
 let frameCount = 0, lastFps = performance.now(), lastAnimationTime = performance.now()
 // While the engine runs, the 60 fps viewport (with its 2048² shadow map)
 // competes with it for the GPU. Throttle to ~10 fps unless the user is
@@ -2235,6 +2495,10 @@ let lastRenderTime = 0, lastViewportInput = 0
 for (const type of ['pointerdown', 'pointermove', 'wheel', 'keydown']) {
   renderer.domElement.addEventListener(type, () => { lastViewportInput = performance.now() }, { passive: true })
 }
+// 作用：requestAnimationFrame 渲染循环。
+// 步骤 1：引擎运行且用户近期无视口输入时，按 RUNNING_FRAME_INTERVAL_MS 降帧。
+// 步骤 2：动画步长 deltaSeconds 限幅到 [0, 0.1] s，避免切回页面后动画跳变。
+// 步骤 3：更新控制器、场景动态对象、巡航动画、选中框，渲染主场景与结果查看器，并统计 FPS。
 function animate(now) {
   requestAnimationFrame(animate)
   if (state.running && now - lastViewportInput > VIEWPORT_INTERACTION_GRACE_MS &&
@@ -2251,18 +2515,24 @@ function animate(now) {
 requestAnimationFrame(animate)
 
 // 属性面板
+// 属性面板：各面板 id 对应的标题；以下是生成面板 HTML 的小工具函数（返回 HTML 字符串，t() 为界面翻译）。
 const panelTitles = { scene: '场景', light: '太阳与天空', sensor: '传感器', objects: '场景对象', materials: '材质属性', atmosphere: '大气影响', meteorology: '气象驱动', fluid: '流体力学', simulation: '仿真模拟', 'shared-geo': '地理与时间', 'shared-dem': 'DEM 地形' }
 function inputUnit(id, value, unit, attrs = '') { return `<div class="input-with-unit"><input class="input" id="${id}" value="${escapeHtml(value)}" ${attrs}><span>${unit}</span></div>` }
 function field(label, content) { return `<div class="field"><label>${t(label)}</label>${content}</div>` }
 function switchRow(label, id, on, disabled = false) { return `<div class="switch-row"><span>${t(label)}</span><button type="button" class="switch ${on ? 'on' : ''}" id="${id}" role="switch" aria-checked="${on}" ${disabled ? 'disabled' : ''}></button></div>` }
 function builtinNotice() { return state.inputPath ? '' : '<div class="property-group"><div class="notice">尚未打开工程。请点击“打开工程”，选择已有工程的 project.json。</div></div>' }
 
+// 作用：生成材质库中一张卡片的 HTML；values 为 [名称, 值] 列表，kind/index 写入 data 属性供点击编辑，
+// 并把标题与参数拼成小写搜索串写入 data-library-search（筛选框使用）。
 function libraryCard(title, subtitle, values, kind, index) {
   const detail = values.map(([key, value]) => `${key}: ${value}`).join('；')
   const search = `${title} ${subtitle} ${detail}`.toLowerCase()
   return `<button class="library-card" type="button" data-library-search="${escapeHtml(search)}" data-preset-kind="${kind}" data-preset-index="${index}" title="点击修改 · ${escapeHtml(`${title} · ${subtitle}\n${detail}`)}"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(subtitle)}</small><div class="library-values">${values.map(([key, value]) => `<span><i>${escapeHtml(key)}</i>${escapeHtml(value)}</span>`).join('')}</div></button>`
 }
 
+// 作用：把“物化属性”预设（item）转成卡片展示的 [名称, 值] 列表。
+// 说明：按 energyModel（光伏/木质/薄膜）与 type（植被/水体/船舶/载具/其他）分支；
+// 墙体厚度 0.2 m、室内 22 ℃、h=8、水侧 h=500、座舱 0.5 ACH 等缺省值仅用于界面显示（待核对是否与引擎一致）。
 function physicalValues(item) {
   const p = item.params || {}
   if (item.energyModel === 'photovoltaic') return [['模型','光伏热电耦合'],['参考效率',p.eta25],['温度系数',p.gamma],['背面系数',p.bifaciality],['面热容',p.heatCapacityPerArea],['对流倍率',p.convectiveScale]]
@@ -2282,6 +2552,7 @@ function physicalValues(item) {
     ...(item.type === 'Vehicle' && p.vehiclePart === 'body' && p.cabin ? [['座舱', p.cabin.enabled ? `开启，${p.cabin.occupants ?? 0} 人，车速 ${p.cabin.speed ?? 0} m/s，通风 ${p.cabin.ventilationACH ?? 0.5} ACH${p.cabin.acOn ? `，空调 ${p.cabin.acPower ?? 3500} W/${p.cabin.acSetpoint ?? 24} ℃` : ''}${p.cabin.engineOn ? '，发动机开' : ''}` : '关闭']] : [])]
 }
 
+// 判断船舶参数是否“已给定”（非空且为有限数）；未给定则按场景水体/缺省处理。
 function shipValueGiven(value) { return value !== undefined && value !== null && value !== '' && Number.isFinite(Number(value)) }
 
 // Mirrors withLeafAngles in models/histream/src/base/compo.cpp: how VoxelRT /
@@ -2300,6 +2571,7 @@ function canopyLeafAngleMode(item = {}) {
   return Math.abs(a) + Math.abs(b) > 1 + 1e-6 ? 'invalid' : 'lidf'
 }
 
+// 结构参数面板中 G 值的说明文字，键对应 canopyLeafAngleMode 的返回值。
 const CANOPY_G_HINTS = Object.freeze({
   lidf: 'G 由叶倾角分布 LIDFa/LIDFb（SAIL 13 区间）按方向推导，消光与叶片散射相函数一致；上面的 G 值仅保留，不参与计算。',
   spherical: 'LIDFa > 1 表示精确球形叶倾角分布：G = 0.5，使用 Ross 球形闭式；上面的 G 值不参与计算。',
@@ -2307,6 +2579,8 @@ const CANOPY_G_HINTS = Object.freeze({
   invalid: 'LIDFa/LIDFb 超出 SAIL 定义域（|a| + |b| ≤ 1），引擎回退为上面的常数 G 与球形形状相函数。'
 })
 
+// 作用：把结构参数（冠层/刚体/火焰/雾）预设转成卡片展示的 [名称, 值] 列表。
+// 说明：火焰与雾显示消光、散射率等介质参数；冠层按 canopyLeafAngleMode 决定 G 显示为 LIDF/球形/常数。
 function canopyValues(item) {
   const labels = { canopy: '混沌介质', rigid: '刚体', fire: '火焰', fog: '雾' }
   if (item.structureType === 'fire' || item.structureType === 'fog') return [
@@ -2323,10 +2597,13 @@ function canopyValues(item) {
   ]
 }
 
+// 作用：材质库分组标题（含数量、筛选输入框与“新增”按钮）的 HTML。
 function libraryHeading(title, count, kind) {
   return `<div class="library-heading"><h3>${escapeHtml(title)} · ${count}</h3><div class="library-actions"><input class="input library-filter" data-library-filter="${kind}" placeholder="筛选 ${escapeHtml(title)}"><button class="button ghost library-add" type="button" data-preset-kind="${kind}"><svg><use href="#i-plus"/></svg>新增</button></div></div>`
 }
 
+// 作用：拼出“材质属性”面板：光谱特征、温度特征、结构参数、物化属性四组预设卡片。
+// 输入：工程配置 c（spectra/thermals/canopies/materials）；点击卡片编辑，保存后写回 project.json。
 function materialLibraryHtml(c) {
   const previewLabels = Object.fromEntries(PREVIEW_TEXTURE_PRESETS)
   const spectra = c.spectra.map((item, index) => libraryCard(item.label || item.name, `${item.name} · ${item.model}`, [['反射率', item.reflectance], ['透射率', item.transmittance], ['TIR反射', item.refTir], ...(item.physicalTexture?.enabled ? [['物理纹理', Number(item.physicalTexture.relativeStd) > 0 ? `CV ${item.physicalTexture.relativeStd}` : `强度 ${item.physicalTexture.strength}`]] : []), ...(Number(item.openness) > 0 ? [['开孔率', item.openness]] : []), ...(item.classTexture?.enabled ? [['分类纹理', `${item.classTexture.classes.filter((entry) => entry.spectralName).length} 类`]] : []), ...(item.opennessTexture?.enabled ? [['开孔纹理', `${item.opennessTexture.minOpenness}–${item.opennessTexture.maxOpenness}`]] : []), ['预览', item.previewTexture?.enabled ? (previewLabels[item.previewTexture.preset] || item.previewTexture.preset) : '关闭']], 'spectrum', index)).join('')
@@ -2337,13 +2614,19 @@ function materialLibraryHtml(c) {
   return `<div class="property-group">${libraryHeading('光谱特征', c.spectra.length, 'spectrum')}<div class="library-list" data-library-list="spectrum">${spectra}</div></div><div class="property-group">${libraryHeading('温度特征', c.thermals.length, 'thermal')}<div class="library-list" data-library-list="thermal">${thermals}</div></div><div class="property-group">${libraryHeading('结构参数', c.canopies.length, 'canopy')}<div class="library-list" data-library-list="canopy">${canopies}</div></div><div class="property-group">${libraryHeading('物化属性', c.materials.length, 'physical')}<div class="library-list" data-library-list="physical">${materials}</div></div><div class="property-group"><div class="notice">点击任一属性可直接修改；保存后同步更新当前工程的 project.json。</div></div>`
 }
 
+// 是否面元模式（FacetRT 或 FacetEB）；面元与体元使用不同的计算后端字段与 GPU 编号。
 function isFacetMode(mode = state.mode) { return mode === 'eFacetRT' || mode === 'eFacetEB' }
 
+// 作用：取当前模式对应的后端（面元用 facetBackend，体元用 computeBackend）；仅识别 cpu/auto，其余一律视为 gpu。
 function selectedBackend(control) {
   const value = isFacetMode() ? control.facetBackend : control.computeBackend
   return ['cpu', 'auto'].includes(value) ? value : 'gpu'
 }
 
+// 作用：刷新左侧“计算设备”下拉框与 CPU 线程数/提示文字。
+// 输入：state.config.control（后端、gpu 序号、cpuThreads）、state.devices（设备检测报告）。
+// 说明：面元模式与体元模式使用不同的 GPU 编号（facetIndex / voxelIndex），
+// 编号为负表示该 GPU 不满足对应模式要求，只显示为禁用项。
 function renderComputeDevices() {
   const select = $('#computeDevice')
   const control = state.config?.control
@@ -2363,11 +2646,13 @@ function renderComputeDevices() {
   for (const gpu of (report?.gpus || []).filter((item) => item[indexKey] < 0)) {
     options.push({ value: '', label: `${gpu.name}（${facet ? t('不满足面元 GPU 要求') : t('不支持硬件光线追踪')}）`, disabled: true })
   }
+  // CPU 与“自动”（GPU 不可用时回退 CPU）两个固定选项；体元 CPU 版经 Mesa lavapipe 软件 Vulkan，面元 CPU 版为原生多线程栅格。
   options.push({ value: 'cpu', label: facet ? `CPU · ${t('原生多线程栅格')}` : `CPU · Mesa lavapipe${report && !report.cpu?.lavapipe ? `（${t('驱动未就绪')}）` : ''}` })
   options.push({ value: 'auto', label: `${t('自动')} · GPU ${gpuIndex}，${t('不可用时回退 CPU')}` })
   select.innerHTML = options.map((item) => `<option value="${item.value}"${item.disabled ? ' disabled' : ''}>${escapeHtml(item.label)}</option>`).join('')
   select.value = backend === 'gpu' ? `gpu:${gpuIndex}` : backend
   $('#cpuThreadsRow').hidden = backend === 'gpu'
+  // CPU 线程数不超过本机逻辑处理器数；体元 CPU（lavapipe）实际最多用 lavapipeThreadLimit（缺省 32）个线程，超出时在提示里说明。
   const processors = report?.logicalProcessors
   const threads = processors ? Math.min(normalizeCpuThreads(control.cpuThreads), processors) : normalizeCpuThreads(control.cpuThreads)
   $('#cpuThreads').max = String(processors || 1024)
@@ -2384,7 +2669,9 @@ function renderComputeDevices() {
   $('#computeDeviceHint').textContent = hint
 }
 
+// 设备检测请求序号：只接受最近一次请求的结果，丢弃过期的异步返回。
 let deviceRequest = 0
+// 作用：向后端请求计算设备报告（refresh=true 强制重新检测），完成后重绘设备下拉框。
 async function loadComputeDevices(refresh = false) {
   const request = ++deviceRequest
   state.devicesLoading = true; state.devicesError = ''; renderComputeDevices()
@@ -2397,6 +2684,8 @@ async function loadComputeDevices(refresh = false) {
   renderComputeDevices()
 }
 
+// 作用：在体元模式与面元模式之间切换时，把已选 GPU 换成另一套编号下的同一块物理 GPU，
+// 避免两套编号不一致导致选到别的设备；找不到对应设备时保持原值。
 function remapGpuIndex(previousMode, nextMode) {
   const control = state.config?.control
   const facetModes = ['eFacetRT', 'eFacetEB']
@@ -2411,6 +2700,13 @@ function remapGpuIndex(previousMode, nextMode) {
   }
 }
 
+// 作用：按当前面板 state.panel 重新生成右侧属性面板 HTML，写入 #inspectorContent 并绑定事件。
+// 输入：state.config（缺省用 defaultConfig()）、state.mode、state.panel。
+// 结构：先算若干共用片段（DEM 信息、背景属性），再按面板分支拼 html：
+//   shared-geo 地理与时间 / shared-dem DEM 地形 / scene 场景 / light 太阳与天空 / sensor 传感器 /
+//   objects 场景对象 / materials 材质 / atmosphere 大气 / meteorology 气象 / fluid 流体 /
+//   其余（simulation 仿真模拟）。
+// 说明：部分分支会就地给 c.* 补缺省对象（terrainEnvironment、atmosphere、fluid），属兼容旧工程的惰性初始化。
 function renderInspector() {
   renderComputeDevices()
   const c = state.config || defaultConfig()
@@ -2422,6 +2718,7 @@ function renderInspector() {
   const sceneOffsetX = Number(c.scene.offsetX) || 0
   const sceneOffsetY = Number(c.scene.offsetY) || 0
   const sceneOffsetZ = Number(c.scene.offsetZ) || 0
+  // DEM 高差超过场景最大高度时给出警告，提示用户增大“最大高度”。
   const demReliefWarning = dem && Number(dem.relief) > Number(c.scene.height)
     ? `<div class="notice warning">高差 ${demNumber(dem.relief)} m 超过场景最大高度 ${demNumber(c.scene.height)} m，请增大最大高度。</div>` : ''
   const demMetadata = dem ? `<div class="metric-grid"><div class="metric"><strong>${escapeHtml(dem.width)} × ${escapeHtml(dem.height)}</strong><small>栅格列 × 行</small></div><div class="metric"><strong>${escapeHtml(demPixelSize)}</strong><small>像元大小</small></div><div class="metric"><strong>${demNumber(dem.minimum)}–${demNumber(dem.maximum)} m</strong><small>最低–最高高程</small></div><div class="metric"><strong>${dem.noData == null ? '未设置' : demNumber(dem.noData)}</strong><small>NoData</small></div></div><div class="notice">整幅 DEM 自动双线性拉伸至 ${demNumber(c.scene.x)} × ${demNumber(c.scene.y)} m 场景范围。</div>${demReliefWarning}` : ''
@@ -2433,6 +2730,8 @@ function renderInspector() {
   if (state.panel === 'shared-geo') {
     html = `<div class="property-group"><h3>站点位置</h3>${field('纬度', inputUnit('meteoLatitude', c.meteo.latitude, '°', 'type="number" min="-90" max="90" step="0.0001"'))}${field('经度', inputUnit('meteoLongitude', c.meteo.longitude, '°', 'type="number" min="-180" max="180" step="0.0001"'))}${field('时区', inputUnit('meteoTimezone', c.meteo.timezone, 'UTC±h', 'type="number" min="-12" max="14" step="0.25"'))}${field('年份', inputUnit('meteoYear', c.meteo.year, '年', 'type="number" min="-2000" max="6000" step="1"'))}<div class="notice">气象文件中的年积日按此年份和当地时区解释，用于计算太阳位置。</div></div>${sharedNotice}${builtinNotice()}`
   } else if (state.panel === 'shared-dem') {
+    // 分支 shared-dem：DEM 地形开关/导入与“地形水热经验场（VoxelEB）”参数，
+    // 参数存于 c.scene.terrainEnvironment；经验公式见面板内说明文字。
     const environment = c.scene.terrainEnvironment || (c.scene.terrainEnvironment = normalizeTerrainEnvironment())
     const environmentFields = (rows) => rows.map(([key, label, unit, attributes]) =>
       field(label, inputUnit(`terrainEnv_${key}`, environment[key], unit, `type="number" ${attributes || 'step="any"'}`))).join('')
@@ -2455,12 +2754,18 @@ function renderInspector() {
     </div>`
     html = `<div class="property-group"><h3>DEM 地形</h3>${switchRow('启用 DEM 地形', 'terrainSwitch', c.scene.terrain)}${c.scene.demFile ? `<div class="path-input"><span title="${escapeHtml(c.scene.demFile)}">${escapeHtml(c.scene.demFile)}</span></div>` : ''}${demMetadata}<label class="button ghost" for="demFile" style="width:100%;justify-content:center;margin-top:9px"><svg><use href="#i-import"/></svg>导入 DEM 文件<input id="demFile" type="file" accept=".tif,.tiff,.asc,image/tiff,text/plain" hidden></label></div><div class="property-group"><div class="notice">DEM 用于三维地形网格。</div></div>${environmentPanel}${sharedNotice}${builtinNotice()}`
   } else if (state.panel === 'scene') {
+    // 分支 scene：空间范围、计算域偏移与背景属性。注意界面坐标：X 向北、Z 向东、Y 向上，
+    // 而 c.scene.x/y/height 分别对应 X 尺寸、Z 尺寸（东西）、Y 最大高度。
     const domainNotice = `Three.js 显示全部实例；运行时跳过完整 OBJ 包围盒与计算域 X=[${formatSceneDimension(sceneOffsetX)}, ${formatSceneDimension(sceneOffsetX + Number(c.scene.x))}]、Y=[${formatSceneDimension(sceneOffsetY)}, ${formatSceneDimension(sceneOffsetY + Number(c.scene.height))}]、Z=[${formatSceneDimension(sceneOffsetZ)}, ${formatSceneDimension(sceneOffsetZ + Number(c.scene.y))}] m 无交集的实例；跨界对象仅计算域内部分。`
     html = `<div class="property-group"><h3>空间范围</h3>${field('X 尺寸（南北）', inputUnit('sceneX', c.scene.x, 'm', 'type="number" min="1"'))}${field('Z 尺寸（东西）', inputUnit('sceneY', c.scene.y, 'm', 'type="number" min="1"'))}${field('Y 最大高度', inputUnit('sceneHeight', c.scene.height, 'm', 'type="number" min="0.1"'))}${field('体元大小', inputUnit('voxelSize', c.scene.voxel, 'm', 'type="number" min="0.1" step="0.1"'))}${field('OBJ填充阈值', inputUnit('voxelFillThreshold', c.scene.voxelFillThreshold, '0–1', 'type="number" min="0" max="1" step="0.01"'))}<div class="notice">统一方向：+X 向北、−X 向南；+Y 向上；+Z 向东、−Z 向西。OBJ、Three.js 与计算引擎采用同一约定；方位角 0° 向北、90° 向东；平行投影固定上北、右东，中心投影保持天空向上和地平线水平。</div></div><div class="property-group"><h3>计算域偏移</h3>${field('X 偏移（北向）', inputUnit('sceneOffsetX', sceneOffsetX, 'm', 'type="number" step="any"'))}${field('Y 偏移（高度）', inputUnit('sceneOffsetY', sceneOffsetY, 'm', 'type="number" step="any"'))}${field('Z 偏移（东向）', inputUnit('sceneOffsetZ', sceneOffsetZ, 'm', 'type="number" step="any"'))}<div class="notice">${domainNotice}</div></div>${backgroundPanel}${builtinNotice()}`
   } else if (state.panel === 'light') {
+    // 分支 light：太阳位置与辐照条件。EB 模式显示气象短波直散拆分；
+    // RT 模式显示地表水平短波总辐照（仅影响热红外波段的太阳反射绝对量）。
     html = `<div class="property-group"><h3>太阳位置</h3>${field('太阳天顶角', inputUnit('sunZenith', c.light.zenith, '°', 'type="number" min="0" max="90"'))}${field('太阳方位角', inputUnit('sunAzimuth', c.light.azimuth, '°', 'type="number" min="0" max="360"'))}</div>
       <div class="property-group"><h3>辐照条件</h3>${field('直射比例', `<div class="range-wrap"><input class="range" id="directLight" type="range" min="0" max="1" step="0.01" value="${c.light.direct}"><span class="range-value" id="directValue">${c.light.direct.toFixed(2)}</span></div>`)}${field('漫射比例', `<div class="range-wrap"><input class="range" id="diffuseLight" type="range" min="0" max="1" step="0.01" value="${c.light.diffuse}"><span class="range-value" id="diffuseValue">${c.light.diffuse.toFixed(2)}</span></div>`)}${field('天空温度', inputUnit('skyTemperature', c.light.skyTemperature, 'K', 'type="number"'))}<div class="notice">HiStream 自动令漫射比例 = 1 − 直射比例。</div>${['eVoxelEB', 'eFacetEB'].includes(state.mode) ? `${field('气象短波直散拆分', `<select class="select" id="diffuseFractionMode"><option value="erbs" ${c.light.diffuseFractionMode === 'erbs' ? 'selected' : ''}>逐节点（实测列或 Erbs 模型）</option><option value="fixed" ${c.light.diffuseFractionMode !== 'erbs' ? 'selected' : ''}>固定为上面的直射比例（旧工程兼容）</option></select>`)}<div class="notice">逐节点：气象文件第 8、9 列给出水平直射与散射短波（W/m²）时按其比例拆分 Rin；否则由 Rin 与大气顶辐照（太阳天顶角、日地距离）求晴空指数 kt，按 Erbs (1982) 求散射份额（晴天正午 kt≈0.75 时散射约 0.18）；夜间与太阳高度 < 1° 全部按漫射。固定：全时段用直射比例。运行日志每个节点打印所用直射份额（SHORTWAVE_SPLIT）。</div>` : ''}${['eRaytracing', 'eVoxelRT', 'eFacetRT'].includes(state.mode) ? `${field('地表水平短波总辐照', inputUnit('shortwaveIrradiance', c.light.shortwaveIrradiance ?? 0, 'W/m²', 'type="number" min="0" max="2000" step="10"'))}<div class="notice">只用于 2.5–6 µm 热红外波段的太阳反射绝对量（按上面的直射/漫射比例拆分）；0 = 默认（${state.mode === 'eFacetRT' ? '700·cosθs + 50 W/m²' : '晴空 Haurwitz 公式'}）。可见光–短波红外输出是归一化反射率，不受影响。</div>` : ''}</div>${builtinNotice()}`
   } else if (state.panel === 'sensor') {
+    // 分支 sensor：观测方向、采样方式、成像参数；中心投影时额外显示位置/视场角/航点巡航。
+    // 步骤 1：预览巡航位置（最多 8 个；更多时只列前 5 个和最后 2 个，中间用省略号）。
     const perspective = c.sensor.projection === 'perspective'
     updateCruiseVisualization(c)
     const cruisePositions = perspective && c.sensor.cruiseEnabled ? sensorCruisePositions(c.sensor, c.scene) : []
@@ -2474,6 +2779,7 @@ function renderInspector() {
           return `${separator}P${index + 1} · X/Y/Z (${demNumber(point.x)}, ${demNumber(point.z)}, ${demNumber(point.y)}) m`
         }).join('　')}</div>`
       : ''
+    // 步骤 2：按巡航轨迹类型（直线往返/中心矩形/随机）生成各自的输入项，未知值回退为 line。
     const cruiseRoute = ['line', 'rectangle', 'random'].includes(c.sensor.cruiseRoute) ? c.sensor.cruiseRoute : 'line'
     const cruiseRouteOptions = `<select class="input" id="sensorCruiseRoute"><option value="line" ${cruiseRoute === 'line' ? 'selected' : ''}>直线往返</option><option value="rectangle" ${cruiseRoute === 'rectangle' ? 'selected' : ''}>中心矩形</option><option value="random" ${cruiseRoute === 'random' ? 'selected' : ''}>随机飞行</option></select>`
     const cruiseRouteFields = cruiseRoute === 'line'
@@ -2488,6 +2794,7 @@ function renderInspector() {
     const projectionFields = perspective
       ? `${field(cruiseRoute === 'rectangle' && c.sensor.cruiseEnabled ? '矩形中心 X（北向）' : '起始位置 X（北向）', inputUnit('sensorPositionX', c.sensor.positionX, 'm', 'type="number"'))}${field(cruiseRoute === 'rectangle' && c.sensor.cruiseEnabled ? '矩形中心 Z（东向）' : '起始位置 Z（东向）', inputUnit('sensorPositionY', c.sensor.positionY, 'm', 'type="number"'))}${field(sensorHeightLabel, inputUnit('sensorHeight', c.sensor.height, 'm', 'type="number" min="0.01"'))}${field('垂直视场角', inputUnit('sensorFov', c.sensor.fov, '°', 'type="number" min="0.1" max="120" step="0.1"'))}${switchRow('启用航点巡航', 'sensorCruiseSwitch', c.sensor.cruiseEnabled)}${cruiseFields}<div class="notice">视场方向见上方“观测方向”。</div>`
       : '<div class="notice">平行投影的观测方向与采样方式见上方“观测方向”。</div>'
+    // 步骤 3：统计输出波段数与平行投影的观测方向数，用于下面的说明文字。
     const bandCount = sensorBandValues(c.sensor).length
     const angleCount = perspective ? 1 : sensorViewAngles(c.sensor, c.light.azimuth).length
     const continuousFields = c.sensor.continuousBands
@@ -2500,6 +2807,8 @@ function renderInspector() {
       : `平行投影共 ${angleCount} 个观测方向。主平面批量范围为 −75°～75°、间隔 5°，同时包含太阳主平面和垂直太阳主平面；半球采用 128 个等面积方向并限制在 VZA 0°～75°。输出统一为上北、右东。`
     html = `<div class="property-group"><h3>观测方向</h3>${field('观测天顶角', inputUnit('viewZenith', c.sensor.vza, '°', 'type="number" min="0" max="89.999" step="any"'))}${field('观测方位角', inputUnit('viewAzimuth', c.sensor.vaa, '°', 'type="number" min="0" max="360" step="any"'))}<div class="notice">方位角从正北顺时针。平行投影按该方向成像；中心投影下它是视场指向（巡航时表示相对飞机方位角）。</div></div><div class="property-group"><h3>采样方式</h3>${switchRow('太阳主平面与垂直主平面', 'principalPlaneSwitch', c.sensor.principalPlane)}${switchRow('128 方向半球观测', 'hemisphereSwitch', c.sensor.hemisphere)}</div><div class="property-group"><h3>成像参数</h3>${field('图像分辨率', `<div class="input-row"><input class="input" id="sensorX" type="number" value="${escapeHtml(c.sensor.x)}"><input class="input" id="sensorY" type="number" value="${escapeHtml(c.sensor.y)}"></div>`)}${field('自定义波段 [nm]', `<input class="input" id="sensorBands" value="${escapeHtml(c.sensor.bands)}">`)}${switchRow('连续波段模拟', 'continuousBandsSwitch', c.sensor.continuousBands)}${continuousFields}<div class="notice">最终输出 ${bandCount} 个波段：连续与自定义波段合并、去重并按波长升序排列；最多 ${MAX_SENSOR_BANDS} 个波段。</div>${field('投影方式', `<select class="input" id="sensorProjection"><option value="parallel" ${perspective ? '' : 'selected'}>平行投影</option><option value="perspective" ${perspective ? 'selected' : ''}>中心投影</option></select>`)}${projectionFields}</div><div class="property-group"><div class="notice">${projectionNotice}</div></div>${builtinNotice()}`
   } else if (state.panel === 'objects') {
+    // 分支 objects：场景对象列表，分 OBJ 导入实体 / PRIM 原型几何 / 参与介质（火焰、雾）三组。
+    // objectCard 生成单个对象卡片；介质对象仅在 VoxelRT/VoxelEB 模式可新增。
     const objectCard = (item, index) => {
       const prim = isPrimObject(item)
       const meshBindings = (item.meshes || []).map((mesh) => `${mesh.name}: ${mesh.spectralName} / ${mesh.thermalName} / ${mesh.materialName || item.materialName} / ${mesh.canopyName || item.canopyName}`).join('；') || '无 Mesh 映射'
@@ -2530,6 +2839,7 @@ function renderInspector() {
   } else if (state.panel === 'materials') {
     html = materialLibraryHtml(c)
   } else if (state.panel === 'atmosphere') {
+    // 分支 atmosphere：MODTRAN 查找表（LUT）大气参数；未启用时输入项置灰。
     const atmosphere = c.atmosphere || (c.atmosphere = { enabled: false, model: 'midlatitude-summer', waterVapor: 2, aerosol: 'rural', visibility: 23, lutFile: 'assets/atmosphere/simple_modtran_lut.csv' })
     const disabled = atmosphere.enabled ? '' : 'disabled'
     html = `<div class="property-group"><h3>大气辐射传输</h3>${switchRow('启用 MODTRAN 查找表', 'atmosphereSwitch', atmosphere.enabled)}${field('大气类型', `<select class="select" id="atmosphereModel" ${disabled}><option value="tropical" ${atmosphere.model === 'tropical' ? 'selected' : ''}>热带大气</option><option value="midlatitude-summer" ${atmosphere.model === 'midlatitude-summer' ? 'selected' : ''}>中纬度夏季</option><option value="midlatitude-winter" ${atmosphere.model === 'midlatitude-winter' ? 'selected' : ''}>中纬度冬季</option></select>`)}${field('柱状水汽量 PWV', inputUnit('atmosphereWaterVapor', atmosphere.waterVapor, 'cm', `type="number" min="0.5" max="5" step="0.1" ${disabled}`))}${field('气溶胶类型', `<select class="select" id="atmosphereAerosol" ${disabled}><option value="rural" ${atmosphere.aerosol === 'rural' ? 'selected' : ''}>乡村型</option><option value="urban" ${atmosphere.aerosol === 'urban' ? 'selected' : ''}>城市型</option></select>`)}${field('能见度', inputUnit('atmosphereVisibility', atmosphere.visibility, 'km', `type="number" min="10" max="50" step="1" ${disabled}`))}<div class="notice">传感器高度和观测角度自动读取，参数在 LUT 节点间插值，覆盖 350–14000 nm。地表短波仅计算路径透过率衰减，不包含大气散射程辐射；热红外包含透过率和程辐射。视场中的天空像元按各自半球天顶角计算；启用时使用 LUT，关闭时使用简化经验天空模型。</div></div>${builtinNotice()}`
@@ -2539,6 +2849,7 @@ function renderInspector() {
       <div class="property-group"><h3>初始状态</h3>${field('初始土壤温度 Tsold', inputUnit('meteoSoilTemperature', c.meteo.Tsold, 'K', 'type="number" min="150" max="400" step="0.1"'))}${field('饱和含水量 SatWater', inputUnit('meteoSatWater', c.meteo.SatWater, '0–1', 'type="number" min="0" max="1" step="0.01"'))}<div class="notice">FacetEB 与 VoxelEB 都以此值（K）作为土壤初温；工程 JSON 中未写 Tsold 时，FacetEB 取首个气象节点气温、VoxelEB 取 300 K。饱和含水量以“材质属性 → 物化属性”的土壤参数为准。</div></div>
       <div class="property-group"><h3>驱动文件</h3><div class="path-input"><span title="${escapeHtml(c.meteo.path)}">${escapeHtml(c.meteo.path)}</span></div><label class="button ghost" for="meteoFile" style="width:100%;justify-content:center;margin-top:9px"><svg><use href="#i-import"/></svg>导入本地 meteo 文件<input id="meteoFile" type="file" accept=".txt,.meteo,.dat,.csv,text/plain" hidden></label><div class="notice">文件将复制到当前工程的 meteorology 目录，并写入 project.json。</div></div>${builtinNotice()}`
   } else if (state.panel === 'fluid') {
+    // 分支 fluid：D3Q19 LBM 流体力学参数，当前仅 VoxelEB 模式可用，缺省值写入 c.fluid。
     const fluid = c.fluid || (c.fluid = { enabled: false, voxelSize: Number(c.scene.voxel) || 1, timeStep: 5, pressureIterations: 20, windDirection: 0, buoyancy: 0.033, dragCoefficient: 0.3, thermalCoupling: 1, diffusivity: 0.1, smokeEmission: 0.02, maxVelocity: 30, outputWind: false, outputAirTemperature: false, outputHeight: 2 })
     if (state.mode !== 'eVoxelEB') {
       html = `<div class="property-group"><h3>流体力学</h3><div class="notice">流体力学当前只接入体元能量平衡（VoxelEB）。切换到“体元能量平衡”后，可设置风场、热浮力、树冠阻力以及地表换热。</div></div>${builtinNotice()}`
@@ -2550,11 +2861,14 @@ function renderInspector() {
         Number(c.scene.height) || 0,
         (Number(fluid.outputHeight) || 2) + spacing * 0.5
       )
+      // 流体网格尺寸估算：高度方向至少覆盖场景高度与输出高度 + 半个体元；
+      // 显存估算按每单元 236 字节计（经验值，待核对来源）。
       const gridX = Math.max(1, Math.ceil(Number(c.scene.x) / spacing))
       const gridY = Math.max(1, Math.ceil(fluidHeight / spacing))
       const gridZ = Math.max(1, Math.ceil(Number(c.scene.y) / spacing))
       const cellCount = gridX * gridY * gridZ
       const memoryMb = cellCount * 236 / 1048576
+      // 输出高度落到的流体体元层号，并换算为该层中心高度（实际输出高度）。
       const outputLayer = Math.max(0, Math.min(gridY - 1, Math.floor((Number(fluid.outputHeight) || 2) / spacing)))
       const resolvedOutputHeight = (outputLayer + 0.5) * spacing
       html = `<div class="property-group"><h3>求解器 · D3Q19 LBM</h3>${switchRow('启用流体力学', 'fluidSwitch', fluid.enabled)}${field('流体体元大小', inputUnit('fluidVoxelSize', spacing, 'm', `type="number" min="0.1" step="0.1" ${disabled}`))}<div class="metric-grid"><div class="metric"><strong>${gridX} × ${gridY} × ${gridZ}</strong><small>空气网格 X × 高 × Y</small></div><div class="metric"><strong>${cellCount.toLocaleString('zh-CN')}</strong><small>空气单元</small></div><div class="metric"><strong>${memoryMb < 1 ? memoryMb.toFixed(2) : memoryMb.toFixed(1)} MB</strong><small>流体状态估算显存</small></div></div><div class="notice">流体采用 D3Q19 BGK 格子玻尔兹曼方法；分布函数、风速、气温和烟雾使用独立稠密网格，辐射传输与能量平衡仍使用场景体元。调大流体体元可显著降低显存占用。</div></div>
@@ -2564,6 +2878,8 @@ function renderInspector() {
         <div class="property-group"><h3>高度切片输出</h3>${field('输出高度', inputUnit('fluidOutputHeight', fluid.outputHeight, 'm', `type="number" min="0.1" step="0.1" ${disabled}`))}${switchRow('输出风速 GeoTIFF', 'fluidWindOutputSwitch', Boolean(fluid.outputWind), !fluid.enabled)}${switchRow('输出气温 GeoTIFF', 'fluidTemperatureOutputSwitch', Boolean(fluid.outputAirTemperature), !fluid.enabled)}<div class="notice">填写高度会定位到对应流体体元；当前实际输出体元中心约为 ${resolvedOutputHeight.toFixed(2)} m。两个文件均按气象时间节点输出到 output 目录。风速文件包含水平风速大小、X 分量、垂直分量和 Y 分量；气温文件单位为 ℃。建筑内部按固体处理，在风速和气温图中写为 NoData。默认均不输出。</div></div>${builtinNotice()}`
     }
   } else {
+    // 分支 simulation（其余面板）：输出选项、计算控制（采样/深度/周期边界/求解方法）、
+    // RT–EB 耦合参数与温度模拟方法；各控件只在对应模式下出现。
     const energyBalanceOutput = state.mode === 'eFacetEB' || state.mode === 'eVoxelEB'
     const imageOutputLabel = energyBalanceOutput ? '逐时间输出图像' : '输出图像'
     const processOutputNotice = energyBalanceOutput
@@ -2587,6 +2903,7 @@ function renderInspector() {
         : state.mode === 'eVoxelEB'
           ? `${field('体元射线步数上限', `<input class="input" id="radiationMaxSteps" type="number" min="16" max="4096" step="16" value="${escapeHtml(c.control.radiationMaxSteps ?? 64)}">`)}${field('短波散射阶数', `<select class="select" id="shortwaveScatteringOrders">${[[1, '1 阶（快速档）'], [2, '2 阶（标准档）'], [3, '3 阶（高精度档）']].map(([value, label]) => `<option value="${value}" ${Number(c.control.shortwaveScatteringOrders ?? 1) === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`)}<div class="notice">步数上限约束短波、长波和成像射线的最大体元穿越数；运行后“运行质量”中若出现步数截断，应增大该值。显式散射阶数之外的高阶散射用光谱不变理论补偿，增加阶数可提高浓密冠层近红外吸收精度。</div>`
           : ''
+    // 周期穿透边界次数限幅到 0–20（0 = 关闭）；非数值按 0 处理。
     const configuredPeriodicCount = Math.max(0, Math.min(20, Math.round(
       Number.isFinite(Number(c.control.periodicTraversalCount))
         ? Number(c.control.periodicTraversalCount) : 0
@@ -2612,6 +2929,7 @@ function renderInspector() {
       : 'GPU / CPU / 自动及 CPU 线程数在左侧“计算设备”中选择。CPU 版通过 Mesa lavapipe 软件 Vulkan 驱动多线程执行与 GPU 相同的着色器和光线追踪算法，速度明显慢于 GPU，建议先用较少采样数试算。'}</div>`
     const couplingGeometry = state.mode === 'eFacetEB' ? '面元' : state.mode === 'eVoxelEB' ? '体元' : ''
     const spectralAcceleration = field('光谱加速宽度', inputUnit('spectralAccelerationWidth', c.control.spectralAccelerationWidth ?? 100, 'nm', 'type="number" min="1" max="1000" step="1"'))
+    // RT–EB 耦合说明：VoxelEB 与 FacetEB 的迭代上限和收敛判据不同，具体数值以下面文字为准（待核对与引擎一致）。
     const couplingNotice = state.mode === 'eVoxelEB'
       ? '默认100 nm。直射逐波段积分，漫射与多次散射按窗口内辐照度加权的平均光学属性求解。温度迭代由引擎自动控制（最多 50 次，逐步减小步长），收敛判据为全部体元能量残差 < 2 W/m²。大气稳定度选 Monin–Obukhov 时，按场景显热与地面柱 u* 在迭代中更新 Obukhov 长度（-5 ≤ z/L ≤ 1）并重算气动阻抗，同时要求 z/L 收敛；中性大气与旧版逐位一致。'
       : '默认100 nm。短波净辐射按窗口分别积分直射和漫射，并使用窗口加权光学属性求解后累加；最终影像对传感器选定波段逐个独立求解，不进行输出波段插值。收敛判据：能量残差 ≥ 2 W/m² 的面元 < 0.1%，且任一面元的温度等效残差 ≤ 0.5 K；未收敛节点会在运行质量中标出。'
@@ -2624,12 +2942,14 @@ function renderInspector() {
       : ''
     const coupling = couplingGeometry ? `<div class="property-group"><h3>${couplingGeometry} RT–EB 耦合</h3>${spectralAcceleration}${facetCouplingControls}<div class="notice">${couplingNotice}场景几何和${couplingGeometry}辐射结构只初始化一次。${state.mode === 'eFacetEB' ? '松弛系数默认 0.8；出现振荡（运行质量中迭代用满）时再调小。' : ''}</div></div>` : ''
     const temperatureMethods = energyBalanceOutput ? `<div class="property-group"><h3>温度模拟方法</h3>${field('土壤温度', `<select class="select" id="soilTemperatureMethod"><option value="0" ${c.control.soilTemperatureMethod === 0 ? 'selected' : ''}>0 · 瞬时能量平衡</option><option value="1" ${c.control.soilTemperatureMethod === 1 ? 'selected' : ''}>1 · 热惯性动态模型</option><option value="2" ${c.control.soilTemperatureMethod === 2 ? 'selected' : ''}>2 · 温度廓线传导模型（默认）</option></select>`)}${field('方法 1 热历史', `<select class="select" id="soilInertiaHistory"><option value="full" ${c.control.soilInertiaHistory === 'full' ? 'selected' : ''}>完整历史（8 节点 + 指数模态，新建默认）</option><option value="truncated" ${c.control.soilInertiaHistory !== 'full' ? 'selected' : ''}>仅最近 8 个节点（旧工程）</option></select>`)}${field('植被温度', `<select class="select" id="vegetationTemperatureMethod"><option value="0" ${c.control.vegetationTemperatureMethod === 0 ? 'selected' : ''}>经验法 · Ball–Berry</option><option value="1" ${c.control.vegetationTemperatureMethod === 1 ? 'selected' : ''}>机制法 · Farquhar</option></select>`)}<div class="notice">初始温度只作为求解初值；能量平衡各时刻均由所选方法动态更新。土壤方法会同步应用到全部土壤物化属性。</div></div>` : ''
+    // 拼装 simulation 面板：运行质量/时限 → 模拟产出 → 计算控制 → 温度方法 → RT–EB 耦合。
     html = `<div class="property-group"><h3>运行质量与时限</h3>${qualityPresetControl(c)}${runTimeoutControl(c)}</div><div class="property-group"><h3>模拟产出</h3>${switchRow(imageOutputLabel, 'imageSwitch', c.sensor.image)}${processOutputSwitches}${processOutputNotice}${switchRow('输出温度', 'temperatureSwitch', c.sensor.temperature)}${switchRow('输出反照率', 'albedoSwitch', c.sensor.albedo)}</div><div class="property-group"><h3>计算控制</h3>${depthControl}${samplingControl}${periodicBoundaryControl}${heterogeneousVoxelControl}${radiationSolverControl}${collisionOrdersControl}${backendNotice}</div>${temperatureMethods}${coupling}${builtinNotice()}`
   }
   $('#inspectorContent').innerHTML = html
   bindInspector()
 }
 
+// 作用：以当前工程配置重新载入实际场景对象，失败时写错误日志。
 function restoreActualScene() {
   loadActualScene(state.config).catch((error) => addLog(`恢复场景对象失败：${error.message}`, 'error'))
 }
@@ -2641,10 +2961,13 @@ const QUALITY_FIELD_LABELS = {
   radiationMaxSteps: () => '步数上限', couplingIterations: () => '耦合迭代'
 }
 
+// 作用：读取工程记录的质量档位；不是已知档位时视为 'custom'。
 function storedQualityPreset(c) {
   return QUALITY_PRESETS.includes(c.control?.qualityPreset) ? c.control.qualityPreset : 'custom'
 }
 
+// 作用：生成“运行质量”下拉框与各档参数摘要。
+// 说明：档位按模式分别写入参数；若当前模式参数与记录的档位不一致，则显示为“自定义”并提示重新选择。
 function qualityPresetControl(c) {
   const fields = qualityPresetFields(state.mode)
   if (!fields.length) return `<div class="notice">运行质量档位：当前模式（面元辐射传输）没有受档位管理的参数，切换到其他模式时按工程记录的档位写入。</div>`
@@ -2657,12 +2980,16 @@ function qualityPresetControl(c) {
   return `${field('运行质量', `<select class="select" id="qualityPreset">${options}</select>`)}<div class="notice">${summary}。选择档位只改写当前模式实际读取的参数；手动修改其中任一参数后显示为“自定义”。${state.mode === 'eVoxelEB' ? '标准档步数上限 = 场景对角线体元数 × 1.5，高精度档 = max(512, × 3)，取 16 的倍数；修改场景尺寸或体元大小时随之更新。' : ''}</div>${mismatch}`
 }
 
+// 作用：生成“单次运行上限”输入项（分钟）；留空或 0 使用服务端默认。
+// 单位：分钟（范围 1–1440，由 normalizeRunTimeoutMinutes 规范化）。
 function runTimeoutControl(c) {
   const minutes = normalizeRunTimeoutMinutes(c.control?.runTimeoutMinutes)
   const serverDefault = state.serverRunTimeoutSeconds ? formatDuration(state.serverRunTimeoutSeconds) : '15 分钟'
   return `${field('单次运行上限', inputUnit('runTimeoutMinutes', minutes || '', '分钟', `type="number" min="0" max="1440" step="1" placeholder="默认 ${escapeHtml(serverDefault)}"`))}<div class="notice">只计引擎执行时间，超过后终止运行并记为超时。留空或 0 使用服务端默认（当前 ${escapeHtml(serverDefault)}，可用环境变量 STREAM_STUDIO_RUN_TIMEOUT_MS 设置）；工程内可设 1–1440 分钟。</div>`
 }
 
+// 作用：用户选择质量档位（fast/standard/high）时，把该档在当前模式下的参数写入 c.control，
+// 记录档位名、写日志、同步 project.json 文本并重绘面板。
 function applyQualityPreset(preset) {
   const c = state.config
   if (!c || !['fast', 'standard', 'high'].includes(preset)) return
@@ -2715,12 +3042,17 @@ function followQualityPresetMode() {
 
 // Blank or non-numeric entries in a number field restore the previous value
 // instead of silently becoming 0 (Number('') === 0).
+// 作用：把输入框内容解析为有限数；空串或非数值返回 null（调用方据此恢复原值）。
 function finiteInputNumber(input) {
   const raw = String(input?.value ?? '').trim()
   const value = Number(raw)
   return raw !== '' && Number.isFinite(value) ? value : null
 }
 
+// 作用：给输入框 #id 绑定 change 事件，把值写回配置。
+// 参数：target(value) 写入配置；selector 为旧 XML 路径标识（updateXml 现已忽略参数，仅触发
+// 项目文本同步）；converter 把输入转为目标类型（兼作限幅）；rebuildScene 为真则重建实际场景。
+// 说明：空串/非有限值会恢复上一次有效值，避免 Number('') === 0 被静默写成 0。
 function bindValue(id, target, selector, converter = Number, rebuildScene = false) {
   const input = $(`#${id}`)
   if (!input) return
@@ -2741,6 +3073,7 @@ function bindValue(id, target, selector, converter = Number, rebuildScene = fals
   })
 }
 
+// 作用：给开关按钮 #id 绑定点击事件：取反配置值、更新按钮外观并同步工程文本。
 function bindSwitch(id, getter, setter, selector, rebuildScene = false) {
   const button = $(`#${id}`)
   button?.addEventListener('click', () => {
@@ -2749,16 +3082,25 @@ function bindSwitch(id, getter, setter, selector, rebuildScene = false) {
   })
 }
 
+// 传感器采样参数变化后的同步入口（目前等价于 syncProjectText，保留旧名）。
 function syncSensorSamplingXml() {
   syncProjectText()
 }
 
+// 作用：为 renderInspector 刚生成的面板控件绑定事件，把输入写回 state.config 并同步工程文本。
+// 说明：各面板的控件互斥存在，绑定函数对不存在的 id 直接忽略（$(...)? 判空）。
+// 分段：场景尺寸/偏移 → 计算控制 → 质量档位/超时 → 温度方法 → 流体 → DEM 地形环境 →
+// 大气 → 背景 → 太阳/辐照 → 传感器 → 观测方向与输出选项。
+// 范围限幅：多数 converter 给出限幅与缺省值（如 rayDepth 1–16、sampleCount 1–1024）。
 function bindInspector() {
   const c = state.config
   if (!c) return
   // DEFERRED[中|Bug]: sceneX/sceneY/sceneHeight/voxelSize/rayDepth/couplingIterations/sensorX/sensorY 等只校验“有限数”，不校验 min（HTML min 属性不阻止 change 提交），0 或负值会写进 project.json 交给引擎（体元 0 m、分辨率 0、尺寸负数）；预览侧 generateWorld 用 Math.max 兜底掩盖了问题；建议：为这些字段传入带下限/取整的 converter，与 project-schema 的 normalize 规则保持一致 —— bindValue 已能拦住空串/非有限值（回退原值），但“下限”需要为每个字段新增数值约束并与服务端 normalize 对齐，本轮禁止新增/修改数值常量
+  // 场景尺寸与体元大小：修改后需重建场景，并让 VoxelEB 的步数上限随质量档位重算。
   bindValue('sceneX', (v) => followQualityPresetScene(() => c.scene.x = v), 'Scene sceneSizeX', Number, true); bindValue('sceneY', (v) => followQualityPresetScene(() => c.scene.y = v), 'Scene sceneSizeY', Number, true)
   bindValue('sceneHeight', (v) => followQualityPresetScene(() => c.scene.height = v), 'Scene Height', Number, true); bindValue('voxelSize', (v) => followQualityPresetScene(() => c.scene.voxel = v), 'Scene voxelSize'); bindValue('voxelFillThreshold', (v) => c.scene.voxelFillThreshold = Math.min(1, Math.max(0, v)), 'Scene voxelFillThreshold')
+  // 计算域偏移：输入过程中实时更新边界辅助框，并用 280 ms 防抖重建实际场景；
+  // change 提交时取消待执行的防抖（bindValue 已做完整重建）。
   for (const [id, key] of [['sceneOffsetX', 'offsetX'], ['sceneOffsetY', 'offsetY'], ['sceneOffsetZ', 'offsetZ']]) {
     bindValue(id, (value) => c.scene[key] = value, `Scene ${key}`, Number, true)
     $(`#${id}`)?.addEventListener('input', (event) => {
@@ -2787,6 +3129,7 @@ function bindInspector() {
     previewOnNextFrame('sceneBounds', () => { updateSceneBoundsGuide(c); updateSun(c) })
     scheduleProjectTextSync()
   })
+  // 计算控制：各深度/采样/阶数字段限幅并带缺省值；改动受管参数时 markQualityCustom 把档位记为“自定义”。
   bindValue('rayDepth', (v) => c.control.depth = Math.max(1, Math.min(16, Math.round(v))), 'Control rayTracingDepth', (value) => Math.max(1, Math.min(16, Math.round(Number(value) || 4))))
   bindValue('raytracingDepth', (v) => { c.control.raytracingDepth = v; markQualityCustom('raytracingDepth') }, 'Control raytracingDepth', (value) => Math.max(1, Math.min(64, Math.round(Number(value) || 16))))
   bindValue('radiationMaxSteps', (v) => { c.control.radiationMaxSteps = v; markQualityCustom('radiationMaxSteps') }, 'Control radiationMaxSteps', (value) => Math.max(16, Math.min(4096, Math.round(Number(value) || 64))))
@@ -2806,6 +3149,7 @@ function bindInspector() {
   bindValue('voxelCollisionOrders', (v) => { c.control.voxelCollisionOrders = v; markQualityCustom('voxelCollisionOrders') }, 'Control voxelCollisionOrders', (value) => Math.max(2, Math.min(5, Math.round(Number(value)) || 2)))
   bindValue('radiationSolver', (v) => c.control.radiationSolver = v, 'Control radiationSolver', (value) => value === 'accelerated' ? 'accelerated' : 'traditional')
   bindValue('couplingIterations', (v) => { c.control.couplingIterations = v; markQualityCustom('couplingIterations') }, 'Control couplingIterations')
+  // 质量档位与单次运行上限。
   $('#qualityPreset')?.addEventListener('change', (event) => applyQualityPreset(event.target.value))
   // 留空或 0 = 服务端默认；其他值取整并限制在 1–1440 分钟。
   $('#runTimeoutMinutes')?.addEventListener('change', (event) => {
@@ -2817,6 +3161,7 @@ function bindInspector() {
     syncProjectText()
     addLog(minutes ? `单次运行上限设为 ${minutes} 分钟` : '单次运行上限恢复为服务端默认')
   })
+  // RT–EB 耦合与温度方法：光谱加速宽度限幅 1–1000 nm；土壤方法同时写入所有 Soil 物化属性的 params.method。
   bindValue('spectralAccelerationWidth', (v) => c.control.spectralAccelerationWidth = Math.max(1, Math.min(1000, v)), 'Control spectralAccelerationWidth', (value) => Math.max(1, Math.min(1000, Number(value) || 100)))
   bindValue('temperatureTolerance', (v) => c.control.temperatureTolerance = v, 'Control temperatureTolerance')
   bindValue('temperatureRelaxation', (v) => c.control.temperatureRelaxation = v, 'Control temperatureRelaxation')
@@ -2827,6 +3172,8 @@ function bindInspector() {
   }, 'Control soilTemperatureMethod', (value) => Math.max(0, Math.min(2, Math.round(Number(value) || 0))))
   bindValue('soilInertiaHistory', (v) => { c.control.soilInertiaHistory = v }, 'Control soilInertiaHistory', (value) => value === 'full' ? 'full' : 'truncated')
   bindValue('vegetationTemperatureMethod', (v) => c.control.vegetationTemperatureMethod = Math.max(0, Math.min(1, Math.round(v))), 'Control vegetationTemperatureMethod', (value) => Math.max(0, Math.min(1, Math.round(Number(value) || 0))))
+  // 流体力学参数：数值各自限幅（如最大速度 0.1–200 m/s、时间步 0.1–60 s）；
+  // 风向规范到 [0, 360) °。fluidPressureIterations 在当前面板中没有对应输入框（疑似旧版残留，待核对）。
   const fluid = c.fluid || (c.fluid = {})
   $('#fluidSwitch')?.addEventListener('click', () => {
     fluid.enabled = !fluid.enabled
@@ -2847,6 +3194,7 @@ function bindInspector() {
   bindValue('fluidOutputHeight', (v) => fluid.outputHeight = Math.max(0.1, v), 'Fluid outputHeight', (value) => Math.max(0.1, Number(value) || 2))
   bindSwitch('fluidWindOutputSwitch', () => Boolean(fluid.outputWind), (v) => fluid.outputWind = v, 'Fluid outputWind')
   bindSwitch('fluidTemperatureOutputSwitch', () => Boolean(fluid.outputAirTemperature), (v) => fluid.outputAirTemperature = v, 'Fluid outputAirTemperature')
+  // DEM 地形开关与地形水热经验场（terrainEnvironment）参数；开关切换需重建场景。
   bindSwitch('terrainSwitch', () => c.scene.terrain, (v) => c.scene.terrain = v, 'Control isDEM', true)
   const terrainEnvironment = c.scene.terrainEnvironment || (c.scene.terrainEnvironment = normalizeTerrainEnvironment())
   bindSwitch('terrainAirSwitch', () => terrainEnvironment.airEnabled, (v) => terrainEnvironment.airEnabled = v, 'Scene TerrainEnvironment')
@@ -2855,6 +3203,7 @@ function bindInspector() {
     bindValue(`terrainEnv_${key}`, (v) => terrainEnvironment[key] = v, 'Scene TerrainEnvironment')
   }
 
+  // 大气 LUT 参数：水汽 0.5–5 cm、能见度 10–50 km 限幅；开关同时启用/禁用其余输入框。
   const atmosphere = c.atmosphere || (c.atmosphere = { enabled: false, model: 'midlatitude-summer', waterVapor: 2, aerosol: 'rural', visibility: 23, lutFile: 'assets/atmosphere/simple_modtran_lut.csv' })
   const atmosphereSwitch = $('#atmosphereSwitch')
   atmosphereSwitch?.addEventListener('click', () => {
@@ -2872,6 +3221,7 @@ function bindInspector() {
   bindValue('atmosphereWaterVapor', (value) => atmosphere.waterVapor = Math.max(0.5, Math.min(5, value)), 'Atmosphere waterVapor', (value) => Math.max(0.5, Math.min(5, Number(value) || 2)))
   bindValue('atmosphereAerosol', (value) => atmosphere.aerosol = value, 'Atmosphere aerosol', String)
   bindValue('atmosphereVisibility', (value) => atmosphere.visibility = Math.max(10, Math.min(50, value)), 'Atmosphere visibility', (value) => Math.max(10, Math.min(50, Number(value) || 23)))
+  // 背景属性：光谱/温度/物化绑定、镜面反射开关与 Hapke 角度效应强度（0–1，关闭时写 0）。
   const background = c.scene.background || (c.scene.background = {})
   const bindBackground = (id, key, selector) => $(`#${id}`)?.addEventListener('change', (event) => {
     background[key] = event.target.value
@@ -2910,8 +3260,10 @@ function bindInspector() {
     updateXml('Scene backgroundAngularStrength', background.heterogeneityEnabled ? value : 0)
   })
   angularStrengthInput?.addEventListener('change', () => refreshFromState(false))
+  // 太阳天顶/方位角输入；方位角变化且启用主平面采样时需同步传感器采样设置。
   const bindAngle = (id, key) => $(`#${id}`)?.addEventListener('change', (event) => { const value = finiteInputNumber(event.target); if (value === null) { event.target.value = String(c.light[key] ?? ''); return } c.light[key] = value; syncProjectText(); if (key === 'azimuth' && c.sensor.principalPlane) syncSensorSamplingXml(); refreshFromState(false) })
   bindAngle('sunZenith', 'zenith'); bindAngle('sunAzimuth', 'azimuth')
+  // 直射/漫射比例联动：二者之和恒为 1，拖动滑块时实时预览太阳光，释放后才刷新场景。
   const bindLightFraction = (id, sourceKey) => {
     const input = $(`#${id}`)
     input?.addEventListener('input', () => {
@@ -2935,6 +3287,7 @@ function bindInspector() {
   })
   bindValue('skyTemperature', (v) => c.light.skyTemperature = v, 'Geometry Light light skyTemperature')
   bindValue('shortwaveIrradiance', (v) => c.light.shortwaveIrradiance = Math.max(0, Math.min(2000, v)), 'Geometry Light light shortwaveIrradiance')
+  // 传感器：图像分辨率、波段、投影方式、位置/视场角与航点巡航参数。
   bindValue('sensorX', (v) => c.sensor.x = v, 'Geometry Sensor sensor pixelResolutionX'); bindValue('sensorY', (v) => c.sensor.y = v, 'Geometry Sensor sensor pixelResolutionY')
   $('#sensorBands')?.addEventListener('change', (event) => { c.sensor.bands = event.target.value; syncSensorSamplingXml(); renderInspector() })
   const bindSensorNumber = (id, key, minimum = -Infinity) => $(`#${id}`)?.addEventListener('change', (event) => {
@@ -2950,6 +3303,7 @@ function bindInspector() {
   bindSensorSwitch('principalPlaneSwitch', 'principalPlane')
   bindSensorSwitch('hemisphereSwitch', 'hemisphere')
   bindSensorSwitch('sensorCruiseSwitch', 'cruiseEnabled')
+  // 切换投影方式；首次切到中心投影时给缺省位置（场景中心）与高度 3000 m（当前值无效时）。
   $('#sensorProjection')?.addEventListener('change', (event) => {
     c.sensor.projection = event.target.value === 'perspective' ? 'perspective' : 'parallel'
     if (!Number.isFinite(Number(c.sensor.positionX))) c.sensor.positionX = Number(c.scene.x) / 2
@@ -2983,6 +3337,7 @@ function bindInspector() {
   bindSensorNumber('sensorCruiseRectangleHeight', 'cruiseRectangleHeight', 0.01)
   bindSensorNumber('sensorCruiseStep', 'cruiseStep', 0.01)
   bindSensorNumber('sensorCruiseCount', 'cruiseCount', 1)
+  // 随机巡航路线：换一个随机种子（1 ~ 2147483646 的整数）。
   $('#randomCruiseBtn')?.addEventListener('click', () => {
     c.sensor.cruiseRandomSeed = Math.max(1, Math.floor(Math.random() * 2147483646))
     syncSensorSamplingXml()
@@ -2990,6 +3345,7 @@ function bindInspector() {
   })
   const bindView = (id, key) => $(`#${id}`)?.addEventListener('change', (event) => { const value = finiteInputNumber(event.target); if (value === null) { event.target.value = String(c.sensor[key] ?? ''); return } c.sensor[key] = value; syncSensorSamplingXml(); renderInspector() })
   bindView('viewZenith', 'vza'); bindView('viewAzimuth', 'vaa')
+  // 模拟产出开关：能量平衡模式下“过程输出”= 辐射过程或能量过程任一开启；其他模式仅看辐射过程。
   const energyOutputMode = state.mode === 'eFacetEB' || state.mode === 'eVoxelEB'
   const syncActiveProcess = () => updateXml('Control isProcess',
     (energyOutputMode ? (c.sensor.radiationProcess || c.sensor.energyProcess) : c.sensor.radiationProcess) ? 1 : 0)
@@ -2997,6 +3353,9 @@ function bindInspector() {
   bindSwitch('radiationProcessSwitch', () => c.sensor.radiationProcess, (v) => { c.sensor.radiationProcess = v; syncActiveProcess() }, 'Control isRadiationProcess')
   bindSwitch('energyProcessSwitch', () => c.sensor.energyProcess, (v) => { c.sensor.energyProcess = v; syncActiveProcess() }, 'Control isEnergyProcess')
   bindSwitch('temperatureSwitch', () => c.sensor.temperature, (v) => c.sensor.temperature = v, 'Control isTemperature'); bindSwitch('albedoSwitch', () => c.sensor.albedo, (v) => c.sensor.albedo = v, 'Control isAlbedo')
+  // 气象时间与站点参数：开始节点改动后若结束节点不大于它，则自动置为开始节点 + 1。
+  // converter 同时是缺省值来源：dTime 1800 s、年份 2019、时区 8（UTC+8）、土壤初温 300 K（范围 150–400 K）；
+  // 这些缺省仅在输入无效时使用（待核对与引擎/旧工程缺省是否一致）。
   bindValue('meteoStart', (v) => {
     c.meteo.start = v
     if (!(Number(c.meteo.end) > v)) { c.meteo.end = v + 1; updateXml('Meteorology endTimeNode', c.meteo.end); $('#meteoEnd').value = String(c.meteo.end) }
@@ -3010,6 +3369,7 @@ function bindInspector() {
   bindValue('meteoHeight', (v) => c.meteo.z = v, 'Meteorology z', (value) => Math.max(0, Number(value) || 0))
   bindValue('meteoSoilTemperature', (v) => c.meteo.Tsold = v, 'Meteorology Tsold', (value) => Math.max(150, Math.min(400, Number(value) || 300)))
   bindValue('meteoSatWater', (v) => c.meteo.SatWater = v, 'Meteorology SatWater', (value) => Math.max(0, Math.min(1, Number(value) || 0)))
+  // 文件导入、对象列表（选中/属性/分布/删除/篷布罩）与材质库（新增/编辑/筛选）的事件绑定。
   $('#demFile')?.addEventListener('change', (event) => importDem(event.target.files?.[0]))
   $('#meteoFile')?.addEventListener('change', (event) => importMeteo(event.target.files?.[0]))
   $('#objectImportAction')?.addEventListener('click', importObj)
@@ -3037,6 +3397,7 @@ function bindInspector() {
   }))
 }
 
+// 作用：刷新左侧导航各项的右侧小徽标（场景尺寸、太阳角、传感器分辨率、对象数、大气/流体状态等）。
 function renderNavBadges() {
   const c = state.config
   if (!c) return
@@ -3051,6 +3412,7 @@ function renderNavBadges() {
   $('#demBadge').textContent = t(c.scene.demFile ? (c.scene.terrain ? '已启用' : '已载入') : '关闭')
 }
 
+// 作用：配置变化后刷新界面：徽标 →（rebuild 为真时）重新生成预览场景并复位相机 → 天空盒与太阳。
 function refreshFromState(rebuild = true) {
   const c = state.config
   renderNavBadges()
@@ -3059,6 +3421,7 @@ function refreshFromState(rebuild = true) {
   updateSun(c)
 }
 
+// 判断 DEM 信息里是否已带地形高程栅格（terrainValues 长度须等于宽×高，宽高各至少 2）。
 function hasTerrainValues(config) {
   const dem = config?.scene?.demInfo
   const width = Math.max(2, Math.round(Number(dem?.terrainWidth) || 0))
@@ -3066,6 +3429,8 @@ function hasTerrainValues(config) {
   return Array.isArray(dem?.terrainValues) && dem.terrainValues.length === width * height
 }
 
+// 作用：启用了地形且有 DEM 文件、但缺少高程栅格时，向后端查询 DEM 元数据与高程并写入 config。
+// 返回：是否已具备高程栅格（true 时调用方需重新生成场景）。
 async function ensureDemInfo(config, projectPath = state.inputPath) {
   if (!config?.scene?.terrain || !config.scene.demFile || hasTerrainValues(config)) return false
   const inspected = await api.inspectDem({ path: config.scene.demFile, projectPath })
@@ -3075,8 +3440,11 @@ async function ensureDemInfo(config, projectPath = state.inputPath) {
   return hasTerrainValues(config)
 }
 
+// 实际场景加载的代数：并发的 loadActualScene 只让最新一次生效，旧的异步结果丢弃。
 let sceneLoadGeneration = 0
 
+// 作用：载入工程里真实的场景对象（OBJ/PRIM 等）到 world，并刷新边界框、统计和视图样式。
+// 步骤：清除对象选中 → 必要时补取 DEM 高程并重生成地形 → loadXmlScene 载入对象 → 刷新辅助显示。
 async function loadActualScene(config) {
   const generation = ++sceneLoadGeneration
   const isCurrent = () => generation === sceneLoadGeneration
@@ -3092,6 +3460,9 @@ async function loadActualScene(config) {
   if (objectEdit.enabled) geometryDrawHint('单击选择 OBJ；双击修改物化属性；W/E/R 切换移动、旋转、缩放')
 }
 
+// 作用：把打开工程/示例得到的结果装载进界面（名字沿用旧的 XML 时代，现为 project.json）。
+// 输入：result（path/content/project/projectPath 等，来自后端）。
+// 说明：影像模拟（STREAM）工程交给 streamWorkspace，不走三维流程；模拟运行中拒绝切换工程。
 function loadXml(result) {
   if (result?.streamProject) {
     Promise.resolve(streamWorkspace.openProject(result.streamProject))
@@ -3102,20 +3473,24 @@ function loadXml(result) {
   streamWorkspace.close()
   if (projectTextSyncTimer) { clearTimeout(projectTextSyncTimer); projectTextSyncTimer = null }
   try {
+    // 步骤 1：解析并规范化工程，补齐材质预设；沿用工程里保存的 DEM 元数据。
     const projectMode = result.project?.mode || projectModeFromXml(result.content, state.mode)
     const project = normalizeProject(result.project || parseProjectJson(result.content))
     const config = ensureMaterialPresets(project.configuration)
     if (project?.configuration?.scene?.demInfo) config.scene.demInfo = project.configuration.scene.demInfo
     const storedItems = project?.configuration?.objects?.items || []
+    // 步骤 2：按文件名或名称（否则按序号）匹配文件中保存的对象，恢复其 distribution / instanceCount。
     config.objects.items = config.objects.items.map((item, index) => {
       const stored = storedItems.find((entry) => (entry.fileName && entry.fileName === item.fileName) || entry.name === item.name) || storedItems[index]
       return stored ? { ...stored, ...item, distribution: stored.distribution, instanceCount: stored.instanceCount } : item
     })
     if (project) project.configuration = config
+    // 步骤 3：清纹理缓存，一次性替换 state 中与工程相关的字段（工程代数 +1），并切换到工程记录的模式。
     invalidateTextureCaches()
     state.projectGeneration += 1
     Object.assign(state, { inputPath: result.path, xmlText: result.content, xmlDirty: false, xmlManualEdit: false, project, projectPath: result.projectPath || '', config, outputDir: config.outDir || result.path.replace(/[\\/][^\\/]+$/, '') , selectedObjectIndex: -1, editingObjectIndex: -1, editingAttributeIndex: -1 })
     selectMode(projectMode)
+    // 步骤 4：刷新编辑器文本与标题，重建预览与实际场景、属性面板，并写日志。
     $('#xmlEditor').value = result.content; $('#xmlEditor').hidden = false; $('#emptyEditor').hidden = true; $('#applyXmlBtn').disabled = false; $('#xmlStatus').textContent = result.path
     $('#projectName').textContent = project?.name || fileName(result.path); $('#unsavedMark').hidden = true
     refreshFromState(); restoreActualScene(); renderInspector(); addLog(`已加载配置：${result.path}`, 'success'); toast('配置已加载', fileName(result.path))
@@ -3123,6 +3498,7 @@ function loadXml(result) {
   } catch (error) { toast('无法读取配置', error.message, 'error'); addLog(error.message, 'error') }
 }
 
+// 作用：弹出“打开工程”选择框（按当前模式过滤），选中后调用 loadXml。
 async function chooseXml() {
   try {
     const result = await api.chooseXml(state.mode)
@@ -3133,6 +3509,7 @@ async function chooseXml() {
   }
 }
 
+// 作用：把保存工程时同步 project.usd 的结果写入日志（失败、统计、外部修改备份、跳过的对象）。
 function reportUsdSave(usd) {
   if (!usd) return
   if (usd.error) { addLog(`project.usd 同步失败：${usd.error}`, 'warning'); return }
@@ -3142,6 +3519,8 @@ function reportUsdSave(usd) {
 }
 
 // A USD file opened as a project, or project.usd edited elsewhere since Stream Studio last wrote it.
+// 作用：打开工程后处理 USD 相关提示：汇报从 OpenUSD 导入的摘要；
+// 若 project.usd 在外部被改动，询问是否载入这些修改（载入即重新打开 project.usd）。
 async function reportUsdOpen(result) {
   const summary = result?.usdImport
   if (summary) {
@@ -3161,12 +3540,14 @@ async function reportUsdOpen(result) {
 
 function hideExampleDialog() { $('#exampleDialog').hidden = true }
 
+// 作用：在示例对话框里显示所选示例的推荐模式、关注点与备注。
 function renderExampleSummary() {
   const example = state.examples?.find((item) => item.id === $('#exampleSelect').value)
   const mode = example?.recommendedMode
   $('#exampleSummary').textContent = example ? `${t('推荐模式')}：${mode} · ${example.focus.map((item) => t(item)).join('、')}${example.note ? ` · ${t(example.note)}` : ''}` : ''
 }
 
+// 作用：向后端获取示例列表，按“技术演示/内置精选 · 类别”分组填入下拉框并打开对话框；运行中禁止。
 async function showExampleDialog() {
   if (state.running) { toast('无法打开示例', '模拟运行中，不能更换工程', 'error'); return }
   try {
@@ -3187,6 +3568,8 @@ async function showExampleDialog() {
   } catch (error) { toast('无法读取示例', error.message, 'error') }
 }
 
+// 作用：把所选示例复制到用户指定目录（同名副本会被覆盖）并作为工程打开；
+// 目录记入 appStorage（histreamExampleDirectory），去除用户粘贴时可能带的外层引号。
 async function openExampleFromDialog(event) {
   event.preventDefault()
   const submit = $('#submitExampleBtn')
@@ -3204,6 +3587,8 @@ async function openExampleFromDialog(event) {
   } finally { submit.disabled = false }
 }
 
+// 作用：导入气象驱动文件：内容交给后端复制到工程 meteorology 目录，更新 meteo.path 并保存工程，
+// 然后重新载入场景。导入期间若工程被切换或保存失败则放弃/报错。
 async function importMeteo(file) {
   if (!file) return
   try {
@@ -3229,6 +3614,7 @@ async function importMeteo(file) {
   }
 }
 
+// 作用：把 File 读成 base64 字符串（去掉 data URL 前缀），用于上传 DEM。
 function readFileBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -3238,6 +3624,8 @@ function readFileBase64(file) {
   })
 }
 
+// 作用：导入 DEM（GeoTIFF/ASC，≤ 64 MB）：后端写入工程并返回元数据，随即启用地形、保存工程，
+// 重新生成场景；后端给出的 warnings 以提示显示。切换工程/保存失败的处理同 importMeteo。
 async function importDem(file) {
   if (!file) return
   try {
@@ -3267,12 +3655,18 @@ async function importDem(file) {
   }
 }
 
+// 作用：保存当前工程（project.json 文本与配置）到磁盘。
+// 参数：fromProject 为真表示配置来自界面状态（state.config），否则可能来自用户在 JSON 编辑器中
+// 手改的文本（此时重新解析，替换 state.config）。
+// 返回：true 保存并生效；false 失败；null 已被新的工程切换/新的编辑取代（调用方应跳过刷新与回滚）。
 async function saveXml(fromProject = false) {
   fromProject = fromProject === true
+  // 步骤 1：先提交正在编辑的数字框（blur 触发 change），并冲刷待同步的工程文本。
   // Commit a number field still being edited (its change event fires on blur).
   const active = document.activeElement
   if (active && active !== document.body && active.closest?.('#inspectorContent')) active.blur()
   flushProjectTextSync()
+  // 步骤 2：记录 projectGeneration / editRevision 等快照，保存期间据此检测工程切换或后续编辑。
   const generation = state.projectGeneration
   const revision = state.editRevision
   const savedInputPath = state.inputPath
@@ -3287,6 +3681,7 @@ async function saveXml(fromProject = false) {
     const manualEdit = !fromProject && (state.xmlManualEdit || !state.config)
     const sourceConfig = manualEdit ? ensureMaterialPresets(parseXml(savedText, savedMode)) : state.config
     const replaced = sourceConfig !== state.config
+    // 步骤 3：对配置与工程做深拷贝后提交后端，避免保存过程中被界面修改。
     const config = structuredClone(sourceConfig)
     const project = structuredClone(state.project)
     if (fromProject) await ensureDemInfo(config, savedInputPath)
@@ -3296,10 +3691,12 @@ async function saveXml(fromProject = false) {
       project.configuration = config
       project.mode = savedMode
     }
+    // 步骤 4：写盘；之后按快照是否仍有效，决定更新 state、保持“未保存”标记，还是只写日志。
     const result = await api.saveXml({ path: savedInputPath, content: savedText, project })
     if (!result?.path) return isCurrent() ? false : null
     // The submitted snapshot is on disk; newer edits must remain dirty and intact.
     if (!isCurrent()) { addLog('已保存提交时的配置；当前工程保持不变', 'warning'); reportUsdSave(result.usd); return null }
+    // 保存期间用户又有新编辑：磁盘已是提交时的快照，界面保持“未保存”状态。
     if (state.editRevision !== revision) {
       // An older save may finish after a newer one cleared the dirty indicator.
       state.xmlDirty = true
@@ -3329,6 +3726,7 @@ async function saveXml(fromProject = false) {
   }
 }
 
+// 作用：保证 state.project 存在；没有时按工程文件所在目录名建一个默认工程并挂上当前配置。
 function ensureProjectState() {
   if (state.project) return state.project
   const parts = state.inputPath.replaceAll('\\', '/').split('/')
@@ -3337,11 +3735,13 @@ function ensureProjectState() {
   return state.project
 }
 
+// 作用：把文件名等转成可作标识的名字（去扩展名，非字母数字/下划线/连字符替换为下划线）；为空用 fallback。
 function uniqueName(value, fallback) {
   const cleaned = String(value || '').replace(/\.[^.]+$/, '').replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '')
   return cleaned || fallback
 }
 
+// 作用：去掉 OBJ 文本中的 mtllib / usemtl 行，使导入网格不依赖外部 MTL 文件；结果以换行结尾。
 function sanitizeObjContent(content) {
   const sanitized = String(content)
     .split(/\r?\n/)
@@ -3351,16 +3751,20 @@ function sanitizeObjContent(content) {
   return sanitized ? sanitized + '\n' : ''
 }
 
+// 作用：转为数值，非有限数时返回 fallback。
 function finiteNumber(value, fallback) {
   const number = Number(value)
   return Number.isFinite(number) ? number : fallback
 }
 
+// 实例分布参数约束：密度下限 0.01 个/公顷，保留 2 位小数；单个对象最多 100000 个实例；
+// 1 公顷 = 10000 m²（分布范围面积按 m² 计，密度统一存为 个/公顷）。
 const MIN_DISTRIBUTION_DENSITY = .01
 const DISTRIBUTION_DENSITY_DECIMALS = 2
 const MAX_DISTRIBUTION_INSTANCES = 100000
 const SQUARE_METERS_PER_HECTARE = 10000
 
+// 作用：把密度换算为 个/公顷（unit 为 squareKilometer 时 1 km² = 100 公顷，故除以 100）。
 function densityPerHectare(value, unit = 'hectare') {
   const density = normalizeDistributionDensity(value)
   return unit === 'squareKilometer'
@@ -3368,6 +3772,7 @@ function densityPerHectare(value, unit = 'hectare') {
     : density
 }
 
+// 作用：密度规范化：非正/非数值用缺省 200 个/公顷，保留 2 位小数并不低于下限。
 function normalizeDistributionDensity(value, fallback = 200) {
   const number = Number(value)
   const safe = Number.isFinite(number) && number > 0 ? number : fallback
@@ -3378,12 +3783,15 @@ function distributionDensityInputValue(value) {
   return normalizeDistributionDensity(value).toFixed(DISTRIBUTION_DENSITY_DECIMALS)
 }
 
+// 作用：分布矩形范围（minX–maxX × minY–maxY）的面积（m²），下限 1e-6 以避免除零。
 function distributionArea(distribution) {
   const width = Math.max(0, Math.abs(distribution.maxX - distribution.minX))
   const height = Math.max(0, Math.abs(distribution.maxY - distribution.minY))
   return Math.max(.000001, width * height)
 }
 
+// 作用：按“数量”或“密度”为准互相换算：basis = 'density' 时由密度×面积得数量，
+// 否则由数量/面积反推密度；数量限幅到 1–100000。返回 { count, density }。
 function populationFromValues(countValue, densityValue, area, basis) {
   let count = Math.max(1, Math.min(MAX_DISTRIBUTION_INSTANCES, Math.round(finiteNumber(countValue, 1))))
   let density = normalizeDistributionDensity(densityValue)
@@ -3395,6 +3803,8 @@ function populationFromValues(countValue, densityValue, area, basis) {
   return { count, density }
 }
 
+// 作用：新对象的缺省分布：覆盖整个场景范围、随机分布、密度 200 个/公顷、种子 1；
+// 植被缩放 0.85–1.15，其余对象不缩放；rows/columns 为网格模式缺省值。
 function defaultDistribution(item = {}) {
   const sceneX = Math.max(1, finiteNumber(state.config?.scene?.x, 60))
   const sceneY = Math.max(1, finiteNumber(state.config?.scene?.y, 60))
@@ -3411,6 +3821,9 @@ function defaultDistribution(item = {}) {
   }
 }
 
+// 作用：从分布对话框表单读取并规范化分布参数（缺项用 defaultDistribution）。
+// 说明：options.requireValidDensity 为真且模式为 random/grid 且按密度时，密度必须是有效正数，否则抛错；
+// 数量与密度经 populationFromValues 互相换算；缩放下限 0.01。
 function distributionFromForm(form, options = {}) {
   const values = Object.fromEntries(new FormData(form).entries())
   const defaults = defaultDistribution({ type: values.objectType })
@@ -3453,6 +3866,7 @@ function distributionFromForm(form, options = {}) {
   }
 }
 
+// 作用：把分布参数填回表单；旧工程若以 km² 为密度单位，先换算为 个/公顷。
 function setDistributionForm(form, value) {
   const source = value || {}
   const distribution = {
@@ -3477,6 +3891,7 @@ function setDistributionForm(form, value) {
   for (const [name, fieldValue] of Object.entries(fields)) if (form.elements[name]) form.elements[name].value = fieldValue
 }
 
+// 作用：带种子的伪随机数生成器（mulberry32 形式），返回 [0, 1) 的函数；同一种子结果可复现。
 function seededRandom(seed) {
   let value = seed >>> 0
   return () => {
@@ -3488,6 +3903,7 @@ function seededRandom(seed) {
   }
 }
 
+// 作用：计算要生成的实例数：按密度时 = 面积×密度/10000，否则取 count；限幅到 1–100000。
 function distributionTargetCount(distribution) {
   const width = Math.max(0, Math.abs(distribution.maxX - distribution.minX))
   const height = Math.max(0, Math.abs(distribution.maxY - distribution.minY))
@@ -3497,10 +3913,13 @@ function distributionTargetCount(distribution) {
   return Math.max(1, Math.min(MAX_DISTRIBUTION_INSTANCES, requested || 1))
 }
 
+// 可移动对象类型：人、车辆、船舶（这些类型才有“随机移动”设置）。
 function isMobileAgentType(type) {
   return type === 'Human' || type === 'Vehicle' || type === 'Ship'
 }
 
+// 作用：随机移动的缺省参数；车辆/船舶 speed 8.3 m/s、人 1.3 m/s，
+// range / turnInterval 的物理含义与单位以动态更新代码为准（待核对）。
 function defaultMovement(type) {
   const vehicle = type === 'Vehicle' || type === 'Ship'
   return {
@@ -3514,6 +3933,7 @@ function defaultMovement(type) {
   }
 }
 
+// 作用：从表单读取随机移动参数（仅可移动类型，否则返回 null）；速度、范围等做下限保护。
 function movementFromForm(form) {
   const type = form.elements.objectType.value
   if (!isMobileAgentType(type)) return null
@@ -3529,6 +3949,7 @@ function movementFromForm(form) {
   }
 }
 
+// 作用：把移动参数填回表单（缺项用缺省值；模式目前固定为 random）。
 function setMovementForm(form, movement, type) {
   const value = { ...defaultMovement(type), ...(movement || {}), mode: 'random' }
   form.elements.movementEnabled.checked = Boolean(value.enabled)
@@ -3539,6 +3960,7 @@ function setMovementForm(form, movement, type) {
   form.elements.movementSeed.value = value.seed
 }
 
+// 作用：仅对可移动类型显示移动设置，且未勾选“启用”时禁用其余输入框。
 function updateMovementFormState(form) {
   const section = $('#objectMovementFields')
   const visible = isMobileAgentType(form.elements.objectType.value)
@@ -3547,6 +3969,9 @@ function updateMovementFormState(form) {
   section.querySelectorAll('input:not([name="movementEnabled"])').forEach((input) => { input.disabled = !enabled })
 }
 
+// 作用：解析“自定义坐标”文本，每行 2–5 个数：x y [z [scale [rotation]]]（空白或逗号分隔）。
+// 说明：z 缺省取 defaultZ，scale 缺省 1（须 > 0），rotation 缺省 0；以 # 或 // 开头的行为注释；
+// 总数不得超过 100000，行号在错误提示中给出。
 function parseDistributionPointsText(text, defaultZ = 0) {
   const points = []
   const lines = String(text || '').replace(/^\uFEFF/, '').split(/\r?\n/)
@@ -3569,10 +3994,12 @@ function parseDistributionPointsText(text, defaultZ = 0) {
   return points
 }
 
+// 作用：parseDistributionPointsText 的逆过程，把点列表序列化为文本。
 function distributionPointsText(points) {
   return points.map((point) => [point.x, point.y, point.z, point.scale, point.rotation].join(' ')).join('\n')
 }
 
+// 作用：给所有实例点统一加上分布的整体偏移 offsetX/Y/Z（m）。
 function applyDistributionOffset(points, distribution) {
   const offsetX = finiteNumber(distribution.offsetX, 0)
   const offsetY = finiteNumber(distribution.offsetY, 0)
@@ -3585,6 +4012,11 @@ function applyDistributionOffset(points, distribution) {
   }))
 }
 
+// 作用：按分布参数生成实例点列表 [{x, y, z, scale, rotation}]（最后统一加整体偏移）。
+// 模式：manual 读自定义坐标；single 取范围中心、缩放取 scaleMin；
+// grid 按范围宽高比选列数 ceil(√(N·w/h))、行数 ceil(N/列数)，等间距铺点（只取前 N 个）；
+// random 在范围内均匀随机，缩放在 [scaleMin, scaleMax]，旋转 0–360（度，待核对）。
+// 说明：范围与缩放的上下限先排序，容忍用户把 min/max 填反；grid 会回写 d.rows/d.columns（仅局部副本）。
 function generateDistribution(distribution) {
   const d = { ...defaultDistribution(), ...distribution }
   const minX = Math.min(d.minX, d.maxX), maxX = Math.max(d.minX, d.maxX)
@@ -3616,6 +4048,7 @@ function generateDistribution(distribution) {
   })), d)
 }
 
+// 作用：生成对象卡片上的分布摘要：模式 · 密度或实例数 ·（偏移）·（随机移动速度）。
 function distributionSummary(item) {
   const labels = { random: '随机', grid: '网格', single: '单实例', manual: '自定义' }
   const count = item.instanceCount || (item.distribution ? distributionTargetCount({ ...defaultDistribution(item), ...item.distribution }) : 1)
@@ -3628,11 +4061,13 @@ function distributionSummary(item) {
   return `${labels[item.distribution?.mode] || '已有位置'} · ${control}${offset}${movement}`
 }
 
+// 作用：生成下拉选项：首项“新建：xxx”（值 __new__），其后为已有预设，selected 标记当前项。
 function optionList(items, newLabel, selected = '__new__') {
   const create = `<option value="__new__" ${selected === '__new__' ? 'selected' : ''}>新建：${escapeHtml(newLabel)}</option>`
   return create + items.map((item) => `<option value="${escapeHtml(item.name)}" ${item.name === selected ? 'selected' : ''}>${escapeHtml(item.label || item.name)} · ${escapeHtml(item.name)}</option>`).join('')
 }
 
+// 材质/预设对话框（#materialForm）的字段读写小工具：按 name 取输入框，值非空时才写入。
 function formField(name) { return document.querySelector("#materialForm [name=\"" + name + "\"]") }
 
 function setFormField(name, value) {
@@ -3640,6 +4075,7 @@ function setFormField(name, value) {
   if (input && value !== undefined && value !== null) input.value = value
 }
 
+// 作用：由对象类型映射到物化属性（材质）类型：光伏板→Photovoltaic；植被/火焰/雾→Vegetation；其余按类型，未知为 Soil。
 function physicalTypeForObject(type) {
   if (type === 'SolarPanel') return 'Photovoltaic'
   if (type === 'Vegetation' || type === 'Fire' || type === 'Fog') return 'Vegetation'
@@ -3647,16 +4083,22 @@ function physicalTypeForObject(type) {
   return 'Soil'
 }
 
+// 作用：取对象的分类标签：光伏板单独保留，其余用 item.type（缺省 Other）。
 function objectClassification(item) {
   return item.classification === 'SolarPanel' ? 'SolarPanel' : (item.type || 'Other')
 }
 
+// 作用：由界面分类得到要写入对象的字段；光伏板在引擎中按 Building 处理，分类以 classification 持久记录。
 function objectTypeFields(classification) {
   // Keep the engine's supported solid type; the UI classification is persistent metadata.
   return { type: classification === 'SolarPanel' ? 'Building' : classification,
     classification: classification === 'SolarPanel' ? 'SolarPanel' : undefined }
 }
 
+// 作用：判断某个物化属性（material）能否绑定到某类对象（objectType），用于过滤下拉选项。
+// 规则：光伏模型除火焰/雾外都可用；薄膜模型除火焰/雾/水外都可用；
+// 其余要求 material.type 与对象类型对应的物化类型一致（见 physicalTypeForObject），
+// 并兼容旧工程：建筑可用 Soil；车辆/人可用无 energyModel 的 Building 材质。
 function materialMatchesObjectType(material, objectType) {
   if (!material) return false
   // A surface's geometry and semantic label do not restrict photovoltaic EB.
@@ -3670,6 +4112,7 @@ function materialMatchesObjectType(material, objectType) {
     || ((objectType === 'Vehicle' || objectType === 'Human') && material.type === 'Building' && !material.energyModel)
 }
 
+// 作用：生成对话框中带标签的数值输入框 HTML（供物化属性等表单拼装使用）。
 function physicalInput(label, name, value, step = 'any') {
   return `<label class="dialog-field"><span>${escapeHtml(label)}</span><input class="input" name="${name}" type="number" step="${step}" value="${escapeHtml(value)}"></label>`
 }
@@ -3711,10 +4154,15 @@ function vehicleFields(defaults = {}) {
 }
 
 // ---- Vehicle object dialog: "车辆参数" fold-out, auto-binding of the OBJ groups, per-vehicle body material ----
+// 车型预设：名称与座舱容积（m³），用于车辆对象对话框的“车型 / 座舱容积”下拉框。
 const VEHICLE_CAR_TYPES = { sedan: { label: '轿车（座舱 2.8 m³）', volume: 2.8 }, suv: { label: 'SUV（座舱 3.6 m³）', volume: 3.6 }, van: { label: '厢式/MPV（座舱 5.0 m³）', volume: 5.0 } }
+// 是否启用“自动绑定材料族”：仅新建车辆对象、FacetEB 模式且勾选了 vpAutoBind 时为真。
 function vehicleAutoBindEnabled() {
   return !!state.pendingObject && state.mode === 'eFacetEB' && $('#materialObjectType').value === 'Vehicle' && document.querySelector('#vehicleParamFields [name="vpAutoBind"]')?.checked === true
 }
+// 作用：在新建车辆对象的对话框中生成“车辆参数”折叠区（只构建一次，dataset.built 标记）。
+// 内容：车型/容积、乘员、状态与车速（m/s）、发动机、空调、通风、窗膜、车漆、座椅；
+// 任一选项变化时重新生成网格组的材质行。仅 FacetEB 模式的新对象可见。
 function renderVehicleParams() {
   const section = $('#vehicleParamsSection')
   if (!section) return
@@ -3738,10 +4186,13 @@ function renderVehicleParams() {
   for (const element of $$('#vehicleParamFields select, #vehicleParamFields input[name="vpAutoBind"]'))
     element.addEventListener('change', () => { if (state.pendingObject) renderMeshMaterialRows() })
 }
+// 作用：读取自动绑定所需的车漆颜色（缺省 white）与是否隔热膜；values 为空时直接读表单。
 function vehicleBindingOptions(values = null) {
   const read = (name) => (values ? values[name] : document.querySelector(`#vehicleParamFields [name="${name}"]`)?.value)
   return { paint: read('vpPaint') || 'white', film: read('vpFilm') === 'insulated' }
 }
+// 补充：乘员数限幅 0–8；停放时车速为 0；航向与风来向须同时给出才生效；
+// 表单项为空或非数值时取括号内的缺省（发动机 15000 W、空调 3500 W/24 ℃ 等）。
 // Body material of a new vehicle object: the vehicle_material preset with the cabin parameters of the form.
 function vehicleBodyMaterial(values, name) {
   const n = (key, fallback) => (String(values[key] ?? '').trim() !== '' && Number.isFinite(Number(values[key])) ? Number(values[key]) : fallback)
@@ -3786,6 +4237,8 @@ function wallLayersText(layers) {
   return Array.isArray(layers) ? layers.map((layer) => [layer.thickness, layer.lambda, layer.rho, layer.cp].join(', ')).join('\n') : ''
 }
 
+// 作用：解析墙体构造层文本：以换行或分号分行，每行 “厚度, λ, ρ, cp”（空白或逗号分隔，含全角逗号），
+// 由外到内；本函数不校验数值有效性，层数上限与合法性由调用方/引擎处理（待核对）。
 function parseWallLayers(text) {
   return String(text || '').split(/[\n;]+/).map((row) => row.trim()).filter(Boolean).map((row) => {
     const [thickness, lambda, rho, cp] = row.split(/[\s,，]+/).filter(Boolean).map(Number)
@@ -3800,10 +4253,14 @@ function waterInitialFields(defaults = {}) {
   return `<label class="dialog-field"><span>初始水温（FacetEB）</span><select class="select" name="waterInitialMode">${option('firstAir', '首节点气温（旧行为）')}${option('dailyMeanAir', '起始 24 h 平均气温')}${option('fixed', '指定温度')}</select></label>${physicalInput('指定初始水温（℃）', 'waterInitialTemperature', defaults.initialTemperature ?? 20, 0.1)}`
 }
 
+// 作用：自定义光谱的“波谱文件”导入控件；TXT 约定：第 1 行波长，第 2 行反射率，第 3 行可选透射率。
 function spectrumFileImportFields(prefix, fileName = '') {
   return `<label class="dialog-field"><span>波谱文件</span><input class="input" id="${prefix}SpectrumFile" type="file" accept=".txt,.dat,.csv,text/plain"></label><input type="hidden" name="fileName" value="${escapeHtml(fileName)}"><div class="notice" id="${prefix}SpectrumFileStatus">${fileName ? `已导入：${escapeHtml(fileName)}` : 'TXT 第 1 行为波长，第 2 行为反射率，第 3 行可选为透射率。'}</div>`
 }
 
+// 作用：光谱预设对话框中“物理纹理”（反射率空间方差）的表单字段与说明。
+// 说明：纹理文件取自预设列表，文件不在列表中时作为自定义项保留；缺省强度 0.2、重复尺寸 2 m。
+// 仅 FacetRT / FacetEB / RayTracing 生效，体元模式不支持（见面板说明）。
 function physicalTextureFields(texture = {}) {
   const enabled = Boolean(texture.enabled)
   const fileName = String(texture.fileName || PHYSICAL_TEXTURE_PRESETS[0][0])
@@ -3816,6 +4273,7 @@ function physicalTextureFields(texture = {}) {
   return `<label class="dialog-field"><span>物理纹理</span><select class="select" name="physicalTextureEnabled"><option value="false" ${enabled ? '' : 'selected'}>关闭（默认）</option><option value="true" ${enabled ? 'selected' : ''}>启用</option></select></label><label class="dialog-field"><span>方差模板</span><select class="select" name="physicalTextureFileName">${options}${custom}</select></label><label class="dialog-field"><span>导入纹理图像</span><input class="input physical-texture-file" type="file" accept=".png,.jpg,.jpeg,.tif,.tiff,image/png,image/jpeg,image/tiff"></label>${physicalInput('方差强度（0–1）', 'physicalTextureStrength', texture.strength ?? 0.2, 0.01)}${physicalInput('反射率变异系数 CV（0–0.5，0 = 按方差强度）', 'physicalTextureRelativeStd', texture.relativeStd ?? 0, 0.01)}${physicalInput('重复尺寸（m）', 'physicalTextureRepeatSize', texture.repeatSize ?? 2, 0.01)}<div class="notice" style="grid-column:1 / -1">仅改变短波反射率的空间方差（按图像亮度，所有波段同一倍率）；按材质面积归一化，平均反射率保持不变。变异系数 CV &gt; 0 时直接指定反射率的相对标准差（例如 0.08 表示 ±8%），图像只决定斑块形状和尺度；为 0 时按“方差强度”缩放，实际 CV 通常只有强度的 1/4 左右。为保证反射率为正且不超过 1−透射率，实际 CV 可能被限低，运行日志会给出实际 CV。热红外发射率和透射率不随此纹理变化。每个三角面取面心处一个值，网格需细于纹理斑块。FacetRT / FacetEB / RayTracing 生效，体元模式不支持。</div>`
 }
 
+// 作用：绑定“导入纹理图像”：上传到后端，加入下拉框并选中、启用物理纹理，同时使该文件的纹理缓存失效。
 function bindPhysicalTextureImport(rootSelector) {
   const root = $(rootSelector)
   const input = root?.querySelector('.physical-texture-file')
@@ -3842,30 +4300,39 @@ function bindPhysicalTextureImport(rootSelector) {
   })
 }
 
+// 作用：光谱的“开孔率”输入（遮阳网、穿孔篷布）。运行时的等效换算见面板说明：
+// R′=(1−O)R、T′=O+(1−O)T；孔中透过的直射光按漫射处理。
 function opennessField(value = 0) {
   return `${physicalInput('开孔率（0–0.95）', 'openness', value ?? 0, 0.01)}<div class="notice" style="grid-column:1 / -1">用于遮阳网、穿孔篷布：上方反射率/透射率填纤维本身的值，运行时按开孔率 O 换算为等效值 R′=(1−O)R、T′=O+(1−O)T（热红外同理）。孔中透过的直射光按漫射处理，棚下不形成光斑。仅自定义和导入 TXT 光谱可用。</div>`
 }
 
+// 作用：生成纹理文件下拉选项；当前文件不在预设里时追加为已选的自定义项。
 function textureFileOptions(presets, fileName) {
   const known = presets.some(([value]) => value === fileName)
   return presets.map(([value, label]) => `<option value="${escapeHtml(value)}" ${value === fileName ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')
     + (!known && fileName ? `<option value="${escapeHtml(fileName)}" selected>${escapeHtml(fileName)}</option>` : '')
 }
 
+// 作用：生成“关闭（默认）/启用”下拉框，值为字符串 'false' / 'true'。
 function enabledSelect(label, name, enabled) {
   return `<label class="dialog-field"><span>${escapeHtml(label)}</span><select class="select" name="${name}"><option value="false" ${enabled ? '' : 'selected'}>关闭（默认）</option><option value="true" ${enabled ? 'selected' : ''}>启用</option></select></label>`
 }
 
+// 作用：“光谱分类纹理”表单：分类 PNG 中每种颜色绑定一条光谱，运行时按三角面面心取色并归入最接近的类别；
+// 启用后本光谱自身反射率不再使用（见面板说明）。缺省重复尺寸 1.5 m。
 function classTextureFields(texture = {}) {
   const fileName = String(texture.fileName || CLASS_TEXTURE_PRESETS[0][0])
   return `${enabledSelect('光谱分类纹理', 'classTextureEnabled', Boolean(texture.enabled))}<label class="dialog-field"><span>分类图像（PNG）</span><select class="select" name="classTextureFileName">${textureFileOptions(CLASS_TEXTURE_PRESETS, fileName)}</select></label><label class="dialog-field"><span>导入分类图像</span><input class="input class-texture-file" type="file" accept=".png,image/png"></label>${physicalInput('分类纹理重复尺寸（m）', 'classTextureRepeatSize', texture.repeatSize ?? 1.5, 0.01)}<div class="class-texture-rows" style="grid-column:1 / -1" data-classes-file="${escapeHtml(fileName)}" data-classes="${escapeHtml(JSON.stringify(texture.classes || []))}"></div><div class="notice" style="grid-column:1 / -1">图像中每种颜色绑定一条光谱：运行时每个三角面按面心取色，归入颜色最接近的类别并使用该类别光谱（含其透射率、热红外、物理纹理和开孔率设置）。未指定光谱的颜色归入最接近的已指定颜色。按对象自身坐标投影，图案随对象移动；需使用无损 PNG。启用后本光谱自身的反射率不再使用。</div>`
 }
 
+// 作用：“开孔率纹理”表单：灰度 PNG 的亮度在最小/最大开孔率间线性映射并量化为 levels 档（缺省 8，范围 2–32），
+// 启用后覆盖固定开孔率。缺省范围 0–0.5，重复尺寸 1 m。
 function opennessTextureFields(texture = {}) {
   const fileName = String(texture.fileName || OPENNESS_TEXTURE_PRESETS[0][0])
   return `${enabledSelect('开孔率纹理', 'opennessTextureEnabled', Boolean(texture.enabled))}<label class="dialog-field"><span>开孔率图像（灰度 PNG）</span><select class="select" name="opennessTextureFileName">${textureFileOptions(OPENNESS_TEXTURE_PRESETS, fileName)}</select></label><label class="dialog-field"><span>导入开孔率图像</span><input class="input openness-texture-file" type="file" accept=".png,image/png"></label>${physicalInput('开孔率纹理重复尺寸（m）', 'opennessTextureRepeatSize', texture.repeatSize ?? 1, 0.01)}${physicalInput('最小开孔率（黑）', 'opennessTextureMin', texture.minOpenness ?? 0, 0.01)}${physicalInput('最大开孔率（白）', 'opennessTextureMax', texture.maxOpenness ?? 0.5, 0.01)}${physicalInput('开孔率档位数（2–32）', 'opennessTextureLevels', texture.levels ?? 8, 1)}<div class="notice" style="grid-column:1 / -1">图像亮度在最小、最大开孔率之间线性映射（黑 = 最小，白 = 最大），量化为若干档；每个三角面按面心取值，运行时按 R′=(1−O)R、T′=O+(1−O)T 换算透射率和反射率（热红外同理）。启用后覆盖上方固定开孔率。仅自定义和导入 TXT 光谱可用。</div>`
 }
 
+// 分类图像调色板缓存：键为工程相对路径，值为统计颜色的 Promise。
 const imagePaletteCache = new Map()
 
 // Both caches are keyed by project-relative path; omit fileName on project switch.
@@ -3875,6 +4342,9 @@ function invalidateTextureCaches(fileName) {
   invalidateImageTextures(fileName)
 }
 
+// 作用：统计分类纹理 PNG 的颜色，返回 Promise<[{ color: '#rrggbb', share }]>。
+// 说明：按 RGB（忽略 alpha）计数，只保留占比 ≥ 0.5% 的颜色，最多 12 种、按占比降序；
+// 结果按文件名缓存（imagePaletteCache），加载失败时移出缓存以便重试。
 function imagePalette(fileName) {
   if (imagePaletteCache.has(fileName)) return imagePaletteCache.get(fileName)
   const promise = new Promise((resolve, reject) => {
@@ -3905,8 +4375,13 @@ function imagePalette(fileName) {
   return promise
 }
 
+// 各分类纹理容器的最新请求序号：用于丢弃过期的异步调色板结果。
 const classTextureRequests = new WeakMap()
 
+// 作用：为所选分类图像生成“颜色 → 光谱”绑定行（每种主要颜色一个下拉框）。
+// 步骤 1：收集已有绑定（先取界面里的，没有则取 data-classes 里保存的）。
+// 步骤 2：读取调色板期间以隐藏域保留绑定，使表单仍可提交（仅当属于同一图像）。
+// 步骤 3：调色板返回后重绘；候选光谱排除自身和已启用分类纹理的光谱，推测为避免循环引用（待核对）。
 async function renderClassTextureRows(root, currentSpectrumName) {
   const container = root?.querySelector('.class-texture-rows')
   const select = root?.querySelector('[name="classTextureFileName"]')
@@ -3944,6 +4419,7 @@ async function renderClassTextureRows(root, currentSpectrumName) {
   }
 }
 
+// 作用：通用的纹理图像导入绑定（分类/开孔率纹理）：上传 → 加入下拉框并选中 → 启用该纹理 → 失效缓存 → 回调。
 function bindTextureImport(root, inputSelector, selectName, enabledName, afterImport) {
   const input = root?.querySelector(inputSelector)
   const select = root?.querySelector(`[name="${selectName}"]`)
@@ -3970,6 +4446,7 @@ function bindTextureImport(root, inputSelector, selectName, enabledName, afterIm
   })
 }
 
+// 作用：绑定光谱对话框中的分类纹理与开孔率纹理控件，并首次渲染分类绑定行。
 function bindSurfaceTextureFields(rootSelector, currentSpectrumName) {
   const root = $(rootSelector)
   if (!root) return
@@ -3980,6 +4457,7 @@ function bindSurfaceTextureFields(rootSelector, currentSpectrumName) {
   refresh()
 }
 
+// 作用：由表单数据组装 classTexture 配置（重复尺寸下限 0.01 m，缺省 1.5 m；classColor 与 classSpectral 按序配对）。
 function classTextureFromForm(formData) {
   const colors = formData.getAll('classColor').map(String)
   const spectra = formData.getAll('classSpectral').map(String)
@@ -3991,6 +4469,7 @@ function classTextureFromForm(formData) {
   }
 }
 
+// 作用：由表单值组装 opennessTexture 配置：开孔率限幅 0–0.95，最大值不小于最小值，档位数 2–32（缺省 8）。
 function opennessTextureFromValues(values) {
   const minimum = Math.max(0, Math.min(0.95, Number(values.opennessTextureMin) || 0))
   return {
@@ -4003,6 +4482,7 @@ function opennessTextureFromValues(values) {
   }
 }
 
+// 作用：Three.js 预览纹理表单（仅影响界面预览，不影响求解结果）；缺省重复尺寸 2 m。
 function previewTextureFields(texture = {}) {
   const enabled = Boolean(texture.enabled)
   const preset = String(texture.preset || PREVIEW_TEXTURE_PRESETS[0][0])
@@ -4012,6 +4492,7 @@ function previewTextureFields(texture = {}) {
   return `<label class="dialog-field"><span>Three.js 预览纹理</span><select class="select" name="previewTextureEnabled"><option value="false" ${enabled ? '' : 'selected'}>关闭</option><option value="true" ${enabled ? 'selected' : ''}>启用</option></select></label><label class="dialog-field"><span>常见外观</span><select class="select" name="previewTexturePreset">${options}</select></label>${physicalInput('纹理重复尺寸（m）', 'previewTextureRepeatSize', texture.repeatSize ?? 2, 0.05)}<div class="notice" style="grid-column:1 / -1">只用于 Three.js 场景预览，不参与 HiStream 求解，也不改变反射率、发射率或模拟结果。</div>`
 }
 
+// 作用：由表单值组装 previewTexture 配置（重复尺寸下限 0.05 m）。
 function previewTextureFromValues(values) {
   return {
     enabled: values.previewTextureEnabled === 'true',
@@ -4020,6 +4501,7 @@ function previewTextureFromValues(values) {
   }
 }
 
+// 作用：由表单值组装 physicalTexture 配置：强度限幅 0–1，相对标准差 CV 限幅 0–0.5，重复尺寸下限 0.01 m。
 function physicalTextureFromValues(values) {
   return {
     enabled: values.physicalTextureEnabled === 'true',
@@ -4030,6 +4512,7 @@ function physicalTextureFromValues(values) {
   }
 }
 
+// 作用：绑定自定义光谱文件的导入：读取 TXT 文本交后端保存，把返回的相对路径写入隐藏字段 fileName。
 function bindSpectrumFileInput(prefix, rootSelector) {
   const root = $(rootSelector)
   const input = root?.querySelector(`#${prefix}SpectrumFile`)
@@ -4052,6 +4535,10 @@ function bindSpectrumFileInput(prefix, rootSelector) {
   })
 }
 
+// 作用：按光谱模型 #spectralModel 生成相应的参数输入区（#modelParameterFields）。
+// 模型：Prospect（叶片光学模型：Cab、Cw、Cdm、Cs、N）、BSM（土壤光谱模型：SMC、亮度、纬度/经度参数、
+// 湿端 TIR 反射率，留空自动）、file（导入 TXT 波谱）、其余为按传感器波段手填的自定义模型。
+// 说明：各参数的缺省值写在输入框 value 中（如 Cab 40、N 1.5、SMC 25）；物理含义与单位待核对。
 function renderModelParameters(fileName = '') {
   const model = $('#spectralModel').value
   if (model === 'Prospect') {
@@ -4067,16 +4554,24 @@ function renderModelParameters(fileName = '') {
   }
 }
 
+// 作用：收集材质表单中名为 `${name}Value` 的所有数值输入框（反射率/透射率，多波段时有多个），
+// 去掉空项后用逗号拼成字符串，供保存材质时写入工程。
 function materialSpectrumValues(name) {
   return $$(`#materialForm [name="${name}Value"]`).map((input) => input.value.trim()).filter(Boolean).join(',')
 }
 
+// 作用：重建材质对话框里的反射率/透射率输入框。
+// 说明：光谱模型为 custom 时按传感器波段数展开成多个输入框（每个波段一个值），
+// 其余模型只有单个值；入参为逗号分隔的字符串，缺省值 0.20 / 0.0。
 function renderMaterialSpectrumValueFields(reflectance = '0.20', transmittance = '0.0') {
   const multiband = $('#spectralModel').value === 'custom'
   $('#materialReflectanceFields').innerHTML = presetSpectrumFields('反射率', 'reflectance', reflectance, '0.20', multiband)
   $('#materialTransmittanceFields').innerHTML = presetSpectrumFields('透射率', 'transmittance', transmittance, '0.0', multiband)
 }
 
+// 作用：按“光谱预设”下拉框的选择刷新材质对话框的光谱部分。
+// 选中已有预设：名称只读，回填模型、TIR 反射/透射、波段值、纹理与镜面参数以及 Prospect/BSM 参数；
+// 选中“新建”：名称可编辑，各字段恢复缺省。
 function applySpectrumPreset() {
   const selected = state.config.spectra.find((item) => item.name === document.querySelector('#spectralPreset').value)
   const nameInput = document.querySelector('#spectralMaterialName')
@@ -4104,6 +4599,8 @@ function applySpectrumPreset() {
   }
 }
 
+// 作用：按当前物体类型重建光谱预设下拉框，并默认选中该类型的推荐预设
+// （保持用户已选的预设，若其仍存在）；最后调用 applySpectrumPreset 回填字段。
 function renderSpectrumPresetOptions() {
   const type = document.querySelector("#materialObjectType").value
   const preferred = { SolarPanel: "pv_opaque", Vegetation: "green_leaf", Fire: "fire_medium", Fog: "fog_medium", Soil: "soil", Building: "concrete", Human: "human_surface", Vehicle: "vehicle_surface", Ship: "ship_surface", Other: "concrete", Water: "water_surface" }[type]
@@ -4113,6 +4610,8 @@ function renderSpectrumPresetOptions() {
   applySpectrumPreset()
 }
 
+// 作用：按“热学预设”下拉框刷新对话框：选中已有预设时回填向阳/背阴温度并锁定名称，
+// 选“新建”时名称可编辑。
 function applyThermalPreset() {
   const selected = state.config.thermals.find((item) => item.name === document.querySelector("#thermalPreset").value)
   const nameInput = document.querySelector("#thermalMaterialName")
@@ -4124,6 +4623,8 @@ function applyThermalPreset() {
   } else nameInput.readOnly = false
 }
 
+// 作用：按物体类型重建热学预设下拉框并默认选中推荐预设（保持已选，若仍存在），
+// 随后应用该预设。
 function renderThermalPresetOptions() {
   const type = document.querySelector("#materialObjectType").value
   const preferred = { SolarPanel: "pv_temperature", Vegetation: "vegetation_temperature", Fire: "fire_temperature", Fog: "fog_temperature", Soil: "soil_temperature", Building: "building_temperature", Human: "human_temperature", Vehicle: "vehicle_temperature", Ship: "ship_temperature", Other: "building_temperature", Water: "water_temperature" }[type]
@@ -4133,6 +4634,10 @@ function renderThermalPresetOptions() {
   applyThermalPreset()
 }
 
+// 作用：渲染“物理参数”区域。物体类型先映射为物理材料类型（physicalTypeForObject）。
+// 选中已有物理预设：只显示该预设参数的只读摘要；
+// 选“新建”：按类型（Photovoltaic/Vegetation/Water/其余按土壤等固体）生成输入框，
+// 缺省值取 createMaterialPresets() 中同类型的内置预设参数。
 function renderPhysicalParameters() {
   const type = physicalTypeForObject($('#materialObjectType').value)
   const selected = state.config.materials.find((item) => item.name === $('#physicalMaterialPreset').value)
@@ -4177,6 +4682,9 @@ function renderPhysicalParameters() {
   }
 }
 
+// 作用：按物体类型过滤可用的物理材料预设，重建下拉框并默认选中推荐预设
+// （如 SolarPanel→pv_panel、Vegetation→leaf_c3、Water→water_set；无推荐项时选第一个，
+// 没有可选项则为“新建”），再渲染物理参数。
 function renderPhysicalPresetOptions() {
   const objectType = $('#materialObjectType').value
   const type = physicalTypeForObject(objectType)
@@ -4186,6 +4694,9 @@ function renderPhysicalPresetOptions() {
   renderPhysicalParameters()
 }
 
+// 作用：植被类 OBJ 按网格组名推荐材质绑定：叶片（leaf/needle/叶片…）→ 绿叶光谱与叶冠；
+// 树枝（branch/twig/枝条…）→ 木质光谱与刚性枝；树干（trunk/bark/树干…）→ 木质与刚性干；
+// 都不匹配则原样返回 fallback。名称匹配不区分大小写，规则为启发式。
 function recommendedVegetationMeshBinding(meshName, fallback) {
   const name = String(meshName || '').toLowerCase()
   if (/(leaf|leaves|foliage|needle|叶片|树叶|针叶)/.test(name)) {
@@ -4200,6 +4711,11 @@ function recommendedVegetationMeshBinding(meshName, fallback) {
   return fallback
 }
 
+// 作用：为待导入 OBJ 的每个网格组生成一行材质绑定（光谱/热学/物理/冠层/镜面）。
+// 步骤：1) 取当前物体类型的推荐预设与对话框当前选择；2) 保存已有的镜面设置避免重绘丢失；
+// 3) FacetEB 车辆开启自动绑定时，按组名使用车辆规则并展开可拆分的组（车窗、引擎盖）；
+// 4) 植被且非光伏时可按组名推荐叶/枝/干绑定；5) 输出每行的 select 与镜面字段。
+// 光伏材质与车辆一律使用刚性冠层 rigid_body。
 function renderMeshMaterialRows({ recommendVegetation = false } = {}) {
   const pending = state.pendingObject
   if (!pending) return
@@ -4248,6 +4764,8 @@ function renderMeshMaterialRows({ recommendVegetation = false } = {}) {
   }).join('')
 }
 
+// 作用：打开“新对象材质”对话框，按待导入 OBJ 的路径生成唯一的对象/材质/光谱/热学名称，
+// 按建议类型选择光谱模型（植被 Prospect、土壤 BSM，其余 custom），并渲染各预设与网格行。
 function showMaterialDialog() {
   const pending = state.pendingObject
   if (!pending) return
@@ -4269,12 +4787,18 @@ function showMaterialDialog() {
   $('#materialDialog').hidden = false
 }
 
+// 作用：关闭材质对话框；discard 为真时释放待导入对象的三维资源并清空 state.pendingObject。
 function hideMaterialDialog(discard = true) {
   $('#materialDialog').hidden = true
   if (discard && state.pendingObject) disposeObject(state.pendingObject.object)
   if (discard) state.pendingObject = null
 }
 
+// 作用：读取“几何体”对话框表单，规整为数值对象；非法枚举回落到缺省
+// （形状 ellipsoid、模式 surface、基准 lai、取向 spherical），细分度 detail 限幅为 1–32。
+// 校验：尺寸必须 > 0；chaos 的填充强度与面元面积 > 0；火/雾介质参数须为有限数且
+// 消光 ≥ 0、单次散射反照率在 [0,1]、|不对称因子| < 1、温度与发射缩放 ≥ 0；水体位置/偏移须有限。
+// 校验失败抛出 Error，由调用方 toast 提示。
 function geometryValues() {
   const values = Object.fromEntries(new FormData($('#geometryForm')).entries())
   const result = {
@@ -4301,6 +4825,10 @@ function geometryValues() {
   return result
 }
 
+// 作用：估算 chaos（随机面元填充）模式生成的三角形数。
+// basis=count：直接取 amount；lai：amount × 水平投影面积 / 单面元面积；
+// lad：amount × 体积 / 单面元面积（椭球取 π/4·X·Z 与 π/6·X·Y·Z，立方体取 X·Z 与 X·Y·Z）。
+// 结果向上取整。
 function chaosTriangleCount(values) {
   if (values.basis === 'count') return Math.round(values.amount)
   const footprint = values.shape === 'cube'
@@ -4312,6 +4840,9 @@ function chaosTriangleCount(values) {
   return Math.ceil((values.basis === 'lad' ? values.amount * volume : values.amount * footprint) / values.facetArea)
 }
 
+// 作用：估算 surface/water 模式的三角形数（用于预览与上限提示）。
+// 公式随形状与 detail 变化：立方体 12·detail²（水面 2·detail²），
+// 椭球 16·detail·(4·detail−1)（水面 max(16, 16·detail)）；系数的网格划分依据（待核对）。
 function surfaceTriangleCount(values) {
   if (values.mode === 'water') return values.shape === 'cube'
     ? 2 * values.detail * values.detail
@@ -4319,6 +4850,11 @@ function surfaceTriangleCount(values) {
   return values.shape === 'cube' ? 12 * values.detail * values.detail : 16 * values.detail * (4 * values.detail - 1)
 }
 
+// 作用：根据所选“几何模式”刷新几何体对话框：显示/隐藏各字段分组、切换标签与提示文字，
+// 并实时给出生成结果的估算说明（三角面元数、水面最终中心、介质体积位置）。
+// 说明：模式为 surface/chaos/water/fire/fog；水面不使用“Y 高度”；火/雾时 Y/Z 标签改为
+// “Y 尺寸/Z 高度”。表单里的 X/Y/Z 沿用工程旧键序（x=南北向、y=东西向、z=高度），
+// 与三维预览中 Y 向上的坐标不同，生成 OBJ 时再互换（见 surfaceGeometryObj）。
 function updateGeometryDialog() {
   const form = $('#geometryForm')
   if (!form) return
@@ -4343,6 +4879,8 @@ function updateGeometryDialog() {
   $('#geometrySurfaceNotice').textContent = water
     ? '生成朝上的水平三角网格水面；水面高程可在对象“分布”中通过 Z 设置。'
     : '生成封闭外壳，适用于建筑等连续表面。立方体按六个面细分，椭球生成连续三角网格。'
+  // 步骤：按填充基准切换“用量”输入框的标签，再用 geometryValues 校验并估算三角形数；
+  // 校验失败时把错误信息直接显示在估算栏。
   const labels = { lai: 'LAI（m²/m²）', lad: 'LAD（m²/m³）', count: '面元数量' }
   $('#geometryAmountLabel').textContent = labels[form.elements.chaosBasis.value] || labels.lai
   try {
@@ -4360,6 +4898,7 @@ function updateGeometryDialog() {
   }
 }
 
+// 作用：打开“生成几何体”对话框（需先有工程），以 geometry_N 作为缺省对象名并刷新界面。
 function showGeometryDialog() {
   if (!state.inputPath) { toast('无法生成几何体', '请先新建或打开工程', 'error'); return }
   const form = $('#geometryForm')
@@ -4370,6 +4909,10 @@ function showGeometryDialog() {
   setTimeout(() => form.elements.geometryName.focus(), 0)
 }
 
+// 作用：给火焰/雾的参与介质对话框填缺省值。雾：包络取整个场景（X/Y 取场景尺寸，
+// 高度取 max(5, 场景高度)），消光 0.08、单次散射反照率 0.95、不对称因子 0.85、温度 288 K；
+// 火焰：25×25×10 的椭球，消光 1.2、反照率 0.72、不对称因子 0.55、温度 1100 K。
+// 介质中心位于场景水平中心，底部高度 0；消光系数单位按 m⁻¹ 理解（待核对）。
 function setMediumDefaults(kind) {
   const form = $('#geometryForm')
   const fog = kind === 'fog'
@@ -4389,6 +4932,8 @@ function setMediumDefaults(kind) {
   form.elements.mediumEmissionScale.value = 1
 }
 
+// 作用：给水体对话框填缺省值：与场景同尺寸的矩形水面，中心在场景水平中心，
+// 高度 0.01 m，偏移为 0，细分度 2。
 function setWaterDefaults() {
   const form = $('#geometryForm')
   form.elements.geometryMode.value = 'water'
@@ -4406,6 +4951,7 @@ function setWaterDefaults() {
   form.elements.waterOffsetZ.value = 0
 }
 
+// 作用：打开参与介质（火/雾）对话框；仅 VoxelRT / VoxelEB 模式支持，其他模式提示并返回。
 function showMediumDialog(kind = 'fire') {
   if (!state.inputPath) { toast('无法添加参与介质', '请先新建或打开工程', 'error'); return }
   if (state.mode !== 'eVoxelRT' && state.mode !== 'eVoxelEB') { toast('参与介质不可用', '请先切换到 VoxelRT 或 VoxelEB', 'error'); return }
@@ -4421,11 +4967,18 @@ function hideGeometryDialog() {
   $('#geometryDialog').hidden = true
 }
 
+// 作用：把坐标格式化为 OBJ 文本：绝对值小于 5e-9 的置 0（避免 -0 与科学计数法），
+// 其余保留 7 位小数并去掉末尾多余的 0。
 function objNumber(value) {
   const rounded = Math.abs(value) < 5e-9 ? 0 : value
   return Number(rounded.toFixed(7)).toString()
 }
 
+// 作用：生成立方体/椭球的封闭外壳 OBJ 文本（surface 模式，也用于火/雾介质的包络）。
+// 说明：three.js 的 Y 轴向上、底面平移到 Y=0；介质模式下表单的 Z 是高度、Y 是进深，故互换。
+// 立方体按 detail 在三个方向细分（12·detail² 个三角形）；椭球取单位球的
+// (8·detail)×(4·detail) 分段后缩放，三角形数 16·detail·(4·detail−1)，与 surfaceTriangleCount 一致。
+// 输出为非索引三角形，每三个顶点一个面。
 function surfaceGeometryObj(values) {
   const medium = values.mode === 'fire' || values.mode === 'fog'
   const sizeYUp = medium ? values.sizeZ : values.sizeY
@@ -4455,6 +5008,9 @@ function surfaceGeometryObj(values) {
   return `${lines.join('\n')}\n`
 }
 
+// 作用：生成朝上（法向 +Y）的水平水面 OBJ，位于 Y=0，高程由对象分布的 z 设置。
+// 矩形用 PlaneGeometry(sizeX×sizeZ, detail×detail)；圆/椭圆用 CircleGeometry，
+// 分段 max(16, 16·detail)，再按 sizeX/2、sizeZ/2 缩放。
 function waterSurfaceObj(values) {
   const detail = Math.max(1, values.detail)
   const geometry = values.shape === 'cube'
@@ -4488,6 +5044,9 @@ function crossVector(a, b) {
   return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
+// 作用：为 chaos 面元抽取随机法向（单位向量，Y 向上）。orientation：
+// horizontal：以 +Y 为中心、倾角在 ±15° 内；vertical：近水平法向，仰角在 ±15° 内；
+// spherical：在整个单位球面上均匀（Y 取 [-1,1] 均匀，方位角均匀）。
 function chaosNormal(random, orientation) {
   const azimuth = random() * Math.PI * 2
   if (orientation === 'horizontal') {
@@ -4503,6 +5062,8 @@ function chaosNormal(random, orientation) {
   return [horizontal * Math.cos(azimuth), y, horizontal * Math.sin(azimuth)]
 }
 
+// 作用：在包络内抽取面元中心。立方体：X/Z 在 ±尺寸/2、Y 在 [0, sizeY] 内均匀；
+// 椭球：取单位球内均匀点（半径取 cbrt(random)），缩放到半轴并上移 sizeY/2。
 function chaosCenter(random, values) {
   if (values.shape === 'cube') return [(random() - 0.5) * values.sizeX, random() * values.sizeY, (random() - 0.5) * values.sizeZ]
   const direction = chaosNormal(random, 'spherical')
@@ -4510,6 +5071,8 @@ function chaosCenter(random, values) {
   return [direction[0] * radius * values.sizeX / 2, values.sizeY / 2 + direction[1] * radius * values.sizeY / 2, direction[2] * radius * values.sizeZ / 2]
 }
 
+// 作用：判断点是否在包络内（立方体：|x|≤sizeX/2、0≤y≤sizeY、|z|≤sizeZ/2；
+// 椭球：归一化后 x²+y²+z² ≤ 1+1e-7，容许浮点误差）。
 function insideEnvelope(point, values) {
   if (values.shape === 'cube') return Math.abs(point[0]) <= values.sizeX / 2 && point[1] >= 0 && point[1] <= values.sizeY && Math.abs(point[2]) <= values.sizeZ / 2
   const x = point[0] / (values.sizeX / 2)
@@ -4518,6 +5081,12 @@ function insideEnvelope(point, values) {
   return x * x + y * y + z * z <= 1 + 1e-7
 }
 
+// 作用：生成 chaos 模式的 OBJ：在包络内随机撒 N 个互不相连的正三角形面元（模拟叶片云）。
+// 步骤：1) 用 chaosTriangleCount 得 N，非有限或 <1 报错，超过 200000 报错；
+// 2) 由种子建伪随机数发生器（seed 相同则结果可复现）；
+// 3) 由单面元面积 A 求正三角形外接圆半径 R=√(4A/(3√3))，三个顶点相隔 120°；
+// 4) 逐个面元：抽中心与法向，构造面内正交轴，三个顶点都在包络内才接受，
+// 最多重试 80 次，仍放不下则报错（提示减小面元面积或增大尺寸）；5) 每个面元写 3 个顶点和 1 个面。
 function chaosGeometryObj(values) {
   const count = chaosTriangleCount(values)
   if (!Number.isFinite(count) || count < 1) throw new Error('计算得到的面元数量必须大于 0')
@@ -4556,6 +5125,9 @@ function chaosGeometryObj(values) {
   return `${lines.join('\n')}\n`
 }
 
+// 作用：解析 OBJ 文本，登记为 state.pendingObject（待用户在材质对话框中确认的对象）。
+// 说明：收集去重后的网格组名（无名时用材质名或 mesh_N）；预览用的缩放使最大边为 8 个场景单位，
+// 中心移到水平原点、底部落在 y=0；metadata.dimensions 缺省记录原始包围盒尺寸（缩放前）。
 function preparePendingObject(result, content, metadata = {}) {
   const object = new OBJLoader().parse(content)
   const meshNames = []
@@ -4571,6 +5143,10 @@ function preparePendingObject(result, content, metadata = {}) {
   state.pendingObject = { source: { ...result, content }, object, meshNames, dimensions: metadata.dimensions || [size.x, size.y, size.z], ...metadata }
 }
 
+// 作用：几何体对话框提交：生成 OBJ → 导入工程 → 建单实例分布 → 登记材质/冠层 → 加入对象列表
+// → 保存工程并刷新场景。成功后打开对象属性对话框；失败时 toast 报错，按钮恢复可用。
+// 步骤见下方各“步骤 n”。
+// 注意：此流程在导入 OBJ 之后才保存工程，保存失败时已导入的文件不会回滚（待核对）。
 async function generateGeometryObject(event) {
   event.preventDefault()
   const submit = $('#geometryForm button[type="submit"]')
@@ -4579,10 +5155,13 @@ async function generateGeometryObject(event) {
   try {
     submit.disabled = true
     ensureProjectState()
+    // 步骤 1：读取并校验表单；名称不得与已有对象重复；火/雾介质只能用于 VoxelRT/VoxelEB。
     const values = geometryValues()
     if (state.config.objects.items.some((item) => item.name === values.name)) throw new Error(`对象名称已存在：${values.name}`)
     const medium = values.mode === 'fire' || values.mode === 'fog'
     if (medium && state.mode !== 'eVoxelRT' && state.mode !== 'eVoxelEB') throw new Error('参与介质当前只支持 VoxelRT 或 VoxelEB')
+    // 步骤 2：按模式生成 OBJ 文本（chaos / water / 其余外壳），并解析一遍取网格组名，
+    // 确认有可用三角面元；解析用的临时对象随即释放。
     const content = values.mode === 'chaos'
       ? chaosGeometryObj(values)
       : values.mode === 'water' ? waterSurfaceObj(values) : surfaceGeometryObj(values)
@@ -4591,8 +5170,11 @@ async function generateGeometryObject(event) {
     source.traverse((child) => { if (child.isMesh) { const name = child.name || child.material?.name || `mesh_${meshNames.length + 1}`; if (!meshNames.includes(name)) meshNames.push(name) } })
     disposeObject(source)
     if (!meshNames.length) throw new Error('生成结果中没有可用三角面元')
+    // 步骤 3：确定对象类型（chaos→Vegetation，water→Water，surface→Building），把 OBJ 写入工程。
     const type = values.mode === 'fire' ? 'Fire' : values.mode === 'fog' ? 'Fog' : values.mode === 'chaos' ? 'Vegetation' : values.mode === 'water' ? 'Water' : 'Building'
     const imported = await api.importObj({ name: `PRIM_${values.name}.obj`, content })
+    // 步骤 4：建立单实例（count=1，缩放 1）的分布并保存位置文件。位置来源随情形而定：
+    // 火/雾用对话框中的介质位置；绘制放置（drawPlacement，非介质非水体）用点击位置；水体用位置+偏移。
     const distribution = {
       ...defaultDistribution({ type }), mode: 'single', basis: 'count', count: 1, scaleMin: 1, scaleMax: 1,
       // Position files expose X north, Z east and Y height. Internal x/y/z keys
@@ -4612,11 +5194,15 @@ async function generateGeometryObject(event) {
     }
     const instances = generateDistribution(distribution)
     const savedDistribution = await api.saveDistribution({ path: imported.positionPath, name: values.name, instances })
+    // 步骤 5：确定缺省的光谱/热学/冠层绑定。介质对象使用专属名称（后缀 _spectrum、
+    // _temperature、_medium），其余用内置预设（绿叶/水面/混凝土等）。
     const mediumLabel = type === 'Fog' ? '雾' : '火焰'
     const mediumKey = type === 'Fog' ? 'fog' : 'fire'
     const spectralName = medium ? `${values.name}_${mediumKey}_spectrum` : type === 'Vegetation' ? 'green_leaf' : type === 'Water' ? 'water_surface' : 'concrete'
     const thermalName = medium ? `${values.name}_${mediumKey}_temperature` : type === 'Vegetation' ? 'vegetation_temperature' : type === 'Water' ? 'water_temperature' : 'building_temperature'
     const canopyName = medium ? `${values.name}_${mediumKey}_medium` : type === 'Vegetation' ? 'canopy_default' : 'rigid_body'
+    // 步骤 6：介质对象登记专属预设：光谱反射/透射为 0（只靠体散射与发射），
+    // 热学取固定温度（向阳/背阴相同），冠层写入消光、散射反照率、不对称因子、发射缩放与固定温度。
     if (medium) {
       upsertByName(state.config.spectra, {
         name: spectralName, label: `${values.name} · ${mediumLabel}介质`,
@@ -4635,6 +5221,7 @@ async function generateGeometryObject(event) {
         fixedTemperature: values.temperature
       })
     }
+    // 步骤 7：组装对象条目，每个网格组绑定同一组光谱/热学/冠层；介质对象标记为仅辐射传输（radiationOnly）。
     const item = {
       name: values.name, type,
       materialName: type === 'Vegetation' || medium ? 'leaf_c3' : type === 'Water' ? 'water_set' : 'soil_dry', canopyName,
@@ -4649,6 +5236,8 @@ async function generateGeometryObject(event) {
       ...(medium ? { medium: { kind: values.mode, radiationOnly: true, coordinateOrder: 'XYZ' } } : {}),
       generation: { type: values.mode === 'fire' ? '火焰' : values.mode === 'fog' ? '雾' : values.mode === 'chaos' ? '几何体混沌' : values.mode === 'water' ? '水体' : '几何体', shape: values.shape, parameters: values }
     }
+    // 步骤 8：加入对象列表、保存工程；保存失败则报错，用户取消（返回 null）则静默退出。
+    // 随后关闭对话框、选中新对象、重新载入场景并打开属性对话框。
     state.config.objects.items.push(item)
     state.config.objects.count = state.config.objects.items.length
     state.config.objects.names = state.config.objects.items.map((entry) => entry.name)
@@ -4672,6 +5261,8 @@ async function generateGeometryObject(event) {
   finally { submit.disabled = false }
 }
 
+// 作用：导入 OBJ 的入口：弹出文件选择，清理 OBJ 文本（sanitizeObjContent），解析为待确认对象，
+// 再打开材质对话框；需先有工程。已有未确认的待导入对象会先释放。失败时 toast/日志提示。
 async function importObj() {
   if (!state.inputPath) { toast('无法导入 OBJ', '请先新建或打开工程', 'error'); return }
   let result
@@ -4686,12 +5277,20 @@ async function importObj() {
   } catch (error) { toast('OBJ 解析失败', error.message, 'error') }
 }
 
+// 作用：按 name 更新列表中的同名条目（整体替换），不存在则追加。
 function upsertByName(list, value) {
   const index = list.findIndex((item) => item.name === value.name)
   if (index >= 0) list[index] = value
   else list.push(value)
 }
 
+// 作用：把物理材质表单（FormData 转成的对象）转换成工程里的材质预设条目 {name, type, params}。
+// 输入：values 表单值，type 物化类型（Building/Photovoltaic/Membrane/Vegetation/Wood/Soil/Water/
+// Ship/Vehicle）；输出的 type 映射为引擎支持的类型：光伏、薄膜→Building（加 energyModel），
+// 木质→Vegetation（energyModel=wood）。
+// 说明：各类型分别取对应字段并做下限/范围限幅（如薄膜面热容 ≥1、水体蒸发系数限 0–1、
+// 折射率 ≥1）；默认分支为土壤/建筑/船舶/载具的固体热参数，可附加墙体模式、船体和座舱参数；
+// 最后过滤掉非有限数值，避免缺失字段被序列化成 null。
 function physicalFromForm(values, type) {
   let params
   if (type === 'Photovoltaic') {
@@ -4734,6 +5333,8 @@ function physicalFromForm(values, type) {
     })
     else if (values.wallMode === 'shell') params.wallMode = 'shell'
     if (values.wallMode === 'wall' && String(values.wallLayers || '').trim()) params.layers = parseWallLayers(values.wallLayers)
+    // 船舶附加参数：航速（≥0）；水线由固定高度或场景水面（+吃水偏移）给出，二者互斥且固定高度优先；
+    // 航向与风来向须同时给出才写入；开关量与内热源只在开启/非零时写入，其余沿用引擎缺省。
     if (type === 'Ship') {
       if (values.shipSpeed !== undefined) params.speed = Math.max(0, Number(values.shipSpeed) || 0)
       const given = (key) => String(values[key] ?? '').trim() !== ''
@@ -4757,6 +5358,9 @@ function physicalFromForm(values, type) {
       if (Number(values.shipInternalHeatFlux)) params.internalHeatFlux = Number(values.shipInternalHeatFlux)
       if (Number(values.shipInternalHeatPower)) params.internalHeatPower = Number(values.shipInternalHeatPower)
     }
+    // 载具附加参数：vehiclePart 标明部件（车身/玻璃/底盘等）；只有车身（body）部件写入座舱 cabin。
+    // 各 num(...) 的第二个参数为缺省值（如容积 2.8 m³、通风 0.5 ACH、开窗缝 10 ACH、空调 3500 W、
+    // 设定 24 ℃、发动机 15000 W、进车份额 0.3）；其余单位以对应表单项为准。
     if (type === 'Vehicle' && values.vehiclePart !== undefined) {
       // Cabin / driving parameters of a Vehicle material (FacetEB only; absent fields keep the engine defaults).
       const on = (key) => values[key] === '1' || values[key] === 'on' || values[key] === true
@@ -4773,6 +5377,10 @@ function physicalFromForm(values, type) {
           interiorArea: num('cabinInteriorArea', 8), interiorH: num('cabinInteriorH', 8), absorbedFraction: num('cabinAbsorbedFraction', 0.8)
         }
         if (given('cabinHeading') && given('cabinWindDirection')) { params.cabin.heading = Number(values.cabinHeading); params.cabin.windDirection = Number(values.cabinWindDirection) }
+        // 内饰分节点与发动机模型：仅在对应开关打开时写入 cabin.interior / cabin.engine。
+        // 以内置缺省 + 隐藏 JSON 中保留的节点参数为底，再用表单值覆盖，避免界面没有的字段丢失。
+        // 内饰四个节点的份额缺省为仪表台 0.30、座椅 0.35、方向盘 0.05、内衬 0.30（合计 1）；
+        // 发动机的散热器/机体/排气份额缺省为 0.5/0.3/0.2（合计 1）。
         // Parts model (interior nodes / engine): hidden JSON keeps the node parameters the form does not show.
         let kept = {}
         try { kept = JSON.parse(values.cabinPartsJson || '{}') || {} } catch { kept = {} }
@@ -4795,6 +5403,7 @@ function physicalFromForm(values, type) {
   }
   // FIXED 配套：过滤掉 NaN/Infinity，避免“缺失”被写成 NaN（JSON 里是 null）
   params = Object.fromEntries(Object.entries(params).filter(([, value]) => typeof value !== 'number' || Number.isFinite(value)))
+  // 返回材质条目：光伏/薄膜/木质以 energyModel 区分，type 映射为 Building 或 Vegetation。
   if (type === 'Photovoltaic') return {name:values.materialName,type:'Building',energyModel:'photovoltaic',params}
   if (type === 'Membrane') return { name: values.materialName, type: 'Building', energyModel: 'membrane', params }
   return type === 'Wood'
@@ -4802,6 +5411,7 @@ function physicalFromForm(values, type) {
     : { name: values.materialName, type, params }
 }
 
+// 预设对话框的表单控件小工具：presetSelect 生成下拉框，presetText 生成文本/数值输入框（均转义标签与值）。
 function presetSelect(label, id, name, options) {
   return `<label class="dialog-field"><span>${escapeHtml(label)}</span><select class="select" id="${id}" name="${name}">${options}</select></label>`
 }
@@ -4810,16 +5420,22 @@ function presetText(label, name, value, attrs = '') {
   return `<label class="dialog-field"><span>${escapeHtml(label)}</span><input class="input" name="${name}" value="${escapeHtml(value)}" ${attrs}></label>`
 }
 
+// 作用：把逗号分隔的光谱值字符串拆成数组；为空时返回 [fallback]。
 function splitSpectrumValues(value, fallback) {
   const values = String(value ?? '').split(',').map((entry) => entry.trim()).filter(Boolean)
   return values.length ? values : [String(fallback)]
 }
 
+// 作用：读取传感器配置 sensor.bands（按空白、逗号或分号分隔）作为波段标签列表；
+// 未配置时返回占位 ['默认波段']，调用方据此判断是否为多波段。
 function configuredSpectralBands() {
   const bands = String(state.config?.sensor?.bands || '').split(/[\s,;]+/).map((entry) => entry.trim()).filter(Boolean)
   return bands.length ? bands : ['默认波段']
 }
 
+// 作用：生成反射率/透射率输入框（0–1 数值）。useConfiguredBands 且配置了多个波段时，
+// 每个波段一个输入框（标签带波段，单位 nm），值按顺序取自 value，缺失时用第一个值再用 fallback；
+// 否则只生成一个输入框。输入框 name 为 `${name}Value`，由 currentSpectrumValues 回收。
 function presetSpectrumFields(label, name, value, fallback, useConfiguredBands = false) {
   const sourceValues = splitSpectrumValues(value, fallback)
   const bands = useConfiguredBands ? configuredSpectralBands() : []
@@ -4831,10 +5447,14 @@ function presetSpectrumFields(label, name, value, fallback, useConfiguredBands =
   }).join('')
 }
 
+// 作用：收集预设对话框内名为 `${name}Value` 的输入框，去空后用逗号拼接（与材质对话框的
+// materialSpectrumValues 对应，只是作用域不同）。
 function currentSpectrumValues(name) {
   return $$(`#presetParameterFields [name="${name}Value"]`).map((input) => input.value.trim()).filter(Boolean).join(',')
 }
 
+// 作用：按预设类别返回工程配置中的数组：spectrum→spectra，thermal→thermals，canopy→canopies，
+// 其余（物理）→materials。
 function presetList(kind) {
   if (kind === 'spectrum') return state.config.spectra
   if (kind === 'thermal') return state.config.thermals
@@ -4842,9 +5462,16 @@ function presetList(kind) {
   return state.config.materials
 }
 
+// 作用：按“预设类别”重绘预设对话框里的参数区。item 为正在编辑的预设（新建时为 null），
+// spectralModel 为光谱预设的当前模型；对话框的类别在 #presetKind。
+// 分支：光谱 / 热学 / 冠层 / 物理（其余），每个分支生成输入框后即返回；见下方各步骤。
 function renderPresetParameterFields(spectralModel = 'custom', item = null) {
   const kind = $('#presetKind').value
   const target = $('#presetParameterFields')
+  // 步骤 1：光谱预设。模型 custom（面板数据）/ Prospect / BSM / file（导入波谱 TXT）；
+  // 模型参数缺省取内置同模型预设，再用当前预设已有的有效参数覆盖。
+  // 切换模型时先把当前输入暂存再重绘（见下方 change 监听），避免丢失已填内容。
+  // Prospect 缺省反射/透射 0.08/0.04，其余 0.20/0.0；只有 custom 才按传感器波段展开多个输入框。
   if (kind === 'spectrum') {
     const current = item || {}
     const models = [['custom', '自定义（面板数据）'], ['Prospect', 'PROSPECT 模型'], ['BSM', 'BSM 模型'], ['file', '导入波谱 TXT']]
@@ -4862,6 +5489,8 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
     target.innerHTML = `${presetSelect('光谱模型', 'presetSpectralModel', 'spectralModel', modelOptions)}${presetSpectrumFields('反射率', 'reflectance', current.reflectance, spectralModel === 'Prospect' ? '0.08' : '0.20', spectralModel === 'custom')}${presetSpectrumFields('透射率', 'transmittance', current.transmittance, spectralModel === 'Prospect' ? '0.04' : '0.0', spectralModel === 'custom')}${physicalInput('TIR 反射率', 'refTir', current.refTir ?? 0.05, 0.01)}${physicalInput('TIR 透射率', 'tauTir', current.tauTir ?? 0, 0.01)}${opennessField(current.openness)}${parameters}${previewTextureFields(current.previewTexture)}${physicalTextureFields(current.physicalTexture)}${specularParameterFields(current.specular)}${classTextureFields(current.classTexture)}${opennessTextureFields(current.opennessTexture)}`
     bindPhysicalTextureImport('#presetForm')
     bindSurfaceTextureFields('#presetForm', current.name || $('#presetName').value)
+    // 切换光谱模型：收集当前 param* 参数、反射/透射、TIR、纹理、镜面等表单值作为新的 item 再重绘；
+    // 表单中缺失或非有限的参数不保留。
     $('#presetSpectralModel').addEventListener('change', (event) => {
       const preservedParams = finiteParams(current.params)
       $$(`#presetParameterFields [name^="param"]`).forEach((input) => {
@@ -4891,14 +5520,20 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
     return
   }
   if (kind === 'thermal') {
+    // 步骤 2：热学预设：阳面/阴面温度（K），新建缺省 305 K / 295 K。
     target.innerHTML = `${physicalInput('阳面温度（K）', 'sunlitTemperature', item?.sunlitTemperature ?? 305, 0.1)}${physicalInput('阴面温度（K）', 'shadedTemperature', item?.shadedTemperature ?? 295, 0.1)}`
     return
   }
   if (kind === 'canopy') {
+    // 步骤 3：冠层预设。结构类型：canopy 混沌介质（多孔透射）/ rigid 刚体 / fire / fog；
+    // 缺省取内置第一个冠层预设并被已有 item 覆盖。火/雾使用后六项介质参数（消光 m⁻¹、反照率、
+    // 不对称因子、发射倍率、固定温度 K）。
     const defaults = { ...createMaterialPresets().canopies[0], ...(item || {}) }
     const structureOptions = [['canopy', '混沌介质（多孔透射）'], ['rigid', '刚体（不透光轮廓）'], ['fire', '火焰（参与介质）'], ['fog', '雾（参与介质）']]
       .map(([value, label]) => `<option value="${value}" ${value === defaults.structureType ? 'selected' : ''}>${label}</option>`).join('')
     target.innerHTML = `${presetSelect('结构类型', 'presetStructureType', 'structureType', structureOptions)}${physicalInput('叶面积指数 LAI', 'lai', defaults.lai, 0.01)}${physicalInput('叶面积密度 LAD', 'density', defaults.density, 0.01)}${physicalInput('介质高度 hc（m）', 'hc', defaults.hc, 0.01)}${physicalInput('投影系数 G（仅 LIDF 无效时使用）', 'G', defaults.G, 0.01)}${physicalInput('叶倾角参数 LIDFa', 'LIDFa', defaults.LIDFa, 0.01)}${physicalInput('叶倾角参数 LIDFb', 'LIDFb', defaults.LIDFb, 0.01)}<div class="notice" id="presetCanopyGHint" style="grid-column:1 / -1"></div>${physicalInput('热点参数 hspot', 'hspot', defaults.hspot, 0.01)}${physicalInput('叶宽 leafwidth（m）', 'leafwidth', defaults.leafwidth, 0.01)}${physicalInput('消光系数（m⁻¹）', 'extinction', defaults.extinction ?? 0, 0.01)}${physicalInput('单次散射反照率', 'scatteringAlbedo', defaults.scatteringAlbedo ?? 0, 0.01)}${physicalInput('散射非对称因子', 'asymmetry', defaults.asymmetry ?? 0, 0.01)}${physicalInput('发射倍率', 'emissionScale', defaults.emissionScale ?? 0, 0.01)}${physicalInput('固定温度（K）', 'fixedTemperature', defaults.fixedTemperature ?? 0, 1)}`
+    // 作用：按结构类型与 LIDFa/LIDFb 判断叶倾角模式（canopyLeafAngleMode）；当引擎会由 LIDF
+    // 推导投影系数 G 时，G 输入框设为只读并显示说明，输入变化时联动刷新。
     const updateCanopyGField = () => {
       const field = (name) => $(`#presetParameterFields [name="${name}"]`)
       const mode = canopyLeafAngleMode({ structureType: field('structureType')?.value, LIDFa: field('LIDFa')?.value, LIDFb: field('LIDFb')?.value })
@@ -4914,6 +5549,8 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
     updateCanopyGField()
     return
   }
+  // 步骤 4：物理（物化）预设。物化类型由 state.presetPhysicalType 决定，缺省值取内置同类预设
+  // （光伏/薄膜/木质按 energyModel 匹配，其余按 type 且无 energyModel 的预设），再叠加已有 item.params。
   const typeOptions = [['Building', '建筑表面'], ['Photovoltaic', '光伏板热电耦合'], ['Membrane', '篷布/织物薄膜（FacetEB）'], ['Vegetation', '植被生理生化'], ['Wood', '木质固体热平衡'], ['Soil', '土壤表面物化'], ['Water', '水体物性'], ['Ship', '船舶表面物化'], ['Vehicle', '载具物化（车身/玻璃/底盘，FacetEB 座舱）']].map(([value, label]) => `<option value="${value}" ${value === state.presetPhysicalType ? 'selected' : ''}>${label}</option>`).join('')
   const baseDefaults = createMaterialPresets().materials.find((entry) => state.presetPhysicalType === 'Photovoltaic' ? entry.energyModel === 'photovoltaic' : state.presetPhysicalType === 'Membrane' ? entry.energyModel === 'membrane' : state.presetPhysicalType === 'Wood' ? entry.energyModel === 'wood' : entry.type === state.presetPhysicalType && !entry.energyModel)?.params || {}
   const defaults = { ...baseDefaults, ...(item?.params || {}) }
@@ -4927,6 +5564,8 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
     if (!item.params?.initialTemperatureMode) delete defaults.initialTemperatureMode
     if (state.presetPhysicalType === 'Water' && item.params?.mixingDepth === undefined) defaults.mixingDepth = 0.5
   }
+  // 步骤 5：按物化类型生成参数输入框（薄膜、光伏、植被、水体、木质，其余为土壤/建筑/船舶/载具的
+  // 固体参数 + 墙体模式 + 船体/载具专有字段）；各字段保存时由 physicalFromForm 读回。
   let parameters
   if (state.presetPhysicalType === 'Membrane') {
     parameters = `${physicalInput('面热容（J·m⁻²·K⁻¹）', 'membraneHeatCapacityPerArea', defaults.heatCapacityPerArea, 10)}${physicalInput('对流换热倍率', 'membraneConvectiveScale', defaults.convectiveScale, 0.1)}<div class="notice" style="grid-column:1 / -1">单层薄板：两面共用一个温度，两面同时吸收/发射辐射并与空气对流换热，不计蒸腾。面热容 = 面密度 × 比热容，例如 PVC 涂层帆布 0.6 kg·m⁻² × 1300 ≈ 800；PE 篷布 0.15 × 1900 ≈ 300；HDPE 遮阳网（含孔）约 100–300。仅 FacetEB 使用，VoxelEB 不支持。</div>`
@@ -4949,6 +5588,7 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
   } else {
     parameters = `${physicalInput('方法', 'soilMethod', defaults.method, 1)}${physicalInput('表面阻力 rss', 'soilRss', defaults.rss, 1)}${physicalInput('比热容 cs', 'soilCs', defaults.cs, 1)}${physicalInput('密度 rhos', 'soilRhos', defaults.rhos, 1)}${physicalInput('导热率 λ', 'soilLambdas', defaults.lambdas, 0.01)}${physicalInput('初始温度', 'soilTsoil', defaults.Tsoil, 0.1)}${physicalInput('土壤含水量 SMC', 'soilSMC', defaults.SMC, 0.1)}${physicalInput('饱和含水量', 'soilSatwater', defaults.Satwater, 0.01)}${wallModeFields(defaults)}${state.presetPhysicalType === 'Ship' ? shipFields(defaults) : ''}${state.presetPhysicalType === 'Vehicle' ? vehicleFields(defaults) : ''}`
   }
+  // 步骤 6：写入类型下拉框与参数；切换物化类型时更新 state.presetPhysicalType 并按 custom 重绘。
   target.innerHTML = `${presetSelect('物化类型', 'presetPhysicalType', 'physicalType', typeOptions)}${parameters}`
   $('#presetPhysicalType').addEventListener('change', (event) => {
     state.presetPhysicalType = event.target.value
@@ -4956,6 +5596,8 @@ function renderPresetParameterFields(spectralModel = 'custom', item = null) {
   })
 }
 
+// 作用：打开预设（材质属性）对话框。index ≥ 0 为编辑已有预设（类别与名称锁定），否则为新增；
+// 编辑时回填名称、显示名、物化类型，并按预设内容渲染参数区。需先有工程。
 function showPresetDialog(kind = 'spectrum', index = -1) {
   if (!state.inputPath) { toast('无法编辑材质属性', '请先新建或打开工程', 'error'); return }
   $('#presetForm').reset()
@@ -4975,6 +5617,7 @@ function showPresetDialog(kind = 'spectrum', index = -1) {
   setTimeout(() => (item ? $('#presetParameterFields .input, #presetParameterFields .select') : $('#presetName'))?.focus(), 0)
 }
 
+// 作用：关闭预设对话框并恢复类别/名称的可编辑状态，清除编辑中标记。
 function hidePresetDialog() {
   $('#presetDialog').hidden = true
   $('#presetKind').disabled = false
@@ -4982,6 +5625,7 @@ function hidePresetDialog() {
   state.editingPreset = null
 }
 
+// 光谱模型参数的键名：Prospect 的 Cab/Cw/Cdm/Cs/N，BSM 的 SMC/BSMBrightness/BSMlat/BSMlon。
 const SPECTRUM_MODEL_PARAMS = ['Cab', 'Cw', 'Cdm', 'Cs', 'N', 'SMC', 'BSMBrightness', 'BSMlat', 'BSMlon']
 
 // Parameters missing from the form (other spectral models) or stored as null
@@ -4990,6 +5634,7 @@ function finiteParams(params) {
   return Object.fromEntries(Object.entries(params || {}).filter(([, value]) => value !== null && value !== '' && Number.isFinite(Number(value))))
 }
 
+// 作用：以旧参数（仅有限值）为底，用表单中非空且有限的 param* 值覆盖，得到光谱模型参数对象。
 function spectrumParamsFromValues(values, previous) {
   const params = finiteParams(previous)
   for (const key of SPECTRUM_MODEL_PARAMS) {
@@ -5007,6 +5652,11 @@ function optionalTirReflectance(value) {
   return Math.max(0, Math.min(1, numeric))
 }
 
+// 作用：把预设对话框表单转成 {list, item}：list 为目标数组，item 为待写入的预设条目。
+// 编辑时沿用原名称与类别，新增时名称由 uniqueName 去重，显示名为空则取名称。
+// 光谱：纹理（classTexture / opennessTexture）仅在启用或原来已有时写入。
+// 冠层：结构类型非法回落 canopy；消光、发射倍率、固定温度 ≥ 0，散射反照率限 [0,1]，
+// 不对称因子限 ±0.99。物理：交给 physicalFromForm。
 function presetFromForm(values) {
   const editing = state.editingPreset
   const existing = editing ? presetList(editing.kind)[editing.index] : null
@@ -5047,6 +5697,11 @@ function presetFromForm(values) {
   return { list: state.config.materials, item: { ...physicalFromForm({ ...values, materialName: name }, values.physicalType), label } }
 }
 
+// 作用：预设对话框提交：把表单转成预设条目（presetFromForm），写入工程配置并保存。
+// 步骤：1) 读表单，光谱预设把多波段的反射/透射输入合并成逗号字符串，file 模型必须已导入波谱；
+// 2) 名称在同一列表内查重（编辑时排除自身）；3) 先改内存（编辑替换 / 新增追加）再 saveXml；
+// 4) 保存失败则回滚（编辑恢复旧条目，新增则弹出刚加入的条目）。
+// saveXml 返回 null 表示保存已被取代（工程已切换或有更新的编辑），此时直接返回、不刷新也不回滚。
 async function savePreset(event) {
   event.preventDefault()
   const submit = $('#presetForm button[type="submit"]')
@@ -5087,6 +5742,11 @@ async function savePreset(event) {
   } finally { submit.disabled = false }
 }
 
+// 作用：材质对话框提交（导入 OBJ 的最后一步）：复制 OBJ、生成实例分布与位置文件、
+// 按需新建光谱/热学/物理预设、建立每个网格组的属性绑定、写入对象条目并保存工程。
+// stage 变量记录当前阶段，出错时拼进提示信息。出错回滚：对象列表还原（新增则移除，
+// 替换则恢复旧条目）、预设列表还原为快照；已复制到工程的 OBJ 与位置文件不会删除。
+// 步骤见下方各“步骤 n”。
 async function saveImportedObject(event) {
   event.preventDefault()
   const pending = state.pendingObject
@@ -5100,22 +5760,29 @@ async function saveImportedObject(event) {
   try {
     submit.disabled = true
     ensureProjectState()
+    // 步骤 1：读取表单；多波段反射/透射输入合并为逗号字符串；file 模型必须已导入波谱。
     const formData = new FormData($('#materialForm'))
     const values = Object.fromEntries(formData.entries())
     values.reflectance = formData.getAll('reflectanceValue').map(String).join(',')
     values.transmittance = formData.getAll('transmittanceValue').map(String).join(',')
     if (values.spectralModel === 'file' && !values.fileName) throw new Error('请先导入波谱文件')
+    // 步骤 2：把 OBJ 复制进工程。车辆自动绑定且表格行数与原网格数不同（组已按法向拆分）时，
+    // 导入拆分后的 OBJ 内容，否则导入原始内容。
     stage = '复制 OBJ 到工程'
     // FacetEB vehicle: split the glass group (front / side / rear) and the bonnet by facet orientation.
     const vehicleAuto = vehicleAutoBindEnabled()
     const rowNames = $$('#meshMaterialRows tr').map((row) => row.dataset.meshName)
     const vehicleSplit = vehicleAuto && rowNames.length !== pending.meshNames.length ? splitVehicleObj(pending.source.content) : null
     const imported = await api.importObj({ name: `${uniqueName(values.objectName, 'object')}.obj`, content: vehicleSplit ? vehicleSplit.content : pending.source.content })
+    // 步骤 3：按物体类型与尺寸生成缺省实例分布（defaultDistribution），展开为实例列表。
     stage = '生成实例分布'
     const distribution = defaultDistribution({ type: values.objectType, dimensions: pending.dimensions })
     const instances = generateDistribution(distribution)
+    // 步骤 4：把实例位置写入 OBJ 对应的 positions 文件。
     stage = '保存实例位置文件'
     const savedDistribution = await api.saveDistribution({ path: imported.positionPath, name: values.objectName, instances })
+    // 步骤 5：由表单构造新的光谱/热学/物理预设，并记录预设列表快照供失败回滚；
+    // 只有某一行选了“新建”时才把对应预设写入工程配置（upsertByName）。
     stage = '校验 Mesh 属性映射'
     const spectrum = { name: values.spectralName, model: values.spectralModel, fileName: values.fileName || '', reflectance: values.reflectance, transmittance: values.transmittance, refTir: Number(values.refTir), refTirWet: optionalTirReflectance(values.refTirWet), tauTir: Number(values.tauTir), openness: Number(values.openness) || 0, previewTexture: previewTextureFromValues(values), physicalTexture: physicalTextureFromValues(values), specular: specularParametersFromValues(values, state.config.spectra.find(entry => entry.name === values.spectralName)?.specular), params: { Cab: values.paramCab, Cw: values.paramCw, Cdm: values.paramCdm, Cs: values.paramCs, N: values.paramN, SMC: values.paramSMC, BSMBrightness: values.paramBSMBrightness, BSMlat: values.paramBSMlat, BSMlon: values.paramBSMlon } }
     const thermal = { name: values.thermalName, sunlitTemperature: Number(values.sunlitTemperature), shadedTemperature: Number(values.shadedTemperature) }
@@ -5133,6 +5800,8 @@ async function saveImportedObject(event) {
       ensureVehiclePresets()
       upsertByName(state.config.materials, vehicleBodyMaterial(values, `${values.objectName}_body`))
     }
+    // 步骤 6：逐网格组生成绑定：下拉框选“新建”则换成刚建的预设名；车辆自动绑定时，规则为
+    // paint/other/tarp 且仍选默认车身材料的行绑定到 `${对象名}_body`（带本车座舱参数的车身材料）。
     const meshes = (vehicleAuto ? rowNames : pending.meshNames).map((name, index) => ({
       name,
       spectralName: spectralSelections[index].value === '__new__' ? spectrum.name : spectralSelections[index].value,
@@ -5143,6 +5812,7 @@ async function saveImportedObject(event) {
       canopyName: canopySelections[index]?.value || defaultCanopy,
       specularEnabled: meshSpecularFromRow($('#meshMaterialRows').rows[index])
     }))
+    // 步骤 7：校验：物化、光谱、热学、冠层引用必须存在，且各网格物化预设须与物体类型匹配。
     if (!physical?.name || !state.config.materials.some((entry) => entry.name === physical.name)) throw new Error('物化属性未定义')
     for (const mesh of meshes) {
       if (!state.config.spectra.some((entry) => entry.name === mesh.spectralName)) throw new Error('光谱属性不存在：' + mesh.spectralName)
@@ -5151,6 +5821,8 @@ async function saveImportedObject(event) {
       if (!materialMatchesObjectType(meshPhysical, values.objectType)) throw new Error('Mesh 物化属性无效：' + mesh.materialName)
       if (!state.config.canopies.some((entry) => entry.name === mesh.canopyName)) throw new Error('Mesh 结构属性不存在：' + mesh.canopyName)
     }
+    // 步骤 8：组装对象条目（人/车/船附带缺省移动参数）；同名对象则替换并记下旧条目供回滚，
+    // 否则追加；随后同步对象计数与名称表。
     const item = { name: values.objectName, ...objectTypeFields(values.objectType), materialName: meshes[0]?.materialName || physical.name, canopyName: meshes[0]?.canopyName || defaultCanopy, fileName: imported.path, positionFile: savedDistribution.path, shape: pending.shape || 'cube', dimensions: pending.dimensions, meshes, distribution, instanceCount: instances.length, ...(isMobileAgentType(values.objectType) ? { movement: defaultMovement(values.objectType) } : {}), ...(pending.generation ? { generation: pending.generation } : {}) }
     const existing = state.config.objects.items.findIndex((entry) => entry.name === item.name)
     objectIndex = existing >= 0 ? existing : state.config.objects.items.length
@@ -5166,11 +5838,13 @@ async function saveImportedObject(event) {
     state.config.objects.names = state.config.objects.items.map((entry) => entry.name)
     state.project.configuration = state.config
     markXmlDirty()
+    // 步骤 9：保存工程；saveXml 返回 null（被取代）则直接退出；失败则抛出最近一次保存错误。
     stage = '保存 project.json'
     const projectSaved = await saveXml(true)
     if (projectSaved === null) return
     if (!projectSaved) throw state.lastSaveError || new Error('工程配置保存失败')
 
+    // 步骤 10：释放待导入对象，关闭对话框，重载三维场景并选中新对象，打开实例分布对话框继续设置。
     stage = '刷新三维场景'
     disposeObject(pending.object); state.pendingObject = null
     hideMaterialDialog(false); refreshFromState(false); await loadActualScene(state.config)
@@ -5199,12 +5873,15 @@ async function saveImportedObject(event) {
 }
 
 
+// 作用：生成属性绑定下拉框的 option 列表。选中项优先 selected，其次 fallback，
+// 再次取第一项；列表为空时给出“无可用属性”占位。
 function bindingOptionList(items, selected, fallback) {
   if (!items.length) return '<option value="">无可用属性</option>'
   const selectedName = items.some((item) => item.name === selected) ? selected : (items.some((item) => item.name === fallback) ? fallback : items[0].name)
   return items.map((item) => `<option value="${escapeHtml(item.name)}" ${item.name === selectedName ? 'selected' : ''}>${escapeHtml(item.label || item.name)} · ${escapeHtml(item.name)}</option>`).join('')
 }
 
+// 作用：在对象属性对话框中显示当前所选物化材质的参数摘要（找不到时提示未定义）。
 function renderObjectAttributeSummary() {
   const form = $('#objectAttributeForm')
   const material = state.config?.materials?.find((item) => item.name === form.elements.materialName.value)
@@ -5212,6 +5889,10 @@ function renderObjectAttributeSummary() {
   $('#objectAttributeSummary').textContent = material ? `${material.label || material.name} · ${summary}` : summary
 }
 
+// 作用：重建对象属性对话框的物化/冠层下拉框与逐网格组绑定表。
+// useCurrent：保留对话框当前选择（否则取对象已保存的绑定）；
+// resetBindings：对象类型改变时，全部回到该类型的推荐预设（与材质对话框的推荐表一致）。
+// 物化预设只列出与对象类型匹配者（materialMatchesObjectType）。
 function renderObjectAttributeOptions(useCurrent = false, resetBindings = false) {
   const item = state.config?.objects?.items?.[state.editingAttributeIndex]
   if (!item) return
@@ -5241,6 +5922,7 @@ function renderObjectAttributeOptions(useCurrent = false, resetBindings = false)
   renderObjectAttributeSummary()
 }
 
+// 作用：打开第 index 个对象的“OBJ 属性”对话框并回填名称、类型、路径、叶密度来源。
 function showObjectAttributeDialog(index) {
   const item = state.config?.objects?.items?.[index]
   if (!item) return
@@ -5257,11 +5939,18 @@ function showObjectAttributeDialog(index) {
   $('#objectAttributeDialog').hidden = false
 }
 
+// 作用：关闭对象属性对话框并清除编辑索引。
 function hideObjectAttributeDialog() {
   $('#objectAttributeDialog').hidden = true
   state.editingAttributeIndex = -1
 }
 
+// 作用：保存对象属性对话框：更新对象类型与每个网格组的光谱/热学/物化/冠层绑定。
+// 步骤：1) 读表单；2) 校验：火/雾只能用于 VoxelRT/VoxelEB，物化须匹配类型，火焰/雾对象
+// （含每个网格组）必须绑定相应 structureType 的冠层，引用的预设须存在；
+// 3) 应用：火/雾写 medium 标记（仅辐射传输），人/车/船保留或补默认移动参数（mode 为 random），
+// 其余类型删除 medium/movement；叶密度来源仅 geometry 时写入；
+// 4) 保存工程，失败则用保存前的快照恢复该对象；null（被取代）直接退出。
 async function saveObjectAttributes(event) {
   event.preventDefault()
   const index = state.editingAttributeIndex
@@ -5322,6 +6011,9 @@ async function saveObjectAttributes(event) {
   finally { submit.disabled = false }
 }
 
+// 作用：随机/规则网格分布下，让“数量”和“密度”两个输入框互相保持一致。
+// 面积取分布范围 (maxX−minX)×(maxY−minY)；source 为 density 时由密度算数量，否则由数量算密度，
+// 并把依据（basis）同步到表单。其他分布模式不处理。
 function syncDistributionPopulation(form, source = 'count') {
   const mode = form.elements.distributionMode.value
   if (mode !== 'random' && mode !== 'grid') return
@@ -5338,6 +6030,9 @@ function syncDistributionPopulation(form, source = 'count') {
   form.elements.distributionDensity.value = distributionDensityInputValue(population.density)
 }
 
+// 作用：按分布模式刷新分布表单的可用状态与说明：仅随机/规则网格使用数量与密度，
+// 依据为密度时数量只读、为数量时密度只读，手动模式显示坐标文本框。
+// 状态行显示实例数估算（密度单位为 个/公顷，面积换算为公顷）。
 function updateDistributionFormState(form) {
   const mode = form.elements.distributionMode.value
   const basis = form.elements.distributionBasis.value
@@ -5367,6 +6062,8 @@ function updateDistributionFormState(form) {
   $('#objectDistributionStatus').textContent = `${detail}；保存后覆盖该 OBJ 自己的位置文件。`
 }
 
+// 作用：打开第 index 个对象的“实例分布与移动”对话框。若对象没有 distribution 但有位置文件，
+// 则读取该文本作为手动坐标；回填分布表单与移动表单。
 async function showObjectDialog(index) {
   const item = state.config?.objects?.items?.[index]
   if (!item) return
@@ -5392,6 +6089,8 @@ async function showObjectDialog(index) {
   $('#objectDialog').hidden = false
 }
 
+// 作用：从 TXT 导入自定义实例坐标（上限 5 MB）；缺省高度取表单里的 distributionZ，
+// 导入后切到手动模式，保存时才写入 positions 文件。
 async function importDistributionTxt(file) {
   if (!file) return
   try {
@@ -5411,11 +6110,16 @@ async function importDistributionTxt(file) {
   }
 }
 
+// 作用：关闭实例分布对话框并清除编辑索引。
 function hideObjectDialog() {
   $('#objectDialog').hidden = true
   state.editingObjectIndex = -1
 }
 
+// 作用：保存“实例分布与移动”对话框：改名、重新生成实例并写位置文件、更新分布与移动参数。
+// 步骤：1) 校验名称非空且不与其他对象重名；2) 由表单生成分布（要求密度有效）并展开实例，
+// 写入 positions 文件；3) 更新对象条目与计数，保存工程；
+// 4) 出错时用进入时的浅拷贝快照恢复对象，并重算对象名列表（保证 names 与 item.name 一致）。
 async function saveSceneObject(event) {
   event.preventDefault()
   const index = state.editingObjectIndex
@@ -5464,6 +6168,12 @@ async function saveSceneObject(event) {
   finally { submit.disabled = false }
 }
 
+// 作用：为第 index 个对象生成一个贴合其网格的篷布罩对象并插入其后。
+// 步骤：1) 补齐内置预设（tarp_olive_canvas 光谱、tarp_temperature 热学、tarp_fabric 物化、rigid_body 冠层）；
+// 2) 生成唯一名称 `${目标名}_tarp[_n]`；3) 调用 api.generateTarpCover 生成罩面 OBJ；
+// 4) 新对象沿用目标的位置文件、分布、移动参数与地面投影（groundFootprint），并标记 tarpCoverOf；
+// 5) 保存工程并刷新场景，失败则删除新对象并恢复预设列表快照。
+// 说明：FacetEB 求解薄膜热平衡；VoxelEB 不支持薄膜，故沿用目标物化属性。
 async function addTarpCover(index) {
   const target = state.config?.objects?.items?.[index]
   if (!target?.fileName) { toast('无法生成篷布罩', '该对象没有 OBJ 网格', 'error'); return }
@@ -5513,6 +6223,8 @@ async function addTarpCover(index) {
   }
 }
 
+// 作用：从场景删除第 index 个对象并保存工程；同步修正选中索引与计数。
+// 保存失败则把对象插回原位并恢复选中项。注意：不删除磁盘上的 OBJ / 位置文件。
 async function deleteSceneObject(index) {
   const item = state.config?.objects?.items?.[index]
   if (!item) return
@@ -5541,6 +6253,8 @@ async function deleteSceneObject(index) {
   }
 }
 
+// 作用：点击“运行”的入口。依次：需有工程；防止重入（正在运行或正在准备）；
+// 检查镜面设置能否运行；有未保存的修改先保存；运行预检（可能需用户确认）；最后启动引擎。
 async function runSimulation() {
   if (!state.inputPath) { toast("无法运行", "请先打开场景工程的 project.json", "error"); return }
   if (state.running || state.runPending) return
@@ -5554,6 +6268,7 @@ async function runSimulation() {
   } finally { state.runPending = false }
 }
 
+// 作用：把秒数格式化为中文时长：<90 秒显示秒，<90 分钟（5400 s）显示分钟，否则显示小时（一位小数）。
 function formatDuration(seconds) {
   const value = Math.max(0, Math.round(Number(seconds) || 0))
   if (value < 90) return `${value} 秒`
@@ -5565,6 +6280,7 @@ function formatDuration(seconds) {
 // (timeout, facet limit, memory) ask for confirmation; otherwise the summary
 // only goes to the log. A failing preflight never blocks the run.
 async function runPreflightCheck() {
+  // 步骤 1：向服务端请求预检报告；预检接口不可用时只记警告并放行，不阻止运行。
   let report
   try {
     report = await api.preflight({ mode: state.mode, inputPath: state.inputPath })
@@ -5572,6 +6288,8 @@ async function runPreflightCheck() {
     addLog(`运行预检不可用：${error.message}`, 'warning')
     return true
   }
+  // 步骤 2：汇总规模信息写入日志：面元数/上限与可见性栅格，体元网格与辐射场显存估计，
+  // 时间节点、观测方向、波段数，预计耗时（及依据）与单次运行上限（工程设置或服务端默认）。
   const parts = []
   if (report.facet) parts.push(`面元约 ${report.facet.triangles.toLocaleString('zh-CN')} 个（上限 ${report.facet.limit.toLocaleString('zh-CN')}）`, `可见性栅格 ${report.facet.raster}²${report.facet.periodicTiles ? ` · 周期邻块 ${report.facet.periodicTiles}` : ''}`)
   if (report.voxel) parts.push(`体元网格 ${report.voxel.grid.join('×')}（${report.voxel.size} m）`, `辐射场显存上限估计 ${report.voxel.radianceMiB >= 1024 ? (report.voxel.radianceMiB / 1024).toFixed(1) + ' GB' : report.voxel.radianceMiB + ' MB'}`)
@@ -5582,6 +6300,8 @@ async function runPreflightCheck() {
   parts.push(`单次运行上限 ${formatDuration(report.timeoutSeconds)}${report.timeoutSource === 'project' ? '（工程设置）' : '（服务端默认）'}`)
   addLog(`运行预检 · ${parts.join(' · ')}`)
   for (const warning of report.warnings || []) addLog(`运行预检提示：${warning}`, 'warning')
+  // 步骤 3：无风险提示则直接放行；有提示时弹确认。若预计耗时超限且有建议上限，
+  // 给出三选一：调高上限后运行 / 按当前上限运行 / 取消。
   if (!report.warnings?.length) return true
   const riskText = `运行预检发现以下风险：\n\n${report.warnings.map((item) => '• ' + item).join('\n')}`
   const suggested = Number(report.suggestedTimeoutMinutes) || 0
@@ -5626,6 +6346,8 @@ function chooseDialog({ title, message, actions }) {
   })
 }
 
+// 作用：置初始进度状态并调用 api.run 启动引擎；真正的输出与结束由 handleSimulationEvent 处理。
+// 启动失败时复位进度；引擎路径未被服务端白名单允许时给出专门提示。
 async function startSimulation() {
   try {
     state.startedAt = Date.now(); state.progress = 1; state.progressStage = '正在启动计算引擎'; state.outputDir = state.config?.outDir || state.outputDir; state.runId = ''
@@ -5642,6 +6364,7 @@ async function startSimulation() {
   }
 }
 
+// 作用：重置模拟环境：请求服务端终止残留的模拟进程，并把运行状态与进度归零。
 async function resetSimulation() {
   const button = $('#resetBtn')
   try {
@@ -5664,12 +6387,16 @@ async function resetSimulation() {
   } finally { button.disabled = false }
 }
 
+// 运行模式（state.mode 取值）到界面中文名的映射。
 const simulationModeLabels = {
   eFacetRT: '面元辐射传输', eFacetEB: '面元能量平衡',
   eVoxelRT: '体元辐射传输', eVoxelEB: '体元辐射传输与能量平衡',
   eRaytracing: '简单光线追踪'
 }
 
+// 作用：能量平衡模式（eFacetEB / eVoxelEB）的运行日志中，写出所选温度方法：
+// 土壤（缺省 2=温度廓线传导模型；0 瞬时能量平衡，1 热惯性动态模型）与
+// 植被（缺省 0=Ball–Berry 经验法，否则 Farquhar 机制法）。其他模式返回空串。
 function simulationMethodSummary() {
   if (!['eFacetEB', 'eVoxelEB'].includes(state.mode)) return ''
   const soil = t(['瞬时能量平衡', '热惯性动态模型', '温度廓线传导模型'][state.config?.control?.soilTemperatureMethod ?? 2])
@@ -5678,6 +6405,10 @@ function simulationMethodSummary() {
   return t(`温度方法：土壤=${soil}；植被=${vegetation}`)
 }
 
+// 作用：把引擎 stdout 的原始行整理成界面日志行。
+// 规则：丢弃以 cube / OBJ placement 开头的行；PROGRESS n 阶段 → 更新进度条并输出“进度 n%”
+// （常见英文阶段名翻译为中文）；PROCESS / RESULT / OBSERVATION / Angle Info / Time Info 转为
+// 中文前缀；诊断行交给 recordRunQualityLine；其余原样保留。
 function normalizedEngineLog(text) {
   const translations = [
     [/Preparing CPU raster buffers/i, '准备面元计算缓冲区'],
@@ -5716,6 +6447,12 @@ function emptyRunQuality() {
   return { facet: [], timing: [], voxel: [], scattering: [] }
 }
 
+// 识别的引擎诊断行（均记入 state.runQuality，部分同时返回日志文字）：
+// FACET_CONVERGENCE（节点、是否收敛、迭代数、温度变化、残差 W/m² 与等效 K）、
+// FACET_STEP（忽略）、FACET_TIMING（短波/耦合/出图耗时，单位 s）、
+// ENERGY_BALANCE（VoxelEB 节点迭代与未达容差状态数，可附 Monin–Obukhov 诊断）、
+// SHORTWAVE_SCATTERING（短波散射耗时与射线截断数）、SHORTWAVE_SPLIT（直散拆分）、
+// VEHICLE_CABIN（车辆座舱温度）。行格式依赖引擎输出，字段顺序变化会导致解析失败。
 // Engine diagnostics lines -> structured run quality + a readable log line.
 // Returns null when the line is not a diagnostics line, '' to hide it.
 function recordRunQualityLine(line) {
@@ -5768,6 +6505,8 @@ function recordRunQualityLine(line) {
   return null
 }
 
+// 运行结束时汇总诊断为日志行（{kind, text}）：车辆座舱最高气温、FacetEB 收敛情况与建议、
+// 耗时构成、VoxelEB 能量平衡收敛、短波直散拆分、射线截断提示（短波散射与太阳可见性）。
 // Summary of the run diagnostics, written to the log when a run closes.
 function runQualitySummary(quality) {
   if (!quality) return []
@@ -5812,6 +6551,13 @@ function runQualitySummary(quality) {
   return lines
 }
 
+// 作用：处理服务端推送的模拟事件（事件流）。按 event.type 分支：
+// status：重连事件流后同步运行状态（仍在运行则接管；已结束则提示刷新结果）；
+// started：重置进度与运行质量，记录模式、温度方法与输出选项；
+// stdout：引擎原始输出可能被任意切块，只解析完整行，残余缓存在 state.stdoutCarry；
+// stderr/error：写错误日志；
+// closed：冲刷残余缓存，按退出码判定成功/未收敛/异常，输出质量汇总，
+// 成功或未收敛（结果保留）时延时 300 ms 自动打开结果。
 function handleSimulationEvent(event) {
   if (event.type === 'status') {
     if (event.running && !state.running) {
@@ -5885,6 +6631,7 @@ function handleSimulationEvent(event) {
   }
 }
 
+// 作用：字节数格式化为 B / KB / MB（1024 进制，KB 与 MB 保留一位小数）。
 function formatBytes(value) {
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
@@ -5892,10 +6639,13 @@ function formatBytes(value) {
 }
 
 
+// —— 结果预览：把引擎输出的 ENVI/TIFF 预览数据绘制为二维图像或风场箭头图 ——
+// 作用：在结果预览区显示空状态（标题 + 说明）。
 function emptyResultPreview(title, message) {
   $('#resultPreview').innerHTML = `<div class="empty-editor"><svg><use href="#i-layers"/></svg><h3>${escapeHtml(title)}</h3><p>${escapeHtml(message)}</p></div>`
 }
 
+// 作用：把服务端返回的 base64 预览像素（每像素 1 字节，已拉伸到 0–255）解码为 Uint8Array。
 function decodeResultPixels(result) {
   const source = atob(result.pixels || '')
   return Uint8Array.from(source, (character) => character.charCodeAt(0))
@@ -5915,6 +6665,8 @@ function grayscaleResultPixels(bytes, width, height) {
   return canvas
 }
 
+// 作用：把高温异常强度（0–255）画成半透明叠加层：强度越大越红（G、B 分量减小），
+// 透明度 160–255；强度为 0 的像素保持全透明。
 function thermalHotspotPixels(bytes, width, height) {
   const canvas = document.createElement('canvas')
   canvas.width = width; canvas.height = height
@@ -5933,6 +6685,8 @@ function thermalHotspotPixels(bytes, width, height) {
   return canvas
 }
 
+// 作用：把单波段预览结果转成栅格对象 {width, height, bytes, textureCanvas}：
+// 灰度画布，若存在 hotspotPixels 再叠加高温异常层。尺寸取预览尺寸（previewWidth/Height）。
 function resultRasterFromEnvi(result) {
   const width = result.previewWidth, height = result.previewHeight
   const bytes = decodeResultPixels(result)
@@ -5949,6 +6703,8 @@ function resultViewActions(allow3D = true) {
   return '<div class="result-view-actions"><button class="button ghost result-2d-btn" id="result2dBtn" type="button">二维图像</button><button class="button ghost result-3d-btn" id="result3dBtn" type="button">三维分析</button></div>'
 }
 
+// 作用：色标数值文字：非有限值显示“—”，0 显示“0”，绝对值 ≥ 1e4 或 < 1e-3 用 3 位小数的科学计数，
+// 其余用 5 位有效数字。
 function formatColorbarValue(value) {
   if (!Number.isFinite(Number(value))) return '—'
   const numeric = Number(value)
@@ -5957,6 +6713,8 @@ function formatColorbarValue(value) {
   return absolute >= 10000 || absolute < .001 ? numeric.toExponential(3) : numeric.toPrecision(5)
 }
 
+// 作用：生成色标 HTML。label 形如“名称 [单位]” 时标题显示为“名称 · 单位”；
+// palette 取 gray/hotspot/red/green/blue/diverging 之一，否则用缺省色带。
 function resultColorbar(label, minimum, maximum, palette = 'spectral') {
   const text = String(label || '数值')
   const match = text.match(/^(.*?)\s*\[([^\]]+)\]\s*$/)
@@ -5965,6 +6723,8 @@ function resultColorbar(label, minimum, maximum, palette = 'spectral') {
   return `<div class="result-colorbar ${paletteClass}" role="img" aria-label="${escapeHtml(title)} 色标"><div class="result-colorbar-title" title="${escapeHtml(title)}">${escapeHtml(title)}</div><div class="result-colorbar-scale"><div class="result-colorbar-gradient"></div><div class="result-colorbar-labels"><span>${escapeHtml(formatColorbarValue(minimum))}</span><span>${escapeHtml(formatColorbarValue(maximum))}</span></div></div></div>`
 }
 
+// 作用：求第 index 个波段的波长（nm）：优先从波段名中的“@ 数字 nm”解析；
+// 否则当传感器配置的波段数与结果波段数一致时取配置值；都没有则返回 null。
 function resultBandWavelength(result, index) {
   const name = String(result.bandNames?.[index] || '')
   const labelled = Number(name.match(/@\s*([0-9.]+)\s*nm/i)?.[1])
@@ -5977,6 +6737,8 @@ function resultBandLabel(result, index) {
   return result.bandNames?.[index] || `波段 ${index + 1}`
 }
 
+// 作用：选出可用于彩色合成的“光学”波段：波长已知且 ≤ 2500 nm 的波段；
+// 一个也没有（波长未知）时退回前 5 个波段。
 function resultOpticalBands(result) {
   if (!result) return []
   const all = Array.from({ length: result.bands }, (_, index) => ({ index, wavelength: resultBandWavelength(result, index) }))
@@ -5984,6 +6746,9 @@ function resultOpticalBands(result) {
   return knownOptical.length ? knownOptical : all.slice(0, Math.min(5, all.length))
 }
 
+// 作用：给出缺省真彩色的 [R, G, B] 波段索引：取光学波段中最接近 668 / 560 / 475 nm 者；
+// 波长未知时按波段顺序取前三个并反序（第 3、2、1 波段作 R、G、B）；
+// 光学波段不足 3 个则返回 null（只能灰度显示）。
 function defaultColorBands(result) {
   if (!result || result.bands < 3) return null
   const optical = resultOpticalBands(result)
@@ -5993,6 +6758,8 @@ function defaultColorBands(result) {
   return [closest(668).index, closest(560).index, closest(475).index]
 }
 
+// 作用：得到并缓存该结果文件的显示设置 {mode, channels, gray}（存于 state.resultDisplay[path]）。
+// 之前的选择若越界或不在光学波段内则回落到缺省；无缺省彩色波段时强制灰度模式。
 function normalizedResultDisplay(result, file) {
   const defaults = defaultColorBands(result)
   const opticalIndices = new Set(resultOpticalBands(result).map((item) => item.index))
@@ -6012,6 +6779,8 @@ function resultBandOptions(result, selected, indices = Array.from({ length: resu
   return indices.map((index) => `<option value="${index}" ${index === selected ? 'selected' : ''}>${escapeHtml(resultBandLabel(result, index))}</option>`).join('')
 }
 
+// 作用：生成显示控制区：彩色/灰度切换按钮，彩色模式下 R/G/B 三个波段下拉（仅光学波段），
+// 灰度模式下一个波段下拉；附拉伸说明（缺省真彩色 668/560/475 nm；灰度 P2–P98 拉伸）。
 function resultDisplayControls(result, settings) {
   const colorAvailable = Boolean(defaultColorBands(result))
   const opticalIndices = resultOpticalBands(result).map((item) => item.index)
@@ -6022,6 +6791,8 @@ function resultDisplayControls(result, settings) {
   return `<div class="result-display-controls"><div class="result-display-modes"><button class="button ghost ${settings.mode === 'color' ? 'active' : ''}" id="resultColorMode" type="button" ${colorAvailable ? '' : 'disabled'}>彩色图像</button><button class="button ghost ${settings.mode === 'gray' ? 'active' : ''}" id="resultGrayMode" type="button">灰度图像</button></div><div class="result-channel-controls">${selectors}</div>${settings.mode === 'color' ? '<small>默认真彩色：红 668 nm、绿 560 nm、蓝 475 nm；也可选择红边或近红外组成假彩色。</small>' : '<small>选择一个波段，以 P2–P98 灰度拉伸显示。</small>'}</div>`
 }
 
+// 作用：把三个单波段栅格（已各自拉伸到 0–255）合成为彩色画布；bytes 只保留第一通道，
+// 因此三维分析不用于彩色模式。
 function colorCompositeRaster(rasters) {
   const width = rasters[0].width, height = rasters[0].height
   const canvas = document.createElement('canvas')
@@ -6039,6 +6810,10 @@ function colorCompositeRaster(rasters) {
   return { width, height, bytes: rasters[0].bytes, textureCanvas: canvas }
 }
 
+// 作用：解析模拟时间标签为 {day, hour, minute}。
+// 两种写法：纯数字（整数部分为日序，小数部分为当天的比例，按 1440 分钟折算并处理进位）；
+// 或文本中形如 “DOY123 … 12-30” 的日序与时分。无法识别返回 null。
+// 数字写法的日序含义以引擎输出为准（待核对）。
 function simulationTimeParts(value) {
   const text = String(value ?? '').trim()
   if (!text) return null
@@ -6054,17 +6829,21 @@ function simulationTimeParts(value) {
   return match ? { day: Number(match[1]), hour: Number(match[2]), minute: Number(match[3]) } : null
 }
 
+// 作用：把时间标签显示为 “DOY<日序> HH:MM”；无法解析时把 _to_ 换成“ → ”、下划线换成空格。
 function displaySimulationTime(value) {
   const parts = simulationTimeParts(value)
   if (parts) return `DOY${parts.day} ${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}`
   return String(value || '').replaceAll('_to_', ' → ').replaceAll('_', ' ')
 }
 
+// 作用：绑定“二维图像 / 三维分析”两个按钮：三维进入 showResult3D，二维按结果类型重画预览。
 function bindResultViewActions(result, file, raster, image = false) {
   $('#result3dBtn')?.addEventListener('click', () => showResult3D(raster, file, result))
   $('#result2dBtn')?.addEventListener('click', () => image ? drawImagePreview(result, file) : result.kind === 'tiff' ? drawTiffPreview(result, file) : drawEnviPreview(result, file))
 }
 
+// 作用：流场切片（空气温度、风场）的画布显示尺寸：保持宽高比，最大边小于 480 像素时放大到 480，
+// 大于 720 时缩小到 720，其余保持原尺寸。
 function fluidSliceDisplaySize(width, height) {
   const previewMaximum = Math.max(Number(width) || 0, Number(height) || 0, 1)
   const scale = Math.min(720 / previewMaximum, Math.max(1, 480 / previewMaximum))
@@ -6074,9 +6853,17 @@ function fluidSliceDisplaySize(width, height) {
   }
 }
 
+// 作用：绘制 ENVI（或 TIFF，format 区分）结果的二维预览，含色标、显示控制和元信息。
+// 步骤：1) 递增请求号并释放旧三维视图（异步竞态保护）；2) 取显示设置，读取所需波段
+// （已持有的波段直接复用）；3) 读取完成后若已有更新请求或选中文件已变则放弃；
+// 4) 转栅格，彩色模式合成；5) 按波段与拉伸信息生成色标、高温异常图例与元信息；
+// 6) 写入预览 HTML 并把栅格画到画布；7) 绑定模式/波段切换（切换后重绘）与三维按钮。
+// 坐标约定：影像上北右东；透视投影且 |vza| > 0.001 时改为天空朝上（vza 为观测天顶角，待核对）。
 async function drawEnviPreview(result, file, format = 'ENVI') {
+  // 步骤 1：请求号用于丢弃过期的异步结果（用户连续切换文件/波段时只有最后一次生效）。
   const previewRequest = ++state.resultPreviewRequest
   disposeResultViewer()
+  // 步骤 2：彩色模式读取 R/G/B 三个波段，灰度只读一个；失败时在预览区、toast 与日志中报告。
   const settings = normalizedResultDisplay(result, file)
   const selectedBands = settings.mode === 'color' ? settings.channels : [settings.gray]
   let bandResults
@@ -6092,11 +6879,14 @@ async function drawEnviPreview(result, file, format = 'ENVI') {
     return
   }
   if (previewRequest !== state.resultPreviewRequest || state.selectedResult?.path !== file.path) return
+  // 步骤 4：转栅格并保存到 state.resultRaster；仅 ENVI 灰度模式允许三维分析（TIFF、彩色不允许）。
   const rasters = bandResults.map(resultRasterFromEnvi)
   const raster = settings.mode === 'color' ? colorCompositeRaster(rasters) : rasters[0]
   state.resultRaster = raster
   const allow3D = format !== 'TIFF' && settings.mode === 'gray'
   const observationMeta = format === 'TIFF' && file.observationLabel ? '<span>' + escapeHtml(file.observationLabel.replaceAll('_to_', ' → ').replaceAll('_', ' ')) + '</span>' : ''
+  // 步骤 5：显示范围优先用读取端给出的 P2–P98 拉伸范围，缺失时退回 min/max；
+  // 热红外波段额外显示原始范围；灰度模式下若有高温异常像元，附带热点图例。
   const activeResult = bandResults[0]
   const layerName = resultBandLabel(result, settings.gray)
   const displayMinimum = Number.isFinite(Number(activeResult.stretchMinimum)) ? Number(activeResult.stretchMinimum) : Number(activeResult.minimum)
@@ -6115,6 +6905,8 @@ async function drawEnviPreview(result, file, format = 'ENVI') {
   const displaySummary = settings.mode === 'color'
     ? `彩色合成：R ${escapeHtml(resultBandLabel(result, settings.channels[0]))} · G ${escapeHtml(resultBandLabel(result, settings.channels[1]))} · B ${escapeHtml(resultBandLabel(result, settings.channels[2]))}`
     : `灰度波段：${escapeHtml(layerName)}`
+  // 空气温度切片（文件名 fluid_air_temperature_*）按流场切片的显示尺寸放大并开启图像平滑，
+  // 其余结果保持原尺寸、关闭平滑以保留像元边界。
   const isAirTemperatureSlice = format === 'TIFF' && /^fluid_air_temperature_/i.test(String(file.name || ''))
   const displaySize = isAirTemperatureSlice
     ? fluidSliceDisplaySize(result.previewWidth, result.previewHeight)
@@ -6128,11 +6920,14 @@ async function drawEnviPreview(result, file, format = 'ENVI') {
     ? '<div class="result-north-indicator" aria-label="影像上方朝向天空"><strong>UP</strong><span>↑</span></div>'
     : '<div class="result-north-indicator" aria-label="影像上方为正北"><strong>N</strong><span>↑</span></div>'
   const orientationLabel = perspectiveForwardView ? '天空向上 · 地平线水平' : '上北 · 右东'
+  // 步骤 6：写入预览卡片 HTML（画布、方位指示、显示控制、色标、视图按钮、元信息），
+  // 随后把栅格画到画布。
   $('#resultPreview').innerHTML = `<div class="result-preview-card${fluidSliceClass}"><div class="result-image-stage"><canvas class="result-canvas${fluidCanvasClass}" id="resultCanvas" width="${displaySize.width}" height="${displaySize.height}"></canvas>${orientationIndicator}</div>${resultDisplayControls(result, settings)}${colorbars}${hotspotLegend}${resultViewActions(allow3D)}<div class="result-meta"><span>${result.width} × ${result.height}</span><span>${format} · ${result.bands} 个独立波段</span><span>${orientationLabel}</span><span>${displaySummary}</span>${observationMeta}<span>${settings.mode === 'color' ? '各通道显示 P2–P98' : `灰度显示 ${grayStretchLabel}`}</span>${settings.mode === 'gray' ? `<span>MIN ${displayMinimum.toPrecision(6)}</span><span>MAX ${displayMaximum.toPrecision(6)}</span>` : ''}${rawRange}</div></div>`
   const canvas = $('#resultCanvas')
   const context = canvas.getContext('2d')
   context.imageSmoothingEnabled = isAirTemperatureSlice
   context.drawImage(raster.textureCanvas, 0, 0, displaySize.width, displaySize.height)
+  // 步骤 7：绑定显示控制：切换彩色/灰度、更换波段后按新设置重绘；最后绑定二维/三维视图按钮。
   $('#resultColorMode')?.addEventListener('click', () => { settings.mode = 'color'; drawEnviPreview(result, file, format) })
   $('#resultGrayMode')?.addEventListener('click', () => { settings.mode = 'gray'; drawEnviPreview(result, file, format) })
   $$('.result-channel').forEach((select) => select.addEventListener('change', () => {
@@ -6146,16 +6941,25 @@ async function drawEnviPreview(result, file, format = 'ENVI') {
   bindResultViewActions(activeResult, file, raster)
 }
 
+// 作用：TIFF 结果预览入口，与 ENVI 共用 drawEnviPreview（灰度/彩色合成、色标、2D 画布），
+//   仅把格式标记为 'TIFF'（TIFF 下不提供三维分析按钮，且会显示观测方向标签）。
 async function drawTiffPreview(result, file) {
   await drawEnviPreview(result, file, 'TIFF')
 }
 
+// 作用：风速箭头配色。把风速线性归一化到 [minimum, maximum] 后映射到 HSL 色相：
+//   最小值为 225°（蓝），最大值为 0°（红）；范围退化（max <= min）时取中间值 0.5。
 function windArrowColor(value, minimum, maximum) {
   const range = maximum - minimum
   const normalized = range > 0 ? Math.max(0, Math.min(1, (value - minimum) / range)) : 0.5
   return `hsl(${(1 - normalized) * 225},82%,42%)`
 }
 
+// 作用：绘制水平风场预览——底图为风速栅格（半透明），上面叠加自适应风矢量箭头。
+// 输入：result（含 width/height、arrows、arrowStep、stretchMinimum/Maximum）；
+//   arrows 每项为 [gridX, gridY, u, v, magnitude]（网格坐标 + 水平风分量 + 风速，m/s）。
+// 说明：画布上方为正北、右为正东，故 v（北向分量）取负号换算成画布 y 方向。
+// 步骤 1：生成预览卡片 HTML 并取得画布；步骤 2：半透明绘制风速底图；步骤 3：逐个绘制箭头。
 function drawWindPreview(result, file) {
   disposeResultViewer()
   const raster = resultRasterFromEnvi(result)
@@ -6166,23 +6970,28 @@ function drawWindPreview(result, file) {
   const observationMeta = file.observationLabel
     ? `<span>${escapeHtml(file.observationLabel.replaceAll('_to_', ' → ').replaceAll('_', ' '))}</span>` : ''
   $('#resultPreview').innerHTML = `<div class="result-preview-card fluid-slice-result-card"><div class="result-image-stage"><canvas class="result-canvas fluid-slice-canvas" id="windFieldCanvas" width="${canvasWidth}" height="${canvasHeight}" role="img" aria-label="自适应风速箭头图"></canvas><div class="result-north-indicator" aria-label="影像上方为正北"><strong>N</strong><span>↑</span></div></div>${resultColorbar('水平风速 P2–P98 [m/s]', result.stretchMinimum, result.stretchMaximum)}<div class="result-meta"><span>${result.width} × ${result.height}</span><span>上北 · 右东</span><span>自适应箭头 ${Number(result.arrows?.length || 0).toLocaleString('zh-CN')} 个</span><span>每隔 ${result.arrowStep} 个网格采样</span>${observationMeta}<span>色标范围：水平风速 P2–P98</span><span>箭头方向：水平风向</span><span>箭头长度与颜色：水平风速</span></div></div>`
+  // 步骤 2：底图以 0.34 透明度绘制，避免遮盖箭头。
   const canvas = $('#windFieldCanvas')
   const context = canvas.getContext('2d')
   context.imageSmoothingEnabled = true
   context.globalAlpha = 0.34
   context.drawImage(raster.textureCanvas, 0, 0, canvasWidth, canvasHeight)
   context.globalAlpha = 1
+  // 步骤 3：箭头采样间距（画布像素）；最大箭头长度取间距较小者的 78%，避免相邻箭头重叠。
   const spacingX = result.arrowStep * canvasWidth / Math.max(1, result.width)
   const spacingY = result.arrowStep * canvasHeight / Math.max(1, result.height)
   const availableLength = Math.max(5, Math.min(spacingX, spacingY) * 0.78)
   const minimum = Number(result.stretchMinimum)
   const maximum = Number(result.stretchMaximum)
   for (const arrow of result.arrows || []) {
+    // 水平风速近零或风速非有限的点不画箭头（方向无意义）。
     const [gridX, gridY, u, v, magnitude] = arrow.map(Number)
     const horizontalSpeed = Math.hypot(u, v)
     if (!(horizontalSpeed > 1e-8) || !Number.isFinite(magnitude)) continue
     const normalized = maximum > minimum
       ? Math.max(0, Math.min(1, (magnitude - minimum) / (maximum - minimum))) : 0.5
+    // 箭头长度随风速在 38%–100% 的最大长度之间变化；以格元中心为箭头中点；
+    //   箭头头部长度限制在 2.5–7 像素，线宽限制在 1.1–2.1 像素。
     const length = availableLength * (0.38 + 0.62 * normalized)
     const dx = u / horizontalSpeed * length
     const dy = -v / horizontalSpeed * length
@@ -6207,6 +7016,9 @@ function drawWindPreview(result, file) {
   }
 }
 
+// 作用：把普通图像（PNG/JPG 等）转成灰度栅格（调用方存入 state.resultRaster）。
+// 说明：长边最多缩小到 768 像素（不放大）；亮度按 Rec.709 系数（0.2126/0.7152/0.0722）计算，
+//   返回 { width, height, bytes（0–255 灰度）, textureCanvas }。
 function rasterFromImage(image) {
   const scale = Math.min(1, 768 / Math.max(image.naturalWidth, image.naturalHeight, 1))
   const width = Math.max(1, Math.round(image.naturalWidth * scale))
@@ -6224,6 +7036,8 @@ function rasterFromImage(image) {
   return { width, height, bytes, textureCanvas: canvas }
 }
 
+// 作用：显示图像类结果（result.data 为 base64）。previewRequest 是请求序号，
+//   异步解码完成后若用户已切换到别的结果则丢弃本次结果，避免旧请求覆盖新预览。
 async function drawImagePreview(result, file) {
   const previewRequest = ++state.resultPreviewRequest
   disposeResultViewer()
@@ -6241,6 +7055,8 @@ async function drawImagePreview(result, file) {
   state.resultRaster = raster
 }
 
+// 作用：释放结果三维视图（three.js）占用的几何体、材质、纹理、渲染器和 WebGL 上下文，
+//   并移除 DOM；可重复调用（无 viewer 时仅清除分析预览样式）。
 function disposeResultViewer() {
   $('#resultPreview')?.classList.remove('analysis-preview')
   if (!resultViewer) return
@@ -6260,6 +7076,7 @@ function disposeResultViewer() {
   resultViewer = null
 }
 
+// 作用：按宿主容器尺寸更新结果三维视图的渲染尺寸与相机宽高比。
 function resizeResultViewer() {
   if (!resultViewer) return
   const host = resultViewer.host
@@ -6269,12 +7086,19 @@ function resizeResultViewer() {
   resultViewer.camera.updateProjectionMatrix()
 }
 
+// 作用：渲染一帧结果三维视图；结果对话框隐藏或无 viewer 时跳过。
 function renderResultViewer() {
   if (!resultViewer || $('#resultDialog').hidden) return
   resultViewer.controls.update()
   resultViewer.renderer.render(resultViewer.scene, resultViewer.camera)
 }
 
+// 作用：把灰度栅格（ENVI/TIFF/图像结果）显示为整幅三维高度面：像素亮度越大，面越高。
+// 输入：raster（{ width, height, bytes(0–255), textureCanvas }）、file、sourceResult（来源结果，
+//   用于色标范围与返回二维预览）；输出：写入全局 resultViewer（three.js 场景），无返回值。
+// 说明：只是显示用的相对高度（无物理单位），不是真实地形或物理高度。
+// 步骤：1 生成卡片与色标；2 场景/灯光/相机/控制器；3 降采样顶点；4 三角形索引；
+//   5 贴图纹理与表面网格；6 底板与网格线；7 创建渲染器与“二维视图”切换。
 function showResult3D(raster, file, sourceResult = null) {
   if (!raster) return
   disposeResultViewer()
@@ -6282,7 +7106,9 @@ function showResult3D(raster, file, sourceResult = null) {
   const rasterLabel = rasterResult?.bandNames?.[rasterResult.band] || '像素亮度'
   const rasterMinimum = rasterResult?.minimum ?? 0
   const rasterMaximum = rasterResult?.maximum ?? 255
+  // 步骤 1：色标范围取源结果的 minimum/maximum；没有源结果（普通图像）时按 0–255。
   $('#resultPreview').innerHTML = `<div class="result-preview-card result-3d-card"><div class="result-3d-viewport" id="result3dViewport"></div>${resultColorbar(rasterLabel, rasterMinimum, rasterMaximum, 'gray')}${resultViewActions()}<div class="result-meta"><span>${raster.width} × ${raster.height}</span><span>整幅图像三维分析</span><span>高度按像素亮度映射</span></div></div>`
+  // 步骤 2：创建场景、半球光 + 平行光、透视相机和带阻尼的轨道控制器（限制俯仰角、缩放范围）。
   const host = $('#result3dViewport')
   const resultScene = new THREE.Scene()
   resultScene.background = new THREE.Color(0xf7f9fc)
@@ -6300,6 +7126,8 @@ function showResult3D(raster, file, sourceResult = null) {
   controls3d.maxDistance = 55
   controls3d.target.set(0, 1.2, 0)
 
+  // 步骤 3：把栅格降采样为不超过 180×180 的顶点网格以控制三维性能；
+  //   世界宽度固定 16，深度按图像宽高比；高度 = 0.08 + 亮度 × 4.12。
   const columns = Math.max(2, Math.min(180, raster.width))
   const rows = Math.max(2, Math.min(180, raster.height))
   const width = 16
@@ -6314,6 +7142,7 @@ function showResult3D(raster, file, sourceResult = null) {
       uvs.push(column / (columns - 1), 1 - row / (rows - 1))
     }
   }
+  // 步骤 4：每个网格单元拆成两个三角形，并建立几何体与法向量。
   for (let row = 0; row < rows - 1; row += 1) for (let column = 0; column < columns - 1; column += 1) {
     const a = row * columns + column, b = a + 1, c = a + columns, d = c + 1
     indices.push(a, c, b, b, c, d)
@@ -6323,6 +7152,7 @@ function showResult3D(raster, file, sourceResult = null) {
   geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
   geometry.setIndex(indices)
   geometry.computeVertexNormals()
+  // 步骤 5：用 2D 预览的着色画布作贴图（最近邻采样，保留像元边界），颜色与二维视图一致。
   const texture = new THREE.CanvasTexture(raster.textureCanvas)
   texture.colorSpace = THREE.SRGBColorSpace
   texture.minFilter = THREE.NearestFilter
@@ -6331,12 +7161,15 @@ function showResult3D(raster, file, sourceResult = null) {
   const surface = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ map: texture, roughness: .88, metalness: .02, side: THREE.DoubleSide, transparent: false, opacity: 1, depthTest: true, depthWrite: true, alphaTest: 0, alphaToCoverage: false }))
   surface.castShadow = surface.receiveShadow = true
   resultScene.add(surface)
+  // 步骤 6：半透明底板与参考网格线。
   const base = new THREE.Mesh(new THREE.PlaneGeometry(width, depth), new THREE.MeshBasicMaterial({ color: 0xe6edf5, transparent: true, opacity: .8, side: THREE.DoubleSide }))
   base.rotation.x = -Math.PI / 2; base.position.y = -.06
   resultScene.add(base)
   const resultGrid = new THREE.GridHelper(Math.max(width, depth), 16, 0x7895b5, 0xb8c6d6)
   resultGrid.position.y = -.04; resultGrid.material.opacity = .25; resultGrid.material.transparent = true
   resultScene.add(resultGrid)
+  // 步骤 7：创建渲染器（像素比最多 2，ACES 色调映射），监听容器尺寸变化；
+  //   “二维视图”按钮按来源类型重新调用 drawImagePreview / drawTiffPreview / drawEnviPreview。
   resultViewer = { host, scene: resultScene, camera: camera3d, controls: controls3d, renderer: new THREE.WebGLRenderer({ antialias: true, alpha: true }), texture }
   resultViewer.renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
   resultViewer.renderer.outputColorSpace = THREE.SRGBColorSpace
@@ -6363,6 +7196,8 @@ function showResult3D(raster, file, sourceResult = null) {
 
 }
 
+// 作用：面元三维视图的控制条 HTML——显示指标按钮（result.metrics）和面方向按钮
+//   （both 正反两面 / front 正面 / back 背面），当前选项带 active。
 function facetControls(result, metric, side) {
   const metrics = result.metrics || []
   const metricButtons = metrics.map((item) => `<button class="button ghost facet-metric ${item.id === metric ? 'active' : ''}" type="button" data-metric="${escapeHtml(item.id)}">${escapeHtml(item.label)}</button>`).join('')
@@ -6372,6 +7207,8 @@ function facetControls(result, metric, side) {
 // 结果读取接口可能以二进制块回传大数组（Float32Array/Float64Array），与普通数组同等对待。
 const isNumberArray = (value) => Array.isArray(value) || ArrayBuffer.isView(value)
 
+// 作用：返回要显示的面值下标。面元值按 [面0正, 面0反, 面1正, 面1反, ...] 交错存放，
+//   所以正面下标 = 2·i，背面下标 = 2·i + 1。
 function facetIndices(result, side) {
   const total = result.facetCount * 2
   if (side === 'front') return Array.from({ length: result.facetCount }, (_, index) => index * 2)
@@ -6379,6 +7216,7 @@ function facetIndices(result, side) {
   return Array.from({ length: total }, (_, index) => index)
 }
 
+// 作用：统计所选面方向上的有限值最小/最大值（色标范围）；无有限值时返回 0、0。
 function facetStatsForSide(values, facetCount, side) {
   let minimum = Infinity, maximum = -Infinity
   const update = (value) => {
@@ -6394,22 +7232,32 @@ function facetStatsForSide(values, facetCount, side) {
   return Number.isFinite(minimum) ? { minimum, maximum } : { minimum: 0, maximum: 0 }
 }
 
+// 作用：按 id 取面元指标，找不到时退回第一个指标。
 function facetMetric(result, metric) {
   return result.metrics.find((item) => item.id === metric) || result.metrics[0]
 }
 
+// 作用：为指标/面方向按钮绑定重绘（showFacet3D），切换其一时保持另一个不变。
 function bindFacetControls(result, file, metric, side) {
   $$('.facet-metric').forEach((button) => button.addEventListener('click', () => showFacet3D(result, file, button.dataset.metric, side)))
   $$('.facet-side').forEach((button) => button.addEventListener('click', () => showFacet3D(result, file, metric, button.dataset.side)))
   $('#facet3dBtn')?.addEventListener('click', () => showFacet3D(result, file, metric, side))
 }
 
+// 作用：面元三维视图的操作按钮 HTML（目前只有“面元三维”）。
 function facetViewActions() {
   return '<div class="result-view-actions"><button class="button ghost facet-3d-btn active" id="facet3dBtn" type="button">面元三维</button></div>'
 }
 
+// 作用：FacetRT/FacetEB 结果的面元三维视图：每个三角面元按所选指标着色。
+// 输入：result（facetCount、metrics[].values（正反面交错）、vertexPositions（每面元 3 个顶点
+//   × xyz，共 9 个数）、sourceFacetCount）、metric 指标 id、side 面方向。
+// 说明：旧结果没有 vertexPositions 时退化为按面元序号排布的柱状图；
+//   面元过多时只显示抽样的一部分，界面会提示“原始 N 个，当前显示 M 个”。
+// 步骤：1 统计与卡片；2 场景；3 有几何时按真实位置绘制，否则柱状图；4 创建渲染器。
 function showFacet3D(result, file, metric = 'radiosity', side = 'both') {
   disposeResultViewer()
+  // 步骤 1：确定指标与色标范围、抽样提示文案，并生成预览卡片 HTML。
   const selected = facetMetric(result, metric)
   const stats = facetStatsForSide(selected.values, result.facetCount, side)
   const valueCount = side === 'both' ? result.facetCount * 2 : result.facetCount
@@ -6421,6 +7269,7 @@ function showFacet3D(result, file, metric = 'radiosity', side = 'both') {
   const hasGeometry = rawPositions.length >= result.facetCount * 9
   const sideDescription = side === 'both' ? '三维表面取正反面较大值' : side === 'front' ? '显示正面值' : '显示背面值'
   $('#resultPreview').innerHTML = `<div class="result-preview-card result-3d-card"><div class="result-3d-viewport" id="result3dViewport"></div>${resultColorbar(selected.label, stats.minimum, stats.maximum)}${facetControls(result, selected.id, side)}${facetViewActions()}<div class="result-meta"><span>${escapeHtml(samplingLabel)} · ${valueCount.toLocaleString('zh-CN')} 个面值</span><span>颜色：${escapeHtml(selected.label)}</span><span>${sideDescription}</span><span>MIN ${Number(stats.minimum).toPrecision(6)} · MAX ${Number(stats.maximum).toPrecision(6)}</span>${hasGeometry ? '<span>真实 OBJ 面元空间位置</span>' : '<span>旧结果无几何坐标，使用面元序号排列</span>'}</div></div>`
+  // 步骤 2：创建场景、灯光、相机和轨道控制器（近远裁剪面 0.01–300，适应小尺度模型）。
   const host = $('#result3dViewport')
   const resultScene = new THREE.Scene()
   resultScene.background = new THREE.Color(0xf7f9fc)
@@ -6432,6 +7281,8 @@ function showFacet3D(result, file, metric = 'radiosity', side = 'both') {
   controls3d.enableDamping = true; controls3d.dampingFactor = .08; controls3d.maxPolarAngle = Math.PI * .49
   controls3d.minDistance = .5; controls3d.maxDistance = 300
 
+  // 颜色映射：值线性归一化后用 HSL 色相 (1 − t)·0.67（蓝=小 → 红=大）；
+  //   非有限值显示深灰（饱和度 0、亮度 0.16）；范围为 0 时取中间色。
   const range = stats.maximum - stats.minimum
   const colorForValue = (value, color) => {
     const normalized = Number.isFinite(value) ? (range ? (value - stats.minimum) / range : .5) : 0
@@ -6439,6 +7290,8 @@ function showFacet3D(result, file, metric = 'radiosity', side = 'both') {
     return normalized
   }
 
+  // 步骤 3a：有真实几何时，每个面元按原三角形绘制。以包围盒最大边把模型缩放到 20 个世界单位，
+  //   X/Z 以包围盒中心居中、Y 以最小值为 0（Y 向上）；both 模式下每面元取正反面较大值着色。
   if (hasGeometry) {
     let minimum = [Infinity, Infinity, Infinity], maximum = [-Infinity, -Infinity, -Infinity]
     for (let index = 0; index < result.facetCount * 9; index += 3) {
@@ -6481,6 +7334,8 @@ function showFacet3D(result, file, metric = 'radiosity', side = 'both') {
     camera3d.position.set(Math.max(16, groundWidth * 1.25), Math.max(12, spanY * modelScale * .85 + 8), Math.max(16, groundDepth * 1.25))
     controls3d.target.set(0, Math.max(.5, spanY * modelScale * .35), 0)
   } else {
+    // 步骤 3b：无几何的旧结果——按面值序号排成近似正方形的柱状网格，
+    //   柱高 = 0.18 + 归一化值 × 6（非有限值 0.04）。
     const indices = facetIndices(result, side)
     const columns = Math.max(1, Math.ceil(Math.sqrt(indices.length)))
     const rows = Math.max(1, Math.ceil(indices.length / columns))
@@ -6504,6 +7359,7 @@ function showFacet3D(result, file, metric = 'radiosity', side = 'both') {
     camera3d.position.set(sideLength * .8, sideLength * .75, sideLength * .9); controls3d.target.set(0, 1.8, 0)
   }
 
+  // 步骤 4：创建渲染器并挂接尺寸监听，同时为指标/面方向按钮绑定重绘。
   resultViewer = { host, scene: resultScene, camera: camera3d, controls: controls3d, renderer: new THREE.WebGLRenderer({ antialias: true, alpha: true }) }
   resultViewer.renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); resultViewer.renderer.outputColorSpace = THREE.SRGBColorSpace
   resultViewer.renderer.toneMapping = THREE.ACESFilmicToneMapping; resultViewer.renderer.toneMappingExposure = 1.05
@@ -6512,6 +7368,13 @@ function showFacet3D(result, file, metric = 'radiosity', side = 'both') {
   resizeResultViewer(); controls3d.update(); $('#facet3dBtn').classList.add('active'); bindFacetControls(result, file, selected.id, side)
 }
 
+// 作用：VoxelRT/VoxelEB 结果的体元三维视图：每个体元为一个立方体，按所选过程变量着色。
+// 输入：result（voxelCount、voxelPositions（每体元 xyz）、voxelSize、metrics[].values、
+//   sourceVoxelCount、soilProfile、time）、metric 指标 id。
+// 说明：体元过多时三维窗口只显示抽样的一部分（结果文件保存全部），界面显示“抽样显示 n / N”；立方体面按太阳入射方向加明暗，
+//   实例颜色表示指标值（所以面明暗与指标颜色相乘）。
+// 步骤：1 统计取值与位置范围；2 抽样提示与卡片；3 场景；4 立方体面明暗；
+//   5 实例化体元；6 地面网格、相机与渲染器。
 function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
   disposeResultViewer()
   const selected = result.metrics.find((item) => item.id === metric) || result.metrics[0]
@@ -6519,6 +7382,7 @@ function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
     emptyResultPreview('体元过程结果为空', '没有可显示的体元位置或过程变量。')
     return
   }
+  // 步骤 1：一次遍历同时统计指标值的有限最小/最大值和体元位置包围盒（色标与居中缩放用）。
   let valueMinimum = Infinity, valueMaximum = -Infinity
   let minimum = [Infinity, Infinity, Infinity], maximum = [-Infinity, -Infinity, -Infinity]
   for (let voxel = 0; voxel < result.voxelCount; voxel += 1) {
@@ -6531,6 +7395,7 @@ function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
     }
   }
   if (!Number.isFinite(valueMinimum)) valueMinimum = valueMaximum = 0
+  // 步骤 2：判断是否抽样显示，并生成提示文案与预览卡片 HTML。
   const sourceCount = Math.max(result.voxelCount, Number(result.sourceVoxelCount) || result.voxelCount)
   const sampled = sourceCount > result.voxelCount
   const sampleLabel = sampled
@@ -6544,6 +7409,7 @@ function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
     ? '<button class="button ghost" id="soilProfile3dBtn" type="button">多层土壤温度</button>' : ''
   $('#resultPreview').innerHTML = `<div class="result-preview-card result-3d-card"><div class="result-3d-viewport" id="result3dViewport"></div>${samplingNotice}${resultColorbar(selected.label, valueMinimum, valueMaximum)}<div class="facet-controls"><div><span>显示指标</span>${metricButtons}</div></div><div class="result-view-actions"><button class="button ghost facet-3d-btn active" id="facet3dBtn" type="button">体元过程</button>${soilProfileAction}</div><div class="result-meta"><span>${escapeHtml(sampleLabel)}</span><span>颜色：${escapeHtml(selected.label)}</span><span>MIN ${Number(valueMinimum).toPrecision(6)} · MAX ${Number(valueMaximum).toPrecision(6)}</span><span>${escapeHtml(result.time || '静态辐射场')}</span></div></div>`
 
+  // 步骤 3：创建场景；包围盒最大边缩放到 20 个世界单位，X/Z 居中、Y 以最小值为 0。
   const host = $('#result3dViewport')
   const resultScene = new THREE.Scene()
   resultScene.background = new THREE.Color(0xf7f9fc)
@@ -6554,6 +7420,9 @@ function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
   // 略微覆盖相邻体元，消除斜视角和抗锯齿造成的地形接缝。
   const boxSize = Math.max(.025, Number(result.voxelSize || 1) * modelScale * 1.002)
   const geometry = new THREE.BoxGeometry(boxSize, boxSize, boxSize)
+  // 步骤 4：由 config.light 的太阳天顶角（限制 0–90°）和方位角算出太阳方向，
+  //   每个顶点按法向与太阳方向的夹角余弦给明暗 0.32 + 0.68·max(0, cosθ)，
+  //   使立方体各面有可分辨的立体感（方位角取向的约定待核对）。
   // BoxGeometry 为六个面保留独立法向；顶点颜色只表达面朝向，实例颜色仍表达计算指标。
   const zenith = THREE.MathUtils.degToRad(THREE.MathUtils.clamp(Number(state.config?.light?.zenith) || 0, 0, 90))
   const azimuth = THREE.MathUtils.degToRad(((Number(state.config?.light?.azimuth) || 0) % 360 + 360) % 360)
@@ -6577,6 +7446,8 @@ function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
   }
   geometry.setAttribute('color', new THREE.Float32BufferAttribute(faceColors, 3))
   const material = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true, transparent: false, opacity: 1, depthTest: true, depthWrite: true, alphaTest: 0, alphaToCoverage: false, toneMapped: false })
+  // 步骤 5：用实例化网格一次绘制全部体元；每个体元设平移矩阵与指标颜色
+  //   （HSL 色相 (1 − t)·0.67，蓝=小 → 红=大，非有限值为深灰）。
   const voxels = new THREE.InstancedMesh(geometry, material, result.voxelCount)
   const matrix = new THREE.Matrix4(), color = new THREE.Color()
   const valueRange = valueMaximum - valueMinimum
@@ -6595,6 +7466,7 @@ function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
   if (voxels.instanceColor) voxels.instanceColor.needsUpdate = true
   material.needsUpdate = true
   resultScene.add(voxels)
+  // 步骤 6：按场景范围画参考网格，相机放在场景外斜上方，再创建渲染器并绑定指标/土壤剖面按钮。
   const groundWidth = Math.max(.5, span[0] * modelScale), groundDepth = Math.max(.5, span[2] * modelScale)
   const grid = new THREE.GridHelper(Math.max(groundWidth, groundDepth) * 1.08, 22, 0x7895b5, 0xb8c6d6)
   grid.position.y = -.02; grid.scale.x = groundWidth / Math.max(groundWidth, groundDepth); grid.scale.z = groundDepth / Math.max(groundWidth, groundDepth); grid.material.opacity = .25; grid.material.transparent = true
@@ -6614,6 +7486,8 @@ function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
   $('#soilProfile3dBtn')?.addEventListener('click', () => showSoilProfile3D(result, file))
 }
 
+// 作用：土壤层深度的显示文本。单位为 m 时，0 显示“表层 0 m”，小于 0.1 m 的换算成 cm；
+//   非有限值显示“未知深度”。
 function soilProfileDepthLabel(depth, unit) {
   const numeric = Number(depth)
   if (!Number.isFinite(numeric)) return '未知深度'
@@ -6624,6 +7498,13 @@ function soilProfileDepthLabel(depth, unit) {
   return `${formatColorbarValue(numeric)} ${unit || ''}`.trim()
 }
 
+// 作用：VoxelEB 多层土壤温度剖面三维视图：把各土层的温度叠成一摞水平薄片，同一色标显示。
+// 输入：result.soilProfile（layerCount、values[层][体元]、depths、depthUnit、temperatureUnit）、
+//   result.voxelPositions/voxelSize；selectedLayers 为要显示的层集合（Set，缺省全部层）。
+// 说明：层间距是等距展开（不按真实深度比例），标签才是真实土层深度；至少保留一层可见；
+//   为控制性能，所有可见层合计最多绘制 320000 个单元，超出时按层均匀抽样。
+// 步骤：1 校验与可见层；2 统计有效值与范围；3 土层按钮/抽样/卡片；4 场景与分层单元；
+//   5 相机与渲染器；6 绑定土层开关与视图切换按钮。
 function showSoilProfile3D(result, file, selectedLayers = null) {
   const profile = result.soilProfile
   disposeResultViewer()
@@ -6632,12 +7513,15 @@ function showSoilProfile3D(result, file, selectedLayers = null) {
     emptyResultPreview('土壤温度剖面为空', '当前结果没有多层土壤温度数据。')
     return
   }
+  // 步骤 1：确定可见层；传入的层号不合法时忽略，一层都没有时回退到第 0 层（表层）。
   const allLayers = Array.from({ length: profile.layerCount }, (_, layer) => layer)
   const visibleLayers = selectedLayers instanceof Set
     ? new Set([...selectedLayers].filter((layer) => allLayers.includes(layer)))
     : new Set(allLayers)
   if (!visibleLayers.size) visibleLayers.add(0)
 
+  // 步骤 2：逐层记录有效（有限数值）的体元下标、温度范围和水平位置范围；
+  //   X/Z 范围用于居中和缩放（本视图把 voxelPositions 的 X、Z 作为水平面）。
   let valueMinimum = Infinity, valueMaximum = -Infinity
   let minimumX = Infinity, maximumX = -Infinity, minimumZ = Infinity, maximumZ = -Infinity
   const validIndices = Array.from({ length: profile.layerCount }, () => [])
@@ -6664,6 +7548,7 @@ function showSoilProfile3D(result, file, selectedLayers = null) {
     return
   }
 
+  // 步骤 3：生成土层开关按钮，并按每层均匀抽样计算实际绘制的单元数（上限 320000 个实例）。
   const depthButtons = allLayers.map((layer) => {
     const label = soilProfileDepthLabel(profile.depths?.[layer] ?? layer, profile.depthUnit)
     return `<button class="button ghost soil-profile-layer ${visibleLayers.has(layer) ? 'active' : ''}" type="button" data-layer="${layer}">L${layer + 1} · ${escapeHtml(label)}</button>`
@@ -6691,6 +7576,8 @@ function showSoilProfile3D(result, file, selectedLayers = null) {
     : ''
   $('#resultPreview').innerHTML = `<div class="result-preview-card result-3d-card"><div class="result-3d-viewport" id="result3dViewport"></div>${samplingNotice}${resultColorbar(`土壤温度 [${unitLabel}]`, valueMinimum, valueMaximum)}<div class="facet-controls"><div><span>土层开关</span>${depthButtons}</div></div><div class="result-view-actions"><button class="button ghost" id="facet3dBtn" type="button">体元过程</button><button class="button ghost active" id="soilProfile3dBtn" type="button">多层土壤温度</button></div><div class="result-meta"><span>${profile.layerCount} 层温度剖面 · ${soilCount.toLocaleString('zh-CN')} 个有效土壤体元</span><span>深度：${escapeHtml((profile.depths || []).map((depth) => soilProfileDepthLabel(depth, profile.depthUnit)).join('、'))}</span><span>统一色标：${formatColorbarValue(valueMinimum)} ～ ${formatColorbarValue(valueMaximum)} ${escapeHtml(unitLabel)}</span><span>垂向等距展开，标签为真实土层深度</span>${displaySamplingLabel ? `<span>${escapeHtml(displaySamplingLabel)}</span>` : ''}<span>${sourceCount > result.voxelCount ? `抽样载入 ${result.voxelCount.toLocaleString('zh-CN')} / ${sourceCount.toLocaleString('zh-CN')} 个体元` : escapeHtml(result.time || '静态温度场')}</span></div></div>`
 
+  // 步骤 4：创建场景；每个体元在每个可见层画一个很薄的方片（厚度为边长的 7%），
+  //   表层（第 0 层）位于最上方，每层各配一张参考网格，颜色按统一色标 (1 − t)·0.67 色相映射。
   const host = $('#result3dViewport')
   const resultScene = new THREE.Scene()
   resultScene.background = new THREE.Color(0xf7f9fc)
@@ -6737,6 +7624,7 @@ function showSoilProfile3D(result, file, selectedLayers = null) {
   if (layers.instanceColor) layers.instanceColor.needsUpdate = true
   resultScene.add(layers)
 
+  // 步骤 5：相机放在整摞薄片外斜上方，创建渲染器并挂接尺寸监听。
   const groundWidth = Math.max(.5, spanX * modelScale)
   const groundDepth = Math.max(.5, spanZ * modelScale)
   const stackHeight = Math.max(layerGap, (profile.layerCount - 1) * layerGap)
@@ -6751,6 +7639,7 @@ function showSoilProfile3D(result, file, selectedLayers = null) {
   resultViewer.resizeObserver = new ResizeObserver(resizeResultViewer); resultViewer.resizeObserver.observe(host)
   resizeResultViewer(); controls3d.update()
 
+  // 步骤 6：点击土层按钮切换该层显示（至少保留一层）；指标按钮或“体元过程”回到体元视图。
   $$('.soil-profile-layer').forEach((button) => button.addEventListener('click', () => {
     const next = new Set(visibleLayers)
     const layer = Number(button.dataset.layer)
@@ -6763,6 +7652,9 @@ function showSoilProfile3D(result, file, selectedLayers = null) {
   $('#soilProfile3dBtn')?.addEventListener('click', () => showSoilProfile3D(result, file, visibleLayers))
 }
 
+// 作用：解析带表头的 CSV（支持双引号字段与 "" 转义、去除 BOM、跳过空行）。
+// 输入：CSV 文本；输出：以表头为键的对象数组，少于 2 行（只有表头）时返回空数组。
+// 说明：循环多走一步，用末尾补的换行符把最后一行刷出。
 function parseCsvRows(content) {
   const rows = []
   let row = [], cell = '', quoted = false
@@ -6786,15 +7678,24 @@ function parseCsvRows(content) {
   return rows.slice(1).map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index] ?? ''])))
 }
 
+// 作用：从文件名中取 key=数值 形式的角度（如 _SZA=30_ 或 _VZA=12.5.），取不到返回 NaN。
+//   用于统计 CSV 缺少角度列时的兜底。
 function fileAngleToken(file, key) {
   const match = String(file || '').match(new RegExp(`(?:^|_)${key}=([^_.]+(?:\\.[^_.]+)?)(?=_|\\.|$)`, 'i'))
   return match ? Number(match[1]) : NaN
 }
 
+// 作用：CSV 单元转数值；空串返回 NaN（避免 Number('') 变成 0）。
 function csvNumeric(value) {
   return String(value ?? '').trim() === '' ? NaN : Number(value)
 }
 
+// 作用：把统计 CSV（file、mode、time、vza、vaa、sza、saa、band_index、band_name、
+//   count、min、max、mean、stddev）转成行对象，供“分析”图表使用。
+// 输入：content 为 CSV 文本；observation 为该次运行的观测设置（planeAzimuth、
+//   principalPlane、hemisphere），原样附加到每行。
+// 说明：角度列缺失或为空时，从文件名中的 SZA/SAA/VZA/VAA 令牌补；
+//   同一方向同一波段只保留最新一行（后出现的覆盖先出现的）。
 function statisticsRows(content, observation = {}) {
   const latest = new Map()
   for (const source of parseCsvRows(content)) {
@@ -6826,10 +7727,13 @@ function statisticsRows(content, observation = {}) {
   return [...latest.values()]
 }
 
+// 作用：按 getter 取值并去重（以字符串相等判断，保留首个），再排序；
+//   默认按中文区域规则做数字感知的字符串排序。
 function uniqueValues(rows, getter, sorter = (a, b) => String(a).localeCompare(String(b), 'zh-CN', { numeric: true })) {
   return [...new Map(rows.map((row) => { const value = getter(row); return [String(value), value] })).values()].sort(sorter)
 }
 
+// 以下 analysisOption / analysisSelect：生成分析面板里下拉框（<option>/<select>）的 HTML。
 function analysisOption(value, label, selected) {
   return `<option value="${escapeHtml(value)}" ${String(value) === String(selected) ? 'selected' : ''}>${escapeHtml(label)}</option>`
 }
@@ -6838,11 +7742,15 @@ function analysisSelect(label, id, values, selected, labeler = (value) => value)
   return `<label><span>${escapeHtml(label)}</span><select class="input analysis-control" id="${id}">${values.map((value) => analysisOption(value, labeler(value), selected)).join('')}</select></label>`
 }
 
+// 以下四个函数：统计行的“波段键/角度键”及其显示文本。
+//   波段键 = 序号|名称；角度键 = VZA|VAA（单位：度）；标签中图层号 = 序号 + 1。
 function statisticBandKey(row) { return `${row.bandIndex}|${row.bandName}` }
 function statisticAngleKey(row) { return `${row.vza}|${row.vaa}` }
 function statisticBandLabel(key) { const [index, ...name] = String(key).split('|'); return `${name.join('|')}（图层 ${Number(index) + 1}）` }
 function statisticAngleLabel(key) { const [vza, vaa] = String(key).split('|'); return `VZA ${formatColorbarValue(vza)}° / VAA ${formatColorbarValue(vaa)}°` }
 
+// 作用：根据波段名称关键词推断物理量类别（反射率/亮温/辐亮度/温度/其他）。
+// 说明：判断顺序有意义——“亮温”必须先于“温度”判断，否则会被误归为温度。
 function statisticQuantity(row) {
   const name = String(row?.bandName || '').toLowerCase()
   if (name.includes('reflectance') || name.includes('反射率')) return 'reflectance'
@@ -6852,6 +7760,7 @@ function statisticQuantity(row) {
   return 'value'
 }
 
+// 物理量类别 → 坐标轴文字（含单位）；反射率无量纲，温度单位 K。
 const statisticQuantityLabels = {
   reflectance: '反射率 [-]', brightnessTemperature: '亮温 [K]',
   radiance: '光谱辐亮度', temperature: '温度 [K]', value: '结果值'
@@ -6861,6 +7770,8 @@ function statisticValueLabel(row) {
   return statisticQuantityLabels[statisticQuantity(row)] || '结果值'
 }
 
+// 作用：把统计行的时间标签转成可排序的数值：优先按“第几天 时:分”换算成分钟，
+//   其次按日期时间解析，都失败的排在最后。
 function statisticTimeOrder(value) {
   const parts = simulationTimeParts(value)
   if (parts) return parts.day * 1440 + parts.hour * 60 + parts.minute
@@ -6869,11 +7780,15 @@ function statisticTimeOrder(value) {
   return Number.isFinite(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER
 }
 
+// 作用：取波段名里最后一个数字（通常是波长）作为横轴位置；名称无数字时用序号 + 1。
 function numericBandPosition(row) {
   const numbers = String(row.bandName).match(/\d+(?:\.\d+)?/g)
   return numbers?.length ? Number(numbers[numbers.length - 1]) : row.bandIndex + 1
 }
 
+// 作用：生成“漂亮”的坐标刻度。步长取 {1, 2, 2.5, 5, 10}×10^n 中不小于 (范围/target) 的最小者。
+// 输出：{ ticks, format }，format 负责按步长决定小数位；绝对值 ≥ 1e5 时用科学计数法；
+//   刻度少于 3 个时把 target 加倍重试（target 小于 40 时）。
 function niceTicks(minimum, maximum, target) {
   const raw = (maximum - minimum) / target
   const magnitude = 10 ** Math.floor(Math.log10(raw))
@@ -6887,9 +7802,16 @@ function niceTicks(minimum, maximum, target) {
   return { ticks, format: (value) => large ? value.toExponential(2) : value.toFixed(decimals) }
 }
 
+// 作用：把若干条折线序列画成 SVG 折线图（分析面板使用）。
+// 输入：series = [{ name, points: [{ x, y, label? }] }]；xLabel/yLabel 为轴标题；
+//   xFormatter 为 x 刻度格式化函数（缺省为数值色标格式；自定义时 x 轴按序号均匀放 6 个刻度）。
+// 步骤：1 收集有限数据点；2 确定坐标范围并留边；3 刻度与网格；4 各序列折线与数据点；
+//   5 图例（多于一条序列时）并拼装 SVG。
 function lineAnalysisSvg(series, xLabel, yLabel, xFormatter = formatColorbarValue) {
   const points = series.flatMap((item) => item.points).filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
   if (!points.length) return '<div class="analysis-empty">当前筛选条件没有可绘制的数据。</div>'
+  // 步骤 2：画布 820×440，四周留白放坐标轴文字；x 只有单一取值时左右各扩 0.5；
+  //   y 范围上下各扩 8%（全相等时扩 5% 或至少 0.001），避免折线贴边或除零。
   const width = 820, height = 440, left = 76, right = 28, top = 28, bottom = 62
   let xMin = Math.min(...points.map((point) => point.x)), xMax = Math.max(...points.map((point) => point.x))
   let yMin = Math.min(...points.map((point) => point.y)), yMax = Math.max(...points.map((point) => point.y))
@@ -6899,6 +7821,7 @@ function lineAnalysisSvg(series, xLabel, yLabel, xFormatter = formatColorbarValu
   else { const pad = (yMax - yMin) * .08; yMin -= pad; yMax += pad }
   const x = (value) => left + (value - xMin) / (xMax - xMin) * (width - left - right)
   const y = (value) => top + (yMax - value) / (yMax - yMin) * (height - top - bottom)
+  // 步骤 3：序列配色循环使用四种颜色；下面计算 x/y 刻度并拼出网格线与刻度文字。
   const colors = ['#246fd3', '#ef8c28', '#20a36a', '#9b5de5']
   // Ordinal axes (time) keep their own labels at evenly spaced positions.
   const xAxis = xFormatter !== formatColorbarValue ? null
@@ -6912,6 +7835,7 @@ function lineAnalysisSvg(series, xLabel, yLabel, xFormatter = formatColorbarValu
     const gy = y(value)
     return `<line x1="${left}" y1="${gy}" x2="${width - right}" y2="${gy}"/><text x="${left - 12}" y="${gy + 4}" text-anchor="end">${escapeHtml(yAxis.format(value))}</text>`
   })).join('')
+  // 步骤 4：每条序列按 x 升序连线，并在各数据点画圆点（悬停 <title> 显示标签）。
   const paths = series.map((item, seriesIndex) => {
     const sorted = [...item.points].filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)).sort((a, b) => a.x - b.x)
     const color = colors[seriesIndex % colors.length]
@@ -6919,12 +7843,19 @@ function lineAnalysisSvg(series, xLabel, yLabel, xFormatter = formatColorbarValu
     const dots = sorted.map((point) => `<circle cx="${x(point.x)}" cy="${y(point.y)}" r="4"><title>${escapeHtml(point.label || `${xFormatter(point.x)} · ${formatColorbarValue(point.y)}`)}</title></circle>`).join('')
     return `<g style="--series-color:${color}"><path class="analysis-series-line" d="${path}"/>${dots}</g>`
   }).join('')
+  // 步骤 5：多于一条序列时显示图例。
   const legend = series.length > 1 ? `<div class="analysis-legend">${series.map((item, index) => `<span><i style="background:${colors[index % colors.length]}"></i>${escapeHtml(item.name)}</span>`).join('')}</div>` : ''
   return `<div class="analysis-chart-wrap"><svg class="analysis-chart" viewBox="0 0 ${width} ${height}" role="img"><g class="analysis-grid">${grid}</g><line class="analysis-axis" x1="${left}" y1="${height - bottom}" x2="${width - right}" y2="${height - bottom}"/><line class="analysis-axis" x1="${left}" y1="${top}" x2="${left}" y2="${height - bottom}"/><text class="analysis-axis-title" x="${(left + width - right) / 2}" y="${height - 12}" text-anchor="middle">${escapeHtml(xLabel)}</text><text class="analysis-axis-title" transform="translate(18 ${(top + height - bottom) / 2}) rotate(-90)" text-anchor="middle">${escapeHtml(yLabel)}</text>${paths}</svg>${legend}</div>`
 }
 
+// 作用：两个方位角（度）之间的最小夹角，结果在 0–180° 之间（处理 360° 回绕）。
 function angularDistance(a, b) { return Math.abs(((Number(a) - Number(b) + 540) % 360) - 180) }
 
+// 作用：把一条统计行的观测方向投影到“主平面”（perpendicular=false）或其垂直平面上，
+//   返回带符号的观测天顶角（度）：VAA 等于平面方位（垂直面则 +90°）时为 +VZA，
+//   相反一侧（+180°）为 −VZA，天底（VZA≈0）为 0；不在该平面上返回 null。
+// 说明：平面方位优先取运行时保存的 planeAzimuth；其次仅在非时间序列行取该行 saa。
+//   VZA 只接受 5° 的整数倍（原因待核对，推测与主平面角度步长有关）；正负侧与前向/后向的对应（待核对）。
 function signedPlaneZenith(row, perpendicular = false) {
   if (!Number.isFinite(row.vza) || !Number.isFinite(row.vaa)) return null
   // Time-series sun azimuths vary per node; the view planes stay at the
@@ -6940,6 +7871,13 @@ function signedPlaneZenith(row, perpendicular = false) {
   return null
 }
 
+// 作用：把半球多角度观测（每行一个 VZA/VAA 方向的整幅图像均值 mean）画成极坐标补全图。
+// 输入：rows（含 vza、vaa、mean，单位 度/度/结果值）；valueLabel 为色标标题。
+// 说明：径向 = VZA（线性，0 在圆心）；方位 = VAA，正北在上、顺时针（见 N/E/S/W 标注）。
+//   色标为蓝（小）→ 白 → 红（大）的发散色，范围取各方向均值的最小/最大值。
+// 步骤：1 过滤并规整方位角到 0–360；2 同一方向求平均；3 画布与范围；
+//   4 判断是否为规则的极坐标网格；5 两种插值（规则网格 / 散点）；6 逐扇形单元着色；
+//   7 参考圈、方位轴与色标。
 function polarAnalysisSvg(rows, valueLabel) {
   const normalizeAzimuth = (angle) => ((Number(angle) % 360) + 360) % 360
   const points = rows
@@ -6947,6 +7885,8 @@ function polarAnalysisSvg(rows, valueLabel) {
     .map((row) => ({ ...row, vza: Number(row.vza), vaa: normalizeAzimuth(row.vaa), mean: Number(row.mean) }))
   if (!points.length) return '<div class="analysis-empty">当前筛选条件没有半球观测数据。</div>'
 
+  // 步骤 2：同一方向（天底不区分 VAA）的重复观测取平均，以下的补全方式与 TiRT-EB 一致。
+  //   至少需要两个不同的观测天顶角才能做径向插值。
   // Match TiRT-EB's angle-completion mode: average duplicate directions,
   // interpolate periodically around VAA, then interpolate radially along VZA.
   const directionKey = (vza, vaa) => Math.abs(vza) < 1e-6 ? 'nadir'
@@ -6963,12 +7903,17 @@ function polarAnalysisSvg(rows, valueLabel) {
   const zeniths = [...new Set(averaged.map((point) => point.vza))].sort((a, b) => a - b)
   if (zeniths.length < 2) return '<div class="analysis-empty">角度补全至少需要两个观测天顶角。</div>'
 
+  // 步骤 3：画布 820×460，圆心 (410, 220)，最大半径 178 像素对应最大 VZA；
+  //   最大 VZA 必须大于 0。
   const width = 820, height = 460, cx = 410, cy = 220, radius = 178
   const minimum = Math.min(...averaged.map((row) => row.mean)), maximum = Math.max(...averaged.map((row) => row.mean))
   const range = maximum - minimum
   const radialMin = zeniths[0], radialMax = zeniths[zeniths.length - 1]
   if (!(radialMax > 0)) return '<div class="analysis-empty">角度补全需要非零的观测天顶角。</div>'
 
+  // 步骤 4：按天顶角分环并按方位排序；各非天底环的方位集合完全一致才视为规则极坐标网格，
+  //   否则（如半球 + 主平面混合）按散点处理。规则网格时绘制范围为 [最小 VZA, 最大 VZA]，
+  //   散点时从圆心（0°）开始绘制。
   const samplesByZenith = zeniths.map((vza) => averaged.filter((point) => Math.abs(point.vza - vza) < 1e-8).sort((a, b) => a.vaa - b.vaa))
   // A combined hemisphere + principal-plane run is still scattered data.
   // Repeated zeniths along its two cross-sections must not turn it into a grid.
@@ -6978,6 +7923,8 @@ function polarAnalysisSvg(rows, valueLabel) {
     samples.length === firstRing.length && samples.every((sample, index) =>
       angularDistance(sample.vaa, firstRing[index].vaa) < 1e-6))
   const plottedRadialMin = isPolarGrid ? radialMin : 0
+  // 散点插值用：把每个方向转成单位向量 [sinθ·sinφ, sinθ·cosφ, cosθ]（x 东、y 北、z 天顶，
+  //   θ=VZA，φ=VAA），以球面上的夹角余弦衡量远近。
   const scatteredSamples = averaged.map((point) => {
     const zenithRadians = point.vza * Math.PI / 180
     const azimuthRadians = point.vaa * Math.PI / 180
@@ -6990,6 +7937,7 @@ function polarAnalysisSvg(rows, valueLabel) {
       ]
     }
   })
+  // 步骤 5a：沿方位角做周期线性插值（环上首尾相接，跨 360° 回绕）；只有一个样本时直接返回。
   const interpolateAzimuth = (samples, target) => {
     if (!samples.length) return NaN
     if (samples.length === 1) return samples[0].mean
@@ -7007,6 +7955,8 @@ function polarAnalysisSvg(rows, valueLabel) {
     const fraction = (angle - lower.vaa) / Math.max(upper.vaa - lower.vaa, 1e-9)
     return lower.mean + (upper.mean - lower.mean) * fraction
   }
+  // 步骤 5b：规则网格插值——先在每个天顶角环上按方位插值，再沿 VZA 线性插值；
+  //   超出 [最小, 最大] VZA 返回 NaN（该单元不绘制），低于最内环时取最内环的值。
   const interpolatePolarGrid = (vza, vaa) => {
     if (vza < radialMin - 1e-9 || vza > radialMax + 1e-9) return NaN
     const radialSamples = zeniths.map((zenith, index) => ({ zenith, value: interpolateAzimuth(samplesByZenith[index], vaa) })).filter((sample) => Number.isFinite(sample.value))
@@ -7021,6 +7971,8 @@ function polarAnalysisSvg(rows, valueLabel) {
     }
     return radialSamples[radialSamples.length - 1].value
   }
+  // 步骤 5c：散点插值——取球面上最近的 8 个样本（距离 = 1 − cos 夹角），
+  //   按 1/距离 反距离加权平均；与某样本几乎重合（距离 < 1e-12）时直接取该样本值。
   const interpolateScattered = (vza, vaa) => {
     const zenithRadians = vza * Math.PI / 180
     const azimuthRadians = normalizeAzimuth(vaa) * Math.PI / 180
@@ -7050,6 +8002,8 @@ function polarAnalysisSvg(rows, valueLabel) {
     return totalWeight ? weightedValue / totalWeight : NaN
   }
   const interpolateField = isPolarGrid ? interpolatePolarGrid : interpolateScattered
+  // 发散色标：归一化值 0 → 蓝 (30,74,161)，0.5 → 近白 (245,245,245)，1 → 红 (190,28,28)，
+  //   两段分别线性插值；各方向值相等时取中间的白色。
   const colorFor = (value) => {
     const normalized = Math.max(0, Math.min(1, range ? (value - minimum) / range : .5))
     const stops = [[30, 74, 161], [245, 245, 245], [190, 28, 28]]
@@ -7058,6 +8012,7 @@ function polarAnalysisSvg(rows, valueLabel) {
     const left = stops[segment], right = stops[segment + 1]
     return `rgb(${left.map((channel, index) => Math.round(channel + (right[index] - channel) * local)).join(',')})`
   }
+  // 极坐标 → 画布坐标：方位 0° 在正上方（北），顺时针增大；以下 sectorPath 生成扇环 SVG 路径。
   const pointOnCircle = (distance, azimuth) => {
     const radians = (azimuth - 90) * Math.PI / 180
     return [cx + Math.cos(radians) * distance, cy + Math.sin(radians) * distance]
@@ -7071,6 +8026,8 @@ function polarAnalysisSvg(rows, valueLabel) {
     return `M${outerStartX.toFixed(2)},${outerStartY.toFixed(2)}A${outerRadius.toFixed(2)},${outerRadius.toFixed(2)} 0 0 1 ${outerEndX.toFixed(2)},${outerEndY.toFixed(2)}L${innerEndX.toFixed(2)},${innerEndY.toFixed(2)}A${innerRadius.toFixed(2)},${innerRadius.toFixed(2)} 0 0 0 ${innerStartX.toFixed(2)},${innerStartY.toFixed(2)}Z`
   }
 
+  // 步骤 6：把圆（或圆环）分成约每 1° VZA 一圈、每 2° 方位一格（共 180 格）的扇形单元，
+  //   取单元中心方向的插值着色；插值为 NaN 的单元不画。
   const radialSteps = Math.max(1, Math.ceil(radialMax - plottedRadialMin))
   const azimuthSteps = 180
   const cells = []
@@ -7088,6 +8045,7 @@ function polarAnalysisSvg(rows, valueLabel) {
     }
   }
 
+  // 步骤 7：三圈天顶角参考圈（最大 VZA 的 1/3、2/3、1）、N/E/S/W 方位轴，并附发散色标。
   const guideAngles = [radialMax / 3, radialMax * 2 / 3, radialMax]
   const guides = guideAngles.map((angle) => `<circle cx="${cx}" cy="${cy}" r="${radius * angle / radialMax}"/><text x="${cx + 5}" y="${cy - radius * angle / radialMax + 14}">${formatColorbarValue(angle)}°</text>`).join('')
   const axes = [0, 90, 180, 270].map((azimuth) => {
@@ -7099,6 +8057,10 @@ function polarAnalysisSvg(rows, valueLabel) {
   return `<div class="analysis-chart-wrap"><svg class="analysis-chart analysis-polar" viewBox="0 0 ${width} ${height}" role="img" aria-label="方位角周期补全极坐标图"><g class="analysis-polar-field">${cells.join('')}</g><g class="analysis-polar-grid">${guides}${axes}</g></svg>${resultColorbar(`${valueLabel} · 整幅图像均值`, minimum, maximum, 'diverging')}</div>`
 }
 
+// 作用：把“图像 A vs 图像 B”的像元对画成散点图（变化分析使用）。
+// 输入：sourcePoints = [[A 值, B 值], ...]（由服务端抽样得到）。
+// 说明：两个轴共用同一范围——取全部 A、B 值的 P2–P98 后各外扩 5%（全相等时扩 5% 或 0.001），
+//   超出范围的点由 clipPath 裁掉；analysis-reference-line 为 1:1 参考线。
 function scatterAnalysisSvg(sourcePoints) {
   const points = sourcePoints
     .map((point) => ({ x: Number(point[0]), y: Number(point[1]) }))
@@ -7130,6 +8092,7 @@ function scatterAnalysisSvg(sourcePoints) {
   return `<div class="analysis-chart-wrap"><svg class="analysis-chart change-scatter-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="图像 A 与图像 B 像元散点图"><defs><clipPath id="changeScatterClip"><rect x="${left}" y="${top}" width="${width - left - right}" height="${height - top - bottom}"/></clipPath></defs><g class="analysis-grid">${grid}</g><line class="analysis-reference-line" x1="${x(minimum)}" y1="${y(minimum)}" x2="${x(maximum)}" y2="${y(maximum)}"/><line class="analysis-axis" x1="${left}" y1="${height - bottom}" x2="${width - right}" y2="${height - bottom}"/><line class="analysis-axis" x1="${left}" y1="${top}" x2="${left}" y2="${height - bottom}"/><text class="analysis-axis-title" x="${(left + width - right) / 2}" y="${height - 12}" text-anchor="middle">图像 A 像元值</text><text class="analysis-axis-title" transform="translate(18 ${(top + height - bottom) / 2}) rotate(-90)" text-anchor="middle">图像 B 像元值</text><g class="change-scatter-points" clip-path="url(#changeScatterClip)">${dots}</g></svg></div>`
 }
 
+// 变化分析只比较 TIFF 类型的结果文件；以下为文件标签与差值色标（对称范围 ±limit）。
 function changeResultFiles() {
   return state.resultFiles.filter((file) => file.kind === 'tiff')
 }
@@ -7142,6 +8105,7 @@ function changeDifferenceColorbar(limit) {
   return `<div class="result-colorbar change-colorbar" role="img" aria-label="B 减 A 差值色标"><div class="result-colorbar-title">B − A · P2–P98</div><div class="result-colorbar-scale"><div class="result-colorbar-gradient"></div><div class="result-colorbar-labels"><span>${escapeHtml(formatColorbarValue(-limit))}</span><span>0</span><span>${escapeHtml(formatColorbarValue(limit))}</span></div></div></div>`
 }
 
+// 作用：绑定变化分析的 A/B 文件、波段、交换按钮；改变 A 或 B 时波段重置为 0，随后重新渲染。
 function bindChangeAnalysisControls() {
   const update = (key, value) => {
     state.analysisSelection.change = {
@@ -7161,8 +8125,12 @@ function bindChangeAnalysisControls() {
   })
 }
 
+// 作用：渲染“变化分析”（逐像元 B − A 差异图 + 统计指标 + A/B 散点图）。
+// 说明：changeAnalysisRequest 为请求序号，异步返回时若已有新请求或已离开该分析则丢弃旧结果。
+// 步骤：1 选定 A/B 文件与波段；2 生成控件与占位卡片；3 调服务端比较；4 填充指标并绘制差值图。
 async function renderChangeAnalysis() {
   disposeResultViewer()
+  // 步骤 1：A 缺省取第一个 TIFF；B 缺省取与 A 不同的第一个；A/B 组合变化时波段回到 0。
   const requestId = ++state.changeAnalysisRequest
   const files = changeResultFiles()
   const previous = state.analysisSelection.change || {}
@@ -7173,6 +8141,7 @@ async function renderChangeAnalysis() {
   const band = pairChanged ? 0 : Math.max(0, Math.floor(Number(previous.band) || 0))
   state.analysisSelection.change = { firstPath: first?.path || '', secondPath: second?.path || '', band: String(band) }
   renderResultFiles()
+  // 步骤 2：生成 A/B/波段下拉框和交换按钮，先显示“正在计算…”占位（少于两个 TIFF 时提示不足）。
   const fileValues = files.map((file) => file.path)
   const fileLabel = (path) => changeFileLabel(files.find((file) => file.path === path))
   const controls = `${analysisSelect('图像 A（基准）', 'changeFirst', fileValues, first?.path || '', fileLabel)}${analysisSelect('图像 B（对比）', 'changeSecond', fileValues, second?.path || '', fileLabel)}${analysisSelect('波段', 'changeBand', [band], band, (value) => `图层 ${Number(value) + 1}`)}<button class="button ghost change-swap" id="changeSwap" type="button">交换 A / B</button>`
@@ -7186,6 +8155,8 @@ async function renderChangeAnalysis() {
     return
   }
 
+  // 步骤 3：请求服务端比较（最后一个参数 4000 疑为散点抽样上限，待核对），
+  //   结果含有效像元数、平均差、MAE、RMSE、相关系数 R、差值范围与散点样本。
   $('#resultStatus').textContent = `正在比较 ${first.name} 与 ${second.name}...`
   try {
     const result = await api.compareResults(first.path, second.path, band, 4000)
@@ -7194,6 +8165,7 @@ async function renderChangeAnalysis() {
     bandSelect.innerHTML = Array.from({ length: result.bands }, (_, index) => analysisOption(index, `${result.bandNames[index] || `波段 ${index + 1}`}（图层 ${index + 1}）`, result.band)).join('')
     const correlation = Number.isFinite(result.correlation) ? formatColorbarValue(result.correlation) : '—'
     $('#changeAnalysisOutput').innerHTML = `<div class="change-metrics"><div><span>有效像元</span><strong>${Number(result.validPixels).toLocaleString('zh-CN')}</strong></div><div><span>平均差值</span><strong>${escapeHtml(formatColorbarValue(result.meanDifference))}</strong></div><div><span>MAE</span><strong>${escapeHtml(formatColorbarValue(result.mae))}</strong></div><div><span>RMSE</span><strong>${escapeHtml(formatColorbarValue(result.rmse))}</strong></div><div><span>相关系数 R</span><strong>${escapeHtml(correlation)}</strong></div><div><span>差值范围</span><strong>${escapeHtml(formatColorbarValue(result.differenceMinimum))} ～ ${escapeHtml(formatColorbarValue(result.differenceMaximum))}</strong></div></div><div class="change-figures"><section><h4>差异图（B − A）</h4><div class="change-difference-stage"><canvas class="result-canvas change-difference-canvas" id="changeDifferenceCanvas" width="${result.previewWidth}" height="${result.previewHeight}"></canvas></div>${changeDifferenceColorbar(result.differenceLimit)}</section><section><h4>像元散点图</h4>${scatterAnalysisSvg(result.scatter)}</section></div><div class="result-meta"><span>${result.width} × ${result.height}</span><span>${escapeHtml(result.bandNames[result.band] || `波段 ${result.band + 1}`)}</span><span>显示范围 P2–P98，统计使用全部有效像元</span><span>散点抽样 ${Number(result.scatter.length).toLocaleString('zh-CN')} 个</span></div>`
+    // 步骤 4：differencePixels 为 base64 的 RGBA 预览像素（已按差值色标着色），写入画布。
     const source = atob(result.differencePixels || '')
     const bytes = Uint8ClampedArray.from(source, (character) => character.charCodeAt(0))
     const canvas = $('#changeDifferenceCanvas')
@@ -7209,6 +8181,7 @@ async function renderChangeAnalysis() {
   }
 }
 
+// 作用：统计分析面板的下拉框变化时，保存当前选择并用同一批 rows 重新渲染。
 function bindAnalysisControls(rows) {
   $$('.analysis-control').forEach((control) => control.addEventListener('change', () => {
     state.analysisSelection[state.analysisType] = Object.fromEntries($$('.analysis-control').map((item) => [item.id, item.value]))
@@ -7216,8 +8189,16 @@ function bindAnalysisControls(rows) {
   }))
 }
 
+// 作用：渲染基于统计 CSV 行的分析图（角度 / 波段 / 时间三类）并写入结果预览区。
+// 输入：rows（statisticsRows 的输出）、type（'angle' | 'band' | 'time'）。
+//   每行的 mean 是整幅图像的均值（单位随波段名：反射率、亮温 K、辐亮度等）。
+// 说明：用户在下拉框里的选择保存在 state.analysisSelection[type]，选项失效时回退到第一项。
+// 步骤：1 选定模式并整理可选的波段/时刻/观测角；2 按 type 生成控件与图表；
+//   3 写入卡片、滚动到顶部并绑定控件。
 function renderStatisticsAnalysis(rows, type = state.analysisType) {
   disposeResultViewer()
+  // 步骤 1：统计文件可能含多个模式的行；优先取与当前工程模式同名的（去掉 'e' 前缀后不分大小写比较），
+  //   否则取第一个。波段按序号、观测角按 VZA 再 VAA、时刻按模拟时间先后排序。
   const selection = state.analysisSelection[type] || {}
   const modes = uniqueValues(rows, (row) => row.mode)
   const expectedMode = String(state.mode || '').replace(/^e/, '')
@@ -7231,6 +8212,10 @@ function renderStatisticsAnalysis(rows, type = state.analysisType) {
   const angle = angleKeys.includes(selection.analysisAngle) ? selection.analysisAngle : angleKeys[0]
   let controls = '', chart = '', description = '', interactionHint = '鼠标停留在数据点上可查看精确值'
 
+  // 步骤 2a（角度分析）：固定波段与时刻，比较不同观测方向的均值。
+  //   可用的显示方式：主平面/垂直主平面折线（main）、半球极坐标补全（hemisphere）；
+  //   两者都不满足时退化为按 VAA 分组的 VZA 折线（directions）。
+  //   是否半球观测优先用运行设置 hemisphereRequested；缺失时用“方向数 ≥ 100”作旧结果的兜底判断。
   if (type === 'angle') {
     const candidates = modeRows.filter((row) => statisticBandKey(row) === band && row.time === time)
     const mainRows = candidates.map((row) => ({ row, signed: signedPlaneZenith(row, false) })).filter((item) => item.signed != null)
@@ -7272,6 +8257,8 @@ function renderStatisticsAnalysis(rows, type = state.analysisType) {
     }
     description = `角度分析 · ${statisticBandLabel(band)} · ${time ? displaySimulationTime(time) : '静态'} · 整幅图像均值`
   } else if (type === 'band') {
+    // 步骤 2b（波段分析）：固定观测角与时刻，横轴为波长。以 2500 nm 为界拆成光学与热红外两张图
+    //   （波长取波段名中最后一个数字，假定单位 nm）；同一张图内物理量不一致时不写具体单位。
     const anglesAtTime = uniqueValues(modeRows.filter((row) => row.time === time), statisticAngleKey, (a, b) => Number(a.split('|')[0]) - Number(b.split('|')[0]) || Number(a.split('|')[1]) - Number(b.split('|')[1]))
     const selectedAngle = anglesAtTime.includes(angle) ? angle : anglesAtTime[0]
     const candidates = modeRows.filter((row) => row.time === time && statisticAngleKey(row) === selectedAngle)
@@ -7288,6 +8275,8 @@ function renderStatisticsAnalysis(rows, type = state.analysisType) {
     }).join('')
     description = `波段分析 · ${statisticAngleLabel(selectedAngle)} · ${time ? displaySimulationTime(time) : '静态'} · 整幅图像均值`
   } else {
+    // 步骤 2c（时间分析）：固定波段与观测角，横轴为模拟时间；时间轴是序数轴，
+    //   刻度文字取离刻度值最近的数据点的时间标签。
     const selectedRows = modeRows.filter((row) => statisticBandKey(row) === band && statisticAngleKey(row) === angle).sort((a, b) => statisticTimeOrder(a.time) - statisticTimeOrder(b.time))
     const selectedBandRow = selectedRows[0] || modeRows.find((row) => statisticBandKey(row) === band)
     const valueLabel = statisticValueLabel(selectedBandRow)
@@ -7298,6 +8287,7 @@ function renderStatisticsAnalysis(rows, type = state.analysisType) {
     })
     description = `时间分析 · ${statisticBandLabel(band)} · ${statisticAngleLabel(angle)} · 整幅图像均值`
   }
+  // 步骤 3：写入分析卡片；滚动位置在下一帧再次置顶（避免内容重排后位置被浏览器恢复）。
   const preview = $('#resultPreview')
   preview.classList.add('analysis-preview')
   preview.innerHTML = `<div class="result-preview-card analysis-card"><div class="analysis-controls">${controls}</div>${chart}<div class="result-meta"><span>${escapeHtml(description)}</span><span>${escapeHtml(interactionHint)}</span></div></div>`
@@ -7306,6 +8296,8 @@ function renderStatisticsAnalysis(rows, type = state.analysisType) {
   bindAnalysisControls(rows)
 }
 
+// 作用：把统计 CSV 结果（result.content 文本、result.observation 观测设置）解析后绘制分析图；
+//   没有有效行时提示先运行图像模拟。
 function drawStatisticsAnalysis(result) {
   const rows = statisticsRows(result.content, result.observation)
   if (!rows.length) {
@@ -7316,6 +8308,11 @@ function drawStatisticsAnalysis(result) {
 }
 
 
+// 作用：读取并显示一个结果文件（ENVI/TIFF/风场/面元/体元/图像/CSV 等），按类型分派预览函数。
+// 输入：file（列表项）、band（多波段影像的波段序号，从 0 起）。
+// 说明：openResultFile 可能被快速连续调用，openRequest 序号与 stale() 用于丢弃过期或对话框已关闭
+//   的异步结果。
+// 步骤：1 读取；2 兼容旧版面元结果；3 按 kind 分派绘制；4 绑定“用系统程序打开”并更新状态栏。
 async function openResultFile(file, band = 0) {
   if (!file) return
   const openRequest = ++state.resultOpenRequest
@@ -7327,6 +8324,8 @@ async function openResultFile(file, band = 0) {
     $('#resultStatus').textContent = `正在读取 ${displayName}...`
     let result = await api.readResult(file.path, band)
     if (stale()) return
+    // 步骤 2：旧版面元结果没有 kind，只给 radiosity / lightEnhancement / sunlit 三个数组；
+    //   这里包装成 kind='facet' 与 metrics 列表，使其走新的面元三维视图。
     if (!result.kind && Number.isInteger(Number(result.facetCount)) &&
         isNumberArray(result.radiosity) && isNumberArray(result.lightEnhancement) &&
         isNumberArray(result.sunlit)) {
@@ -7338,6 +8337,8 @@ async function openResultFile(file, band = 0) {
       delete result.radiosity; delete result.lightEnhancement; delete result.sunlit
       result = { ...result, kind: 'facet', path: file.path, metrics }
     }
+    // 步骤 3：按 kind 选择预览方式；统计 CSV 仅在“分析”视图（且不是三维分析）下按图表绘制，
+    //   其余文本直接显示原文；未知类型提示用外部程序打开。
     if (result.kind === 'envi') await drawEnviPreview(result, file)
     else if (result.kind === 'wind') drawWindPreview(result, file)
     else if (result.kind === 'tiff') await drawTiffPreview(result, file)
@@ -7348,6 +8349,7 @@ async function openResultFile(file, band = 0) {
     else if (result.kind === 'text') { disposeResultViewer(); state.resultRaster = null; $('#resultPreview').innerHTML = `<div class="result-preview-card"><pre class="result-text">${escapeHtml(result.content)}</pre><button class="button ghost result-open-external" type="button">用系统程序打开</button></div>` }
     else { disposeResultViewer(); state.resultRaster = null; $('#resultPreview').innerHTML = `<div class="empty-editor"><svg><use href="#i-layers"/></svg><h3>暂不支持内置预览</h3><p>可在资源管理器中定位并使用外部程序打开该文件。</p><button class="button ghost result-open-external" type="button">用系统程序打开</button></div>` }
     $('#resultPreview').querySelector('.result-open-external')?.addEventListener('click', () => api.openPath(file.path))
+    // 步骤 4：状态栏文字按结果类型给出简短说明（未列出的类型直接显示文件名）。
     $('#resultStatus').textContent = result.kind === 'envi' ? `ENVI 浮点影像 · ${displayName}` : result.kind === 'wind' ? `自适应风速箭头图 · ${displayName}` : result.kind === 'tiff' ? `TIFF 栅格影像 · ${displayName}` : result.kind === 'facet' ? `面元结果 · ${displayName}` : result.kind === 'text' && state.resultView === 'analysis' ? `${({ angle: '角度', band: '波段', time: '时间' })[state.analysisType] || ''}统计分析 · ${displayName}` : result.kind === 'image' ? `图像结果 · ${displayName}` : displayName
   } catch (error) {
     if (stale()) return
@@ -7356,6 +8358,8 @@ async function openResultFile(file, band = 0) {
   }
 }
 
+// 作用：判断当前配置是否输出了三维过程结果。能量平衡模式（FacetEB/VoxelEB）
+//   辐射过程或能量过程任一开启即可；其他模式只看辐射过程开关。
 function threeDimensionalOutputEnabled() {
   const energyMode = state.mode === 'eFacetEB' || state.mode === 'eVoxelEB'
   return energyMode
@@ -7363,6 +8367,8 @@ function threeDimensionalOutputEnabled() {
     : Boolean(state.config?.sensor?.radiationProcess)
 }
 
+// 作用：按当前视图筛选结果文件：图像视图 = tiff/envi/image；变化分析 = tiff；
+//   三维分析 = facet/process（未启用过程输出时为空）；其余统计分析 = result_statistics*.csv。
 function resultFilesForView() {
   if (state.resultView === 'image') return state.resultFiles.filter((file) => ['tiff', 'envi', 'image'].includes(file.kind))
   if (state.analysisType === 'change') return changeResultFiles()
@@ -7370,6 +8376,7 @@ function resultFilesForView() {
   return state.resultFiles.filter((file) => file.kind === 'text' && /(?:^|[\\/])result_statistics(?:_[a-z0-9-]+)?\.csv$/i.test(file.path))
 }
 
+// 作用：结果文件显示名；体元流体力学过程文件显示为“体元流体力学 · 时刻”，其余用文件名。
 function resultFileDisplayName(file) {
   if (file?.kind === 'process' && file.processType === 'fluid') {
     return `体元流体力学 · ${file.processTime || '静态'}`
@@ -7377,6 +8384,7 @@ function resultFileDisplayName(file) {
   return file?.name || ''
 }
 
+// 作用：按当前视图（图像/分析）和分析类型刷新结果对话框的标题与标签页高亮。
 function updateResultViewHeader() {
   const analysis = state.resultView === 'analysis'
   $('#resultDialogTitle').textContent = analysis ? '分析' : '图像结果'
@@ -7387,6 +8395,8 @@ function updateResultViewHeader() {
   for (const [type, selector] of Object.entries(tabs)) $(selector).classList.toggle('active', analysis && state.analysisType === type)
 }
 
+// 作用：切换结果对话框的“图像结果 / 分析”视图；先释放旧三维视图并清空选中结果，
+//   openFirst 为真时自动打开该视图的第一个文件（变化分析则直接渲染）。
 async function setResultView(view, openFirst = true) {
   disposeResultViewer()
   state.resultRaster = null
@@ -7402,6 +8412,7 @@ async function setResultView(view, openFirst = true) {
   if (openFirst && first) await openResultFile(first)
 }
 
+// 作用：切换分析类型（angle/band/time/change/3d，非法值回退为 angle），其余同 setResultView。
 async function setAnalysisType(type, openFirst = true) {
   disposeResultViewer()
   state.resultRaster = null
@@ -7418,6 +8429,8 @@ async function setAnalysisType(type, openFirst = true) {
   if (openFirst && first) await openResultFile(first)
 }
 
+// 作用：渲染左侧结果文件列表；当前视图没有文件时显示空状态与所需前置条件。
+// 说明：变化分析中点击文件 = 设为 B（点到 A 本身时不变），并把波段重置为 0。
 function renderResultFiles() {
   const visibleFiles = resultFilesForView()
   if (!visibleFiles.length) {
@@ -7455,6 +8468,8 @@ function renderResultFiles() {
   }))
 }
 
+// 作用：重新列出输出目录中的结果文件并刷新界面；已选结果仍存在则重新打开，
+//   否则（openFirst 为真时）打开第一个。
 async function refreshResults(openFirst = false) {
   if (!state.outputDir) throw new Error('当前工程未配置输出目录')
   const result = await api.listResults(state.outputDir)
@@ -7472,6 +8487,8 @@ async function refreshResults(openFirst = false) {
   else if (openFirst && visibleFiles.length) await openResultFile(visibleFiles[0])
 }
 
+// 作用：删除全部结果：三维分析视图删除三维输出，其他视图删除 TIFF 图像结果；
+//   删除后刷新列表并提示删除个数。
 async function deleteAllResults() {
   try {
     const kind = state.resultView === 'analysis' && state.analysisType === '3d' ? '3d' : 'image'
@@ -7488,6 +8505,9 @@ async function deleteAllResults() {
   }
 }
 
+// 作用：打开“结果”对话框。view 取 'image'（图像结果）、'analysis'（分析，可带 analysisType）
+//   或 '3d'（三维分析）；随后读取输出目录并自动打开第一个结果，失败时在对话框内提示原因。
+//   未打开工程时直接提示并返回。
 async function showResults(view = 'image', analysisType = null) {
   if (!state.inputPath) { toast('无法查看结果', '请先新建或打开工程', 'error'); return }
   $('#resultDialog').hidden = false
@@ -7506,6 +8526,7 @@ async function showResults(view = 'image', analysisType = null) {
   }
 }
 
+// 作用：关闭结果对话框；resultOpenRequest 加 1 使仍在读取的异步结果作废，并释放三维视图。
 function hideResults() {
   state.resultOpenRequest += 1
   disposeResultViewer()
@@ -7513,6 +8534,11 @@ function hideResults() {
   $('#resultDialog').hidden = true
 }
 
+// 作用：切换计算模式（RayTracing/VoxelRT/VoxelEB/FacetRT/FacetEB 等）并刷新界面。
+// 说明：announce 为真表示由用户操作触发，此时才重映射 GPU 序号、标记工程为未保存、写日志。
+//   从面元类模式（含 eRaytracing）切到体元模式视为“面元 → 体元”转换：
+//   在 project.voxelization 记录源/目标模式与体元大小（scene.voxel，缺省 1 m），
+//   并打开体元预览；OBJ、材质和位置保持不变，体元在运行时稀疏生成。
 function selectMode(mode, announce = false) {
   const button = $(`.mode-card[data-mode="${mode}"]`)
   if (!button) return
@@ -7551,6 +8577,8 @@ function showProjectDialog() {
 
 function hideProjectDialog() { $('#projectDialog').hidden = true }
 
+// 作用：打开“另存为”对话框。运行中或未打开工程时拒绝；默认保存到当前工程目录的上一级，
+//   默认名称为“原名_copy”。
 function showSaveAsDialog() {
   if (!state.project || !state.inputPath) {
     toast('无法另存为', '请先新建或打开工程', 'error')
@@ -7586,6 +8614,9 @@ function hideHistreamProxyDialog() {
   $('#histreamProxyDialog').hidden = true
 }
 
+// 以下为 histream-proxy（代理/替代模型）对话框：用训练时捕获的登记帧生成数值影像，
+//   不调用 histream.exe（原生引擎）。
+// 作用：读取下拉框选中的捕获帧；选项 value 是 JSON [episode_id, frame_index]。
 function selectedHistreamProxyFrame() {
   const value = $('#histreamProxyFrameSelect').value
   if (!value) throw new Error('请选择训练捕获帧')
@@ -7594,6 +8625,7 @@ function selectedHistreamProxyFrame() {
   return { episodeId, frameIndex }
 }
 
+// 作用：显示当前所选波段的预览图与标题（波段名 · 单位 · 宽 × 高；shape 为 [高, 宽]）。
 function showHistreamProxyBand() {
   const result = histreamProxyState.result
   if (!result) return
@@ -7609,6 +8641,8 @@ function showHistreamProxyBand() {
   $('#histreamProxyPreviewTitle').textContent = `${band} · ${units} · ${result.shape[1]} × ${result.shape[0]}`
 }
 
+// 作用：打开代理对话框并向服务端查询部署清单（api.histreamProxyInfo）。
+//   未就绪（info.ready 为假）时只显示原因，不启用运行按钮；就绪时用登记帧填充下拉框。
 async function openHistreamProxyDialog() {
   const dialog = $('#histreamProxyDialog')
   dialog.hidden = false
@@ -7651,6 +8685,9 @@ async function openHistreamProxyDialog() {
   }
 }
 
+// 作用：对选中的登记帧运行代理预测，并校验返回的状态：status 必须为 'ok'、
+//   backend 为 'histream-proxy'、native_engine_invoked 为 false，否则按失败处理。
+//   成功后显示波段预览与下载链接（npz）；无论成败都在 finally 中恢复按钮状态。
 async function runHistreamProxyFrame() {
   const button = $('#runHistreamProxyBtn')
   const select = $('#histreamProxyFrameSelect')
@@ -7684,6 +8721,7 @@ async function runHistreamProxyFrame() {
   }
 }
 
+// 作用：放大显示参考图例（取按钮内 img 的 src/alt，标题取 data-reference-title）。
 function showReferenceImage(button) {
   const image = button.querySelector('img')
   if (!image) return
@@ -7699,6 +8737,11 @@ function hideReferenceImage() {
   $('#referenceImage').removeAttribute('src')
 }
 
+// 作用：把当前工程另存为新目录并切换到新工程。
+// 说明：保存前先同步 XML 文本；generation（工程代次）与 revision（编辑版本）用于检测
+//   异步保存期间用户是否换了工程或又改了内容——若已变化，只提示已另存，不加载结果、不改当前工程。
+// 步骤：1 取表单值并克隆当前配置/工程；2 补全 DEM 信息；3 调服务端另存为；
+//   4 记住父目录、加载新工程。
 async function saveProjectAs(event) {
   event.preventDefault()
   const submit = $('#saveAsForm button[type="submit"]')
@@ -7730,6 +8773,7 @@ async function saveProjectAs(event) {
   } finally { submit.disabled = false }
 }
 
+// 作用：按“新建工程”表单（名称、目录、模式）创建工程，成功后记住目录并加载。
 async function createProject(event) {
   event.preventDefault()
   const submit = $('#projectForm button[type="submit"]')
@@ -7746,6 +8790,10 @@ async function createProject(event) {
   finally { submit.disabled = false }
 }
 
+// 模块：界面事件绑定（模块加载时一次性执行，按界面区域分组）。
+// 分组 1：计算模式卡片、计算设备/CPU 线程、导航树、视图样式、网格与体元预览按钮。
+//   设备下拉框的取值：'gpu:<序号>' 表示 GPU，其余值直接作为后端名；
+//   同时写入 control.computeBackend 与 control.facetBackend，然后更新 XML 文本。
 $$('.mode-card').forEach((button) => button.addEventListener('click', () => selectMode(button.dataset.mode, true)))
 $('#computeDevice').addEventListener('change', (event) => {
   const control = state.config?.control
@@ -7770,6 +8818,7 @@ $('#refreshDevicesBtn').addEventListener('click', () => loadComputeDevices(true)
 $$('.tree-item').forEach((button) => button.addEventListener('click', () => { state.panel = button.dataset.panel; $$('.tree-item').forEach((item) => item.classList.toggle('active', item === button)); renderInspector() }))
 $$('#viewStyle button').forEach((button) => button.addEventListener('click', () => { $$('#viewStyle button').forEach((item) => item.classList.toggle('active', item === button)); applyViewStyle(button.dataset.style) }))
 $('#gridBtn').addEventListener('click', () => { if (!grid) return; grid.visible = !grid.visible; $('#gridBtn').classList.toggle('active', grid.visible) })
+// 体元预览开关：已显示则关闭；否则调用 buildVoxelPreview，场景无可体元化对象时提示。
 $('#voxelBtn').addEventListener('click', () => {
   if (voxelPreview?.visible) {
     voxelPreview.visible = false
@@ -7786,6 +8835,8 @@ $('#voxelBtn').addEventListener('click', () => {
     toast('体元预览失败', error.message, 'error')
   }
 })
+// 分组 2：场景对象工具——工具菜单（修改/添加子菜单）、绘制区域/方块、对象编辑开关；
+//   点击菜单之外的任何位置关闭菜单。
 $('#sceneObjectToolsBtn').addEventListener('click', (event) => {
   event.stopPropagation()
   const menu = $('#sceneObjectToolsMenu')
@@ -7806,6 +8857,8 @@ $('#editObjectBtn').addEventListener('click', () => {
 document.addEventListener('pointerdown', (event) => {
   if (!event.target.closest?.('.scene-object-tools')) closeSceneObjectToolsMenu()
 })
+// 对象变换模式按钮（移动/旋转/缩放）：未处于编辑状态时先启用编辑。
+// 以下 transformControls 为 three.js 变换控件的事件：拖动时临时关闭轨道相机控制。
 $$('#transformModeButtons button').forEach((button) => button.addEventListener('click', () => {
   if (!objectEdit.enabled) setObjectEditEnabled(true)
   setObjectTransformMode(button.dataset.transformMode)
@@ -7817,6 +8870,10 @@ transformControls.addEventListener('dragging-changed', (event) => {
 transformControls.addEventListener('mouseDown', () => {
   if (objectEdit.selected) objectEdit.transformStartScale.copy(objectEdit.selected.scale)
 })
+// 拖动过程中的实时修正：缩放模式下按被拖动的轴的比例（拖动整体手柄时取三轴最大比例）
+//   对起始缩放做等比缩放，最小因子 0.01，避免出现非等比缩放或零/负尺度；
+//   随后 snapGroundedObject 让带地面足迹的对象按地形高度重新贴地，并刷新选择框。
+//   鼠标松开（mouseUp）时保存对象变换。
 transformControls.addEventListener('objectChange', () => {
   const object = objectEdit.selected
   if (!object) return
@@ -7835,6 +8892,8 @@ transformControls.addEventListener('objectChange', () => {
   updateObjectSelectionBox()
 })
 transformControls.addEventListener('mouseUp', () => saveEditedObjectTransform(objectEdit.selected))
+// 三维画布的指针事件：绘制几何（捕获阶段，优先于相机控制）与对象选择/双击编辑；
+//   绘制中指针取消、右键或 Esc 都会取消绘制。
 renderer.domElement.addEventListener('pointerdown', onGeometryDrawPointerDown, true)
 renderer.domElement.addEventListener('pointermove', onGeometryDrawPointerMove, true)
 renderer.domElement.addEventListener('pointerup', onGeometryDrawPointerUp, true)
@@ -7855,6 +8914,8 @@ window.addEventListener('keydown', (event) => {
   const target = event.target
   if (target instanceof HTMLElement && (target.matches('input, textarea, select') || target.isContentEditable)) return
   const key = event.key.toLowerCase()
+  // 对象编辑快捷键：W 移动、E 旋转、R 缩放；无对话框打开时 Esc 先取消选择，再退出编辑模式。
+  //   焦点在输入控件时（上面已 return）不响应。
   if (key === 'w') setObjectTransformMode('translate')
   else if (key === 'e') setObjectTransformMode('rotate')
   else if (key === 'r') setObjectTransformMode('scale')
@@ -7865,6 +8926,8 @@ window.addEventListener('keydown', (event) => {
     else setObjectEditEnabled(false)
   }
 })
+// 分组 3：顶部工具栏按钮——适应视图、打开/保存/另存为工程、运行、停止、重置，
+//   以及“打开示例”“新建工程”“另存为”“参考”等对话框的打开/关闭/提交。
 $('#fitBtn').addEventListener('click', fitCamera); $('#openXmlBtn').addEventListener('click', chooseXml); $('#drawerOpenBtn').addEventListener('click', chooseXml); $('#saveXmlBtn').addEventListener('click', saveXml); $('#saveAsBtn').addEventListener('click', showSaveAsDialog); $('#runBtn').addEventListener('click', runSimulation); $('#stopBtn').addEventListener('click', () => { api.stop().catch((error) => { toast('无法停止模拟', error.message, 'error'); addLog(`停止失败：${error.message}`, 'error') }) }); $('#resetBtn').addEventListener('click', resetSimulation)
 $('#openExampleBtn').addEventListener('click', showExampleDialog)
 $('#exampleForm').addEventListener('submit', openExampleFromDialog)
@@ -7884,6 +8947,8 @@ $('#referenceBtn').addEventListener('click', showReferenceDialog)
 $('#closeReferenceBtn').addEventListener('click', hideReferenceDialog)
 $('#referenceDialog').addEventListener('click', (event) => { if (event.target === $('#referenceDialog')) hideReferenceDialog() })
 $('#openHistreamProxyBtn').addEventListener('click', openHistreamProxyDialog)
+// 菜单栏：带 data-scene-command 的菜单项在 STREAM 工作区打开时转交给工作区处理
+//   （route 返回 true 即已接管）；streamWorkspace 在下一行才创建，route 只在点击时调用。
 createMenubar({
   root: $('#menubar'),
   route: (item) => {
@@ -7892,6 +8957,8 @@ createMenubar({
     return true
   }
 })
+// STREAM（遥感像元尺度）工作区：data-stream-command 的菜单项 'show' 打开工作区，
+//   其余命令转发给工作区；data-solution-mode 的菜单项先关闭工作区再切换计算模式。
 const streamWorkspace = createStreamWorkspace({ toast })
 for (const item of document.querySelectorAll('[data-stream-command]')) {
   item.addEventListener('click', () => {
@@ -7906,6 +8973,8 @@ for (const item of document.querySelectorAll('[data-solution-mode]')) {
   })
 }
 
+// 快捷键帮助表：[分组名, [[按键, 说明], ...]]；Ctrl+N/O 由 menubar.js 处理，
+//   Ctrl+S/F5/F7 由本文件下方的全局 keydown 处理。
 const SHORTCUTS = [
   ['项目', [['Ctrl+N', '新建工程'], ['Ctrl+O', '打开工程'], ['Ctrl+S', '保存'], ['Ctrl+Shift+S', '另存为']]],
   ['工作台', [['F7', '打开解析模型（STREAM 像元辐射传输 / 能量平衡）']]],
@@ -7914,6 +8983,9 @@ const SHORTCUTS = [
   ['菜单与对话框', [['方向键', '在菜单之间和菜单项之间移动'], ['Esc', '关闭菜单或对话框']]]
 ]
 
+// 作用：帮助菜单。topic='reference' 打开参考图例；'user'/'theory' 通过 api.openHelpDocument
+//   打开用户手册/理论手册；'shortcuts' 显示快捷键表；其余显示“关于”（版本与引擎路径
+//   来自 api.defaults()，读取失败时显示 —）。
 async function showHelp(topic) {
   if (topic === 'reference') { showReferenceDialog(); return }
   if (topic === 'user' || topic === 'theory') {
@@ -7950,6 +9022,8 @@ for (const item of document.querySelectorAll('[data-help]')) item.addEventListen
 $('#closeHelpBtn').addEventListener('click', hideHelp)
 $('#helpDialog').addEventListener('click', (event) => { if (event.target === $('#helpDialog')) hideHelp() })
 window.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !$('#helpDialog').hidden) hideHelp() })
+// 分组 4：各类对话框的关闭（按钮/点击遮罩）与表单提交：histream-proxy、参考图例、
+//   几何生成、材质导入、对象属性、场景对象、预设（光谱/热/物理）。
 $('#closeHistreamProxyBtn').addEventListener('click', hideHistreamProxyDialog)
 $('#histreamProxyDialog').addEventListener('click', (event) => { if (event.target === $('#histreamProxyDialog')) hideHistreamProxyDialog() })
 $('#runHistreamProxyBtn').addEventListener('click', runHistreamProxyFrame)
@@ -7973,6 +9047,8 @@ $('#closeObjectAttributeBtn').addEventListener('click', hideObjectAttributeDialo
 $('#objectAttributeDialog').addEventListener('click', (event) => { if (event.target === $('#objectAttributeDialog')) hideObjectAttributeDialog() })
 $('#objectAttributeForm').addEventListener('submit', saveObjectAttributes)
 $('#objectAttributeType').addEventListener('change', () => renderObjectAttributeOptions(true, true))
+// 对象属性：整体材质改变时同步到所有 Mesh 行（各行仍可单独改）；
+//   光伏（energyModel='photovoltaic'）材质同时把冠层设为 rigid_body（刚体）。
 $('#objectAttributeMaterial').addEventListener('change', () => {
   const materialName = $('#objectAttributeMaterial').value
   // Apply the object-wide choice to all meshes; individual rows remain editable.
@@ -7986,6 +9062,8 @@ $('#objectAttributeMaterial').addEventListener('change', () => {
 $('#closeObjectBtn').addEventListener('click', hideObjectDialog)
 $('#objectDialog').addEventListener('click', (event) => { if (event.target === $('#objectDialog')) hideObjectDialog() })
 $('#objectForm').addEventListener('submit', saveSceneObject)
+// 场景对象表单：分布数量/密度/范围/基准改变时联动数量与密度（syncDistributionPopulation），
+//   并刷新分布与运动表单的可用状态。
 $('#objectForm').addEventListener('input', (event) => {
   const form = $('#objectForm')
   if (event.target.name === 'distributionCount') syncDistributionPopulation(form, 'count')
@@ -8001,6 +9079,7 @@ $('#objectForm').addEventListener('change', (event) => {
   updateMovementFormState(form)
 })
 $('#distributionTxtFile').addEventListener('change', (event) => importDistributionTxt(event.target.files?.[0]))
+// 材质对话框：光谱模型改变时重绘模型参数与反射率/透射率输入（保留已输入的值，缺省 0.20/0.0）。
 $('#spectralModel').addEventListener('change', () => {
   const reflectance = materialSpectrumValues('reflectance') || '0.20'
   const transmittance = materialSpectrumValues('transmittance') || '0.0'
@@ -8016,6 +9095,8 @@ document.querySelector("#thermalPreset").addEventListener("change", () => {
   applyThermalPreset()
   $$('.mesh-thermal').forEach((select) => { select.value = $('#thermalPreset').value })
 })
+// 对象类型改变时设置缺省光谱模型：植被 → Prospect，土壤 → BSM，其他 → custom；
+//   太阳能板（SolarPanel）把光谱/热预设置为“新建”，然后重绘各预设选项与 Mesh 行。
 $('#materialObjectType').addEventListener('change', () => {
   const type = $('#materialObjectType').value
   if (type === 'SolarPanel') {
@@ -8025,6 +9106,7 @@ $('#materialObjectType').addEventListener('change', () => {
   $('#spectralModel').value = type === 'Vegetation' ? 'Prospect' : type === 'Soil' ? 'BSM' : 'custom'
   renderModelParameters(); renderSpectrumPresetOptions(); renderThermalPresetOptions(); renderPhysicalPresetOptions(); renderMeshMaterialRows()
 })
+// 物理材质预设改变：同步到所有 Mesh 行；光伏材质同时把冠层设为 rigid_body。
 $('#physicalMaterialPreset').addEventListener('change', () => {
   renderPhysicalParameters()
   const materialName = $('#physicalMaterialPreset').value
@@ -8039,6 +9121,8 @@ $('#presetKind').addEventListener('change', () => { state.presetPhysicalType = '
 $('#presetForm').addEventListener('submit', savePreset)
 
 
+// 分组 5：结果与分析入口按钮（图像/三维/时间/角度/波段/变化）、结果对话框标签页与操作、
+//   日志清空、XML(project.json) 抽屉、全局快捷键、运行计时刷新。
 $('#engineBtn').addEventListener('click', chooseEngine)
 $('#openOutputBtn').addEventListener('click', () => showResults('image'))
 $('#openImageResultsTopBtn').addEventListener('click', () => showResults('image'))
@@ -8060,16 +9144,27 @@ $('#resultDeleteAllBtn').addEventListener('click', deleteAllResults)
 $('#resultRefreshBtn').addEventListener('click', async () => { try { await refreshResults(true) } catch (error) { toast('刷新结果失败', error.message, 'error') } })
 $('#resultFolderBtn').addEventListener('click', async () => { try { await api.openPath(state.outputDir) } catch (error) { toast('无法打开输出目录', error.message, 'error') } })
 $('#clearLogBtn').addEventListener('click', () => { $('#consoleOutput').innerHTML = ''; state.logCount = 0; $('#logCount').textContent = '0' })
+// project.json 编辑抽屉：手动编辑后标记未保存并置 xmlManualEdit 标志；点击遮罩关闭。
 $('#xmlBtn').addEventListener('click', () => { $('#xmlDrawer').hidden = false }); $('#closeXmlBtn').addEventListener('click', () => { $('#xmlDrawer').hidden = true })
 $('#xmlDrawer').addEventListener('click', (event) => { if (event.target === $('#xmlDrawer')) $('#xmlDrawer').hidden = true })
 $('#xmlEditor').addEventListener('input', () => { state.xmlText = $('#xmlEditor').value; markXmlDirty(); state.xmlManualEdit = true; $('#unsavedMark').hidden = false; $('#xmlStatus').textContent = '有未保存的修改' })
+// 应用手动编辑：解析 project.json → 替换 state.project/config → 保存成功后刷新场景与检查器；
+//   解析失败提示“JSON 格式错误”。
 $('#applyXmlBtn').addEventListener('click', async () => { try { const project = parseProjectJson(state.xmlText); const mode = project.mode; state.project = project; state.config = ensureMaterialPresets(project.configuration); state.xmlManualEdit = false; selectMode(mode); if (await saveXml()) { refreshFromState(); restoreActualScene(); renderInspector(); $('#xmlDrawer').hidden = true } } catch (error) { toast('JSON 格式错误', error.message, 'error') } })
+// 全局快捷键：Ctrl/Cmd+S 保存，Ctrl/Cmd+Shift+S 另存为，F5 运行，F7 打开 STREAM 工作区；
+//   Esc 按固定优先级只关闭最上层的一个对话框/抽屉
+//   （histream-proxy → 参考图 → 参考 → 结果 → 对象属性 → 场景对象 → 材质 → 几何 → 预设 → 新建工程 → XML 抽屉）。
 window.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); if (event.shiftKey) showSaveAsDialog(); else saveXml() } if (event.key === 'F5') { event.preventDefault(); runSimulation() } if (event.key === 'F7') { event.preventDefault(); streamWorkspace.open() } if (event.key === 'Escape') { if (!$('#histreamProxyDialog').hidden) hideHistreamProxyDialog(); else if (!$('#referenceImageDialog').hidden) hideReferenceImage(); else if (!$('#referenceDialog').hidden) hideReferenceDialog(); else if (!$('#resultDialog').hidden) hideResults(); else if (!$('#objectAttributeDialog').hidden) hideObjectAttributeDialog(); else if (!$('#objectDialog').hidden) hideObjectDialog(); else if (!$('#materialDialog').hidden) hideMaterialDialog(true); else if (!$('#geometryDialog').hidden) hideGeometryDialog(); else if (!$('#presetDialog').hidden) hidePresetDialog(); else if (!$('#projectDialog').hidden) hideProjectDialog(); else if (!$('#xmlDrawer').hidden) $('#xmlDrawer').hidden = true } })
+// 运行中每 250 ms 刷新一次进度/耗时显示。
 setInterval(() => { if (state.running) renderRunProgress() }, 250)
 
+// 引擎路径设置的提示与被拒绝时的提示文案：自定义引擎必须先加入服务端环境变量
+//   STREAM_STUDIO_ENGINE_ALLOWLIST 并重启，否则运行被拒绝。
 const ENGINE_PROMPT = 'HiStream 可执行文件路径（留空恢复内置引擎）。自定义路径须先由管理员加入服务端环境变量 STREAM_STUDIO_ENGINE_ALLOWLIST（多个路径用系统路径分隔符分隔，Windows 为分号 ;），并重启 Stream Studio，否则运行会被拒绝。'
 const ENGINE_REJECTED_HINT = '自定义引擎不在允许列表中：请将该路径加入环境变量 STREAM_STUDIO_ENGINE_ALLOWLIST后重启 Stream Studio，或在“引擎”中留空以恢复内置引擎。'
 
+// 作用：选择自定义 HiStream 可执行文件。Facet 模式只显示当前引擎；选择对话框取消（null）则不变；
+//   空路径或等于默认路径表示恢复内置引擎。设置后重新加载计算设备列表。
 async function chooseEngine() {
   if (state.mode === 'eFacetRT' || state.mode === 'eFacetEB') { toast('HiStream Facet 引擎', state.executable); return }
   let path
@@ -8088,10 +9183,15 @@ async function chooseEngine() {
   addLog('自定义引擎须已加入服务端 STREAM_STUDIO_ENGINE_ALLOWLIST，否则运行时会被拒绝', 'warning')
 }
 
+// 作用：判断错误是否来自引擎白名单（ENGINE_ALLOWLIST）拒绝，用于给出针对性提示。
 function isEngineAllowlistError(error) {
   return String(error?.message || '').includes('ENGINE_ALLOWLIST')
 }
 
+// 作用：应用启动初始化（模块末尾调用一次）。
+// 步骤：1 用默认配置生成预览场景；2 订阅模拟事件；3 读取服务端默认值（引擎路径、
+//   运行超时秒数、histream-proxy 是否配置）并写日志，桥接不可用时报错返回；
+//   4 若有上次工程（defaults.projectFile）则自动重新打开，失败只写日志。
 async function init() {
   state.config = defaultConfig(); generateWorld(state.config); refreshFromState(false); fitCamera(); renderInspector(); resize()
   api.onSimulationEvent(handleSimulationEvent)
@@ -8112,6 +9212,7 @@ async function init() {
   catch (error) { addLog(`无法重新打开上次的工程：${error.message}`, 'error') }
 }
 
+// 启动界面本地化；语言切换后回调重绘依赖 t() 的动态内容（检查器、导航徽标、场景范围/航线/太阳提示）。
 startLocalization({ onChange: () => {
   renderInspector()
   if (!state.config) return
