@@ -6,7 +6,7 @@
 //   1. 夹具：临时目录、气象包与输入文件占位、scene()（最小 EB 场景）与 build()（编译为引擎配置）
 //   2. S1：非法 temperature.energy 取值在提交阶段按引擎规则被拒绝；未知字段只告警不报错
 //   3. iceMelt：只有显式 false 才下发给引擎
-//   4. S7：以源码文本断言（正则）检查 server/stream/index.mjs 中 stop()/launch() 的处理
+//   4. S7：假引擎行为测试——排队/运行中的任务被 stop 都以 stopped 收尾（另有一个宽松的结构兜底检查）
 //   5. 缓存键：fileStamp 的 key 含 4 段（最后一段为 ctimeMs）
 //   6. S11：rasterBand 的统计覆盖所有像元，仅降采样网格才置 sampled 标志
 // 关系：被测模块 server/stream/config.mjs（createProjectStore）、server/result-cache.mjs（fileStamp）、
@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url'
 import { createProjectStore } from '../server/stream/config.mjs'
 import { fileStamp } from '../server/result-cache.mjs'
 import { createRasterTools } from '../server/stream/rasters.mjs'
+import { fakeEngine, makeService, waitFor } from './stream-server-test-helpers.mjs'
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const root = mkdtempSync(join(tmpdir(), 'stream-bugs-server-'))
@@ -78,13 +79,40 @@ test('ice melt: only an explicit iceMelt=false is passed to the engine', () => {
   assert.equal(build(scene({ iceMelt: true })).temperature.energy.iceMelt, undefined)
 })
 
-// 测试 S7：这里没有真正启动引擎，而是对 index.mjs 的源码做正则检查——
-//   stop() 能标记尚无子进程的活动作业，launch() 见到 stopped 标志就直接结束为 stopped。
-//   （对源码文本的断言较脆弱，index.mjs 重构这两行时需同步修改。）
-test('S7: stop() marks an active job that has no engine process yet, and launch() honours it', () => {
+// 测试 S7（行为级）：用假引擎（长时间睡眠的脚本）排两个任务。
+//   1) 排队中的第二个任务被 stop 时直接以 stopped 关闭，引擎从未为它启动；
+//   2) 运行中的第一个任务被 stop 时以 stopped 收尾，run-manifest.json 的 status 也是 stopped（不是 failed）。
+//   “已激活但尚无子进程时 stop() 只打标记、launch() 见标记即不启动”的窗口在 HTTP 接口下不可达（start() 是同步的），
+//   所以对应两行实现仍用下面一个宽松的源码检查兜底，只要求结构存在、不绑定具体写法。
+test('S7: stop() closes queued jobs and running jobs as stopped', async () => {
+  const resource = fakeEngine(root, 'sleepy', 'setTimeout(() => {}, 60000)')
+  const { service, call, events } = await makeService({ resourceRoot: resource, modelRoot: join(resource, 'models'), documentsRoot: join(root, 'documents') })
+  const outputRoot = join(root, 'sleepy-out')
+  const input = (name) => ({ overpass: '2019-07-15T04:00:00Z', locationSource: 'input', name, outputRoot,
+    surface: { type: { file: inputFile }, lai: { value: 2 }, latitude: { value: 40 }, longitude: { value: 116 } },
+    view: { vza: { value: 0 }, vaa: { value: 0 } }, optical: { enabled: false }, thermal: { enabled: true, bands: [{ name: 'T', center: 10.5, fwhm: 0.5 }] },
+    temperature: { mode: 'rt', components: Object.fromEntries(['soilSunlit', 'soilShaded', 'leafSunlit', 'leafShaded'].map((key) => [key, { value: 300 }])) } })
+  try {
+    const first = (await call('POST', '/api/stream/run', { scene: input('first') })).payload
+    await waitFor(() => events.some((event) => event.type === 'job-started' && event.job.id === first.id), 'first job started')
+    const second = (await call('POST', '/api/stream/run', { scene: input('second') })).payload
+    assert.equal((await call('POST', '/api/stream/stop', { id: second.id })).payload.stopped, true)
+    assert.ok(events.some((event) => event.type === 'job-closed' && event.job.id === second.id && event.status === 'stopped'))
+    assert.ok(!events.some((event) => event.type === 'job-started' && event.job.id === second.id), 'a stopped queued job must never start')
+    assert.equal((await call('POST', '/api/stream/stop', { id: first.id })).payload.stopped, true)
+    await waitFor(() => events.some((event) => event.type === 'job-closed' && event.job.id === first.id), 'first job closed')
+    const closed = events.find((event) => event.type === 'job-closed' && event.job.id === first.id)
+    assert.equal(closed.status, 'stopped')
+    const runs = (await call('POST', '/api/stream/runs', { outputRoot })).payload.runs
+    assert.equal(runs.length, 1)
+    assert.equal(JSON.parse(readFileSync(join(runs[0].outputDir, 'run-manifest.json'), 'utf8')).status, 'stopped')
+  } finally {
+    service.shutdown()
+  }
+  // 兜底的结构检查：stop() 里有“激活但无子进程 → 打 stopped 标记”，launch() 开头见 stopped 即收尾，容忍空白与引号差异。
   const source = readFileSync(join(repo, 'server', 'stream', 'index.mjs'), 'utf8')
-  assert.match(source, /active && active\.id === target && !active\.child/)
-  assert.match(source, /if \(job\.stopped\) \{ finish\(job, 'stopped', null\); return \}/)
+  assert.match(source, /function stop\([^)]*\)[\s\S]*?!\s*active\.child[\s\S]*?active\.stopped\s*=\s*true/)
+  assert.match(source, /function launch\([^)]*\)\s*\{\s*if\s*\(\s*job\.stopped\s*\)\s*\{\s*finish\(\s*job\s*,\s*['"]stopped['"]/)
 })
 
 // 测试：fileStamp(file).key 以 '|' 分为 4 段，最后一段为数值（ctimeMs），用于改名/替换后的缓存失效。

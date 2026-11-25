@@ -7,7 +7,7 @@
 //   2. S2：过境年份必须在 1900–2200（与引擎一致）
 //   3. S3：soilBrightness 给出时必须有效，不得静默丢弃；空串视为未提供
 //   4. S4：maxIterations 给出时必须为正整数（1e9 被拒绝，具体上限待核对）
-//   5. S5：以源码文本断言 start() 中 buildEngineConfig 先于 mkdirSync
+//   5. S5：行为测试——不合法的运行请求被拒绝且不留输出目录，合法请求创建输出目录
 //   6. E4：unreachableNonAsciiPackFile 对没有可用 8.3 短名的非 ASCII 数据包文件路径报告
 // 关系：被测模块 server/stream/config.mjs（createProjectStore）与 server/stream/index.mjs
 //   （unreachableNonAsciiPackFile）；不依赖真实引擎。
@@ -19,14 +19,13 @@
 // Run: node --test tools/test-stream-server-review-20261124.mjs
 import assert from 'node:assert/strict'
 import { test, after } from 'node:test'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { unreachableNonAsciiPackFile } from '../server/stream/index.mjs'
 import { createProjectStore } from '../server/stream/config.mjs'
+import { fakeEngine, makeService, waitFor } from './stream-server-test-helpers.mjs'
 
-const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const root = mkdtempSync(join(tmpdir(), 'stream-review-server-'))
 after(() => rmSync(root, { recursive: true, force: true }))
 const identity = (path) => path
@@ -67,14 +66,28 @@ test('S4: maxIterations must be a positive integer when given', () => {
   assert.equal(build(scene({ energy: { maxIterations: '' } })).temperature.energy.maxIterations, undefined)
 })
 
-// 测试 S5：对 index.mjs 源码取 submitRun 之后的 start() 片段，断言 buildEngineConfig 的位置
-//   早于 mkdirSync(job.outputDir)，即校验失败时不会留下空输出目录。（文本断言，较脆弱。）
-test('S5: start() validates the configuration before it creates the output folder', () => {
-  const source = readFileSync(join(repo, 'server', 'stream', 'index.mjs'), 'utf8')
-  const start = source.slice(source.indexOf('start() {', source.indexOf('function submitRun')))
-  const build = start.indexOf('projects.buildEngineConfig(scene, { outputDir: job.outputDir')
-  const mkdir = start.indexOf('mkdirSync(job.outputDir')
-  assert.ok(build > 0 && mkdir > build, 'buildEngineConfig must precede mkdirSync in start()')
+// 测试 S5（行为级）：配置不合法的运行请求被拒绝（400 并带字段名），且不会在输出根目录下留下空的运行文件夹；
+//   合法请求则正常创建带时间戳的输出目录（用假引擎立即退出）。
+test('S5: an invalid run request is rejected without leaving an output folder behind', async () => {
+  const resource = fakeEngine(root, 'quick', 'process.exit(0)')
+  const { service, call, events } = await makeService({ resourceRoot: resource, modelRoot: join(resource, 'models'), documentsRoot: join(root, 'documents') })
+  const outputRoot = join(root, 'quick-out')
+  // 合法的 rt 场景（四个分量温度已给）；非法请求用 eb 场景 + 非法 maxIterations。
+  const rtScene = () => ({ ...scene(), name: 's5ok', outputRoot,
+    temperature: { mode: 'rt', components: Object.fromEntries(['soilSunlit', 'soilShaded', 'leafSunlit', 'leafShaded'].map((key) => [key, { value: 300 }])) } })
+  try {
+    const bad = await call('POST', '/api/stream/run', { scene: { ...scene({ energy: { maxIterations: -3 } }), name: 's5', outputRoot } })
+    assert.equal(bad.status, 400)
+    assert.match(bad.payload.error, /maxIterations/)
+    assert.equal(existsSync(outputRoot), false, 'no output folder may be created for a rejected request')
+    // 合法请求：创建 <name>_<时间戳> 输出目录并运行结束。
+    const good = await call('POST', '/api/stream/run', { scene: rtScene() })
+    assert.equal(good.status, 200, JSON.stringify(good.payload))
+    await waitFor(() => events.some((event) => event.type === 'job-closed' && event.job.id === good.payload.id), 'quick job closed')
+    assert.equal(readdirSync(outputRoot).length, 1)
+  } finally {
+    service.shutdown()
+  }
 })
 
 // 测试 E4：netCDF 经 ANSI 代码页打开文件，引擎只能靠 Windows 8.3 短名读取非 ASCII 路径（见 index.mjs 的 FIX E4）；
