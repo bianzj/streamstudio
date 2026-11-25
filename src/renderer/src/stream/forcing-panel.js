@@ -10,7 +10,7 @@
 //   4. 事件入口（onClick/onChange/onInput/onToggle）与渲染（variableRows/stationSection/editor/render）
 // 数据流：scene.temperature.forcing = { metadata, files } ↔ state.working（完整元数据副本）→
 //       streamApi.checkForcing/saveForcingMetadata/readForcingMetadata（见 stream/api.js）→ server/stream
-// 关系：由 STREAM 工作区（workspace.js，待核对）创建并转发事件；字段含义见 docs/forcing-metadata.md
+// 关系：由 STREAM 工作区（workspace.js）创建并转发事件（input/change 经 forcing.onInput / onChange 进入）；字段含义见 docs/forcing-metadata.md
 // 约定：metadata 为 undefined 表示 ERA5 缺省（旧工程行为不变）；高度单位 m；温度/气压/风速的源单位见各单位表
 // ==========================================================================
 
@@ -224,14 +224,16 @@ export function createForcingPanel({ api, getForm, getProject, getPack, markDirt
   }
   // 作用：把输入控件的值写进 working；data-fm 为点号路径，data-fm-type 为 text/number/list；
   //       空值删除该键；list 以逗号拆分（单个元素时存为字符串）。
-  function setField(target) {
+  // 输入控件当前文本换算成要写入的值（供 setField 与 onField 的“是否有变化”判断共用）。
+  function fieldValue(target) {
     const kind = target.dataset.fmType || 'text'
     const raw = target.value
-    let value
-    if (kind === 'number') { const parsed = Number(raw); value = raw.trim() !== '' && Number.isFinite(parsed) ? parsed : undefined }
-    else if (kind === 'list') { const parts = raw.split(',').map((item) => item.trim()).filter(Boolean); value = parts.length > 1 ? parts : parts[0] }
-    else value = raw === '' ? undefined : raw
-    setAt(state.working, target.dataset.fm, value)
+    if (kind === 'number') { const parsed = Number(raw); return raw.trim() !== '' && Number.isFinite(parsed) ? parsed : undefined }
+    if (kind === 'list') { const parts = raw.split(',').map((item) => item.trim()).filter(Boolean); return parts.length > 1 ? parts : parts[0] }
+    return raw === '' ? undefined : raw
+  }
+  function setField(target) {
+    setAt(state.working, target.dataset.fm, fieldValue(target))
   }
   // 作用：下拉框（类型/种类/单位）改变后做联动修正，使文档保持自洽：
   //   - 湿度类型 → 切换到该类型的合法单位；气压类型 none 时去掉 source；
@@ -275,13 +277,20 @@ export function createForcingPanel({ api, getForm, getProject, getPack, markDirt
     }
   }
   // 作用：面板内带 data-fm 的控件事件入口，返回是否已处理。
-  // 说明：下拉/复选框在 input 事件时忽略，等 change 再处理；文本类控件在 input 时处理，change 时忽略；
+  // 说明：下拉/复选框在 input 事件时忽略，等 change 再处理；文本类控件在 input 时处理；
   //       下拉框改变属于“结构性”修改，会 normalise 并整体重绘。
+  //       浏览器的粘贴、剪切、拖入、撤销/重做、IME 与自动填充都会触发 input 事件，所以文本框在 input 时已同步；
+  //       作为兜底（个别自动填充/脚本只触发 change），文本框 change 时再比较一次：值与模型一致则不做事
+  //       （不重复触发 touch/commit），不一致才补写。
   function onField(event) {
     const target = event.target
     if (target.dataset.fm === undefined || !state.working) return false
     if (event.type === 'input' && (target.tagName === 'SELECT' || target.type === 'checkbox')) return true
-    if (event.type === 'change' && target.tagName !== 'SELECT') return target.tagName === 'INPUT'
+    if (event.type === 'change' && target.tagName !== 'SELECT') {
+      if (target.tagName !== 'INPUT') return false
+      if (JSON.stringify(fieldValue(target)) !== JSON.stringify(getAt(state.working, target.dataset.fm))) { setField(target); touch() }
+      return true
+    }
     setField(target)
     const structural = target.tagName === 'SELECT'
     if (structural) normalise(target.dataset.fm)

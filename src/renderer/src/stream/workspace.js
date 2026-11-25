@@ -350,7 +350,12 @@ const isoHour = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
 //   lastNodeHour=过境前最后一个整点（须早于过境时刻 5 分钟以上）；lastHour=引擎读取的最后一个整点；
 //   firstHour=引擎读取的第一个整点（ERA5-Land 需再早一小时）；marchStart=起算时刻（ms）；
 //   startsLate=数据包不够长而被迫晚起算。
-// 说明：整年数据包且年份与过境年相同（yearEdge）时不按包起点截断（原因待核对）。
+// 说明：起点按数据包覆盖截断，与引擎 image.cpp 步骤 3c 一致：起点之前（ERA5-Land 再早一小时）至 lastHour 必须被数据包
+//   连续覆盖，否则起点逐小时后移；整年数据包（yearEdge：fullYear 且年份等于过境年）也一样，因为引擎的
+//   pack.covers 是严格检查，“年边界外沿用最近一小时”只在后面步骤 3d 载入数据时生效。yearEdge 只影响两件事：
+//   ① 起点后移到过境小时后“无可用时次”不报错（packProblems 跳过）；② 数据包末端早于 lastHour（过境靠近年末）时
+//   引擎的覆盖检查对任何起点都失败，起点退到过境整点。此前这里对 yearEdge 完全不截断，与引擎不一致，
+//   靠近年初/年末的过境会多算出起转时次；已按引擎行为修正（仅影响界面计划与提示）。
 // Plan of the EB march for an overpass and pack: requested / usable nodes, first node, hours the engine reads.
 // `pack` may be missing (only the requested window is described). Hours are integer hours since the epoch.
 function ebPlan(overpass, nodesValue, pack) {
@@ -366,7 +371,11 @@ function ebPlan(overpass, nodesValue, pack) {
   const yearEdge = Boolean(pack?.fullYear) && pack.year === new Date(time).getUTCFullYear()
   const packStart = pack?.period ? Math.floor(Date.parse(pack.period.start) / HOUR_MS) : null
   const packEnd = pack?.period ? Math.floor(Date.parse(pack.period.end) / HOUR_MS) : null
-  if (packStart !== null && !yearEdge) start = Math.min(Math.max(start, packStart + (land ? 1 : 0)), overpassHour)
+  if (packStart !== null) {
+    // 引擎的覆盖检查要求 [起点−lead, lastHour] 全在包内；末端不够时任何起点都不满足，起点退到过境整点。
+    if (yearEdge && packEnd !== null && packEnd < lastHour) start = overpassHour
+    else start = Math.min(Math.max(start, packStart + (land ? 1 : 0)), overpassHour)
+  }
   const usable = requested > 0 ? Math.max(0, lastNodeHour - start + 1) : 0
   const firstHour = start - (land ? 1 : 0)
   return { requested, usable, nodeCount: usable + 1, desiredStart, start, lastHour, firstHour, packStart, packEnd, yearEdge,
@@ -393,7 +402,7 @@ function packProblems(pack, overpass, moistureSource, nodesValue) {
 // Non-blocking: the pack starts later than the requested spin-up (the engine starts at the pack's earliest hour).
 function packWarnings(pack, overpass, nodesValue) {
   const plan = ebPlan(overpass, nodesValue, pack)
-  if (!plan || !plan.startsLate || plan.usable === 0 || plan.yearEdge) return []
+  if (!plan || !plan.startsLate || plan.usable === 0) return []
   return [`数据包不覆盖要求的 ${plan.requested} 个起转时次，实际从 ${isoHour(plan.start * HOUR_MS).slice(0, 16).replace('T', ' ')} UTC 起算，只有 ${plan.usable} 个（土壤热历史偏短，建议补充更早的逐小时数据）`]
 }
 function packPeriodLabel(pack) {
@@ -434,6 +443,17 @@ function utmZone(crs) {
 }
 const isGeographic = (crs) => /EPSG:4326/.test(String(crs || ''))
 const crsLabel = (crs) => String(crs || '').split('|')[0].trim()
+
+// 作用：EPSG:3857（Web Mercator）栅格上“投影米 → 地面米”的缩放系数 cos(纬度)，纬度取影像中心；其他坐标系返回 1。
+// 说明：墨卡托 y（球半径 R = 6378137 m）对应纬度 φ = atan(sinh(y/R))，cos φ = 1/cosh(y/R)；
+//   影像中心 y = originY − |pixelSizeY| × 原栅格高度 / 2（sourceHeight 来自服务端，缺省退回显示高度×step）。
+function mercatorGroundScale(layer) {
+  if (!/EPSG:3857/.test(layer?.crs || '')) return 1
+  const height = Number(layer.sourceHeight) || (Number(layer.height) || 0) * (Number(layer.step) || 1)
+  const centerY = Number(layer.originY) - Math.abs(Number(layer.pixelSizeY) || Number(layer.pixelSizeX) || 0) * height / 2
+  const scale = 1 / Math.cosh(centerY / 6378137)
+  return Number.isFinite(scale) && scale > 0 ? scale : 1
+}
 
 // 作用：由栅格坐标系和坐标 (x, y) 求 [纬度°, 经度°]；EPSG:4326 直接换序，WGS84/UTM 走反算，其他返回 null。
 function geographic(crs, x, y) {
@@ -803,7 +823,8 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
     if (toggle) { toggle.checked = true; toggle.dispatchEvent(new Event('change', { bubbles: true })) }
   }
   // 作用：把表单中的 ISO UTC 过境时刻拆成日期（YYYY-MM-DD）和时间（HH:MM:SS，缺秒补 :00），供日期/时间输入框使用。
-  function overpassParts() {    const text = String(form.overpass || '')
+  function overpassParts() {
+    const text = String(form.overpass || '')
     return { date: text.slice(0, 10), time: text.slice(11, 19).padEnd(8, ':00').slice(0, 8) }
   }
 
@@ -1237,9 +1258,11 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const pack = packs.find((item) => item.path === t.era5.pack)
       if (Number.isNaN(spinupNodes(t.spinupHours))) problems.push('起转节点数须在 0–240 之间（留空使用缺省 7）')
       problems.push(...forcing.problems().map((text) => `气象强迫：${text}`))
-      if (forcing.isStation()) { /* 站点 CSV 来源不需要数据包 */ }
-      else if (!t.era5.pack) problems.push('EB 模式请选择气象数据包')
-      else if (pack) problems.push(...packProblems(pack, form.overpass, t.soilMoisture.source, t.spinupHours).map((text) => `气象强迫：${text}`))
+      // 站点 CSV 来源不需要数据包；其余来源必须选择数据包，选中且索引可读时再校验其时段与变量。
+      if (!forcing.isStation()) {
+        if (!t.era5.pack) problems.push('EB 模式请选择气象数据包')
+        else if (pack) problems.push(...packProblems(pack, form.overpass, t.soilMoisture.source, t.spinupHours).map((text) => `气象强迫：${text}`))
+      }
     }
     return problems
   }
@@ -1820,15 +1843,17 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
 
   // 作用：刷新比例尺和指北针。仅当栅格有像元大小且坐标系为 WGS84/UTM 或 EPSG:3857 时显示比例尺；
   // 比例尺目标长度约 140 屏幕像素，取整齐的长度（见 niceLength）。
-  // 说明：layer.step 为服务端返回数据相对原栅格的抽样步长（待核对）。
+  // 说明：layer.step 为服务端 rasters.mjs 返回的抽样步长：step = ceil(max(宽, 高) / 2048)，显示数据每 step 个原始像元取一个，
+  //   所以屏幕上一个显示像元对应 pixelSizeX × step 米（EPSG:3857 还要乘 cos 纬度）。
   function renderScale() {
     const layer = view.layers[0]
     const scaleElement = $('#swScale')
     const projected = layer && layer.pixelSizeX && (utmZone(layer.crs) || /EPSG:3857/.test(layer.crs || ''))
     $('#swNorth').hidden = !(layer && layer.pixelSizeX)
     if (!projected) { scaleElement.hidden = true; return }
-    // DEFERRED[低] Bug: EPSG:3857 的像元大小是投影米，地面距离要乘 cos(纬度)，中纬度下比例尺会偏大约 30–50%；建议：Web Mercator 按影像中心纬度乘 cos φ 修正，或不为 3857 显示比例尺 —— 需要为 3857 增加反算纬度（新的椭球/半径常量与坐标约定），或按建议直接隐藏比例尺（属视觉变更），两者都超出本轮允许范围
-    const metresPerScreenPixel = layer.pixelSizeX * layer.step / view.scale
+    // EPSG:3857 的像元大小是投影米，地面距离 = 投影米 × cos(纬度)（中纬度下不修正会偏大 30–50%），
+    // 按影像中心纬度修正；UTM 的像元大小已是地面米，系数为 1。
+    const metresPerScreenPixel = layer.pixelSizeX * layer.step * mercatorGroundScale(layer) / view.scale
     const length = niceLength(metresPerScreenPixel * 140)
     scaleElement.hidden = false
     scaleElement.querySelector('i').style.width = `${length / metresPerScreenPixel}px`
@@ -2264,13 +2289,14 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const product = $('#swEra5Product').value
       const data = { files: picked.paths, product, label: $('#swEra5Label').value }
       if (product === 'current') {
-        const document = forcing.currentDocument()
-        if (!document || forcing.isStation()) throw new Error('请先在“气象强迫”面板选择网格类来源并核对元数据')
-        data.metadata = document
+        const metadataDocument = forcing.currentDocument()
+        if (!metadataDocument || forcing.isStation()) throw new Error('请先在“气象强迫”面板选择网格类来源并核对元数据')
+        data.metadata = metadataDocument
         data.projectPath = project?.path || ''
         delete data.product
       }
-      const job = await api.registerEra5(data)
+      // 登记是后台任务，进度与结果经 SSE 事件回到 handleEvent，这里不使用返回值。
+      await api.registerEra5(data)
       $('#swEra5Status').textContent = `开始登记气象强迫数据：${picked.paths.length} 个文件`
       $('#swEra5Status').dataset.level = ''
       addLog(`气象强迫数据登记：${picked.paths.length} 个文件`)
@@ -2354,8 +2380,7 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       const mode = name === 'mode-eb' ? 'eb' : 'rt'
       if (form.temperature.mode !== mode) {
         form.temperature.mode = mode
-        appStorage.setItem(STORAGE_KEY, JSON.stringify(exportScene(form)))
-        markDirty()
+        markDirty() // markDirty 内已把表单写入 appStorage，无需再单独写一次
       }
       if (!rendered) render()
       else renderParams()

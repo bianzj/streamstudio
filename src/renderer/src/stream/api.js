@@ -2,32 +2,16 @@
 // 文件：stream/api.js
 // 功能：STREAM 影像工作区的 HTTP 客户端与服务端事件通道（/api/stream/*）
 // 主要模块：
-//   1. request/post：封装 fetch，统一把网络错误、非 JSON 响应、HTTP 错误转成 Error
+//   1. request/post：来自 ../http.js，统一把网络错误、非 JSON 响应、HTTP 错误转成 Error
 //   2. streamApi：运行/停止、文件选择与检查、栅格读取、工程、ERA5、气象强迫元数据等接口
 //   3. streamApi.onEvent：订阅 /api/stream/events（SSE），返回取消订阅函数
 // 数据流：stream/*.js 界面模块 → streamApi → 本地服务 server/stream/index.mjs
-// 关系：与 web-api.js 中的 request/post 实现重复（该处有 DEFERRED 说明）
+// 关系：request/post 与 web-api.js 共用 ../http.js（此前各有一份重复实现，已合并）
 // ==========================================================================
 
-// HTTP client and event channel of the STREAM image workspace (/api/stream/*).
-// 作用：发起请求并解析 JSON；失败时抛出带中文提示的 Error（服务端 error 字段优先）。
-async function request(path, options) {
-  let response
-  try {
-    response = await fetch(path, options)
-  } catch (error) {
-    throw new Error(`无法连接本地服务：${error?.message || path}`)
-  }
-  const text = await response.text()
-  let result
-  try { result = JSON.parse(text) } catch {
-    throw new Error(`请求失败：${response.status}${response.ok ? '（响应不是 JSON）' : ''}`)
-  }
-  if (!response.ok) throw new Error(result.error || `请求失败：${response.status}`)
-  return result
-}
+import { request, post } from '../http.js'
 
-const post = (path, value = {}) => request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
+// HTTP client and event channel of the STREAM image workspace (/api/stream/*).
 
 // 模块：streamApi 接口表。除 status 与 forcingPresets 为 GET 外，其余均为 POST + JSON。
 export const streamApi = {

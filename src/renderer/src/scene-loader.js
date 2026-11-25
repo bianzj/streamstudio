@@ -25,7 +25,8 @@ const PREVIEW_INSTANCE_LIMIT = 5000
 
 // 作用：解析位置文本，每行 "x y z [scale [rotation]]"（空白或逗号分隔），忽略空行与 #、// 注释行。
 // 输出：{ x, y, z, scale, rotation, sourceIndex }；缺省 scale = 1、rotation = 0，坐标缺省为 0。
-// 说明：sourceIndex 是过滤注释/空行之后的序号；rotation 的单位未在此处声明（待核对）。
+// 说明：sourceIndex 是过滤注释/空行之后的序号；rotation 单位为度（loadXmlScene 用 degToRad 转换后绕 Y 轴取负号旋转，
+//   引擎 scene.cpp 的旋转面积计算也按 rotationDegrees 处理）。
 function positionsFromText(content) {
   return String(content).replace(/^\uFEFF/, '').split(/\r?\n/)
     .map((line) => line.trim())
@@ -96,7 +97,8 @@ function drawNoise(ctx, random, count, colors, radius = 2) {
 
 // 作用：按预设名程序化绘制 512×512 的预览纹理，并包装为可重复平铺的 CanvasTexture。
 // 输入：preset（如 solar-panel、red-brick、gravel、stone-wall、roof-tile、wood、grass、canvas、
-//       camouflage-*、stripes、shade-net、metal；其余按 plaster/混凝土类缺省绘制）。
+//       camouflage-*、stripes、shade-net、metal；plaster 为米白抹灰底色；其余未识别的预设名统一画灰色（#aaa79e）
+//       颗粒底，不另区分具体材质）。
 // 说明：这只是视觉预览，不参与辐射/能量平衡计算；种子由预设名哈希得到，结果可复现。
 function createPreviewTexture(preset) {
   if (previewTextureCache.has(preset)) return previewTextureCache.get(preset)
@@ -758,7 +760,9 @@ function chooseMovementDirection(movement) {
 // 作用：仅对启用了 movement 的 Human/Vehicle/Ship 在预览中挂随机游走状态（userData.randomMovement）。
 // 参数：range 为相对出生点的最大游走半径（场景单位 × sceneScale）；min/max 为世界边界；
 //       heightOffset 记录物体相对地形的初始抬升，地形上起伏时保持不变。
-// 说明：这只是编辑器预览动画；真实的运动轨迹以引擎/工程文件为准（待核对）。
+// 说明：这只是编辑器预览动画；引擎（histream）不读取 movement 字段，计算时物体仍按位置文件中的静态位置处理，
+//   用户手册 8.5 节也说明随机移动不是交通流求解器。movement 的 range 为相对出生点的游走半径（m），
+//   turnInterval 为转向间隔（s）。
 function attachRandomMovement(object, item, placementIndex, config, sceneScale, worldWidth, worldDepth) {
   if ((item.type !== 'Human' && item.type !== 'Vehicle' && item.type !== 'Ship') || !item.movement?.enabled) return
   const movement = {

@@ -3,7 +3,7 @@
 // 功能：主界面（非 STREAM 工作区）访问本地服务 /api/* 的统一客户端 webApi
 // 主要模块：
 //   1. 二进制结果解码 decodeBinaryResult（SSR1 格式，见 server/result-cache.mjs）
-//   2. request/post：fetch 封装与错误转换
+//   2. request/post：对共用 http.js 的薄封装（带二进制结果解码器）
 //   3. chooseFile：浏览器文件选择对话框，读取文本内容
 //   4. webApi：工程/示例/导入/保存/结果读取与对比/运行控制/仿真事件订阅
 // 数据流：界面模块 → webApi → server.mjs 中的 HTTP 接口；仿真进度经 SSE（/api/events）推回
@@ -11,6 +11,7 @@
 // ==========================================================================
 
 import { appStorage } from './storage.js'
+import { request as httpRequest, post as httpPost } from './http.js'
 
 // 结果读取接口的二进制格式（见 server/result-cache.mjs）：
 // 'SSR1' | uint32 头长度 | 头 JSON { value, buffers } | 8 字节对齐的 Float32/Float64 数据块。
@@ -41,24 +42,10 @@ function decodeBinaryResult(buffer) {
 }
 
 // 作用：发起请求；响应为二进制结果类型时走 decodeBinaryResult，否则按 JSON 解析。
-// 失败时抛出带中文提示的 Error（服务端 error 字段优先）。
-async function request(path, options) {
-  const response = await fetch(path, options)
-  if (response.ok && (response.headers.get('Content-Type') || '').startsWith(BINARY_RESULT_TYPE)) {
-    return decodeBinaryResult(await response.arrayBuffer())
-  }
-  const text = await response.text()
-  let result
-  try { result = JSON.parse(text) } catch {
-    throw new Error(`请求失败：${response.status}${response.ok ? '（响应不是 JSON）' : ''}`)
-  }
-  if (!response.ok) throw new Error(result.error || `请求失败：${response.status}`)
-  return result
-}
-
-function post(path, value = {}) {
-  return request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
-}
+// 失败时抛出带中文提示的 Error（服务端 error 字段优先），实现见 http.js。
+const BINARY = { type: BINARY_RESULT_TYPE, decode: decodeBinaryResult }
+const request = (path, options) => httpRequest(path, options, BINARY)
+const post = (path, value = {}) => httpPost(path, value, BINARY)
 
 // 作用：弹出浏览器文件选择框，返回 { path: 文件名, content: 文本 }；取消或读取失败返回 null。
 // 注意：浏览器拿不到真实路径，path 只是文件名。
@@ -84,7 +71,6 @@ function chooseFile(accept) {
 
 // 模块：webApi 接口表。多数为 POST + JSON；readResult 通过 Accept 头请求二进制格式。
 export const webApi = {
-  // DEFERRED[低] 可维护性: request/post 与 stream/api.js 中的实现完全重复，错误处理、超时等改进需要改两处；建议：抽成共享的 http.js —— 抽出共享模块属于跨文件重构/改名，本轮明确禁止，保留待确认
   defaults: () => request('/api/defaults'),
   devices: (executable, refresh = false) => request(`/api/devices?${new URLSearchParams({ executable: executable || '', refresh: refresh ? '1' : '0' })}`),
   openProject: (path, mode) => post('/api/project/open', { path, mode }),
