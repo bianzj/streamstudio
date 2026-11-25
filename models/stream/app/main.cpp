@@ -116,7 +116,10 @@ int forcingCheck(const std::vector<std::string>& args)
         } catch (const std::exception& error) {
             issues.error(error.what());
         }
-    }    if (json) {
+    }
+    // 步骤 3：输出结果。--json 时输出 ok/errors/warnings/notes（元数据无误时附 resolved 摘要）；
+    // 否则逐行输出错误、警告、信息及通过提示。退出码 0 = 通过，3 = 有错误。
+    if (json) {
         CPLJSONObject root;
         root.Add("ok", issues.ok());
         CPLJSONArray errors, warnings, notes;

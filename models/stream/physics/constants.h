@@ -17,7 +17,7 @@
 namespace stream {
 
 // 模块：数学常数与几何缺省。kRad 取 0.01745329（比 π/180 略短），为与原有内核
-//       逐位一致而保留，不要改成精确值（待核对：由原作者保留的舍入）。
+//       逐位一致而保留，不要改成精确值（与 π/180 = 0.0174532925 的相对差约 1.4e-8，对角度换算无实际影响）。
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kRad = 0.01745329;          // degrees to radians, same rounding as the original kernels
 constexpr float kDefaultLeafProjection = 0.5f;

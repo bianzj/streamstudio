@@ -22,6 +22,9 @@ namespace stream {
 //       与 TiRT 取同一数值，保证与 TiRT 对比时逐位一致。
 // Planck radiance [W m-2 sr-1 um-1] for wavelength in um and temperature in K (TiRT c1, c2).
 constexpr double kPlanckC1 = 11910.439340652 * 1.0e4;
+// 量级估算（2026-11-25）：c2 取 14388.2910 与 CODATA 2018 的 14387.7688 相比相对大 3.63e-5。若辐亮度来自 CODATA 的真 Planck 函数而用本常数反演，
+// 亮温偏高 ΔT ≈ T × 3.63e-5（300 K 时约 0.011 K，0.003% 量级）；前向辐亮度相对偏差约 -x·3.63e-5（x = c2/(λT)，10.9 μm/300 K 时 x≈4.4，约 -0.016%）。
+// 本引擎正反演共用同一常数，内部自洽，故不改（改动会让全部亮温产品变化约 0.01 K）。
 // DEFERRED[低] 物理: c2 用的是 14388.29 μm·K（ITS-68 以前的旧值），CODATA 值为 hc/k = 14387.769 μm·K；c1=1.19104e8 W·m⁻²·sr⁻¹·μm⁴ 本身正确。正反演用同一常数时亮温自洽，但与外部辐亮度（传感器 L1、MODTRAN）互转时，10 μm/300 K 约有 0.01 K 的偏差；建议：改用 CODATA 值，或注明是为与 TiRT 逐位一致而保留
 constexpr double kPlanckC2 = 14388.291040407;
 

@@ -246,11 +246,10 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 std::array<double, kComponents> weights{}, fixed{};
                 double reflectivity = 0.0;
                 if (!thermalSceneWeights(scene, leafArea, moisture, weights, fixed, reflectivity)) continue;
-                double fixedSum = 0.0, weightSum = 0.0;
+                double fixedSum = 0.0;
                 for (int k = 0; k < kComponents; ++k) {
                     sample.weights[k] = static_cast<float>(weights[k]);
                     fixedSum += fixed[k];
-                    weightSum += weights[k];
                 }
                 sample.fixedEmissivity = static_cast<float>(std::clamp(fixedSum, 1e-6, 1.0));
                 sample.wavelength = static_cast<float>(item.wavelength);
@@ -261,7 +260,6 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                     // FIX(2026-11-21 S-1): mean directional reflectivity of the composite (= 1 - sum w when flat).
                     sample.reflected = static_cast<float>(std::clamp(reflectivity, 0.0, 1.0) * sample.sky);
                 }
-                (void)weightSum;
                 sample.value = value;
                 ++valid;
             }

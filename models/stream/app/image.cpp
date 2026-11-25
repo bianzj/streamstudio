@@ -556,8 +556,8 @@ int runImage(const std::string& configPath)
             } catch (...) { errorsBsm.capture(); }
         }
         errorsBsm.rethrow("BSM 土壤光谱");
-        // 平地面地类：把常数地面反射率铺成分档光谱（EB 短波用）。注意：此循环遍历的是植被地类 leafTypes，
-        // 非植被的 Flat 地类是否也会进入 flatGroundBins 待核对（后面用 flatGroundBins.at(code) 读取）。
+        // 平地面地类：把常数地面反射率铺成分档光谱（EB 短波用）。此循环遍历的是场景中出现的植被地类 leafTypes；
+        // 只有植被地类会走到 groundBins()（水体在其之前直接取表皮温度，Fill/未定义地类被跳过），所以后面用 flatGroundBins.at(code) 读取不会缺项。
         for (const int code : leafTypes)
             if (classes.classes[code].groundKind == GroundKind::Flat)
                 flatGroundBins[code] = std::vector<float>(solarBins.size(), classes.classes[code].groundReflectance);
@@ -587,7 +587,7 @@ int runImage(const std::string& configPath)
                                            daysFromCivil(overpassTime.year, 1, 1)) + 1;
     // 步骤 6a：地形辐射输入（可选）。Hill/Ridge：读坡度/密度（/走向）栅格并校验，无效像元置 0，坡度须在 0–90°；
     //          Single：常数或栅格的单一坡；Facet：由 DEM 的 3×3 Sobel 算子求逐像元坡度与坡向
-    //          （坡向为下坡方向方位角，自北起顺时针，度；按行向南的栅格约定，待核对）。
+    //          （坡向 = 下坡方向的方位角，自北起顺时针，度，0 = 朝北、90 = 朝东。栅格按
     //          经纬度坐标的 DEM 先按纬度把像元尺寸换算成米；栅格最外一圈无 8 邻域，坡度保持 0。
     // Optional receiving-surface orientation for the shortwave forcing: one plane, a per-pixel DEM
     // slope/aspect field, or a statistical cone + density composite. Elevation correction is independent.
@@ -1553,8 +1553,8 @@ int runImage(const std::string& configPath)
         {
             // temperature.forcing: the metadata that was used and what the standardisation layer did (docs/forcing-metadata.md 9).
             CPLJSONObject forcingInfo;
-            CPLJSONDocument summary;
-            if (summary.LoadMemory(forcingMetadataSummaryJson(pack.metadata()))) forcingInfo = summary.GetRoot();
+            CPLJSONDocument forcingSummary;   // 不与外层的 summary（scene_summary.json 根对象）同名，避免遮蔽
+            if (forcingSummary.LoadMemory(forcingMetadataSummaryJson(pack.metadata()))) forcingInfo = forcingSummary.GetRoot();
             const ForcingReport& report = pack.report();
             const auto list = [](const std::vector<std::string>& values) {
                 CPLJSONArray array;

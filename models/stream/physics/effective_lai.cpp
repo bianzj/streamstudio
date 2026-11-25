@@ -23,7 +23,9 @@
 namespace stream {
 namespace {
 
-// 常数：kPiLegacy 为沿用旧实现的 π 近似值（与 constants.h 的 kPi 略有差别，勿混用）；
+// 常数：kPiLegacy = 3.1415926535 为沿用旧实现的 π 近似值（与 constants.h 的 kPi 相差约 9e-11，相对 3e-11）。
+//       本文件的函数目前没有任何调用者（2026-11-25 复查：全引擎无 effectiveLai / directionalLai / hemisphericalLai 的引用），
+//       所以该差别不影响任何输出；保留旧值是为了与原实现的数值一致，将来若接入请统一改用 kPi 并重新验证；
 //       其余是积分采样数与 Gauss 节点：kGaussMu/Weight 为 4 点 Gauss-Legendre 在 [0,1] 上
 //       的 cosθ 节点与权重，kGaussAzimuth/Weight 为相对行向 0-90° 方位角上的 3 点节点与权重。
 constexpr double kPiLegacy = 3.1415926535;

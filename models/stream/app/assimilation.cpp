@@ -13,7 +13,7 @@
 //      MAP 高斯-牛顿迭代（带回溯，保证代价 J 下降）、质量标志与诊断 → 汇总统计、写出产品
 // 数据流：config.h 的 AssimilationConfig + AssimilationInputs（场景栅格、物理表）+ 背景组分
 //   温度 → runAssimilation → AssimilationResult（分析量、不确定度、QA 波段、通量、统计摘要）。
-// 约定：温度 K；土壤湿度 m3 m-3；Vcmax 为 Vcmax25（μmol m-2 s-1，待核对）；
+// 约定：温度 K；土壤湿度 m3 m-3；Vcmax 为 Vcmax25（μmol m-2 s-1，25 °C 参考温度下的最大羧化速率）；
 //   控制量顺序 Tss/Tsh/Tcs/Tch/土壤湿度/Vcmax/LAI；RT 背景以组分温度为控制量，
 //   EB 背景以土壤湿度和 Vcmax 为控制量，温度由能量平衡经隐函数求导得到；
 //   QA 位常量来自 inversion.h，与 LST/LSCT 反演共享。
@@ -48,7 +48,8 @@ namespace {
 // Vcmax 相对 sd 0.3（下限 10，范围 5–250）；LAI 相对 sd 0.3（下限 0.5，上限 10）。
 // kTemperatureLow/High：控制量温度搜索域；kValid*：分析结果合理范围（K）。
 // kMaxIterations*：RT 20 步、EB 10 步（EB 每步要重解能量平衡，较贵）。
-// kLowSupportDfs：自由度信号（DFS）低于该值视为观测支持不足（待核对）；
+// kLowSupportDfs：DFS = n − tr(P·B⁻¹)（n 为控制量个数，P 为分析协方差，B 为背景协方差，即平均核迹）；DFS < 0.2 表示
+//   观测合计提供的独立信息不足 0.2 个自由度（分析几乎等于背景），像元置 QA 位 8（低支持，缺省拒收，见 README 质量位表）；
 // kMoistureSteps：土壤反射率按湿度的查表步数。
 // ---- built-in defaults (not exposed in the workbench) ----
 constexpr double kTemperatureSd = 5.0;      // K, background error of each component

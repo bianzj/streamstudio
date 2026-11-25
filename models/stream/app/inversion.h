@@ -18,7 +18,7 @@
 //
 //   LST : one radiometric temperature per pixel (every component at T). Weighted Gauss-Newton over all
 //         observations; the emissivity error is propagated into each observation error.
-//   LSCT: Tss/Tsh/Tls/Tlh by MAP Gauss-Newton. The background is the component temperature of the run
+//   LSCT: Tss/Tsh/Tcs/Tch (sunlit soil, shaded soil, sunlit canopy leaf, shaded canopy leaf) by MAP Gauss-Newton. The background is the component temperature of the run
 //         (RT input or EB solution) with error sd and inter-component correlation; optional s x s window of
 //         same-class pixels sharing the four temperatures. Posterior covariance (J^T R^-1 J + B^-1)^-1,
 //         degrees of freedom for signal 4 - tr(A B^-1).

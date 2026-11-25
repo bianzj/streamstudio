@@ -110,7 +110,7 @@ bool thermalSceneAt(const TerrainFields& terrain, size_t pixel, double sza, doub
     // Single slope and the DEM facet field both give one plane per pixel (2026-11-20: single slope used to be
     // imaged with the horizontal geometry although its shortwave forcing was tilted).
     if ((terrain.mode == TerrainRadiation::Facet || terrain.mode == TerrainRadiation::Single) &&
-        terrain.slope && !terrain.slope->empty()) {
+        terrain.slope && !terrain.slope->empty() && terrain.aspect && !terrain.aspect->empty()) {   // 坡度与坡向都要有（缺坡向时按水平面处理，不解引用空指针）
         const double beta = (*terrain.slope)[pixel] * kPi / 180.0;
         const double aspect = (*terrain.aspect)[pixel] * kPi / 180.0;
         const double vzaRad = vza * kPi / 180.0, vaaRad = vaa * kPi / 180.0;

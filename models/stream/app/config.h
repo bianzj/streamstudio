@@ -90,7 +90,7 @@ struct AssimilationConfig {
     double sigmaBrightnessK = 0.5, sigmaLstK = 1.0, sigmaComponentK = 2.0, sigmaReflectance = 0.02;
     double lstWavelengthUm = 10.5;
     // rejectQaBits = 895 = 二进制 1101111111：剔除 QA 第 0–6、8–9 位被置位的观测，第 7 位不剔除；
-    // 各位含义见行尾注释，位定义的来源（待核对）。
+    // 各位定义见 README
     unsigned rejectQaBits = 895;  // invalid/ill-conditioned/low-support/not-converged; bits 0-6,8-9 except bit 7
     std::string observationLevel;  // canopy (brightness), surface (LST/components); no TOA operator
     std::vector<std::string> sourceIds, priorSourceIds;
