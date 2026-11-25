@@ -1,3 +1,19 @@
+// ==========================================================================
+// 文件：export-faceteb-frames.mjs
+// 功能：把已保存的 FacetEB 各节点结果，通过现有的 Stream Studio 影像渲染器导出为 512×512 温度 TIFF。
+// 用法：node tools/export-faceteb-frames.mjs <RUN_DIR> <OUTPUT_DIR>（输出目录必须不存在）。
+// 主要步骤：
+//   1. 读 <RUN_DIR>/output/faceteb_run.json，要求节点非空且全部已收敛，按节点序号排序
+//   2. 在 <OUTPUT_DIR>/tiff 下复制几何 faceteb.json 与组分 components.bin
+//   3. 取运行的 project.json，改成只出影像和温度（关闭各类过程输出），另存 export-project.json
+//   4. 逐节点：复制 energy_T=<token>.bin 并记录其 SHA-256，起一个 server.mjs 的 worker
+//      （kind: facet-step）渲染，校验输出为 1 张 512×512 的 TIFF
+//   5. 每完成一个节点即重写 export-manifest.json（含来源哈希、TIFF 路径、可见像元数、温度单位 K）
+// 约定：只使用复制出的 step 二进制，原始仿真结果不被修改。
+// 与其他文件：依赖 server.mjs 中 worker 的 'facet-step' 任务；STREAM_STUDIO_SERVER_AUTOSTART=0
+//   使其只作为 worker 加载而不启动服务。
+// ==========================================================================
+
 // Export saved FacetEB nodes through the existing Stream Studio image renderer.
 // Only copied step binaries are consumed; original simulation results remain intact.
 import fs from 'node:fs';
@@ -20,6 +36,7 @@ const project = JSON.parse(fs.readFileSync(path.join(run, 'project.json')));
 Object.assign(project.configuration.sensor, { image: true, temperature: true, process: false, radiationProcess: false, energyProcess: false, principalPlane: false, hemisphere: false });
 const inputPath = path.join(out, 'export-project.json');
 fs.writeFileSync(inputPath, JSON.stringify(project, null, 2));
+// 步骤 4-5：逐节点渲染并写清单；任何一步失败即抛错，不会留下“看似完整”的清单（最后检查数量）。
 const products = [];
 for (const step of nodes) {
   const name = 'energy_T=' + step.token + '.bin';

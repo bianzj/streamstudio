@@ -1,4 +1,21 @@
 #!/usr/bin/env python
+# ==========================================================================
+# 文件：test-forcing-metadata.py
+# 功能：STREAM 引擎“元数据驱动气象强迫”机制的端到端测试（规格见 docs/forcing-metadata.md），
+#       全部使用合成数据；缺少 numpy/netCDF4/GDAL 或未构建引擎时输出 SKIP 并以 0 退出
+# 运行：python -I tools/test-forcing-metadata.py [--exe models/bin_x64/Release/stream.exe] [--keep]
+# 主要模块/步骤：
+#   1. 合成数据：空间均匀、带解析日变化的 ERA5 类强迫，写成多种形态
+#      （原始 ERA5、ERA5-Land 累积量、改名/改单位变量、GLDAS 式 3 h 栅格、站点 CSV）
+#   2. make_scene / run_case：12×12 像元的小场景，以 EB 模式运行 stream.exe，读 tir_surface_temperature.tif
+#   3. main 中的检查：预设列表与校验、错误信息、ERA5 预设与缺省逐字节一致（sha256）、
+#      改名/改单位还原、ERA5-Land 去累积、GLDAS 式 3 h、站点 CSV、场景摘要记录的元数据
+#   4. 汇总失败项；退出码 0=全部通过，1=有失败
+# 比较方式：各形态得到的地表温度与基准 ERA5 运行比较平均绝对差（阈值见各检查项）。
+# 约定：温度 K（或 degC 视变量而定）；ERA5 辐射量为累积 J m-2，其他为 W m-2；
+#       时间以“自 1970 起的整小时数”表示（FIRST / HOURS），场景覆盖 2019-08-14 起 48 h。
+# ==========================================================================
+
 """Tests of the weather-forcing metadata mechanism of the STREAM engine (docs/forcing-metadata.md).
 
     python -I tools/test-forcing-metadata.py [--exe models/bin_x64/Release/stream.exe] [--keep]
@@ -47,12 +64,17 @@ def engine(*args, cwd=None):
 
 
 # ---------------------------------------------------------------- synthetic ERA5-like data (uniform in space)
+# 合成数据的时间轴：2019-08-14 00 UTC 起连续 48 个整点（自 1970 起的小时数）；
+# 空间网格 9×9，纬度 41→39°N，经度 115.5→117.5°E，各格点取同一值（空间均匀）。
 FIRST = int(np.datetime64('2019-08-14T00:00:00', 's').astype('int64') // 3600)
 HOURS = list(range(FIRST, FIRST + 48))
 LAT = np.array([41.0 - 0.25 * i for i in range(9)])
 LON = np.array([115.5 + 0.25 * j for j in range(9)])
 
 
+# 作用：给定小时数 h，返回解析的气象场：气温（298 K ± 6 K 日变化）、露点（低 8 K）、气压 101000 Pa、
+# 风 (2, 1.5) m s-1、短波/长波下行、地表温度（气温 + 2 K）、土壤水分 0.25。
+# sun 为简化的日照因子（4.25 h 为峰值，半宽 7.25 h；时刻取小时区间中点，约定待核对）。
 def fields(h):
     hod = h % 24
     t = 298.0 + 6.0 * math.sin(2 * math.pi * (hod - 9.0) / 24.0)
@@ -61,10 +83,13 @@ def fields(h):
     return dict(t2m=t, d2m=t - 8.0, sp=101000.0, u10=2.0, v10=1.5, sw=900.0 * sun, lw=380.0 + 20.0 * sun, skt=t + 2.0, swvl1=0.25)
 
 
+# 饱和水汽压（hPa），输入摄氏度（Magnus 型公式 6.107·10^(7.5c/(237.3+c))）。
 def es(c):
     return 6.107 * 10 ** (7.5 * c / (237.3 + c))
 
 
+# 作用：写一个 netCDF：时间维 + 经纬度维 + 若干 (time, lat, lon) 变量，每个变量把时间序列广播到全部格点。
+# variables 形如 {名: (数值序列, 单位)}。
 def write_nc(path, tname, tunits, times, variables, lat='latitude', lon='longitude'):
     d = nc.Dataset(path, 'w')
     d.createDimension(tname, len(times)); d.createDimension(lat, len(LAT)); d.createDimension(lon, len(LON))
@@ -78,6 +103,8 @@ def write_nc(path, tname, tunits, times, variables, lat='latitude', lon='longitu
     d.close()
 
 
+# 作用：写 ERA5 布局文件。land=False 时辐射为逐时累积量（W m-2 × 3600 → J m-2）；
+# land=True 模拟 ERA5-Land：自 00 UTC 起累积，00 UTC 的记录属于前一天（累计 24 h）。
 def era5_file(path, land=False):
     f = [fields(h) for h in HOURS]
     ssrd, strd = [], []
@@ -95,6 +122,7 @@ def era5_file(path, land=False):
         'skt': ([x['skt'] for x in f], 'K'), 'swvl1': ([x['swvl1'] for x in f], 'm3 m-3')})
 
 
+# 作用：写同样内容但变量名、单位都不同的文件（degC、hPa、km/h、W m-2 ...），用于测试元数据还原。
 def renamed_file(path):
     f = [fields(h) for h in HOURS]
     base = int(np.datetime64('2000-01-01', 's').astype('int64') // 3600)
@@ -105,6 +133,8 @@ def renamed_file(path):
         'Tskin': ([x['skt'] for x in f], 'K'), 'SM': ([x['swvl1'] for x in f], 'm3 m-3')})
 
 
+# 作用：写 GLDAS-Noah 风格的 3 小时数据（瞬时量取整点值，*_tavg 为前 3 小时均值，时间单位为分钟，
+# Qair 由露点与气压换算，土壤水分由体积含水量换算为 kg m-2）。仅为合成，不代表真实 GLDAS 产品。
 def gldas_file(path):
     keys = [h for h in HOURS if h % 3 == 0 and h - 2 >= FIRST]
     base = int(np.datetime64('2000-01-01', 's').astype('int64') // 3600)
@@ -118,6 +148,8 @@ def gldas_file(path):
         lat='lat', lon='lon')
 
 
+# 作用：写单站点 CSV（摄氏度、相对湿度 %、hPa、风速、下行短波/长波）；站点在 (40.0°N, 116.5°E, 50 m)。
+# 参数 rows 未使用（待核对）。
 def station_csv(path, rows=None, header='time,station_id,lat,lon,elev,temp,rh,pressure,wind_speed,swdown,lwdown'):
     lines = [header]
     for h in HOURS:
@@ -129,6 +161,7 @@ def station_csv(path, rows=None, header='time,station_id,lat,lon,elev,temp,rh,pr
 
 
 # ---------------------------------------------------------------- tiny scene
+# 作用：生成 12×12 像元、300 m 分辨率（UTM 50N）的小场景：地类 12、LAI 2、DEM 50 m 三个 GeoTIFF。
 def make_scene(folder):
     folder.mkdir(parents=True, exist_ok=True)
     srs = osr.SpatialReference(); srs.ImportFromEPSG(32650)
@@ -138,6 +171,8 @@ def make_scene(folder):
         d.GetRasterBand(1).WriteArray(np.full((12, 12), value)); d = None
 
 
+# 作用：组装 EB 模式的 stream 配置（TIRT 能量方案等固定选项）并运行，返回 (退出码, 输出文本, 输出目录)。
+# temperature 字典覆盖/追加 temperature 配置（如 era5 数据包、forcing 元数据）。
 def run_case(name, scene, temperature, overpass='2019-08-15T02:55:00Z'):
     out = work / 'runs' / name
     out.mkdir(parents=True, exist_ok=True)
@@ -167,6 +202,7 @@ def digest(out):
     return hashlib.sha256((out / 'tir_surface_temperature.tif').read_bytes()).hexdigest()
 
 
+# 作用：调用引擎命令 era5-register 或 forcing-register 登记数据包，返回索引文件路径；失败则断言。
 def register(index, *files, metadata=None, era5=False):
     args = ['era5-register', index, *files] if era5 else ['forcing-register', index, '--metadata', metadata, *files]
     code, text = engine(*args)
@@ -175,6 +211,8 @@ def register(index, *files, metadata=None, era5=False):
 
 
 # ---------------------------------------------------------------- tests
+# 各检查按顺序运行：预设与校验 → 错误路径 → 1. ERA5 预设 = 缺省 → 2. 改名变量 → 3. ERA5-Land 去累积
+# → 4. GLDAS 式 3 h → 5. 站点 CSV。第 1 项失败则后续不再运行。
 def main():
     # presets and the checker
     code, text = engine('forcing-preset')
@@ -213,6 +251,7 @@ def main():
     era5_file(data / 'era5.nc')
     pack = register(data / 'era5-pack.json', data / 'era5.nc', era5=True)
 
+    # 以下各节中的 d、dl、dgl、ds 为与 ERA5 基准运行的平均绝对温差（K），阈值依次为 0.02、0.2、1.0、1.5 K（见各 check）。
     # 1. ERA5 preset equals the default (byte-for-byte)
     code, text, a = run_case('era5-default', scene, {'era5': {'pack': pack}})
     check('ERA5 default run', code == 0 and (a / 'tir_surface_temperature.tif').exists(), text.strip().splitlines()[-1] if code else '')
@@ -252,6 +291,7 @@ def main():
     code, text, f = run_case('land-generic', scene, {'era5': {'pack': str(data / 'land-pack2.json')}, 'forcing': {'metadata': forced}})
     dg = float(np.nanmean(np.abs(surface(f) - surface(e)))) if code == 0 else 99
     check('generic de-accumulation matches the ERA5-Land path', code == 0 and dg < 0.02, f'mean |dT| = {dg:.4f} K')
+    # standardised 标志：只有布局与原 ERA5 不同（通用去累积、改名变量）时才应使用标准化层，原路径与 ERA5 预设不用。
     flags = [json.loads((x / 'scene_summary.json').read_text(encoding='utf-8'))['temperature']['forcing']['standardised'] for x in (e, f, b, c)]
     check('standardisation layer used only where the layout differs', flags == [False, True, False, True], str(flags))
 
@@ -287,6 +327,7 @@ def main():
     check('forcing-check --json has warnings array', 'warnings' in json.loads(text))
 
 
+# 收尾：运行 main，除非 --keep 否则删除临时目录；以失败数决定退出码。
 try:
     main()
 finally:

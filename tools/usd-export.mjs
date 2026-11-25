@@ -1,3 +1,26 @@
+// ==========================================================================
+// 文件：usd-export.mjs
+// 功能：把 HiStream/StreamStudio 工程导出为 ASCII OpenUSD（.usda）场景，供编辑器预览与外部 DCC 工具查看；
+//   同时在根层 customLayerData 中保存完整工程 JSON 与每个实例的放置记录，以便 usd-import.mjs 回读。
+//   坐标轴与编辑器预览一致：Y 向上，X = 北，Z = 东（单位 m，metersPerUnit = 1）。
+// 主要模块：
+//   1. 文本写出基础：LayerWriter（分块缓冲写文件）、usdString 转义、number/tuple 数值格式化
+//      （6 位小数）、uniqueNames（合法且不重名的 prim 名）、writeArray（大数组分块输出）
+//   2. 输入解析：readPlacements（位置文件：北、东、高、缩放、旋转）、parseObj（按组收集面与顶点色）
+//   3. 原型资产缓存：prototypeAsset 为每个 OBJ 写一份 .usda + .json 元数据，按路径/大小/mtime 缓存
+//   4. 预览外观：previewColor 按光谱名/类型挑一个仅用于显示的 UsdPreviewSurface 漫反射色
+//   5. sunTransform：由太阳天顶角/方位角构造 DistantLight 的朝向矩阵
+//   6. exportProjectUsd：写根层——Prototypes 类（OBJ 引用或基本体）、World/Ground（平面或 DEM 网格）、
+//      Sun、Objects（逐放置实例化）、Looks（材料）；最后清理不再使用的缓存资产
+// 数据流：project（工程 JSON）+ options（输出路径、资产目录、resolveAssetPath、heightAt）
+//   → 原型资产 .usda（assetsDirectory）与根层 .usda（先写 .tmp 再原子改名）→ 返回统计信息。
+// 约定：方位角从北（+X）向东（+Z）顺时针；放置旋转 rotation 以度计，USD 中取负号写入 rotateY；
+//   heightAt(north, east) 返回相对 DEM 最小值的地形高度（场景局部坐标）；
+//   导出格式标识 histream-usd-v1，原型资产布局版本 ASSET_VERSION 变化时缓存重建。
+// 关系：与 usd-import.mjs 成对使用；贴地判断来自 src/renderer/src/project-schema.js
+//   （isGroundedObject、groundedPlacementHeight、stringifyProject）；列顺序与 tools/runtime-scene.mjs 一致。
+// ==========================================================================
+
 // Exports a HiStream project as ASCII OpenUSD in editor-preview axes (Y-up, X = north, Z = east).
 import { createHash } from 'node:crypto'
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
@@ -5,11 +28,15 @@ import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import { groundedPlacementHeight, isGroundedObject, stringifyProject } from '../src/renderer/src/project-schema.js'
 
 export const USD_EXPORT_FORMAT = 'histream-usd-v1'
+// 常量：ARRAY_CHUNK = 每次拼接写出的数组元素个数（避免一次拼出超长字符串）；
+//   ASSET_FILE = 缓存资产文件名模式（名称-12 位十六进制键.usda/.json），清理缓存时只删匹配的文件。
 const ARRAY_CHUNK = 8192
 // Bump when the prototype asset layout changes so cached assets are rebuilt.
 const ASSET_VERSION = 2
 const ASSET_FILE = /^[A-Za-z0-9_]+-[0-9a-f]{12}\.(usda|json)$/
 
+// 模块：LayerWriter —— 带缓冲的文本写出器；累计超过 2^23 个字符就落盘一次，
+//   避免大场景在内存里拼接整份 .usda。close() 会先 flush。
 class LayerWriter {
   constructor(path) {
     this.fd = openSync(path, 'w')
@@ -35,6 +62,7 @@ class LayerWriter {
   }
 }
 
+// 作用：把任意值转成 USD 字符串字面量：转义反斜杠、双引号、换行、制表符，其他控制字符写成 \xNN。
 function usdString(value) {
   let result = '"'
   for (const character of String(value ?? '')) {
@@ -50,6 +78,7 @@ function usdString(value) {
   return result + '"'
 }
 
+// 作用：数值格式化——四舍五入到 1e-6，非有限值与 -0 都写成 0，保证输出稳定且可往返。
 function number(value) {
   const rounded = Math.round(Number(value) * 1e6) / 1e6
   return Number.isFinite(rounded) && !Object.is(rounded, -0) ? String(rounded) : '0'
@@ -59,6 +88,8 @@ function tuple(values) {
   return `(${Array.from(values, number).join(', ')})`
 }
 
+// 作用：返回命名函数 (文本, 备用名) → 合法 USD 标识符：非字母数字下划线替换为 _，
+//   合并连续下划线，首字符不是字母/下划线则前缀 _，重名时追加 _1、_2……（每次调用独立一组）。
 function uniqueNames() {
   const used = new Set()
   return (text, fallback) => {
@@ -72,6 +103,8 @@ function uniqueNames() {
   }
 }
 
+// 模块：位置文件解析。每行至少 3 个数（北、东、高，m），缩放缺省 1，旋转缺省 0（度）；
+//   # 与 // 开头的注释、空行、不足 3 个有限数的行被忽略；分隔符为空白或逗号。
 // Same column order as tools/runtime-scene.mjs: north, east, height, scale, rotation.
 function readPlacements(content) {
   const placements = []
@@ -89,6 +122,9 @@ function readPlacements(content) {
   return placements
 }
 
+// 模块：OBJ 解析。输出 points（x,y,z 平铺）、colors（仅当每个顶点都带 RGB 时保留）、
+//   groups（组名 → 每面顶点数 counts 与 0 起始的顶点索引 indices）与包围盒 bounds。
+//   面索引支持负数（相对当前顶点数）；有效顶点少于 3 的面丢弃；不做三角化（保持 n 边形）。
 // Groups follow parseObjGeometry in tools/runtime-scene.mjs, so mesh names
 // match the `meshes[].name` entries the GUI assigns materials to.
 function parseObj(content) {
@@ -134,6 +170,8 @@ function parseObj(content) {
   return { points, colors: everyVertexColored && colors.length ? colors : null, groups, bounds }
 }
 
+// 作用：把平铺数组写成 USD 数组属性；width 为每元素分量数（1 = 标量，3 = 元组）；
+//   按 ARRAY_CHUNK 分块拼接，suffix 用于追加元数据块（如 primvar 的 interpolation）。
 function writeArray(writer, type, name, values, width, suffix = '') {
   writer.write(`${type} ${name} = [`)
   const count = values.length / width
@@ -148,6 +186,8 @@ function writeArray(writer, type, name, values, width, suffix = '') {
   writer.write(`]${suffix}\n`)
 }
 
+// 作用：把键值对写成 `custom ... histream:<键>` 自定义属性行（布尔 → bool 0/1，数值 → double，
+//   其余 → string）；undefined / null / 空串的项跳过。这些属性供 usd-import.mjs 回读材料名等信息。
 function attributeLines(indent, attributes) {
   return Object.entries(attributes)
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
@@ -159,6 +199,9 @@ function attributeLines(indent, attributes) {
     .join('')
 }
 
+// 作用：为 UsdPreviewSurface 选一个仅用于显示的漫反射色（不是辐射传输用的光谱）。
+//   按光谱名/模型关键词（叶、木、土、水、光伏）→ 对象类型（建筑、车、船、人）→ 首个反射率值
+//   （灰度限幅在 0.2–0.85）的顺序判断；数值是经验配色，不对应测量值。
 function previewColor(spectrum, item) {
   const name = `${spectrum?.name || ''} ${spectrum?.label || ''}`.toLowerCase()
   const model = String(spectrum?.model || '').toLowerCase()
@@ -177,6 +220,8 @@ function previewColor(spectrum, item) {
   return [gray, gray, gray]
 }
 
+// 作用：取某网格组对应的材料名集合：优先用 item.meshes 中同名条目的设置，
+//   只有一个条目时用它，否则回退到对象本身的 spectralName/thermalName/materialName 等。
 function meshMaterial(item, groupName) {
   const mesh = (item.meshes || []).find((entry) => entry.name === groupName)
     || (item.meshes?.length === 1 ? item.meshes[0] : null)
@@ -190,6 +235,10 @@ function meshMaterial(item, groupName) {
   }
 }
 
+// 模块：prototypeAsset(objectPath, assetsDirectory) —— 为 OBJ 生成（或复用）原型资产。
+//   缓存键 = sha1(版本|小写路径|大小|mtime) 的前 12 位十六进制；命中且元数据可读则直接返回。
+//   输出：{ file, metaFile, meta }，meta 含包围盒 bounds 与每个组的 { prim, source, faces }；
+//   OBJ 没有面时返回 null；写入先到 .tmp 再改名，失败时清理临时文件并抛出。
 // One cached .usda per OBJ (keyed by path, size and mtime) so saving only rewrites the root layer.
 function prototypeAsset(objectPath, assetsDirectory) {
   const info = statSync(objectPath)
@@ -210,6 +259,8 @@ function prototypeAsset(objectPath, assetsDirectory) {
   try {
     writer.write(`#usda 1.0\n(\n    defaultPrim = "Prototype"\n    doc = ${usdString(`Stream Studio prototype from ${objectPath}`)}\n    metersPerUnit = 1\n    upAxis = "Y"\n)\n\n`)
     writer.write('def Xform "Prototype"\n{\n')
+    // 步骤：几何整体上移 -minY，使 OBJ 最低顶点落在 y = 0（与编辑器、面元求解器一致）。
+    //   下面逐组写 Mesh：顶点按组重新编号（remap），每个 Mesh 只带自己用到的顶点。
     // The editor and facet solvers rest an OBJ on its lowest vertex.
     writer.write('    def Xform "geometry"\n    {\n')
     writer.write(`        double3 xformOp:translate = ${tuple([0, -obj.bounds.minY, 0])}\n`)
@@ -266,6 +317,9 @@ function prototypeAsset(objectPath, assetsDirectory) {
   return { file, metaFile, meta }
 }
 
+// 模块：sunTransform(zenith, azimuth) —— 返回 DistantLight 的 4x4 变换（USD matrix4d，前三行为 X/Y/Z 轴，第四行为平移 0）。
+//   toSun 为指向太阳的单位向量；光源局部 -Z 为照射方向，故局部 +Z 取 toSun；
+//   太阳接近天顶（|y| > 0.999）时换用 X 轴作参考，避免叉乘退化。
 // Unit vector towards the sun: zenith from +Y, azimuth clockwise from north (+X) towards east (+Z).
 function sunTransform(zenithDegrees, azimuthDegrees) {
   const zenith = Number(zenithDegrees) * Math.PI / 180
@@ -280,8 +334,14 @@ function sunTransform(zenithDegrees, azimuthDegrees) {
   return `( ${tuple([...xAxis, 0])}, ${tuple([...yAxis, 0])}, ${tuple([...toSun, 0])}, (0, 0, 0, 1) )`
 }
 
+// 模块：exportProjectUsd(project, options) —— 写出根层并返回统计。
+//   options：outputPath、assetsDirectory、resolveAssetPath(相对名 → 绝对路径)、heightAt（可选地形函数）、
+//   sourceProjectFile（写入 customLayerData）。返回 { path, prototypes, meshes, faces, instances,
+//   skippedObjects, materials }；找不到 OBJ/位置文件的对象被跳过并记录原因。
 // heightAt(north, east) returns terrain height above the DEM minimum in local scene coordinates.
 export function exportProjectUsd(project, options) {
+  // 步骤 1：读取场景尺寸（x = 南北、y = 东西，m）与偏移（offsetX/Y/Z），建立地形高度函数；
+  //   尺寸下限 1e-3，避免除零；无地形时 heightAt 恒为 0。
   const configuration = project.configuration
   const scene = configuration.scene
   const offsetX = Number(scene.offsetX) || 0
@@ -299,6 +359,8 @@ export function exportProjectUsd(project, options) {
   const temporaryPath = `${options.outputPath}.tmp`
   const writer = new LayerWriter(temporaryPath)
   try {
+    // 步骤 2：根层头——defaultPrim = World、Y 向上、customLayerData 保存导出格式、模式、
+    //   完整工程 JSON 与源工程文件路径（usd-import 据此回读）。
     writer.write(`#usda 1.0
 (
     defaultPrim = "World"
@@ -317,6 +379,8 @@ export function exportProjectUsd(project, options) {
 
 `)
 
+    // 步骤 3：材料登记。materialFor 按光谱名（无则按对象类型）去重，返回 /World/Looks/<名> 路径；
+    //   Looks 的内容在最后统一写出。
     // Looks: one UsdPreviewSurface per HiStream spectral record actually used.
     const looks = []
     const lookName = uniqueNames()
@@ -331,6 +395,10 @@ export function exportProjectUsd(project, options) {
       return materialPaths.get(key)
     }
 
+    // 步骤 4：写 Prototypes（USD class，抽象，不直接显示）。每个工程对象一个原型：
+    //   有 OBJ 的用 references 指向缓存资产并在此处覆写材料绑定（绑定写在这里而不是资产里，
+    //   因为被引用文件之外的目标会丢失）；无 OBJ 的（盒/椭球、介质、程序化水体）用 Cube/Sphere 按 dimensions 缩放。
+    //   介质（Fire/Fog）加 displayOpacity 0.3。
     // Prototypes are abstract (class) so only their instances are imaged.
     writer.write('class "Prototypes"\n{\n')
     const prototypeName = uniqueNames()
@@ -398,6 +466,8 @@ export function exportProjectUsd(project, options) {
 
     writer.write('def Xform "World"\n{\n')
 
+    // 步骤 5：地面。无地形为 1x1 的平面；有地形时按约 1 m 一格（最多 256x256）采样 heightAt，
+    //   四边形顶点顺序为从 +Y 看逆时针，使地面朝上。
     // Ground: flat quad, or a terrain grid sampled from the project DEM.
     const background = scene.background || {}
     const columns = scene.terrain ? Math.min(256, Math.max(1, Math.round(sizeEast))) : 1
@@ -433,6 +503,8 @@ export function exportProjectUsd(project, options) {
     }))
     writer.write('    }\n\n')
 
+    // 步骤 6：太阳 DistantLight（缺省天顶 30°、方位 135°）；天顶/方位原值也写成自定义属性。
+    //   intensity = 3、angle = 0.53° 仅为预览用的经验设置。
     const light = configuration.light || {}
     writer.write('    def DistantLight "Sun"\n    {\n')
     writer.write('        float inputs:angle = 0.53\n        float inputs:intensity = 3\n')
@@ -442,6 +514,11 @@ export function exportProjectUsd(project, options) {
     writer.write('    }\n\n')
 
     writer.write('    def Scope "Objects"\n    {\n')
+    // 步骤 7：Objects —— 每个放置点一个 instanceable 的 Xform 引用原型。无位置文件时放在场景中心。
+    //   贴地对象（目前为车辆）的高度 = offsetY + groundedPlacementHeight（取足迹下最高地形点）；
+    //   其余用位置文件的高度；再统一加上放置点处的地形高度 ground。
+    //   旋转以 -rotation（度）写入 rotateY，即取与 USD 绕 Y 轴正向相反的符号（符号约定待核对）；
+    //   原始 (north, east, height)、旋转、缩放另存为 histream:placement* 属性，未改动的实例可精确回读。
     for (const { item, index, name, path, footprint } of prototypes) {
       let placements = [{ north: offsetX + sizeNorth / 2, east: offsetZ + sizeEast / 2, height: offsetY, scale: 1, rotation: 0 }]
       if (item.positionFile) {
@@ -483,6 +560,8 @@ export function exportProjectUsd(project, options) {
     writer.write('    }\n\n')
 
     writer.write('    def Scope "Looks"\n    {\n')
+    // 步骤 8：Looks —— 每个用到的光谱记录对应一个 Material + UsdPreviewSurface（roughness 0.8），
+    //   漫反射色来自 previewColor；spectralName/label 作为自定义属性保留。
     for (const look of looks) {
       writer.write(`        def Material ${usdString(look.name)}\n        {\n`)
       writer.write(`            token outputs:surface.connect = </World/Looks/${look.name}/PreviewSurface.outputs:surface>\n`)
@@ -501,6 +580,7 @@ export function exportProjectUsd(project, options) {
     try { if (existsSync(temporaryPath)) unlinkSync(temporaryPath) } catch {}
     throw error
   }
+  // 步骤 9：清理缓存目录中符合 ASSET_FILE 命名但本次导出没有用到的旧资产。
   if (existsSync(options.assetsDirectory)) {
     for (const name of readdirSync(options.assetsDirectory)) {
       if (ASSET_FILE.test(name) && !usedAssets.has(name)) {

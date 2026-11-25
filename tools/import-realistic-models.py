@@ -1,3 +1,21 @@
+# ==========================================================================
+# 文件：import-realistic-models.py
+# 功能：下载 CC0 / 开放许可的 glTF 资产（Poly Haven、Khronos glTF-Sample-Assets），转换为带顶点颜色、
+#       面数受控的中等细节 OBJ，写入 assets/obj-library（树木、车辆等“realistic”模型）
+# 依赖：numpy、trimesh（simplify_quadric_decimation 需要相应的可选依赖，待核对）；需要联网
+# 主要模块/步骤：
+#   1. POLYHAVEN / KHRONOS：资产清单（资产 id、输出相对路径、目标三角形数）
+#   2. download：带完整性校验的下载（Content-Length、sha256、.download.json 元数据，原子替换）
+#   3. polyhaven_source / khronos_source：取 glTF 及其依赖文件，并写 SOURCE.txt 记录来源与许可
+#   4. material_color / semantic_color：由材质或名称（叶、树干、轮胎、玻璃、灯……）确定顶点 RGB
+#   5. simplify_mesh / vertex_normals：二次误差抽取简化（失败或仍超标时均匀抽面），自算平滑法线
+#   6. export_colored_obj：按材质合并 → 按面数占比分配预算 → 简化 → 写 OBJ 与同名 .json 元数据
+#   7. main：依次处理两类清单；源文件放在输出旁的 _<模型名>_source 目录
+# 约定：输出 OBJ 为 Y-up，顶点行 “v x y z r g b” 内嵌 0–1 的 RGB，面引用 “v//vn”；
+#       每个分组命名为 part_<n>__<材质名>，供对象属性表按分组绑定光谱。
+# 与其他文件：配套 tools/build-typical-obj-library.mjs；资产来源见 assets/obj-library/SOURCES.md。
+# ==========================================================================
+
 """Download CC0/open glTF assets and build Stream Studio-friendly colored OBJ LODs."""
 
 from __future__ import annotations
@@ -19,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LIBRARY = ROOT / "assets" / "obj-library"
 USER_AGENT = "Stream Studio realistic asset importer"
 
+# 资产清单：(源资产 id, 输出路径（相对 assets/obj-library，无扩展名）, 目标三角形数)。
 POLYHAVEN = [
     ("fir_sapling", "vegetation/realistic/fir_sapling_realistic", 70000),
     ("fir_tree_01", "vegetation/typical/mature_fir_realistic", 70000),
@@ -36,12 +55,14 @@ KHRONOS = [
 ]
 
 
+# 请求 JSON 接口（带自定义 User-Agent），返回解析结果。
 def request_json(url: str):
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request) as response:
         return json.load(response)
 
 
+# 分块计算文件的 sha256。
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -50,6 +71,9 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+# 作用：下载到 target，已有且元数据（url/size/sha256）全部吻合的完整文件会被跳过。
+# 做法：先写临时 .part 文件并校验长度，再原子替换目标与元数据；失败时清理临时文件，
+#       旧文件（无完成证明的遗留文件）保留到完整替换成功为止。
 def download(url: str, target: Path):
     target.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = target.with_name(target.name + ".download.json")
@@ -103,6 +127,7 @@ def download(url: str, target: Path):
                 path.unlink(missing_ok=True)
 
 
+# 作用：从 Poly Haven 取 1k 版 glTF 及其 include 文件，写 SOURCE.txt（CC0 许可），返回 glTF 路径。
 def polyhaven_source(asset_id: str, source_dir: Path) -> Path:
     files = request_json(f"https://api.polyhaven.com/files/{asset_id}")
     descriptor = files["gltf"]["1k"]["gltf"]
@@ -120,6 +145,8 @@ def polyhaven_source(asset_id: str, source_dir: Path) -> Path:
     return gltf_path
 
 
+# 作用：通过 GitHub API 列出 Khronos 样例模型的 glTF 目录并逐个下载，附带 README；
+# 许可以上游仓库为准（SOURCE.txt 只指向 README 与仓库）。找不到 .gltf 时抛错。
 def khronos_source(model: str, source_dir: Path) -> Path:
     api = f"https://api.github.com/repos/KhronosGroup/glTF-Sample-Assets/contents/Models/{model}/glTF"
     items = request_json(api)
@@ -147,11 +174,14 @@ def khronos_source(model: str, source_dir: Path) -> Path:
     return gltf_path
 
 
+# 把名称规范成仅含字母数字及 _ . - 的 OBJ 分组名，空值用 fallback。
 def clean_name(value: str, fallback: str) -> str:
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "").strip("_")
     return name or fallback
 
 
+# 作用：取材质基色（baseColorFactor / main_color），统一到 0–1 的 RGB 并限幅到 [0.02, 1]；
+# 取不到时返回中性灰绿 (0.55, 0.58, 0.52)。
 def material_color(mesh: trimesh.Trimesh) -> np.ndarray:
     visual = getattr(mesh, "visual", None)
     material = getattr(visual, "material", None)
@@ -172,6 +202,8 @@ def material_color(mesh: trimesh.Trimesh) -> np.ndarray:
     return np.array([0.55, 0.58, 0.52])
 
 
+# 作用：按名称关键词（叶、树干、轮胎、玻璃、灯、帆、绳、船体）覆盖为预设颜色，其余沿用材质色。
+# 顺序即优先级，先匹配到的为准。
 def semantic_color(name: str, source: np.ndarray) -> np.ndarray:
     hint = name.lower()
     presets = (
@@ -190,6 +222,8 @@ def semantic_color(name: str, source: np.ndarray) -> np.ndarray:
     return source
 
 
+# 作用：把网格面数降到 target 以内。target < 32 或本来就不超标则原样复制；
+# 先用二次误差抽取（失败时保留原网格），仍超标则等间隔抽取面子集（见下方说明）。
 def simplify_mesh(mesh: trimesh.Trimesh, target: int) -> trimesh.Trimesh:
     if len(mesh.faces) <= target or target < 32:
         return mesh.copy()
@@ -226,6 +260,9 @@ def vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return normals
 
 
+# 作用：读 glTF 场景，输出带顶点颜色的 OBJ（Y-up）与同名 .json 元数据（来源、三角形数、尺寸）。
+# 步骤：1) 展开场景为三角网格；2) 按（材质名, 颜色）合并；3) 按各组面数占比分配 target_faces（每组至少 32）；
+#       4) 简化并计算法线，顶点/法线编号按组累加；5) 写 OBJ，并用原始网格包围盒记录尺寸。
 def export_colored_obj(gltf_path: Path, output_path: Path, target_faces: int, source_url: str):
     scene = trimesh.load(gltf_path, force="scene", process=False)
     meshes = [mesh for mesh in scene.dump() if isinstance(mesh, trimesh.Trimesh) and len(mesh.faces)]
@@ -244,6 +281,7 @@ def export_colored_obj(gltf_path: Path, output_path: Path, target_faces: int, so
         key = (material_name, tuple(np.round(color, 5)))
         grouped_meshes.setdefault(key, []).append(mesh)
     groups = []
+    # 每组：单网格直接复制，多网格拼接成一个网格。
     for group_index, ((material_name, color), members) in enumerate(grouped_meshes.items()):
         mesh = members[0].copy() if len(members) == 1 else trimesh.util.concatenate(members)
         groups.append((mesh, clean_name(material_name, f"material_{group_index + 1}"), np.asarray(color)))
@@ -258,6 +296,7 @@ def export_colored_obj(gltf_path: Path, output_path: Path, target_faces: int, so
     normal_offset = 0
     written_faces = 0
     for index, (mesh, material_name, color) in enumerate(groups):
+        # 各组面数预算按其占源总面数的比例分配（总和可能略超 target_faces，因为有 32 的下限）。
         share = max(32, round(target_faces * len(mesh.faces) / source_faces))
         lod = simplify_mesh(mesh, share)
         mesh_name = f"part_{index + 1}"
@@ -299,6 +338,7 @@ def export_colored_obj(gltf_path: Path, output_path: Path, target_faces: int, so
     print(f"created {output_path}: {written_faces} triangles, dimensions={metadata['dimensions']}")
 
 
+# 主流程：依次处理 Poly Haven 与 Khronos 清单；源资产放在输出文件旁的 _<名>_source 目录。
 def main():
     for asset_id, relative, target_faces in POLYHAVEN:
         output = LIBRARY / f"{relative}.obj"

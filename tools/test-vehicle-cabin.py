@@ -1,3 +1,24 @@
+# ==========================================================================
+# 文件：test-vehicle-cabin.py
+# 功能：FacetEB 车辆座舱热平衡（docs/vehicle-thermal.md 第 3、10 节）的独立单元式检查。
+#   这里用纯 Python（只依赖 math）重写 facetrtcore.cpp 的离散隐式方程，与解析解/能量闭合对照；
+#   脚本顺序执行，失败则退出码 1（用法见原有说明：python -I tools/test-vehicle-cabin.py）。
+# 主要模块：
+#   1. step/run：两节点模型（座舱空气 Ta + 内饰集总质量 Ti）的后向欧拉步，含壁板线性响应
+#      q(Ta) = q0 - K (Ta - Ta0) 与比例控制空调（带宽 band，功率上限 P）；
+#      在不同步长 dt 与换气次数 ACH 下迭代到稳态，与解析稳态比较，并检查每步能量闭合
+#   2. 空调检查：稳态落在比例带内，或过载时受功率上限约束
+#   3. gauss/parts_step：第二版部件模型（空气 + 4 个内饰节点，可选发动机块与发动机舱）
+#      的联立线性系统，部分选主元高斯消元，与 facetrtcore.cpp 的做法一致
+#   4. 检查 1-3：稳态（φ = 0 有闭式解）、瞬态逐步闭合（60/600/3600 s）、
+#      熄火后发动机块/舱余热衰减与 2x2 两指数解析解的对比
+# 约定：温度 K，功率 W，热容 J/K，换热 W/K，Gv = Ca·ACH/3600（通风导热，W/K）；
+#   Qtrans 为透射太阳功率，f 为进入内饰的吸收份额（f_abs），Qocc 为乘员代谢热；
+#   phi 为壁板内侧换热中辐射所占份额，w 为各内饰节点的辐射面积权重。
+# 关系：对应实现为 models/histream 中 FacetEB 的 facetrtcore.cpp 座舱步；数值参数为本测试自设，
+#   与引擎缺省不一定相同（部分与文档的典型值一致，待核对）。
+# ==========================================================================
+
 """Unit-style check of the FacetEB vehicle cabin step (docs/vehicle-thermal.md section 3).
 
 Replicates the discrete implicit air + interior-mass equations of facetrtcore.cpp for a constant forcing and a
@@ -8,6 +29,12 @@ Run: python -I tools/test-vehicle-cabin.py
 """
 import math
 
+# 作用：两节点座舱的一个后向欧拉步，返回 (Ta, Ti, qAc, residual)。
+#   方程：Ca(Ta-Ta0)/dt = Gi(Ti-Ta) + qWall + Qocc + Gv(Tout-Ta) - qAc，
+#         Ci(Ti-Ti0)/dt = f·Qtrans - Gi(Ti-Ta)；qWall = q0 - K(Ta-Ta0)。
+#   先消去 Ti 得到只含 Ta 的线性方程 lhs·Ta = rhs（convEff 为内饰对空气的有效串联导热）；
+#   开空调时按比例控制 qAc = clamp(P(Ta-Tset)/band, 0, P)：带内解 prop，超出带宽则取 P 满功率。
+#   residual 为该步的能量收支残差（输入 = 储热 + 通风 + 空调），应为舍入量级。
 def step(Ta0, Ti0, p, dt):
     storeA, storeI = p['Ca'] / dt, p['Ci'] / dt
     total = storeI + p['Gi']
@@ -28,6 +55,8 @@ def step(Ta0, Ti0, p, dt):
     residual = (p['Ca'] * (Ta - Ta0) + p['Ci'] * (Ti - Ti0)) / dt - (qWall + p['Qocc'] + qSol - p['Gv'] * (Ta - p['Tout']) - qAc)
     return Ta, Ti, qAc, residual
 
+# 作用：从 Ta = Ti = Tout 起算，反复调用 step 直到稳态（steps 步），返回末态与最大单步残差。
+#   壁板取常导热 K 到固定壳体温度 Tw：每步令 q0 = K(Tw - Ta)（Ta 为上一步的座舱温度）。
 def run(p, dt, steps=4000):
     Ta, Ti, worst = p['Tout'], p['Tout'], 0.0
     for _ in range(steps):
@@ -36,6 +65,11 @@ def run(p, dt, steps=4000):
         worst = max(worst, abs(res))
     return Ta, Ti, qAc, worst
 
+# 基准参数：Ca = ρ·cp·V（V = 2.8 m³），Ci = 80 kJ/K，Gi = 8 W m-2 K-1 × 8 m² = 64 W/K，
+#   f_abs = 0.8，Qtrans = 1000 W，乘员 100 W，室外 300 K，壁板 K = 40 W/K、壳体 Tw = 320 K。
+# 检查 1：3 种步长 × 3 种换气次数（ACH 0.5/10/25），稳态与解析值
+#   Ta = (Gv Tout + K Tw + Qocc + f Qtrans)/(Gv + K)、Ti = Ta + f Qtrans/Gi 相对差 < 1e-6，
+#   且每步闭合残差 < 1e-6 W。
 base = dict(Ca=1.2 * 1005 * 2.8, Ci=80000.0, Gi=64.0, f=0.8, Qtrans=1000.0, Qocc=100.0, Tout=300.0, K=40.0, q0=0.0, Tw=320.0)
 failures = 0
 for dt in (600.0, 1800.0, 3600.0):
@@ -47,6 +81,8 @@ for dt in (600.0, 1800.0, 3600.0):
         ok = abs(Ta - Ta_an) < 1e-6 * Ta_an and abs(Ti - Ti_an) < 1e-6 * Ti_an and worst < 1e-6
         failures += not ok
         print('dt %5.0f ACH %5.1f  Ta %.4f (analytic %.4f)  Ti %.4f (%.4f)  max step residual %.2e W  %s' % (dt, Gv_ach, Ta, Ta_an, Ti, Ti_an, worst, 'ok' if ok else 'FAIL'))
+# 检查 2：空调。P = 3500 W 时应落在比例带内；P = 300 W 为过载，应取功率上限；
+#   两种情形都检查稳态能量平衡 balance 与 qAc ≤ P。
 # air conditioning: the cabin must settle inside the proportional band, or at the power limit when overloaded
 for P in (3500.0, 300.0):
     p = dict(base, Gv=base['Ca'] * 10.0 / 3600.0, ac=True, Tset=297.15, band=2.0, P=P)
@@ -56,9 +92,11 @@ for P in (3500.0, 300.0):
     failures += not ok
     print('AC P=%6.0f W: Ta %.3f K (set %.2f) Q_ac %.1f W  steady balance %.2e  %s' % (P, Ta, p['Tset'], qAc, balance, 'ok' if ok else 'FAIL'))
 
+# 模块：第二版部件模型的单元检查（见上方原有说明与 docs/vehicle-thermal.md 第 10 节）。
 # ---------------------------------------------------------------------------------------------------------------
 # Parts model (docs/vehicle-thermal.md sections 3-4): air + interior nodes (+ engine block and bay) as one implicit
 # linear system solved with a small Gaussian elimination, exactly as facetrtcore.cpp does.
+# 作用：解 n 阶线性方程组 a·x = b（部分选主元高斯消元，不改动输入）；n 很小（≤ 8，见文档）。
 def gauss(a, b):
     n = len(b)
     a = [row[:] for row in a]; b = b[:]
@@ -74,7 +112,16 @@ def gauss(a, b):
         x[i] = (b[i] - sum(a[i][c] * x[c] for c in range(i + 1, n))) / a[i][i]
     return x
 
+# NODES：4 个内饰节点（仪表台、座椅、方向盘、车顶内衬/门板）的参数——
+#   share = 透射太阳吸收份额 s_k（和为 1）；cap = 热容 C_k（J/K）；hcA = 有效 hA_k（W/K）；
+#   rad = 辐射面积 radA（m²，用于壁板辐射平均温度的权重 w_k = radA_k/ΣradA）。
+#   数值为文档 10.3 的典型值（待核对）。
 NODES = dict(share=[0.30, 0.35, 0.05, 0.30], cap=[10000.0, 40000.0, 2000.0, 60000.0], hcA=[8.0, 24.0, 2.0, 40.0], rad=[1.0, 3.0, 0.25, 8.0])
+# 作用：部件模型的一个后向欧拉步。未知量排列：x[0] = 座舱空气 Ta，x[1..m] = 内饰节点 Tk，
+#   有 engine 时再追加 x[1+m] = 发动机块 Te、x[2+m] = 发动机舱空气 Tb。
+#   q 为外部条件字典：Ca、Gv、Qocc、Qsol（透射吸收后的太阳功率）、Tout、壁板 K、phi，
+#   以及壁板初始热流 q0 或常导热 G 与壳体温度 Tw；engine 含 Ce、Cb、Geb、Gg、Gfw、Qblk、Qrad、Te0、Tb0。
+#   返回字典：新温度、各方程残差之和 res（应接近 0）、壁板热流 qw，以及发动机分支的独立闭合 eres。
 def parts_step(Ta0, Tk0, dt, q, engine=None):
     """One backward Euler step; wall response q(Tb) = q0 - K (Tb - Tb0) with Tb = (1-phi) Ta + phi sum(w Tk)."""
     m = len(Tk0); n = 1 + m + (2 if engine else 0)
@@ -114,6 +161,7 @@ def parts_step(Ta0, Tk0, dt, q, engine=None):
         out['eres'] = (engine['Ce'] * (x[1 + m] - engine['Te0']) + engine['Cb'] * (x[2 + m] - engine['Tb0'])) / dt - (engine['Qblk'] + engine['Qrad'] - engine['Gg'] * (x[2 + m] - q['Tout']) - fw)
     return out
 
+# qbase：部件模型检查的基准条件（ACH = 0.5，Qsol = 640 W，K = 60 W/K，Tw = 310 K，phi = 0.45）。
 qbase = dict(Ca=1.2 * 1005 * 2.8, Gv=1.2 * 1005 * 2.8 * 0.5 / 3600, Qocc=0.0, Qsol=640.0, Tout=300.0, K=60.0, Tw=310.0, phi=0.45)
 # 1) steady state: with the wall at a fixed temperature the converged step must satisfy the steady equations of an
 #    independent fixed-point (Jacobi) solution; phi = 0 has the closed form Ta = (Gv Tout + K Tw + Qocc + Qsol)/(Gv + K), Tk = Ta + s_k Qsol / hA_k.
@@ -142,6 +190,8 @@ for dt in (60.0, 600.0, 3600.0):
         s = parts_step(Ta, Tk, dt, dict(qbase, G=qbase['K'])); worst = max(worst, abs(s['res'])); Ta, Tk = s['Ta'], s['Tk']
 ok = worst < 1e-8; failures += not ok
 print('parts transient closure: max |residual| %.2e W (relative %.1e of 640 W)  %s' % (worst, worst / 640.0, 'ok' if ok else 'FAIL'))
+# 检查 3 的准备：线性系统 x' = A x（x 为发动机块与舱内空气相对室外的温差）的 2x2 矩阵特征分解，
+#   给出两个负特征值 l1（慢）、l2（快）与解析解 analytic(t)。此处防火墙传热 Gfw = 0。
 # 3) engine cool-down after parking: block (Ce, Geb) and bay (Cb, Gg + firewall) against the analytic two-exponential decay
 eng = dict(Ce=70000.0, Cb=15000.0, Geb=40.0, Gg=1.2 * 1005 * 0.04, Gfw=0.0, Qblk=0.0, Qrad=0.0)
 a11, a12, a21, a22 = -eng['Geb'] / eng['Ce'], eng['Geb'] / eng['Ce'], eng['Geb'] / eng['Cb'], -(eng['Geb'] + eng['Gg']) / eng['Cb']
@@ -158,6 +208,8 @@ def analytic(t):
     c1 = (T0e * v2[1] - v2[0] * T0b) / det_v; c2 = (v1[0] * T0b - T0e * v1[1]) / det_v
     return c1 * v1[0] * math.exp(l1 * t) + c2 * v2[0] * math.exp(l2 * t), c1 * v1[1] * math.exp(l1 * t) + c2 * v2[1] * math.exp(l2 * t)
 tau_min = -1.0 / l1 / 60.0
+# 对 dt = 10 s、60 s 各积分 2 h：温度整体加 300 K 偏移后调用 parts_step（太阳与壁板关闭，室外 300 K 仅作参考温度），
+#   相对初始温差的误差应小于 tol（后向欧拉的一阶误差，故步长越大容差越宽），且发动机闭合 < 1e-8 W。
 for dt, tol in ((10.0, 2e-3), (60.0, 1.2e-2)):
     Te, Tbay, worst_res, t = T0e, T0b, 0.0, 0.0
     while t < 7200.0 - 1e-9:

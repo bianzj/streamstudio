@@ -1,3 +1,14 @@
+// ==========================================================================
+// 文件：generate-tarp-cover.mjs
+// 功能：命令行包装：读取目标物体的 OBJ，生成一块覆盖在其上的篷布/伪装网 OBJ（Y 向上，单位 m）。
+// 用法：见下方原有的用法注释。可选参数均为数值：
+//   --cell 网格间距（缺省按目标最大水平尺寸/80 自动取 0.05~0.5 m）、--lift 离目标表面的抬升
+//   （缺省 0.05 m）、--drape 裙边每水平 1 m 下垂高度（缺省 6）、--margin 足迹外水平余量（缺省 0.15 m）。
+// 数据流：<target.obj> → generateTarpCover(文本, options) → <output.obj>，并打印目标/覆盖层尺寸、
+//   顶点数、三角形数与网格间距。
+// 与其他文件：核心算法在 tools/tarp-cover.mjs（也被 server.mjs 的篷布覆盖接口调用）。
+// ==========================================================================
+
 // node tools/generate-tarp-cover.mjs <target.obj> <output.obj> [--cell m] [--lift m] [--drape slope] [--margin m]
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'

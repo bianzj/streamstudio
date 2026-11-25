@@ -1,3 +1,26 @@
+# ==========================================================================
+# 文件：compact_promotion005.py
+# 功能：案例005（光伏草场热环境）的推广材料紧凑版：3 张推广图（PDF 与 PNG）、小红书文案、
+#       知乎文章和案例 README，并把它们发布到 docs/cases/005-photovoltaic 与本地案例目录。
+#       只使用已有的原生输出（tables/*.csv、sensor/ 下的 TIFF、figures/ 下的软件截图），不重跑模型。
+# 主要模块/步骤：
+#   1. plots()：读 tables/ 下的 CSV 画空间分布图 maps.png、日变化 diurnal.png、方向性 angular.png，
+#      并把 12:00 的三个视角 TIFF 转成伪彩色 view-*.png；
+#   2. cards()：用 reportlab 画 1080 x 1440 的 3 页 PDF（report.pdf），每页一张推广图；
+#   3. copywriting()：生成 小红书文案.md、知乎文章.md、README.md（正文数值为手写文字）；
+#   4. publish()：备份旧件、复制 PDF/PNG/文案到 docs/cases/005-photovoltaic 与本地案例目录，
+#      生成 index.html，更新 catalog.json、docs/cases/README.md、promotion-manifest.json 与 manifest.json；
+#   5. main()：归档旧的第 4 张图，依次运行 1-4，中间用 pdftoppm 把 PDF 转成 page-N.png。
+# 数据流：ROOT（D:/cases/StreamStudio/case005，见 pv_case005.py）/tables、sensor → OUT=ROOT/publication/promotion
+#         → 发布目标 DEST=docs/cases/005-photovoltaic。
+# 与其他文件的关系：从 pv_case005.py 引入 ROOT、sha、dump；从 case005_resources.py 引入参考文献
+#         REFERENCES 与下载链接 LINKS；从 pv_media005.py 引入 readtif。
+# 约定：PDF 页面坐标 y 自页面顶部向下计（绘制时用 1440 - y 换算）；温度单位 °C，
+#       空间图为 0.25 m 网格（72 x 72，覆盖 18 m x 18 m）；亮温波长 10.5 μm。
+# 注意：文案中的 −2.32 K、46.2 °C、5.65 K 等数值为手写常量（待核对是否与 tables/ 当前结果一致）；
+#       模块文档字符串仍写“四张卡片”，实际 CARD_COUNT=3。
+# ==========================================================================
+
 """Four coordinated social/editorial cards; only uses existing native outputs."""
 import csv,hashlib,html,json,pathlib,re,shutil,subprocess
 import numpy as np
@@ -16,12 +39,20 @@ from reportlab.lib.colors import HexColor
 from reportlab.lib.utils import ImageReader
 from pv_case005 import ROOT,sha,dump
 from case005_resources import REFERENCES,LINKS
+# 常量：REPO 为仓库根，DEST 为发布目录；OUT 为推广材料输出目录；INK/MUTED/BLUE/GREEN 为配色。
+# CARD_COUNT 为推广图张数（页脚、发布循环、清单都以它为准）。
 REPO=pathlib.Path('C:/work/streamstudio');DEST=REPO/'docs/cases/005-photovoltaic'
 OUT=ROOT/'publication/promotion';INK='#19364b';MUTED='#637887';BLUE='#245e8a';GREEN='#267861'
 CARD_COUNT=3
+# 作用：读取 ROOT/tables/ 下的 CSV（utf-8-sig），返回按列名取值的字典列表。
 def csvread(name):return list(csv.DictReader((ROOT/'tables'/name).open(encoding='utf-8-sig')))
+# 模块：用原生结果表生成 3 张统计图和 3 张视角缩略图，写入 OUT/assets/。
+# 输入：tables/spatial_noon_025m.csv、temperature_diurnal.csv、thermal_directionality.csv，
+#       sensor/pv_grass/angular 下 12:00 的 TIFF；输出：maps.png、diurnal.png、angular.png、view-*.png。
 def plots():
     font_manager.fontManager.addfont('C:/Windows/Fonts/msyh.ttc');plt.rcParams.update({'font.family':'Microsoft YaHei','font.size':16,'axes.unicode_minus':False,'axes.spines.top':False,'axes.spines.right':False,'figure.facecolor':'white','axes.facecolor':'white'})
+    # 步骤 1：12:00 的 0.25 m 草叶温度（无光伏 open_C / 有光伏 pv_C）重排成 72 x 72 并排绘制，
+    # 色标固定 26–42 °C；虚线框为光伏板垂直投影（4 行，南北向宽度取 sqrt(3) m）。
     rows=csvread('spatial_noon_025m.csv');g=np.array([float(r['open_C']) for r in rows]).reshape(72,72);p=np.array([float(r['pv_C']) for r in rows]).reshape(72,72)
     cm=LinearSegmentedColormap.from_list('temps',['#d9e9f1','#afcbd8','#f2eddc','#dfb873','#bb6351'])
     fig,axs=plt.subplots(1,2,figsize=(9.5,4.5),layout='constrained')
@@ -30,20 +61,28 @@ def plots():
         if i:
             for y in [3,7,11,15]:a.add_patch(Rectangle((3,y),12,np.sqrt(3),fill=False,edgecolor='#526a78',lw=.8,ls='--'))
     fig.colorbar(im,ax=axs,orientation='horizontal',fraction=.09,pad=.03,label='12:00 草叶物理温度 / °C',ticks=[26,30,34,38,42]);fig.savefig(OUT/'assets/maps.png',dpi=120);plt.close(fig)
+    # 步骤 2：板温与两种草叶温度的日变化曲线（横轴为第二天，前 24 个节点为预热）。
     rows=csvread('temperature_diurnal.csv');fig,ax=plt.subplots(figsize=(9.5,3.6),layout='constrained')
     for key,label,color in [('panel_C','光伏板',BLUE),('grass_open_C','无光伏草叶','#b9853e'),('grass_pv_C','有光伏草叶',GREEN)]:ax.plot([float(r['hour']) for r in rows],[float(r[key]) for r in rows],color=color,lw=2.8,label=label)
     ax.set(xlabel='第二天当地时间 / h',ylabel='物理温度 / °C',xticks=[0,6,12,18,24]);ax.legend(loc='upper left',fontsize=13,ncol=1,frameon=False);ax.grid(alpha=.12);fig.savefig(OUT/'assets/diurnal.png',dpi=120);plt.close(fig)
+    # 步骤 3：12 点主平面（vaa=0/180）的 10.5 μm 亮温随观测天顶角变化；
+    # vaa=180（南向）取正、vaa=0（北向）取负，便于画成一条连续曲线。
     rows=csvread('thermal_directionality.csv');fig,ax=plt.subplots(figsize=(9.5,3.9),layout='constrained')
     for scenario,label,color in [('grass','无光伏草场',GREEN),('pv_grass','光伏草场',BLUE)]:
         pts=sorted([(float(r['vza_deg'])*(1 if float(r['vaa_deg'])==180 else -1),float(r['brightness_C'])) for r in rows if r['scenario']==scenario and int(r['hour'])==12 and float(r['vaa_deg']) in [0,180]])
         ax.plot(*zip(*pts),label=label,color=color,lw=2.8)
     ax.set(xlabel='观测天顶角 / °（负：北向，正：南向）',ylabel='10.5 μm 亮温 / °C',xticks=[-75,-50,-25,0,25,50,75]);ax.legend(fontsize=13,frameon=False);ax.grid(alpha=.12);fig.savefig(OUT/'assets/angular.png',dpi=120);plt.close(fig)
+    # 步骤 4：把 12:00 三个视角（北向 60°、天底、南向 60°）的亮温 TIFF 转伪彩色缩略图。
+    # 色标 inferno 固定 22–48 °C，NaN 按 22 °C 处理，使三张图可直接比较。
     from pv_media005 import readtif
     from matplotlib import colormaps
     from PIL import Image
     for z,az in [(60,0),(0,0),(60,180)]:
         pattern=f'T=DOY180_12-00_VZA={z:.2f}_VAA={az:.2f}*.tif' if z else 'T=DOY180_12-00_VZA=0.00_*.tif'
         path=next((ROOT/'sensor/pv_grass/angular').glob(pattern));a=readtif(path);rgb=(colormaps['inferno'](np.clip((np.nan_to_num(a,nan=22)-22)/26,0,1))[:,:,:3]*255).astype('uint8');Image.fromarray(rgb).save(OUT/f'assets/view-{z}-{az}.png')
+# 模块：用 reportlab 画 3 页 1080 x 1440 的 PDF（report.pdf）。页面 y 自顶向下，绘制时用 1440 - y。
+# 第 1 页封面（软件截图），第 2 页空间与日变化，第 3 页方向性与参考文献。
+# 内部助手 text/para/box/image/scene 为绘制原语；top/foot 为页眉页脚，foot 同时翻页。
 def cards():
     pdfmetrics.registerFont(TTFont('YaHei','C:/Windows/Fonts/msyh.ttc'));pdfmetrics.registerFont(TTFont('YaHeiBold','C:/Windows/Fonts/msyhbd.ttc'))
     c=canvas.Canvas(str(OUT/'report.pdf'),pagesize=(1080,1440));c.setTitle('STREAMSTUDIO | 光伏草场热环境 · 案例005');c.setAuthor('StreamStudio')
@@ -53,11 +92,13 @@ def cards():
     def box(x,y,w,h,col):c.setFillColor(HexColor(col));c.rect(x,1440-y-h,w,h,fill=1,stroke=0)
     def image(p,x,y,w,h):
         im=ImageReader(str(p));iw,ih=im.getSize();sc=min(w/iw,h/ih);c.drawImage(im,x+(w-iw*sc)/2,1440-y-h+(h-ih*sc)/2,width=iw*sc,height=ih*sc,mask='auto')
+    # 绘制软件界面截图：按 1240 x 695 的视口比例缩放并裁切（偏移量 300、840 为经验值，待核对）。
     def scene(y,h):
         x=65;w=950;box(x,y,w,h,'#f1f5f9');im=ImageReader(str(ROOT/'figures/06_StreamStudio场景.png'));iw,ih=im.getSize();sc=min(w/1240,h/695);vx=x+(w-1240*sc)/2
         viewport_y=1440-y-h+(h-695*sc)/2
         c.saveState();p=c.beginPath();p.rect(vx,viewport_y,1240*sc,695*sc);c.clipPath(p,stroke=0);c.drawImage(im,vx-300*sc,viewport_y-(ih-840)*sc,width=iw*sc,height=ih*sc);c.restoreState()
     def top(n,tag):text('StreamStudio',65,48,25,INK,True);text('案例005 · '+tag,680,52,18,MUTED);box(65,96,950,1,'#dce5ea')
+    # 页脚：分隔线与免责声明；仅最后一页写代码与网盘链接并加超链接，然后结束当前页。
     def foot(n):
         box(65,1325,950,1,'#dce5ea')
         if n==CARD_COUNT:
@@ -66,6 +107,7 @@ def cards():
             c.linkURL(LINKS[0]['url'],(65,1440-1362,1015,1440-1340));c.linkURL(LINKS[3]['url'],(65,1440-1388,1015,1440-1366))
         text('理想化数值案例 · 未完成独立实测验证',65,1400,14,MUTED);text(f'{n}/{CARD_COUNT}',970,1400,14,MUTED)
         c.showPage()
+    # 步骤 1：第 1 页——封面：标题、软件界面截图、三个要点与场景说明。
     top(1,'光伏与草场热环境')
     image(REPO/'design/branding/stream-studio-logo-concept.png',65,145,105,105)
     text('STREAMSTUDIO',192,158,75,INK,True);text('光伏 × 草场',65,273,78,GREEN,True)
@@ -77,6 +119,7 @@ def cards():
         x=65+i*325;box(x,1130,285,2,'#dce5ea');text(label,x,1151,28,INK,True)
     para('基于三维辐射传输与能量平衡，展示光伏阵列与草场的热环境。<br/>18 × 18 m草场 · 南向30°阵列 · 原生数值案例 [1,2]',65,1230,950,23)
     foot(1)
+    # 步骤 2：第 2 页——有/无光伏的空间图与日变化曲线（图为 plots() 的产物）。
     top(2,'草场对照与日变化');text('同一片草场，',65,145,62,INK,True);text('板下与行间怎样变化？',65,227,62,INK,True)
     image(OUT/'assets/maps.png',55,333,970,435)
     text('午间草叶均温变化 −2.32 K',65,785,35,GREEN,True)
@@ -84,6 +127,7 @@ def cards():
     image(OUT/'assets/diurnal.png',55,945,970,285)
     para('上图是0.25 m午间空间诊断；全天曲线沿用1 m草叶网格。<br/>前24个节点预热。草叶温差不能直接解释为气温变化。[1,2,5]',65,1245,950,20)
     foot(2)
+    # 步骤 3：第 3 页——方向亮温曲线、三个视角缩略图和参考文献。
     top(3,'热辐射方向性');text('换一个角度看，',65,135,59,INK,True);text('热红外亮温也会变',65,215,59,INK,True)
     para('同一温度场 · 12:00 · 10.5 μm<br/>板面、草叶与土壤的可见比例随方向改变。[4]',65,315,950,24)
     image(OUT/'assets/angular.png',55,402,970,300)
@@ -93,12 +137,15 @@ def cards():
     para('同一22–48°C色标；曲线示南北平面。亮温不同于物理温度；<br/>板发射率固定取0.90，未验证角度依赖发射率。',65,1033,950,18)
     text('参考文献（完整条目见配套文案）',65,1102,21,INK,True)
     short=['Armstrong et al. (2016), ERL 11:074016','Barron-Gafford et al. (2019), Nature Sustainability 2:848–855','Faiman (2008), Progress in Photovoltaics 16:307–315','Cao et al. (2019), Remote Sensing of Environment 232:111304','Barron-Gafford et al. (2016), Scientific Reports 6:35070']
+    # 逐条排版参考文献，累计高度 y 必须小于页脚线（1315），否则断言失败。
     y=1144
     for r,title in zip(REFERENCES,short):
         citation=f'[{r["id"]}] {title}. <link href="https://doi.org/{r["doi"]}" color="#245e8a">doi:{r["doi"]}</link>'
         y+=para(citation,65,y,950,14,INK)+6
     assert y<1315,('References exceed footer',y)
     foot(3);c.save()
+# 模块：生成小红书文案、知乎文章和案例 README 三个 Markdown 文件，写入 OUT。
+# 正文中的数值为手写常量，不从表格读取；参考文献由 REFERENCES 拼接。
 def copywriting():
     refs='\n\n'.join(f'[{r["id"]}] {r["authors"]} ({r["year"]}). {r["title"]}. {r["journal"]}. https://doi.org/{r["doi"]}' for r in REFERENCES)
     footer=''  # Resource entry appears once, below the third card.
@@ -173,6 +220,11 @@ StreamStudio把光伏阵列、草地、太阳和观测方向放在同一场景�
 
 '''
     (OUT/'README.md').write_text(readme.rstrip()+'\n',encoding='utf8')
+# 模块：把推广材料发布到仓库与本地案例目录，并更新各类清单。
+# 步骤：1 备份旧 PDF/index.html；2 复制 PDF、页面 PNG、文案；3 生成 index.html（仓库版与本地版）；
+#       4 更新 catalog.json 与 docs/cases/README.md 的案例 005 条目；
+#       5 写 promotion-manifest.json（含文件大小与 sha256）；6 刷新 docs/cases/manifest.json。
+# 副作用：覆盖 DEST 与 ROOT 下的发布文件，并改写 docs/cases 下的清单。
 def publish():
     backup=ROOT/'qa/promotion-before-compact';backup.mkdir(exist_ok=True)
     for p in [ROOT/'案例005_光伏草场热环境.pdf',ROOT/'index.html']:
@@ -191,18 +243,24 @@ def publish():
     (ROOT/'index.html').write_text(local,encoding='utf8')
     for name in ['小红书文案.md','知乎文章.md']:shutil.copy2(OUT/name,ROOT/name)
     (DEST/'.gitattributes').write_bytes(b'*.pdf binary\n')
+    # 更新案例目录：catalog.json 写入图数与平台；README 表格中的旧描述改为“3张融合推广图”。
     for path in [REPO/'docs/cases/catalog.json',REPO/'docs/cases/README.md']:
         if path.suffix=='.json':
             cat=json.loads(path.read_text(encoding='utf8'));case=next(c for c in cat['cases'] if c['id']=='005');case.update(figures=CARD_COUNT,report_pages=CARD_COUNT,promotion_platforms=['xiaohongshu','zhihu','github']);dump(path,cat)
         else:
             text=path.read_text(encoding='utf8').replace('| 005 | [光伏草场热环境](005-photovoltaic/README.md) | 7图 + 动态图 |','| 005 | [光伏草场热环境](005-photovoltaic/README.md) | 3张融合推广图 |').replace('| 4张融合推广图 |','| 3张融合推广图 |');path.write_text(text,encoding='utf8')
+    # 写本次发布的清单（不含清单自身）：基础工程 98 节点、空间补算 74 节点均已收敛（手写常量）。
     files=[p for p in DEST.rglob('*') if p.is_file() and p.name!='promotion-manifest.json']
     dump(DEST/'promotion-manifest.json',dict(date='2026-11-07',scope='promotional_materials_only',model_rerun_during_publication=False,report_pages=CARD_COUNT,promotion_cards=CARD_COUNT,base_native_converged_nodes=98,spatial_refinement_converged_nodes=74,references=5,published_files=[dict(path=p.relative_to(DEST).as_posix(),bytes=p.stat().st_size,sha256=sha(p)) for p in files]))
+    # 刷新仓库级文件清单：去掉已移除的第 4 张图，并重新登记 DEST 下所有文件的大小与 sha256。
     manifest=REPO/'docs/cases/manifest.json';m=json.loads(manifest.read_text(encoding='utf8'));m['files'].pop('README.md',None)
     m['files'].pop('docs/cases/005-photovoltaic/promotion/page-4.png',None)
     for p in [REPO/'docs/cases/README.md',REPO/'docs/cases/catalog.json',*[p for p in DEST.rglob('*') if p.is_file()]]:m['files'][p.relative_to(REPO).as_posix()]=dict(bytes=p.stat().st_size,sha256=sha(p))
     dump(manifest,m)
     print('Prepared three-page promotion for Xiaohongshu, Zhihu and GitHub',flush=True)
+# 入口：归档上一版（四张图）推广材料后，重新生成 3 张图、PDF、文案并发布。
+# 步骤：1 保存旧 report.pdf 与 page-4.png 到 qa/previous-four-card-promotion 并删除原件；
+#       2 plots → cards → copywriting；3 调用 pdftoppm（需在 PATH 中）把 PDF 渲染为 page-N.png；4 publish。
 def main():
     previous=ROOT/'qa/previous-four-card-promotion';previous.mkdir(exist_ok=True)
     if (OUT/'report.pdf').exists() and not (previous/'report.pdf').exists():shutil.copy2(OUT/'report.pdf',previous/'report.pdf')

@@ -1,3 +1,24 @@
+# ==========================================================================
+# 文件：stream_inverse.py
+# 功能：STREAM 单像元热红外正向链的可微原型（autograd）与变分/Gauss–Newton 反演 demo：
+#       由 LAI 与四组分温度预测多角度、多波段亮温和视角间隙，再用最小二乘反演这 5 个参数。
+# 主要模块：
+#   1. 工具函数：天顶角余弦、限幅、E1 级数与 E3、Planck 辐亮度及其反函数；
+#   2. hom3 节点辐射度：hom_canopy（节点容量/交换因子/到达矩阵）、hom_split（直射束到达各节点的份额）；
+#   3. 四组分比例：leaf_correlation（双尺度热点）、two_layer_sunlit_leaf、fractions；
+#   4. thermal_weights：各组分温度对观测辐亮度的权重（直接发射 + 多次散射）；
+#   5. simulate：正向算子 H(x)，x = [LAI, Tss, Tsh, Tls, Tlh]（K），输出亮温 bt 与间隙 gap；
+#   6. 反演：参数界、残差构造 make_residual（观测项 + 先验项）、invert（scipy least_squares，解析 Jacobian）；
+#   7. 入口：run_demo（合成数据反演与梯度校验）、export_sample / run_sample（样本 JSON 的导出与反演）。
+# 数据流：config（太阳/观测几何、波段、发射率、热点）+ 参数 → simulate → 观测向量 [bt 展平, gap]
+#         → 残差 → least_squares → 反演参数。Jacobian 由 autograd 对整条正向链自动求导。
+# 与其他文件的关系：数值对应 models/stream/physics/canopy.cpp、radiosity.cpp、brightness.h（C++ 实现）；
+#       说明与结果见同目录 README.md；autograd 放在 vendor/（运行时需把 vendor 加入 PYTHONPATH）。
+# 约定：角度单位度；波长单位 μm；温度 K；Planck 辐亮度单位 W m-2 sr-1 μm-1（C1=2hc²，C2=hc/k）；
+#       G = 0.5 为球面叶片投影函数；两层等厚冠层，每层 tau = G·LAI/2；相对方位取 0–180°。
+# 注意：只是原型，未含完整球面叶片 BRF、大气与 EB 时间序列；只有亮温时四个组分温度不能独立反演。
+# ==========================================================================
+
 """Differentiable single-pixel STREAM forward model and inversion prototype.
 
 Role in the system:
@@ -35,6 +56,9 @@ import autograd.numpy as anp
 from autograd import grad, jacobian
 from scipy.optimize import least_squares
 
+# 常量：G 为叶片投影函数（球面叶分布取 0.5）；SIGMA 为 Stefan–Boltzmann 常数；
+# C1、C2 为 Planck 常数（波长 μm、辐亮度 W m-2 sr-1 μm-1，C1 = 1.19104e8，C2 = 14388.29 μm K）；
+# EULER 为 Euler–Mascheroni 常数（E1 级数用）；DEG 为度转弧度。
 G = 0.5
 SIGMA = 5.67e-8
 C1 = 11910.439340652 * 1.0e4
@@ -45,14 +69,17 @@ DEG = math.pi / 180.0
 
 
 # ----------------------------------------------------------------------------- utilities
+# 作用：天顶角（度）的余弦；角度限制在 89.999° 以内，避免掠射时除零。
 def cos_zenith(angle_deg):
     return anp.cos(anp.minimum(anp.abs(angle_deg), 89.999) * DEG)
 
 
+# 作用：可微限幅（minimum/maximum 在 autograd 下给出分段梯度）。
 def clip(value, low, high):
     return anp.minimum(anp.maximum(value, low), high)
 
 
+# 说明：E1(x) = -γ - ln x - Σ (-x)^k/(k·k!)，取前 80 项；仅对 x 不大（约 ≤ 8）时收敛得足够准。
 def e1_series(x):
     """E1(x) for x in (0, ~8]: convergent series, fully differentiable."""
     total = -EULER - anp.log(x)
@@ -68,6 +95,7 @@ def e3(x):
     return 0.5 * (anp.exp(-x) * (1.0 - x) + x * x * e1_series(x))
 
 
+# 作用：Planck 辐亮度 B(λ,T) = C1 / (λ^5 · (exp(C2/(λT)) - 1))；inverse_planck 为其反函数（亮温，K）。
 def planck(temperature_k, wavelength_um):
     return C1 / anp.power(wavelength_um, 5.0) / anp.expm1(C2 / (wavelength_um * temperature_k))
 
@@ -76,6 +104,7 @@ def inverse_planck(radiance, wavelength_um):
     return C2 / (wavelength_um * anp.log1p(C1 / (radiance * anp.power(wavelength_um, 5.0))))
 
 
+# 作用：把嵌套列表（元素为 autograd 标量/数组）逐行堆叠成矩阵，保持可微。
 def rows_to_matrix(rows):
     return anp.stack([anp.stack(row) for row in rows])
 
@@ -107,6 +136,8 @@ def hom_canopy(lai):
     return {"capacity": capacity, "factors": factors, "escape": escape, "arrive": arrive, "radiance": radiance, "tau": tau}
 
 
+# 作用：单位直射束（沿天顶角方向）到达三个节点的份额：[土壤缝隙, 下层命中, 上层命中]。
+# 假定两层等厚：穿过上层的透过率为 exp(-τ_total/2)，总透过率 exp(-G·LAI/cosθ)。
 def hom_split(lai, zenith_deg):
     """Unit beam reaching each node: [soil gap, lower-layer hit, upper-layer hit]."""
     cosine = anp.maximum(cos_zenith(zenith_deg), 1e-6)
@@ -116,6 +147,9 @@ def hom_split(lai, zenith_deg):
     return anp.stack([anp.exp(-optical_depth), anp.exp(-half) * top, top])
 
 
+# 作用：双尺度热点的叶片相关系数（太阳与观测方向重合时趋于 1）。
+# 说明：separation 为太阳/观测方向在地面投影上的角距（以 tan 表示）；hotspot 为热点尺度参数，
+#       对应 canopy.cpp 的热点相关项（公式细节待与 C++ 核对）。
 def leaf_correlation(hotspot, sun_zenith, view_zenith, relative_azimuth):
     sun_tan = anp.tan(anp.minimum(anp.abs(sun_zenith), 89.999) * DEG)
     view_tan = anp.tan(anp.minimum(anp.abs(view_zenith), 89.999) * DEG)
@@ -128,6 +162,9 @@ def leaf_correlation(hotspot, sun_zenith, view_zenith, relative_azimuth):
     return anp.where(separation < 1e-12, 1.0, -anp.expm1(-a_safe) / a_safe)
 
 
+# 作用：由观测方向间隙 view_gap、太阳方向间隙 sun_gap 与联合间隙 sunlit_soil（土壤被光照且可见的份额）
+# 估计观测方向上“被光照叶片”的可见份额：把冠层分成上层与下层，上层按间隙重叠计算。
+# index = 0.82 - 0.08·LAI（下限 0.02）为经验的上层权重；与 C++ 的对应关系待核对。
 def two_layer_sunlit_leaf(lai, view_gap, sun_gap, sunlit_soil):
     pv = clip(view_gap, 1e-12, 1.0)
     ps = clip(sun_gap, 1e-12, 1.0)
@@ -146,6 +183,9 @@ def two_layer_sunlit_leaf(lai, view_gap, sun_gap, sunlit_soil):
     return clip(1.0 - anp.exp(-kv * lai_upper) + lit_bottom * lit_background, 0.0, 1.0 - pv)
 
 
+# 作用：观测方向上四组分的像元面积比例：soilSun、soilShade、leafSun、leafShade，另给间隙 gap（= 土壤可见份额）。
+# 步骤：1 单向间隙 gs、gv；2 热点相关 → 联合间隙 joint；3 土壤光照份额 = joint；
+#       4 叶片光照份额由 two_layer_sunlit_leaf 给出；5 其余按和为 1 补齐（均限幅保证非负）。
 def fractions(lai, hotspot, sun_zenith, view_zenith, relative_azimuth):
     mu_s = anp.maximum(cos_zenith(sun_zenith), 1e-6)
     mu_v = anp.maximum(cos_zenith(view_zenith), 1e-6)
@@ -166,6 +206,13 @@ def fractions(lai, hotspot, sun_zenith, view_zenith, relative_azimuth):
     }
 
 
+# 作用：四个组分温度对观测方向热辐亮度的权重（长度 4，对应 Tss、Tsh、Tls、Tlh）。
+# 权重 = 直接发射（组分比例 x 发射率）+ 多次散射贡献。
+# 步骤：1 用直射束到达份额得各节点被光照的比例 sunlit；2 source 为各节点由四种温度发射的权重；
+#       3 emitted 为 5 个状态的发射项；4 散射矩阵 scatter（土壤反照率 1-ε；叶片前向 (1-ε)/3、
+#       后向 2(1-ε)/3，系数与 C++ 的一致性待核对）；
+#       5 解 (I - scatter·arrive^T)·total = emitted 得全阶辐射度，减去 emitted 为散射部分；
+#       6 乘观测方向的节点辐亮度系数得多次散射项。
 def thermal_weights(nodes, leaf_emissivity, soil_emissivity, fractions_view,
                     view_zenith, sun_zenith):
     view = hom_split(nodes["tau"] * 4.0, view_zenith)
@@ -215,6 +262,10 @@ def thermal_weights(nodes, leaf_emissivity, soil_emissivity, fractions_view,
     return direct + multiple
 
 
+# 模块：正向算子 H(x)。输入 parameters = [LAI, Tss, Tsh, Tls, Tlh]（K 为温度单位）与 config；
+# 输出 {bt: [视角, 波段] 亮温 K, gap: [视角] 间隙}。
+# 步骤：1 由 LAI 建节点；2 逐视角算相对方位（折到 0–180°）与四组分比例；3 算权重；
+#       4 对每个波段：权重 · Planck(四组分温度) 得辐亮度，再反演成亮温。
 def simulate(parameters, config):
     """Forward model.  parameters = [LAI, Tss, Tsh, Tls, Tlh] (K)."""
     lai = parameters[0]
@@ -237,14 +288,18 @@ def simulate(parameters, config):
 
 
 # ----------------------------------------------------------------------------- inversion helpers
+# 参数物理界：LAI 0.05–8；四个组分温度 240–380 K（least_squares 的 bounds）。
 def parameter_bounds():
     return np.array([0.05, 240.0, 240.0, 240.0, 240.0]), np.array([8.0, 380.0, 380.0, 380.0, 380.0])
 
 
+# 作用：把正向输出展平成观测向量：先 bt（视角 x 波段，行优先），再 gap（视角）。
 def flatten(simulation):
     return anp.concatenate([anp.reshape(simulation["bt"], (-1,)), anp.reshape(simulation["gap"], (-1,))])
 
 
+# 作用：构造最小二乘残差函数。观测项 = (模拟 - 观测)/σ（bt 与 gap 各用自己的 σ）；
+# 先验项 = prior_weight·(x - 先验)/先验标准差，prior_weight=0.15 为弱先验（取值依据待核对）。
 def make_residual(config, observations, sigma_bt, sigma_gap, prior, prior_sd, prior_weight=0.15):
     bt_count = len(config["views"]) * len(config["bands"])
     gap_count = len(config["views"])
@@ -257,6 +312,9 @@ def make_residual(config, observations, sigma_bt, sigma_gap, prior, prior_sd, pr
     return residual
 
 
+# 作用：带界的 Gauss–Newton 类最小二乘反演（scipy least_squares，默认 trust-region reflective），
+# Jacobian 用 autograd 的解析结果；x_scale 平衡 LAI 与温度量纲；最多 60 次函数评估。
+# seed 参数目前未使用。
 def invert(config, observations, sigma_bt, sigma_gap, prior, prior_sd, initial, seed=None):
     residual = make_residual(config, observations, sigma_bt, sigma_gap, prior, prior_sd)
     jac = jacobian(residual)
@@ -268,6 +326,8 @@ def invert(config, observations, sigma_bt, sigma_gap, prior, prior_sd, initial, 
 
 
 # ----------------------------------------------------------------------------- demo
+# demo 的观测配置：太阳天顶 35°、方位 150°；三个视角 (VZA, VAA)；三个热红外波段（μm）；
+# hotspot=0.2；叶片发射率 0.985，土壤发射率 0.955。
 def demo_config():
     return {
         "sza": 35.0,
@@ -280,6 +340,10 @@ def demo_config():
     }
 
 
+# 作用：合成数据的完整反演 demo。步骤：1 用真值生成观测并加高斯噪声（bt 的 σ 为 noise，gap 的 σ 为 0.02）；
+#       2 在真值处做 autograd 与中心差分的梯度校验（对象为第 1 视角第 1 波段的亮温）；
+#       3 反演并统计观测 RMSE、LAI 误差、温度误差、解处 Jacobian 条件数；4 打印 JSON。
+# 注意：噪声个数按 3 个波段（3*len(views)）写死，与 demo_config 的波段数一致。
 def run_demo(noise, seed):
     config = demo_config()
     truth = np.array([2.5, 312.0, 302.0, 308.0, 301.0])
@@ -334,6 +398,8 @@ def run_demo(noise, seed):
     }, indent=2, ensure_ascii=False))
 
 
+# 作用：导出一份“HiStream 风格”的合成样本 JSON（kind=stream-inversion-sample，schemaVersion=1），
+# 含配置、带噪观测、σ、真值、先验与初值；真值仅用于评估，真实样本可省略。
 def export_sample(path, noise, seed):
     config = demo_config()
     truth = np.array([2.5, 312.0, 302.0, 308.0, 301.0])
@@ -359,6 +425,7 @@ def export_sample(path, noise, seed):
     print(path)
 
 
+# 作用：读样本 JSON 并反演，打印反演参数、真值（若有）、代价与评估次数。
 def run_sample(path):
     sample = json.loads(Path(path).read_text(encoding="utf-8"))
     config = sample["config"]
@@ -377,6 +444,7 @@ def run_sample(path):
     }, indent=2, ensure_ascii=False))
 
 
+# 命令行入口：--export-sample 导出样本；--sample 反演样本；否则运行 demo（--noise 为亮温噪声 σ，K）。
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--demo", action="store_true", help="synthetic single-pixel inversion demo")

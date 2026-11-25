@@ -1,3 +1,20 @@
+// ==========================================================================
+// 文件：build-typical-obj-library.mjs
+// 功能：生成/整理 assets/obj-library 中“典型”车辆、船舶、树木 OBJ（Y 向上、单位 m、带顶点颜色）。
+// 主要模块：
+//   1. 常量与小工具：COLORS 调色板、fmt、normal（三角形法线）
+//   2. ObjBuilder：累积三角形（box / 圆柱等基本体）并写出 .obj 与同名 .json 元数据
+//   3. importColoredObj：导入 Quaternius 的 OBJ+MTL（CC0），把材质 Kd 转为顶点色并缩放到目标尺寸
+//   4. 程序化模型：buildCityBus、addShipHull + buildContainerShip / buildBulkCarrier
+//   5. rescaleColoredObj：把已有 OBJ 按目标高度等比缩放并更新 json 元数据
+//   6. 脚本主体：导入 2 辆车和 1 艘邮轮，生成 3 个程序化模型，缩放街道树
+// 输入：.tmp-asset-import/{cars,ships}/OBJ 下的原始素材（仓库外获取，不随代码提供）。
+// 输出：assets/obj-library/<类别>/typical/*.obj 与 *.json；导入素材的原件另存到 _<名称>_source/。
+// 约定：Y 向上、长度单位 m；车/船长度沿 Z、宽沿 X；模型以 XZ 中心、最低点 y=0 为原点；
+//   .json 记录三角形数、包围盒尺寸 dimensions、coordinateSystem、unit。
+// 注意：本脚本会直接覆盖库中同名文件；rescaleColoredObj 要求目标 OBJ 与 json 已存在。
+// ==========================================================================
+
 /**
  * Build the recommended, metre-scale OBJ set used by Stream Studio.
  *
@@ -14,6 +31,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const library = path.join(root, 'assets', 'obj-library')
 const importRoot = path.join(root, '.tmp-asset-import')
 
+// 调色板：RGB，范围 0-1（线性/sRGB 未标明，待核对），写入 OBJ 顶点颜色。
 const COLORS = {
   black: [0.025, 0.03, 0.035],
   blue: [0.08, 0.28, 0.55],
@@ -38,6 +56,7 @@ function fmt(value) {
   return Number(value).toFixed(6)
 }
 
+// 作用：返回三角形 abc 的单位法线 (b-a)×(c-a)；退化三角形时长度按 1 处理以避免除零。
 function normal(a, b, c) {
   const ux = b[0] - a[0]
   const uy = b[1] - a[1]
@@ -50,6 +69,9 @@ function normal(a, b, c) {
   return n.map((value) => value / length)
 }
 
+// 模块：三角形累积器。triangle/quad 添加面（quad 拆成 abc、acd 两个三角形），
+// box、cylinderX（轴沿 X）、cylinderY（轴沿 Y）生成基本体；write 输出 OBJ。
+// group 名用于 OBJ 的 g 分组，供应用内按组绑定材质。
 class ObjBuilder {
   constructor(label, source = 'Stream Studio procedural geometry') {
     this.label = label
@@ -66,6 +88,7 @@ class ObjBuilder {
     this.triangle(a, c, d, color, group)
   }
 
+  // 长方体：min/max 为对角点；6 个面的顶点顺序按外法线向外排列。
   box(min, max, color, group = 'box') {
     const [x0, y0, z0] = min
     const [x1, y1, z1] = max
@@ -123,6 +146,8 @@ class ObjBuilder {
     }
   }
 
+  // 作用：把累积的三角形写成 OBJ（每个三角形独立 3 顶点 + 面法线，不共享顶点；
+  // 顶点行格式 v x y z r g b）和同名 .json（尺寸取包围盒，extra 合并进元数据）。
   write(relativePath, extra = {}) {
     const target = path.join(library, relativePath)
     ensureDir(path.dirname(target))
@@ -166,6 +191,7 @@ class ObjBuilder {
   }
 }
 
+// 作用：读取 MTL，返回 材质名 → Kd 漫反射 RGB 的 Map（材质名中的空白换成下划线）。
 function parseMtl(file) {
   const materials = new Map()
   let current = 'default'
@@ -177,6 +203,12 @@ function parseMtl(file) {
   return materials
 }
 
+// 作用：导入带 MTL 的 OBJ，转为“逐面顶点色”的库内 OBJ。
+// 输入：源 OBJ/MTL、库内相对路径、目标包围盒尺寸 [X, Y, Z]（m）、标签、来源 URL。
+// 步骤：1 备份源文件、许可证与来源说明到 _<名称>_source；2 解析顶点与面（多边形扇形三角化，
+// 支持负索引）；3 按三轴独立比例缩放到目标尺寸（可能改变纵横比），XZ 居中、底面落在 y=0；
+// 4 每个面取其材质 Kd 为顶点色（缺材质用灰色），材质名作为 group 写出。
+// 说明：源文件不存在时回退使用已备份的副本，使脚本可在素材目录清理后重跑。
 function importColoredObj({ sourceObj, sourceMtl, relativePath, targetDimensions, label, sourceUrl }) {
   const sourceDir = path.join(library, path.dirname(relativePath), `_${path.basename(relativePath, '.obj')}_source`)
   ensureDir(sourceDir)
@@ -222,6 +254,8 @@ function importColoredObj({ sourceObj, sourceMtl, relativePath, targetDimensions
   builder.write(relativePath, { derivedFrom: path.basename(objFile) })
 }
 
+// 作用：程序化生成城市低地板公交（约 2.55 m 宽、11.9 m 长、3.18 m 高，尺寸按代码坐标估算）。
+// 组成：车身、车顶、窗带、前后风挡、8 对侧窗、4 个车轮、前灯。
 function buildCityBus() {
   const model = new ObjBuilder('Modern low-floor city bus', 'Stream Studio procedural reference geometry')
   model.box([-1.275, 0.52, -5.95], [1.275, 2.72, 5.95], COLORS.blue, 'body')
@@ -243,6 +277,11 @@ function buildCityBus() {
   model.write('vehicle/typical/modern_city_bus.obj')
 }
 
+// 作用：生成船体壳：沿船长 Z 分 stations 个横剖面，每个剖面是 9 点的折线环
+// （甲板两侧、舷侧、舭部、龙骨），相邻剖面连成四边形，首尾剖面封盖。
+// 说明：宽度沿船长按 sin(π·t)^0.32 收窄，下限 0.035 以避免闭合成退化面；
+// sternBias 使 +Z 端（船尾）略宽。深度（甲板 -2.2 m、-6.0 m）为固定经验值，
+// 不随船型缩放。
 function addShipHull(model, { length, beam, deckY, keelY, color, group = 'hull', stations = 72 }) {
   const rings = []
   for (let i = 0; i <= stations; i += 1) {
@@ -277,6 +316,9 @@ function addShipHull(model, { length, beam, deckY, keelY, color, group = 'hull',
   cap(rings.at(-1), false)
 }
 
+// 作用：程序化生成 Panamax 集装箱船（长 220 m、宽 32.2 m）。
+// 组成：船体、主甲板；20 个箱位 × 10 列 × 4 层的集装箱（配色循环），
+// z 在 58~88 的箱位留给上层建筑；上层建筑、驾驶台、烟囱、桅杆在船尾（+Z）。
 function buildContainerShip() {
   const model = new ObjBuilder('Modern Panamax container ship', 'Stream Studio procedural reference geometry')
   addShipHull(model, { length: 220, beam: 32.2, deckY: 11, keelY: 0, color: COLORS.hullRed })
@@ -303,6 +345,8 @@ function buildContainerShip() {
   model.write('ship/typical/modern_container_ship.obj')
 }
 
+// 作用：程序化生成散货船（长 190 m、宽 30 m）：6 个货舱口盖，前 5 个旁配吊机立柱与吊臂，
+// 上层建筑、驾驶台、烟囱在船尾（+Z）。
 function buildBulkCarrier() {
   const model = new ObjBuilder('Modern bulk carrier', 'Stream Studio procedural reference geometry')
   addShipHull(model, { length: 190, beam: 30, deckY: 10, keelY: 0, color: COLORS.black })
@@ -321,6 +365,9 @@ function buildBulkCarrier() {
   model.write('ship/typical/modern_bulk_carrier.obj')
 }
 
+// 作用：原地重写库中 OBJ 的顶点坐标：以 XZ 中心、最低点为原点，按高度方向统一比例
+// 缩放到 targetHeight（m）；顶点颜色字段保持不变；同时更新 json 中的 dimensions 与 normalizedHeight。
+// 注意：直接覆盖原文件，不生成备份。
 function rescaleColoredObj(relativePath, targetHeight) {
   const file = path.join(library, relativePath)
   const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/)
@@ -350,6 +397,8 @@ function rescaleColoredObj(relativePath, targetHeight) {
   console.log(`rescaled ${relativePath} to ${targetHeight} m height`)
 }
 
+// 脚本主体：先导入 2 款轿车/SUV 与邮轮（目标尺寸为 [宽, 高, 长] m），
+// 再生成程序化的公交、集装箱船、散货船，最后把街道树归一化到 10 m 高。
 const carObjRoot = path.join(importRoot, 'cars', 'OBJ')
 const shipObjRoot = path.join(importRoot, 'ships', 'OBJ')
 

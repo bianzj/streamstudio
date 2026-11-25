@@ -1,3 +1,21 @@
+# ==========================================================================
+# 文件：build-example-manual-pdf.py
+# 功能：生成《Stream Studio 功能与案例手册》PDF（总体功能 + 森林 / 北京城市 / 船舶三个案例）。
+# 主要模块：
+#   1. 字体、配色、路径常量；PIL 字体辅助
+#   2. 预览图渲染：parse_obj / transform_point / render_obj_preview（OBJ 软渲染）、
+#      render_carbon_chart（GPP/NPP 日变化折线）
+#   3. reportlab 部件：SectionBand 章节色带、page_background 页面底图、段落样式、
+#      P / bullet / data_table 辅助函数
+#   4. extract_material_images + compose_panel：从 Word 文档里取出截图，拼成 9 张面板图
+#   5. 脚本主体：封面 + 7 个章节（总体功能、森林场景/结果、城市场景/结果、水上目标、
+#      运行检查）的 story，最后 doc.build
+# 数据流：Word 文档截图（SOURCE_DOCX）→ tmp/pdfs/... 面板 PNG → output/pdf/*.pdf。
+# 注意：SOURCE_DOCX 是硬编码的桌面文档路径，换机器需修改；本脚本在 import 时即执行全部流程；
+#   封面与正文中的软件版本（1.0）、人员、联系方式、案例文字均为手写内容。
+# 与 tools/build-core-manuals-pdf.py 的区别：那个脚本由 Markdown 手册生成 PDF，本脚本为手写版面。
+# ==========================================================================
+
 from __future__ import annotations
 
 import json
@@ -29,6 +47,9 @@ from reportlab.platypus import (
 )
 
 
+# 模块：路径与字体。临时图片放 tmp/pdfs/stream_studio_example_manual，
+# PDF 输出到 output/pdf/（与 build-core-manuals-pdf.py 的输出目录 docs/ 不同）。
+# reportlab 用等线（Deng/Dengb）；PIL 画预览图的常规字体为 NotoSansSC-VF，粗体用 Dengb。
 ROOT = Path(__file__).resolve().parents[1]
 TMP = ROOT / "tmp" / "pdfs" / "stream_studio_example_manual"
 OUTPUT = ROOT / "output" / "pdf" / "Stream Studio功能与案例手册.pdf"
@@ -45,6 +66,7 @@ pdfmetrics.registerFontFamily(
     italic="StreamCN", boldItalic="StreamCN-Bold"
 )
 
+# 模块：页面尺寸与配色。
 PAGE_W, PAGE_H = A4
 NAVY = colors.HexColor("#10273D")
 BLUE = colors.HexColor("#2674D9")
@@ -57,11 +79,16 @@ MUTED = colors.HexColor("#65798B")
 LINE = colors.HexColor("#DCE5ED")
 
 
+# 作用：按字号与粗细返回 PIL 字体（预览图和图表文字用）。
 def pil_font(size: int, bold: bool = False):
     source = FONT_BOLD if bold else PIL_FONT
     return ImageFont.truetype(str(source), size=size)
 
 
+# 作用：极简 OBJ 解析，只读顶点 v 和面 f。
+# 输出：(顶点列表, 顶点颜色列表, 三角形索引列表)；顶点行带 7 个以上字段时，
+# 后三个作为 RGB（限幅到 0-1），否则该顶点颜色为 None。
+# 说明：多边形面按扇形拆成三角形；索引支持负数（相对当前顶点数）；忽略法线/纹理索引。
 def parse_obj(path: Path):
     vertices = []
     vertex_colors = []
@@ -86,6 +113,8 @@ def parse_obj(path: Path):
     return vertices, vertex_colors, triangles
 
 
+# 作用：对点做“绕 Y 轴旋转（度）→ 缩放 → 平移”，坐标系为 Y 向上（与示例位置文件的
+# 缩放/旋转字段对应，待核对）。
 def transform_point(point, scale=1.0, rotation=0.0, translation=(0.0, 0.0, 0.0)):
     x, y, z = point
     angle = math.radians(rotation)
@@ -97,6 +126,10 @@ def transform_point(point, scale=1.0, rotation=0.0, translation=(0.0, 0.0, 0.0))
     )
 
 
+# 作用：用纯 PIL 软渲染一张 OBJ（可多实例）的斜轴测预览图（1400×760），带标题条。
+# 输入：OBJ 路径、输出图片路径、标题/副标题、默认 RGB 调色、实例列表 [(缩放, 旋转, 平移)]、
+# 三角形数上限 max_triangles（默认 60000，超出则等间隔抽样）。
+# 说明：画家算法（按相机深度从远到近）+ 固定方向光的简单明暗；无遮挡剔除与阴影。
 def render_obj_preview(
     source: Path,
     destination: Path,
@@ -108,6 +141,7 @@ def render_obj_preview(
 ):
     vertices, vertex_colors, faces = parse_obj(source)
     instance_specs = instances or [(1.0, 0.0, (0.0, 0.0, 0.0))]
+    # 步骤 1：展开所有实例的顶点并抽样三角形（每隔 step 个取 1 个），控制绘制量。
     total_triangles = len(faces) * len(instance_specs)
     step = max(1, math.ceil(total_triangles / max_triangles))
     rendered = []
@@ -124,6 +158,7 @@ def render_obj_preview(
             sequence += 1
 
     width, height = 1400, 760
+    # 步骤 2：创建画布并画垂直渐变背景。
     canvas = PILImage.new("RGB", (width, height), (244, 248, 251))
     draw = ImageDraw.Draw(canvas)
     for y in range(height):
@@ -131,6 +166,8 @@ def render_obj_preview(
         color = tuple(int(238 + 12 * ratio) for _ in range(3))
         draw.line((0, y, width, y), fill=color)
 
+    # 步骤 3：定义投影：以包围盒底面中心为原点，yaw 38°、俯仰 24° 的正交斜投影；
+    # 再计算投影包围盒，缩放到绘图区并留 8% 边距（×0.92）。
     min_x = min(point[0] for point in all_points)
     max_x = max(point[0] for point in all_points)
     min_y = min(point[1] for point in all_points)
@@ -168,6 +205,8 @@ def render_obj_preview(
             depth,
         )
 
+    # 步骤 4：给每个三角形着色。亮度 = 0.55 + 0.45·|n·light|（双面照明）；
+    # 优先用顶点颜色平均值；否则“森林”“北京”标题按相对高度渐变，其余用 palette。
     projected_faces = []
     light = (0.35, 0.82, 0.45)
     height_span = max(1e-6, max_y - min_y)
@@ -191,6 +230,7 @@ def render_obj_preview(
         fill = tuple(max(0, min(255, int(value * brightness))) for value in base)
         projected_faces.append((sum(point[2] for point in projected) / 3, projected, fill))
 
+    # 步骤 5：先画地面条，再按平均深度从远到近画三角形，最后画标题条并保存。
     ground_y = plot_bottom - 18
     draw.rounded_rectangle((34, ground_y - 13, width - 34, ground_y + 18), 10, fill=(219, 228, 234))
     for _, points, fill in sorted(projected_faces, key=lambda item: item[0], reverse=True):
@@ -204,6 +244,10 @@ def render_obj_preview(
     canvas.save(destination, quality=94)
 
 
+# 作用：用 PIL 画作物示例的 GPP/NPP 日变化折线图（1400×680）。
+# 输入：assets/examples/crop_gpp_npp/validated-carbon-summary.json 的 rows（时刻 hh:mm、GPP、NPP）；
+# 输出：图片文件。纵轴固定 -2 ~ 24（单位见图内文字：微摩尔 CO2 /（平方米叶面积·秒）），
+# 横轴 0-24 时；图中标注日期 DOY 214 为硬编码。
 def render_carbon_chart(destination: Path):
     summary_path = ROOT / "assets" / "examples" / "crop_gpp_npp" / "validated-carbon-summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -263,6 +307,7 @@ def render_carbon_chart(destination: Path):
     canvas.save(destination, quality=94)
 
 
+# 模块：章节色带 flowable（序号方块 + 标题 + 副标题），高度固定 23 mm，宽度随可用宽度。
 class SectionBand(Flowable):
     def __init__(self, number: str, title: str, subtitle: str):
         super().__init__()
@@ -291,6 +336,8 @@ class SectionBand(Flowable):
         self.canv.drawString(24 * mm, 6.5 * mm, self.subtitle)
 
 
+# 作用：每页的底图回调。第 1 页画深色封面背景和大字母 S；其余页画页眉线、页眉文字，
+# 页脚页码为 doc.page - 1（封面不计页）。
 def page_background(canvas, doc):
     canvas.saveState()
     if doc.page == 1:
@@ -311,6 +358,8 @@ def page_background(canvas, doc):
     canvas.restoreState()
 
 
+# 模块：段落样式（封面标题/副标题、正文、小标题、提示框、图注、表格等），
+# 名字在下方 P() 中按字符串引用。
 styles = getSampleStyleSheet()
 styles.add(ParagraphStyle(
     name="CoverTitle", fontName="StreamCN-Bold", fontSize=31, leading=40,
@@ -355,6 +404,8 @@ styles.add(ParagraphStyle(
 ))
 
 
+# 辅助函数：P 生成段落；bullet 生成蓝色圆点列表项；data_table 生成带深色表头、
+# 隔行底色的表格（header=False 时无表头；widths 为各列宽度）。
 def P(text, style="BodyCN"):
     return Paragraph(text, styles[style])
 
@@ -386,9 +437,12 @@ def data_table(rows, widths, header=True):
     return table
 
 
+# 模块：案例截图来源。截图保存在一个 Word 文档的 word/media/imageN.* 中，
+# N 即后面 compose_panel 引用的编号（硬编码的桌面路径）。
 SOURCE_DOCX = Path(r"C:\Users\jiank\Desktop\新建 Microsoft Word 文档 (2).docx")
 
 
+# 作用：把 docx（zip）里 word/media/image* 解压到 TMP，返回 {图片编号: 路径}。
 def extract_material_images(source: Path):
     images = {}
     with ZipFile(source) as archive:
@@ -402,6 +456,9 @@ def extract_material_images(source: Path):
     return images
 
 
+# 作用：把若干截图拼成一张 1400×760 的面板图，每格带深色标题条。
+# 输入：material（编号→路径）、items=[(图片编号, 标签)]、列数；
+# 说明：每格等大，截图按比例缩放（LANCZOS）后居中，不裁切。
 def compose_panel(destination: Path, material, items, columns=2):
     width, height = 1400, 760
     canvas = PILImage.new("RGB", (width, height), (242, 246, 250))
@@ -432,6 +489,7 @@ def compose_panel(destination: Path, material, items, columns=2):
     canvas.save(destination, quality=94)
 
 
+# 模块：生成 9 张面板图。编号与标签的对应关系取决于 Word 文档中的图片顺序（待核对）。
 material = extract_material_images(SOURCE_DOCX)
 overview_panel = TMP / "overview_panel.png"
 forest_scene_panel = TMP / "forest_scene_panel.png"
@@ -465,6 +523,8 @@ compose_panel(ship_results_panel, material, [
 ], columns=3)
 
 
+# 模块：文档与正文。story 按“封面 → 7 个章节”顺序排列，每章一个 SectionBand + 图 + 说明 +
+# 表格，章节之间 PageBreak。封面页由 page_background 绘制深色背景。
 doc = BaseDocTemplate(
     str(OUTPUT), pagesize=A4,
     leftMargin=18 * mm, rightMargin=18 * mm,
@@ -493,6 +553,7 @@ story = [
     P("本手册依据现有软件界面和结果截图整理。红外组联系人：卞尊健，bianzj@aircas.ac.cn。", "SmallCN"),
     PageBreak(),
 
+    # 第 1 章：总体功能（四种几何/辐射模式、分析入口、标准运行顺序）。
     SectionBand("01", "总体功能与工作流程", "统一管理场景 几何 材质 气象 传感器和计算结果"),
     Spacer(1, 5 * mm),
     P("Stream Studio 面向三维地表场景的辐射传输与能量过程模拟。工程文件统一保存场景尺寸、对象分布、材质属性、太阳与天空、气象驱动、传感器和求解控制参数。Three.js 负责场景检查和结果浏览，HiStream 引擎完成辐射、能量与流体相关计算。", "BodyCN"),
@@ -520,6 +581,7 @@ story = [
     bullet("结果生成后依次检查图像、统计分析和三维过程，避免只依据单张影像判断。"),
     PageBreak(),
 
+    # 第 2-3 章：森林场景设置与结果（含 GPP/NPP 图）。
     SectionBand("02", "森林场景", "展示冠层辐射 温度 多角度 多时相 土壤分层和碳通量"),
     Spacer(1, 4 * mm),
     Image(str(forest_scene_panel), width=174 * mm, height=94 * mm),
@@ -546,6 +608,7 @@ story = [
     P("GPP 和 NPP 在本案例中用于观察森林植被体元的空间差异。解释时应同时检查有效辐射、叶温和植被体元位置。夜间 GPP 应接近零；NPP 可因暗呼吸出现负值。", "BodyCN"),
     PageBreak(),
 
+    # 第 4-5 章：北京城市案例的计算域、体元分级与结果。
     SectionBand("04", "城市场景", "在完整城市背景中选择局部区域进行体元化和求解"),
     Spacer(1, 4 * mm),
     Image(str(city_scene_panel), width=174 * mm, height=94 * mm),
@@ -572,6 +635,7 @@ story = [
     P("雾和火焰作为局部参与介质加入场景；空气温度与水平风速属于体元流体力学结果。高天顶角及前视视场适合生成城市天际线，但应核对相机朝向，避免把侧视误判为前视。", "BodyCN"),
     PageBreak(),
 
+    # 第 6 章：船舶与水面案例。
     SectionBand("06", "水上目标", "联合处理船体 水面 红外温度 时间变化和多角度观测"),
     Spacer(1, 4 * mm),
     Image(str(ship_scene_panel), width=174 * mm, height=94 * mm),
@@ -583,6 +647,7 @@ story = [
     P("顶视热红外影像可辨认船体轮廓和部件温差；时间分析用于比较水面或船体亮温的日变化；多角度分析反映船体几何和水面方向反射共同造成的观测差异。", "BodyCN"),
     PageBreak(),
 
+    # 第 7 章：运行检查表与常见错误提示（显存分配失败、Vulkan 设备丢失等）。
     SectionBand("07", "运行检查与结果判读", "先确认几何和输入 再判断辐射 温度和流体结果"),
     Spacer(1, 5 * mm),
     data_table([
@@ -603,5 +668,6 @@ story = [
     P("三个案例覆盖了植被冠层、城市建筑和水上目标。它们使用同一套工程结构和结果分析入口，可以作为新工程的配置参考。", "BodyCN"),
 ]
 
+# 输出 PDF 并打印路径。
 doc.build(story)
 print(OUTPUT)

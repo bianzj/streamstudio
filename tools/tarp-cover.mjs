@@ -1,3 +1,18 @@
+// ==========================================================================
+// 文件：tarp-cover.mjs
+// 功能：为任意 OBJ 目标生成“篷布覆盖”网格（Y-up），由 server.mjs 的 /api/project/tarp-cover 调用
+// 导出：generateTarpCover(objText, { cell, lift, drape, margin, maxNodes })
+// 主要步骤：
+//   1. 解析 OBJ 顶点与三角形，求包围盒，缺省网格尺寸 CELL 取 clamp(最大水平尺寸/80, 0.05, 0.5) m
+//   2. 建立以目标足迹中心对称的规则高度场，宽度足以容纳下垂裙边
+//   3. 把目标所有三角形采样“盖章”到高度场，得到目标上表面高度
+//   4. 倒锥形最大值传播（模拟布料下垂）并做只升不降的平滑
+//   5. 仅输出被覆盖区域及其一圈邻居的网格点，加上 lift 抬升并三角化
+//   6. 返回 OBJ 文本与统计量（顶点数、三角形数、尺寸、足迹）
+// 约定：OBJ 单位 m、Y 向上；高度场在 XZ 平面；lift 为篷布离目标表面的抬升（m）；
+//       drape 为裙边每水平 1 m 下降的高度（m/m）；margin 为足迹外额外留出的水平余量（m）。
+// ==========================================================================
+
 // Draped tarp cover for an arbitrary OBJ, in the target's own coordinates (Y up).
 // The cover is a heightfield: the target's top surface lifted by `lift`, extended
 // outward like hanging cloth (height falls `drape` m per m) down to the target's base.
@@ -16,6 +31,7 @@ export function generateTarpCover(objText, { cell, lift = 0.05, drape = 6, margi
   for (const v of vertices) for (let k = 0; k < 3; k += 1) { lo[k] = Math.min(lo[k], v[k]); hi[k] = Math.max(hi[k], v[k]) }
   const size = hi.map((value, k) => value - lo[k])
   if (!size.every(Number.isFinite)) throw new Error('目标 OBJ 顶点无效')
+  // 步骤 1：未指定网格尺寸时按目标水平尺寸自适应，限幅 0.05–0.5 m。
   const CELL = Number(cell) > 0 ? Number(cell) : Math.max(0.05, Math.min(0.5, Math.max(size[0], size[2]) / 80))
 
   // Grid symmetric about the target's footprint centre, wide enough for the skirt.
@@ -28,6 +44,7 @@ export function generateTarpCover(objText, { cell, lift = 0.05, drape = 6, margi
 
   // Stamp every sample into all four surrounding nodes, so any interpolation of
   // the cover over a sample is at least the sample's height (no poke-through).
+  // 步骤 3 开始：高度场初值为目标最低高度 lo[1]，即“未覆盖”。
   const height = new Float64Array(nx * nz).fill(lo[1])
   const stamp = (x, y, z) => {
     const fi = (x - x0) / CELL, fj = (z - z0) / CELL
@@ -35,6 +52,7 @@ export function generateTarpCover(objText, { cell, lift = 0.05, drape = 6, margi
       if (i >= 0 && i < nx && j >= 0 && j < nz) height[j * nx + i] = Math.max(height[j * nx + i], y)
     }
   }
+  // 每个三角形按重心坐标加密采样（间隔约半个网格），逐点盖章；保证细长三角形也不漏。
   for (const [a, b, c] of triangles) {
     const A = vertices[a], B = vertices[b], C = vertices[c]
     const edge = Math.max(Math.hypot(B[0] - A[0], B[2] - A[2]), Math.hypot(C[0] - A[0], C[2] - A[2]), Math.hypot(C[0] - B[0], C[2] - B[2]))
@@ -44,11 +62,14 @@ export function generateTarpCover(objText, { cell, lift = 0.05, drape = 6, margi
       stamp(A[0] * w + B[0] * s + C[0] * t, A[1] * w + B[1] * s + C[1] * t, A[2] * w + B[2] * s + C[2] * t)
     }
   }
+  // 保存目标上表面高度，仅用于统计被盖章的格数（topCells）。
   const top = Float64Array.from(height)
 
   // Hanging cloth: chamfer max-propagation with a conical falloff, then a light
   // smoothing that can only raise the surface.
+  // 步骤 4：step / diag 为沿轴向 / 对角相邻一格的下垂量（drape × 格距）。
   const step = drape * CELL, diag = step * Math.SQRT2
+  // relax：用邻点高度减去 drop 抬高本格（只升不降）；正反两次扫描覆盖 8 邻域，近似倒锥形距离变换。
   const relax = (i, j, di, dj, drop) => {
     const ii = i + di, jj = j + dj
     if (ii < 0 || ii >= nx || jj < 0 || jj >= nz) return
@@ -60,6 +81,7 @@ export function generateTarpCover(objText, { cell, lift = 0.05, drape = 6, margi
   for (let j = nz - 1; j >= 0; j -= 1) for (let i = nx - 1; i >= 0; i -= 1) {
     relax(i, j, 1, 0, step); relax(i, j, 0, 1, step); relax(i, j, 1, 1, diag); relax(i, j, -1, 1, diag)
   }
+  // 平滑 2 遍：取原值与（自身×4 + 4 邻点）/8 的较大者，只升不降，使布面更连续。
   for (let pass = 0; pass < 2; pass += 1) {
     const copy = Float64Array.from(height)
     for (let j = 1; j < nz - 1; j += 1) for (let i = 1; i < nx - 1; i += 1) {
@@ -68,6 +90,7 @@ export function generateTarpCover(objText, { cell, lift = 0.05, drape = 6, margi
     }
   }
 
+  // 步骤 5：covered 表示该格高于目标底面；仅保留被覆盖格及其 8 邻域的顶点，其余不生成。
   const covered = (k) => height[k] > lo[1] + 1e-6
   const index = new Int32Array(nx * nz).fill(-1)
   const out = ['# Stream Studio draped tarp cover', 'g tarp_cover']
@@ -83,6 +106,7 @@ export function generateTarpCover(objText, { cell, lift = 0.05, drape = 6, margi
     index[k] = ++vertexCount
     out.push(`v ${(x0 + i * CELL).toFixed(4)} ${(height[k] + (covered(k) ? lift : 0)).toFixed(4)} ${(z0 + j * CELL).toFixed(4)}`)
   }
+  // 四个角点都存在时才生成方格，拆为两个三角形；index 为顶点编号（从 1 起，OBJ 约定）。
   let faceCount = 0
   for (let j = 0; j < nz - 1; j += 1) for (let i = 0; i < nx - 1; i += 1) {
     const a = index[j * nx + i], b = index[j * nx + i + 1], c = index[(j + 1) * nx + i + 1], d = index[(j + 1) * nx + i]
@@ -90,6 +114,7 @@ export function generateTarpCover(objText, { cell, lift = 0.05, drape = 6, margi
     out.push(`f ${a} ${d} ${c}`, `f ${a} ${c} ${b}`)
     faceCount += 2
   }
+  // 步骤 6：统计输出网格的包围盒，用于返回 dimensions。
   let coverLo = [Infinity, Infinity, Infinity], coverHi = [-Infinity, -Infinity, -Infinity]
   for (let k = 0; k < nx * nz; k += 1) {
     if (index[k] < 0) continue

@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：test-facet-sparse-aerodynamics.cpp
+// 功能：FacetEB 稀疏冠层空气动力学（energyphysics.h 的 aerodynamics()）回归测试，
+//       对应 review/2026-11-02-sparse-leaf-aerodynamics.md 中的修正
+// 检查项：
+//   1. 稀疏柱中突出的叶片，其叶边界层阻抗不得含有按 1/LAI 放大的“冠层面积稀释”
+//   2. 裸土 LAI 截断点（0.01）两侧叶阻抗连续
+//   3. 中性风廓线下叶宽放大 4 倍，叶边界层阻抗增量等于独立重算的 70·sqrt(w/u) 差值
+//   4. 不同稳定度 × 极小/稀疏 LAI 下阻抗有限且 ≥ 1 s m-1
+//   5. 稀疏土壤阻抗与裸土分支一致（未被改动）
+// 构建：独立可执行文件（只依赖头文件）；通过输出 PASS/FAIL 与退出码报告结果。
+// 约定：aerodynamics(参考高度 m, 风速 m s-1, 冠层高 m, LAI, 叶宽 m, 稳定度 1/L m-1)；阻抗 s m-1。
+// ==========================================================================
+
 #include "../models/histream/src/facetrt/energyphysics.h"
 #include <iostream>
 
@@ -16,6 +30,9 @@ int main() try {
     // Under the same neutral wind profile, increasing width fourfold doubles
     // the leaf boundary resistance. Its increment is independent of LAI
     // dilution; reconstruct only wind, independently of the resistance path.
+    // 独立重建中性风廓线：位移高度 d、粗糙长度 z0、u*、冠层顶风速与 z0 处风速 uz0，
+    // 再算叶边界层阻抗 70·sqrt(w/uz0)；比较叶宽 0.08 → 0.32 m 时 leafResistance 的差值。
+    // （70 与各经验系数沿用被测实现的取值，来源待核对。）
     for (double lai : {.000001, .001, .02, .5, 1.25, 3.5}) {
         const double h=1.5, wind=.4326, sq=std::sqrt(20.6*lai/2);
         const double d=h*(1+std::expm1(-sq)/sq);

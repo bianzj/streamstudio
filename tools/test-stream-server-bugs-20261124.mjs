@@ -1,3 +1,19 @@
+// ==========================================================================
+// 文件：test-stream-server-bugs-20261124.mjs
+// 功能：STREAM 服务端 2026-11-24 第三批修复的 node:test 测试：S1（能量参数校验与未知字段警告）、
+//   冰雪融化开关透传、S7（停止发生在子进程启动之前）、缓存键含 ctime、S11（栅格统计取全部像元）。
+// 主要模块：
+//   1. 夹具：临时目录、气象包与输入文件占位、scene()（最小 EB 场景）与 build()（编译为引擎配置）
+//   2. S1：非法 temperature.energy 取值在提交阶段按引擎规则被拒绝；未知字段只告警不报错
+//   3. iceMelt：只有显式 false 才下发给引擎
+//   4. S7：以源码文本断言（正则）检查 server/stream/index.mjs 中 stop()/launch() 的处理
+//   5. 缓存键：fileStamp 的 key 含 4 段（最后一段为 ctimeMs）
+//   6. S11：rasterBand 的统计覆盖所有像元，仅降采样网格才置 sampled 标志
+// 关系：被测模块 server/stream/config.mjs（createProjectStore）、server/result-cache.mjs（fileStamp）、
+//   server/stream/rasters.mjs（createRasterTools）；不依赖真实引擎。
+// 运行：node --test tools/test-stream-server-bugs-20261124.mjs
+// ==========================================================================
+
 // Server-side tests for the third batch of 2026-11-24 fixes: S1 (energy validation + unknown-field warnings), S7 (stop before
 // spawn), S11 (float32 nodata, true-extreme raster statistics), cache key ctime.
 // Run: node --test tools/test-stream-server-bugs-20261124.mjs
@@ -21,12 +37,16 @@ writeFileSync(pack, JSON.stringify({ kind: 'stream-forcing-pack', schemaVersion:
 const inputFile = join(root, 'input.tif')
 writeFileSync(inputFile, '')
 const store = createProjectStore({ normalizeHostPath: identity, windowsPath: identity, forcingDirectories: () => [join(root, 'documents', 'forcing-metadata')] })
+// scene(energy)：最小 EB 场景（用户给定土壤湿度、ERA5 包为占位），energy 并入 temperature.energy；
+// build(input)：经 createProjectStore.buildEngineConfig 编译成引擎配置，非法取值在此抛错。
 const scene = (energy = {}) => ({ overpass: '2019-07-15T04:00:00Z', locationSource: 'input',
   surface: { type: { file: inputFile }, lai: { value: 2 }, latitude: { value: 40 }, longitude: { value: 116 }, soilMoisture: { value: 0.2 } },
   view: { vza: { value: 0 }, vaa: { value: 0 } }, optical: { enabled: false }, thermal: { enabled: true, bands: [{ name: 'T', center: 10.5, fwhm: 0.5 }] },
   temperature: { mode: 'eb', soilMoisture: { source: 'user' }, era5: { pack }, energy } })
 const build = (input) => store.buildEngineConfig(input, { outputDir: root, dataDir: root })
 
+// 测试：bad 表中每个字段取越界/非法值时都应抛出含字段名的错误；
+//   合法值与"未提供"（空字符串、diffuseFraction = -1 表示 Erbs）应通过。
 test('S1: EB energy values are validated at submission with the engine rules', () => {
   const bad = { soilHeatMethod: 'banana', temperatureMethod: 'x', diffuseFraction: 1.5, spectralBinNm: 150,
     heatRoughnessKb: 21, soilEmissivityK: 0, soilHeatFraction: 2, leafEmissivity: 0, stomatalG0: -1, minWindSpeed: -1,
@@ -42,6 +62,7 @@ test('S1: EB energy values are validated at submission with the engine rules', (
   assert.doesNotThrow(() => build(scene({})))
 })
 
+// 测试：拼写错误的字段（如 stomatalg0）只在 sceneWarnings 中给出一条警告，不使 build 失败。
 test('S1: unknown temperature.energy fields are reported as warnings, never as errors', () => {
   const input = scene({ stomatalg0: 0.02, maxIterations: 40, soilHeatMethod: 'surface' })
   assert.doesNotThrow(() => build(input))
@@ -57,18 +78,25 @@ test('ice melt: only an explicit iceMelt=false is passed to the engine', () => {
   assert.equal(build(scene({ iceMelt: true })).temperature.energy.iceMelt, undefined)
 })
 
+// 测试 S7：这里没有真正启动引擎，而是对 index.mjs 的源码做正则检查——
+//   stop() 能标记尚无子进程的活动作业，launch() 见到 stopped 标志就直接结束为 stopped。
+//   （对源码文本的断言较脆弱，index.mjs 重构这两行时需同步修改。）
 test('S7: stop() marks an active job that has no engine process yet, and launch() honours it', () => {
   const source = readFileSync(join(repo, 'server', 'stream', 'index.mjs'), 'utf8')
   assert.match(source, /active && active\.id === target && !active\.child/)
   assert.match(source, /if \(job\.stopped\) \{ finish\(job, 'stopped', null\); return \}/)
 })
 
+// 测试：fileStamp(file).key 以 '|' 分为 4 段，最后一段为数值（ctimeMs），用于改名/替换后的缓存失效。
 test('cache key: ctimeMs is part of the file identity', () => {
   const stamp = fileStamp(inputFile)
   assert.equal(stamp.key.split('|').length, 4)
   assert.match(stamp.key, /\|\d+(\.\d+)?$/)
 })
 
+// 测试 S11：4100x3 的假栅格，宽度超限时预览按步长 3 降采样；
+//   但最大/最小/均值/计数仍须基于全部像元（1000 位于被跳过的 x = 1 处仍应被统计到），
+//   并置 sampled = true。均值的期望值按 10 的底值加两个异常点解析计算。
 test('S11: rasterBand statistics use every pixel; sampled flag set only for down-sampled grids', () => {
   const width = 4100, height = 3
   const values = new Float64Array(width * height).fill(10)

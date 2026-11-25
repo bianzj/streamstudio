@@ -1,3 +1,16 @@
+# ==========================================================================
+# 文件：prepare_user_release.py
+# 功能：组装 Stream Studio 用户交付目录 D:/releases/streamstudio/<version>（发布辅助脚本，
+#       目前尚未实际使用；详见 docs/development-and-release.md）
+# 主要步骤（main）：
+#   1. 解析参数并检查：输出目录不得已存在；安装包必须存在且文件名含版本号
+#   2. 复制安装包、LICENSE、用户手册与理论手册 PDF
+#   3. 原样带入上一版交付的 examples，并按 --add-example 追加新案例（NAME=目录=案例JSON）
+#   4. 写 案例目录.json（沿用上一版 requiredRunLocation / scope，追加新案例并记录项目文件 sha256）
+#   5. 写 交付清单.json（列出此前所有文件的大小与 sha256）与 SHA256SUMS.txt
+# 约定：路径记录统一为正斜杠；sha256 以 1 MiB 分块计算；不会覆盖已有交付目录。
+# ==========================================================================
+
 """Assemble a Stream Studio user delivery directory D:/releases/streamstudio/<version> (not yet used; for a future release).
 
 Copies the new installer, the two manual PDFs and LICENSE, carries the examples of the previous delivery
@@ -15,6 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+# 作用：分块计算文件的 SHA-256，返回十六进制字符串。
 def sha(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -23,6 +37,7 @@ def sha(path):
     return h.hexdigest()
 
 
+# 作用：按命令行参数生成交付目录（步骤见文件头）。出错时通过 SystemExit 给出原因。
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--version', required=True); p.add_argument('--previous', type=Path, required=True)
@@ -39,6 +54,7 @@ def main():
     shutil.copy2(ROOT / 'LICENSE.txt' if (ROOT / 'LICENSE.txt').exists() else a.previous / 'LICENSE.txt', a.out / 'LICENSE.txt')
     shutil.copy2(ROOT / 'docs' / 'Stream_Studio_User_Manual_CN.pdf', a.out / f'StreamStudio-{a.version}-用户使用手册.pdf')
     shutil.copy2(ROOT / 'docs' / 'Stream_Studio_Theory_Manual_CN.pdf', a.out / f'StreamStudio-{a.version}-模型理论与方法.pdf')
+    # 步骤 3：先整体拷贝上一版 examples，再逐个追加新案例；案例名重复则中止。
     # Previous examples unchanged (built-in examples and user data are kept).
     shutil.copytree(a.previous / 'examples', a.out / 'examples')
     cases = previous['cases']
@@ -48,6 +64,7 @@ def main():
         if target.exists():
             raise SystemExit(f'example name already used: {name}')
         shutil.copytree(folder, target, ignore=shutil.ignore_patterns('__pycache__', 'output', '*.log'))
+        # 案例 JSON 中的 input 被改写为 examples/<name>/<input>，并记录该工程文件的 sha256。
         record = json.loads(Path(entry).read_text(encoding='utf-8')); record['name'] = name
         record['project'] = f"examples/{name}/{record.pop('input')}"
         record['projectSha256'] = sha(a.out / record['project'])
@@ -58,6 +75,8 @@ def main():
                    scope=previous.get('scope', ''),
                    carriedOverFrom=str(a.previous).replace('\\', '/'), cases=cases)
     (a.out / '案例目录.json').write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding='utf-8')
+    # 步骤 5：交付清单只包含此刻已存在的文件（不含它自己和 SHA256SUMS.txt）；
+    # SHA256SUMS.txt 则覆盖除自身外的全部文件（含 交付清单.json）。
     files = sorted(f for f in a.out.rglob('*') if f.is_file())
     listing = [dict(path=f.relative_to(a.out).as_posix(), bytes=f.stat().st_size, sha256=sha(f)) for f in files]
     manifest = dict(kind='streamstudio-user-delivery', version=a.version, preparedAt=now, installerUnchanged=False, newSoftwareRelease=True,

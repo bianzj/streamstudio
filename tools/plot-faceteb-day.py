@@ -1,3 +1,21 @@
+# ==========================================================================
+# 文件：plot-faceteb-day.py
+# 功能：把玉米场景 FacetEB（面元能量平衡）一整天 48 个半小时节点的原生结果整理成图和表：
+#       俯视表面温度 PNG / 总览图 / GIF、分组件（叶、茎、地表网格、底层土壤列）面积加权时间序列
+# 运行：在研究用 WSL Python 中执行 plot-faceteb-day.py <导出目录>（路径同时兼容 C:\ 形式，自动转 /mnt/c/）
+# 输入：导出目录 export-manifest.json（节点、token、TIFF 名、sourceStepSha256 等）、
+#       源运行目录的 project.json、output/faceteb.json（面元顶点）、output/.facet_steps/energy_T=*.bin
+# 主要步骤（main）：
+#   1. 读清单与几何，按工程对象顺序把 faceteb.json 的三角形划分为各对象组件 + 2 个背景三角形
+#   2. 逐节点校验步结果文件 sha256 与布局（每面元 2 侧 × 17 个 float32），读取导出的 512×512 温度 TIFF
+#   3. 按组件做面元面积加权：温度、净辐射 Rn、显热 H、潜热 LE、储热、受光比例及受光/阴影温度
+#   4. 出图：逐节点 PNG（统一色标）、48 图总览、时间变化曲线（PNG/PDF）、动画 GIF
+#   5. 写 timeseries.csv、更新 manifest、生成 index.html / README.md 并打包 zip
+# 约定：二进制温度为 K，输出 PNG/CSV 温度为 °C；通量 W m-2；时间为当地时（UTC+8）；
+#       仅支持“单实例、无缩放、无旋转”的 OBJ 对象（本玉米案例），否则报错；DOY 固定 160。
+# 注意：生成的图为仿真结果（合成晴天气象），不是实测温度；大气校正关闭。
+# ==========================================================================
+
 """Plot native FacetEB temperature rasters and area-weighted component series.
 
 Run with the research WSL Python: plot-faceteb-day.py EXPORT_DIR.
@@ -20,6 +38,7 @@ from osgeo import gdal
 from PIL import Image
 
 
+# 把 Windows 路径（C:\...）转成 WSL 路径（/mnt/c/...），其余路径原样返回。
 def host_path(value):
     value = str(value).replace('\\', '/')
     if re.match(r'^[A-Za-z]:/', value):
@@ -27,6 +46,9 @@ def host_path(value):
     return Path(value)
 
 
+# 作用：读取对象的 OBJ，返回其在场景坐标系中的三角形顶点数组（N×3×3，float32），用于与原生几何逐面对照。
+# 说明：只支持一个未缩放、未旋转的放置（位置文件 1 行 5 列），平移为 (x - 场景宽/2, z, y - 场景长/2)；
+#       面积近似为 0 的退化三角形被剔除（与原生几何一致，待核对）。
 def object_triangles(item, scene):
     vertices, faces = [], []
     with host_path(item['fileName']).open() as stream:
@@ -47,6 +69,7 @@ def object_triangles(item, scene):
     return triangles[np.sum(normal * normal, axis=1) > np.float32(1e-16)]
 
 
+# 作用：命令行入口，完整流程见文件头。
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('export_dir', type=host_path)
@@ -56,6 +79,8 @@ def main():
     source = host_path(manifest['sourceRun'])
     project = json.loads((source / 'project.json').read_text())['configuration']
     geo = json.loads((source / 'output/faceteb.json').read_text())
+    # 步骤 1：每个面元 3 个顶点；面元面积 = 叉积范数/2。对象按工程顺序依次占据面元序列，
+    # 最后 2 个三角形是原生底层土壤列（background），顺序不符时报错。
     vertices = np.asarray(geo['vertexPositions'], dtype=float).reshape(-1, 3, 3)
     area = np.linalg.norm(np.cross(vertices[:, 1] - vertices[:, 0], vertices[:, 2] - vertices[:, 0]), axis=1) / 2
     groups, offset = {}, 0
@@ -70,11 +95,13 @@ def main():
     if len(groups['background']) != 2 or len(vertices) != geo['facetCount']:
         raise ValueError('Unexpected native background or facet count')
     gdal.UseExceptions()
+    # 绘图字体：借用 Windows 的微软雅黑以显示中文；不存在时使用 matplotlib 缺省字体。
     font = Path('/mnt/c/Windows/Fonts/msyh.ttc')
     if font.exists():
         font_manager.fontManager.addfont(str(font))
         plt.rcParams['font.family'] = font_manager.FontProperties(fname=str(font)).get_name()
     plt.rcParams.update({'axes.unicode_minus': False, 'font.size': 10, 'pdf.fonttype': 42})
+    # 步骤 2 的准备：需要 48 个连续的半小时节点；气象文件首行跳过，第 1/5/6 列为气温、入射短波、入射长波。
     nodes = manifest['nodes']
     if len(nodes) != 48 or [n['node'] for n in nodes] != list(range(48)):
         raise ValueError('Expected 48 consecutive half-hour nodes')
@@ -85,6 +112,8 @@ def main():
         binary = source / 'output/.facet_steps' / ('energy_T=' + token + '.bin')
         if hashlib.sha256(binary.read_bytes()).hexdigest() != node['sourceStepSha256']:
             raise ValueError('Original step was changed: ' + token)
+        # 步骤 2：布局为 [面元][侧 0/1][17 个量]；用到的列：0 温度(K)、4 Rn、5 H、6 LE、7 储热、
+        # 8 受光比例、9 受光温度(K)、10 阴影温度(K)，其余列含义待核对。
         data = np.fromfile(binary, dtype='<f4').reshape(len(vertices), 2, -1)
         if data.shape[2] != 17 or not np.isfinite(data).all():
             raise ValueError('Invalid step field layout or values')
@@ -101,6 +130,8 @@ def main():
                'incoming_longwave_W_m2': float(weather[node['node'], 6]),
                'image_mean_C': float(np.nanmean(image)), 'image_min_C': float(np.nanmin(image)),
                'image_max_C': float(np.nanmax(image))}
+        # 步骤 3：逐组件统计。对象的整体/叶片通量存在 side 0，不重复计两侧；
+        # 背景土壤按法线朝向选取朝上的一侧。
         for name, ids in groups.items():
             # Objects store a whole-object/leaf flux on side 0; do not double-count sides.
             # Native background soil uses its upward-facing side.
@@ -125,6 +156,7 @@ def main():
             for key, col, w in [('sunlit', 9, weights * fraction), ('shaded', 10, weights * (1 - fraction))]:
                 row[name + '_' + key + '_conditional_temperature_C'] = float(np.average(values[:, col] - 273.15, weights=w)) if w.sum() > 1e-10 else np.nan
         rows.append(row)
+    # 步骤 4：输出时间序列 CSV（带 BOM 便于 Excel 打开），再统一色标 [floor(min), ceil(max)] 出图。
     table = pd.DataFrame(rows)
     table.to_csv(out / 'timeseries.csv', index=False, encoding='utf-8-sig', float_format='%.7f')
     stack = np.stack(images)
@@ -153,6 +185,7 @@ def main():
     fig.suptitle('FacetEB 玉米场景：48 个半小时时刻的俯视温度图\nDOY 160 · 同一色标 · 合成晴天气象', fontsize=19)
     fig.savefig(out / 'temperature_48_overview.png')
     plt.close(fig)
+    # 时间变化曲线：上排为各组件平均温度、受光/阴影叶温、辐射驱动；下排为叶、茎、地表网格的能量通量。
     fig, axes = plt.subplots(2, 3, figsize=(18, 10.2), dpi=160, layout='constrained')
     t = table.hour_local
     for name, label, color in [('leaf', '叶片', '#20948b'), ('stem', '茎', '#ba6b35'), ('soil', '地表网格', '#bc3158'), ('background', '底层土壤列', '#6e66ad')]:
@@ -180,12 +213,14 @@ def main():
     fig.savefig(out / 'time_variation.png')
     fig.savefig(out / 'time_variation.pdf')
     plt.close(fig)
+    # 动画 GIF：把各节点 PNG 缩成缩略图后按每帧 220 ms 循环播放。
     thumbs = []
     for node in nodes:
         with Image.open(out / node['png']) as frame:
             frame.thumbnail((720, 630))
             thumbs.append(frame.convert('RGB').copy())
     thumbs[0].save(out / 'temperature_day.gif', save_all=True, append_images=thumbs[1:], duration=220, loop=0)
+    # 步骤 5：回写清单（色标范围、各组件面元数与面积、数据性质声明），再生成 HTML/README 与 zip 包。
     manifest.update({'colorRange_C': [float(vmin), float(vmax)], 'pngCount': len(nodes),
                      'originalStepHashesVerified': True, 'componentFacetCounts': {k: len(v) for k, v in groups.items()},
                      'componentAreas_m2': {k: float(area[v].sum()) for k, v in groups.items()},

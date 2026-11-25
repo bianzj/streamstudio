@@ -1,3 +1,20 @@
+# ==========================================================================
+# 文件：test-assimilation-contract.py
+# 功能：STREAM 原生引擎（models/bin_x64/Release/stream.exe）的同化 / 热红外正演 / 反演契约测试（pytest），
+#       使用 1×1 像元的合成栅格，只验证契约与数值一致性，不声称野外精度
+# 运行：C:/work/miniconda/python.exe -m pytest tools/test-assimilation-contract.py（需先构建 stream 的 Release 版）；
+#       Node 侧配置编译测试见 test-assimilation-config.mjs
+# 主要模块：
+#   1. raster / run：写合成 GeoTIFF、拼 stream-image-config JSON、调用 stream.exe run
+#   2. 同化契约：无效参数被拒；栅格误差/协方差控制分析值；QA 剔除、非法误差、非正定协方差保持背景值
+#   3. 反演产物：lsct 权重分数与辐亮度分数是两个不同产品
+#   4. 热红外正演：run_thermal + Planck 函数，检查反射天空、夜间无阳照分量、LST 反演与正演互逆
+#   5. 跨仓库集成：LS4T 导出 → 工作台配置编译 → 原生再次分析（需 LS4T_ROOT，缺失则跳过）
+# 约定：温度 K；波长 µm；分量顺序 soilSunlit / soilShaded / leafSunlit / leafShaded；
+#       背景协方差缺省为方差 25 K²、分量间协方差 12.5 K²（相关 0.5，来自测试中的解析推导）；
+#       Planck 常数 C1 = 1.1910439340652e8 W µm4 m-2 sr-1，C2 = 14388.291040407 µm K。
+# ==========================================================================
+
 """Small synthetic RT assimilation checks; no field accuracy claim.
 
 Run with C:/work/miniconda/python.exe -m pytest tools/test-assimilation-contract.py
@@ -17,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / 'models/bin_x64/Release'
 
 
+# 作用：把 values 写成 1×1 像元、len(values) 个波段的 Float32 GeoTIFF，返回路径字符串。
 def raster(path, values):
     values = np.asarray(values, np.float32).reshape(-1, 1, 1)
     ds = gdal.GetDriverByName('GTiff').Create(str(path), 1, 1, len(values), gdal.GDT_Float32)
@@ -26,6 +44,9 @@ def raster(path, values):
     return str(path)
 
 
+# 作用：生成同化场景配置并运行 stream.exe，返回 (进程结果, 输出目录)。
+# extra 覆盖/追加 assimilation 字段；inversion=True 改为 lsct 反演（去掉同化块）；
+# brightness=True 改用亮温观测并打开 10.5 µm 热红外通道。超时 60 s。
 def run(tmp_path, extra, *, inversion=False, brightness=False):
     out = tmp_path / 'out'
     out.mkdir()
@@ -53,6 +74,7 @@ def run(tmp_path, extra, *, inversion=False, brightness=False):
     return result, out
 
 
+# 无效契约：分量误差为 0、波长为 0、观测层级未知、来源与先验来源重复，引擎都应返回非零退出码。
 @pytest.mark.parametrize('extra', [dict(sigmaComponentK=0), dict(lstWavelengthUm=0),
     dict(observationLevel='toa'), dict(sourceIds=['scene'], priorSourceIds=['scene'])])
 def test_reject_invalid_contract(tmp_path, extra):
@@ -60,6 +82,8 @@ def test_reject_invalid_contract(tmp_path, extra):
     assert result.returncode != 0, result.stdout
 
 
+# 观测增量 +10 K、观测误差 σ=20 K（R=400 K²）；背景协方差的全 1 特征值为 25·(1+3·0.5)=62.5 K²，
+# 分析增量 = 10·62.5/(400+62.5)（见下方断言）。
 def test_raster_errors_control_the_analysis(tmp_path):
     sigma = raster(tmp_path/'sigma.tif', [20.] * 4)
     result, out = run(tmp_path, dict(uncertainty=sigma, lstWavelengthUm=12.))
@@ -74,6 +98,7 @@ def test_raster_errors_control_the_analysis(tmp_path):
 
 
 @pytest.mark.parametrize('value', [256., float('nan')])
+# QA 位 256（被剔除）或 NaN 的观测不参与同化，分析值保持背景 300 K。
 def test_qa_rejection_preserves_background(tmp_path, value):
     qa = raster(tmp_path/'qa.tif', [value])
     result, out = run(tmp_path, dict(qa=qa))
@@ -83,6 +108,7 @@ def test_qa_rejection_preserves_background(tmp_path, value):
 
 
 @pytest.mark.parametrize('value', [0., -1., float('nan')])
+# 不合法的观测误差（0、负、NaN）不得退回缺省误差，而是丢弃该观测，保持背景。
 def test_invalid_error_never_falls_back_to_default(tmp_path, value):
     sigma = raster(tmp_path/'sigma.tif', [value] * 4)
     result, out = run(tmp_path, dict(uncertainty=sigma))
@@ -91,6 +117,7 @@ def test_invalid_error_never_falls_back_to_default(tmp_path, value):
     np.testing.assert_allclose(ds.ReadAsArray(), 300.)
 
 
+# 观测误差协方差 R（方差 400、协方差 200）使四个分量不能当作 4 个独立观测，全 1 特征值 400+3·200=1000 K²。
 def test_correlated_component_errors_are_not_four_independent_measurements(tmp_path):
     covariance = np.full((4, 4), 200.)
     np.fill_diagonal(covariance, 400.)
@@ -102,6 +129,7 @@ def test_correlated_component_errors_are_not_four_independent_measurements(tmp_p
     np.testing.assert_allclose(ds.ReadAsArray(), 300. + 10.*62.5/(1000.+62.5), atol=3e-4)
 
 
+# R 非正定（对角 1、非对角 2）时拒绝分析，保持背景值。
 def test_non_positive_definite_covariance_keeps_background(tmp_path):
     covariance = np.full((4, 4), 2.)
     np.fill_diagonal(covariance, 1.)
@@ -111,6 +139,7 @@ def test_non_positive_definite_covariance_keeps_background(tmp_path):
     np.testing.assert_allclose(ds.ReadAsArray(), 300.)
 
 
+# lsct_radiance_fractions 应等于 权重 × Planck 辐亮度 再归一化，不等同于权重分数 lsct_fractions。
 def test_weight_fractions_and_radiance_fractions_are_distinct_products(tmp_path):
     result, out = run(tmp_path, {}, inversion=True)
     assert result.returncode == 0, result.stderr + result.stdout
@@ -126,9 +155,11 @@ def test_weight_fractions_and_radiance_fractions_are_distinct_products(tmp_path)
 
 
 # ---- thermal forward operator (2026-11-20): reflected sky, night weights, retrieval consistency ----
+# Planck 辐射常数（C1：W µm4 m-2 sr-1；C2：µm K）与 Stefan–Boltzmann 常数（W m-2 K-4）。
 C1, C2, SIGMA = 1.1910439340652e8, 14388.291040407, 5.670374419e-8
 
 
+# Planck 光谱辐亮度（W m-2 sr-1 µm-1），t 为 K，wl 为 µm；inverse_planck 为其逆（辐亮度 → 亮温）。
 def planck(t, wl):
     return C1/(wl**5*np.expm1(C2/(wl*t)))
 
@@ -137,6 +168,8 @@ def inverse_planck(radiance, wl):
     return C2/(wl*np.log1p(C1/(radiance*wl**5)))
 
 
+# 作用：运行 RT 模式热红外正演（或反演）并返回输出目录，失败直接断言。components 依次为四个分量温度（K）；
+# sky 为反射天空长波设置；土壤发射率取常数模型。地类 10 与 LAI 由参数决定。
 def run_thermal(tmp_path, tag, *, components, lai=0., overpass='2019-07-15T04:00:00Z', sky=None, inversion=None,
                 thermal=True, soil_moisture=.05):
     out = tmp_path/tag
@@ -164,11 +197,14 @@ def run_thermal(tmp_path, tag, *, components, lai=0., overpass='2019-07-15T04:00
     return out
 
 
+# 读取 1×1 栅格指定波段的像元值。
 def read_band(path, band=1):
     with gdal.Open(str(path)) as ds:
         return float(ds.GetRasterBand(band).ReadAsArray()[0, 0])
 
 
+# 预期亮温：Planck 逆变换（ε·B(300 K) + (1-ε)·B(T_sky)），其中 T_sky = (L↓/σ)^(1/4)；
+# sky 模式为 none 时回到仅有发射项的旧结果。
 def test_bare_soil_brightness_includes_reflected_sky(tmp_path):
     # Dry bare soil, constant emissivity 0.955 (classes.json), isothermal 300 K, configured L↓ = 350 W m-2.
     out = run_thermal(tmp_path, 'sky', components=[300.]*4, sky=dict(value=350.))
@@ -181,6 +217,7 @@ def test_bare_soil_brightness_includes_reflected_sky(tmp_path):
     assert abs(read_band(legacy/'tir_brightness_temperature.tif') - inverse_planck(.955*planck(300., 10.5), 10.5)) < 2e-3
 
 
+# 夜间（116°E 当地午夜）阳照分量不应出现在亮温中：改变阳照分量温度结果不变。
 def test_night_thermal_has_no_sunlit_components(tmp_path):
     night = '2019-07-15T16:00:00Z'  # local midnight at 116 E
     a = run_thermal(tmp_path, 'night_a', components=[320., 290., 315., 292.], lai=2., overpass=night, sky=dict(mode='none'))
@@ -188,6 +225,7 @@ def test_night_thermal_has_no_sunlit_components(tmp_path):
     assert abs(read_band(a/'tir_brightness_temperature.tif') - read_band(b/'tir_brightness_temperature.tif')) < 1e-4
 
 
+# 一致性：用正演得到的亮温作观测做 LST 反演，应取回 305 K（含反射天空项）。
 def test_lst_retrieval_inverts_the_forward_operator_with_sky(tmp_path):
     sky = dict(value=380.)
     forward = run_thermal(tmp_path, 'forward', components=[305.]*4, lai=2., sky=sky)
@@ -203,6 +241,7 @@ def test_rt_mode_reads_soil_emissivity_settings(tmp_path):
     assert abs(read_band(out/'tir_brightness_temperature.tif') - inverse_planck(.955*planck(300., 10.5), 10.5)) < 2e-3
 
 
+# Windows 文件名不区分大小写：views 中引用大小写不同的同一文件应被原生引擎拒绝。
 @pytest.mark.skipif(os.name != 'nt', reason='Windows case-insensitive file identity')
 def test_native_rejects_same_brightness_file_with_different_case(tmp_path):
     result, _ = run(tmp_path, dict(views=[dict(data=str(tmp_path/'OBS.tif'),
@@ -210,6 +249,8 @@ def test_native_rejects_same_brightness_file_with_different_case(tmp_path):
     assert result.returncode != 0, result.stdout
 
 
+# 跨仓库集成：LS4T 反演结果导出 → 工作台（server/stream/config.mjs）编译 → 原生再次分析，
+# 结果应等于解析后验 300 + B (B+P)^-1 (T_ls4t - 300)。
 def test_ls4t_export_through_workbench_to_native_analysis(tmp_path, monkeypatch):
     ls4t_root = Path(os.environ.get('LS4T_ROOT', 'C:/work/ls4t'))
     if not (ls4t_root/'base/component_map.py').is_file():
@@ -231,6 +272,7 @@ def test_ls4t_export_through_workbench_to_native_analysis(tmp_path, monkeypatch)
     scene['locationSource'] = 'input'
     scene_path = tmp_path/'workbench-scene.json'
     scene_path.write_text(json.dumps(scene), encoding='utf-8')
+    # 用 node 调用 createProjectStore().buildEngineConfig 编译场景，输出 JSON 供原生引擎重新读取。
     js = """import fs from 'node:fs';
 const {createProjectStore}=await import(process.argv[1]);
 const scene=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));

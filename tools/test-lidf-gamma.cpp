@@ -1,3 +1,22 @@
+// ==========================================================================
+// 文件：test-lidf-gamma.cpp
+// 功能：叶倾角分布（LIDF）、投影函数 G 与双向散射函数 Gamma 的数值自检（独立可执行程序，无单元测试框架）。
+//   被测代码是 VoxelRT/VoxelEB 着色器共用的 models/histream/shader/lidf_common.h，这里按 C++ 编译。
+//   下方原有注释给出编译命令与 7 项检查清单（SAIL 类频率、G 与暴力积分/PROSAIL 对照、球面均值、
+//   Gamma 归一化、球面分布极限）。
+// 主要模块：
+//   1. check()/failures：打印 [ok]/[FAIL] 行并累计失败数，进程退出码 = 是否有失败
+//   2. 暴力参考实现：对叶法向方位角做数值积分（bruteClassProjection、bruteClassGamma）
+//   3. 独立参考实现：双精度 PROSAIL 的 dcum/volscatt 转写（prosailDcum、prosailG）、
+//      Ross 球形叶分布闭式 Gamma（rossSphericalGamma）、连续 LIDF 密度（continuousDensity）
+//   4. sphereMean：在 (mu, phi) 等立体角网格上对 G 与 Gamma 做全球面积分
+//   5. main()：逐个 LIDF 算例执行检查 1-6，最后做检查 7（球面极限）
+// 约定：方向向量为 (x, y, z)，y 轴向上（mu = cos 天顶角 = y）；s 指向光源，o 指向观测者；
+//   角度除注明外均为度；13 个叶倾角类中心为 5,15,...,75 度、81,83,85,87,89 度（SAIL 离散化）。
+//   Gamma 积分归一化：(1/pi)∫Gamma dΩ = (rho+tau)·G(s)，反射部分与透射部分各自积分为 G(s)。
+// 关系：只读依赖 lidf_common.h；不参与构建默认目标（CMake 目标 histream_lidf_gamma_tests）。
+// ==========================================================================
+
 // Numerical check of the shared LIDF / G / Gamma code used by VoxelRT and
 // VoxelEB (models/histream/shader/lidf_common.h, compiled here as C++).
 //
@@ -36,6 +55,7 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 int failures = 0;
 
+// 作用：输出一行检查结果；ok 为假时累加 failures。value 为实测误差，limit 为阈值（仅用于显示）。
 void check(bool ok, const std::string& what, double value, double limit)
 {
     std::printf("  [%s] %-58s %.3e (limit %.1e)\n", ok ? "ok" : "FAIL", what.c_str(), value, limit);
@@ -49,6 +69,8 @@ Dir fromAngles(double zenithDeg, double azimuthDeg)
     return {std::sin(t) * std::cos(p), std::cos(t), std::sin(t) * std::sin(p)};
 }
 
+// 作用：暴力参考——单个叶倾角类 thetaL（弧度）在观测方向余弦 mu 下的平均投影面积，
+//   对叶法向方位角 phi 做 20000 点中点积分，用来校验 lidf 闭式类核。
 // (1/2pi) int_0^2pi |d . n(thetaL, phi)| dphi
 double bruteClassProjection(double thetaL, double mu)
 {
@@ -62,6 +84,7 @@ double bruteClassProjection(double thetaL, double mu)
     return sum / n;
 }
 
+// 作用：暴力参考——同上思路求单类的 Gamma 反射/透射分量（输出 r、t，已按方位角平均）。
 // Gamma_R/T of one inclination class by brute force, s towards the source,
 // o towards the observer: reflection when both lie on the same leaf side.
 void bruteClassGamma(double thetaL, Dir s, Dir o, double& r, double& t)
@@ -79,11 +102,14 @@ void bruteClassGamma(double thetaL, Dir s, Dir o, double& r, double& t)
     t /= n;
 }
 
+// 作用：第 i 个（0..12）SAIL 叶倾角类的中心角（弧度）：前 8 类 5+10i 度，后 5 类 81+2(i-8) 度。
 double classCenterRad(int i)
 {
     return (i < 8 ? 5.0 + 10.0 * i : 81.0 + 2.0 * (i - 8)) * kPi / 180.0;
 }
 
+// 作用：Ross 球形叶倾角分布的 Gamma 闭式解（rho 叶反射率、tau 叶透射率），
+//   作为检查 7 中"改动前所用闭式"的参考值；返回的是 rho·Gamma_R + tau·Gamma_T 的组合量。
 double rossSphericalGamma(Dir s, Dir o, double rho, double tau)
 {
     // a = angle between incident (-s) and scattered (o) propagation.
@@ -122,6 +148,8 @@ double continuousG(const std::vector<double>& f, double mu)
 // Independent double-precision transcription of PROSAIL (Verhoef SAIL) for the
 // reference G: dcum/dladgen class frequencies and volscatt chi_s, so that
 // G_SAIL(theta_s) = sum_i lidf_i chi_s(theta_Li) = k_s cos(theta_s).
+// 作用：PROSAIL 中 dcum 的双精度转写：Verhoef LIDF 参数 (a, b) 下，天顶角 t（度）以内的
+//   累积叶倾角频率；a > 1 表示球形分布（闭式 1-cos t）。用不动点迭代解 y（步长小于 1e-12 时停止）。
 double prosailDcum(double a, double b, double t)
 {
     const double rd = kPi / 180.0;
@@ -137,6 +165,8 @@ double prosailDcum(double a, double b, double t)
     return (2.0 * y + p) / kPi;
 }
 
+// 作用：PROSAIL 参考 G(thetaS)：先由 dcum 差分得 13 类频率，再对 volscatt 的 chi_s 加权求和，
+//   即 G = k_s·cos(theta_s)。与 lidf_common.h 的实现相互独立，用于检查 2。
 double prosailG(double a, double b, double thetaSDeg)
 {
     const double rd = kPi / 180.0;
@@ -161,6 +191,8 @@ double prosailG(double a, double b, double thetaSDeg)
     return g;
 }
 
+// 作用：在 (mu, phi) 等立体角网格（400×400）上积分。返回 G 的球面平均；gamma 为真时同时输出
+//   (1/pi)∫Gamma_R dΩ 与 (1/pi)∫Gamma_T dΩ（光源方向 s 固定，观测方向遍历全球面）。
 double sphereMean(const float* frequency, bool gamma, Dir s, double& reflectionIntegral, double& transmissionIntegral)
 {
     // Midpoint rule in (mu, phi), equal solid angle cells.
@@ -188,6 +220,8 @@ double sphereMean(const float* frequency, bool gamma, Dir s, double& reflectionI
 }
 } // namespace
 
+// 作用：测试入口。先检查类频率有效性与类中心表，再对 7 个 LIDF 算例逐一做检查 2-6，
+//   最后做检查 7；有失败则返回 1。固定随机种子 20261122，保证结果可复现。
 int main()
 {
     struct Case { const char* name; double a, b; };
@@ -224,6 +258,7 @@ int main()
         std::printf("\n");
         check(ok && std::abs(sum - 1.0) < 1e-6, "frequencies valid, sum = 1", std::abs(sum - 1.0), 1e-6);
 
+        // 步骤：天顶角每 5 度取样，比较闭式 G 与暴力积分、PROSAIL 参考、连续密度（9000 个倾角格）三者。
         // 2./3. G(mu)
         const auto density = continuousDensity(c.a, c.b, 9000);
         double errBrute = 0.0, errCont = 0.0;

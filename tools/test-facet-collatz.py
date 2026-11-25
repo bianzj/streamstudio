@@ -1,3 +1,17 @@
+# ==========================================================================
+# 文件：test-facet-collatz.py
+# 功能：FacetRT 叶片气孔阻抗（Collatz C3/C4 + Ball-Berry）的聚焦测试：从 facetrtcore.cpp 中按函数签名
+#       抽取真实实现（saturationVaporPressure、quadraticRoot、leafStomatalResistance）拼成测试程序，
+#       避免链接 Vulkan 应用，也不复制生理学实现
+# 运行：在 VS x64 开发者命令行中执行（需要 cl）；生成 build/test-facet-collatz-generated.cpp 并编译运行
+# 主要步骤：
+#   1. function()：按花括号配平从 facetrtcore.cpp 截取指定函数全文
+#   2. 拼出 C++ 测试程序（含冻结的 C4 参考值，来自 diagnose-maize-hot-leaf.py 的独立 CO2/能量闭合）
+#   3. 检查：C4 参考值、夜间截距的局地摩尔体积转换、零截距解析解、C3/C4 阻抗范围 [1, 625000] s m-1
+#   4. 调用 cl 编译并运行，失败即抛出非零退出码
+# 与其他文件：依赖 models/histream/src/facetrt/facetrtcore.cpp 与 leafbiochemistry.h。
+# ==========================================================================
+
 """Compile the actual anonymous-namespace Collatz function for focused tests.
 
 Extraction avoids linking the Vulkan application; no physiology implementation
@@ -12,6 +26,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 source = (ROOT/'models/histream/src/facetrt/facetrtcore.cpp').read_text(encoding='utf-8')
 
 
+# 作用：返回 facetrtcore.cpp 中以 signature 开头的函数全文（从签名到匹配的右花括号）。
+# 局限：按花括号计数，不处理字符串/注释内的花括号。
 def function(signature):
     start = source.index(signature)
     opening = source.index('{', start)
@@ -23,6 +39,7 @@ def function(signature):
     return source[start:end]
 
 
+# 测试程序头部：包含生物化学头文件并拼接被测函数（保持原实现不变）。
 harness = r'''
 #include "../models/histream/src/facetrt/leafbiochemistry.h"
 #include <limits>
@@ -69,6 +86,7 @@ int main() try {
     std::cout << "PASS: Collatz nonzero/zero intercept, local gas conversion, darkness and C3/C4 bounds\n";
 } catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; return 1; }
 '''
+# 步骤 4：写出测试源码，用 MSVC cl（C++17）编译并运行；任一步失败即抛 CalledProcessError。
 test = ROOT/'build/test-facet-collatz-generated.cpp'
 test.write_text(harness, encoding='utf-8')
 exe = ROOT/'build/test-facet-collatz.exe'

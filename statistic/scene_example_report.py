@@ -1,3 +1,18 @@
+# ==========================================================================
+# 文件：scene_example_report.py
+# 功能：读取 run_scene_examples.mjs 跑出的建筑/森林 FacetEB 结果，生成对照图、汇总 CSV 与说明 TXT。
+# 主要步骤：
+#   1. 逐场景读取 output/process/faceteb_T=*.json（必须恰好一个时刻），取面元正反面均值
+#   2. 读取同目录引用的几何文件，得到三角形顶点；按组分（1 土壤/背景、2 植被、3 建筑）
+#      统计温度与四类通量（净辐射、显热、潜热、表面热通量）的均值/极值/标准差
+#   3. 绘制两场景并排的画布：斜轴测三维温度图（共用色标）、温度直方图、组分均值表
+#   4. 写出 PNG、汇总 CSV（utf-8-sig）和说明与统计摘要 TXT
+# 输入：命令行参数为 run_scene_examples.mjs 创建的 component-scenes-* 目录。
+# 与其他文件：复用 histream_statistics.py 的 colorize、draw_colorbar、load_font、read_structure。
+# 约定：温度 ℃（由 K 减 273.15），通量 W/m2；按面元数量统计，不按面积加权；几何为 Y 轴向上。
+# 注意：画布尺寸与版面坐标为硬编码，只适配这两个固定示例。
+# ==========================================================================
+
 """Render the actual building/forest demo outputs using numpy and Pillow."""
 from __future__ import annotations
 
@@ -12,6 +27,8 @@ from PIL import Image, ImageDraw
 from histream_statistics import colorize, draw_colorbar, load_font, read_structure
 
 
+# 作用：完整的报告流程（读取结果 → 统计 → 绘图 → 写文件），见文件头步骤 1-4。
+# 输入：命令行 directory；输出：目录下的 PNG、CSV、TXT；缺数据时抛 ValueError。
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory', type=Path)
@@ -19,24 +36,29 @@ def main() -> None:
     destination = args.directory.resolve()
     scenes = []
     rows = []
+    # 步骤 1-2：逐场景读取结果并按组分统计。groups 为（组分编号, 显示名）。
     for key, title, groups in [('building', '建筑场景 · 单栋房屋', [(1, '土壤/背景'), (3, '建筑')]),
                                ('forest', '森林场景 · 9 株简化树木', [(1, '土壤/背景'), (2, '植被')])]:
         files = sorted((destination / key / 'output/process').glob('faceteb_T=*.json'))
         if len(files) != 1:
             raise ValueError(f'{key}: expected exactly one energy timestep, got {len(files)}')
+        # 'mean' 即面元正反面取均值（与画布说明文字一致）。
         structure = read_structure(files[0], 'mean')
         if structure.components is None:
             raise ValueError(f'{key}: missing component labels')
         fields = {field.identifier: field.values for field in structure.fields}
         temperature = fields['temperature'] - 273.15
+        # 几何文件路径来自结果元数据，缺省回退到上一级的 faceteb.json（兼容缺该字段的结果）。
         geometry_path = files[0].parent / structure.metadata.get('geometryFile', '../faceteb.json')
         geometry = json.loads(geometry_path.read_text(encoding='utf-8'))
+        # 顶点数组按（三角形, 3 个顶点, xyz）重排；其数量必须与面元数一致。
         triangles = np.asarray(geometry['vertexPositions']).reshape(-1, 3, 3)
         assert len(triangles) == len(temperature) == len(structure.components)
         for component, label in groups:
             mask = structure.components == component
             for field, values in [('temperatureC', temperature), *[(f, fields[f]) for f in
                                   ('netRadiation', 'sensibleHeat', 'latentHeat', 'surfaceHeatFlux')]]:
+                # 仅统计有限值；invalid_count 记录该组分中被剔除（NaN/Inf）的面元数。
                 valid = values[mask & np.isfinite(values)]
                 if not len(valid):
                     raise ValueError(f'{key}: no valid {label}/{field} data')
@@ -47,8 +69,11 @@ def main() -> None:
                                  maximum=float(valid.max()), standard_deviation=float(valid.std())))
         scenes.append((key, title, groups, structure, temperature, triangles))
 
+    # 步骤 3：画布 1800×1430，左右各一个场景面板；温度色标范围取两场景全局取整的最小/最大值，
+    # 使两场景颜色可直接比较。
     canvas = Image.new('RGB', (1800, 1430), '#eef3f7')
     draw = ImageDraw.Draw(canvas)
+    # 局部绘字辅助函数：在 canvas 上指定位置按字号/粗体绘制文本。
     def text(x, y, message, size=23, fill='#20394b', bold=False):
         draw.text((x, y), message, font=load_font(size, bold), fill=fill)
 
@@ -63,6 +88,8 @@ def main() -> None:
         text(x + 22, 147, title, 29, bold=True)
         text(x + 22, 191, '三维面元温度（℃）· 两场景共用色标', 21)
 
+        # 三维视图：绕 Y 轴旋转 yaw=38°，再俯仰 elevation=30° 做正交斜投影，
+        # 按相机深度由远到近画多边形（画家算法）；缩放使图形适配约 790×370 像素区域。
         # Y-up geometry; fit an orthographic oblique view and paint far to near.
         center = (triangles.min(axis=(0, 1)) + triangles.max(axis=(0, 1))) / 2
         points = triangles - center
@@ -79,6 +106,7 @@ def main() -> None:
             draw.polygon(list(zip(px[face], py[face])), fill=tuple(int(c) for c in colors[face]))
         draw_colorbar(canvas, draw, x + 28, 659, 798, 15, low, high)
 
+        # 温度直方图：28 个等宽区间，纵轴为该组内面元占比（%），纵轴上限向上取整到 10 的倍数。
         text(x + 22, 705, '温度分布 · 每组内面元比例（%）', 24, bold=True)
         left, right, top, bottom = x + 72, x + 810, 794, 962
         edges = np.linspace(low, high, 29)
@@ -105,6 +133,7 @@ def main() -> None:
             n = int((structure.components == component).sum())
             text(x + 25 + j * 395, 753, f'{label}：{n:,} 面元', 21, palette[component])
 
+        # 组分均值表：从 rows 中取各组分、各字段的 mean。
         text(x + 22, 1010, '组分均值 · 通量单位 W/m²', 24, bold=True)
         columns = [(22, '组分'), (185, '温度℃'), (315, '净辐射'), (445, '显热'), (560, '潜热'), (675, '表面热通量')]
         for offset, header in columns:
@@ -118,6 +147,7 @@ def main() -> None:
         text(x + 22, 1213, '全量统计；未按面积加权；不存在的组分不画图。', 20, '#617381')
     text(40, 1305, '说明：单节点、默认物化参数；森林 OBJ 整体赋予植被属性，未细分木质部。', 23)
     text(40, 1349, '仅验证输出与统计展示，不代表实测标定或长期热状态；CSV/TXT 和各组分布图随附。', 23)
+    # 步骤 4：写出图片、汇总 CSV 与说明 TXT（中文文件名；CSV/TXT 用 utf-8-sig 便于 Excel 打开）。
     canvas.save(destination / '建筑与森林统计对照.png')
     with (destination / '建筑与森林统计汇总.csv').open('w', encoding='utf-8-sig', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))

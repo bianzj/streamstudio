@@ -1,4 +1,24 @@
-﻿// Builds examples on the realistic 100 m forest (20 jacaranda trees + 200 searsia
+﻿// ==========================================================================
+// 文件：generate-forest-example.mjs
+// 功能：基于“真实 100 m 森林”布局（20 棵蓝花楹 + 200 株漆树灌木）生成内置示例工程，两种变体：
+//   - 默认：VoxelEB，输出温度、GPP、NPP（assets/examples/forest）
+//   - --vehicles：RayTracing，在林间空地摆放 11 辆车（1 辆裸车 + 5 辆遮阳棚下 + 5 辆苫布覆盖），
+//     100 个连续波段高光谱影像
+// 主要步骤：
+//   1. 解析参数，确定输出目录；准备 positions/、meteorology/ 子目录
+//   2. 写入 48 节点气象（内置 meteo.txt 的前 48 条）
+//   3. 创建默认工程，按变体设定场景/光照/气象/传感器/控制参数
+//   4. 为两个树种生成植被对象：复制布局位置文件，读取模型 json 取尺寸，按网格材质绑定
+//   5. （仅 --vehicles）在林冠空地中选 11 个车位：栅格化树木最低几何高度 → 找净空 ≥ 3.3 m 的候选
+//      → 选冠层覆盖最少的 → 最远点法铺开 → 调用 addVehicleLineup 添加车辆与所需共享资源
+//   6. 校验工程，写 project.json 与 README.md
+// 约定：长度 m；布局/位置文件每行为 北向、东向、高度、缩放、旋转角（度）；场景边长 SCENE = 100 m。
+// 注意：未指定输出目录时，--vehicles 默认写到 D:/cases/streamstudio/vehicle-tarp/forest（本机路径）。
+// 与其他文件：依赖 src/renderer/src/project-schema.js、tools/vehicle-lineup.mjs、
+//   tools/compact-obj.mjs（蓝花楹用其生成的紧凑副本）与 assets/obj-library 下的布局与模型。
+// ==========================================================================
+
+// Builds examples on the realistic 100 m forest (20 jacaranda trees + 200 searsia
 // shrubs, layout in assets/obj-library/large_scene/realistic_forest_100m/).
 //   node tools/generate-forest-example.mjs [output directory]             VoxelEB: temperature, GPP, NPP
 //   node tools/generate-forest-example.mjs --vehicles [output directory]  RayTracing: vehicle lineup in forest openings
@@ -16,11 +36,15 @@ const outputArg = args.find((arg) => !arg.startsWith('--'))
 const exampleRoot = resolve(outputArg ?? (withVehicles ? 'D:/cases/streamstudio/vehicle-tarp/forest' : join(projectRoot, 'assets', 'examples', 'forest')))
 for (const folder of ['positions', 'meteorology']) mkdirSync(join(exampleRoot, folder), { recursive: true })
 
+// 常量：场景边长、布局目录，以及 mesh() 辅助函数（为 OBJ 的各分组绑定
+// 光谱/热/材质/冠层名称）。
 const SCENE = 100
 const LAYOUT = 'assets/obj-library/large_scene/realistic_forest_100m'
 const mesh = (name, spectralName, thermalName, materialName, canopyName) => ({ name, spectralName, thermalName, materialName, canopyName })
 // Shared library models (not copied): the server resolves assets/ paths against Stream Studio's resources.
 // The jacaranda uses its compact copy (tools/compact-obj.mjs) so it fits the 15 MiB packaging limit.
+// 树种表：每个树种给出位置布局文件、模型文件与各网格分组的绑定。
+// 蓝花楹分枝、树干（木质）与树叶三组；漆树的叶片两组、细枝一组。
 const SPECIES = [
   {
     name: 'jacaranda', label: '蓝花楹（真实模型）', layout: 'jacaranda_position.txt', file: 'assets/obj-library/vegetation/realistic/jacaranda_tree_realistic_compact.obj',
@@ -40,6 +64,7 @@ const SPECIES = [
   }
 ]
 
+// 作用：读取 OBJ 的顶点和面（面保留 1 起始索引，不做三角化），仅用于步骤 5 的最低高度栅格化。
 const parseObj = (path) => {
   const vertices = [], faces = []
   for (const line of readFileSync(join(projectRoot, path), 'utf8').split(/\r?\n/)) {
@@ -49,11 +74,14 @@ const parseObj = (path) => {
   return { vertices, faces }
 }
 
+// 步骤 2：气象取内置文件第 2~49 行（跳过首行节点数），首行改写为 48。
 const meteo = readFileSync(join(projectRoot, 'models', 'bin_x64', 'Release', 'defined', 'meteo.txt'), 'utf8')
   .replace(/^\uFEFF/, '').split(/\r?\n/).filter((line) => line.trim())
 writeFileSync(join(exampleRoot, 'meteorology', 'meteo_doy214_48.txt'), `48\n${meteo.slice(1, 49).join('\n')}\n`, 'utf8')
 
 // Jacaranda crowns reach 19.3 m x 1.14 = 22 m.
+// 步骤 3：两种变体的差别——RayTracing：体元 0.25 m；VoxelEB：体元 0.5 m。场景高 23 m 容纳树冠。
+// 固定 createdAt/updatedAt 使重复生成的文件内容不变。
 const project = withVehicles
   ? createDefaultProject({ name: 'Realistic 100 m forest - bare, shade-canopy and tarp-covered vehicles', mode: 'eRaytracing', sceneX: SCENE, sceneY: SCENE, sceneHeight: 23, voxelSize: 0.25 })
   : createDefaultProject({ name: 'Realistic 100 m forest - GPP/NPP', mode: 'eVoxelEB', sceneX: SCENE, sceneY: SCENE, sceneHeight: 23, voxelSize: 0.5 })
@@ -65,6 +93,7 @@ c.scene.voxelFillThreshold = 0.05
 Object.assign(c.scene.background, { spectralName: 'soil', thermalName: 'soil_temperature', materialType: 'Soil', materialName: 'soilset' })
 Object.assign(c.light, { zenith: 30, azimuth: 135, direct: 0.8, diffuse: 0.2, skyTemperature: 250 })
 Object.assign(c.meteo, { path: 'meteorology/meteo_doy214_48.txt', start: 1, end: 48, z: 25, Tsold: 298.15, SatWater: 0.45, dTime: 1800, latitude: 40, longitude: 116 })
+// 传感器与控制参数：车辆变体 800×800 像元、100 个连续波段；VoxelEB 变体 400×400、6 个波段。
 if (withVehicles) {
   // 100 continuous bands, 400-2380 nm at 20 nm; 0.125 m pixels. Depth 16 keeps NIR multiple scattering in the crowns.
   Object.assign(c.sensor, {
@@ -83,6 +112,8 @@ if (withVehicles) {
   Object.assign(c.control, { depth: 4, samples: 16, couplingIterations: 12, temperatureTolerance: 0.05, temperatureRelaxation: 0.5, soilTemperatureMethod: 2, vegetationTemperatureMethod: 0 })
 }
 
+// 步骤 4：把每个树种变成一个工程对象。位置行原样复制到示例的 positions/；
+// distribution 使用 manual 模式，scaleMin/Max 取位置文件中缩放列的范围；dimensions 来自模型 json。
 const items = SPECIES.map((species) => {
   const rows = readFileSync(join(projectRoot, LAYOUT, species.layout), 'utf8').trim().split(/\r?\n/)
   const positionFile = `positions/${species.name}_position.txt`
@@ -98,14 +129,19 @@ const items = SPECIES.map((species) => {
   }
 })
 
+// 步骤 5：车位选择（仅 --vehicles）。spots 为最终选出的 {north, east, rotation, cover}。
 const spots = []
 if (withVehicles) {
   // Openings in the forest: nothing below 3.3 m (trunks, low branches, shrubs)
   // may enter a canopy-sized footprint plus 0.5 m; higher crowns may overhang.
   // Each model is rasterised once into a local 0.2 m column grid holding the
   // lowest geometry height, then stamped per instance into a world 0.25 m grid.
+  // CLEAR_HEIGHT：车位上方须净空的高度（m）；MARGIN：足迹外扩（m）；LOCAL/WORLD：单个模型/整个场景的
+  // 栅格边长（m）；N：世界栅格每边格数。lowest[] 记录每个世界格内所有树木几何的最低高度（无几何为 Infinity）。
   const CLEAR_HEIGHT = 3.3, MARGIN = 0.5, LOCAL = 0.2, WORLD = 0.25, N = Math.round(SCENE / WORLD)
   const lowest = new Float64Array(N * N).fill(Infinity)
+  // 5a：对每个树种，先把单个模型三角形加密采样，得到局部 0.2 m 列网格中每列的最低高度；
+  // 再按每个实例的位置/缩放/旋转盖章到世界栅格（3×3 邻格膨胀，避免旋转后出现空洞）。
   for (const species of SPECIES) {
     const { vertices, faces } = parseObj(species.file)
     const columns = new Map()
@@ -134,6 +170,8 @@ if (withVehicles) {
       }
     }
   }
+  // 作用：统计以 spot 为中心、按 rotation 旋转的矩形足迹（半长 halfAlong、半宽 halfAcross）内，
+  // 满足 test(最低高度) 的世界栅格数。
   const cellsIn = (spot, halfAlong, halfAcross, test) => {
     const radians = (spot.rotation - 90) * Math.PI / 180, reach = Math.hypot(halfAlong, halfAcross)
     let count = 0
@@ -145,12 +183,16 @@ if (withVehicles) {
       }
     return count
   }
+  // 5b：在离边界 ≥ 8 m 的 1 m 网格上、两种朝向（90°/0°）枚举候选车位；足迹外扩后若含低于 3.3 m 的
+  // 几何（树干、低枝、灌木）则舍弃；cover 为足迹内有树冠覆盖的栅格数。
   const candidates = []
   for (let north = 8; north <= SCENE - 8; north += 1) for (let east = 8; east <= SCENE - 8; east += 1) for (const rotation of [90, 0]) {
     const spot = { north, east, rotation }
     if (cellsIn(spot, CANOPY_FOOTPRINT.length / 2 + MARGIN, CANOPY_FOOTPRINT.width / 2 + MARGIN, (h) => h < CLEAR_HEIGHT)) continue
     candidates.push({ ...spot, cover: cellsIn(spot, CANOPY_FOOTPRINT.length / 2, CANOPY_FOOTPRINT.width / 2, (h) => Number.isFinite(h)) })
   }
+  // 5c：只保留冠层覆盖不超过最小值 + 5 格的候选（open）；第 1 个车位取离场景中心最近者，
+  // 之后用最远点法依次补到 11 个，任意两车位至少相距 10 m，否则报错。
   // Least crown cover first (the nadir sensor must see each vehicle and its cover),
   // then spread over the forest by farthest-point selection.
   const minimumCover = Math.min(...candidates.map((candidate) => candidate.cover))
@@ -167,6 +209,8 @@ if (withVehicles) {
   }
   console.log(`Clear candidates ${candidates.length}, open (cover <= ${minimumCover + 5} cells) ${open.length}`)
 
+  // 5d：添加车辆（由 vehicle-lineup.mjs 完成），并把光谱及纹理中引用的 assets/ 共享文件
+  // 复制进示例目录，使示例可独立使用。
   mkdirSync(join(exampleRoot, 'models'), { recursive: true })
   items.push(...addVehicleLineup({ theme: 'forest', spots, configuration: c, exampleRoot, projectRoot, sceneSize: SCENE }))
   const shared = new Set()
@@ -179,6 +223,7 @@ if (withVehicles) {
 }
 c.objects = { count: items.length, names: items.map((item) => item.name), items }
 
+// 步骤 6：校验并写出工程与 README（两种变体的 README 文字不同）。
 const validation = validateProject(project)
 if (!validation.valid) throw new Error(validation.errors.join('; '))
 writeFileSync(join(exampleRoot, 'project.json'), stringifyProject(project), 'utf8')

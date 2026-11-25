@@ -1,3 +1,22 @@
+# ==========================================================================
+# 文件：build-core-manuals-pdf.py
+# 功能：把 docs/user-manual.md 与 docs/theory-manual.md 两本核心手册排版成带封面、目录、书签的
+#       中文 PDF，写到 docs/（Stream_Studio_User_Manual_CN.pdf / _Theory_Manual_CN.pdf）。
+# 主要模块：
+#   1. 字体、配色、版面常量（依赖 Windows 字体 Deng / Dengb / segoeui）
+#   2. 文本转换：latex_plain（LaTeX → 纯文本）、symbol_markup（符号字体回退）、
+#      inline_markup（Markdown 行内 → reportlab 标记）
+#   3. ManualDocTemplate：页眉页脚（封面不画）、标题 → 书签/大纲/目录
+#   4. make_styles 段落样式；code_box 代码/公式盒；markdown_table 表格
+#   5. markdown_story：逐行解析 Markdown（标题、列表、表格、代码块、$$ 公式）成 flowable 列表
+#   6. cover 封面；build_manual 组装封面 + 目录 + 正文并两遍排版（multiBuild）；main
+# 数据流：docs/*.md + package.json（版本号）→ reportlab → docs/*.pdf。
+# 约定：Markdown 第 1 行（总标题）被跳过；## 为章（目录一级），### 为节（二级），
+#   #### 只排版不进目录；表格为竖线分隔，列等宽；正文宽度 174 mm。
+# 注意：$$ 公式若在 docs/figures/equations/<sha256>.svg 存在矢量图则用图，否则退化为纯文本。
+# 与其他文件：依赖 reportlab，公式矢量图依赖 svglib（可选）；封面中的工程格式文字为硬编码。
+# ==========================================================================
+
 from __future__ import annotations
 
 import html
@@ -29,6 +48,8 @@ from reportlab.platypus import (
 from reportlab.platypus.tableofcontents import TableOfContents
 
 
+# 模块：路径、版本与字体。输出目录为仓库 docs/；版本号取自 package.json；
+# 字体依赖 Windows 自带的等线（Deng/Dengb）和 Segoe UI（数学符号回退），非 Windows 环境不可用。
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "docs"
 VERSION = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
@@ -48,6 +69,7 @@ pdfmetrics.registerFontFamily(
     boldItalic="StreamCN-Bold",
 )
 
+# 模块：页面尺寸与配色（深蓝/蓝/青 + 正文/弱化文字色 + 分隔线与浅底色）。
 PAGE_W, PAGE_H = A4
 NAVY = colors.HexColor("#10273D")
 BLUE = colors.HexColor("#2674D9")
@@ -59,6 +81,10 @@ PALE = colors.HexColor("#F2F7FA")
 PALE_BLUE = colors.HexColor("#EAF2FD")
 
 
+# 作用：把 Markdown 中的行内/块级 LaTeX 近似转成可在 PDF 里直接排版的纯文本。
+# 输入：含 LaTeX 的字符串；输出：用 Unicode 符号和 a_(b)、a^(b)、(分子)/(分母) 表示的文本。
+# 说明：只覆盖手册里用到的常见命令，未识别的命令原样保留；不是通用 LaTeX 渲染器。
+# 分数、上下标、根号最多迭代 4 轮以处理嵌套。
 def latex_plain(value: str) -> str:
     replacements = {
         r"\rightarrow": "→",
@@ -99,6 +125,7 @@ def latex_plain(value: str) -> str:
         r"\prod": "Π",
         r"\infty": "∞",
     }
+    # 步骤 1：去掉数学定界符，统一 \dfrac/\tfrac 为 \frac，并展开字体/文本包装命令。
     value = value.replace("$", "")
     value = value.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
     value = re.sub(r"\\(?:mathrm|text|boldsymbol|mathbf|operatorname|mathcal)\{([^{}]*)\}", r"\1", value)
@@ -107,7 +134,10 @@ def latex_plain(value: str) -> str:
     value = re.sub(r"\\hat\{([^{}]*)\}", r"\1_hat", value)
     value = re.sub(r"\\(?:left|right)(?![A-Za-z])", "", value)
     value = value.replace(r"\begin{aligned}", "").replace(r"\end{aligned}", "")
+    # 步骤 2：把希腊字母、运算符等命令替换为 Unicode 符号。
     value = re.sub(r"\\[A-Za-z]+", lambda match: replacements.get(match.group(0), match.group(0)), value)
+    # 步骤 3：把 _{..}、^{..}、\frac{..}{..}、\sqrt{..} 改写成括号形式；
+    # 最内层先被替换，循环到不再变化（最多 4 轮）以处理嵌套。
     for _ in range(4):
         updated = re.sub(r"_\{([^{}]+)\}", r"_(\1)", value)
         updated = re.sub(r"\^\{([^{}]+)\}", r"^(\1)", updated)
@@ -116,6 +146,7 @@ def latex_plain(value: str) -> str:
         if updated == value:
             break
         value = updated
+    # 步骤 4：公式编号与剩余函数名、空白命令、对齐符号的收尾清理。
     value = re.sub(r"\\tag\{([^{}]+)\}", r"[\1]", value)
     value = value.replace(r"\exp", "exp").replace(r"\ln", "ln")
     value = value.replace(r"\sin", "sin").replace(r"\cos", "cos")
@@ -126,6 +157,8 @@ def latex_plain(value: str) -> str:
     return value
 
 
+# 作用：对等线字体缺失、但 Segoe UI 有的非 ASCII 字符，包上 <font name="StreamMath"> 标签。
+# 原因：等线缺少部分科学符号，不回退会显示为方块。
 def symbol_markup(value: str) -> str:
     """Use a covered font for scientific characters missing from the CJK face."""
     primary = pdfmetrics.getFont("StreamCN").face.charToGlyph
@@ -136,6 +169,9 @@ def symbol_markup(value: str) -> str:
                   else m.group(0), value)
 
 
+# 作用：把一段 Markdown 行内文本转成 reportlab Paragraph 可用的 XML 标记。
+# 步骤：LaTeX 近似 → HTML 转义 → 外链转 <link> → 去掉相对链接 → 行内代码暂存 →
+# 粗体/斜体 → 恢复行内代码（着色）→ 符号字体回退。
 def inline_markup(value: str) -> str:
     value = latex_plain(value)
     value = html.escape(value.strip(), quote=False)
@@ -166,10 +202,14 @@ def inline_markup(value: str) -> str:
     return symbol_markup(value)
 
 
+# 作用：把 Markdown 表格的一行（| a | b |）切成去除首尾空白的单元格列表。
 def split_table_row(line: str) -> list[str]:
     return [part.strip() for part in line.strip().strip("|").split("|")]
 
 
+# 模块：手册的文档模板。A4、四周边距约 17-18 mm，单一正文 Frame。
+# 第 1 页（封面）不画页眉页脚；之后页脚页码为 doc.page - 1，即封面不计页。
+# afterFlowable 为带 toc_level 的标题生成书签、PDF 大纲与目录条目。
 class ManualDocTemplate(BaseDocTemplate):
     def __init__(self, filename: str, manual_title: str):
         super().__init__(
@@ -220,6 +260,8 @@ class ManualDocTemplate(BaseDocTemplate):
                 self.notify("TOCEntry", (level, text, self.page - 1, key))
 
 
+# 作用：集中定义各类段落样式（正文、1-3 级标题、列表、代码、表格、目录标题），
+# 返回以名字为键的字典；wordWrap="CJK" 使中文可在任意字符处折行。
 def make_styles():
     sample = getSampleStyleSheet()
     styles = {
@@ -325,8 +367,13 @@ def make_styles():
     return styles
 
 
+# 作用：把代码块或 $$ 公式块排成带浅底色边框的单格表格。
+# math_mode 下：先找矢量公式图（文件名为公式文本的 SHA-256，按 150 mm 列宽内缩放、
+# 右侧列出 \tag 编号）；没有图则整块转纯文本后按代码样式显示。
+# 普通代码块保留行结构（\t 换成 4 个空格，空行用不换行空格占位）。
 def code_box(lines: list[str], styles, math_mode: bool = False) -> Table:
     if math_mode:
+        # 步骤 1：公式矢量图存在时优先使用。
         # Optional vector equations preserve fractions, integrals and subscripts.
         expression = "\n".join(lines).strip()
         key = hashlib.sha256(expression.encode("utf-8")).hexdigest()
@@ -350,6 +397,7 @@ def code_box(lines: list[str], styles, math_mode: bool = False) -> Table:
                 ("TOPPADDING", (0, 0), (-1, -1), 3 * mm),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 3 * mm),
             ]))
+    # 步骤 2：无矢量图时的文本回退。
     cleaned = []
     if math_mode:
         # Convert the whole display block at once: \frac numerators and
@@ -377,6 +425,8 @@ def code_box(lines: list[str], styles, math_mode: bool = False) -> Table:
     return table
 
 
+# 作用：把连续的 Markdown 表格行排成 reportlab 表格。
+# 说明：丢弃 |---| 分隔行；各行补齐到最大列数；各列等宽（总宽 174 mm）；首行为表头并跨页重复。
 def markdown_table(lines: list[str], styles) -> Table:
     rows = [split_table_row(line) for line in lines]
     if len(rows) >= 2 and all(re.fullmatch(r":?-{3,}:?", cell or "-") for cell in rows[1]):
@@ -407,6 +457,10 @@ def markdown_table(lines: list[str], styles) -> Table:
     return table
 
 
+# 作用：把一份 Markdown 文件逐行解析为 flowable 列表（见文件头“约定”）。
+# 输入：Markdown 路径；输出：Paragraph/Table/Spacer 等组成的 story。
+# 说明：用 paragraph_lines/table_lines/code_lines 三个缓冲累积连续行，遇到块边界时 flush；
+# 仅支持 - 开头的无序列表和 1. 形式的有序列表，不支持嵌套列表（待核对）。
 def markdown_story(source: Path, styles):
     lines = source.read_text(encoding="utf-8").splitlines()
     story = []
@@ -429,6 +483,8 @@ def markdown_story(source: Path, styles):
             story.append(Spacer(1, 2.5 * mm))
             table_lines.clear()
 
+    # 逐行处理；跳过第 1 行（文档总标题，封面已单独排版）。判断顺序：代码围栏 → $$ 公式 →
+    # 代码/公式正文 → 表格行 → 空行 → 标题 → 列表 → 普通段落。
     for raw in lines[1:]:
         line = raw.rstrip()
         stripped = line.strip()
@@ -464,6 +520,7 @@ def markdown_story(source: Path, styles):
         if not stripped:
             flush_paragraph()
             continue
+        # 章标题：进入目录一级；非第一章时若页面剩余不足 70 mm 则换页，避免标题落在页底。
         if stripped.startswith("## "):
             flush_paragraph()
             if chapter_seen:
@@ -508,6 +565,8 @@ def markdown_story(source: Path, styles):
     return story
 
 
+# 作用：生成封面 flowable（色块、标题、副标题、版本/工程格式/日期表、页脚英文标语），
+# 末尾 PageBreak。工程格式“三维 v6 / 遥感影像 v2”为硬编码，需与 project-schema 保持一致（待核对）。
 def cover(title: str, subtitle: str, styles):
     return [
         Spacer(1, 38 * mm),
@@ -580,6 +639,8 @@ def cover(title: str, subtitle: str, styles):
     ]
 
 
+# 作用：组装并输出一本手册：封面 → 目录 → 正文。
+# 说明：目录页码依赖标题所在页，因此用 multiBuild 做多遍排版；目录条目页码为 page - 1（封面不计）。
 def build_manual(source: Path, output: Path, title: str, subtitle: str):
     styles = make_styles()
     doc = ManualDocTemplate(str(output), title)
@@ -611,6 +672,7 @@ def build_manual(source: Path, output: Path, title: str, subtitle: str):
     doc.multiBuild(story)
 
 
+# 入口：依次生成使用手册与理论与方法两本 PDF，并打印输出路径。
 def main():
     build_manual(
         ROOT / "docs" / "user-manual.md",

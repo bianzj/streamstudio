@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：generate-tarp-example.mjs
+// 功能：生成自包含的「篷布 / 遮阴棚 / 车辆」RayTracing 示例工程（project.json + 模型 + 位置 +
+//       气象 + 光谱资源），用法：node tools/generate-tarp-example.mjs <输出目录>
+// 主要模块/步骤：
+//   1. 复制 assets/obj-library 中的 SUV、覆车模型、行道树到示例目录的 models/
+//   2. lightTreeObj：把树的叶片三角形抽稀一半并按面积守恒放大，降低面元总数
+//   3. shadeCanopyObj：程序化生成双坡遮阴棚（篷布网格 + 立柱/脊梁）OBJ
+//   4. 写 positions/*.txt 与 meteorology/（取 meteo.txt 前 48 个节点）
+//   5. 基于 createDefaultProject 配置传感器、光照、控制参数、气象、光谱变体、材料与热参数
+//   6. 组装 5 个对象（裸车 / 覆盖车 / 棚下车 / 遮阴棚 / 行道树），拷贝被引用的 assets/ 文件
+//   7. validateProject 校验后写 project.json 并打印各对象尺寸与实例数
+// 数据流：assets/ 与 models/bin_x64/.../meteo.txt → 本脚本 → 输出目录（可直接用 Stream Studio 打开）
+// 约定：OBJ 为 Y-up、单位 m；位置文件每行 x=北向、y=东向、z=高度、缩放、旋转（度）；
+//       场景为 SCENE×SCENE m 的方形区域；示例固定太阳（DOY 214、13:50、怀来）。
+// 与其他文件：依赖 src/renderer/src/project-schema.js 的工程默认值与校验。
+// ==========================================================================
+
 // Generates a self-contained tarp example: a bare SUV, a tarp-covered car and
 // an SUV under a tarp shade canopy, side by side, with street trees to the north.
 // OBJ files and every referenced assets/ file are copied into the output folder.
@@ -13,10 +31,12 @@ if (!process.argv[2]) throw new Error('Usage: node tools/generate-tarp-example.m
 const exampleRoot = resolve(process.argv[2])
 for (const folder of ['models', 'positions', 'meteorology', 'spectral', 'terrain']) mkdirSync(join(exampleRoot, folder), { recursive: true })
 
+// 常量：场景边长（m）与示例使用的模型相对路径（相对仓库根目录）。
 const SCENE = 30
 const SUV = 'assets/obj-library/vehicle/typical/modern_suv.obj'
 const COVERED_CAR = 'assets/obj-library/vehicle/realistic/covered_car_realistic.obj'
 const TREE = 'assets/obj-library/vegetation/typical/street_tree_realistic.obj'
+// 作用：把仓库内的模型复制到示例目录 models/，返回工程内使用的相对路径。
 const localModel = (source) => {
   const target = `models/${source.split('/').pop()}`
   copyFileSync(join(projectRoot, source), join(exampleRoot, target))
@@ -26,15 +46,21 @@ const localModel = (source) => {
 // Keeps every other leaf triangle and enlarges each kept one by 1/sqrt(keep)
 // about its centroid, so leaf area is conserved while the facet count halves.
 // Wood groups are copied unchanged; vertex and normal indices are renumbered.
+// 作用：生成叶片抽稀后的树模型 OBJ（写入示例 models/，返回相对路径）。
+// 输入：源 OBJ、叶片分组名匹配式 leafPattern、保留比例 keep；输出：*_light.obj。
+// 说明：叶片三角形每 1/keep 个保留 1 个并绕质心放大 1/sqrt(keep)，叶面积基本守恒；
+//       树枝/树干（非叶片）原样保留，仅重新编号顶点与法线；叶片顶点/法线逐面复制。
 function lightTreeObj(source, leafPattern = /leaves/, keep = 0.5) {
   const lines = readFileSync(join(projectRoot, source), 'utf8').split(/\r?\n/)
   const out = [`# Leaf-thinned copy of ${source}: ${keep * 100}% of leaf triangles kept, each scaled to conserve leaf area`]
+  // 步骤 1：vertices/normals 保存原文件全部顶点与法线；Map 记录非叶片元素的新编号。
   const vertices = [], normals = []
   const vertexMap = new Map(), normalMap = new Map()
   let leaf = false, leafIndex = 0, vCount = 0, vnCount = 0
   const emitVertex = (text) => { out.push(text); return ++vCount }
   const emitNormal = (text) => { out.push(text); return ++vnCount }
   const scale = Math.sqrt(1 / keep)
+  // 步骤 2：逐行处理。分组行更新 leaf 标志；非叶片的 v/vn 立即输出；面按 leaf 分支处理。
   for (const line of lines) {
     if (line.startsWith('o ') || line.startsWith('g ')) { leaf = leafPattern.test(line); out.push(line); continue }
     if (line.startsWith('v ')) {
@@ -48,6 +74,7 @@ function lightTreeObj(source, leafPattern = /leaves/, keep = 0.5) {
       continue
     }
     if (!line.startsWith('f ')) { if (line.startsWith('#')) out.push(line); continue }
+    // 步骤 3：解析面的 v/vt/vn 引用；非叶片面按新编号输出，引用叶片顶点则报错。
     const refs = line.slice(2).trim().split(/\s+/).map((ref) => ref.split('/').map(Number))
     if (!leaf) {
       out.push('f ' + refs.map(([v, , vn]) => {
@@ -56,6 +83,7 @@ function lightTreeObj(source, leafPattern = /leaves/, keep = 0.5) {
       }).join(' '))
       continue
     }
+    // 步骤 4：叶片面只保留每 1/keep 个；保留的面绕质心放大后输出为新顶点/新法线。
     if (leafIndex++ % Math.round(1 / keep) !== 0) continue
     const parsed = refs.map(([v, , vn]) => ({ p: vertices[v - 1].split(/\s+/).slice(1).map(Number), n: normals[vn - 1] }))
     const centroid = [0, 1, 2].map((k) => parsed.reduce((sum, item) => sum + item.p[k], 0) / parsed.length)
@@ -70,6 +98,7 @@ function lightTreeObj(source, leafPattern = /leaves/, keep = 0.5) {
   return target
 }
 
+// 作用：读取示例目录内 OBJ 的全部顶点，返回包围盒 min/max 与尺寸 size（m，保留 3 位）。
 function objBounds(path) {
   const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity]
   for (const line of readFileSync(join(exampleRoot, path), 'utf8').split('\n')) {
@@ -81,8 +110,12 @@ function objBounds(path) {
 }
 
 // Shade canopy in OBJ Y-up: X across (width), Z along the car, gable ridge along Z.
+// 作用：生成双坡遮阴棚 OBJ 文本，含 canopy_fabric（篷布网格）与 canopy_frame（立柱）两组。
+// 参数（m）：width 棚宽、length 棚长、eave 檐口高、ridge 脊高、cell 篷布网格边长、post 立柱截面边长。
+// 说明：篷布按 cell 划分为规则网格，高度随 |x| 线性下降，脊线沿 Z；每个方格拆成两个三角形。
 function shadeCanopyObj({ width = 3.6, length = 6.4, eave = 2.4, ridge = 2.85, cell = 0.1, post = 0.06 } = {}) {
   const lines = ['# Stream Studio tarp shade canopy (generated by tools/generate-tarp-example.mjs)', '# Coordinates: Y-up, metres', 'o canopy_fabric', 'g canopy_fabric']
+  // 步骤 1：篷布网格。nx × nz 个方格，顶点高度由 height(x) 给出（脊高 → 檐口高）。
   const nx = Math.round(width / cell), nz = Math.round(length / cell)
   const height = (x) => ridge - (ridge - eave) * Math.abs(x) / (width / 2)
   for (let j = 0; j <= nz; j += 1) {
@@ -97,6 +130,7 @@ function shadeCanopyObj({ width = 3.6, length = 6.4, eave = 2.4, ridge = 2.85, c
       lines.push(`f ${id(i, j)} ${id(i, j + 1)} ${id(i + 1, j + 1)}`, `f ${id(i, j)} ${id(i + 1, j + 1)} ${id(i + 1, j)}`)
     }
   }
+  // 步骤 2：立柱框架。base 为框架顶点编号起点（紧接篷布网格顶点之后），每个立方体 8 个顶点。
   let base = (nx + 1) * (nz + 1)
   lines.push('o canopy_frame', 'g canopy_frame')
   const box = (cx, cz, sx, sy0, sy1, sz) => {
@@ -107,6 +141,7 @@ function shadeCanopyObj({ width = 3.6, length = 6.4, eave = 2.4, ridge = 2.85, c
     q(1, 2, 3, 4); q(5, 8, 7, 6); q(1, 5, 6, 2); q(2, 6, 7, 3); q(3, 7, 8, 4); q(4, 8, 5, 1)
     base += 8
   }
+  // 四角立柱高到檐口，沿脊线两端的中间立柱高到屋脊（均略低 0.02 m，避免与篷布共面）。
   const px = width / 2 - post, pz = length / 2 - post
   for (const [x, z] of [[-px, -pz], [px, -pz], [px, pz], [-px, pz]]) box(x, z, post, 0, eave - 0.02, post)
   box(0, -pz, post, 0, ridge - 0.02, post)
@@ -114,10 +149,12 @@ function shadeCanopyObj({ width = 3.6, length = 6.4, eave = 2.4, ridge = 2.85, c
   return lines.join('\n') + '\n'
 }
 
+// 写出程序生成的遮阴棚模型。
 writeFileSync(join(exampleRoot, 'models', 'shade_canopy.obj'), shadeCanopyObj(), 'utf8')
 
 // Position files: x = north, y = east, z = height, scale, rotation (deg).
 // Cars face east (OBJ +Z) and stand 7 m apart along the north axis.
+// 模块：各对象的位置表（每行：x 北向、y 东向、z 高度、缩放、旋转角度），单位 m / 度。
 const CAR_Y = 13
 const placements = {
   bare_suv: [[7, CAR_Y, 0, 1, 0]],
@@ -138,16 +175,20 @@ const placements = {
     [6.5, 1, 0, 0.6, 250], [14, 0.8, 0, 0.58, 45], [22, 1, 0, 0.62, 180]
   ]
 }
+// 把位置行数组转成位置文件文本（同时用作 distribution.points）。
 const pointsText = (rows) => rows.map((row) => row.join(' ')).join('\n')
 for (const [name, rows] of Object.entries(placements)) {
   writeFileSync(join(exampleRoot, 'positions', `${name}_position.txt`), pointsText(rows) + '\n', 'utf8')
 }
 
+// 模块：气象强迫。取 defined/meteo.txt 去除 BOM 和空行后的第 2–49 行（第 1 行为表头/节点数，待核对）共 48 个节点，
+// 首行写节点数 48；meteo.start/end（13、42）为节点序号范围，dTime = 1800 s（含义待核对）。
 const meteoSource = readFileSync(join(projectRoot, 'models', 'bin_x64', 'Release', 'defined', 'meteo.txt'), 'utf8')
   .replace(/^\uFEFF/, '').split(/\r?\n/).filter((line) => line.trim())
 const meteoNodes = meteoSource.slice(1, 49)
 writeFileSync(join(exampleRoot, 'meteorology', 'meteo_doy214_48.txt'), `48\n${meteoNodes.join('\n')}\n`, 'utf8')
 
+// 模块：工程配置。以默认工程为基础，覆盖传感器、光照、控制、气象；固定日期为 2019 年 DOY 214。
 const project = createDefaultProject({ name: 'Tarp vehicle - covered car, shade canopy and trees', mode: 'eRaytracing', sceneX: SCENE, sceneY: SCENE, sceneHeight: 10, voxelSize: 0.25 })
 project.createdAt = '2026-10-16T00:00:00.000Z'
 project.updatedAt = project.createdAt
@@ -169,6 +210,8 @@ Object.assign(c.meteo, {
   latitude: 40.35, longitude: 115.78, year: 2019, timezone: 8
 })
 
+// 模块：光谱/纹理辅助构造函数。
+// texture：亮度（方差）纹理；variant：带纹理的光谱文件变体；custom：单值反射率的自定义光谱。
 const texture = (fileName, strength, repeatSize) => ({ enabled: true, fileName: `assets/texture-library/${fileName}`, strength, repeatSize })
 const noTexture = { enabled: false, fileName: '', strength: 0.2, repeatSize: 2 }
 const variant = (name, label, file, refTir, tauTir, preview, physical, extra = {}) => ({
@@ -187,6 +230,7 @@ Object.assign(c.spectra.find((item) => item.name === 'soil'), {
   label: '典型土壤（BSM + 裸土斑块，CV 10%）',
   physicalTexture: { enabled: true, fileName: 'assets/texture-library/soil_mottling_variance.jpg', strength: 0.2, relativeStd: 0.1, repeatSize: 10 }
 })
+// 篷布光谱变体：覆车 A–D 与遮阴棚 A–D 各自在对象属性表中按网格选用一种。
 const tarp = c.spectra.find((item) => item.name === 'tarp_olive_canvas')
 Object.assign(tarp, variant('tarp_olive_canvas', '覆车篷布 方案A：军绿帆布 + 林地迷彩', 'tarp_olive_canvas', 0.10, 0,
   { preset: 'camouflage-woodland', repeatSize: 1.5 }, texture('camouflage_woodland_variance.jpg', 0.35, 1.5)))
@@ -203,6 +247,7 @@ c.spectra.push(
     { preset: 'metal', repeatSize: 1 }, texture('crumpled_film_variance.jpg', 0.2, 2.0)),
   variant('shade_net_green_fiber', '遮阳网·绿色 HDPE（开孔 35%）', 'shade_net_green_fiber', 0.07, 0,
     { preset: 'shade-net', repeatSize: 0.3 }, { enabled: false, fileName: '', strength: 0.2, repeatSize: 2 }, { openness: 0.35 }),
+  // 注意：下方 camo_class_* 是多光谱迷彩的分类光谱，由 classTexture 中的颜色 → spectralName 映射引用。
   // Class spectra for the multispectral camouflage (no brightness texture of their own).
   variant('camo_class_light_green', '迷彩类别·浅绿斑（仿植被伪装布）', 'tarp_ir_camouflage_green', 0.06, 0, { preset: 'canvas', repeatSize: 0.6 }, noTexture),
   variant('camo_class_dark_green', '迷彩类别·深绿斑（军绿帆布）', 'tarp_olive_canvas', 0.10, 0, { preset: 'canvas', repeatSize: 0.6 }, noTexture),
@@ -227,12 +272,14 @@ c.spectra.push(
   custom('tyre_rubber', '轮胎橡胶', 0.05, 0.06),
   custom('steel_frame', '镀锌钢管支架', 0.30, 0.30)
 )
+// 模块：材料与热参数（FacetEB 薄板模型 membrane）。
 c.materials.push(
   // 0.8 mm steel ~ 3100 J m-2 K-1 plus trim and interior coupling; single shell, both sides convective.
   { name: 'thin_steel_shell', label: '薄钢壳（车身/支架，FacetEB 薄板）', type: 'Building', energyModel: 'membrane', params: { heatCapacityPerArea: 6000, convectiveScale: 1 } }
 )
 c.thermals.push({ name: 'canopy_temperature', label: '遮阴棚初始温度', sunlitTemperature: 315, shadedTemperature: 303 })
 
+// 模块：对象表。mesh 描述 OBJ 内一个分组的光谱/热/材料/冠层绑定；suvMeshes 是 SUV 六个分组的默认绑定。
 const mesh = (name, spectralName, thermalName, materialName, canopyName = 'rigid_body') => ({ name, spectralName, thermalName, materialName, canopyName })
 const suvMeshes = () => [
   mesh('White', 'car_paint_white', 'vehicle_temperature', 'thin_steel_shell'),
@@ -242,6 +289,8 @@ const suvMeshes = () => [
   mesh('Headlights', 'car_glass', 'vehicle_temperature', 'thin_steel_shell'),
   mesh('TailLights', 'car_glass', 'vehicle_temperature', 'thin_steel_shell')
 ]
+// 作用：构造一个对象条目；dimensions 取自 OBJ 包围盒，分布模式为手动（manual）位置文件。
+// 对象级 spectralName 等取第一个 mesh 的设置作为缺省值。
 const object = (name, label, type, fileName, positions, meshes, extra = {}) => {
   const rows = placements[positions]
   return {
@@ -254,6 +303,7 @@ const object = (name, label, type, fileName, positions, meshes, extra = {}) => {
     ...extra
   }
 }
+// 裸车与棚下车共用同一份 SUV 模型文件，仅位置文件不同。
 const suvModel = localModel(SUV)
 const items = [
   object('bare_suv', '裸车 SUV（对照）', 'Vehicle', suvModel, 'bare_suv', suvMeshes()),
@@ -274,6 +324,7 @@ const items = [
 ]
 c.objects = { count: items.length, names: items.map((item) => item.name), items }
 
+// 模块：拷贝资源。收集光谱、纹理与大气 LUT 引用的 assets/ 文件，复制到示例目录以便独立分发。
 // Keep "assets/..." paths and copy the files beside project.json; the server
 // prefers a project-local copy over the shared Stream Studio resources.
 const sharedAssets = new Set([c.atmosphere.lutFile])
@@ -286,6 +337,7 @@ for (const file of sharedAssets) {
   copyFileSync(join(projectRoot, file), join(exampleRoot, file))
 }
 
+// 模块：校验并输出 project.json，最后打印各对象尺寸与实例数。
 const validation = validateProject(project)
 if (!validation.valid) throw new Error(validation.errors.join('; '))
 writeFileSync(join(exampleRoot, 'project.json'), stringifyProject(project), 'utf8')

@@ -1,3 +1,14 @@
+// ==========================================================================
+// 文件：test-facet-energy-convergence.cpp
+// 功能：FacetEB 能量平衡收敛判据（energyphysics.h 的 facetEnergyViolation / facetEnergyConverged）的边界测试
+// 检查项：
+//   1. 残差阈值严格小于 2 W m-2（正负对称），非有限残差一律判为违规
+//   2. 失败面元比例严格小于 0.1 %（整数运算，0 个面元视为未收敛），含原始玉米场景的阈值
+//   3. 大面元数下的乘法不溢出（uint32 上限附近）
+//   4. 等效温度残差上限 ≤ 0.5 K，NaN 不通过
+// 构建：作为独立可执行文件编译（只依赖头文件，无需链接引擎）；通过输出 PASS/FAIL 与退出码报告结果。
+// ==========================================================================
+
 #include "../models/histream/src/facetrt/energyphysics.h"
 #include <iostream>
 #include <limits>

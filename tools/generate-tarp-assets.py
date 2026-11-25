@@ -1,3 +1,21 @@
+# ==========================================================================
+# 文件：generate-tarp-assets.py
+# 功能：生成篷布/遮阳网/沙地的示意光谱与无缝（周期）纹理，并更新两个资源目录的 catalog.json。
+#       光谱为合成曲线，非实测；用途与限制见下方原有文档字符串。
+# 主要模块：
+#   1. SPECTRA：每种材料的标签、热红外反射/透射率、透射/反射比和可见-短波锚点反射率
+#   2. write_spectra：400-2500 nm、10 nm 间隔插值；透射率 = min(比值 × 反射率, 1 - 反射率)；
+#      写 spectral-library/<id>.txt（三行：波长、反射率、透射率），并合并进 catalog.json
+#   3. 噪声与纹理生成：periodic_noise（FFT 高斯滤波的周期噪声）、camouflage、canvas_weave、
+#      digital_camouflage、awning_stripes、crumpled_film、damaged_net、weave_density、
+#      soil_mottling、sand_mottling
+#   4. write_textures：生成 1024×1024 的方差纹理(JPG)、分类纹理(PNG，调色板精确颜色)、
+#      开孔率纹理(PNG 灰度)，计算 SHA-256 并合并进 texture-library/catalog.json
+# 输出：assets/spectral-library/*.txt、assets/texture-library/*.{jpg,png}、两处 catalog.json。
+# 约定：波长 nm；反射/透射率 0-1；suggestedRepeatSize 为纹理在场景中重复一次覆盖的边长（m）；
+#   固定随机种子，重复运行得到相同纹理；catalog 中同 id 的旧条目被新条目替换，其余保留。
+# ==========================================================================
+
 """Generate tarp / shade-net spectra and seamless variance textures.
 
     python tools/generate-tarp-assets.py
@@ -16,8 +34,11 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent
 SPECTRAL = ROOT / 'assets' / 'spectral-library'
 TEXTURES = ROOT / 'assets' / 'texture-library'
+# 统一波长网格：400-2500 nm，步长 10 nm。
 GRID = np.arange(400, 2501, 10)
 
+# 材料表：锚点 (nm, R) 间做线性插值得到整条光谱；吸收带附近（如 1400/1900 nm）的锚点
+# 用于保留水汽/材料吸收谷。
 # name: (label, refTir, tauTir, transmittance/reflectance ratio, [(nm, R), ...])
 SPECTRA = {
     'tarp_olive_canvas': ('篷布·军绿帆布', 0.10, 0.0, 0.18, [
@@ -61,6 +82,8 @@ SPECTRA = {
 }
 
 
+# 作用：写出所有材料的光谱文件，并把条目合并进 spectral-library/catalog.json
+# （同 id 旧条目被替换；catalog 的其他顶层字段原样保留，格式手工拼接以保持原有缩进）。
 def write_spectra():
     entries = []
     for name, (label, ref_tir, tau_tir, ratio, anchors) in SPECTRA.items():
@@ -81,6 +104,8 @@ def write_spectra():
     catalog_path.write_text('{\n' + body + ',\n  "spectra": [\n' + lines + '\n  ]\n}\n', encoding='utf-8')
 
 
+# 作用：生成 size×size 的周期（首尾可无缝拼接）噪声：白噪声经傅里叶域高斯核滤波，
+# sigma_x/sigma_y 为两个方向的相关长度（像素），输出零均值、单位标准差。
 def periodic_noise(size, sigma_x, sigma_y, seed):
     """Gaussian-blurred white noise; sigma in pixels. Periodic, zero mean, unit std."""
     rng = np.random.default_rng(seed)
@@ -91,6 +116,8 @@ def periodic_noise(size, sigma_x, sigma_y, seed):
     return (field - field.mean()) / field.std()
 
 
+# 作用：迷彩分类图。大尺度 + 小尺度噪声叠加后，按 fractions 给定的面积比例用分位数切成
+# len(palette) 类，输出每类对应的 RGB。
 def camouflage(size, palette, fractions, seed):
     field = periodic_noise(size, 34, 20, seed) + 0.35 * periodic_noise(size, 9, 7, seed + 1)
     edges = np.quantile(field, np.cumsum(fractions)[:-1])
@@ -98,6 +125,7 @@ def camouflage(size, palette, fractions, seed):
     return np.array(palette, dtype=np.uint8)[classes]
 
 
+# 作用：帆布织纹（8 像素周期的经纬交织）叠加纵横向疏密条纹与大尺度斑驳，着军绿基色。
 def canvas_weave(size, seed):
     period = 8
     y, x = np.mgrid[0:size, 0:size]
@@ -163,11 +191,17 @@ def sand_mottling(size, seed):
     return (gray[..., None] * np.array([235, 205, 160])).astype(np.uint8)
 
 
+# 迷彩调色板与各色面积占比：林地 4 色、荒漠 3 色、数码 4 色；占比之和为 1，
+# 分类 PNG 使用同样的调色板以便按精确颜色识别类别。
 WOODLAND = ([(86, 99, 52), (52, 64, 31), (110, 82, 50), (30, 31, 25)], [0.34, 0.30, 0.24, 0.12])
 DESERT = ([(200, 177, 131), (168, 141, 95), (131, 112, 76)], [0.45, 0.33, 0.22])
 DIGITAL = ([(92, 104, 62), (58, 70, 40), (124, 112, 80), (36, 38, 30)], [0.36, 0.30, 0.22, 0.12])
 
 
+# 作用：生成全部纹理并更新 texture-library/catalog.json。
+# images 中每项为 文件名: (标签, suggestedRepeatSize（m）, 像素数组)；
+# 同一种子同时用于方差纹理(JPG)与对应的分类纹理(PNG)，两者图案一致。
+# kind 按文件名前缀判定：class_ → class，openness_ → openness，其余 → variance。
 def write_textures():
     size = 1024
     images = {

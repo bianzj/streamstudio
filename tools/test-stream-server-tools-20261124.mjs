@@ -1,3 +1,18 @@
+// ==========================================================================
+// 文件：test-stream-server-tools-20261124.mjs
+// 功能：2026-11-24 评审（第 6 块）发现的 STREAM 服务端测试缺口的补充测试（node:test，不需要真实引擎）。
+// 主要模块：
+//   1. EB 配置映射：服务端发出的每个 energy 键必须被引擎 config.cpp 读取，且服务端缺省值
+//      与引擎缺省值一致（engineDefault 用正则从 config.cpp 源码提取缺省）；起转小时数向上取整
+//   2. rasters.mjs：tiffBytes 手工拼装最小 GeoTIFF，测试 inspectRasters（头信息探测）、
+//      rasterBand（采样/统计/直方图/波段越界）、classStatistics（按类别的均值/标准差与像元数）
+//   3. index.mjs 路由：不依赖引擎的行为（status、inspect、缺引擎时 run 被拒绝、run-info 报错）
+// 关系：被测模块 server/stream/{index,config,rasters}.mjs；用正则读取 models/stream/app/config.cpp
+//   的源码文本做对照（config.cpp 里这些调用的写法改变时需同步修改本文件的正则）。
+// 约定：tiffBytes 生成小端 TIFF，坐标系 EPSG:32650，像元 30 m，原点 (500000, 4400000)。
+// 运行：node --test tools/test-stream-server-tools-20261124.mjs
+// ==========================================================================
+
 // Server-side test gaps found by the 2026-11-24 review (block 6):
 //  - EB configuration mapping / default table: server JS field -> engine config key -> engine default (read from config.cpp);
 //  - rasters.mjs: header probe of a hand-built GeoTIFF, band sampling, per-class statistics (with an injected readTiff);
@@ -25,6 +40,9 @@ writeFileSync(pack, JSON.stringify({ kind: 'stream-forcing-pack', schemaVersion:
 const inputFile = join(root, 'input.tif')
 writeFileSync(inputFile, '')
 const store = createProjectStore({ normalizeHostPath: identity, windowsPath: identity, forcingDirectories: () => [join(root, 'documents', 'forcing-metadata')] })
+// scene(energy, temperatureExtra)：最小 EB 场景；energy 并入 temperature.energy，
+//   temperatureExtra 并入 temperature（如 spinupHours）。build(input) 编译为引擎配置。
+// engineSource：引擎配置解析源码文本，供下面的缺省值/键名对照使用。
 const scene = (energy = {}, temperatureExtra = {}) => ({ overpass: '2019-07-15T04:00:00Z', locationSource: 'input',
   surface: { type: { file: inputFile }, lai: { value: 2 }, latitude: { value: 40 }, longitude: { value: 116 }, soilMoisture: { value: 0.2 } },
   view: { vza: { value: 0 }, vaa: { value: 0 } }, optical: { enabled: false }, thermal: { enabled: true, bands: [{ name: 'T', center: 10.5, fwhm: 0.5 }] },
@@ -32,6 +50,8 @@ const scene = (energy = {}, temperatureExtra = {}) => ({ overpass: '2019-07-15T0
 const build = (input) => store.buildEngineConfig(input, { outputDir: root, dataDir: root })
 const engineSource = readFileSync(join(repo, 'models', 'stream', 'app', 'config.cpp'), 'utf8')
 
+// 作用：从 config.cpp 源码按几种固定写法（numberOr/integerOr、GetString、GetBool，
+//   以及 resistance 子对象）提取某键的引擎缺省值，数字转 Number、true/false 转布尔；找不到返回 undefined。
 // Engine default of a key read from the `energy` object in config.cpp: numberOr/integerOr(energy, "k", D, ...), GetString("k", "D"), GetBool("k", D).
 function engineDefault(key) {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -49,6 +69,8 @@ function engineDefault(key) {
   return undefined
 }
 
+// 测试：(1) 服务端缺省与引擎缺省逐键相等；(2) 仅在给出时才转发的键，转发后键名必须出现在
+//   config.cpp 中（防止服务端发出引擎不认识的名字）；(3) 未给出的可选键不会被服务端凭空生成。
 test('EB mapping: every emitted energy key is read by the engine and the JS defaults equal the engine defaults', () => {
   const { energy } = build(scene()).temperature
   const defaults = { soilHeatMethod: 'surface', temperatureMethod: 'robust', diffuseFraction: 0.2, enforceSolarLimit: true, spectralBinNm: 50,
@@ -77,6 +99,8 @@ test('EB mapping: every emitted energy key is read by the engine and the JS defa
     assert.equal(energy[key], undefined, `${key} omitted`)
 })
 
+// 测试：spinupHours 向上取整为整点节点数（7.2 → 8）；未给出则不下发（引擎缺省 7）；
+//   范围 0–240 以外被拒绝。
 test('EB mapping: spin-up hours are whole nodes rounded up, like the engine', () => {
   assert.equal(build(scene({}, { spinupHours: 7.2 })).temperature.spinupHours, 8)
   assert.equal(build(scene({}, { spinupHours: 0 })).temperature.spinupHours + 0, 0)
@@ -87,6 +111,11 @@ test('EB mapping: spin-up hours are whole nodes rounded up, like the engine', ()
 })
 
 // ---------- rasters.mjs ----------
+// 作用：拼装最小 TIFF 字节：IFD 标签按升序排列；256/257 宽高，258 位深 32，259 无压缩，
+//   273/279 单条带的偏移与字节数，339 = 3 表示浮点样本，270 为含 band names 的描述；
+//   33550 像元尺度 (30, 30, 0)，33922 连接点（原点 500000, 4400000），
+//   34735 GeoKey（3072 投影坐标系 = 32650，即 EPSG:32650）。大于 4 字节的值写在 IFD 之后，
+//   像元数据放在最后，并回填条带偏移。
 // Minimal little-endian TIFF: one Float32 strip, GeoTIFF scale / tie point / EPSG key, band-name description.
 function tiffBytes({ width, height, values }) {
   const entries = []
@@ -121,6 +150,8 @@ function tiffBytes({ width, height, values }) {
   return Buffer.concat([head, ...data, pixels])
 }
 
+// 测试：inspectRasters 对 6 种输入的返回：正常 TIFF（尺寸、类型、CRS、像元大小、原点、波段名）、
+//   不存在、相对路径、非 TIFF 的 .txt、损坏的 .tif、空串；参数不是数组时返回空数组。
 test('rasters.inspectRasters: header probe, missing file, relative path, non-TIFF', () => {
   const tool = createRasterTools({ readTiff: () => { throw new Error('unused') }, normalizeHostPath: identity, windowsPath: identity })
   const file = join(root, 'probe.tif')
@@ -143,6 +174,8 @@ test('rasters.inspectRasters: header probe, missing file, relative path, non-TIF
   assert.equal(tool.inspectRasters('not an array').length, 0)
 })
 
+// 测试：rasterBand 对含 NaN 的 2x2 数据：有效像元数 3、最小/最大/均值（7/3）、96 格直方图、
+//   base64 的 Float32 样本保留 NaN；波段号越界与文件缺失分别报错。
 test('rasters.rasterBand: samples, statistics, band range and missing file', () => {
   const file = join(root, 'band.tif')
   writeFileSync(file, tiffBytes({ width: 2, height: 2, values: [1, 2, 3, 4] }))
@@ -161,6 +194,8 @@ test('rasters.rasterBand: samples, statistics, band range and missing file', () 
   assert.throws(() => tool.rasterBand(join(root, 'nope.tif'), 0), /找不到栅格/)
 })
 
+// 测试：按类别图（含一个 NaN 像元）统计产品波段：类别 10 有 2 个像元（值 1、3：均值 2、std 1，
+//   即总体标准差），类别 12 有 1 个（均值 5）；像元面积 pixelAreaKm2 = 30 m × 30 m = 900e-6 km²。
 test('rasters.classStatistics: per-class mean / std and class pixel counts', () => {
   const out = join(root, 'run-out')
   mkdirSync(out, { recursive: true })
@@ -182,6 +217,8 @@ test('rasters.classStatistics: per-class mean / std and class pixel counts', () 
   assert.throws(() => tool.classStatistics(out, typeFile, 0), /波段无效/)
 })
 
+// 以下 makeService 构造资源/模型目录都不存在的服务（因此"没有引擎"），请求体用内存回调；
+//   call(method, path, data) 返回 { status, payload }。
 // ---------- index.mjs routes that need no engine ----------
 function makeService() {
   let next = {}, reply = null
@@ -196,6 +233,8 @@ function makeService() {
   return { call }
 }
 
+// 测试：无引擎时 status 报不可用；inspect 仍可读栅格头；run 被拒绝并提示 STREAM 引擎缺失；
+//   run-info 对不存在的目录、没有 run-manifest.json 的目录、空路径都返回 >= 400。
 test('index routes: status without engine, inspect, missing engine on run, run-info errors', async () => {
   const { call } = makeService()
   const status = await call('GET', '/api/stream/status')

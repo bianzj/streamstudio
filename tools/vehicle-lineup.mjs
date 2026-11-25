@@ -1,3 +1,25 @@
+// ==========================================================================
+// 文件：vehicle-lineup.mjs
+// 功能：荒漠与森林两个示例共用的车辆阵列生成器：1 辆裸车（对照）、5 辆遮阳棚下的车、5 辆篷布覆盖的车；
+//   每个棚/篷布都有自己的光谱与纹理。把模型文件与位置文件写入示例目录，并把用到的光谱、热状态
+//   记录追加到工程 configuration（原有同名记录不重复添加）。
+// 主要模块：
+//   1. shadeCanopyObj：程序化生成双坡遮阳棚 OBJ（棚面 canopy_fabric + 6 根立柱 canopy_frame）
+//   2. 光谱构造：texture / fileSpectrum（引用 assets/spectral-library 文件）/ customSpectrum
+//   3. 数据表：SHARED_SPECTRA（车漆、饰件、玻璃、轮胎、钢架）、DESERT_CLASSES / WOODLAND_CLASSES
+//      （多光谱迷彩的类别光谱）、THEMES（每个主题 5 种棚布与 5 种篷布）、MODELS（车辆 OBJ 来源）
+//   4. objBounds：由 OBJ 顶点算三轴尺寸，用作对象 dimensions
+//   5. addVehicleLineup：复制模型、写棚 OBJ、登记光谱/热记录、按 11 个位置生成对象条目
+// 数据流：调用方（示例生成脚本，待核对）传入 theme、11 个 spots、configuration、示例/项目根目录
+//   → 写 models/*.obj 与 positions/*_position.txt → 返回对象 items 数组由调用方放入工程。
+// 约定：OBJ 为 Y 向上；棚的 X 方向为宽度，Z 为车长方向；位置文件一行 = 北、东、高度 0、缩放 1、旋转；
+//   spots 顺序 = [裸车, 5 个棚车位, 5 个篷布车位]，棚与其下的车共用同一位置；
+//   refTir / tauTir 为热红外波段反射率/透射率。
+// 关系：车辆网格组名（White/Blue、Windows、Black、Grey、Headlights、TailLights、part_N__covered_car）
+//   与 src/renderer/src/project-schema.js 的车辆绑定规则对应；材料名 vehicle_material、
+//   tarp_fabric 等见 docs/vehicle-thermal.md。
+// ==========================================================================
+
 // Shared vehicle lineup for the desert and forest examples: one bare car, five
 // cars under shade canopies and five tarp-covered cars, each canopy and tarp with
 // its own spectrum and texture. Writes models/ and positions/ into exampleRoot
@@ -5,6 +27,11 @@
 import { copyFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+// 作用：生成双坡（人字形）遮阳棚的 OBJ 文本。参数均为米：width 宽（X）、length 长（Z）、
+//   eave 檐口高、ridge 脊高、cell 棚面网格边长、post 立柱截面边长。
+//   棚面高度 height(x) 由脊线（x = 0）线性降到檐口；每个网格单元拆成 2 个三角形；
+//   立柱为 4 根角柱（高到 eave-0.02）加 2 根脊线端柱（高到 ridge-0.02），各为 8 顶点的方柱。
+//   输出含 canopy_fabric 与 canopy_frame 两个组，供工程按组分配材料。
 // Gable canopy in OBJ Y-up: X across, Z along the car, ridge along Z.
 export function shadeCanopyObj({ width = 3.6, length = 6.4, eave = 2.4, ridge = 2.85, cell = 0.1, post = 0.06 } = {}) {
   const lines = ['# Stream Studio shade canopy (tools/vehicle-lineup.mjs)', 'o canopy_fabric', 'g canopy_fabric']
@@ -33,8 +60,12 @@ export function shadeCanopyObj({ width = 3.6, length = 6.4, eave = 2.4, ridge = 
   return `${lines.join('\n')}\n`
 }
 
+// CANOPY_FOOTPRINT：缺省棚的占地尺寸（m），供调用方排布车位时避让（与 shadeCanopyObj 缺省参数一致）。
 export const CANOPY_FOOTPRINT = { length: 6.4, width: 3.6 }
 
+// 光谱/纹理构造器：texture = 物理纹理（方差纹理，strength 为强度，repeatSize 为平铺尺寸，单位 m，待核对）；
+//   fileSpectrum = 引用光谱库文本文件的光谱，refTir 为热红外反射率，preview 为仅用于显示的预览纹理，
+//   physical 为参与辐射计算的纹理；customSpectrum = 给定单一反射率的自定义光谱。
 const texture = (file, strength, repeatSize, extra = {}) => ({ enabled: true, fileName: `assets/texture-library/${file}`, strength, repeatSize, ...extra })
 const noTexture = { enabled: false, fileName: '', strength: 0.2, repeatSize: 2 }
 const fileSpectrum = (name, label, file, refTir, preview, physical = noTexture, extra = {}) => ({
@@ -46,6 +77,7 @@ const customSpectrum = (name, label, reflectance, refTir, preview) => ({
   previewTexture: preview ? { enabled: true, ...preview } : { enabled: false, preset: 'metal', repeatSize: 1.5 }, physicalTexture: noTexture
 })
 
+// 共享光谱：各主题通用的车漆（白/银/黑/沙/军绿）、饰件、玻璃、轮胎橡胶与棚的镀锌钢管架。
 const SHARED_SPECTRA = [
   customSpectrum('car_paint_white', '车漆·白色', 0.70, 0.08),
   customSpectrum('car_paint_silver', '车漆·银灰', 0.45, 0.10, { preset: 'metal', repeatSize: 1.5 }),
@@ -58,6 +90,8 @@ const SHARED_SPECTRA = [
   customSpectrum('steel_frame', '遮阳棚镀锌钢管支架', 0.30, 0.30, { preset: 'metal', repeatSize: 1 })
 ]
 
+// 多光谱迷彩的"类别光谱"：迷彩分类纹理中每种颜色对应一个真实地物光谱（沙、篷布、土壤等），
+//   荒漠主题用沙色系，林地主题用绿/褐/黑斑。
 const DESERT_CLASSES = [
   fileSpectrum('camo_class_sand', '迷彩类别·沙丘沙', 'sand_desert_dune', 0.05),
   fileSpectrum('camo_class_tan', '迷彩类别·沙色篷布', 'tarp_desert_tan', 0.09),
@@ -70,6 +104,9 @@ const WOODLAND_CLASSES = [
   fileSpectrum('camo_class_black', '迷彩类别·黑斑（炭黑涂层）', 'shade_net_black_fiber', 0.06)
 ]
 
+// THEMES：按主题（desert / forest）给出 classSpectra、5 个遮阳棚（car 车型、paint 车漆光谱、棚布光谱）
+//   和 5 个篷布车光谱。第 2 个篷布车使用分类纹理的多光谱迷彩（classTexture.classes 的 color → spectralName）。
+//   openness / opennessTexture 为遮阳网的开孔率（0–1，待核对含义）。
 // Five canopy fabrics and five tarps per theme, each a distinct spectrum + texture.
 const THEMES = {
   desert: {
@@ -111,12 +148,14 @@ const THEMES = {
   }
 }
 
+// MODELS：车辆 OBJ 来源及用于车漆的组名（SUV 为 White，轿车为 Blue）；covered 为带篷布的整车模型。
 const MODELS = {
   suv: { source: 'assets/obj-library/vehicle/typical/modern_suv.obj', paintGroup: 'White', label: 'SUV' },
   sedan: { source: 'assets/obj-library/vehicle/typical/modern_sedan.obj', paintGroup: 'Blue', label: '轿车' },
   covered: { source: 'assets/obj-library/vehicle/realistic/covered_car_realistic.obj' }
 }
 
+// 作用：读取 OBJ 顶点，返回 [X, Y, Z] 三轴范围（max - min，3 位小数），作为对象 dimensions。
 function objBounds(path) {
   const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity]
   for (const line of readFileSync(path, 'utf8').split('\n')) {
@@ -127,6 +166,11 @@ function objBounds(path) {
   return max.map((value, k) => Number((value - min[k]).toFixed(3)))
 }
 
+// 模块：addVehicleLineup —— 按 11 个车位生成 16 个对象条目（1 裸车 + 5×(车 + 棚) + 5 篷布车）。
+//   副作用：向 exampleRoot/models 复制车辆 OBJ 并写 shade_canopy.obj，向 exampleRoot/positions
+//   写每个对象的位置文件（调用前这些目录须已存在）；就地向 configuration.spectra / thermals 追加记录。
+//   energyBalance 为真（FacetEB）时棚布/篷布使用 tarp_fabric 材料（膜能量平衡），
+//   其他模式只作辐射绑定，用 vehicle_material。返回对象 items。
 // spots: 11 placements { north, east, rotation } — [bare, 5 canopy cars, 5 tarp cars].
 export function addVehicleLineup({ theme, spots, configuration, exampleRoot, projectRoot, sceneSize, energyBalance = false }) {
   const set = THEMES[theme]
@@ -140,6 +184,8 @@ export function addVehicleLineup({ theme, spots, configuration, exampleRoot, pro
   const files = { suv: model('suv'), sedan: model('sedan'), covered: model('covered'), canopy: 'models/shade_canopy.obj' }
   writeFileSync(join(exampleRoot, files.canopy), shadeCanopyObj(), 'utf8')
 
+  // 步骤：登记光谱与热记录——按名称去重；新增 canopy_temperature（日照/阴影初始温度 315/303，
+  //   单位按工程热记录约定，应为 K，待核对）。
   const existing = new Set(configuration.spectra.map((item) => item.name))
   for (const spectrum of [...SHARED_SPECTRA, ...set.classSpectra, ...set.canopies.map((entry) => entry.spectrum), ...set.tarps]) {
     if (!existing.has(spectrum.name)) { configuration.spectra.push(spectrum); existing.add(spectrum.name) }
@@ -151,12 +197,16 @@ export function addVehicleLineup({ theme, spots, configuration, exampleRoot, pro
   const body = 'vehicle_material'
   const fabric = energyBalance ? 'tarp_fabric' : 'vehicle_material'
 
+  // mesh：构造一个网格组设置（光谱、热记录、材料；冠层固定为刚体 rigid_body）。
+  // carMeshes：车辆各网格组的绑定——车漆组 + 车窗 + 轮胎(Black) + 灰饰件(Grey) + 前后灯。
   const mesh = (name, spectralName, thermalName = 'vehicle_temperature', materialName = body) => ({ name, spectralName, thermalName, materialName, canopyName: 'rigid_body' })
   const carMeshes = (car, paint) => [
     mesh(MODELS[car].paintGroup, paint), mesh('Windows', 'car_glass'), mesh('Black', 'tyre_rubber'),
     mesh('Grey', 'car_trim_grey'), mesh('Headlights', 'car_glass'), mesh('TailLights', 'car_glass')
   ]
   const items = []
+  // add：写位置文件一行（北、东、高度 0、缩放 1、旋转）并追加对象条目：手动分布、单实例，
+  //   dimensions 取自 OBJ 范围；对象默认的光谱/热/材料取第一个网格组的设置。
   const add = (name, label, type, fileName, spot, meshes) => {
     const row = [spot.north.toFixed(2), spot.east.toFixed(2), 0, 1, spot.rotation].join(' ')
     writeFileSync(join(exampleRoot, 'positions', `${name}_position.txt`), `${row}\n`, 'utf8')
@@ -167,6 +217,7 @@ export function addVehicleLineup({ theme, spots, configuration, exampleRoot, pro
       instanceCount: 1
     })
   }
+  // 步骤：先加裸车对照，再按 5 个棚各加"车 + 棚"（同位置），最后加 5 辆篷布车（spots[6..10]）。
   add('bare_suv', '空车：白色 SUV（对照）', 'Vehicle', files.suv, spots[0], carMeshes('suv', 'car_paint_white'))
   set.canopies.forEach((entry, index) => {
     const n = index + 1

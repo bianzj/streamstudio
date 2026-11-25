@@ -1,3 +1,23 @@
+// ==========================================================================
+// 文件：cases.mjs
+// 功能：回归测试的算例定义。每个算例固定“内置示例 + 计算模式 + 气象时段 + 参数覆盖”，
+//       使两版引擎能在完全相同的输入上运行并对比结果（见 tools/regression/README.md）。
+// 主要模块：
+//   1. 辅助构造器：规则格网位置 lattice、水面 OBJ waterSheetObj、旋转位置 URBAN_ROTATED、
+//      土壤热参数 soilThermal 以及周期边界/中波红外/土壤方法等常用参数集；
+//   2. 水体与船舶：URBAN_WATER（池塘）、urbanShip 与 SHIP_NEW（船体钢板默认参数）、VEB_SHIP；
+//   3. 车辆：座舱模型算例（VEH_*，docs/vehicle-thermal.md）与车辆部件模型算例（PARTS_*）；
+//   4. CASES：全部算例表，按专题分组（周期边界、中波红外、夜间稳定度、移动阴影、水体、墙体、
+//      船舶、土壤热惯性、Hapke 背景等）；
+//   5. FACET_OUTPUT：Facet 模式需要显式给定的结果索引文件名。
+// 数据流：本文件 → prepare.mjs（生成冻结输入）→ run.mjs（运行）→ compare.py（对比）。
+// 约定：算例字段——example（assets/examples 下的示例名）、mode（eRaytracing / eVoxelRT / eVoxelEB /
+//       eFacetRT / eFacetEB）、meteo [起, 止] 气象节点区间、positions 替换位置文件（行：x y z scale rotation）、
+//       files 追加文本文件、set 点分路径覆盖、addSpectra/addMaterials/addObjects 追加光谱/材料/对象。
+//       算例名前缀 rt/vrt/veb/frt/feb 对应上述五种计算模式（STREAM 模式不在此回归范围内）。
+// 注意：feb_urban_wall_layered 中 building_roof 的 label 字符串在源码中已是乱码（待核对原意，应为中文“建筑屋顶”）。
+// ==========================================================================
+
 // Engine regression cases built from the bundled examples (assets/examples).
 // Each case freezes one example + mode + meteo window + control overrides so
 // two engine builds can be run on identical inputs and compared.
@@ -15,7 +35,9 @@ const FOREST_LATTICE = {
   'positions/jacaranda_position.txt': lattice(4, 100, 0.95),
   'positions/searsia_position.txt': lattice(8, 100),
 }
+// 周期边界：沿 x/y 方向的周期遍历次数取 8（示例中的城市场景已用 20 次）。
 const PERIODIC_8 = { 'configuration.control.periodicTraversalCount': 8 }
+// 中波红外设置：传感器同时输出 3800 nm 与 10500 nm 两个离散波段并输出亮温（温度）。
 const MWIR_BANDS = { 'configuration.sensor.bands': '3800,10500', 'configuration.sensor.continuousBands': false,
   'configuration.sensor.temperature': true }
 // Every soil set on soil method 1 (the control value overrides the material).
@@ -25,6 +47,7 @@ const SOIL_METHOD_2 = { 'configuration.control.soilTemperatureMethod': 2 }
 const NO_PROCESS = { 'configuration.sensor.energyProcess': false, 'configuration.sensor.radiationProcess': false }
 // Method 1 with the complete heat history (8 nodes + exponential modes).
 const SOIL_HISTORY_FULL = { 'configuration.control.soilInertiaHistory': 'full' }
+// 作用：返回“按材料序号写入土壤热参数”的函数：cs（比热）、rhos（密度）、lambdas（导热系数）。
 const soilThermal = (cs, rhos, lambdas) => (index) => ({ [`configuration.materials.${index}.params.cs`]: cs,
   [`configuration.materials.${index}.params.rhos`]: rhos, [`configuration.materials.${index}.params.lambdas`]: lambdas })
 const SOIL_SCOPE = soilThermal(1180, 1800, 1.55)
@@ -155,6 +178,8 @@ const PARTS_PARK = urbanVehicleParts([
 const PARTS_DRIVE = (acOn) => urbanVehicleParts([
   { name: 'dr_car', paint: 'white', rows: ['150 40 0 1 0'], body: { occupants: 1, speed: 15, engineOn: true, acOn, heading: 90, windDirection: 270 } }])
 
+// 算例表：键为算例名，值为算例定义（字段含义见文件头）。
+// 分组与说明见各段上方注释；增删算例后需重新 prepare，并重跑基线变体。
 export const CASES = {
   // FacetEB vehicle cabin (06:00-20:00): 5 parked cars (light paint in sun / tree / two building-side spots, dark paint
   // in sun), one driving car at 15 m/s without and with air conditioning.
