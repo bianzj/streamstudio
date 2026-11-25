@@ -140,6 +140,9 @@ export function buildProjectFromUsd(baseProject, manifest, options) {
     }
     // 步骤 4：每个放置点写成位置文件一行：北、东、离地高度、缩放、旋转。
     //   离地高度 = USD 的 y 减去该点处地形高度（与导出时 height + ground 互逆）。
+    //   位置文件的高度本来就含 scene.offsetY（runtime-scene.mjs 写运行时位置文件时才减去），导出时贴地对象写
+    //   offsetY + 贴地高度、其他对象写文件高度，因此这里不必再区分类型或加减 offsetY（往返测试见
+    //   tools/test-usd-roundtrip-20261125.mjs，offsetY ≠ 0 时不漂移）。
     const records = placements.map((placement) => [
       round(placement.north),
       round(placement.east),

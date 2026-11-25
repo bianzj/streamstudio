@@ -14,7 +14,10 @@
 //         object-N.obj / spectrum-N.txt；返回统计量与 cleanup() 供调用方清理。
 // 约定：OBJ 为 Y 向上；计算域 X∈[offsetX, offsetX+scene.x]，Y(高)∈[offsetY, offsetY+scene.height]，
 //       Z∈[offsetZ, offsetZ+scene.y]（注意工程的 scene.y 对应运行时 Z）；单位 m；
-//       位置文件每行前三列依次赋给运行时的 x、z、y（y 为高度，即“北、东、高”），其后为缩放、旋转角（度）；
+//       位置文件每行前三列依次是 北、东、高（含 scene.offsetX/Z/Y 的绝对坐标），其后为缩放、旋转角（度）；
+//       positionRecords 把前三列依次读成运行时的 x、z、y（y 为高度），写运行时位置文件时同样按 x、z、y 顺序写回，
+//       与 server.mjs /api/project/distribution 写出的 `x y z scale rotation`（x 北、y 东、z 高）及
+//       usd-export.mjs 的 readPlacements 列顺序一致；
 //       旋转取 -rotation 绕 Y 轴；裁剪后实例的位置相对计算域原点（offset 已减去）。
 // ==========================================================================
 
