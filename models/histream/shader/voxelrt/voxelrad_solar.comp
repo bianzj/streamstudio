@@ -52,14 +52,12 @@ ShadowHitPayload shadow_payload;
 #include "../traceray_comp.glsl"
 #include "../solar_steps.glsl"
 
-// 一维工作组；GammaR/GammaT 为漫射角度离散的反射/透射表（本文件未使用，与其他体元着色器共用声明）。
+// 一维工作组。（2026-11-25 删除了本文件未使用的 MAXBAND 宏与 GammaR/GammaT 数组声明——它们是与其他
+// 体元着色器共用的遗留声明。）
 layout(local_size_x = GROUP_SIZEX) in;
 // #define DIFFUSE_ANGLE_NUM 32
-#define MAXBAND    800
 #define NUM_VNIR 2001 
 #define NUM_BAND 2002
-float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
-float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 
 // As VoxelEB: the straight solar ray is followed until it leaves the scene
 // (SolarStepLimit, at least setting.maxStep = clamp(128*depth, 128, 2048));

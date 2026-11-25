@@ -10,7 +10,8 @@
 // 与其他文件关系：依赖 functions.glsl（Rnd、Planck、InvPI 等）与 sampling.glsl
 //         （sampleHemisphereCosine、PdfHemisphereCosine）。
 // 约定：切线空间中法线为 +z（v.z = cosθ）；bsdf 系数的符号 ±1/π 是体元/面元算法中
-//       “正负采样”的约定（概率 0.5 取负），不是物理上的负反射（待核对与调用方的对应关系）。
+//       “正负采样”的约定（概率 0.5 取负），不是物理上的负反射：调用方用符号选择反射（+）/透射（−）分支，
+//       并在有透射材料时对吞吐量乘 2 补偿选择概率（见 SampleBSDF 的说明）。
 // ==========================================================================
 
 #ifndef BSDF_H
@@ -70,7 +71,11 @@ float ProbabilityOfBSDF(vec3 wi)
 }
 
 // 模块：BSDF 采样。余弦加权采样半球方向 wi，同时随机取符号系数 bsdf=±1/π，
-//       Pr 为该方向的 pdf。注意：Pr 不含符号选择的 0.5 概率（待核对调用方是否另行处理）。
+//       Pr 为该方向的 pdf。Pr 不含符号选择的 0.5 概率，这是有意的、并非遗漏：
+//       2026-11-25 核实调用方（RayTracing/offline.rgen 的 InDirectLighting）——bsdf<0 表示选择透射分支，
+//       仅当材料有透射时才用符号选分支，此时吞吐量乘 2.0 补偿“反射/透射各 50%”的选择概率
+//       （pathThroughput = 2·|bsdf|·cosθ，再除以 Pr）；材料无透射时恒走反射分支，不乘 2。
+//       DirectLighting 的天空采样只用方向，忽略符号。
 // 副作用：推进 seed。
 // BSDF sampling, generate a direction, coefficient of BSDF, probability of this direction.
 void SampleBSDF(inout uint seed, out vec3 wi, out float bsdf, out float Pr)

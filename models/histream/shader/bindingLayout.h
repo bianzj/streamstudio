@@ -15,8 +15,8 @@
 // 与其他文件关系：依赖 settings.h（各 *Setting 结构体）与 parameters.h（材料、体元等数据结构）；
 //         宿主端描述符布局必须与本文件的 B_* 编号一致（见 models/histream/src 中对应的管线创建代码）。
 // 约定：各宏段互相独立，B_* 编号只在所属段内有意义（同名宏编号可不同，如 B_THERMAL 在
-//       RAYTRACING 与 VOXELRT 中均为 1，而 VOXELLST 中为 2）；每段的 `// 1-5` 之类行内编号注释
-//       是历史遗留的分组提示，不一定与实际编号一致，以 #define 为准。
+//       RAYTRACING 与 VOXELRT 中均为 1，而 VOXELLST 中为 2）；每段的 `// binding a-b` 行内注释
+//       是分组提示（2026-11-25 已按当前 #define 更正；此前为不对应的旧编号 `// 1-5` 等），以 #define 为准。
 // ==========================================================================
 
 #ifndef BINDINGLAYOUT
@@ -122,45 +122,45 @@ layout(push_constant) uniform _RtxState
 // pairs per voxel; a single element unless some soil set uses it.
 #define B_SOILMEMORY 41
 
-// 1-5
+// binding 0-4（2026-11-25 按当前 #define 更正分组注释，下同）
 layout(binding = B_SPECTRAL) buffer _bufferOPTICAL { SpectralMaterial specMaterials[]; }; // --
 layout(binding = B_FIXEDSPECTRAL) buffer _bufferFOPTICAL { SpectralMaterial spectralMaterials[]; };
 layout(binding = B_THERMAL) buffer _bufferTem { ThermalMaterial tempMaterials[]; }; // --
 layout(binding = B_TEMPE) buffer _bufferTHERMAL { VoxelTempe voxelTempes[]; };
 layout(binding = B_CANOPY) buffer _BufferCanopy {Canopy canopies[];};
-// 5-10 
+// binding 5-10
 layout(binding = B_MESHLINK) buffer _bufferMODELLINK { MeshLink meshLinks[]; }; 
 layout(binding = B_INSTANCELINK) buffer _BufferInstanceLink {InstanceLink instanceLinks[];};
 layout(binding = B_VOXELLINK) buffer _BufferBufferVoxelLink {VoxelLink voxelLinks[];};
 layout(binding = B_NANO) buffer _BufferVoxelNANO {uint pnanovdb_buf_data[];};
 layout(binding = B_TLAS)		uniform accelerationStructureEXT topLevelAS;
 layout(binding = B_SENSOR) uniform _CameraMatrix { SensorMatrix sensorMatrix; };
-//11-15
+// binding 11-14（binding 15 即 B_RADS，见下）
 layout(binding = B_WAVE) buffer _bufferWAVE { float wave[]; };
 layout(binding = B_LIGHT) uniform _LightSet { LightSet lightSet; };
 layout(binding = B_ATOM) buffer _bufferWAVEset { AtomCond atomConds[]; };
 layout(binding = B_DIR) buffer _bufferDir { VoxelDir voxelDirs[]; };
-// 注意：本段的体元辐射 voxelRads 不走描述符绑定（B_RADS=15 仅为占位，未声明对应缓冲），
-//       而是通过 push constant 中的 radianceAddress 物理地址访问，避免超过 4 GiB 的限制。
+// 注意：本段的体元辐射 voxelRads 不走描述符绑定：B_RADS=15 只是占位编号，没有 layout(binding = B_RADS) 的缓冲声明
+//       （着色器里没有 layout(binding = B_RADS) 的缓冲声明），而是通过 push constant 中的 radianceAddress 物理地址访问，
+//       避免超过 4 GiB 的限制。
 // Physical addresses allow the 64-direction scratch field to exceed 4 GiB.
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer VoxelRadianceBuffer {
   VoxelRad values[];
 };
 #define voxelRads VoxelRadianceBuffer(setting.radianceAddress).values
-//12 -20
-// 体元净辐射（voxelNetRads）等缓冲；此处的行内分组注释 `12 -20` 为旧编号提示，以 #define 为准。
+// binding 16-20：体元净辐射（voxelNetRads）、光合净辐射、输出图像、气象 UBO、气动条件
 layout(binding = B_NETRAD) buffer _bufferNET {VoxelNetRad voxelNetRads[];}; //
 layout(binding = B_PNET) buffer _bufferPNRad { VoxelPnet voxelPnets[]; };
 layout(binding = B_STORAGE) buffer _bufferstorage { float outImage[]; };
 layout(binding = B_METEO) uniform UBOM{Meteo meteo;} ubom;
 layout(binding = B_AERO) buffer BUFFER2{ AeroCond aeroConds[];};
-//20-25
+// binding 21-25
 layout(binding = B_RAA) buffer RAA{VoxelRaa voxelRaas[];};
 layout(binding = B_LEAFBIO) buffer UBOL{LeafBio leafBios[];};
 layout(binding = B_SOILSET) buffer UBOS{SoilSet soilSets[];};
 layout(binding = B_RSS) buffer BUFFER5{VoxelRss voxelRsss[];};
 layout(binding = B_AIR) buffer BUFFER4{VoxelAir voxelAirs[];};
-// 25-28
+// binding 26-41（热通量、末次温度、能量平衡状态、叶面积密度、水体、流体场、HEX、土壤记忆）
 layout(binding = B_FLUX) buffer FLUX{VoxelHeatFlux voxelHeatFlux[];};
 layout(binding = B_TLAST) buffer BUFFER3{VoxelTlast voxelTlasts[];};
 layout(binding = B_STATE) buffer  _UBOSS{EBState ebState;};
@@ -216,27 +216,24 @@ layout(push_constant) uniform _RtxState
 #define B_WATERSET 17
 
 
-// 1-5
+// binding 0-4
 layout(binding = B_SPECTRAL) buffer _bufferOPTICAL { SpectralMaterial spectralMaterials[]; }; // --
 layout(binding = B_THERMAL) buffer _bufferTem { ThermalMaterial thermalMaterials[]; }; // --
 layout(binding = B_CANOPY) buffer _BufferCanopy {Canopy canopies[];};
-// 5-10 
 layout(binding = B_MESHLINK) buffer _bufferMODELLINK { MeshLink meshLinks[]; }; 
 layout(binding = B_INSTANCELINK) buffer _BufferInstanceLink {InstanceLink instanceLinks[];};
+// binding 5-8
 layout(binding = B_VOXELLINK) buffer _BufferBufferVoxelLink {VoxelLink voxelLinks[];};
 layout(binding = B_NANO) buffer _BufferVoxelNANO {uint pnanovdb_buf_data[];};
 layout(binding = B_TLAS)		uniform accelerationStructureEXT topLevelAS;
 layout(binding = B_SENSOR) uniform _CameraMatrix { SensorMatrix sensorMatrix; };
-//11-15
+// binding 9-12
 layout(binding = B_WAVE) buffer _bufferWAVE { float wave[]; };
 layout(binding = B_LIGHT) uniform _LightSet { LightSet lightSet; };
 layout(binding = B_DIR) buffer _bufferDir { VoxelDir voxelDirs[]; };
 // 体元辐射缓冲：这里直接绑定为 SSBO（VOXELLST 段则用物理地址）。
 layout(binding = B_RADS) buffer _bufferRad { VoxelRad voxelRads[]; };
-//12 -20
-//20-25
-
-// 25-28
+// binding 13-17（本段没有 VOXELLST 段的气象/土壤/流体等缓冲，原 `12 -20`、`20-25` 等空分组注释已删除）
 layout(binding = B_NETRAD) buffer _bufferNET {VoxelNetRad voxelNetRads[];}; //
 layout(binding = B_STORAGE) buffer _bufferstorage { float outImage[]; };
 layout(binding = B_LAD) buffer  _LAD{float lads[];};

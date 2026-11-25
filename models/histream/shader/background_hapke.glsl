@@ -79,7 +79,8 @@ float hapkeReflectanceWeight(float reflectance, vec3 incomingDirection,
     float mu0 = max(dot(n, wi), 1e-4);
     float mu = max(dot(n, wo), 1e-4);
     float phaseAngle = acos(clamp(dot(wi, wo), -1.0, 1.0));
-    // 步骤 2：由反射率估计单次散射反照率 w = 4r/(1+r)²（经验近似，待核对来源），
+    // 步骤 2：由反射率估计单次散射反照率 w = 4r/(1+r)²：Hapke 的各向同性散射近似下
+    //       r = (1-γ)/(1+γ)，γ=√(1-w)，解得 w = 1-γ² = 4r/(1+r)²（2026-11-25 核实，公式自洽）；
     //       并限幅到 [1e-5, 0.999] 保证 H 函数与核数值稳定。
     float r = clamp(reflectance, 0.0, 0.999);
     float singleScatteringAlbedo = clamp(4.0 * r / pow(1.0 + r, 2.0), 1e-5, 0.999);
@@ -122,7 +123,8 @@ float surfaceThermalEmissivity(float reflectance, float transmittance,
     vec3 n = normalize(surfaceNormal);
     vec3 wo = surfaceHemisphereDirection(outgoingDirection, n);
     float mu = max(dot(n, wo), 1e-4);
-    // 说明：用 w = 1-ε² 由基础发射率反推单次散射反照率（经验近似，待核对），
+    // 说明：用 w = 1-ε² 由基础发射率反推单次散射反照率（即 γ=√(1-w)=ε，与上面 r↔w 的关系同类，
+    //       2026-11-25 核实公式自洽），
     //       再用 Emissivity_Hapke（functions.glsl）算方向发射率并以天底值归一，
     //       使天底方向仍保持基础发射率，仅在斜视方向产生变化。
     float singleScatteringAlbedo = clamp(

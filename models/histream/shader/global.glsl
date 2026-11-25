@@ -30,6 +30,10 @@
 
 // 数学常量与随机数类型。INFINITY 用 1e32 代替 IEEE 无穷（GLSL 中避免真正的 inf）；
 // SHORTDISTANCE 为“短距离”阈值（单位同场景长度，待核对用途）。
+// 说明（2026-11-25）：π 有两套并存的定义——下面的宏 PI / TWO_PI（以及后面的 PID2 等）与第 55 行起的
+//   const float M_PI / M_TWO_PI / M_PI_2 / M_1_OVER_PI / InvPI。数值同为 float 可表示的 π（常量表达式在
+//   编译期折叠为 float，两套结果相同），但各着色器已混用多年；为避免合并时意外改变浮点常量的
+//   折叠方式（例如 1/PI 与 M_1_OVER_PI 的最后一位），两套保持并存，新代码任选其一并在同文件内保持一致。
 #define PI 3.14159265358979323
 #define TWO_PI 6.28318530717958648
 #define INFINITY 1e32
@@ -78,14 +82,14 @@ const float InvPI = 0.318309886183790671538;
 #define GROUP_SIZEXYZ 8
 
 // PID2 ≈ 89.26°（略小于 π/2 的角度上限，用来避免天顶角余弦为 0；待核对）。
-// TLASTNUM：土壤温度“上一时刻”节点数；MAXSTEP、BANDNUM 的含义待核对。
+// TLASTNUM：土壤温度“上一时刻”节点数；BANDNUM 的含义待核对。
+// （2026-11-25 删除了未被任何编译中着色器引用的 MAXSTEP 宏；步数上限取 setting.maxStep。）
 // BANDNUM=2162 与下方 NBAND=2002 两者用途不同（待核对）。
 #define PID2 1.557963
 #define TLASTNUM 8
 // Sum-of-exponentials modes of the soil method-1 history beyond TLASTNUM nodes
 // (SoilSet.inertiaHistory = 1); keep equal to structs.h.
 #define SOIL_MEMORY_MODES 12
-#define MAXSTEP 8
 #define DIFFUSE_ANGLE_NUM 64
 #define BANDNUM 2162
 

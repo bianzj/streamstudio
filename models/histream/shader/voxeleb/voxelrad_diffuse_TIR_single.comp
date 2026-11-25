@@ -68,7 +68,6 @@ ShadowHitPayload shadow_payload;
 
 layout(local_size_x = GROUP_SIZEX) in;
 // #define DIFFUSE_ANGLE_NUM 32
-#define MAXBAND    25
 #define NUM_VNIR 2001 
 #define NUM_BAND 2002
 
