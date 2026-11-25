@@ -1,5 +1,19 @@
 # Stream Studio 尚存问题核查（2026-10-05）
 
+## 2026-11-25 着色器审阅修复（fixshader）
+
+### 已修正（2026-11-25）
+
+- VoxelEB 林下植被位移高度（`aeresist.comp`）：`sqtemp` 漏了 `/2`，已改为 `sqrt(CD1·LAI/2)`（与上层冠层、STREAM 一致）。JSON 工程固定 `hc_veg=0`，该分支几乎不可达（仅冠高 < 0.05 m 才进入）；`veb_forest`、`veb_forest_periodic`、`veb_forest_night`、`veb_forest_soil`、`veb_urban`、`veb_urban_day`、`veb_urban_ship_plate` 输出逐字节不变。强制全部植被走该分支的压力测试（估上限）：植被/建筑组温度变化 ≤0.05 K，净辐射 ≤0.4 W m⁻²（仅 `veb_urban` 12:20 建筑组显热/导热通量约 1.5 W m⁻²）。
+- `functions.glsl`：未被调用的 `computeA` 变量遮蔽（外层 `Vc/Ve/Vs` 从未赋值）已修；`sel_root` 判别式为负时按 0 处理；`cross0`（实为点积）改名 `dot0`。无调用方受影响，输出不变。
+- 删除未使用声明（`GammaR/GammaT`、`MAXBAND`、`MAXSTEP`、`kiter`、`vegTemperatureSum/vegNum`、`Rin`），`skyZero` 改名 `transmittanceOnly`，`QueryClosestPeriodic`/`ClosestHitT` 整理，旧注释（`Rin/Rli`、`bindingLayout.h` 分组、`PeriodicSceneTop` 单位、Rnd 取值区间 [0,1]）更正；12 个算例输出逐字节不变。
+- 核实为有意设计/不影响现有工程（只补注释）：`updateL.comp` 已弃用（管线创建但从未分派）；`shade_state_voxel.glsl` 切线（实例只有均匀缩放）；`offline.rgen` 景深（`aperture` 恒 0 或 −4，遗留）；`bsdf.glsl` 的 ±1/π（调用方对有透射材料乘 2 补偿）；`global.glsl` 两套 π 常量并存。
+
+### 未做 / 仍未处理
+
+- `aeresist.comp` 中性变体（未开稳定度修正）：`CANOPY_KH` 取 `kh0` 而不是算好的 `kh`（为保持与 MOST 之前逐位一致而有意保留；改用 `kh` 会改变 XML 旧工程 `0<|L|<500` 的结果，且 `kh` 在中性时未赋值）；`PID2=1.557963`（≈89.26°）被用作 `psim` 中的 π/2（应为 1.570796，ψm 偏差 0.013：z/L=−0.01 时相对偏差约 34%，−0.1 时约 4.5%，−1 时约 1%；该常数来自首版源码快照，无出处说明）——两者都只影响设了非零 L 的旧 XML 工程，待决定是否一并修正。
+- `random.glsl` 的 `Rnd()` 取值区间实为 [0,1]（约 3×10⁻⁸ 概率为 1.0），改为严格 [0,1) 会改变全部随机序列，未改。
+
 ## 2026-11-25 VoxelEB 叶面空气状态初值（fixhost）
 
 ### 已修正（2026-11-25）

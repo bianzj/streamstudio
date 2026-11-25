@@ -661,8 +661,12 @@ void main()
                 laitemp = canopy.lai;
                 // d and tom 
                 // 林下植被自身的位移高度/粗糙长度（下限 0.01 m），用于确定其底部高度 y2 = d + z0m；
-                //   注意：此处 sqrt(CD1·LAI) 无上面 sq 的 /2 因子（疑似不一致，待核对）。
-                sqtemp = sqrt(CD1*laitemp);
+                //   2026-11-25 起 sqrt(CD1·LAI/2) 与上面 sq 及 STREAM energy.cpp 的 Raupach 形式一致
+                //   （此前漏了 /2，与同一代码块里 g1temp 的 LAI/2 也不一致）。
+                //   该分支只在冠高 < hcmax 时进入：JSON 工程固定 aerocond.hc_veg=0（hcmax 取体元自身冠高，
+                //   见 fileio_json.cpp），所以几乎不可达（仅冠高 < 0.05 m 时 hcmax 下限取 0.05 才会进入）；
+                //   XML 旧工程设了 hc_veg>0 时才常用。
+                sqtemp = sqrt(CD1*laitemp/2.0);
                 g1temp = max(3.3, sqrt(CSSOIL + CD*laitemp / 2.0));
                 dtemp= max(hctemp*(1 - (1 - exp(-sqtemp)) / sqtemp),0.01);   //
                 z0mtemp = max((hctemp - dtemp)*exp(-kappa*g1temp + PSICOR),0.01); //
