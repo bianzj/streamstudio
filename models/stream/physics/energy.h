@@ -128,7 +128,8 @@ struct EnergyDiagnostics {
     double airDensity = 0, ustar = 0, displacement = 0, roughness = 0, canopyWeight = 0;
     double obukhovLength = 0;
     double meltFlux = 0;            // W m-2 scene-weighted melt heat sink of temperature-capped (snow / ice) components
-    int iterations = 0, stabilityIterations = 0;
+    int iterations = 0;
+    int stabilityIterations = 0;     // always equal to iterations: temperature and 1/L share one joint iteration (README); kept for the output layout
     bool meltLimited = false;       // at least one component sat on the temperature cap with a surplus of energy
     bool converged = false, stabilityConverged = false, stabilityLimited = false, fallbackUsed = false;
 };

@@ -571,7 +571,7 @@ int runImage(const std::string& configPath)
     std::array<std::vector<float>, 4> components;
     std::vector<std::vector<float>> forcingOut, fluxOut;
     std::vector<float> diffuseFractionOut(pixels, kNaN);
-    long long ebPixels = 0, ebConverged = 0, ebStable = 0, ebWaterPixels = 0, ebFailed = 0, ebNoForcing = 0, ebClamped = 0;
+    long long ebPixels = 0, ebConverged = 0, ebStable = 0, ebBracket = 0, ebWaterPixels = 0, ebFailed = 0, ebNoForcing = 0, ebClamped = 0;
     constexpr int kBaseFluxBands = 18;
     long long iceMeltPixels = 0, iceCappedPixels = 0;   // FIX(2026-11-24 ice melt)
     double iceMeltSum = 0.0;
@@ -1053,7 +1053,7 @@ int runImage(const std::string& configPath)
         // 逐像元并行求解 EB（每行一个线程；进度只由主线程上报）。每个像元：检查地类/位置/LAI/强迫 →
         // 记录过境时刻强迫 → 水体直接取表皮温度 → 其他地类组装地表、起转推进 → 写组分温度与通量。
         ParallelError errorsEb;
-        #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing, ebClamped, iceMeltPixels, iceCappedPixels)
+        #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebBracket, ebWaterPixels, ebFailed, ebNoForcing, ebClamped, iceMeltPixels, iceCappedPixels)
         for (int row = startRow; row < endRow; ++row) {
             if (errorsEb.failed()) continue;
             try {
@@ -1123,6 +1123,7 @@ int runImage(const std::string& configPath)
                 ++ebPixels;
                 if (result.converged) ++ebConverged;
                 if (result.stabilityConverged) ++ebStable;
+                if (result.fallbackUsed) ++ebBracket;   // 过境节点进入过 1/L 括号法回退的像元（不论最终是否闭合）
                 {   // FIX(2026-11-24 M2): a component pinned at a temperature limit means the solve is not trustworthy
                     const int count = leafArea > 0.0f ? 4 : 2;
                     for (int k = 0; k < count; ++k) {
@@ -1138,7 +1139,7 @@ int runImage(const std::string& configPath)
         for (const double value : rowIceMelt) iceMeltSum += value;
         errorsEb.rethrow("能量平衡求解");
         log("能量平衡：" + std::to_string(ebPixels) + " 个像元，过境时刻收敛 " + std::to_string(ebConverged) + " 个（稳定度迭代收敛 " +
-            std::to_string(ebStable) + " 个），水体取" + (waterSkinMissing ? " 2 m 气温（数据包无 skt）" : " 气象强迫表皮温度") + " " +
+            std::to_string(ebStable) + " 个）" + (ebBracket ? "，其中 " + std::to_string(ebBracket) + " 个使用了 1/L 括号法回退" : "") + "，水体取" + (waterSkinMissing ? " 2 m 气温（数据包无 skt）" : " 气象强迫表皮温度") + " " +
             std::to_string(ebWaterPixels) + " 个" + (ebFailed ? "，未能求解 " + std::to_string(ebFailed) + " 个" : "") +
             (ebNoForcing ? "，气象强迫无有效值（如陆面产品的海面）跳过 " + std::to_string(ebNoForcing) + " 个" : ""));
         log("EB 初值：土壤、叶片与土壤热历史全部取起转起点 " + formatUtc(marchStart) + " 的 2 m 气温（不使用 skt/stl1/stl2）");
@@ -1595,6 +1596,7 @@ int runImage(const std::string& configPath)
                                                std::to_string(static_cast<int>(kComponentTemperatureMin)) + "-" + std::to_string(static_cast<int>(kComponentTemperatureMax)) + " K limit");
         temperatureInfo.Add("componentTemperatureLimitsK", std::to_string(static_cast<int>(kComponentTemperatureMin)) + "-" + std::to_string(static_cast<int>(kComponentTemperatureMax)));
         temperatureInfo.Add("stabilityConvergedPixels", static_cast<GInt64>(ebStable));
+        temperatureInfo.Add("bracketFallbackPixels", static_cast<GInt64>(ebBracket));  // 过境时刻使用 1/L 括号法回退的像元数
         temperatureInfo.Add("stability", "Monin-Obukhov coupled solve: 1/L fixed-point iteration with adaptive relaxation 0.02-0.5 (halved on a sign change of the error, grown by 1.1 otherwise), H-only buoyancy; iteration tolerance 1e-4 + 0.02|target| (m-1), final acceptance 2x iteration tolerance");
         temperatureInfo.Add("energyScheme", "tirt");
         temperatureInfo.Add("soilHeatMethod", config.soilHeatMethod == SoilHeatMethod::Depth ? "depth" :

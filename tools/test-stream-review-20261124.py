@@ -175,6 +175,7 @@ def test_cold_night_converges_below_240_k(tmp_path):
     assert converged.min() == 1.0
     assert np.abs(sensible).max() < 150.0
     assert summary(out)['temperature']['nonConvergedPixels'] == 0
+    assert 'bracketFallbackPixels' in summary(out)['temperature']
 
 
 # 作用：把 maxIterations 限为 1，必有未收敛像元；要求 summary 与日志都明确报告，
@@ -220,7 +221,8 @@ def test_unknown_terrain_mode_lists_every_mode(tmp_path):
 
 # 检查收敛性：强不稳定条件下，旧版 1/L 松弛迭代会出现温度、阵风与 1/L 的极限环；
 #   过境节点的括号式（bracketing）回退应让 144 个像元中至少 140 个收敛（旧引擎为 79）。
-#   fl[8] 为第 9 个波段，含义待核对（此处与 fl[5] 一起作收敛判据）。
+#   fl[8] 为第 9 个波段（稳定度是否收敛），与 fl[5]（能量是否收敛）一起作收敛判据；
+#   summary 的 bracketFallbackPixels（过境节点使用括号法的像元数）应等于迭代次数 fl[4] 超过 maxIterations（缺省 50）的像元数且 > 0。
 # ---------- convergence: strongly unstable cropland / forest pixels no longer end in 1/L limit cycles ----------
 def test_unstable_pixels_converge_with_bracketing_fallback(tmp_path):
     """12 x 12 window of the MODIS example in which the plain 1/L relaxation left 65 of 144 pixels unconverged
@@ -239,3 +241,5 @@ def test_unstable_pixels_converge_with_bracketing_fallback(tmp_path):
     closure = np.abs(fl[0] - fl[1] - fl[2] - fl[3])
     assert np.nanmax(closure) < 100.0
     assert summary(out)['temperature']['nonConvergedPixels'] == int(solved.sum() - converged.sum())
+    bracket = summary(out)['temperature']['bracketFallbackPixels']
+    assert bracket > 0 and bracket == int((fl[4][solved] > 50).sum())

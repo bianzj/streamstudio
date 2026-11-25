@@ -883,8 +883,9 @@ EnergyDiagnostics solveEnergyNode(const EnergySurface& surface, const Forcing& f
     diagnostics.converged = closed;
     diagnostics.stabilityConverged = stabilityClosed;
     diagnostics.stabilityLimited = solution.aero.limited;
-    // 注：fallbackUsed 恒为 false，括号法回退是否启用不在此标记（待核对：该字段是否仍被使用）。
-    diagnostics.fallbackUsed = false;
+    // fallbackUsed：本节点是否进入过 1/L 括号法回退（仅过境节点在 maxIterations 内未闭合时才会进入；
+    // 结果是否最终采用括号法终点，以 converged 与残差为准——括号法不更好时会恢复到普通迭代的终点）。
+    diagnostics.fallbackUsed = bracketMode;
     state.sceneSensible = solution.sceneSensible;
     return diagnostics;
 }
