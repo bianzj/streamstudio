@@ -15,7 +15,8 @@
 //       eFacetRT / eFacetEB）、meteo [起, 止] 气象节点区间、positions 替换位置文件（行：x y z scale rotation）、
 //       files 追加文本文件、set 点分路径覆盖、addSpectra/addMaterials/addObjects 追加光谱/材料/对象。
 //       算例名前缀 rt/vrt/veb/frt/feb 对应上述五种计算模式（STREAM 模式不在此回归范围内）。
-// 注意：feb_urban_wall_layered 中 building_roof 的 label 字符串在源码中已是乱码（待核对原意，应为中文“建筑屋顶”）。
+// 说明：feb_urban_wall_layered 中 building_roof 的 label 曾是乱码（UTF-8 “建筑屋顶”被按 GBK 误读），已于 2026-11-25 改回；
+//   引擎（models/histream/src）不读取 label，改它只影响重新生成的 project.json 文本，不影响计算；已冻结算例里本就是“建筑屋顶”。
 // ==========================================================================
 
 // Engine regression cases built from the bundled examples (assets/examples).
@@ -276,7 +277,7 @@ export const CASES = {
     'configuration.materials.8.params.mixingDepth': 2, 'configuration.materials.8.params.initialTemperatureMode': 'dailyMeanAir' } },
   feb_urban_wall_layered: { example: 'urban_block', mode: 'eFacetEB', meteo: [17, 27], set: {
     'configuration.materials.5.params.wallMode': 'wall', 'configuration.materials.5.params.layers': WALL_LAYERS,
-    'configuration.materials.9': { name: 'building_roof', label: '寤虹瓚灞嬮《', type: 'Building', params: {
+    'configuration.materials.9': { name: 'building_roof', label: '建筑屋顶', type: 'Building', params: {
       method: 2, rss: 1000000000, cs: 880, rhos: 2300, lambdas: 1.4, Tsoil: 25, SMC: 0, Satwater: 0, wallMode: 'wall',
       thickness: 0.3, indoorTemperature: 22, indoorHeatTransferCoefficient: 8, layers: ROOF_LAYERS } },
     'configuration.objects.items.0.meshes.1.materialName': 'building_roof' } },

@@ -13,7 +13,8 @@
 # 与其他文件的关系：用 rasterio_lite.read_tiff 读 TIFF；result.json 由 run.mjs 写；
 #       算例名与模式来自 cases.mjs（经 result.json 的 mode 字段）。
 # 约定：容差是“被比较的均值”的最大相对变化 |b-a|/max(|a|,1e-12)；仅 TIFF 均值、VoxelEB 的 T 与 Rn、
-#       FacetRT 波段均值参与门禁，FacetEB 收敛信息、迭代数和耗时只打印、不判定。
+#       FacetRT 波段均值参与门禁，FacetEB 收敛信息、迭代数和耗时只打印、不判定；
+#       其中 FacetEB 收敛状态/迭代数、VoxelEB 迭代数的差异会在对应行标 [CHANGED, not gated]，并在末尾汇总列出。
 # 用法：python -I tools/regression/compare.py <workDir> <A> <B> [--json out.json] [--tolerance 1e-4]
 # ==========================================================================
 
@@ -170,13 +171,21 @@ def relative_change(a, b):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('work'); parser.add_argument('a'); parser.add_argument('b')
-    parser.add_argument('--json'); parser.add_argument('--tolerance', type=float)
+    parser.add_argument('--json')
+    # --tolerance 的覆盖范围见文件头“约定”：只有下面这些均值参与判定，其余（收敛状态、迭代数、耗时等）只打印并在末尾汇总。
+    parser.add_argument('--tolerance', type=float,
+                        help='fail (exit 1) if the mean of any gated quantity changes by more than this relative amount. '
+                             'Gated: TIFF band means, VoxelEB T and Rn per voxel type, FacetRT band means. '
+                             'NOT gated (printed only): FacetEB convergence flag / iteration count / residuals, '
+                             'VoxelEB iteration counts and out-of-tolerance states, graph edges, run time, p99, gt1 counts.')
     args = parser.parse_args()
     A, B = Variant(args.work, args.a), Variant(args.work, args.b)
     # 只比较两个变体都有运行目录的算例。
     cases = sorted(c for c in set(os.listdir(A.root)) & set(os.listdir(B.root)) if os.path.isdir(os.path.join(A.root, c)))
     worst = 0.0
     report = {}
+    # 不参与门禁、但变了就值得提醒的信息：FacetEB 收敛状态/迭代数、节点数；VoxelEB 迭代数。
+    notes = []
     # 模式从 result.json 的 mode 取（A 优先，缺失用 B）。
     for case in cases:
         mode = (A.result(case) or {}).get('mode') or (B.result(case) or {}).get('mode')
@@ -190,7 +199,11 @@ def main():
             print(f"  {key:78s} mean {x.get('mean', float('nan')):.5f} -> {y.get('mean', float('nan')):.5f}  p99 {x.get('p99', float('nan')):.5f} -> {y.get('p99', float('nan')):.5f}  gt1 {x.get('gt1', '')} -> {y.get('gt1', '')}")
         for tok, x in a.get('voxeleb', {}).items():
             y = b.get('voxeleb', {}).get(tok, {})
-            print(f"  node {tok}: iterations {x.get('_iter')} -> {y.get('_iter')}, states outside {x.get('_outside')} -> {y.get('_outside')}")
+            changed = x.get('_iter') != y.get('_iter') or x.get('_outside') != y.get('_outside')
+            print(f"  node {tok}: iterations {x.get('_iter')} -> {y.get('_iter')}, states outside {x.get('_outside')} -> {y.get('_outside')}"
+                  + ('  [CHANGED, not gated]' if changed else ''))
+            if changed:
+                notes.append(f"{case} node {tok}: VoxelEB iterations {x.get('_iter')}->{y.get('_iter')}, states outside {x.get('_outside')}->{y.get('_outside')}")
             for t, row in x.items():
                 if t.startswith('_'):
                     continue
@@ -198,8 +211,14 @@ def main():
                 for k in ('T', 'Rn'):
                     worst = max(worst, relative_change(row.get(k), other.get(k)))
                 print(f"    {t:5s} " + ' '.join(f"{k} {row[k]:.3f}->{other.get(k, float('nan')):.3f}" if row[k] is not None and other.get(k) is not None else f"{k} -" for k in ('T', 'H', 'LE', 'G', 'Rn', 'G/Rn')))
+        if len(a.get('conv', [])) != len(b.get('conv', [])):
+            notes.append(f"{case}: FacetEB convergence lines {len(a.get('conv', []))} -> {len(b.get('conv', []))}")
         for x, y in zip(a.get('conv', []), b.get('conv', [])):
-            print(f"  node {x['node']}: converged {x['conv']}->{y['conv']} iterations {x['iter']}->{y['iter']} maxRes {x['maxRes']:.3f}->{y['maxRes']:.3f} maxEqK {x['maxEqK']:.3f}->{y['maxEqK']:.3f}")
+            changed = x['conv'] != y['conv'] or x['iter'] != y['iter']
+            print(f"  node {x['node']}: converged {x['conv']}->{y['conv']} iterations {x['iter']}->{y['iter']} maxRes {x['maxRes']:.3f}->{y['maxRes']:.3f} maxEqK {x['maxEqK']:.3f}->{y['maxEqK']:.3f}"
+                  + ('  [CHANGED, not gated]' if changed else ''))
+            if changed:
+                notes.append(f"{case} node {x['node']}: converged {x['conv']}->{y['conv']}, iterations {x['iter']}->{y['iter']}")
         fa, fb = a.get('facetrt', {}), b.get('facetrt', {})
         if fa:
             print(f"  graph edges {fa.get('graphEdges')} -> {fb.get('graphEdges')}")
@@ -211,6 +230,13 @@ def main():
     if args.json:
         json.dump(report, open(args.json, 'w', encoding='utf-8'), indent=1, ensure_ascii=False)
     print(f"\nlargest relative change of a compared mean: {worst:.3e}")
+    # 汇总未参与判定的变化，避免只靠 --tolerance 通过就漏看收敛状态/迭代数的变化。
+    if notes:
+        print(f"convergence / iteration differences (reported only, not part of --tolerance): {len(notes)}")
+        for note in notes[:40]:
+            print('  ' + note)
+        if len(notes) > 40:
+            print(f"  ... {len(notes) - 40} more")
     if args.tolerance is not None and worst > args.tolerance:
         print(f"FAIL: exceeds tolerance {args.tolerance:g}")
         sys.exit(1)
