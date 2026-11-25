@@ -163,7 +163,8 @@ export function createForcingRules({ normalizeHostPath, windowsPath }) {
 
   // 步骤：1) 读取 forcing 块与旧字段 era5.pack、站点文件、元数据；2) 校验数据包与元数据；
   // 3) 站点形态必须有站点 CSV（或元数据已登记 station.stations[].file），网格形态必须有数据包；
-  // 4) 只要写了旧字段 era5.pack 就输出 era5 块；其余写入 forcing 块（pack/files/metadata）。
+  // 4) forcing.pack 与旧字段 era5.pack 同时存在时以 forcing 为准（与引擎一致），只输出 forcing 块；
+  //    只写了旧字段 era5.pack（forcing 里没有 pack）时输出 era5 块；其余写入 forcing 块（pack/files/metadata）。
   // temperature input (project form) -> { era5?, forcing? } for the engine config.
   function buildForcing(temperatureInput, { projectPath = '', directories = [] } = {}) {
     const input = temperatureInput || {}
@@ -180,7 +181,10 @@ export function createForcingRules({ normalizeHostPath, windowsPath }) {
       if (!files.length && !registeredStations) throw new Error('站点形态的气象强迫需要站点 CSV 文件（或在元数据 station.stations 中登记 file）')
     } else if (!packPath) throw new Error('请选择气象数据包')
     const out = {}
-    if (legacyPack) out.era5 = { pack: windowsPath(packFile(legacyPack)) }
+    // 引擎（models/stream/app/config.cpp）取 pack 的规则是：forcing.pack 非空就用它，否则才回退到 era5.pack。
+    // 所以两者同时存在时 forcing 优先，era5 块对引擎毫无作用，这里不再输出（避免重复且互相矛盾的两份路径，
+    // 也不再校验被忽略的旧字段）；只有旧字段单独存在（或 forcing 里没写 pack）时才输出 era5 块让引擎回退使用。
+    if (legacyPack && !forcingPack) out.era5 = { pack: windowsPath(packPath) }
     const block = {}
     if (forcingPack) block.pack = windowsPath(packPath)
     if (files.length) block.files = files

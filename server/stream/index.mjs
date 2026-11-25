@@ -265,7 +265,8 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     const probe = projects.buildEngineConfig(scene, { outputDir: root, dataDir: dataDir() })
     // Unknown temperature.energy fields are ignored (old projects must keep running) but reported, in the reply and in the job log.
     const warnings = projects.sceneWarnings(scene)
-    const pack = probe?.temperature?.era5?.pack
+    // 数据包路径：forcing.pack 优先，其次旧字段 era5.pack（与引擎、buildForcing 的取值顺序一致）。
+    const pack = probe?.temperature?.forcing?.pack || probe?.temperature?.era5?.pack
     if (typeof pack === 'string' && pack) {
       const bad = unreachableNonAsciiPackFile(resolve(normalizeHostPath(pack)))
       if (bad) throw new Error(`气象强迫数据文件路径含非 ASCII 字符且系统没有短文件名，引擎无法打开：${windowsPath(bad)}。请把数据包移到纯英文路径下后重新登记`)

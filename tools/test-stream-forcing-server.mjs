@@ -148,6 +148,12 @@ test('project fields pass through to the engine config', () => {
   assert.throws(() => compile({ forcing: { metadata: 'gldas-noah-0.25' } }), /气象数据包/)
   // forcingMetadata shorthand
   assert.equal(compile({ era5: { pack }, forcingMetadata: 'era5-land' }).forcing.metadata, 'era5-land')
+  // forcing.pack 与旧字段 era5.pack 同时存在：引擎以 forcing.pack 为准，所以只输出 forcing 块（不再重复输出 era5 块）。
+  const other = join(root, 'packs', 'other.json')
+  writeFileSync(other, JSON.stringify({ kind: 'stream-forcing-pack', schemaVersion: 1, product: 'era5', files: [] }))
+  const both = compile({ era5: { pack: other }, forcing: { pack } })
+  assert.equal(both.era5, undefined)
+  assert.equal(both.forcing.pack, pack)
 })
 
 // 测试：元数据保存/读取往返，保存的文件只允许被所属工程引用（其他工程报"只能位于"）；
