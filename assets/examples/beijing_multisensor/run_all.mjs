@@ -16,7 +16,7 @@
 //   project.json / variants/*.json ──(buildRunConfig)──> <out>/<id>/run-config.json
 //     ──(stream.exe run)──> <out>/<id>/{optical_reflectance,tir_brightness_temperature,components,...}.tif
 //   <out>/parent/components.tif ──(写入各变体的 temperature.components.file)──> 变体运行
-//   <out>/run-manifest.json（各次运行的目录、退出码、耗时）──> raster_tools.py ──> results/*.csv
+//   <out>/multisensor-manifest.json（各次运行的目录、退出码、耗时）──> raster_tools.py ──> results/*.csv
 //
 // 用法
 //   node run_all.mjs [--engine <stream.exe>] [--data <stream-defined 目录>] [--out <输出目录>]
@@ -211,10 +211,10 @@ async function main() {
   }
   // 步骤 5
   manifest.finishedAt = new Date().toISOString()
-  writeJson(join(outRoot, 'run-manifest.json'), manifest)
+  writeJson(join(outRoot, 'multisensor-manifest.json'), manifest)
   if (!options['no-analysis'] && manifest.runs.some((run) => run.exitCode === 0)) {
     const python = pickPython(options)
-    const args = ['-I', join(caseDir, 'raster_tools.py'), 'analyze', join(outRoot, 'run-manifest.json'), '--sensors', join(caseDir, 'sensors.json'), '--results', join(caseDir, 'results')]
+    const args = ['-I', join(caseDir, 'raster_tools.py'), 'analyze', join(outRoot, 'multisensor-manifest.json'), '--sensors', join(caseDir, 'sensors.json'), '--results', join(caseDir, 'results')]
     if (options['write-reference']) args.push('--reference', join(caseDir, 'reference'))
     const analysis = spawnSync(python, args, { encoding: 'utf8', maxBuffer: 1 << 26 })
     if (analysis.status !== 0) {

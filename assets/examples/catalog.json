@@ -80,6 +80,23 @@
       ],
       "note": "参考综合收敛率98.82%；异常像元已标记",
       "categoryLabel": "区域遥感影像"
+    },
+    {
+      "id": "beijing_multisensor",
+      "label": "北京市 · 光学与热红外多传感器观测模拟",
+      "project": "assets/examples/beijing_multisensor/project.json",
+      "recommendedMode": "STREAM EB",
+      "category": "remote-sensing",
+      "tier": "featured",
+      "focus": [
+        "多传感器波段",
+        "光学反射率",
+        "热红外亮温",
+        "观测角",
+        "300 m→1 km聚合"
+      ],
+      "note": "母工程EB求组分温度，variants/复用并成像；run_all.mjs一键运行；部分波段参数标“待核对”见sensors.json",
+      "categoryLabel": "区域遥感影像"
     }
   ],
   "categories": [

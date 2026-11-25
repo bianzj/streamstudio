@@ -3,13 +3,13 @@
 """北京多传感器案例：栅格统计、角度曲线、300 m → 1 km 聚合与参考结果导出。
 
 由 run_all.mjs 调用（也可单独运行）：
-    python -I raster_tools.py analyze <run-manifest.json> --sensors <sensors.json>
+    python -I raster_tools.py analyze <multisensor-manifest.json> --sensors <sensors.json>
                               --results <results 目录> [--reference <reference 目录>]
 
 依赖：numpy、osgeo（GDAL ≥ 3.11，写 float16 需要；更旧的 GDAL 自动退回 uint16×10 缩放存储）。
 
 数据流
-    run-manifest.json（各次运行的输出目录、退出码、耗时）
+    multisensor-manifest.json（各次运行的输出目录、退出码、耗时）
       ├─ 传感器运行 ──> results/summary.csv（光学反射率、NDVI、热红外亮温的统计）
       ├─ 角度运行   ──> results/angles.csv（亮温随 VZA/VAA 变化，相对天底的差）
       ├─ landsat89 / modis ──> results/aggregation.csv（300 m 与 1 km 聚合对比）
