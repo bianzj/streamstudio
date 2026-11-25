@@ -1,9 +1,34 @@
+// ==========================================================================
+// 文件：rasters.mjs
+// 功能：STREAM 影像工作台的栅格辅助：只读 GeoTIFF 头部的检查、查看器用的波段采样与统计、
+//   按地表类型（IGBP）分类的产品统计
+// 主要模块：
+//   1. tiffTypeSize / readTiffHeader：不解码像元，只读 IFD 取尺寸、波段、数据类型、CRS、
+//      像元大小与左上角原点、NoData、波段名（来自 ImageDescription 的 band names = {…}）
+//   2. createRasterTools 工厂：注入 server 里的 readTiff（完整解码）与路径换算
+//      - inspectRasters：批量检查栅格（最多 32 个）
+//      - rasterBand：取某波段供显示（大图块采样）并给出统计与 96 档直方图
+//      - classStatistics：按类型栅格逐类统计运行产品各波段的均值、标准差与面积
+// 数据流：路由层传入路径 → 本文件读头/调 readTiff → 返回 JSON（values 为 Float32 的 base64）
+// 与其他文件的关系：readTiff 由 server.mjs 提供（本文件的头部解析与它部分重复，见下方
+//   DEFERRED 说明）；产品文件名与 STREAM 引擎输出一致（optical_reflectance.tif 等）
+// 约定：坐标/像元大小沿用栅格自身单位（度或米，投影单位待核对）；面积单位 km2；
+//   NaN 表示无效值，统计忽略非有限值
+// ==========================================================================
+
 // Raster inspection, display sampling and per-class statistics for the STREAM image workspace.
 import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs'
 import { extname, isAbsolute, join, resolve } from 'node:path'
 
+// TIFF 字段类型编号 → 单个值的字节数（1–12 依次为 BYTE/ASCII/SHORT/LONG/RATIONAL/
+// SBYTE/UNDEFINED/SSHORT/SLONG/SRATIONAL/FLOAT/DOUBLE）；未知类型返回 0。
 const tiffTypeSize = (type) => ({ 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8 })[type] || 0
 
+// 说明：只支持经典 TIFF（魔数 42），不支持 BigTIFF；只读取下面白名单中的标签：
+// 256 宽、257 高、258 位深、277 每像元样本数（波段数）、339 样本格式、
+// 33550 像元大小、33922 控制点、34735 GeoKey 目录、34737 GeoASCII、42113 NoData、270 描述。
+// 原点 = 控制点坐标 − 控制点像元号 × 像元大小；CRS 取 ProjectedCSType(3072) 或
+// GeographicType(2048)，32767（用户自定义）视为未知。
 // Header-only GeoTIFF probe: grid size, bands and CRS without decoding pixels.
 function readTiffHeader(path) {
   const fd = openSync(path, 'r')
@@ -44,6 +69,8 @@ function readTiffHeader(path) {
       }
       tags.set(tag, values)
     }
+    // GeoKey 目录：前 4 个值是头，之后每 4 个值为一项 [键, 位置, 个数, 值]；
+    // 这里只取位置为 0（值直接存在项内）的键。
     const geoKeys = tags.get(34735) || []
     const geoKey = (key) => { for (let i = 4; i + 3 < geoKeys.length; i += 4) if (geoKeys[i] === key && geoKeys[i + 1] === 0) return geoKeys[i + 3]; return null }
     const projected = geoKey(3072), geographic = geoKey(2048)
@@ -64,7 +91,12 @@ function readTiffHeader(path) {
   } finally { closeSync(fd) }
 }
 
+// 模块：栅格工具工厂。readTiff(path, band, includeValues) 返回完整解码结果
+// （width/height/bands/values/crs/unit/pixelSize/origin…）；normalizeHostPath 与 windowsPath
+// 负责主机路径与 Windows 路径互换。
 export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) {
+  // 作用：逐个检查路径对应的文件（最多 32 个），不抛异常，把问题写进每项的 error。
+  // 输出：{ path, exists, bytes, format, … }；.tif/.tiff 额外带 readTiffHeader 的头信息。
   function inspectRasters(paths) {
     return (Array.isArray(paths) ? paths.slice(0, 32) : []).map((value) => {
       const source = normalizeHostPath(String(value || '').trim().replace(/^"|"$/g, ''))
@@ -79,6 +111,11 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
     })
   }
 
+  // 作用：取一个波段给查看器显示。输出尺寸、CRS、像元大小、原点、Float32 值（base64）、
+  // 统计量与 96 档直方图。
+  // 步骤：1) 解码；2) step = ceil(max(宽, 高) / 2048)，每 step 个像元取一个样本；
+  // 3) 对样本求分位数（1/2/98/99 %）与直方图；4) step > 1 时，count/最值/均值/标准差改用
+  // 全部像元重新计算（stats.sampled 标记分位数基于样本）。
   // Float32 band values for the viewer; large grids are block-sampled to keep the payload bounded.
   function rasterBand(value, band) {
     const path = resolve(normalizeHostPath(String(value || '').trim()))
@@ -107,6 +144,7 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
       for (let index = 0; index < tiff.values.length; index += 1) {
         const sample = tiff.values[index]
         if (!Number.isFinite(sample)) continue
+        // 数值处理：先减去首个有效值再累加平方和，避免大偏置（如开尔文温度）造成方差相消误差。
         if (shift === null) shift = sample   // shifted sums keep the variance stable for large offsets (e.g. Kelvin)
         n += 1
         if (sample < lo) lo = sample
@@ -118,6 +156,7 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
         mean = shift + total / n; std = Math.sqrt(Math.max(0, totalSquares / n - (total / n) ** 2))
       }
     }
+    // 直方图：样本落在 [最小值, 最大值] 的 96 个等宽格内（最大值等于最小值时不统计）。
     const histogram = new Array(96).fill(0)
     if (sorted.length && maximum > minimum) for (const sample of sorted) histogram[Math.max(0, Math.min(95, Math.floor((sample - minimum) / (maximum - minimum) * 96)))] += 1
     return {
@@ -131,6 +170,9 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
     }
   }
 
+  // 作用：按地表类型栅格逐类统计本次运行各产品每个波段的像元数、均值、标准差（及面积 km2）。
+  // 输入：输出目录、类型栅格路径与波段（1 起）；输出：{ pixelAreaKm2, classes, products }。
+  // 说明：产品与类型栅格尺寸不一致时跳过；类型码非有限值的像元不计。
   // Per-IGBP-class mean and standard deviation of every band of the run's products.
   function classStatistics(outputDir, typeFile, typeBand = 1) {
     typeFile = typeFile && normalizeHostPath(typeFile)
@@ -142,11 +184,14 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
     // DEFERRED[中] Bug: 只有 unit === '°' 时才按球面面积计算；unit 为空（缺少 GTModelType/线性单位键，或经纬度 CRS 只写了引文）时把度数当成米，面积小 10 个数量级以上；投影单位是英尺或 EPSG:3857（面积放大 1/cos²φ）时也不正确；建议：只有确认线性单位为米(9001)时才用米制公式，其它情况返回 null 并在前端显示“—”，Web Mercator 按纬度修正
     const geographic = type.unit === '°' && type.pixelSizeX && type.pixelSizeY && Number.isFinite(type.originY)
     const area = geographic ? 0 : Math.abs((type.pixelSizeX || 0) * (type.pixelSizeY || 0)) / 1e6
+    // 面积：经纬度栅格按球面逐行计算 R²·Δλ·Δφ·cos φ（φ 取该行中心纬度）；
+    // 其他栅格每像元面积固定 = |dx·dy| / 1e6 km2。球面面积只在 unit 为 '°' 时启用。
     const radians = Math.PI / 180, earthRadiusKm = 6371.0088
     const rowArea = geographic
       ? Array.from({ length: type.height }, (_, row) => earthRadiusKm ** 2 * Math.abs(type.pixelSizeX * radians) * Math.abs(type.pixelSizeY * radians)
         * Math.abs(Math.cos((type.originY - (row + 0.5) * Math.abs(type.pixelSizeY)) * radians)))
       : null
+    // 遍历运行输出里可能存在的产品文件；不存在的跳过。
     const products = {}
     for (const file of ['optical_reflectance.tif', 'tir_brightness_temperature.tif', 'tir_surface_temperature.tif', 'components.tif', 'eb_forcing.tif', 'eb_fluxes.tif', 'lst.tif', 'lsct.tif']) {
       const path = join(outputDir, file)
@@ -157,6 +202,7 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
       const bands = []
       for (let band = 0; band < first.bands; band += 1) {
         const values = readTiff(path, band, true).values
+        // 按类型码累计 count/sum/平方和/面积，再换算成均值与标准差（方差取 max(0, …) 防负）。
         const accumulator = new Map()
         for (let index = 0; index < values.length; index += 1) {
           const value = values[index], code = type.values[index]
@@ -179,5 +225,6 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
       classes: [...classes].sort((a, b) => a[0] - b[0]).map(([code, pixels]) => ({ code, pixels })), products }
   }
 
+  // 对外接口。
   return { inspectRasters, rasterBand, classStatistics }
 }

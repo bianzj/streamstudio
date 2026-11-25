@@ -1,3 +1,25 @@
+// ==========================================================================
+// 文件：index.mjs
+// 功能：STREAM 遥感影像模拟的服务端入口。提供 /api/stream/* 接口、串行任务队列、SSE 事件通道，
+//   负责启动 stream.exe、管理运行输出目录和气象强迫数据包，与 HiStream 的运行机制互不共享
+// 主要模块：
+//   1. 引擎定位与状态：engine / dataDir / status / assertEngine；非 ASCII 数据包路径预检查
+//   2. 串行任务队列：enqueue / pump / launch / finish / stop（子进程输出转 SSE 事件）
+//   3. 影像运行：submitRun（提交期校验、入队、建输出目录并写配置与清单）、readRun、listRuns
+//   4. 气象数据包：packSummary / listPacks / registerPack / removePack
+//   5. 强迫元数据：runEngine（短调用）、listPresets / getPreset / checkForcing、
+//      工程元数据的保存与读取
+//   6. 浏览对话框 pick（Windows PowerShell）与路由表 routes / handle / shutdown
+// 数据流：界面 → /api/stream/run → config.mjs 生成并校验引擎配置 → 写入 run-config.json →
+//   spawn stream.exe run → stdout 进度行/日志经 SSE 推给界面 → 退出后写 run-manifest.json
+//   并读取 scene_summary.json 作为结果
+// 与其他文件的关系：config.mjs（工程与引擎配置）、forcing.mjs（强迫元数据规则）、
+//   rasters.mjs（栅格检查与统计）；readTiff 与 runTask 由 server.mjs 注入；引擎命令行见
+//   models/stream/README.md
+// 约定：同一时刻最多运行一个引擎进程；输出目录 = <输出根>/<名称>_<时间戳>，内含
+//   run-config.json、scene.json、run-manifest.json 与产品文件；只有 completed 的运行才列产品
+// ==========================================================================
+
 // STREAM remote-sensing image simulation service: its own API (/api/stream/*), serial job queue
 // and event channel. It shares nothing with the HiStream run machinery.
 import { execFile, spawn, spawnSync } from 'node:child_process'
@@ -9,6 +31,9 @@ import { createProjectStore } from './config.mjs'
 import { FORCING_METADATA_FILE, FORCING_PRESETS, createForcingRules, isPlainObject, isPresetName } from './forcing.mjs'
 import { createRasterTools } from './rasters.mjs'
 
+// 常量：PROGRESS 匹配引擎 stdout 的进度行 "STREAM<TAB>progress<TAB>百分比<TAB>阶段"；
+// PRODUCT_FILE 为运行产品的扩展名（.tif/.json）；PACK_KINDS 为合法的气象数据包索引 kind；
+// 两个 FORCING_*_TIMEOUT_MS 为调用引擎校验强迫元数据的超时（完整检查 60 s，快速检查 15 s）。
 const PROGRESS = /^STREAM\tprogress\t([\d.]+)\t(.*)$/
 const PRODUCT_FILE = /\.(tif|json)$/i
 const PACK_KINDS = ['stream-era5-pack', 'stream-forcing-pack']
@@ -32,13 +57,21 @@ export function unreachableNonAsciiPackFile(packPath, { shortName = windowsShort
   return ''
 }
 
+// 作用：用 cmd 的 %~sI 取文件的 8.3 短路径（仅 Windows）；失败返回空串。
+// 非 Windows 平台直接返回原路径（可直接打开 UTF-8 路径）。
 function windowsShortName(file) {
   if (process.platform !== 'win32') return file  // other platforms open UTF-8 paths directly
   const result = spawnSync('cmd.exe', ['/d', '/c', `for %I in ("${file.replace(/"/g, '')}") do @echo %~sI`], { encoding: 'utf8', windowsHide: true })
   return result.status === 0 ? String(result.stdout || '').split(/\r?\n/)[0].trim() : ''
 }
 
+// 模块：STREAM 服务工厂。独立于 HiStream 的运行机制，自带 HTTP 接口（/api/stream/*）、
+// 串行任务队列与 SSE 事件通道。
+// 输入：resourceRoot/modelRoot（定位 stream.exe）、json/body（请求读写辅助）、readTiff、
+// 路径换算、runTask（后台线程执行器，待核对）、documentsRoot（缺省 ~/Documents/Stream Studio）。
+// 内部状态：clients（SSE 连接）、queue（排队任务）、active（当前任务，同一时刻最多一个）。
 export function createStreamService({ resourceRoot, modelRoot, json, body, readTiff, normalizeHostPath, windowsPath, runTask = null, documentsRoot = null }) {
+  // 引擎可执行文件候选位置，按顺序取第一个存在者：安装包 engine/、开发构建 Release、Debug。
   const candidates = [
     join(resourceRoot, 'engine', 'stream.exe'),
     join(modelRoot, 'bin_x64', 'Release', 'stream.exe'),
@@ -59,14 +92,18 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   const dataDir = () => join(dirname(engine()), 'stream-defined')
   const defaultOutputRoot = () => windowsPath(join(documents, 'stream'))
 
+  // 作用：向所有 SSE 客户端广播一条事件（data: JSON）。
   function emit(payload) {
     const line = `data: ${JSON.stringify(payload)}\n\n`
     for (const response of clients) response.write(line)
   }
 
+  // 任务摘要：只暴露界面需要的字段（id、类型、状态、进度、阶段、输出目录、进程号、开始时间）。
   const summary = (job) => job && ({ id: job.id, kind: job.kind, label: job.label, status: job.status, progress: job.progress, stage: job.stage,
     outputDir: job.outputDir ? windowsPath(job.outputDir) : null, pid: job.child?.pid ?? null, startedAt: job.startedAt || null })
 
+  // 作用：返回引擎与目录状态：引擎路径、是否存在、数据文件（classes.json 等四个）是否齐全，
+  // 默认输出根、ERA5 包与强迫元数据目录，以及当前任务和排队任务。
   function status() {
     const executable = engine()
     return {
@@ -77,6 +114,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     }
   }
 
+  // 作用：提交/启动前确认引擎可执行文件与 stream-defined 参数目录存在，否则给出可操作的提示。
   function assertEngine() {
     const executable = engine()
     if (!existsSync(executable)) throw new Error(`找不到 STREAM 引擎：${windowsPath(executable)}，请先运行 npm run build:engine`)
@@ -84,6 +122,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return executable
   }
 
+  // 作用：合并 patch 并重写输出目录下的 run-manifest.json（带 updatedAt）。
   function writeManifest(job, patch) {
     Object.assign(job.manifest, patch, { updatedAt: new Date().toISOString() })
     writeFileSync(join(job.outputDir, 'run-manifest.json'), JSON.stringify(job.manifest, null, 2) + '\n', 'utf8')
@@ -97,6 +136,9 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     ? readdirSync(directory).filter((name) => PRODUCT_FILE.test(name) && !['run-manifest.json', 'run-config.json', 'scene.json', 'scene_summary.json'].includes(name)).map((name) => windowsPath(join(directory, name)))
     : []
 
+  // 模块：串行任务队列。job 对象约定：kind/label/successCodes、start()（准备并调用 launch）、
+  // collect(status)（结束后收集结果）；运行期字段 id/status/progress/stage/child/outputDir/
+  // manifest/stopped/finished/startedAt。同一时刻只运行一个引擎进程。
   // ---------- queue ----------
   // DEFERRED[低] 并发: 队列不做去重，同一工程连点/多窗口会排入多个相同任务（前端 startRun 在 await 期间也没有加锁）；建议：按 projectPath+scene 摘要拒绝已在队列/运行中的重复提交，或返回已有任务 id
   function enqueue(job) {
@@ -111,6 +153,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return summary(job)
   }
 
+  // 作用：当前没有运行任务且队列非空时，取队首启动；start() 抛错则该任务按 failed 结束。
   function pump() {
     if (active || !queue.length) return
     const job = queue.shift()
@@ -120,6 +163,9 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     }
   }
 
+  // 作用：任务收尾（幂等，job.finished 防重入）。
+  // 步骤：1) 写 manifest（状态、退出码、产品列表，仅 completed 才列产品）；2) 调 collect 收集结果；
+  // 3) 广播错误与 job-closed；4) 释放 active 并启动下一个任务。
   function finish(job, status, code, error) {
     if (job.finished) return
     job.finished = true
@@ -135,6 +181,11 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     pump()
   }
 
+  // 作用：启动引擎子进程并把输出转成事件。
+  // 步骤：1) 若在启动前已被停止则直接以 stopped 收尾；2) spawn 引擎（工作目录为引擎目录）；
+  // 3) stdout：进度行更新 progress/stage，其他非空行作日志；4) stderr：GDAL/PROJ 的
+  // "ERROR n:"/"Warning n:" 诊断标为 diagnostic，其余标为 error；
+  // 5) 进程关闭时按 successCodes 判定 completed/failed，被停止则为 stopped。
   function launch(job, args) {
     if (job.stopped) { finish(job, 'stopped', null); return }
     job.status = 'running'
@@ -168,6 +219,9 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     })
   }
 
+  // 作用：停止任务。排队中的直接移出并广播关闭；已激活但引擎尚未启动的只打标记；
+  // 运行中的 Windows 用 taskkill /T /F 结束整个进程树（失败再 child.kill），其他平台发 SIGTERM。
+  // 返回 { stopped }，找不到对应运行任务时为 false。
   function stop(id) {
     const target = Number(id)
     if (id === undefined || id === null || !Number.isInteger(target)) throw new Error('任务 id 无效')
@@ -191,6 +245,10 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return { stopped: true }
   }
 
+  // 模块：影像模拟运行（提交、读取、列表）。
+  // submitRun 步骤：1) 校验引擎与输出根；2) 提交时先 buildEngineConfig 校验（坏参数不入队）；
+  // 3) 检查气象数据包路径的非 ASCII 可达性；4) 入队，真正启动时才建输出目录并写
+  // run-config.json / scene.json / run-manifest.json，再调用 launch。
   // ---------- image runs ----------
   function submitRun(data) {
     assertEngine()
@@ -200,8 +258,10 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     // DEFERRED[低] 安全: 输出根目录完全由请求决定，任意绝对路径都会被 mkdir 并写入 run-config/scene/manifest；建议：把输出根限制在工程目录/默认输出目录下
     const root = normalizeHostPath(String(scene.outputRoot || data.outputRoot || defaultOutputRoot()).trim().replace(/^"|"$/g, ''))
     if (!isAbsolute(root)) throw new Error('输出目录须为绝对路径')
+    // 运行名：只保留字母、数字、下划线、连字符（其他替换为 _），最长 64 字符，空则用 image。
     const name = String(scene.name || data.name || 'image').replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 64) || 'image'
     // Validate now so a bad form fails at submission rather than in the queue.
+    // probe 仅用于提交期校验与取数据包路径；真正使用的配置在 start() 里重新生成（输出目录不同）。
     const probe = projects.buildEngineConfig(scene, { outputDir: root, dataDir: dataDir() })
     // Unknown temperature.energy fields are ignored (old projects must keep running) but reported, in the reply and in the job log.
     const warnings = projects.sceneWarnings(scene)
@@ -213,6 +273,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     const job = {
       kind: 'image', label: name, successCodes: [0],
       start() {
+        // 输出目录名 = <运行名>_<时间戳>；时间戳为 UTC ISO 串，冒号和点换成连字符。
         const runId = new Date().toISOString().replace(/[:.]/g, '-')
         job.outputDir = join(resolve(root), `${name}_${runId}`)
         // FIX(2026-11-24 S5): build (= validate) the configuration first, so a failure leaves no empty output folder behind.
@@ -236,6 +297,9 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return { ...enqueue(job), ...(warnings.length ? { warnings } : {}) }
   }
 
+  // 作用：读取一次运行的输出目录，返回清单、摘要（scene_summary.json）、配置与产品列表。
+  // 说明：同时兼容旧版 stream-scene-run 清单与 scene-config.json；类型栅格路径若是相对路径
+  // 则按输出目录解析（随包参考结果可整体拷贝）；读取失败时给出面向用户的提示。
   function readRun(directory) {
     const text = String(directory || '').trim()
     if (!text) throw new Error('未指定运行输出目录')
@@ -264,6 +328,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
       products: runProducts(outputDir, manifest.status), summary: result, config }
   }
 
+  // 作用：列出输出根目录下的运行记录（含 run-manifest.json 的子目录），按开始时间倒序，最多 50 条。
   function listRuns(root) {
     const directory = resolve(normalizeHostPath(String(root || defaultOutputRoot()).trim()))
     if (!existsSync(directory)) return []
@@ -279,7 +344,11 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return runs.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt))).slice(0, 50)
   }
 
+  // 模块：气象数据包（ERA5 / 通用强迫包）的登记、列表与检查。
   // ---------- ERA5 packs ----------
+  // 作用：读取数据包索引并生成界面摘要；kind 不是数据包时返回 null。
+  // 说明：旧索引没有 fullYear/period 时按整年推出；skt/stl1/stl2 不再是必需变量
+  // （EB 初值已改用 2 m 气温），故从缺失/不完整列表里排除，并据此重新判定 complete。
   function packSummary(path) {
     const pack = JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, ''))
     if (!PACK_KINDS.includes(pack.kind)) return null
@@ -300,6 +369,8 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
       kind: pack.kind, metadata: typeof pack.metadata === 'string' ? pack.metadata : null, stepHours: Number(pack.stepHours) || 1 }
   }
 
+  // 作用：列出气象数据包摘要：登记目录里的索引（external=false）加上工程指向的其他位置的索引
+  // （external=true）。排序：已登记在前，同组内按起始时间新→旧，再按标签。解析失败的索引被忽略。
   // Registered packs plus any pack a project points at elsewhere (for example one shipped inside the project).
   function listPacks(include = []) {
     const directory = era5Directory()
@@ -311,6 +382,11 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     }).filter(Boolean).sort((a, b) => Number(a.external) - Number(b.external) || String(b.period?.start || b.year).localeCompare(String(a.period?.start || a.year)) || String(a.label).localeCompare(String(b.label)))
   }
 
+  // 作用：把 NetCDF 文件登记为数据包索引（作为 'era5' 类任务入队），返回入队摘要。
+  // 步骤：1) 校验文件（1–4096 个且都存在）；2) 判定是否通用来源：metadata（或 product）不是
+  // era5/era5-land/auto 即走 forcing-register，内联对象会先存成 era5-packs/metadata/ 下的副本；
+  // 3) 站点形态元数据不需要登记；4) 任务成功后若给了 label 则写回索引，失败则删除半成品索引与副本。
+  // successCodes 为 [0, 3]：退出码 3 的含义由引擎定义（待核对）。
   // ERA5 / ERA5-Land go through era5-register (unchanged); any other gridded source goes through forcing-register
   // with its metadata (a preset name, an inline object stored beside the index, or a metadata file).
   function registerPack(data) {
@@ -359,6 +435,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return enqueue(job)
   }
 
+  // 作用：只允许移除登记目录里的数据包索引，同时删除该索引名下 metadata/ 里的元数据副本。
   function removePack(value) {
     const path = resolve(normalizeHostPath(String(value || '').trim()))
     if (dirname(path).toLowerCase() !== resolve(era5Directory()).toLowerCase() || !existsSync(path)) throw new Error('只能移除登记目录中的气象数据包索引')
@@ -375,6 +452,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return { removed: true, path: windowsPath(path) }
   }
 
+  // 模块：气象强迫元数据的引擎调用与工程元数据文件读写。
   // ---------- forcing metadata ----------
   // Short engine calls (preset listing, forcing-check) run to completion outside the job queue, under a timeout.
   function runEngine(args, timeoutMs) {
@@ -388,7 +466,10 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     })
   }
 
+  // 预设内容缓存（预设随引擎版本固定，进程内只取一次）。
   const presetCache = new Map()
+  // 作用：调用 stream forcing-preset 列出引擎支持的预设名（只保留 forcing.mjs 认识的名字），
+  // 同时返回前端内置列表 builtin。
   async function listPresets() {
     const result = await runEngine(['forcing-preset'], FORCING_QUICK_TIMEOUT_MS)
     const names = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => isPresetName(line))
@@ -409,6 +490,9 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return { name: text, metadata: structuredClone(presetCache.get(text)) }
   }
 
+  // 步骤：1) 解析元数据（预设/文件/对象）；2) 收集数据包与站点文件；3) 内联对象写入临时目录；
+  // 4) 调 forcing-check --json（超时 60 s），退出码 0 或 3 视为得到报告（3 的含义待核对）；
+  // 5) finally 删除临时目录。输出 { ok, errors, warnings, notes, resolved, form }。
   // metadata (preset name | object | file path) + optional data (pack index | station CSV files) -> engine forcing-check JSON.
   async function checkForcing(data) {
     const raw = data.metadata
@@ -435,12 +519,14 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     } finally { try { rmSync(scratch, { recursive: true, force: true }) } catch {} }
   }
 
+  // 工程元数据文件名限制为 forcing-metadata*.json（缺省 forcing-metadata.json），防止写到任意文件名。
   const metadataFileName = (value) => {
     const name = String(value || FORCING_METADATA_FILE).trim()
     if (!/^forcing-metadata[\w.-]*\.json$/.test(name)) throw new Error(`元数据文件名须形如 ${FORCING_METADATA_FILE}`)
     return name
   }
 
+  // 作用：由已保存的工程文件路径得到其所在目录；工程未保存时提示先保存。
   function projectDirectory(value) {
     const text = String(value || '').trim()
     if (!text) throw new Error('请先保存工程，再保存工程元数据')
@@ -449,6 +535,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return dirname(path)
   }
 
+  // 作用：把元数据对象校验后写入工程目录（先写 .tmp 再 rename，避免写一半被读到）。
   function saveProjectMetadata(data) {
     const directory = projectDirectory(data.projectPath)
     const metadata = data.metadata
@@ -464,6 +551,8 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return { path: windowsPath(target), bytes: Buffer.byteLength(text, 'utf8') }
   }
 
+  // 作用：读取工程元数据；data.import 为真时读取任意位置的文件（只回显给编辑器），
+  // 否则只允许工程目录、数据包目录或元数据目录内的文件。文件不存在返回 { exists: false }。
   function readProjectMetadata(data) {
     if (data.import) { // metadata picked anywhere: read back to the editor only
       const { path, document } = forcingRules.importMetadataFile(data.path)
@@ -477,6 +566,8 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     return { exists: true, path: windowsPath(path), metadata: document }
   }
 
+  // 模块：文件/目录浏览对话框。Windows 下用 PowerShell（-STA）弹出系统对话框，
+  // 其他平台提示直接粘贴路径。kind 决定过滤器与是否多选。
   // ---------- dialogs ----------
   function pick(kind) {
     if (process.platform !== 'win32') throw new Error('浏览选择仅在 Windows 上可用，请直接粘贴绝对路径')
@@ -511,6 +602,8 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     })
   }
 
+  // 模块：路由表与请求分发。routes 的键为 "方法 路径"，值为 (请求体) => 结果（可为 Promise）；
+  // handle 返回 false 表示不是本服务的接口，由 server.mjs 继续处理。
   // ---------- routes ----------
   const routes = {
     'GET /api/stream/status': () => status(),
@@ -552,6 +645,8 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     }
   }
 
+  // 作用：处理 /api/stream/*。GET /events 建立 SSE 并先推一条 status；
+  // 其他按路由表执行，成功返回 200 JSON，异常统一返回 400 { error }。
   async function handle(request, response, url) {
     if (!url.pathname.startsWith('/api/stream/')) return false
     if (request.method === 'GET' && url.pathname === '/api/stream/events') {
@@ -568,6 +663,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     catch (error) { return json(response, 400, { error: error.message }) }
   }
 
+  // 作用：服务退出前的收尾：清空队列，停止当前引擎进程（Windows 结束整个进程树）。
   // 进程随后就退出，等不到 close 事件，运行清单在这里同步写成 stopped。
   function shutdown() {
     queue.length = 0

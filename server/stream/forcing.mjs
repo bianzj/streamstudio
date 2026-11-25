@@ -1,8 +1,30 @@
+// ==========================================================================
+// 文件：forcing.mjs
+// 功能：STREAM 服务端的气象强迫（forcing）元数据处理：把工程字段 temperature.forcing 校验并
+//   转成引擎配置里的 era5 / forcing 块，同时提供 /api/stream/forcing/* 路由共用的路径与
+//   大小规则（引擎一侧的规则见 docs/forcing-metadata.md）
+// 主要模块：
+//   1. 常量与判断：预设名 FORCING_PRESETS、大小上限、isPresetName、looksLikeMetadataPath、isInside
+//   2. createForcingRules 工厂内的路径与文件校验：absolutePath、existingFile、packFile、
+//      stationFiles、metadataFile
+//   3. 元数据文档校验：checkDocument、assertSafeStationFiles、assertInlineSize、formOf
+//   4. resolveMetadata（元数据来源解析）与 buildForcing（生成引擎配置块）
+//   5. importMetadataFile：编辑器导入任意位置的元数据文件（只读回编辑器，不交给引擎）
+// 数据流：config.mjs 的 buildEngineConfig 在 EB 模式调用 buildForcing → { era5?, forcing? }；
+//   路由层使用 resolveMetadata / importMetadataFile 等做预检查
+// 与其他文件的关系：被 server/stream/config.mjs 引用（looksLikeMetadataPath 也用于路径改写）；
+//   元数据语义见 docs/forcing-metadata.md；数据包索引由 stream era5-register / forcing-register 生成
+// 约定：元数据可以是预设名、.json 文件路径或内联对象；形态 form 为 'gridded'（网格）或
+//   'station'（站点 CSV）；路径中不得含 ".." 或 NUL
+// ==========================================================================
+
 // Weather-forcing metadata plumbing for the STREAM server: project field (temperature.forcing) -> engine config, plus the
 // path / size rules shared by the /api/stream/forcing/* routes. Engine rules live in docs/forcing-metadata.md.
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 
+// 内置预设名（与 README 列出的预设一致）、元数据文件名、
+// 内联元数据与元数据文件的字节上限、站点文件个数上限；PARENT_SEGMENT 用于拦截 ".." 路径段。
 export const FORCING_PRESETS = ['era5', 'era5-land', 'gldas-noah-0.25', 'gldas-noah-1.0', 'station-csv']
 export const FORCING_METADATA_FILE = 'forcing-metadata.json'
 export const MAX_INLINE_METADATA_BYTES = 64 * 1024     // inline object inside a project / request
@@ -15,15 +37,19 @@ export const isPresetName = (value) => typeof value === 'string' && FORCING_PRES
 // A string metadata value is a path (not a preset name) when it has a separator or ends in .json.
 export const looksLikeMetadataPath = (value) => typeof value === 'string' && value.trim() !== '' && !isPresetName(value) && /[\\/]|\.json$/i.test(value.trim())
 
+// 作用：判断 child 是否位于 parent 目录之内（含相同路径），用于限制元数据文件的位置。
 export function isInside(parent, child) {
   const relation = relative(resolve(parent), resolve(child))
   return relation === '' || (relation !== '..' && !relation.startsWith(`..${sep}`) && !isAbsolute(relation))
 }
 
+// 作用：优先取真实路径（解析符号链接），失败（如不存在）时退回普通绝对路径。
 function realOrResolved(path) {
   try { return realpathSync(path) } catch { return resolve(path) }
 }
 
+// 模块：强迫规则工厂。normalizeHostPath 把主机路径规整为本机形式，windowsPath 用于错误信息
+// 与回写给引擎的路径。返回值汇总了本文件所有对外函数。clean 去掉首尾空白和引号。
 export function createForcingRules({ normalizeHostPath, windowsPath }) {
   const clean = (value) => normalizeHostPath(String(value ?? '').trim().replace(/^"|"$/g, ''))
 
@@ -42,6 +68,7 @@ export function createForcingRules({ normalizeHostPath, windowsPath }) {
     return path
   }
 
+  // 作用：内联元数据序列化后不得超过 MAX_INLINE_METADATA_BYTES（64 KiB），防止请求过大。
   function assertInlineSize(object) {
     const bytes = Buffer.byteLength(JSON.stringify(object), 'utf8')
     if (bytes > MAX_INLINE_METADATA_BYTES) throw new Error(`气象强迫元数据过大（${bytes} 字节，上限 ${MAX_INLINE_METADATA_BYTES}）`)
@@ -60,6 +87,8 @@ export function createForcingRules({ normalizeHostPath, windowsPath }) {
     }
   }
 
+  // 作用：元数据文档的基本形态检查：必须是 JSON 对象，kind（若有）为
+  // stream-forcing-metadata，preset（若有）为已知预设，站点文件路径安全；通过则原样返回。
   function checkDocument(document, label) {
     if (!isPlainObject(document)) throw new Error(`${label}必须是 JSON 对象`)
     if (document.kind !== undefined && document.kind !== 'stream-forcing-metadata') throw new Error(`${label}的 kind 必须是 "stream-forcing-metadata"`)
@@ -83,6 +112,8 @@ export function createForcingRules({ normalizeHostPath, windowsPath }) {
     return { path, document }
   }
 
+  // 作用：校验气象数据包索引：绝对路径的已存在 .json（≤ 64 MiB），且 kind 为
+  // stream-era5-pack 或 stream-forcing-pack；返回绝对路径。
   function packFile(value) {
     // Pack indexes keep the long-standing rule (any absolute existing file); it must still be a pack index.
     const text = clean(value)
@@ -97,6 +128,8 @@ export function createForcingRules({ normalizeHostPath, windowsPath }) {
     return path
   }
 
+  // 作用：校验站点 CSV 文件列表（最多 64 个，空项忽略），逐个要求绝对路径且存在；
+  // 返回 Windows 形式路径数组。
   function stationFiles(list) {
     if (list === undefined || list === null) return []
     if (!Array.isArray(list)) throw new Error('站点文件（forcing.files）须为数组')
@@ -104,8 +137,12 @@ export function createForcingRules({ normalizeHostPath, windowsPath }) {
     return list.filter((item) => String(item ?? '').trim() !== '').map((item) => windowsPath(existingFile(item, '站点数据文件')))
   }
 
+  // 数据形态：文档显式写了 form 就用它，否则预设为 station-csv 时是 'station'，其余按 'gridded'。
   const formOf = (document) => document?.form === 'station' || document?.form === 'gridded' ? document.form : document?.preset === 'station-csv' ? 'station' : 'gridded'
 
+  // 作用：把 raw 元数据（预设名/文件路径/内联对象/空）解析成 { metadata, document, form }。
+  // 说明：内联对象会深拷贝；文件路径只允许在工程目录、数据包目录或 directories 给出的目录内
+  // （由 metadataFile 检查），避免读取任意位置的文件。
   // Returns { metadata, document, form }; metadata is what the engine receives (preset name, file path or inline object).
   function resolveMetadata(raw, { projectPath = '', packPath = '', directories = [] } = {}) {
     if (raw === undefined || raw === null || raw === '') return { metadata: undefined, document: null, form: 'gridded' }
@@ -124,6 +161,9 @@ export function createForcingRules({ normalizeHostPath, windowsPath }) {
     return { metadata: windowsPath(path), document, form: formOf(document) }
   }
 
+  // 步骤：1) 读取 forcing 块与旧字段 era5.pack、站点文件、元数据；2) 校验数据包与元数据；
+  // 3) 站点形态必须有站点 CSV（或元数据已登记 station.stations[].file），网格形态必须有数据包；
+  // 4) 只要写了旧字段 era5.pack 就输出 era5 块；其余写入 forcing 块（pack/files/metadata）。
   // temperature input (project form) -> { era5?, forcing? } for the engine config.
   function buildForcing(temperatureInput, { projectPath = '', directories = [] } = {}) {
     const input = temperatureInput || {}

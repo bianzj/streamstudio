@@ -1,3 +1,25 @@
+// ==========================================================================
+// 文件：config.mjs
+// 功能：STREAM 影像模拟（stream-image-project v2）的工程文件读写，以及由工作台的 scene
+//   生成并校验引擎配置（stream-image-config v2）。校验在提交时完成，避免任务出队、输出目录
+//   建好之后才由引擎报错
+// 主要模块：
+//   1. 基础常量与小工具：PROJECT_FILE、OVERPASS/validUtcParts（过境时刻）、spinupNodes、
+//      iterationCount、hasNumber
+//   2. 能量平衡参数校验：ENERGY_KEYS、validateEnergy、unknownEnergyFields
+//   3. 旧版工程迁移：localToUtc、migrateScene（v1 stream-scene-project → v2）
+//   4. 路径映射：filePaths、mapStreamScenePaths（读工程转绝对路径，存工程转相对路径）
+//   5. createProjectStore 工厂：readProjectFile / saveProjectFile、输入字段与波段校验
+//      （inputField、bands、existingFile）、buildInversion、buildAssimilation、
+//      buildEngineConfig、sceneWarnings
+// 数据流：界面 scene → migrateScene → buildEngineConfig（校验 + 规整）→ 引擎 JSON 配置，
+//   由 server/stream/index.mjs 写盘并启动 stream.exe；气象强迫块来自 forcing.mjs
+// 与其他文件的关系：校验范围与 models/stream/app/config.cpp 保持一致；
+//   字段含义见 models/stream/README.md 的 stream-image-config v2 一节
+// 约定：过境时刻为 UTC（ISO，以 Z 结尾）；温度 K；角度度；波长光学 nm、热红外 μm；
+//   路径在引擎配置中为 Windows 绝对路径，在工程文件中尽量用相对工程目录的写法
+// ==========================================================================
+
 // STREAM image project (stream-image-project v2) and engine configuration (stream-image-config v2).
 // STREAM projects are independent of HiStream: inputs are never merged into the 3D project.json.
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -5,10 +27,14 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { isUnifiedProject } from '../../src/renderer/src/project-unified.js'
 import { createForcingRules, looksLikeMetadataPath } from './forcing.mjs'
 
+// STREAM 工程文件名；COMPONENT_KEYS/LABELS 为四组分温度（光照/阴影土壤、光照/阴影叶片）
+// 的键名与界面显示名；OVERPASS 为过境时刻的严格 ISO UTC 格式（秒可省略，必须以 Z 结尾）。
 export const PROJECT_FILE = 'stream-project.json'
 const COMPONENT_KEYS = ['soilSunlit', 'soilShaded', 'leafSunlit', 'leafShaded']
 const COMPONENT_LABELS = { soilSunlit: '光照土壤温度', soilShaded: '阴影土壤温度', leafSunlit: '光照叶片温度', leafShaded: '阴影叶片温度' }
 const OVERPASS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?Z$/
+// 作用：对 OVERPASS 匹配结果做日历有效性校验（下面两行英文注释说明了原因）。
+// 输入：正则 match；输出：布尔值。年份限制 1900–2200 与引擎 forcing/utc.cpp 一致。
 // Strict calendar check of an OVERPASS match: Date.parse accepts 2019-02-30, 2019-04-31 and T24:00:00Z (rolled over by V8),
 // which the engine rejects, so round-trip the parts through Date.UTC and reject any that change.
 function validUtcParts(match) {
@@ -22,18 +48,24 @@ function validUtcParts(match) {
 }
 // 空串/空白/null 视为“未提供”，避免 Number('') === 0 被当成有效取值。
 const hasNumber = (value) => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value))
+// 作用：校验起转节点数 temperature.spinupHours 并取整，返回整数个“时次”（不是小时数）。
+// 范围 0–240，与引擎一致；向上取整，减 1e-9 是为了吸收浮点误差（7.0000000001 仍得 7）。
 function spinupNodes(value) {
   const number = Number(value)
   if (!Number.isFinite(number) || number < 0 || number > 240) throw new Error('起转节点数（temperature.spinupHours）须在 0–240 之间，缺省 7')
   return Math.ceil(number - 1e-9)
 }
 
+// 作用：校验能量平衡迭代次数 maxIterations：1–10000 的整数，否则报错。
 function iterationCount(value) {
   const number = Number(value)
   if (!Number.isInteger(number) || number < 1 || number > 10000) throw new Error('能量平衡迭代次数 maxIterations 须为 1–10000 的整数')
   return number
 }
 
+// 模块：temperature.energy 的键白名单 ENERGY_KEYS 与数值校验 validateEnergy。
+// validateEnergy 只拒绝引擎本身会拒绝的取值；空串/null/undefined 视为未给出，
+// true/[]/{} 等不会被 Number() 悄悄转成 1/0/NaN。
 // FIX(2026-11-24 S1): the engine's temperature.energy rules (config.cpp), checked at submission so a bad value fails here and
 // not after the job has left the queue and its output folder exists. Only values the engine rejects are rejected.
 export const ENERGY_KEYS = ['scheme', 'soilHeatMethod', 'temperatureMethod', 'diffuseFraction', 'enforceSolarLimit', 'iceMelt',
@@ -76,6 +108,8 @@ export function unknownEnergyFields(scene) {
   return Object.keys(energy).filter((key) => !ENERGY_KEYS.includes(key))
 }
 
+// 作用：把旧版（v1）工程的本地日期、时钟、时区（相对 UTC 的小时数）换算成 ISO UTC 过境时刻。
+// 时区缺省或无效时按 +8（北京时间）处理，保持旧工程行为；格式不合法返回空串。
 // Local date + clock + UTC offset (v1 projects) -> ISO UTC overpass.
 export function localToUtc(date, time, timezone) {
   const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''))
@@ -86,6 +120,8 @@ export function localToUtc(date, time, timezone) {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
 }
 
+// 作用：把 v1 单景工程的 scene 迁移为 v2 形态（surface/view/temperature 等分块）。
+// v1 没有能量平衡，温度一律按 RT 模式并以 components.source='fields' 读取组分温度。
 // v1 (stream-scene-project) form -> v2 form. v2 forms pass through unchanged.
 export function migrateScene(scene) {
   if (!scene || typeof scene !== 'object') return null
@@ -105,6 +141,8 @@ export function migrateScene(scene) {
   }
 }
 
+// 作用：收集 scene 中所有“栅格输入字段”对象（地表、观测几何、组分、反演观测与掩膜、
+// 同化视角几何、天空长波），只保留带 file 路径的字段，供 mapStreamScenePaths 批量改写路径。
 function filePaths(scene) {
   const inversion = scene.inversion || {}
   const observationFields = (Array.isArray(inversion.observations) ? inversion.observations : [])
@@ -116,6 +154,10 @@ function filePaths(scene) {
   return fields.filter((field) => field && typeof field === 'object' && String(field.file || '').trim())
 }
 
+// 作用：就地把 scene 里出现的所有路径用 convert(path[, 'output']) 改写，并返回 scene。
+// 覆盖：栅格字段、组分文件、ERA5/气象强迫数据包与站点文件及元数据路径（仅当看起来是路径时）、
+// 同化的数据/误差/QA 文件与各视角文件、outputRoot（第二参数 'output'）。
+// 用途：读工程时相对路径 → 绝对路径；保存时绝对路径 → 工程目录内的相对路径。
 export function mapStreamScenePaths(scene, convert) {
   for (const field of filePaths(scene)) field.file = convert(field.file)
   const components = scene.temperature?.components
@@ -141,12 +183,19 @@ export function mapStreamScenePaths(scene, convert) {
   return scene
 }
 
+// 模块：STREAM 工程存取与引擎配置生成的工厂。注入主机路径换算 normalizeHostPath 和
+// Windows 路径显示 windowsPath；内部包含工程读写（readProjectFile/saveProjectFile）、
+// 各输入块校验与组装（inputField/bands/buildInversion 等）以及运行配置生成。
 export function createProjectStore({ normalizeHostPath, windowsPath, forcingDirectories = () => [] }) {
   const forcingRules = createForcingRules({ normalizeHostPath, windowsPath })
   const readDocument = (path) => {
     try { return JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')) } catch { return null }
   }
 
+  // 作用：读取 STREAM 工程文件（目录则依次找 stream-project.json 与 project.json）。
+  // 步骤：解析 JSON → 统一工程直接返回 null（STREAM 不通过它打开）→ 校验 kind 与版本
+  // （v1 stream-scene-project 或 v2 stream-image-project）→ 迁移为 v2 → 把相对路径转成绝对路径。
+  // 输出：{ path, name, description, migrated, scene } 或 null（不是 STREAM 工程时）。
   // 统一工程（project.json，format: stream-studio-project）里 STREAM 的输入在 engines.stream，
   // 地理/时间/观测几何等共享输入在 shared；这里编译成工作台认识的 scene。
   function readProjectFile(value) {
@@ -172,6 +221,9 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
       migrated: source.kind === 'stream-scene-project', scene }
   }
 
+  // 作用：保存 STREAM 工程文件（kind=stream-image-project, schemaVersion=2），返回重新读取的结果。
+  // 步骤：确定目标路径 → 迁移 scene → 路径换成相对工程目录的写法（目录外保持绝对路径）
+  // → 已存在的文件必须本身是 STREAM 工程才允许覆盖（overwrite=false 时一律拒绝）→ 写盘。
   // Paths inside the project folder are stored relative to it.
   function saveProjectFile(data) {
     const target = data.path
@@ -201,6 +253,9 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     return readProjectFile(target)
   }
 
+  // 作用：把界面传来的“栅格输入字段”规整为引擎格式：{ file, band? } 或 { value }。
+  // 规则：给了文件（且 mode 不是 'value'）必须是存在的绝对路径，band 为 0 起的整数，0 不写出；
+  // 否则取常数 value（constant=false 时不允许常数）；都没有时 required 报错，否则返回 undefined。
   function inputField(value, label, { constant = true, required = false } = {}) {
     const source = value && typeof value === 'object' ? value : {}
     const file = normalizeHostPath(String(source.file || '').trim().replace(/^"|"$/g, ''))
@@ -222,6 +277,9 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     return undefined
   }
 
+  // 作用：校验并规整波段列表（最多 64 个）。center 须在 [low, high]，fwhm 在 [0, high−low]。
+  // 名称中的逗号、花括号、换行替换为空格（避免破坏下游文本参数），截断到 40 字符。
+  // 热红外额外要求 fwhm ≤ 2·(center − 0.1)（μm），即波段下沿不低于 0.1 μm（待核对来源）。
   function bands(list, label, low, high) {
     if (!Array.isArray(list)) return []
     if (list.length > 64) throw new Error(`${label}波段不能超过 64 个`)
@@ -237,6 +295,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     })
   }
 
+  // 作用：要求 value 是已存在文件的绝对路径，返回 Windows 形式路径，否则抛出带 label 的错误。
   function existingFile(value, label) {
     const path = resolve(normalizeHostPath(String(value || '').trim().replace(/^"|"$/g, '')))
     if (!String(value || '').trim() || !isAbsolute(path)) throw new Error(`请选择${label}`)
@@ -244,6 +303,8 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     return windowsPath(path)
   }
 
+  // 作用：组装反演配置块（inversion）：观测列表（1–32 个）、各观测的波长（3–20 μm）、
+  // σ（缺省 0.5 K，范围 0.01–10 K）以及可选的观测几何；其余参数的范围校验见下文。
   // LST / LSCT retrieval block, validated with the same ranges as the engine (models/stream/app/config.cpp).
   function buildInversion(input, target) {
     const source = input && typeof input === 'object' ? input : {}
@@ -282,6 +343,8 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     return block
   }
 
+  // 作用：判断是否同化。scene.assimilation.mode 为 'assimilate' 时返回观测类型
+  // （brightness/lst/components，非法值按 brightness），否则返回 'none'（直接模拟）。
   // Run mode: 直接模拟 or 同化. Only the data and the observation kind are user choices; observation and background
   // Explicit observation errors/QA override engine defaults; controls remain engine-managed.
   function assimilationKind(scene) {
@@ -290,6 +353,11 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     return ['brightness', 'lst', 'components'].includes(source.observation) ? source.observation : 'brightness'
   }
 
+  // 作用：生成引擎配置的 assimilation 块并做提交时校验。
+  // 输入：界面 assimilation、观测类型、热红外/光学是否启用；输出：块对象，不合法时抛错。
+  // 要点：数据文件必须存在；uncertainty 与 covariance 二选一；σ 与 LST 波长（3–25 μm）须为
+  // 正数；rejectQaBits 为 uint16；观测层级固定（亮温 canopy，其余 surface），暂无 TOA 大气算子；
+  // 观测/先验 sourceIds 不得重叠（否则无法假设误差独立）；附加视角最多 16 个且同一文件不得重复。
   function buildAssimilation(source, observation, { thermalEnabled, opticalEnabled }) {
     const label = observation === 'brightness' ? '亮温观测文件' : observation === 'lst' ? '地表温度观测文件' : '组分温度观测文件'
     const block = { observation, data: existingFile(source.data, label) }
@@ -342,12 +410,19 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     return block
   }
 
+  // 模块：由 scene 生成引擎配置 stream-image-config v2（本文件的核心函数）。
+  // 输入：scene（可为 v1 旧工程）与输出目录、引擎数据目录；输出：可直接序列化的配置对象。
+  // 步骤 1：迁移与过境时刻校验 → 2：模拟类型与波段 → 3：地表栅格、地形、土壤亮度 →
+  // 4：观测几何与位置范围 → 5：温度来源（EB 或 RT）→ 6：线程、反演、同化、天空长波、区域。
   function buildEngineConfig(input, { outputDir, dataDir }) {
     const scene = migrateScene(input)
     if (!scene) throw new Error('缺少影像模拟配置')
+    // 步骤 1：过境时刻须为真实存在的 UTC 时刻；无秒时补 :00（见后面 config 的 overpass）。
     const overpass = String(scene.overpass || '').trim()
     const match = OVERPASS.exec(overpass)
     if (!match || !validUtcParts(match)) throw new Error('过境时刻须为存在的 UTC 日期时间，格式 YYYY-MM-DDTHH:MM:SSZ，年份 1900–2200（不接受 2019-02-30、T24:00 等）')
+    // 步骤 2：确定启用哪些模拟。光学、热红外、反演、同化至少启用一个；反演与同化互斥
+    // （同化时 inversionTarget 一律为 none）。波段范围：光学 400–2400 nm，热红外 3–20 μm。
     const opticalEnabled = Boolean(scene.optical?.enabled)
     const thermalEnabled = Boolean(scene.thermal?.enabled)
     const assimilation = assimilationKind(scene)
@@ -359,6 +434,9 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     if (opticalEnabled && !opticalBands.length) throw new Error('请至少添加一个光学波段')
     if (thermalEnabled && !thermalBands.length) throw new Error('请至少添加一个热红外波段')
 
+    // 步骤 3：地表输入。类型栅格与 LAI 必填；EB 且土壤水分来源不是 'user' 时不要求土壤水分栅格
+    // （由气象强迫提供，待核对）；DEM 可选；纬度/经度仅在 locationSource 为 'input' 时必填，
+    // 否则引擎由地表类型栅格的地理参考换算（见 README）。
     const surfaceInput = scene.surface || {}
     const temperatureInput = scene.temperature || {}
     const mode = temperatureInput.mode === 'eb' ? 'eb' : 'rt'
@@ -372,6 +450,9 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
       surface.latitude = inputField(surfaceInput.latitude, '纬度', { required: true })
       surface.longitude = inputField(surfaceInput.longitude, '经度', { required: true })
     }
+    // 地形模式：single 单一坡面（坡度、坡向可为常数）；facet/composite 面元法（界面里的 composite
+    // 按 facet 传给引擎）；hill 山包与 ridge 山脊需要坡度/密度（及走向）栅格；
+    // ridge 的 endFraction（端面比例）限制在 0–0.5。
     // Optional receiving-surface orientation for the shortwave: one plane for the scene (single) or a
     // per-pixel slope/aspect field from the DEM (composite).
     const terrainInput = surfaceInput.terrain
@@ -398,6 +479,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
         throw new Error('地形辐射模式须为 none、single、facet、hill 或 ridge')
       }
     }
+    // 土壤亮度（BSM 参数）：给出时限制在 0.05–1，省略则沿用 classes.json 的 0.25。
     // Optional BSM soil brightness of the scene; omitted keeps classes.json (0.25).
     // FIX(2026-11-24 S3): a given value must be valid; 0 / negative / non-numeric used to be dropped silently (default 0.25).
     const brightnessInput = surfaceInput.soilBrightness?.value ?? surfaceInput.soilBrightness
@@ -406,6 +488,8 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
       if (!Number.isFinite(brightness) || brightness < 0.05 || brightness > 1) throw new Error('地表土壤亮度 soilBrightness 须为 0.05–1 之间的数（省略则用默认 0.25）')
       surface.soilBrightness = brightness
     }
+    // 步骤 4：观测几何与位置的常数范围检查（栅格由引擎逐像元检查）：VZA ∈ [0, 90)、
+    // VAA ∈ [−360, 360]、纬度 ∈ [−90, 90]、经度 ∈ [−180, 360]，与 README 一致。
     // Constant view geometry and location must be physical (the engine checks the same ranges; rasters are
     // checked per pixel by the engine).
     const constantInRange = (field, low, high, label, { includeHigh = true } = {}) => {
@@ -428,9 +512,14 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
       ...Object.fromEntries(['soilEmissivity', 'soilEmissivityWet'].filter((key) => hasNumber(energy[key])).map((key) => [key, Number(energy[key])]))
     })
 
+    // 步骤 5：温度来源。mode='eb'：由逐小时气象强迫做能量平衡，需要气象强迫块、起转节点数
+    // （缺省由引擎取 7）与 energy 参数；否则 'rt'：直接给定四组分温度（或 components.tif）。
+    // 两种模式都带 emission（土壤发射率设置），因为引擎在两种模式下都从 temperature.energy 读取。
     let temperature
     if (mode === 'eb') {
       validateEnergy(temperatureInput.energy)
+      // EB：土壤水分来源只有 'user'（取自上面的栅格）或 'era5'（取自强迫数据）两种。
+      // energy 中数值型覆盖项只在界面给出有效数字时才写入，未写的字段由引擎采用其缺省值。
       const source = temperatureInput.soilMoisture?.source === 'user' ? 'user' : 'era5'
       // DEFERRED[低] 错误处理: 这里的校验比引擎 config.cpp 宽松：soilHeatMethod/temperatureMethod 原样透传任意字符串，diffuseFraction 不限 [-1,1]，spectralBinNm 不限 1–100 的整数，heatRoughnessKb 不限 ≤20，soilEmissivityK 允许 ≤0；这些错误要等任务出队、建好输出目录后才由引擎报出；建议：在提交时按引擎相同规则校验（白名单 + 范围）
       temperature = { mode: 'eb', ...forcingRules.buildForcing(temperatureInput, { projectPath: input.projectPath, directories: forcingDirectories() }), soilMoisture: { source },
@@ -471,6 +560,8 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
           }
         } }
     } else {
+      // RT：组分温度（K）。source 为 'package' 时用 4 波段 components.tif，否则四个组分逐项给出
+      // （常数或栅格）。不需要热红外成像、反演或同化时不要求组分温度。
       const components = {}
       // LSCT inversion and the RT assimilation need the component temperatures as background even without thermal imaging.
       if (thermalEnabled || inversionTarget === 'lsct' || assimilation !== 'none') {
@@ -482,6 +573,8 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
       temperature = { mode: 'rt', components, energy: emission(temperatureInput.energy) }
     }
 
+    // 步骤 6：汇总配置。threads 限制在 0–256 的整数（0 的含义由引擎决定，待核对）；
+    // overpass 无秒时补 ':00'，保证引擎收到统一格式。
     const config = {
       kind: 'stream-image-config', schemaVersion: 2,
       outputDir: windowsPath(outputDir), dataDir: windowsPath(dataDir),
@@ -505,6 +598,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
         if (field) config.skyLongwave = field
       }
     }
+    // 处理区域（可选）：行列号 0 起，终点不含；缺项或非整数、起点 ≥ 终点都会报错。
     const region = scene.region
     if (region && region.enabled) {
       const values = ['startRow', 'endRow', 'startColumn', 'endColumn'].map((key) => (String(region[key] ?? '').trim() === '' ? NaN : Number(region[key])))
@@ -522,5 +616,6 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     const unknown = unknownEnergyFields(scene)
     return unknown.length ? [`temperature.energy 中的 ${unknown.join('、')} 不是引擎支持的字段，已忽略（请检查拼写）`] : []
   }
+  // 对外接口：读/写工程、生成引擎配置、生成非阻断性警告。
   return { readProjectFile, saveProjectFile, buildEngineConfig, sceneWarnings }
 }
