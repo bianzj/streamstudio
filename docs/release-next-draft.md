@@ -134,7 +134,7 @@
 
 ### 新增内置示例：北京多传感器对比（2026-11-25，不改引擎与数值）
 
-新增内置示例 `assets/examples/beijing_multisensor`（`assets/examples/catalog.json` 已登记，“区域遥感影像”类，精选示例）：同一个北京 300 m 场景（2019-08-15 02:55 UTC），母工程用 ERA5 能量平衡求一次组分温度，7 个传感器变体（Landsat 8/9、MODIS、Sentinel-2、ASTER、ECOSTRESS、VIIRS、FY-3D MERSI-II）与 16 个观测角变体（Landsat TIRS B10 与 MODIS 31，VZA 0/20/32/40/55°）复用该组分温度成像；`run_all.mjs` 一键运行 24 次（约 13 s）并汇总 300 m → 1 km 聚合统计，`reference/` 保留精简参考结果（约 14 MB）。配套分析报告 `docs/cases/beijing-multisensor/report.pdf`（13 页），由 `tools/build-beijing-multisensor-report.py` 与 `tools/plot-beijing-multisensor.py` 从仓库内数据重建。限制：高斯 SRF 近似、`sensors.json` 中 13 个波段（MODIS B32、ASTER B11、ECOSTRESS 全部、MERSI-II 光学）标“待核对”；结果是无大气冠层顶量，没有真实观测验证。只新增文件，不改引擎、服务端与前端，旧示例与算例结果不变；设计说明见 `docs/stream-examples.md` 示例 C。
+新增内置示例 `assets/examples/beijing_multisensor`（`assets/examples/catalog.json` 已登记，“区域遥感影像”类，精选示例）：同一个北京 300 m 场景（2019-08-15 02:55 UTC），母工程用 ERA5 能量平衡求一次组分温度，7 个传感器变体（Landsat 8/9、MODIS、Sentinel-2、ASTER、ECOSTRESS、VIIRS、FY-3D MERSI-II）与 16 个观测角变体（Landsat TIRS B10 与 MODIS 31，VZA 0/20/32/40/55°）复用该组分温度成像；`run_all.mjs` 一键运行 24 次（约 13 s）并汇总 300 m → 1 km 聚合统计，`reference/` 保留精简参考结果（约 14 MB）。配套分析报告 `docs/cases/beijing-multisensor/report.pdf`（14 页），由 `tools/build-beijing-multisensor-report.py` 与 `tools/plot-beijing-multisensor.py` 从仓库内数据重建。`sensors.json` 为每个波段记录数据依据 `basis`（官方规格 / 文献实测值 / 标称值）与出处；其中 MODIS B32、ASTER B11、MERSI-II 光学波段已对照 NASA/JPL/国家卫星气象中心的官方规格，ECOSTRESS 5 个波段采用公开文献的在轨实测中心与带宽。适用范围：结果是无大气冠层顶量，波段为高斯近似，尚未与实测数据对比；后续工作：HiStream 面元/体元模式补充城市三维结构、与 Landsat 8 B10 实测和 MOD11 对比、接入 MODTRAN 大气校正、官方光谱响应函数。只新增文件，不改引擎、服务端与前端，旧示例与算例结果不变；设计说明见 `docs/stream-examples.md` 示例 C。
 
 ### 新工程默认值（2026-11-22）
 

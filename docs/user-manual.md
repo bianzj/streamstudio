@@ -31,7 +31,7 @@
 | 区域遥感影像 | `landsat_beijing_eb` | STREAM EB；北京 300 m 输入与逐时气象强迫驱动 |
 | 区域遥感影像 | `beijing_multisensor` | STREAM EB + RT；北京 300 m，一次 EB 求组分温度后复用于 Landsat、MODIS、Sentinel-2、ASTER、ECOSTRESS、VIIRS、FY-3D MERSI-II 的波段设置，含观测角（热点）与 300 m → 1 km 聚合实验；报告见 `docs/cases/beijing-multisensor/report.pdf` |
 
-各目录的入口是 `project.json`；先阅读各自的 README。300 m 是本案例的建模网格，不能等同于 Landsat 原始像元尺度。`beijing_multisensor` 的各传感器结果是无大气的冠层顶方向量，波段为高斯近似、部分波段标“待核对”，没有真实观测验证。城市 RT 案例使用给定温度，不能把成像结果解释为独立能量平衡温度预测。玉米案例旧碳通量参考的限制见该例说明。
+各目录的入口是 `project.json`；先阅读各自的 README。300 m 是本案例的建模网格，不能等同于 Landsat 原始像元尺度。`beijing_multisensor` 的各传感器结果是无大气的冠层顶方向量，波段为高斯近似（各波段的数据依据与出处见 `sensors.json`），结果尚未与实测数据对比，后续工作见案例 README。城市 RT 案例使用给定温度，不能把成像结果解释为独立能量平衡温度预测。玉米案例旧碳通量参考的限制见该例说明。
 
 ### 0.3 外部培训案例与研究案例
 

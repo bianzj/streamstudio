@@ -96,13 +96,14 @@ output/jjj_modis_1km_<时间戳>/
 | --- | --- |
 | 场景 | 北京市 300 m（EPSG:32650，592 × 598），2019-08-15 02:55 UTC（北京 10:55）；输入与 ERA5 包复制自 `landsat_beijing_eb`，案例自包含 |
 | 母工程 | `project.json`：ERA5 能量平衡，输出组分温度 `components.tif` |
-| 传感器变体 | `variants/`：Landsat 8/9、MODIS、Sentinel-2、ASTER、ECOSTRESS、VIIRS、FY-3D MERSI-II，RT 模式复用组分温度文件，各含该传感器的波段（`sensors.json`，高斯近似 SRF，部分波段标“待核对”） |
+| 传感器变体 | `variants/`：Landsat 8/9、MODIS、Sentinel-2、ASTER、ECOSTRESS、VIIRS、FY-3D MERSI-II，RT 模式复用组分温度文件，各含该传感器的波段（`sensors.json`，高斯近似 SRF；每个波段记录数据依据 `basis`：官方规格 / 文献实测值 / 标称值，并附出处链接） |
 | 观测角实验 | Landsat TIRS B10 与 MODIS 31，VZA 0/20/32/40/55°，主平面前向/后向，热点 VZA = 太阳天顶角 31.85° |
 | 聚合实验 | 300 m → 1 km（GDAL 平均/取最大，网格自原栅格西北角起），比较均值、标准差、最大值与热点占比 |
 | 运行 | `node assets\examples\beijing_multisensor\run_all.mjs --out <目录>`：24 次引擎运行，约 13 s |
-| 报告 | `docs/cases/beijing-multisensor/report.pdf`（13 页）；`python tools\build-beijing-multisensor-report.py` 可由仓库内 `reference/` 重建 |
+| 报告 | `docs/cases/beijing-multisensor/report.pdf`（14 页）；`python tools\build-beijing-multisensor-report.py` 可由仓库内 `reference/` 重建 |
 
-它把 B2 的“复用组分温度换载荷”扩展成一个批量实验：一次 EB、二十多次几秒的成像。结果仍是**无大气的冠层顶量**，不含真实观测验证；各载荷热红外亮温差在 0.01 K 量级，反映发射率光谱而非载荷差异。
+它把 B2 的“复用组分温度换载荷”扩展成一个批量实验：一次 EB、二十多次几秒的成像。结果是**无大气的冠层顶量**，各载荷热红外亮温差在 0.01 K 量级，反映的是随波长变化的地表发射率光谱，不是载荷之间可观测到的差异；波段采用高斯近似，结果尚未与实测数据对比。
+后续工作：城市三维结构效应用 HiStream 的面元/体元模式补充；与 Landsat 8 B10 实测、MOD11 产品对比；接入大气校正（MODTRAN 查找表）给出入瞳辐亮度；以官方光谱响应函数替代高斯近似。
 
 ## 1. 示例 A、B 之间
 
