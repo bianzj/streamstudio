@@ -149,8 +149,8 @@ def gldas_file(path):
 
 
 # 作用：写单站点 CSV（摄氏度、相对湿度 %、hPa、风速、下行短波/长波）；站点在 (40.0°N, 116.5°E, 50 m)。
-# 参数 rows 未使用（待核对）。
-def station_csv(path, rows=None, header='time,station_id,lat,lon,elev,temp,rh,pressure,wind_speed,swdown,lwdown'):
+# 行数由模块常量 HOURS 决定；header 可替换表头（用于缺列测试）。
+def station_csv(path, header='time,station_id,lat,lon,elev,temp,rh,pressure,wind_speed,swdown,lwdown'):
     lines = [header]
     for h in HOURS:
         f = fields(h)

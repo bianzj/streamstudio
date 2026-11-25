@@ -1,4 +1,4 @@
-﻿// ==========================================================================
+// ==========================================================================
 // 文件：generate-forest-example.mjs
 // 功能：基于“真实 100 m 森林”布局（20 棵蓝花楹 + 200 株漆树灌木）生成内置示例工程，两种变体：
 //   - 默认：VoxelEB，输出温度、GPP、NPP（assets/examples/forest）
@@ -13,7 +13,8 @@
 //      → 选冠层覆盖最少的 → 最远点法铺开 → 调用 addVehicleLineup 添加车辆与所需共享资源
 //   6. 校验工程，写 project.json 与 README.md
 // 约定：长度 m；布局/位置文件每行为 北向、东向、高度、缩放、旋转角（度）；场景边长 SCENE = 100 m。
-// 注意：未指定输出目录时，--vehicles 默认写到 D:/cases/streamstudio/vehicle-tarp/forest（本机路径）。
+// 注意：未指定输出目录时，--vehicles 默认写到 D:/cases/streamstudio/vehicle-tarp/forest（本机路径），
+//   可用环境变量 STREAM_STUDIO_VEHICLE_FOREST_DIR 或命令行输出目录参数覆盖。
 // 与其他文件：依赖 src/renderer/src/project-schema.js、tools/vehicle-lineup.mjs、
 //   tools/compact-obj.mjs（蓝花楹用其生成的紧凑副本）与 assets/obj-library 下的布局与模型。
 // ==========================================================================
@@ -33,7 +34,10 @@ const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const args = process.argv.slice(2)
 const withVehicles = args.includes('--vehicles')
 const outputArg = args.find((arg) => !arg.startsWith('--'))
-const exampleRoot = resolve(outputArg ?? (withVehicles ? 'D:/cases/streamstudio/vehicle-tarp/forest' : join(projectRoot, 'assets', 'examples', 'forest')))
+// --vehicles 的缺省输出目录是本机路径 D:/cases/streamstudio/vehicle-tarp/forest；可用命令行 [output directory]
+// 或环境变量 STREAM_STUDIO_VEHICLE_FOREST_DIR 覆盖（命令行优先，缺省行为不变）。
+const vehicleDefaultRoot = process.env.STREAM_STUDIO_VEHICLE_FOREST_DIR || 'D:/cases/streamstudio/vehicle-tarp/forest'
+const exampleRoot = resolve(outputArg ?? (withVehicles ? vehicleDefaultRoot : join(projectRoot, 'assets', 'examples', 'forest')))
 for (const folder of ['positions', 'meteorology']) mkdirSync(join(exampleRoot, folder), { recursive: true })
 
 // 常量：场景边长、布局目录，以及 mesh() 辅助函数（为 OBJ 的各分组绑定

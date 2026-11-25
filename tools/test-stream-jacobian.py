@@ -23,7 +23,7 @@ existing build/stream tree and runs it against the engine's stream-defined data.
 (crop LAI 3 and 1, forest LAI 4, C4 grass), that dR/dLAI of the Ad residual equals the finite difference of the double
 residual with the aerodynamic resistances recomputed at each LAI (the resistances carry Ad derivatives since M3).
 STREAM_RUNTIME overrides the data dir parent (default models/bin_x64/Release); the test is skipped when the build tree
-or cmake is missing.
+is missing and fails with a clear message when cmake cannot be found (PATH, vswhere, Program Files).
 """
 import os
 import shutil
@@ -35,13 +35,45 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = Path(os.environ.get('STREAM_RUNTIME', ROOT / 'models/bin_x64/Release'))
 BUILD = ROOT / 'build' / 'stream'
-# cmake：优先取 PATH 中的，否则回退到本机 Visual Studio 自带的 cmake 路径（路径为本机约定）。
-CMAKE = shutil.which('cmake') or r'C:\Program Files\Microsoft Visual Studio\18\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+# 作用：定位 cmake。顺序：PATH → vswhere（Visual Studio Installer 自带）找到的 VS 安装 → 常见安装目录
+# （Program Files 下任意版本/版本号的 Visual Studio）。都找不到返回 None（由测试给出清楚的错误信息）。
+_VS_CMAKE = Path('Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe')
+
+
+def find_cmake():
+    found = shutil.which('cmake')
+    if found:
+        return found
+    for base in filter(None, (os.environ.get('ProgramFiles(x86)'), os.environ.get('ProgramFiles'))):
+        vswhere = Path(base) / 'Microsoft Visual Studio' / 'Installer' / 'vswhere.exe'
+        if not vswhere.exists():
+            continue
+        try:
+            out = subprocess.run([str(vswhere), '-latest', '-products', '*', '-property', 'installationPath'],
+                                 capture_output=True, encoding='utf-8', errors='replace', timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in out.splitlines():
+            candidate = Path(line.strip()) / _VS_CMAKE
+            if line.strip() and candidate.exists():
+                return str(candidate)
+    for base in filter(None, (os.environ.get('ProgramFiles'), os.environ.get('ProgramFiles(x86)'))):
+        # 例如 C:\Program Files\Microsoft Visual Studio\18\Professional 或 ...\2022\Community
+        for candidate in sorted((Path(base) / 'Microsoft Visual Studio').glob('*/*/' + _VS_CMAKE.as_posix()), reverse=True):
+            return str(candidate)
+    return None
+
+
+CMAKE = find_cmake()
 
 
 # 作用：构建并运行 stream_jacobian_check，失败时断言信息只保留输出尾部（便于阅读）。
-@pytest.mark.skipif(not BUILD.exists() or not Path(CMAKE).exists(), reason='build/stream tree or cmake not available')
+# build/stream 不存在时跳过；构建树在但找不到 cmake 时报错并列出已查找的位置（而不是静默跳过）。
+@pytest.mark.skipif(not BUILD.exists(), reason='build/stream tree not available')
 def test_ad_jacobian_matches_finite_differences():
+    if not CMAKE:
+        pytest.fail('找不到 cmake：已依次查找 PATH、vswhere 报告的 Visual Studio 安装、Program Files 下的 Visual Studio；'
+                    '请把 cmake 加入 PATH 后重试')
     built = subprocess.run([CMAKE, '--build', str(BUILD), '--config', 'Release', '--target', 'stream_jacobian_check'],
                            capture_output=True, encoding='utf-8', errors='replace', timeout=900)
     assert built.returncode == 0, built.stdout[-2000:] + built.stderr[-1000:]

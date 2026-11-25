@@ -10,7 +10,7 @@
 //   4. 随机放置 160 丛林下植被（位置在 [0, 100) m，缩放 1.2~4.0，抬高 0.02 m）
 //   5. 写出 OBJ 并打印路径
 // 约定：Y 向上，单位 m；旋转角为弧度；种子固定，重复运行结果一致。
-// 注意：loadObj 只处理正的面索引；源 OBJ 若使用负索引会出错（只报告，未处理）；
+// 注意：loadObj 把负的面索引按 OBJ 规则换算成正索引（正索引输出不变）；
 //   实例互不避让，可能重叠。
 // ==========================================================================
 
@@ -39,6 +39,7 @@ const random = () => {
 }
 
 // 作用：读取库内 OBJ，返回 { vertices, faces }；面只保留顶点编号（去掉 /vt/vn），1 起始。
+// 负索引按 OBJ 规则相对“当前已读顶点数”换算成正索引（-1 = 最近读到的顶点）；正索引原样保留。
 const loadObj = async (relativePath) => {
   const text = await readFile(join(libraryRoot, relativePath), 'utf8')
   const vertices = []
@@ -48,7 +49,10 @@ const loadObj = async (relativePath) => {
     if (parts[0] === 'v' && parts.length >= 4) {
       vertices.push(parts.slice(1, 4).map(Number))
     } else if (parts[0] === 'f' && parts.length >= 4) {
-      faces.push(parts.slice(1).map((token) => Number(token.split('/')[0])))
+      faces.push(parts.slice(1).map((token) => {
+        const index = Number(token.split('/')[0])
+        return index < 0 ? vertices.length + index + 1 : index
+      }))
     }
   }
   return { vertices, faces }

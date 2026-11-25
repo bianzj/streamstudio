@@ -11,7 +11,8 @@
 #   5. 脚本主体：封面 + 7 个章节（总体功能、森林场景/结果、城市场景/结果、水上目标、
 #      运行检查）的 story，最后 doc.build
 # 数据流：Word 文档截图（SOURCE_DOCX）→ tmp/pdfs/... 面板 PNG → output/pdf/*.pdf。
-# 注意：SOURCE_DOCX 是硬编码的桌面文档路径，换机器需修改；本脚本在 import 时即执行全部流程；
+# 注意：SOURCE_DOCX 缺省是硬编码的桌面文档路径，可由命令行第一个参数或环境变量
+#   STREAM_STUDIO_MANUAL_SOURCE_DOCX 覆盖；全部流程在 main() 中，仅直接运行本脚本时执行（import 不再触发）；
 #   封面与正文中的软件版本（1.0）、人员、联系方式、案例文字均为手写内容。
 # 与 tools/build-core-manuals-pdf.py 的区别：那个脚本由 Markdown 手册生成 PDF，本脚本为手写版面。
 # ==========================================================================
@@ -53,8 +54,6 @@ from reportlab.platypus import (
 ROOT = Path(__file__).resolve().parents[1]
 TMP = ROOT / "tmp" / "pdfs" / "stream_studio_example_manual"
 OUTPUT = ROOT / "output" / "pdf" / "Stream Studio功能与案例手册.pdf"
-TMP.mkdir(parents=True, exist_ok=True)
-OUTPUT.parent.mkdir(parents=True, exist_ok=True)
 
 FONT_REGULAR = Path(r"C:\Windows\Fonts\Deng.ttf")
 FONT_BOLD = Path(r"C:\Windows\Fonts\Dengb.ttf")
@@ -489,185 +488,199 @@ def compose_panel(destination: Path, material, items, columns=2):
     canvas.save(destination, quality=94)
 
 
-# 模块：生成 9 张面板图。编号与标签的对应关系取决于 Word 文档中的图片顺序（待核对）。
-material = extract_material_images(SOURCE_DOCX)
-overview_panel = TMP / "overview_panel.png"
-forest_scene_panel = TMP / "forest_scene_panel.png"
-forest_results_panel = TMP / "forest_results_panel.png"
-forest_carbon_panel = TMP / "forest_carbon_panel.png"
-city_scene_panel = TMP / "city_scene_panel.png"
-city_results_panel = TMP / "city_results_panel.png"
-city_scenarios_panel = TMP / "city_scenarios_panel.png"
-ship_scene_panel = TMP / "ship_scene_panel.png"
-ship_results_panel = TMP / "ship_results_panel.png"
+# 作用：脚本主流程（生成面板图、拼装 story、输出 PDF）。放在函数里，import 本文件不会触发生成。
+# source_docx：截图来源 Word 文档；缺省取 SOURCE_DOCX（可由命令行第一个参数或环境变量
+# STREAM_STUDIO_MANUAL_SOURCE_DOCX 覆盖）。
+def main(source_docx: Path = SOURCE_DOCX):
+    TMP.mkdir(parents=True, exist_ok=True)
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    # 模块：生成 9 张面板图。编号与标签的对应关系取决于 Word 文档中的图片顺序（待核对）。
+    material = extract_material_images(source_docx)
+    overview_panel = TMP / "overview_panel.png"
+    forest_scene_panel = TMP / "forest_scene_panel.png"
+    forest_results_panel = TMP / "forest_results_panel.png"
+    forest_carbon_panel = TMP / "forest_carbon_panel.png"
+    city_scene_panel = TMP / "city_scene_panel.png"
+    city_results_panel = TMP / "city_results_panel.png"
+    city_scenarios_panel = TMP / "city_scenarios_panel.png"
+    ship_scene_panel = TMP / "ship_scene_panel.png"
+    ship_results_panel = TMP / "ship_results_panel.png"
 
-compose_panel(overview_panel, material, [(1, "森林"), (11, "城市"), (24, "水上目标")], columns=3)
-compose_panel(forest_scene_panel, material, [(1, "森林场景与计算域")], columns=1)
-compose_panel(forest_results_panel, material, [
-    (2, "三维辐射分布"), (3, "多角度分析"),
-    (4, "时间序列"), (6, "土壤分层温度"),
-], columns=2)
-compose_panel(forest_carbon_panel, material, [(7, "森林 GPP"), (8, "森林 NPP")], columns=2)
-compose_panel(city_scene_panel, material, [(11, "城市局部计算域")], columns=1)
-compose_panel(city_results_panel, material, [
-    (12, "短波辐射"), (13, "长波辐射"),
-    (14, "方向效应"), (15, "结果对比"),
-], columns=2)
-compose_panel(city_scenarios_panel, material, [
-    (16, "城市雾场"), (18, "城市火灾"), (20, "空气温度"),
-    (21, "水平风速"), (22, "前视天际线"), (23, "高天顶角影像"),
-], columns=3)
-compose_panel(ship_scene_panel, material, [(24, "船舶与水面场景")], columns=1)
-compose_panel(ship_results_panel, material, [
-    (25, "船舶红外温度"), (26, "水面温度时序"), (27, "多角度方向效应"),
-], columns=3)
+    compose_panel(overview_panel, material, [(1, "森林"), (11, "城市"), (24, "水上目标")], columns=3)
+    compose_panel(forest_scene_panel, material, [(1, "森林场景与计算域")], columns=1)
+    compose_panel(forest_results_panel, material, [
+        (2, "三维辐射分布"), (3, "多角度分析"),
+        (4, "时间序列"), (6, "土壤分层温度"),
+    ], columns=2)
+    compose_panel(forest_carbon_panel, material, [(7, "森林 GPP"), (8, "森林 NPP")], columns=2)
+    compose_panel(city_scene_panel, material, [(11, "城市局部计算域")], columns=1)
+    compose_panel(city_results_panel, material, [
+        (12, "短波辐射"), (13, "长波辐射"),
+        (14, "方向效应"), (15, "结果对比"),
+    ], columns=2)
+    compose_panel(city_scenarios_panel, material, [
+        (16, "城市雾场"), (18, "城市火灾"), (20, "空气温度"),
+        (21, "水平风速"), (22, "前视天际线"), (23, "高天顶角影像"),
+    ], columns=3)
+    compose_panel(ship_scene_panel, material, [(24, "船舶与水面场景")], columns=1)
+    compose_panel(ship_results_panel, material, [
+        (25, "船舶红外温度"), (26, "水面温度时序"), (27, "多角度方向效应"),
+    ], columns=3)
 
 
-# 模块：文档与正文。story 按“封面 → 7 个章节”顺序排列，每章一个 SectionBand + 图 + 说明 +
-# 表格，章节之间 PageBreak。封面页由 page_background 绘制深色背景。
-doc = BaseDocTemplate(
-    str(OUTPUT), pagesize=A4,
-    leftMargin=18 * mm, rightMargin=18 * mm,
-    topMargin=21 * mm, bottomMargin=16 * mm,
-    title="Stream Studio 功能与案例手册",
-    author="中国科学院空天信息创新研究院红外组",
-    subject="Stream Studio overview and Forest, Beijing, Ship examples",
-)
-frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="normal")
-doc.addPageTemplates(PageTemplate(id="main", frames=[frame], onPage=page_background))
+    # 模块：文档与正文。story 按“封面 → 7 个章节”顺序排列，每章一个 SectionBand + 图 + 说明 +
+    # 表格，章节之间 PageBreak。封面页由 page_background 绘制深色背景。
+    doc = BaseDocTemplate(
+        str(OUTPUT), pagesize=A4,
+        leftMargin=18 * mm, rightMargin=18 * mm,
+        topMargin=21 * mm, bottomMargin=16 * mm,
+        title="Stream Studio 功能与案例手册",
+        author="中国科学院空天信息创新研究院红外组",
+        subject="Stream Studio overview and Forest, Beijing, Ship examples",
+    )
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="normal")
+    doc.addPageTemplates(PageTemplate(id="main", frames=[frame], onPage=page_background))
 
-story = [
-    Spacer(1, 29 * mm),
-    P("STREAM STUDIO", "CoverTitle"),
-    P("功能与案例手册", "CoverTitle"),
-    P("总体功能 · 森林 · 城市 · 水上目标<br/>从场景配置到影像与过程分析", "CoverSub"),
-    data_table([
-        ["软件版本", "1.0"],
-        ["案例范围", "Forest / Beijing / Ship"],
-        ["计算模式", "Facet RT / Facet EB / Voxel RT / Voxel EB"],
-        ["红外组人员", "卞尊健、曹彪、历华、杜永明、肖青、柳钦火"],
-        ["联系方式", "bianzj@aircas.ac.cn"],
-    ], [30 * mm, 92 * mm], header=False),
-    Spacer(1, 8 * mm),
-    Image(str(overview_panel), width=174 * mm, height=94 * mm),
-    P("本手册依据现有软件界面和结果截图整理。红外组联系人：卞尊健，bianzj@aircas.ac.cn。", "SmallCN"),
-    PageBreak(),
+    story = [
+        Spacer(1, 29 * mm),
+        P("STREAM STUDIO", "CoverTitle"),
+        P("功能与案例手册", "CoverTitle"),
+        P("总体功能 · 森林 · 城市 · 水上目标<br/>从场景配置到影像与过程分析", "CoverSub"),
+        data_table([
+            ["软件版本", "1.0"],
+            ["案例范围", "Forest / Beijing / Ship"],
+            ["计算模式", "Facet RT / Facet EB / Voxel RT / Voxel EB"],
+            ["红外组人员", "卞尊健、曹彪、历华、杜永明、肖青、柳钦火"],
+            ["联系方式", "bianzj@aircas.ac.cn"],
+        ], [30 * mm, 92 * mm], header=False),
+        Spacer(1, 8 * mm),
+        Image(str(overview_panel), width=174 * mm, height=94 * mm),
+        P("本手册依据现有软件界面和结果截图整理。红外组联系人：卞尊健，bianzj@aircas.ac.cn。", "SmallCN"),
+        PageBreak(),
 
-    # 第 1 章：总体功能（四种几何/辐射模式、分析入口、标准运行顺序）。
-    SectionBand("01", "总体功能与工作流程", "统一管理场景 几何 材质 气象 传感器和计算结果"),
-    Spacer(1, 5 * mm),
-    P("Stream Studio 面向三维地表场景的辐射传输与能量过程模拟。工程文件统一保存场景尺寸、对象分布、材质属性、太阳与天空、气象驱动、传感器和求解控制参数。Three.js 负责场景检查和结果浏览，HiStream 引擎完成辐射、能量与流体相关计算。", "BodyCN"),
-    data_table([
-        ["模式", "几何表达", "主要用途"],
-        ["Facet RT", "三角面元", "表面方向性和精细遮挡"],
-        ["Facet EB", "三角面元", "表面温度与能量收支"],
-        ["Voxel RT", "三维体元", "复杂冠层和大场景辐射传输"],
-        ["Voxel EB", "三维体元", "温度 通量 植被生理和流体耦合"],
-    ], [31 * mm, 45 * mm, 98 * mm]),
-    Spacer(1, 4 * mm),
-    data_table([
-        ["分析入口", "适合回答的问题"],
-        ["图像结果", "查看各波段影像 亮温和空间异常"],
-        ["角度分析", "比较不同观测天顶角和方位角的方向效应"],
-        ["波段分析", "比较反射率 光谱辐亮度和热红外结果"],
-        ["时间分析", "查看日变化和多气象节点响应"],
-        ["变化分析", "计算两组影像的差值 误差和像元相关性"],
-        ["三维分析", "定位体元辐射 温度 通量 风速及空气温度"],
-    ], [36 * mm, 138 * mm]),
-    P("标准运行顺序", "H2CN"),
-    bullet("导入 OBJ 或创建 PRIM 原型，先在三维窗口核对坐标、尺度和材质绑定。"),
-    bullet("设置计算域和体元大小。大场景优先选择局部包围盒并从较粗体元开始。"),
-    bullet("先运行少量气象节点，确认太阳方向、输出字段和影像范围，再扩大时段。"),
-    bullet("结果生成后依次检查图像、统计分析和三维过程，避免只依据单张影像判断。"),
-    PageBreak(),
+        # 第 1 章：总体功能（四种几何/辐射模式、分析入口、标准运行顺序）。
+        SectionBand("01", "总体功能与工作流程", "统一管理场景 几何 材质 气象 传感器和计算结果"),
+        Spacer(1, 5 * mm),
+        P("Stream Studio 面向三维地表场景的辐射传输与能量过程模拟。工程文件统一保存场景尺寸、对象分布、材质属性、太阳与天空、气象驱动、传感器和求解控制参数。Three.js 负责场景检查和结果浏览，HiStream 引擎完成辐射、能量与流体相关计算。", "BodyCN"),
+        data_table([
+            ["模式", "几何表达", "主要用途"],
+            ["Facet RT", "三角面元", "表面方向性和精细遮挡"],
+            ["Facet EB", "三角面元", "表面温度与能量收支"],
+            ["Voxel RT", "三维体元", "复杂冠层和大场景辐射传输"],
+            ["Voxel EB", "三维体元", "温度 通量 植被生理和流体耦合"],
+        ], [31 * mm, 45 * mm, 98 * mm]),
+        Spacer(1, 4 * mm),
+        data_table([
+            ["分析入口", "适合回答的问题"],
+            ["图像结果", "查看各波段影像 亮温和空间异常"],
+            ["角度分析", "比较不同观测天顶角和方位角的方向效应"],
+            ["波段分析", "比较反射率 光谱辐亮度和热红外结果"],
+            ["时间分析", "查看日变化和多气象节点响应"],
+            ["变化分析", "计算两组影像的差值 误差和像元相关性"],
+            ["三维分析", "定位体元辐射 温度 通量 风速及空气温度"],
+        ], [36 * mm, 138 * mm]),
+        P("标准运行顺序", "H2CN"),
+        bullet("导入 OBJ 或创建 PRIM 原型，先在三维窗口核对坐标、尺度和材质绑定。"),
+        bullet("设置计算域和体元大小。大场景优先选择局部包围盒并从较粗体元开始。"),
+        bullet("先运行少量气象节点，确认太阳方向、输出字段和影像范围，再扩大时段。"),
+        bullet("结果生成后依次检查图像、统计分析和三维过程，避免只依据单张影像判断。"),
+        PageBreak(),
 
-    # 第 2-3 章：森林场景设置与结果（含 GPP/NPP 图）。
-    SectionBand("02", "森林场景", "展示冠层辐射 温度 多角度 多时相 土壤分层和碳通量"),
-    Spacer(1, 4 * mm),
-    Image(str(forest_scene_panel), width=174 * mm, height=94 * mm),
-    P("图 2-1  森林场景及其计算域", "CaptionCN"),
-    P("森林案例由乔木、林下植被和土壤背景构成。界面截图展示了 100 m × 100 m 场景、太阳方向、体元大小和对象分布。该类场景适合使用 Voxel RT 或 Voxel EB，因为冠层内部包含大量遮挡、空隙和不同高度的叶片。", "BodyCN"),
-    data_table([
-        ["设置重点", "建议"],
-        ["场景范围", "完整包住树冠和根部附近地表，避免边缘裁断"],
-        ["体元大小", "先粗后细；体元越小，冠层结构越清楚，显存占用也越高"],
-        ["对象属性", "乔木和林下植被使用 Vegetation，土壤使用 Soil"],
-        ["过程输出", "开启辐射过程和能量过程，便于查看冠层内部差异"],
-    ], [37 * mm, 137 * mm]),
-    P("结果应先检查树冠位置、地表背景和太阳方位是否一致，再解释辐射和温度差异。", "BodyCN"),
-    PageBreak(),
+        # 第 2-3 章：森林场景设置与结果（含 GPP/NPP 图）。
+        SectionBand("02", "森林场景", "展示冠层辐射 温度 多角度 多时相 土壤分层和碳通量"),
+        Spacer(1, 4 * mm),
+        Image(str(forest_scene_panel), width=174 * mm, height=94 * mm),
+        P("图 2-1  森林场景及其计算域", "CaptionCN"),
+        P("森林案例由乔木、林下植被和土壤背景构成。界面截图展示了 100 m × 100 m 场景、太阳方向、体元大小和对象分布。该类场景适合使用 Voxel RT 或 Voxel EB，因为冠层内部包含大量遮挡、空隙和不同高度的叶片。", "BodyCN"),
+        data_table([
+            ["设置重点", "建议"],
+            ["场景范围", "完整包住树冠和根部附近地表，避免边缘裁断"],
+            ["体元大小", "先粗后细；体元越小，冠层结构越清楚，显存占用也越高"],
+            ["对象属性", "乔木和林下植被使用 Vegetation，土壤使用 Soil"],
+            ["过程输出", "开启辐射过程和能量过程，便于查看冠层内部差异"],
+        ], [37 * mm, 137 * mm]),
+        P("结果应先检查树冠位置、地表背景和太阳方位是否一致，再解释辐射和温度差异。", "BodyCN"),
+        PageBreak(),
 
-    SectionBand("03", "森林结果分析", "把空间分布 时间变化 观测方向和植被生理放在一起检查"),
-    Spacer(1, 4 * mm),
-    Image(str(forest_results_panel), width=174 * mm, height=94 * mm),
-    P("图 3-1  森林案例的三维 辐射 时间和土壤分层结果", "CaptionCN"),
-    P("三维辐射图用于判断冠层顶部与内部的能量差异；极坐标图用于检查观测方向效应；时间曲线反映亮温或辐射随气象节点的变化；多层土壤图显示热量向下传播时的衰减和滞后。", "BodyCN"),
-    Spacer(1, 3 * mm),
-    Image(str(forest_carbon_panel), width=174 * mm, height=94 * mm),
-    P("图 3-2  森林植被体元的 GPP 与 NPP 空间分布", "CaptionCN"),
-    P("GPP 和 NPP 在本案例中用于观察森林植被体元的空间差异。解释时应同时检查有效辐射、叶温和植被体元位置。夜间 GPP 应接近零；NPP 可因暗呼吸出现负值。", "BodyCN"),
-    PageBreak(),
+        SectionBand("03", "森林结果分析", "把空间分布 时间变化 观测方向和植被生理放在一起检查"),
+        Spacer(1, 4 * mm),
+        Image(str(forest_results_panel), width=174 * mm, height=94 * mm),
+        P("图 3-1  森林案例的三维 辐射 时间和土壤分层结果", "CaptionCN"),
+        P("三维辐射图用于判断冠层顶部与内部的能量差异；极坐标图用于检查观测方向效应；时间曲线反映亮温或辐射随气象节点的变化；多层土壤图显示热量向下传播时的衰减和滞后。", "BodyCN"),
+        Spacer(1, 3 * mm),
+        Image(str(forest_carbon_panel), width=174 * mm, height=94 * mm),
+        P("图 3-2  森林植被体元的 GPP 与 NPP 空间分布", "CaptionCN"),
+        P("GPP 和 NPP 在本案例中用于观察森林植被体元的空间差异。解释时应同时检查有效辐射、叶温和植被体元位置。夜间 GPP 应接近零；NPP 可因暗呼吸出现负值。", "BodyCN"),
+        PageBreak(),
 
-    # 第 4-5 章：北京城市案例的计算域、体元分级与结果。
-    SectionBand("04", "城市场景", "在完整城市背景中选择局部区域进行体元化和求解"),
-    Spacer(1, 4 * mm),
-    Image(str(city_scene_panel), width=174 * mm, height=94 * mm),
-    P("图 4-1  北京城市案例的局部计算域", "CaptionCN"),
-    P("城市案例包含建筑、道路、植被及可选的雾、火焰和流体过程。大范围建筑可保持完整显示，但计算时应移动包围盒选择目标街区。完全位于计算域外的对象可直接跳过，跨越边界的对象只处理域内部分。", "BodyCN"),
-    data_table([
-        ["阶段", "体元设置", "检查内容"],
-        ["场景定位", "较粗体元", "建筑范围 高度 太阳方位和计算域位置"],
-        ["热环境试算", "中等体元", "短波 长波 净辐射和建筑温度"],
-        ["街区精算", "较细体元", "局部阴影 风速 空气温度及目标影像"],
-    ], [34 * mm, 40 * mm, 100 * mm]),
-    bullet("城市全场直接使用细体元会迅速增加 GPU 内存和求交开销。"),
-    bullet("先裁切再体元化，能够避免为域外建筑建立无用体元和加速结构。"),
-    PageBreak(),
+        # 第 4-5 章：北京城市案例的计算域、体元分级与结果。
+        SectionBand("04", "城市场景", "在完整城市背景中选择局部区域进行体元化和求解"),
+        Spacer(1, 4 * mm),
+        Image(str(city_scene_panel), width=174 * mm, height=94 * mm),
+        P("图 4-1  北京城市案例的局部计算域", "CaptionCN"),
+        P("城市案例包含建筑、道路、植被及可选的雾、火焰和流体过程。大范围建筑可保持完整显示，但计算时应移动包围盒选择目标街区。完全位于计算域外的对象可直接跳过，跨越边界的对象只处理域内部分。", "BodyCN"),
+        data_table([
+            ["阶段", "体元设置", "检查内容"],
+            ["场景定位", "较粗体元", "建筑范围 高度 太阳方位和计算域位置"],
+            ["热环境试算", "中等体元", "短波 长波 净辐射和建筑温度"],
+            ["街区精算", "较细体元", "局部阴影 风速 空气温度及目标影像"],
+        ], [34 * mm, 40 * mm, 100 * mm]),
+        bullet("城市全场直接使用细体元会迅速增加 GPU 内存和求交开销。"),
+        bullet("先裁切再体元化，能够避免为域外建筑建立无用体元和加速结构。"),
+        PageBreak(),
 
-    SectionBand("05", "城市结果分析", "组合辐射 方向性 情景过程 流体结果和前视影像"),
-    Spacer(1, 4 * mm),
-    Image(str(city_results_panel), width=174 * mm, height=94 * mm),
-    P("图 5-1  城市短波 长波 方向效应与结果对比", "CaptionCN"),
-    P("短波结果突出受光屋顶与阴影立面，长波结果反映材料温度及周围表面的热辐射。角度分析显示不同方向的整幅影像统计值；变化分析可比较两种方法或两个时刻，并给出差值图、误差和像元相关性。", "BodyCN"),
-    Spacer(1, 3 * mm),
-    Image(str(city_scenarios_panel), width=174 * mm, height=94 * mm),
-    P("图 5-2  城市雾 火灾 空气温度 风速与前视结果", "CaptionCN"),
-    P("雾和火焰作为局部参与介质加入场景；空气温度与水平风速属于体元流体力学结果。高天顶角及前视视场适合生成城市天际线，但应核对相机朝向，避免把侧视误判为前视。", "BodyCN"),
-    PageBreak(),
+        SectionBand("05", "城市结果分析", "组合辐射 方向性 情景过程 流体结果和前视影像"),
+        Spacer(1, 4 * mm),
+        Image(str(city_results_panel), width=174 * mm, height=94 * mm),
+        P("图 5-1  城市短波 长波 方向效应与结果对比", "CaptionCN"),
+        P("短波结果突出受光屋顶与阴影立面，长波结果反映材料温度及周围表面的热辐射。角度分析显示不同方向的整幅影像统计值；变化分析可比较两种方法或两个时刻，并给出差值图、误差和像元相关性。", "BodyCN"),
+        Spacer(1, 3 * mm),
+        Image(str(city_scenarios_panel), width=174 * mm, height=94 * mm),
+        P("图 5-2  城市雾 火灾 空气温度 风速与前视结果", "CaptionCN"),
+        P("雾和火焰作为局部参与介质加入场景；空气温度与水平风速属于体元流体力学结果。高天顶角及前视视场适合生成城市天际线，但应核对相机朝向，避免把侧视误判为前视。", "BodyCN"),
+        PageBreak(),
 
-    # 第 6 章：船舶与水面案例。
-    SectionBand("06", "水上目标", "联合处理船体 水面 红外温度 时间变化和多角度观测"),
-    Spacer(1, 4 * mm),
-    Image(str(ship_scene_panel), width=174 * mm, height=94 * mm),
-    P("图 6-1  集装箱船与水面组成的水上目标场景", "CaptionCN"),
-    P("水上目标案例由船舶 OBJ 和水面 PRIM 对象组成。水面应绑定 Water 类型及相应光学和热学属性，船体按不同部件绑定材料。场景截图采用 300 m × 300 m 范围，可覆盖船体及周边背景。", "BodyCN"),
-    Spacer(1, 3 * mm),
-    Image(str(ship_results_panel), width=174 * mm, height=94 * mm),
-    P("图 6-2  船舶红外温度 水面温度时序和多角度方向效应", "CaptionCN"),
-    P("顶视热红外影像可辨认船体轮廓和部件温差；时间分析用于比较水面或船体亮温的日变化；多角度分析反映船体几何和水面方向反射共同造成的观测差异。", "BodyCN"),
-    PageBreak(),
+        # 第 6 章：船舶与水面案例。
+        SectionBand("06", "水上目标", "联合处理船体 水面 红外温度 时间变化和多角度观测"),
+        Spacer(1, 4 * mm),
+        Image(str(ship_scene_panel), width=174 * mm, height=94 * mm),
+        P("图 6-1  集装箱船与水面组成的水上目标场景", "CaptionCN"),
+        P("水上目标案例由船舶 OBJ 和水面 PRIM 对象组成。水面应绑定 Water 类型及相应光学和热学属性，船体按不同部件绑定材料。场景截图采用 300 m × 300 m 范围，可覆盖船体及周边背景。", "BodyCN"),
+        Spacer(1, 3 * mm),
+        Image(str(ship_results_panel), width=174 * mm, height=94 * mm),
+        P("图 6-2  船舶红外温度 水面温度时序和多角度方向效应", "CaptionCN"),
+        P("顶视热红外影像可辨认船体轮廓和部件温差；时间分析用于比较水面或船体亮温的日变化；多角度分析反映船体几何和水面方向反射共同造成的观测差异。", "BodyCN"),
+        PageBreak(),
 
-    # 第 7 章：运行检查表与常见错误提示（显存分配失败、Vulkan 设备丢失等）。
-    SectionBand("07", "运行检查与结果判读", "先确认几何和输入 再判断辐射 温度和流体结果"),
-    Spacer(1, 5 * mm),
-    data_table([
-        ["检查阶段", "关键问题", "异常处理"],
-        ["场景检查", "对象是否在正确位置 尺度是否合理", "核对坐标约定 OBJ 轴向和位置文件"],
-        ["体元化", "体元数是否超过显存承受范围", "增大体元或缩小计算域"],
-        ["辐射结果", "向阳和背阴区域是否符合太阳方向", "检查直接辐射 遮挡和材质绑定"],
-        ["温度结果", "时间曲线是否连续 土壤层是否逐渐滞后", "检查气象节点 初始温度和时间步"],
-        ["多角度", "天顶角 方位角和前视方向是否一致", "核对相机投影和坐标方向"],
-        ["流体结果", "建筑内部是否为无效值 风速箭头是否合理", "检查固体掩膜 边界和流体体元大小"],
-    ], [31 * mm, 70 * mm, 73 * mm]),
-    P("常见运行问题", "H2CN"),
-    bullet("Array buffer allocation failed 通常发生在一次加载过多过程数据时。磁盘可保留全部体元，界面采用抽样显示。"),
-    bullet("VK_ERROR_DEVICE_LOST 多与 GPU 压力或残留计算进程有关。使用重置结束相关进程，再降低体元规模或周期穿透次数。"),
-    bullet("城市或森林计算缓慢时，先查看体元化规模和计算域，不应只降低射线深度。"),
-    bullet("不同模式或时刻的对比应保持场景、体元、波段和气象条件一致。"),
-    Spacer(1, 5 * mm),
-    P("三个案例覆盖了植被冠层、城市建筑和水上目标。它们使用同一套工程结构和结果分析入口，可以作为新工程的配置参考。", "BodyCN"),
-]
+        # 第 7 章：运行检查表与常见错误提示（显存分配失败、Vulkan 设备丢失等）。
+        SectionBand("07", "运行检查与结果判读", "先确认几何和输入 再判断辐射 温度和流体结果"),
+        Spacer(1, 5 * mm),
+        data_table([
+            ["检查阶段", "关键问题", "异常处理"],
+            ["场景检查", "对象是否在正确位置 尺度是否合理", "核对坐标约定 OBJ 轴向和位置文件"],
+            ["体元化", "体元数是否超过显存承受范围", "增大体元或缩小计算域"],
+            ["辐射结果", "向阳和背阴区域是否符合太阳方向", "检查直接辐射 遮挡和材质绑定"],
+            ["温度结果", "时间曲线是否连续 土壤层是否逐渐滞后", "检查气象节点 初始温度和时间步"],
+            ["多角度", "天顶角 方位角和前视方向是否一致", "核对相机投影和坐标方向"],
+            ["流体结果", "建筑内部是否为无效值 风速箭头是否合理", "检查固体掩膜 边界和流体体元大小"],
+        ], [31 * mm, 70 * mm, 73 * mm]),
+        P("常见运行问题", "H2CN"),
+        bullet("Array buffer allocation failed 通常发生在一次加载过多过程数据时。磁盘可保留全部体元，界面采用抽样显示。"),
+        bullet("VK_ERROR_DEVICE_LOST 多与 GPU 压力或残留计算进程有关。使用重置结束相关进程，再降低体元规模或周期穿透次数。"),
+        bullet("城市或森林计算缓慢时，先查看体元化规模和计算域，不应只降低射线深度。"),
+        bullet("不同模式或时刻的对比应保持场景、体元、波段和气象条件一致。"),
+        Spacer(1, 5 * mm),
+        P("三个案例覆盖了植被冠层、城市建筑和水上目标。它们使用同一套工程结构和结果分析入口，可以作为新工程的配置参考。", "BodyCN"),
+    ]
 
-# 输出 PDF 并打印路径。
-doc.build(story)
-print(OUTPUT)
+    # 输出 PDF 并打印路径。
+    doc.build(story)
+    print(OUTPUT)
+
+
+if __name__ == "__main__":
+    # 命令行参数优先，其次环境变量，最后是上面硬编码的缺省路径（缺省行为不变）。
+    import os
+    import sys
+    override = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("STREAM_STUDIO_MANUAL_SOURCE_DOCX")
+    main(Path(override) if override else SOURCE_DOCX)

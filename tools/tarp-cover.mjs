@@ -62,7 +62,9 @@ export function generateTarpCover(objText, { cell, lift = 0.05, drape = 6, margi
       stamp(A[0] * w + B[0] * s + C[0] * t, A[1] * w + B[1] * s + C[1] * t, A[2] * w + B[2] * s + C[2] * t)
     }
   }
-  // 保存目标上表面高度，仅用于统计被盖章的格数（topCells）。
+  // 保存目标物体自身的上表面高度（尚未下垂/平滑），仅用于统计 topCells：目标上表面高于其底面的格数，
+  // 即目标物体直接占据（被三角形盖章）的格数，不含布料下垂和平滑后扩展出的格。
+  // 名字里的 top 指“目标上表面”（不是顶部格）；该字段只随返回值输出，仓库内没有其他使用方，故保留原名。
   const top = Float64Array.from(height)
 
   // Hanging cloth: chamfer max-propagation with a conical falloff, then a light

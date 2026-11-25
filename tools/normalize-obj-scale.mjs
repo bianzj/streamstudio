@@ -20,8 +20,9 @@ for (const path of paths) {
   const text = await readFile(path, 'utf8')
   const lines = text.split(/\r?\n/)
   const vertices = lines.map((line) => line.match(/^\s*v\s+([-+\d.eE]+)\s+([-+\d.eE]+)\s+([-+\d.eE]+)/)).filter(Boolean)
-  // 用最小 Y 把模型落到地面（底部 Y = 0）。顶点数极大时展开参数可能超出调用栈上限（待核对）。
-  const minimumY = Math.min(...vertices.map((match) => Number(match[2])))
+  // 用最小 Y 把模型落到地面（底部 Y = 0）。用循环求极值：顶点数极大时 Math.min(...数组) 的参数展开会超出调用栈上限。
+  let minimumY = Infinity
+  for (const match of vertices) minimumY = Math.min(minimumY, Number(match[2]))
   const output = lines.map((line) => {
     const match = line.match(/^(\s*v\s+)([-+\d.eE]+)\s+([-+\d.eE]+)\s+([-+\d.eE]+)(.*)$/)
     if (!match) return line
