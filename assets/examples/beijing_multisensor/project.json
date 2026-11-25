@@ -1,0 +1,122 @@
+{
+  "kind": "stream-image-project",
+  "schemaVersion": 2,
+  "name": "北京市 · 光学与热红外多传感器观测模拟（母工程）",
+  "description": "多传感器案例的母工程：与 landsat_beijing_eb 同一场景、同一 ERA5 能量平衡配置（过境 2019-08-15 02:55 UTC，北京 10:55），求组分温度 components.tif，并附带 Landsat 波段成像。各传感器与观测角工程在 variants/，复用本工程的组分温度。一键运行：node run_all.mjs。",
+  "scene": {
+    "name": "stream_beijing_300m_multisensor",
+    "locationSource": "georef",
+    "overpass": "2019-08-15T02:55:00Z",
+    "displayTimezone": 8,
+    "threads": 0,
+    "region": {
+      "enabled": false,
+      "startRow": 0,
+      "endRow": 1,
+      "startColumn": 0,
+      "endColumn": 1
+    },
+    "surface": {
+      "type": {
+        "file": "inputs/type.tif"
+      },
+      "lai": {
+        "file": "inputs/lai.tif"
+      },
+      "dem": {
+        "file": "inputs/dem.tif"
+      }
+    },
+    "view": {
+      "vza": {
+        "value": 0
+      },
+      "vaa": {
+        "value": 0
+      }
+    },
+    "optical": {
+      "enabled": true,
+      "preset": "landsat",
+      "bands": [
+        {
+          "name": "B1",
+          "center": 443,
+          "fwhm": 16
+        },
+        {
+          "name": "B2",
+          "center": 482,
+          "fwhm": 60
+        },
+        {
+          "name": "B3",
+          "center": 561,
+          "fwhm": 57
+        },
+        {
+          "name": "B4",
+          "center": 655,
+          "fwhm": 37
+        },
+        {
+          "name": "B5",
+          "center": 865,
+          "fwhm": 28
+        },
+        {
+          "name": "B6",
+          "center": 1609,
+          "fwhm": 85
+        },
+        {
+          "name": "B7",
+          "center": 2201,
+          "fwhm": 187
+        }
+      ]
+    },
+    "thermal": {
+      "enabled": true,
+      "preset": "landsat",
+      "bands": [
+        {
+          "name": "B10",
+          "center": 10.9,
+          "fwhm": 0.6
+        },
+        {
+          "name": "B11",
+          "center": 12,
+          "fwhm": 1
+        }
+      ]
+    },
+    "temperature": {
+      "mode": "eb",
+      "era5": {
+        "pack": "era5/era5-pack.json"
+      },
+      "soilMoisture": {
+        "source": "era5"
+      },
+      "elevationCorrection": true,
+      "components": {
+        "source": "fields"
+      },
+      "energy": {
+        "scheme": "tirt",
+        "soilHeatMethod": "surface",
+        "temperatureMethod": "robust",
+        "diffuseFraction": 0.2,
+        "enforceSolarLimit": true,
+        "spectralBinNm": 50,
+        "soilResistance": {
+          "method": "constant",
+          "value": 200
+        }
+      }
+    },
+    "outputRoot": "output"
+  }
+}
