@@ -504,6 +504,10 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     const float solarZenith = modelio->angles.empty() ? 180.0f : modelio->angles.front().sza;
     const bool noShortwaveNode = !(modelio->meteo.Rin > kShortwaveFloor) && solarZenith >= 90.0f;
 
+    // 散射阶数上限：XML/JSON 读取处（fileio.cpp、fileio_json.cpp）已限定 shortwaveScatteringOrders 为 1~3，
+    // 这里再做一次防御性检查，保证下面按阶累加的 orderMilliseconds（3 项）不会越界。
+    if (modelio->shortwaveScatteringOrders < 1 || modelio->shortwaveScatteringOrders > 3)
+        throw std::runtime_error("shortwaveScatteringOrders must be 1, 2 or 3");
     std::array<double, 3> orderMilliseconds{};
     std::array<ScatteringAggregate, 4> scatteringStats{};
     modelio->solarStats = SolarVisibilityStats{};

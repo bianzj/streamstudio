@@ -44,6 +44,52 @@
 
 using namespace std;
 
+// 模块：必填 XML 节点读取辅助（匿名命名空间，仅本文件使用）。
+// 作用：取必填子元素的文本并转为数值；父节点/子节点缺失、无文本或无法转换为数时抛出
+//       std::runtime_error，错误信息带上下文与节点名（此前直接 FirstChildElement()->GetText() 会解引用空指针，
+//       stof/stoi 的异常也不带节点名）。正常工程的解析结果与原写法完全一致。
+namespace {
+// 取必填子元素的文本；缺失或为空时抛出。
+const char* requiredChildText(TiXmlNode* parent, const char* name, const char* context)
+{
+    TiXmlElement* element = parent ? parent->FirstChildElement(name) : nullptr;
+    if (element == nullptr)
+        throw std::runtime_error(std::string(context) + ": required XML node <" + name + "> is missing");
+    const char* text = element->GetText();
+    if (text == nullptr)
+        throw std::runtime_error(std::string(context) + ": required XML node <" + name + "> is empty");
+    return text;
+}
+
+// 必填子元素转 float（std::stof 语义）；转换失败时抛出带节点名的错误。
+float requiredChildFloat(TiXmlNode* parent, const char* name, const char* context)
+{
+    const char* text = requiredChildText(parent, name, context);
+    try { return std::stof(text); }
+    catch (const std::exception&) {
+        throw std::runtime_error(std::string(context) + ": XML node <" + name + "> is not a valid number: '" + text + "'");
+    }
+}
+
+// 必填子元素转 int（std::stoi 语义）；转换失败时抛出带节点名的错误。
+int requiredChildInt(TiXmlNode* parent, const char* name, const char* context)
+{
+    const char* text = requiredChildText(parent, name, context);
+    try { return std::stoi(text); }
+    catch (const std::exception&) {
+        throw std::runtime_error(std::string(context) + ": XML node <" + name + "> is not a valid integer: '" + text + "'");
+    }
+}
+
+// 必填子元素本身（需要继续往下取子节点时用）；缺失时抛出。
+TiXmlElement* requiredChildElement(TiXmlNode* parent, const char* name, const char* context)
+{
+    TiXmlElement* element = parent ? parent->FirstChildElement(name) : nullptr;
+    if (element == nullptr)
+        throw std::runtime_error(std::string(context) + ": required XML node <" + name + "> is missing");
+    return element;
+}
+} // namespace
 // 模块：工程 XML 总入口 readXml。
 // 输入：Path 为工程 XML 路径（空串表示使用内置示例工程）；mode 为运行模式。
 // 输出：按模式填充 m_pRaytracingXml / m_pVoxelebXml / m_pVoxelrtXml，并设置 m_inputDirectory。
@@ -283,15 +329,15 @@ MeteoXml FileIO::readMeteoXML(TiXmlNode *node, Mode mode) {
 }
 
 // 模块：读取 <Light> 下首个条目的 Esky/Esun 文件名（旧版大气条件入口）。
-// 说明：readXml 中对它的调用已被注释，当前基本不使用；该函数不检查空指针（疑似遗留代码）。
+// 说明：readXml 中对它的调用已被注释，当前基本不使用；Light 节点与必填的两个文件名缺失时抛出带节点名的错误。
 AtomCondXml FileIO::readAtomCondXML(TiXmlNode *node, Mode mode) {
 
     AtomCondXml atomCondXml;
-    TiXmlNode* lightNode = node->FirstChildElement("Light");
+    TiXmlElement* lightNode = requiredChildElement(node, "Light", "<Geometry>");
     for (TiXmlElement* pEle = lightNode->FirstChildElement(); pEle != NULL; pEle = pEle->NextSiblingElement())
     {
-        atomCondXml.rlifile = pEle->FirstChildElement("eskyFileName")->GetText();
-        atomCondXml.rinfile = pEle->FirstChildElement("esunFileName")->GetText();
+        atomCondXml.rlifile = requiredChildText(pEle, "eskyFileName", "<Light>");
+        atomCondXml.rinfile = requiredChildText(pEle, "esunFileName", "<Light>");
         break;
 
     }
@@ -343,21 +389,21 @@ std::vector<PropertyXml> FileIO::readPropertyXML(TiXmlNode *node, Mode mode) {
                 tparam.resize(5, 0.0f);
             }
             // 步骤 2（leafBio）：按 LeafBio 结构体的字段顺序依次构造：Vcmax、m、BallBerry、Type、kV、
-            // Rdparam、Tparam[5]、Tyear、beta、kNPQs、qLs、stressfactor、Tcor。必填项缺失时会解引用空指针。
+            // Rdparam、Tparam[5]、Tyear、beta、kNPQs、qLs、stressfactor、Tcor。必填项缺失或不是数时抛出带节点名的错误。
             propertyXml.leafbio = LeafBio{
-                    stof(leafNode->FirstChildElement("Vcmax")->GetText()),
-                    stof(leafNode->FirstChildElement("m")->GetText()),
-                    stof(leafNode->FirstChildElement("BallBerry")->GetText()),
-                    stof(leafNode->FirstChildElement("Type")->GetText()),
-                    stof(leafNode->FirstChildElement("kV")->GetText()),
-                    stof(leafNode->FirstChildElement("Rdparam")->GetText()),
+                    requiredChildFloat(leafNode, "Vcmax", "<leafBio>"),
+                    requiredChildFloat(leafNode, "m", "<leafBio>"),
+                    requiredChildFloat(leafNode, "BallBerry", "<leafBio>"),
+                    requiredChildFloat(leafNode, "Type", "<leafBio>"),
+                    requiredChildFloat(leafNode, "kV", "<leafBio>"),
+                    requiredChildFloat(leafNode, "Rdparam", "<leafBio>"),
                     {tparam[0], tparam[1], tparam[2], tparam[3], tparam[4]},
-                    stof(leafNode->FirstChildElement("Tyear")->GetText()),
-                    stof(leafNode->FirstChildElement("beta")->GetText()),
-                    stof(leafNode->FirstChildElement("kNPQs")->GetText()),
-                    stof(leafNode->FirstChildElement("qLs")->GetText()),
-                    stof(leafNode->FirstChildElement("stressfactor")->GetText()),
-                    (stoi(leafNode->FirstChildElement("Tcor")->GetText()))
+                    requiredChildFloat(leafNode, "Tyear", "<leafBio>"),
+                    requiredChildFloat(leafNode, "beta", "<leafBio>"),
+                    requiredChildFloat(leafNode, "kNPQs", "<leafBio>"),
+                    requiredChildFloat(leafNode, "qLs", "<leafBio>"),
+                    requiredChildFloat(leafNode, "stressfactor", "<leafBio>"),
+                    (requiredChildInt(leafNode, "Tcor", "<leafBio>"))
             };
             propxmls.push_back(propertyXml);
 //            continue;
@@ -381,14 +427,14 @@ std::vector<PropertyXml> FileIO::readPropertyXML(TiXmlNode *node, Mode mode) {
             // 步骤 1（soilSet）：必填项依次为 method（导热方法）、rss（蒸发阻抗）、cs（体积热容）、
             // rhos（密度）、lambdas（导热率）、Tsoil（平均温度）、SMC（体积含水量）、Satwater（饱和含水量）。
             propertyXml2.soilset = SoilSet{
-                    stoi(soilNode->FirstChildElement("method")->GetText()),
-                    stof(soilNode->FirstChildElement("rss")->GetText()),
-                    stof(soilNode->FirstChildElement("cs")->GetText()),
-                    stof(soilNode->FirstChildElement("rhos")->GetText()),
-                    stof(soilNode->FirstChildElement("lambdas")->GetText()),
-                    stof(soilNode->FirstChildElement("Tsoil")->GetText()),
-                    stof(soilNode->FirstChildElement("SMC")->GetText()),
-                    stof(soilNode->FirstChildElement("Satwater")->GetText())
+                    requiredChildInt(soilNode, "method", "<soilSet>"),
+                    requiredChildFloat(soilNode, "rss", "<soilSet>"),
+                    requiredChildFloat(soilNode, "cs", "<soilSet>"),
+                    requiredChildFloat(soilNode, "rhos", "<soilSet>"),
+                    requiredChildFloat(soilNode, "lambdas", "<soilSet>"),
+                    requiredChildFloat(soilNode, "Tsoil", "<soilSet>"),
+                    requiredChildFloat(soilNode, "SMC", "<soilSet>"),
+                    requiredChildFloat(soilNode, "Satwater", "<soilSet>")
 //                    0.45
             };
             // 步骤 2（soilSet）：可选项。brdfModel 取 Hapke/hapke/1 时为 1（Hapke 双向反射），否则 0（Lambert）；
@@ -432,10 +478,10 @@ std::vector<PropertyXml> FileIO::readPropertyXML(TiXmlNode *node, Mode mode) {
             // 必填项：rss（表面阻抗，通常 0 s m-1）、heatCapacity（体积热容 J m-3 K-1）、
             // mixingDepth（有效混合层深度 m）、evaporationCoefficient（潜热通量乘子 0..1）。
             waterProperty.waterset = WaterSet{
-                stof(waterNode->FirstChildElement("rss")->GetText()),
-                stof(waterNode->FirstChildElement("heatCapacity")->GetText()),
-                stof(waterNode->FirstChildElement("mixingDepth")->GetText()),
-                stof(waterNode->FirstChildElement("evaporationCoefficient")->GetText())
+                requiredChildFloat(waterNode, "rss", "<waterSet>"),
+                requiredChildFloat(waterNode, "heatCapacity", "<waterSet>"),
+                requiredChildFloat(waterNode, "mixingDepth", "<waterSet>"),
+                requiredChildFloat(waterNode, "evaporationCoefficient", "<waterSet>")
             };
             // 可选项：brdfModel 为 CoxMunk/coxMunk/cox-munk/1 时用 Fresnel-Cox-Munk 反射（1），否则 Lambert（0）；
             // refractiveIndex 折射率、slopeVariance 波面斜率方差、diffuseFraction 漫反射份额。
@@ -1235,19 +1281,28 @@ LightXml FileIO::readLightXML(TiXmlNode *geometryNode, Mode mode){
 
 //        LightStruct temp;
 
-        // 步骤 1：逐个 <Light> 子条目解析（多个条目时后者覆盖前者）；name 属性缺失会得到空指针（未检查）。
-        lightxml.name = pEle->Attribute("name");
+        // 步骤 1：逐个 <Light> 子条目解析（多个条目时后者覆盖前者）；name 属性与 <lightAngle> 为必填，
+        // 缺失时抛出带节点名的错误（此前 name 缺失会用空指针构造字符串、<lightAngle> 缺失会解引用空指针）。
+        const char* lightName = pEle->Attribute("name");
+        if (lightName == nullptr)
+            throw std::runtime_error("<Light>: required attribute 'name' is missing");
+        lightxml.name = lightName;
 
 //        temp.isSun = stoi(pEle->FirstChildElement("isSun")->GetText());
 //        glm::vec2 sunAnglesk;
         // 步骤 2：太阳角度 <lightAngle> 下每个子元素为 "天顶角,方位角"（度）；
         // 最后一个子元素生效，方位角同时记入成员 SAA，供 BRF 观测角使用。
-        TiXmlElement* lightAngleEle = pEle->FirstChildElement("lightAngle");
+        TiXmlElement* lightAngleEle = requiredChildElement(pEle, "lightAngle", "<Light>");
         for (TiXmlElement* lightAngleIter = lightAngleEle->FirstChildElement(); lightAngleIter != NULL; lightAngleIter = lightAngleIter->NextSiblingElement())
         {
 
-            nvmath::vec2f lightAngleTemp = { myFunction::mySplitFloat(lightAngleIter->GetText(), ",")[0],
-                                             myFunction::mySplitFloat(lightAngleIter->GetText(), ",")[1] };
+            const char* angleText = lightAngleIter->GetText();
+            if (angleText == nullptr)
+                throw std::runtime_error("<Light>: <lightAngle> entry is empty (expected \"zenith,azimuth\")");
+            const std::vector<float> angleValues = myFunction::mySplitFloat(angleText, ",");
+            if (angleValues.size() < 2)
+                throw std::runtime_error(std::string("<Light>: <lightAngle> entry needs \"zenith,azimuth\", got '") + angleText + "'");
+            nvmath::vec2f lightAngleTemp = { angleValues[0], angleValues[1] };
             lightxml.solarAngle = {lightAngleTemp[0], lightAngleTemp[1]};
             SAA = lightAngleTemp[1];
 
@@ -1255,7 +1310,7 @@ LightXml FileIO::readLightXML(TiXmlNode *geometryNode, Mode mode){
 
         // 步骤 3：天空等效温度 skyTemperature（必填，用于热红外天空辐射，单位待核对，疑为 K）；
         // shortwaveIrradiance 为可选的实测短波辐照度（W m-2），限幅到 [0, 2000]，缺省 0 表示不使用。
-        lightxml.skyTemperature = stof(pEle->FirstChildElement("skyTemperature")->GetText());
+        lightxml.skyTemperature = requiredChildFloat(pEle, "skyTemperature", "<Light>");
         lightxml.shortwaveIrradiance = 0.0f;
         if (sonExists("shortwaveIrradiance", pEle->ToElement())) {
             const char* text = pEle->FirstChildElement("shortwaveIrradiance")->GetText();
@@ -1275,11 +1330,11 @@ LightXml FileIO::readLightXML(TiXmlNode *geometryNode, Mode mode){
         // 未给出该比例时，VoxelEB 仍要读取 Esun/Esky 文件名，RayTracing 无需额外处理。
         if (sonExists("directScatteringRatio", pEle->ToElement())){
             if (m_mode == Mode::eVoxelEB) {
-                m_pVoxelebXml->atomcondxml.rinfile = pEle->FirstChildElement("esunFileName")->GetText();
-                m_pVoxelebXml->atomcondxml.rlifile = pEle->FirstChildElement("eskyFileName")->GetText();
+                m_pVoxelebXml->atomcondxml.rinfile = requiredChildText(pEle, "esunFileName", "<Light>");
+                m_pVoxelebXml->atomcondxml.rlifile = requiredChildText(pEle, "eskyFileName", "<Light>");
             }
             float k;
-            k = stof(pEle->FirstChildElement(("directScatteringRatio"))->GetText());
+            k = requiredChildFloat(pEle, "directScatteringRatio", "<Light>");
             lightxml.direct = k;
             lightxml.diffuse = 1 - lightxml.direct;
             lightxml.solarTemperature = 6000;
@@ -1310,11 +1365,14 @@ LightXml FileIO::readLightXML(TiXmlNode *geometryNode, Mode mode){
 // 可选项均带限幅：sampleCount [1,1024]、periodicNeighborCount [0,20]、
 // spectralAccelerationWidth [1,1000]、radiationMaxSteps [1,4096]、vegetationTemperatureMethod [0,1]；
 // shortwaveScatteringOrders 必须为 1/2/3，否则抛出异常。
+// 必填项（<Control> 节点本身、rayTracingDepth、GPU、outDir）缺失时抛出带节点名的错误。
 SettingXml FileIO::readSettingXML(TiXmlNode *controlNode, Mode mode){
 
+    if (controlNode == nullptr || controlNode->ToElement() == nullptr)
+        throw std::runtime_error("required XML node <Control> is missing");
     SettingXml settingxml;
-    settingxml.maxDepth = stoi(controlNode->FirstChildElement("rayTracingDepth")->GetText());
-    settingxml.theGPU = stoi(controlNode->FirstChildElement("GPU")->GetText());
+    settingxml.maxDepth = requiredChildInt(controlNode, "rayTracingDepth", "<Control>");
+    settingxml.theGPU = requiredChildInt(controlNode, "GPU", "<Control>");
     if (sonExists("computeBackend", controlNode->ToElement())) {
         const char* backend = controlNode->FirstChildElement("computeBackend")->GetText();
         if (backend) settingxml.computeBackend = backend;
@@ -1323,19 +1381,19 @@ SettingXml FileIO::readSettingXML(TiXmlNode *controlNode, Mode mode){
     settingxml.n_sample = 32;
     if (sonExists("sampleCount", controlNode->ToElement())) {
         settingxml.n_sample = std::clamp(
-            stoi(controlNode->FirstChildElement("sampleCount")->GetText()), 1, 1024);
+            requiredChildInt(controlNode, "sampleCount", "<Control>"), 1, 1024);
     }
     if (sonExists("periodicNeighborCount", controlNode->ToElement())) {
         settingxml.periodicNeighborCount = std::clamp(
-            stoi(controlNode->FirstChildElement("periodicNeighborCount")->GetText()), 0, 20);
+            requiredChildInt(controlNode, "periodicNeighborCount", "<Control>"), 0, 20);
     }
     if (sonExists("skyboxEnabled", controlNode->ToElement())) {
         settingxml.skyboxEnabled =
-            stoi(controlNode->FirstChildElement("skyboxEnabled")->GetText()) != 0;
+            requiredChildInt(controlNode, "skyboxEnabled", "<Control>") != 0;
     }
     if (sonExists("spectralAccelerationWidth", controlNode->ToElement())) {
         settingxml.spectralAccelerationWidth = std::clamp(
-            stoi(controlNode->FirstChildElement("spectralAccelerationWidth")->GetText()), 1, 1000);
+            requiredChildInt(controlNode, "spectralAccelerationWidth", "<Control>"), 1, 1000);
     }
     if (sonExists("stabilityCorrection", controlNode->ToElement())) {
         const char* text = controlNode->FirstChildElement("stabilityCorrection")->GetText();
@@ -1343,78 +1401,97 @@ SettingXml FileIO::readSettingXML(TiXmlNode *controlNode, Mode mode){
     }
     if (sonExists("vegetationTemperatureMethod", controlNode->ToElement())) {
         settingxml.vegetationTemperatureMethod = std::clamp(
-            stoi(controlNode->FirstChildElement("vegetationTemperatureMethod")->GetText()), 0, 1);
+            requiredChildInt(controlNode, "vegetationTemperatureMethod", "<Control>"), 0, 1);
     }
     if (sonExists("shortwaveScatteringOrders", controlNode->ToElement())) {
         settingxml.shortwaveScatteringOrders =
-            stoi(controlNode->FirstChildElement("shortwaveScatteringOrders")->GetText());
+            requiredChildInt(controlNode, "shortwaveScatteringOrders", "<Control>");
         if (settingxml.shortwaveScatteringOrders < 1 || settingxml.shortwaveScatteringOrders > 3)
             throw std::runtime_error("shortwaveScatteringOrders must be 1, 2 or 3");
     }
     if (sonExists("radiationMaxSteps", controlNode->ToElement())) {
         settingxml.radiationMaxSteps = std::clamp(
-            stoi(controlNode->FirstChildElement("radiationMaxSteps")->GetText()), 1, 4096);
+            requiredChildInt(controlNode, "radiationMaxSteps", "<Control>"), 1, 4096);
     }
     if (sonExists("isUAVtrave", controlNode->ToElement())){
-        settingxml.isUAVtrave = stoi(controlNode->FirstChildElement("isUAVtrave")->GetText());
+        settingxml.isUAVtrave = requiredChildInt(controlNode, "isUAVtrave", "<Control>");
     }
 
 
 
-    // 步骤：取得可执行文件所在目录，作为 definedDir（Windows 专用 API）。
-    char szFilePath[MAX_PATH + 1] = { 0 };
-    GetModuleFileNameA(NULL, szFilePath, MAX_PATH);
-    /*
-    strrchr:函数功能：查找一个字符c在另一个字符串str中末次出现的位置（也就是从str的右侧开始查找字符c首次出现的位置），
-    并返回这个位置的地址。如果未能找到指定字符，那么函数将返回NULL。
-    使用这个地址返回从最后一个字符c到str末尾的字符串。
-    */
-    // DEFERRED[中] 安全: GetModuleFileNameA 在路径超过 MAX_PATH 时截断、按 ANSI 代码页返回（中文安装目录变成 '?'），strrchr 找不到 '\\' 时返回 NULL 被解引用；且该段仅 Windows 可编译；下方 outDir 的 GetText() 未判空，缺 <outDir> 即崩溃；建议：使用 GetModuleFileNameW + std::filesystem::path::parent_path，并对 outDir 判空。
-    (strrchr(szFilePath, '\\'))[0] = 0; // 删除文件名，只获得路径字串//
-    std::string exe_path = szFilePath;
-    // 按模式把 definedDir / projectDir 写入对应的 Xml 对象（输出目录 outDir 必填）。
+    // 步骤：取得可执行文件所在目录，作为 definedDir。
+    // Windows：GetModuleFileNameA 取可执行文件完整路径，再截掉最后一个 '\' 之后的文件名；
+    //   路径中找不到 '\'（例如调用失败得到空串）时 definedDir 取空串，不再解引用 strrchr 的空返回值。
+    //   （GetModuleFileNameA 按 ANSI 代码页返回，路径超过 MAX_PATH 会被截断，保持原行为。）
+    // 非 Windows：用 /proc/self/exe 的符号链接目标所在目录作为回退，失败时同样取空串。
+    std::string exe_path;
+#ifdef _WIN32
+    {
+        char szFilePath[MAX_PATH + 1] = { 0 };
+        GetModuleFileNameA(NULL, szFilePath, MAX_PATH);
+        /*
+        strrchr:函数功能：查找一个字符c在另一个字符串str中末次出现的位置（也就是从str的右侧开始查找字符c首次出现的位置），
+        并返回这个位置的地址。如果未能找到指定字符，那么函数将返回NULL。
+        使用这个地址返回从最后一个字符c到str末尾的字符串。
+        */
+        char* lastSeparator = strrchr(szFilePath, '\\');
+        if (lastSeparator != nullptr) {
+            lastSeparator[0] = 0; // 删除文件名，只获得路径字串
+            exe_path = szFilePath;
+        }
+    }
+#else
+    {
+        std::error_code exeError;
+        const std::filesystem::path exeFile = std::filesystem::read_symlink("/proc/self/exe", exeError);
+        if (!exeError) exe_path = exeFile.parent_path().string();
+    }
+#endif
+    // 按模式把 definedDir / projectDir 写入对应的 Xml 对象（输出目录 outDir 必填，缺失时抛出）。
     if (mode == Mode::eRaytracing)
     {
         m_pRaytracingXml->definedDir = exe_path;
         //controlNode->FirstChildElement("defineDir")->GetText();
-        m_pRaytracingXml->projectDir = controlNode->FirstChildElement("outDir")->GetText();
+        m_pRaytracingXml->projectDir = requiredChildText(controlNode, "outDir", "<Control>");
     }
     if (mode == Mode::eVoxelRT)
     {
         m_pVoxelrtXml->definedDir = exe_path;//controlNode->FirstChildElement("defineDir")->GetText();
-        m_pVoxelrtXml->projectDir = controlNode->FirstChildElement("outDir")->GetText();
+        m_pVoxelrtXml->projectDir = requiredChildText(controlNode, "outDir", "<Control>");
     }
     if (mode == Mode::eVoxelEB)
     {
         m_pVoxelebXml->definedDir = exe_path;//controlNode->FirstChildElement("defineDir")->GetText();
-        m_pVoxelebXml->projectDir = controlNode->FirstChildElement("outDir")->GetText();
+        m_pVoxelebXml->projectDir = requiredChildText(controlNode, "outDir", "<Control>");
     }
 
     return settingxml;
 }
 
 // 模块：解析 <Scene>（场景大小、体元尺寸、背景、DEM、地形环境、气象经纬度与场景对象）。
-// 输入：<Scene> 节点（不判空）；必填 sceneSizeX、sceneSizeY、Height（m）。
+// 输入：<Scene> 节点（缺失时抛出带节点名的错误）；必填 sceneSizeX、sceneSizeY、Height（m）。
 // 输出：SceneXml，包含 background 与 VoxelEB/VoxelRT 的对象列表（objEntities 等）。
 // 约定：sceneOrigin 固定为 (0,0,0)；voxelSize 缺省 1 m，水平与垂直体元尺寸取同一值。
 SceneXml FileIO::readSceneXML(TiXmlNode *sceneNode, Mode mode) {
 
+    if (sceneNode == nullptr || sceneNode->ToElement() == nullptr)
+        throw std::runtime_error("required XML node <Scene> is missing");
     SceneXml sceneXml;
     sceneXml.background.sceneSize = {
-            stof(sceneNode->FirstChildElement("sceneSizeX")->GetText()),
-            stof(sceneNode->FirstChildElement("sceneSizeY")->GetText()),
-            stof(sceneNode->FirstChildElement("Height")->GetText())
+            requiredChildFloat(sceneNode, "sceneSizeX", "<Scene>"),
+            requiredChildFloat(sceneNode, "sceneSizeY", "<Scene>"),
+            requiredChildFloat(sceneNode, "Height", "<Scene>")
     };
-//    sceneSizeDatasets.sceneSizeX = stof(sceneNode->FirstChildElement("sceneSizeX")->GetText());
-//    sceneSizeDatasets.sceneSizeY = stof(sceneNode->FirstChildElement("sceneSizeY")->GetText());
+//    sceneSizeDatasets.sceneSizeX = requiredChildFloat(sceneNode, "sceneSizeX", "<Scene>");
+//    sceneSizeDatasets.sceneSizeY = requiredChildFloat(sceneNode, "sceneSizeY", "<Scene>");
 // ------------------------------------------------------
     sceneXml.background.sceneOrigin = {0, 0, 0};
 // ------------------------------------------------------
     // DEFERRED[中] 数值: voxelSize 未校验 >0 且有限，0/负值会在体元化时 sceneSize/stepsize 除零或得到负格数（UB 的 float→int 转换）；sceneSizeX/Y/Height 同样未校验 >0；sceneNode 本身也未判空；建议：解析后校验所有尺寸与步长为正有限值，否则抛异常。
     if (sonExists("voxelSize", sceneNode->ToElement()))
     {
-        sceneXml.background.stepsize_surface = stof(sceneNode->FirstChildElement("voxelSize")->GetText());
-        sceneXml.background.stepsize_height = stof(sceneNode->FirstChildElement("voxelSize")->GetText());
+        sceneXml.background.stepsize_surface = requiredChildFloat(sceneNode, "voxelSize", "<Scene>");
+        sceneXml.background.stepsize_height = requiredChildFloat(sceneNode, "voxelSize", "<Scene>");
     }
     else
     {
@@ -1425,7 +1502,7 @@ SceneXml FileIO::readSceneXML(TiXmlNode *sceneNode, Mode mode) {
     // voxelFillThreshold：OBJ 体元化时，体元被几何占据的最小比例，限幅到 [0,1]。
     if (sonExists("voxelFillThreshold", sceneNode->ToElement())) {
         sceneXml.background.voxelFillThreshold = std::clamp(
-            stof(sceneNode->FirstChildElement("voxelFillThreshold")->GetText()),
+            requiredChildFloat(sceneNode, "voxelFillThreshold", "<Scene>"),
             0.0f, 1.0f);
     }
 

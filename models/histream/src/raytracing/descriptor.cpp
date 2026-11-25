@@ -14,6 +14,7 @@
 //
 
 #include "descriptor.h"
+#include <stdexcept>
 
 
 // 作用：创建描述符集。步骤：1 声明绑定；2 创建布局、池与描述符集；3 为各绑定构造写入信息；
@@ -53,6 +54,14 @@ bool Descriptor::createDescriptor(std::shared_ptr<RaytracingIO> &raytracingio){
     m_descSet = nvvk::allocateDescriptorSet(m_device, m_descPool, m_descSetLayout);
 
     // 步骤 3：为每个绑定构造写入（缓冲取 VK_WHOLE_SIZE；TLAS 从加速结构对象获取）。
+    // 光谱、波长集、实例链接缓冲在 createBuffer 中是有条件创建的（对应数组为空时不创建），
+    // 而着色器总会读取这些绑定，因此缺失时直接抛出明确错误，避免解引用空指针。
+    if (!meshio->m_pBufferSpectral)
+        throw std::runtime_error("RayTracing descriptor: the spectral material buffer was not created (no spectral materials)");
+    if (!raytracingio->m_pBufferWave)
+        throw std::runtime_error("RayTracing descriptor: the wavelength buffer was not created (no wavelengths)");
+    if (!instanceio->m_pBufferInstanceLink)
+        throw std::runtime_error("RayTracing descriptor: the instance link buffer was not created (no instances)");
     /// <summary>
     /// get needed buffers and update the descriptor sets.
     /// temBuffer needed corrected.

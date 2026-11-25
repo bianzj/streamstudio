@@ -13,7 +13,8 @@
 //         结果影像经 saveImage* 写回 GTiff。
 // 约定：栅格数据按行优先存放，下标 = 行 * width + 列；读取一律转换为 float。
 // 注意：多处直接用 std::cout 输出错误并以返回 0 表示失败，调用方需检查返回值；
-//       saveImage/saveImage1 的 proj、trans 参数当前未被使用（待核对是否有意）。
+//       saveImage/saveImage1 的 proj、trans 参数当前未被使用（输出不含地理参考；这两个函数目前无调用点）；
+//       写入的 RasterIO 失败时返回 0。
 // ==========================================================================
 
 #include "utils.h"
@@ -291,9 +292,12 @@ int Utils::readImageinout1(std::string infilename,std::vector<float> &collected,
 
 // 作用：用 GDAL 读取影像全部波段为 float，每个波段一个向量（行优先，大小 width*height）。
 // 返回：成功 1，失败 0（打开失败、尺寸无效、像素数溢出、读取失败）。
-// 注意：结果以 push_back 追加到 collected，调用前需保证其为空，否则会混入旧数据。
+// 说明：与 readImageinout1 一致，开始时先清空 collected（此前是直接 push_back 追加，会混入旧数据），
+//       读取失败时 collected 可能保留已读出的部分波段。
 int Utils::readImageinout(std::string infilename,std::vector<std::vector<float>> &collected,
                           int &width, int &height, int &nband) {
+
+    collected.clear();
 
 
     GDALAllRegister();
@@ -454,9 +458,9 @@ std::vector<std::vector<float>> Utils::readImage(std::string infilename) {
 
 // 作用：把单个 float 数组写成单波段 Float32 GTiff。
 // 输入：c 为 width*height 的行优先数据（长度不足则失败）；band、proj、trans 当前未使用，
-//       因此输出文件不含地理参考信息（待核对是否有意）。
-// 返回：成功 1；GTiff 驱动缺失、尺寸不符或创建失败返回 0。
-// 注意：RasterIO 的返回值未检查，写入失败时仍返回 1。
+//       因此输出文件不含地理参考信息（本函数目前没有调用点；输出为无地理参考的普通 GTiff，
+//       如需地理参考应在此用 SetGeoTransform/SetProjection 写入 trans、proj）。
+// 返回：成功 1；GTiff 驱动缺失、尺寸不符、创建失败或 RasterIO 写入失败返回 0。
 int Utils::saveImage1(std::string outfilepath, std::vector<float> &c,
                      int width, int height,int band, std::string proj, double trans[6]) {
 
@@ -485,14 +489,19 @@ int Utils::saveImage1(std::string outfilepath, std::vector<float> &c,
     GDALRasterBand *oBand = ods->GetRasterBand(1);
     //float *bandData = c.data();
     CPLErr result =oBand->RasterIO(GF_Write,0, 0,width,height,c.data(),width,height,GDT_Float32,0,0);
+    if (result != CE_None) {
+        std::cout << "saveImage1: RasterIO write failed: " << outfilepath << std::endl;
+        GDALClose(ods);
+        return 0;
+    }
 
     GDALClose(ods);
     return 1;
 }
 
 // 作用：把 band 个 float 数组写成多波段 Float32 GTiff（c[k] 对应第 k+1 个波段）。
-// 返回：成功 1；驱动缺失、波段数或每个波段大小与 width*height 不符、创建失败返回 0。
-// 说明：proj、trans 当前未使用，输出不含地理参考（待核对是否有意）；RasterIO 返回值未检查。
+// 返回：成功 1；驱动缺失、波段数或每个波段大小与 width*height 不符、创建失败、RasterIO 写入失败返回 0。
+// 说明：proj、trans 当前未使用，输出不含地理参考（本函数目前没有调用点，处理方式同 saveImage1）。
 int Utils::saveImage(std::string outfilepath, std::vector<std::vector<float>> &c,
                       int width, int height,int band, std::string proj, double trans[6]) {
 
@@ -527,7 +536,11 @@ int Utils::saveImage(std::string outfilepath, std::vector<std::vector<float>> &c
         GDALRasterBand *oBand = ods->GetRasterBand(kband+1);
         //float *bandData = c[kband].data();
         CPLErr result = oBand->RasterIO(GF_Write, 0, 0, width, height, c[kband].data(), width, height, GDT_Float32, 0, 0);
-
+        if (result != CE_None) {
+            std::cout << "saveImage: RasterIO write failed (band " << (kband + 1) << "): " << outfilepath << std::endl;
+            GDALClose(ods);
+            return 0;
+        }
     }
     GDALClose(ods);
     return 1;
@@ -675,26 +688,33 @@ int Utils::getMapIndex(std::map<std::string, int> maps, std::string name)
 	return 0;
 }
 
-// 内部辅助（全局函数，非 Utils 成员）：判断字符是否为十进制数字。
-bool isnum(char n)
+// 内部辅助（本文件内部链接，不对外导出）：判断字符是否为十进制数字。
+static bool isnum(char n)
 {
 	return (n >= '0' && n <= '9');
 }
 // 作用：提取字符串中所有连续数字串并依次转为 int（如 "a12b3" → {12, 3}）。
-// 说明：不处理负号与小数点；过长的数字串会发生 int 溢出（未做保护）。
+// 说明：不处理负号与小数点；数字串过长超过 int 范围时按 INT_MAX 饱和（不再发生溢出）。
 std::vector <int> Utils::findnum(std::string& ch)
 {
 	std::vector <int> numVec;
 	int k = ch.size();
 	int result;
 	int n = 0;
+	// 追加一位十进制数字，超出 int 上限时饱和为 INT_MAX。
+	const auto appendDigit = [](int value, char digit) {
+		const int d = digit - '0';
+		if (value > (std::numeric_limits<int>::max() - d) / 10)
+			return std::numeric_limits<int>::max();
+		return value * 10 + d;
+	};
 	while (n < k) {
 		result = 0;
 		if (isnum(ch[n]))
 		{
 			result = ch[n] - '0';
 			while (n < k && isnum(ch[++n]))
-				result = (ch[n] - '0') + 10 * result;
+				result = appendDigit(result, ch[n]);
 			numVec.push_back(result);
 		}
 		++n;

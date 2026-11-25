@@ -86,9 +86,8 @@ public:
     // .direct, diffuse in .diffuse) that a node's split scales.
     std::vector<std::array<float, 2>> m_meteoMeasuredSplit;
     std::vector<AtomCond> m_unitShortwaveShapes;
-    // 写 ENVI 影像（.img + .hdr）。注意：这个无 k 参数的重载在 fileio.cpp 中没有定义（实现已被注释），
-    // 仅有带 k 的重载；调用时若省略 k 会出现重载歧义或链接错误（疑似遗留声明，待核对）。
-    void writeENVIdata(std::string projectDir,float * pData, int width, int height, int band, Angle &angle, float t = -1);
+    // 写 ENVI 影像（.img + .hdr）。t、k 缺省为 -1（文件名不带对应后缀）。
+    // 说明：此前还声明过一个没有 k 参数的重载，fileio.cpp 中无定义且无调用，已删除。
     void writeENVIdata(std::string projectDir,float * pData, int width, int height, int band, Angle &angle, float t = -1,int k = -1);
     // 写多波段 GeoTIFF 并追加统计 CSV；参数含义见 fileio.cpp 中的实现说明。
     bool writeTIFData(const std::string& projectDir, const float* pData, int width, int height,

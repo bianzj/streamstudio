@@ -20,6 +20,8 @@
 //
 
 #include "descriptor.h"
+#include <stdexcept>
+#include <string>
 
 
 // 作用：创建 VoxelEB 的描述符布局、池与描述符集，并把所有缓冲写入描述符集。
@@ -104,6 +106,21 @@ bool Descriptor::createDescriptor(std::shared_ptr<VoxelebIO> &modelio){
     // 注意：dbiXxx 局部变量必须存活到 vkUpdateDescriptorSets 调用，makeWrite 只保存其指针。
     std::vector<VkWriteDescriptorSet> updates;
 
+    // 条件创建的缓冲（表为空时 createBuffer 不创建）缺失时直接抛出明确错误，避免下面解引用空指针。
+    {
+        const auto requireBuffer = [](const std::shared_ptr<nvvk::Buffer>& buffer, const char* name) {
+            if (!buffer)
+                throw std::runtime_error(std::string("VoxelEB descriptor: the ") + name + " buffer was not created (its source table is empty)");
+        };
+        requireBuffer(meshio->m_pBufferSpectral, "spectral material");
+        requireBuffer(meshio->m_pFixedSpectralBuffer, "fixed spectral material");
+        requireBuffer(meshio->m_pBufferCanopy, "canopy");
+        requireBuffer(instanceio->m_pBufferInstanceLink, "instance link");
+        requireBuffer(voxelio->m_pVoxelLinkBuffer, "voxel link");
+        requireBuffer(voxelio->m_pVoxelNanoBuffer, "NanoVDB voxel");
+        requireBuffer(modelio->m_pBufferWave, "wavelength");
+        requireBuffer(modelio->m_pBufferAtomcond, "atmospheric condition");
+    }
     // component    
 
     // 3.1 材质与冠层：光谱材质、固定光谱材质、热学材质、体元温度、冠层

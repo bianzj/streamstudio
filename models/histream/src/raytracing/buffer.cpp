@@ -180,9 +180,8 @@ bool Buffer::createBuffer(std::shared_ptr<RaytracingIO> &raytracingio) {
 
 
 
-// 作用：销毁 createBuffer 创建的缓冲。注意：m_pBufferWave、m_pBufferMeshLink、m_pBufferInstanceLink、
-// m_pBufferSensor、m_pBufferLight 被无条件解引用，而 createBuffer 中波长集与实例链接是有条件创建的，
-// 为空时会出错（疑似问题，仅报告）。
+// 作用：销毁 createBuffer 创建的缓冲。createBuffer 中光谱材料、波长集与实例链接缓冲是有条件创建的
+// （对应数组为空时不创建），因此这些指针销毁前都先判空；其余缓冲总是被创建。
 void Buffer::destroy(std::shared_ptr<RaytracingIO> &raytracingio)
 {
     // destroy component
@@ -190,11 +189,14 @@ void Buffer::destroy(std::shared_ptr<RaytracingIO> &raytracingio)
     {
         raytracingio->m_pAlloc->destroy(*(raytracingio->m_meshio->m_pBufferSpectral));
     }
-    if (raytracingio->m_meshio->thermals.size() > 0)
+    if (raytracingio->m_meshio->m_pBufferThermal)
     {
         raytracingio->m_pAlloc->destroy(*(raytracingio->m_meshio->m_pBufferThermal));
     }
-    raytracingio->m_pAlloc->destroy(*(raytracingio->m_pBufferWave));
+    if (raytracingio->m_pBufferWave)
+    {
+        raytracingio->m_pAlloc->destroy(*(raytracingio->m_pBufferWave));
+    }
 
     // destroy scene
     for (auto& bufferModelTemp : raytracingio->m_meshio->m_bufferMeshes)
@@ -203,7 +205,10 @@ void Buffer::destroy(std::shared_ptr<RaytracingIO> &raytracingio)
         raytracingio->m_pAlloc->destroy(bufferModelTemp.vertexBuffer);
     }
     raytracingio->m_pAlloc->destroy(*(raytracingio->m_meshio->m_pBufferMeshLink));
-    raytracingio->m_pAlloc->destroy(*(raytracingio->m_instanceio->m_pBufferInstanceLink));
+    if (raytracingio->m_instanceio->m_pBufferInstanceLink)
+    {
+        raytracingio->m_pAlloc->destroy(*(raytracingio->m_instanceio->m_pBufferInstanceLink));
+    }
     if (raytracingio->m_pBufferTextureOffset) raytracingio->m_pAlloc->destroy(*(raytracingio->m_pBufferTextureOffset));
     if (raytracingio->m_pBufferTextureFactor) raytracingio->m_pAlloc->destroy(*(raytracingio->m_pBufferTextureFactor));
 

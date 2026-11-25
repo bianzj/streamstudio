@@ -942,8 +942,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
 
 // 模块：destroy——销毁 createBuffer 创建的缓冲，辐射场缓冲由其专用分配器销毁并释放分配器。
 // 注意：m_pFixedSpectralBuffer、m_pBufferWave、m_pBufferInstanceLink、m_pVoxelLinkBuffer、
-//       m_pVoxelNanoBuffer 等在创建时有条件（表为空则不创建），此处却无条件解引用销毁，
-//       条件不满足时可能解引用空指针（疑似问题，待核对）。
+//       m_pVoxelNanoBuffer 等在创建时有条件（表为空则不创建），因此销毁前都先判空，
+//       未创建的缓冲直接跳过（避免解引用空指针）。
 void Buffer::destroy(std::shared_ptr<VoxelebIO> &voxellstio){
 
     VkDevice & m_device = voxellstio->m_device;
@@ -964,7 +964,7 @@ void Buffer::destroy(std::shared_ptr<VoxelebIO> &voxellstio){
         m_pAlloc->destroy(*(meshio->m_pBufferSpectral));
     }
 
-    m_pAlloc->destroy(*(meshio->m_pFixedSpectralBuffer));
+    if (meshio->m_pFixedSpectralBuffer) m_pAlloc->destroy(*(meshio->m_pFixedSpectralBuffer));
 //    m_pAlloc->destroy(*(voxelio->m_pSurfLBuffer));
 
 
@@ -980,15 +980,15 @@ void Buffer::destroy(std::shared_ptr<VoxelebIO> &voxellstio){
     }
     m_pAlloc->destroy(*(meshio->m_pBufferMeshLink));
 
-    m_pAlloc->destroy(*(instanceio->m_pBufferInstanceLink));
-    m_pAlloc->destroy(*(voxelio->m_pVoxelLinkBuffer));
-    m_pAlloc->destroy(*(voxelio->m_pVoxelNanoBuffer));
+    if (instanceio->m_pBufferInstanceLink) m_pAlloc->destroy(*(instanceio->m_pBufferInstanceLink));
+    if (voxelio->m_pVoxelLinkBuffer) m_pAlloc->destroy(*(voxelio->m_pVoxelLinkBuffer));
+    if (voxelio->m_pVoxelNanoBuffer) m_pAlloc->destroy(*(voxelio->m_pVoxelNanoBuffer));
     if (voxelio->m_pVoxelHexBuffer) m_pAlloc->destroy(*(voxelio->m_pVoxelHexBuffer));
 
     m_pAlloc->destroy(*(surfio->m_pBufferLad));
 
     m_pAlloc->destroy(*(voxellstio->m_pBufferSensor));
-    m_pAlloc->destroy(*(voxellstio->m_pBufferWave));
+    if (voxellstio->m_pBufferWave) m_pAlloc->destroy(*(voxellstio->m_pBufferWave));
    // m_pAlloc->destroy(*(voxellstio->m_pBufferWaveset));
     m_pAlloc->destroy(*(voxellstio->m_pBufferLight));
 

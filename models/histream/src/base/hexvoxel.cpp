@@ -1214,7 +1214,8 @@ std::string toTsv(const HexResult& r)
 }
 
 // 作用：输出汇总统计与各方向误差的 JSON 文本（不含逐体元数据）；objPath 经转义后写入。
-// 疑似问题（只报告）："grid" 字段被写成单个字符串元素 ["gx, gy, gz"] 而不是三个数字组成的数组。
+// 说明："grid" 字段输出为三个数字组成的数组 [gx, gy, gz]（此前误写成单个字符串元素 ["gx, gy, gz"]；
+// 仓库内没有读取该 JSON 的脚本或前端，修正不影响任何消费者）。
 std::string toJson(const HexResult& r, const std::string& objPath)
 {
     std::ostringstream os;
@@ -1236,7 +1237,7 @@ std::string toJson(const HexResult& r, const std::string& objPath)
         return out;
     };
     os << "  \"obj\": \"" << jsonEscape(objPath) << "\",\n";
-    os << "  \"grid\": [\"" << r.gridX << ", " << r.gridY << ", " << r.gridZ << "\"],\n";
+    os << "  \"grid\": [" << r.gridX << ", " << r.gridY << ", " << r.gridZ << "],\n";
     os << "  \"n_empty\": " << r.nEmpty << ",\n";
     os << "  \"n_full\": " << r.nFull << ",\n";
     os << "  \"n_mixed\": " << r.nMixed << ",\n";

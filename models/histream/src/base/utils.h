@@ -78,18 +78,15 @@ namespace Utils {
 
 
     // GDAL 读栅格系列：成功返回 1，失败返回 0；width/height/nband 为输出。
-    //   readImageinout：多波段（追加到 c）；readImageinout1：仅第 1 波段；
-    //   readImageinout11：声明中带 trans（6 参数）与 proj 输出，但 utils.cpp 中未见实现（待核对）。
+    //   readImageinout：多波段（c 先清空再按波段依次存入）；readImageinout1：仅第 1 波段（c 被整体覆盖）。
     int readImageinout(std::string infilename,std::vector<std::vector<float>> &c,
                        int &width, int &height, int &nband);
 
     int readImageinout1(std::string infilename,std::vector<float> &c,
                         int &width, int &height, int &nband);
 
-    int readImageinout11(std::string infilename,std::vector<float> &c,
-                         int &width, int &height, int &nband,double *trans, std::string &proj);
-
-    // GDAL 写 Float32 GTiff：saveImage1 单波段，saveImage 多波段；成功返回 1，失败返回 0。
+    // GDAL 写 Float32 GTiff：saveImage1 单波段，saveImage 多波段；成功返回 1，失败（含 RasterIO 写入失败）返回 0。
+    // proj、trans 当前未使用，输出不含地理参考。
     int saveImage1(std::string outfilepath, std::vector<float> &c,
                   int width, int height,int band, std::string proj, double trans[6]);
 
@@ -133,11 +130,7 @@ namespace Utils {
 
     std::string getFileName(const std::string& fullPath);
 
-	template <typename T>
-	// （仅声明，源文件中未见实现，待核对）按 num 个元素把 data 写入 outFile。
-	void saveOut(std::string outFile, T data, int num);
-
-	// 提取字符串中的全部连续数字串为 int 列表。
+	// 提取字符串中所有连续数字串并转为 int（过长时饱和为 INT_MAX）。
 	std::vector <int> findnum(std::string& ch);
 
 
