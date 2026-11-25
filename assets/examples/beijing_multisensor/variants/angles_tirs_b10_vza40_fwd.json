@@ -1,0 +1,64 @@
+{
+  "kind": "stream-image-project",
+  "schemaVersion": 2,
+  "name": "北京 · Landsat TIRS B10 观测角 VZA 40° VAA 319°",
+  "description": "观测角实验：Landsat TIRS B10，VZA 40°，VAA 319°（前向散射（传感器在太阳对侧）；太阳天顶 31.8°、方位 138.8°）。复用母工程组分温度。",
+  "scene": {
+    "name": "stream_beijing_300m_angles_tirs_b10_vza40_fwd",
+    "locationSource": "georef",
+    "overpass": "2019-08-15T02:55:00Z",
+    "displayTimezone": 8,
+    "threads": 0,
+    "region": {
+      "enabled": false,
+      "startRow": 0,
+      "endRow": 1,
+      "startColumn": 0,
+      "endColumn": 1
+    },
+    "surface": {
+      "type": {
+        "file": "../inputs/type.tif"
+      },
+      "lai": {
+        "file": "../inputs/lai.tif"
+      },
+      "dem": {
+        "file": "../inputs/dem.tif"
+      }
+    },
+    "view": {
+      "vza": {
+        "value": 40
+      },
+      "vaa": {
+        "value": 319
+      }
+    },
+    "optical": {
+      "enabled": false,
+      "bands": []
+    },
+    "thermal": {
+      "enabled": true,
+      "bands": [
+        {
+          "name": "B10",
+          "center": 10.895,
+          "fwhm": 0.59
+        }
+      ]
+    },
+    "temperature": {
+      "mode": "rt",
+      "components": {
+        "source": "package",
+        "file": "../reference/components.tif"
+      },
+      "energy": {
+        "diffuseFraction": 0.2
+      }
+    },
+    "outputRoot": "output"
+  }
+}

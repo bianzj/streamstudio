@@ -1,0 +1,64 @@
+{
+  "kind": "stream-image-project",
+  "schemaVersion": 2,
+  "name": "北京 · MODIS 31 观测角 VZA 55° VAA 139°",
+  "description": "观测角实验：MODIS 31，VZA 55°，VAA 139°（后向散射（传感器在太阳一侧）；太阳天顶 31.8°、方位 138.8°）。复用母工程组分温度。",
+  "scene": {
+    "name": "stream_beijing_300m_angles_modis_b31_vza55_back",
+    "locationSource": "georef",
+    "overpass": "2019-08-15T02:55:00Z",
+    "displayTimezone": 8,
+    "threads": 0,
+    "region": {
+      "enabled": false,
+      "startRow": 0,
+      "endRow": 1,
+      "startColumn": 0,
+      "endColumn": 1
+    },
+    "surface": {
+      "type": {
+        "file": "../inputs/type.tif"
+      },
+      "lai": {
+        "file": "../inputs/lai.tif"
+      },
+      "dem": {
+        "file": "../inputs/dem.tif"
+      }
+    },
+    "view": {
+      "vza": {
+        "value": 55
+      },
+      "vaa": {
+        "value": 139
+      }
+    },
+    "optical": {
+      "enabled": false,
+      "bands": []
+    },
+    "thermal": {
+      "enabled": true,
+      "bands": [
+        {
+          "name": "B31",
+          "center": 11.03,
+          "fwhm": 0.5
+        }
+      ]
+    },
+    "temperature": {
+      "mode": "rt",
+      "components": {
+        "source": "package",
+        "file": "../reference/components.tif"
+      },
+      "energy": {
+        "diffuseFraction": 0.2
+      }
+    },
+    "outputRoot": "output"
+  }
+}

@@ -9,6 +9,10 @@
       "id": "landsat89",
       "name": "Landsat 8/9 OLI + TIRS",
       "platform": "Landsat 8 / Landsat 9",
+      "ndvi": {
+        "red": "B4",
+        "nir": "B5"
+      },
       "variant": "variants/landsat89.json",
       "opticalUnit": "nm",
       "thermalUnit": "um",
@@ -122,6 +126,10 @@
       "id": "modis",
       "name": "MODIS（Terra）",
       "platform": "Terra",
+      "ndvi": {
+        "red": "B1",
+        "nir": "B2"
+      },
       "variant": "variants/modis.json",
       "optical": [
         {
@@ -232,6 +240,10 @@
       "id": "sentinel2",
       "name": "Sentinel-2 MSI（仅光学）",
       "platform": "Sentinel-2A",
+      "ndvi": {
+        "red": "B4",
+        "nir": "B8"
+      },
       "variant": "variants/sentinel2.json",
       "optical": [
         {
@@ -425,6 +437,10 @@
       "id": "viirs",
       "name": "VIIRS（Suomi NPP / NOAA-20）",
       "platform": "Suomi NPP",
+      "ndvi": {
+        "red": "M5",
+        "nir": "M7"
+      },
       "variant": "variants/viirs.json",
       "optical": [
         {
@@ -491,6 +507,10 @@
       "id": "fy3d_mersi2",
       "name": "FY-3D MERSI-II",
       "platform": "FY-3D",
+      "ndvi": {
+        "red": "CH3",
+        "nir": "CH4"
+      },
       "variant": "variants/fy3d_mersi2.json",
       "optical": [
         {

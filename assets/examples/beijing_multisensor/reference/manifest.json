@@ -1,0 +1,23 @@
+{
+  "kind": "beijing-multisensor-reference",
+  "note": "光学反射率为 float16、亮温为 float32 的栅格与 landsat_beijing_eb 同网格（EPSG:32650，300 m，592×598）；NaN 为无效像元",
+  "files": [
+    "components.tif",
+    "components.json",
+    "scene_summary.json",
+    "landsat89_optical.tif (float16)",
+    "landsat89_tir_bt.tif (float32)",
+    "modis_optical.tif (float16)",
+    "modis_tir_bt.tif (float32)",
+    "sentinel2_optical.tif (float16)",
+    "aster_tir_bt.tif (float32)",
+    "ecostress_tir_bt.tif (float32)",
+    "viirs_optical.tif (float16)",
+    "viirs_tir_bt.tif (float32)",
+    "fy3d_mersi2_optical.tif (float16)",
+    "fy3d_mersi2_tir_bt.tif (float32)",
+    "summary.csv",
+    "angles.csv",
+    "aggregation.csv"
+  ]
+}
