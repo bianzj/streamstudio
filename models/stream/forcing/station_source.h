@@ -78,6 +78,8 @@ private:
     bool hasKey(const std::string& key) const;
     const ForcingChannel* channelOf(const std::string& key) const;
     double stepOf(const Station& station, const std::string& key) const;
+    // 单站某通道的记录能否覆盖窗口（covers 与 load 的逐站警告共用）。
+    bool stationCovers(const Station& station, const std::string& key, int64_t firstHour, int64_t lastHour, std::string& why) const;
 };
 
 }  // namespace stream

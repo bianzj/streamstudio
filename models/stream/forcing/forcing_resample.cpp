@@ -9,14 +9,14 @@
 //      保证每个时段的能量守恒
 //   5. standardiseQuantities：由各小时通道合成标准量 t2m d2m sp u10 v10 ssrd strd skt swvl1 z
 //      （湿度换算、气压估算、风分量、高度订正、Brutsaert 长波回退）
-//   6. forcingChannelKeys / recordsCover：标准量所需通道推导与记录覆盖检查（站点源使用）
+//   6. forcingChannelKeys / checkRecordsCover / recordsCover：标准量所需通道推导与记录覆盖检查（站点源与网格源共用）
 // 数据流：原始记录（时刻 + 数值）→ fluxRecordsFrom → distributeFlux / resampleInstant → 逐小时通道 →
 //   standardiseQuantities → 标准量（float）供 pixel_forcing 使用
 // 约定：时间为自 1970-01-01 UTC 起的小时数（可为小数）；缺测为 NaN；
 //   逐小时通量 out[h − first] 表示 (h − 1, h] 区间的平均通量（W m-2）
 // 注意：各时段的能量严格守恒；夜间且通量近 0 时权重全取 1，避免除零（见 distributeFlux）
 // 与其他文件：forcing_metadata.h（通道与元数据）、era5.cpp 与 station_source.cpp（调用方）、
-//   utc.h（时间格式）；approximateCosZenith 在别处定义（NOAA 近似式，待核对所在文件）
+//   utc.h（时间格式）；approximateCosZenith 定义在 pixel_forcing.cpp（NOAA 近似式）
 // ==========================================================================
 
 #include "forcing_resample.h"
@@ -28,11 +28,12 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <stdexcept>
 
 namespace stream {
 
 // 外部函数声明：近似太阳天顶角余弦（经纬度为度，时间为 Unix 秒）；
-// 定义在别的源文件中（待核对），用于把短波按太阳高度分配到逐小时。
+// 定义在 pixel_forcing.cpp 中，用于把短波按太阳高度分配到逐小时。
 double approximateCosZenith(double latitudeDeg, double longitudeDeg, double unixSeconds);
 
 namespace {
@@ -277,7 +278,7 @@ void standardiseQuantities(const ForcingMetadata& meta_, const std::map<std::str
 }
 
 // 作用：推出标准量 variables 需要读取的通道键（ta hum p u v speed dir sw lw skt swvl z），
-// 只保留 present(key) 为真的；映射规则与 era5.cpp 中 Pack::channelsFor 相同（待核对是否应合并）。
+// 只保留 present(key) 为真的；era5.cpp 的 Pack::channelsFor 也调用本函数（以 rawName 非空作为 present），两种数据源共用同一映射规则。
 std::vector<std::string> forcingChannelKeys(const ForcingMetadata& meta, const std::vector<std::string>& variables,
                                             const std::function<bool(const std::string&)>& present)
 {
@@ -312,12 +313,14 @@ std::vector<std::string> forcingChannelKeys(const ForcingMetadata& meta, const s
     return out;
 }
 
-// 作用：检查一个通道的记录能否覆盖 [first, last]，不能时 why 写出第一个问题。
-// 规则：通量类要求每个 (h−1, h] 都落在某条记录代表的时段内；瞬时类需要 first 及之前、
-// last 及之后各一条记录，且二者之间相邻记录的间隔不超过 maxGap。
-bool recordsCover(const ForcingChannel& channel, double step, const std::vector<double>& times, bool flux, double maxGap,
-                  int64_t first, int64_t last, std::string& why)
+// 作用：记录覆盖的统一判定（站点源 recordsCover 与网格源 Pack::channelCovers 共用，避免两处规则分叉）。
+// 规则：通量类要求每个 (h−1, h] 都落在某条记录代表的时段内（记录终点由 kind/stamp 决定：
+// previous 或 interval_start 为 t+步长，interval_mid 为 t+步长/2，其余为 t）；瞬时类需要 first 及之前、
+// last 及之后各一条记录，且二者之间相邻记录的间隔不超过 maxGap。返回第一个问题，提示文字由调用方格式化。
+RecordsCoverResult checkRecordsCover(const ForcingChannel& channel, double step, const std::vector<double>& times, bool flux, double maxGap,
+                                     int64_t first, int64_t last)
 {
+    RecordsCoverResult result;
     if (flux) {
         for (int64_t hour = first; hour <= last; ++hour) {
             bool covered = false;
@@ -325,19 +328,39 @@ bool recordsCover(const ForcingChannel& channel, double step, const std::vector<
                 const double end = (channel.kind == "previous" || channel.stamp == "interval_start") ? t + step : channel.stamp == "interval_mid" ? t + 0.5 * step : t;
                 if (end - step <= hour - 1 + 1e-9 && end >= hour - 1e-9) { covered = true; break; }
             }
-            if (!covered) { why = formatUtc(static_cast<double>(hour) * 3600.0) + " 之前的一小时没有记录覆盖"; return false; }
+            if (!covered) { result.kind = RecordsCoverResult::Kind::FluxHourUncovered; result.hour = hour; return result; }
         }
-        return true;
+        return result;
     }
     double before = kNotANumber, after = kNotANumber;
     for (const double t : times) { if (t <= first + 1e-9) before = t; if (t >= last - 1e-9 && !std::isfinite(after)) after = t; }
-    if (!std::isfinite(before)) { why = "最早的记录晚于 " + formatUtc(static_cast<double>(first) * 3600.0); return false; }
-    if (!std::isfinite(after)) { why = "最晚的记录早于 " + formatUtc(static_cast<double>(last) * 3600.0); return false; }
+    if (!std::isfinite(before)) { result.kind = RecordsCoverResult::Kind::NoRecordBefore; return result; }
+    if (!std::isfinite(after)) { result.kind = RecordsCoverResult::Kind::NoRecordAfter; return result; }
     for (size_t i = 1; i < times.size(); ++i)
         if (times[i] > before + 1e-9 && times[i - 1] < after - 1e-9 && times[i] - times[i - 1] > maxGap + 1e-9) {
-            why = formatUtc(times[i - 1] * 3600.0) + " 到 " + formatUtc(times[i] * 3600.0) + " 之间缺测超过 " + std::to_string(maxGap) + " h";
-            return false;
+            result.kind = RecordsCoverResult::Kind::GapTooLarge;
+            result.from = times[i - 1];
+            result.to = times[i];
+            return result;
         }
+    return result;
+}
+
+// 作用：检查一个通道的记录能否覆盖 [first, last]，不能时 why 写出第一个问题（判定见 checkRecordsCover）。
+bool recordsCover(const ForcingChannel& channel, double step, const std::vector<double>& times, bool flux, double maxGap,
+                  int64_t first, int64_t last, std::string& why)
+{
+    const RecordsCoverResult result = checkRecordsCover(channel, step, times, flux, maxGap, first, last);
+    using Kind = RecordsCoverResult::Kind;
+    switch (result.kind) {
+    case Kind::Covered: return true;
+    case Kind::FluxHourUncovered: why = formatUtc(static_cast<double>(result.hour) * 3600.0) + " 之前的一小时没有记录覆盖"; return false;
+    case Kind::NoRecordBefore: why = "最早的记录晚于 " + formatUtc(static_cast<double>(first) * 3600.0); return false;
+    case Kind::NoRecordAfter: why = "最晚的记录早于 " + formatUtc(static_cast<double>(last) * 3600.0); return false;
+    case Kind::GapTooLarge:
+        why = formatUtc(result.from * 3600.0) + " 到 " + formatUtc(result.to * 3600.0) + " 之间缺测超过 " + std::to_string(maxGap) + " h";
+        return false;
+    }
     return true;
 }
 }  // namespace stream

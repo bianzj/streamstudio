@@ -29,11 +29,19 @@
 
 namespace stream {
 
-// 作用：NOAA 通用太阳位置公式的天顶角余弦（经纬度为度，时间为 Unix 秒 UTC）。
+namespace {
+// 模块：NOAA 近似太阳位置的中间量（approximateCosZenith 与 approximateSunAzimuth 共用，避免两份复制的公式分叉）。
+struct NoaaSun {
+    double declination;  // 赤纬（rad）
+    double hourAngle;    // 时角（rad）
+    double latitude;     // 纬度（rad）
+    double cosZenith;    // 天顶角余弦
+};
+
+// 作用：NOAA 通用太阳位置公式（经纬度为度，时间为 Unix 秒 UTC），求赤纬、时角与天顶角余弦。
 // 步骤 1：由日序与分钟求分数年角 gamma；步骤 2：用傅里叶级数求时差 equation（分钟）与赤纬；
 // 步骤 3：真太阳时 = UTC 分钟 + 时差 + 4×经度，换算时角；步骤 4：cos z = sinφ sinδ + cosφ cosδ cos H。
-// 仅用于两个整点中心之间的短波插值与旧的水平/倾斜路径，精度低于 SPA（EB 步进使用 SPA）。
-double approximateCosZenith(double latitudeDeg, double longitudeDeg, double unixSeconds)
+NoaaSun noaaSun(double latitudeDeg, double longitudeDeg, double unixSeconds)
 {
     const double wholeDays = std::floor(unixSeconds / 86400.0);
     int year;
@@ -47,37 +55,35 @@ double approximateCosZenith(double latitudeDeg, double longitudeDeg, double unix
     const double declination = 0.006918 - 0.399912 * std::cos(gamma) + 0.070257 * std::sin(gamma) - 0.006758 * std::cos(2 * gamma) +
                                0.000907 * std::sin(2 * gamma) - 0.002697 * std::cos(3 * gamma) + 0.00148 * std::sin(3 * gamma);
     const double solarMinutes = minutes + equation + 4.0 * longitudeDeg;
-    const double hourAngle = (solarMinutes / 4.0 - 180.0) * kPi / 180.0;
-    const double latitude = latitudeDeg * kPi / 180.0;
-    return std::sin(latitude) * std::sin(declination) + std::cos(latitude) * std::cos(declination) * std::cos(hourAngle);
+    NoaaSun sun;
+    sun.declination = declination;
+    sun.hourAngle = (solarMinutes / 4.0 - 180.0) * kPi / 180.0;
+    sun.latitude = latitudeDeg * kPi / 180.0;
+    sun.cosZenith = std::sin(sun.latitude) * std::sin(declination) + std::cos(sun.latitude) * std::cos(declination) * std::cos(sun.hourAngle);
+    return sun;
+}
+}  // namespace
+
+// 作用：NOAA 通用太阳位置公式的天顶角余弦（经纬度为度，时间为 Unix 秒 UTC）；公式见 noaaSun。
+// 仅用于两个整点中心之间的短波插值与旧的水平/倾斜路径，精度低于 SPA（EB 步进使用 SPA）。
+// 定义在本文件；forcing_resample.cpp 用外部声明调用它（把短波按太阳高度分配到逐小时）。
+double approximateCosZenith(double latitudeDeg, double longitudeDeg, double unixSeconds)
+{
+    return noaaSun(latitudeDeg, longitudeDeg, unixSeconds).cosZenith;
 }
 
 // 作用：与上同一近似下的太阳方位角（弧度，自北顺时针）。天顶角正弦接近 0（太阳在天顶）时返回 0。
-// 前面的太阳位置步骤与 approximateCosZenith 完全相同，这里再复制了一份。
+// 太阳位置的计算与 approximateCosZenith 共用 noaaSun。
 double approximateSunAzimuth(double latitudeDeg, double longitudeDeg, double unixSeconds)
 {
-    const double wholeDays = std::floor(unixSeconds / 86400.0);
-    int year;
-    unsigned month, day;
-    civilFromDays(static_cast<int64_t>(wholeDays), year, month, day);
-    const double dayIndex = wholeDays - static_cast<double>(daysFromCivil(year, 1, 1));
-    const double minutes = (unixSeconds - wholeDays * 86400.0) / 60.0;
-    const double gamma = 2.0 * kPi / (isLeapYear(year) ? 366.0 : 365.0) * (dayIndex + (minutes / 60.0 - 12.0) / 24.0);
-    const double equation = 229.18 * (0.000075 + 0.001868 * std::cos(gamma) - 0.032077 * std::sin(gamma) - 0.014615 * std::cos(2 * gamma) -
-                                      0.040849 * std::sin(2 * gamma));
-    const double declination = 0.006918 - 0.399912 * std::cos(gamma) + 0.070257 * std::sin(gamma) - 0.006758 * std::cos(2 * gamma) +
-                               0.000907 * std::sin(2 * gamma) - 0.002697 * std::cos(3 * gamma) + 0.00148 * std::sin(3 * gamma);
-    const double solarMinutes = minutes + equation + 4.0 * longitudeDeg;
-    const double hourAngle = (solarMinutes / 4.0 - 180.0) * kPi / 180.0;
-    const double latitude = latitudeDeg * kPi / 180.0;
-    const double cosZenith = std::sin(latitude) * std::sin(declination) + std::cos(latitude) * std::cos(declination) * std::cos(hourAngle);
+    const NoaaSun sun = noaaSun(latitudeDeg, longitudeDeg, unixSeconds);
+    const double cosZenith = sun.cosZenith;
     const double sinZenith = std::sqrt(std::max(0.0, 1.0 - cosZenith * cosZenith));
     if (sinZenith < 1e-6) return 0.0;
-    const double sinAzimuth = -std::cos(declination) * std::sin(hourAngle) / sinZenith;
-    const double cosAzimuth = (std::sin(declination) - std::sin(latitude) * cosZenith) / (std::cos(latitude) * sinZenith);
+    const double sinAzimuth = -std::cos(sun.declination) * std::sin(sun.hourAngle) / sinZenith;
+    const double cosAzimuth = (std::sin(sun.declination) - std::sin(sun.latitude) * cosZenith) / (std::cos(sun.latitude) * sinZenith);
     return std::atan2(sinAzimuth, cosAzimuth);
 }
-
 // 作用：为一个像元建立强迫视图。构造时即取好插值权重；elevationShift = 像元高程 − 数据源海拔（m）。
 // slope/aspect（度）描述接收面（0 为水平）；cone*（统计锥）与 ridge*（山脊）为复合地形参数，
 // 密度为 0–1 的覆盖比例；diffuseFraction 为水平短波的缺省漫射份额。

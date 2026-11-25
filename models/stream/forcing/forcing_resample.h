@@ -5,7 +5,7 @@
 //   1. FluxRecord / FluxShape：时段平均通量记录与分配形状（Solar 短波 / Smooth 长波）
 //   2. resampleInstant、fluxRecordsFrom、distributeFlux：瞬时量插值与通量重采样
 //   3. standardiseQuantities、forcingChannelKeys：由逐小时通道合成标准量并推导所需通道
-//   4. recordsCover、forcingMaxGap：覆盖检查与最大缺口规则
+//   4. checkRecordsCover、recordsCover、forcingMaxGap：覆盖检查（共用判定）与最大缺口规则
 // 数据流：era5.cpp（网格）/ station_source.cpp（站点）读出原始记录 → 本模块 → 逐小时标准量
 // 约定：时间为自 1970-01-01 UTC 起的小时数；瞬时量取整点值，通量为截至该整点的前一小时平均（W m-2）；
 //   缺测为 NaN
@@ -65,6 +65,22 @@ void standardiseQuantities(const ForcingMetadata& meta, const std::map<std::stri
 // Which channel keys (ta hum p u v speed dir sw lw skt swvl z) the standard quantities in `variables` need; `present` tells which exist.
 std::vector<std::string> forcingChannelKeys(const ForcingMetadata& meta, const std::vector<std::string>& variables,
                                             const std::function<bool(const std::string&)>& present);
+
+// 模块：记录覆盖检查的结构化结果（网格 Pack::channelCovers 与站点 recordsCover 共用同一判定，各自按需要格式化提示文字）。
+// kind：Covered 覆盖；FluxHourUncovered 通量类某个小时 (hour − 1, hour] 没有记录时段覆盖（hour 有效）；
+// NoRecordBefore / NoRecordAfter 瞬时类在 first 及之前 / last 及之后没有记录；
+// GapTooLarge 瞬时类相邻记录 from→to（小时）的间隔超过 maxGapHours。
+struct RecordsCoverResult {
+    enum class Kind { Covered, FluxHourUncovered, NoRecordBefore, NoRecordAfter, GapTooLarge };
+    Kind kind = Kind::Covered;
+    int64_t hour = 0;           // FluxHourUncovered：第一个没有覆盖的整点
+    double from = 0, to = 0;    // GapTooLarge：缺口两端的记录时刻（小时）
+};
+
+// The single decision rule behind recordsCover and Pack::channelCovers (era5.cpp): flux intervals must cover every hour (h - 1, h];
+// instants need a record at or before `first`, one at or after `last` and no gap above maxGapHours between them. The first problem is returned.
+RecordsCoverResult checkRecordsCover(const ForcingChannel& channel, double stepHours, const std::vector<double>& times, bool flux,
+                                     double maxGapHours, int64_t first, int64_t last);
 
 // Do the records of one channel cover [first, last]? Flux intervals must cover every hour (h - 1, h]; instants need a record at or before
 // `first`, one at or after `last` and no gap above maxGapHours between them. `why` names the first problem.

@@ -44,7 +44,8 @@ struct SurfaceShortwave {
 };
 
 // Surface forcing of one pixel interpolated from an ERA5 pack. elevationShift is the pixel height
-// above the ERA5 orography (m); temperatures follow a 6.5 K/km lapse rate and pressure the hypsometric law.
+// above the ERA5 orography (m); temperatures follow the source's lapse rate ForcingSource::lapseRate() (default 6.5 K/km;
+// metadata sources set it with spatial.lapseRateKPerKm) and pressure the hypsometric law.
 // slopeDeg/aspectDeg describe the receiving surface (0 = horizontal); surfaceShortwave() tilts the beam by the
 // direct-beam incidence ratio and the diffuse part by the sky-view factor. Forcing::shortwave is horizontal.
 class PixelForcing {

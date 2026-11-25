@@ -400,9 +400,23 @@ bool StationSource::available(const std::string& variable) const
     return false;
 }
 
+// 作用：单个站点的某通道记录能否覆盖 [firstHour, lastHour]（站点没有该通道返回 false 且 why 为空）。
+// 判定同 recordsCover（forcing_resample.cpp）：通量类要求每个小时都落在记录时段内，瞬时类要求两端有记录且缺口不超过最大缺口。
+bool StationSource::stationCovers(const Station& station, const std::string& key, int64_t firstHour, int64_t lastHour, std::string& why) const
+{
+    const auto found = station.channels.find(key);
+    if (found == station.channels.end()) return false;
+    const ForcingChannel& channel = *channelOf(key);
+    const bool flux = (key == "sw" || key == "lw") && channel.kind != "instant";
+    const double step = stepOf(station, key);
+    return recordsCover(channel, step, found->second.times, flux, forcingMaxGap(meta_.maxGapHours, step), firstHour, lastHour, why);
+}
+
 // 模块：检查 [firstHour, lastHour] 是否被数据覆盖。每个标准量所需的每个通道，
 //       至少要有一个站点的原始记录（含允许的最大缺口）完整包住该时段；
 //       否则在 gap 里写出缺失的量与原因并返回 false。
+//       只要有一个站点完整覆盖就通过；其余站点在窗口内缺测的情况由 load() 逐站警告（数值上这些站点
+//       的缺测小时在 at() 中被剔除并对剩余站点权重重新归一，所以不影响通过与否）。
 bool StationSource::covers(const std::vector<std::string>& variables, int64_t firstHour, int64_t lastHour, std::string& gap) const
 {
     for (const auto& name : variables) {
@@ -411,20 +425,13 @@ bool StationSource::covers(const std::vector<std::string>& variables, int64_t fi
             if (key == "z") continue;
             bool any = false;
             std::string why;
-            for (const auto& station : stations_) {
-                const auto found = station.channels.find(key);
-                if (found == station.channels.end()) continue;
-                const ForcingChannel& channel = *channelOf(key);
-                const bool flux = (key == "sw" || key == "lw") && channel.kind != "instant";
-                const double step = stepOf(station, key);
-                if (recordsCover(channel, step, found->second.times, flux, forcingMaxGap(meta_.maxGapHours, step), firstHour, lastHour, why)) { any = true; break; }
-            }
+            for (const auto& station : stations_)
+                if (stationCovers(station, key, firstHour, lastHour, why)) { any = true; break; }
             if (!any) { gap = "没有站点完整覆盖 " + key + "：" + why + "（原始记录需包住该时段）"; return false; }
         }
     }
     return true;
 }
-
 // 模块：加载窗口 [firstHour, lastHour]（经纬度窗口对站点无意义，被忽略）。
 // 步骤 1：对每个所需通道、每个站点，把原始记录重采样为逐小时序列（hourly[key][小时×站点数 + 站点]）：
 //         · 通量（sw、lw）且 kind 不是 instant：按时段平均通量守恒分配（短波按太阳高度，长波平滑），
@@ -439,6 +446,17 @@ void StationSource::load(const std::vector<std::string>& variables, double, doub
     lastHour_ = lastHour;
     const size_t hours = static_cast<size_t>(lastHour - firstHour + 1), count = stations_.size();
     std::map<std::string, std::vector<double>> hourly, constant;
+    // 步骤 0：逐站检查窗口覆盖。covers() 只要求至少一个站点完整覆盖；其余站点缺测的小时在 at() 中被剔除，
+    //         由剩余站点补位（权重重新归一）。这里对“有该通道但窗口内不完整覆盖”的站点给出警告，不改变数值。
+    for (const auto& key : keysFor(variables)) {
+        if (key == "z") continue;
+        for (const auto& station : stations_) {
+            std::string why;
+            if (station.channels.count(key) && !stationCovers(station, key, firstHour, lastHour, why))
+                report_.warn("站点 \"" + station.id + "\" 的 " + key + " 通道在 " + formatUtc(static_cast<double>(firstHour) * 3600.0) + " 至 " +
+                             formatUtc(static_cast<double>(lastHour) * 3600.0) + " 内记录不完整（" + why + "），缺测小时由其他站点补位");
+        }
+    }
     for (const auto& key : keysFor(variables)) {
         if (key == "z") {
             auto& z = constant["z"];
@@ -485,7 +503,7 @@ void StationSource::load(const std::vector<std::string>& variables, double, doub
 // 模块：某位置的站点插值权重。
 // 步骤：按球面距离排序，剔除超过 maxDistanceKm（> 0 时）的站点；nearest 取 1 站，
 //       idw 取最近 maxStations 站按 1/d^power 归一化加权；距离 < 1 m 视为同址，直接取该站；
-//       权重槽最多 4 个，超出部分被截掉（at() 会对剩余权重重新归一，所以不影响取值）；
+//       权重槽最多 4 个，取站数被限制在 4（配置校验已限 maxStations 为 1–4，这里再保险），所以存入的权重和恒为 1；
 //       范围内没有站点时权重全为 0。
 ForcingWeights StationSource::weights(double latitude, double longitude) const
 {
@@ -497,7 +515,7 @@ ForcingWeights StationSource::weights(double latitude, double longitude) const
         order.emplace_back(d, s);
     }
     std::sort(order.begin(), order.end());
-    const size_t take = meta_.interpolation == "nearest" ? 1 : std::min<size_t>(order.size(), static_cast<size_t>(meta_.maxStations));
+    const size_t take = meta_.interpolation == "nearest" ? 1 : std::min<size_t>(order.size(), std::min<size_t>(static_cast<size_t>(meta_.maxStations), 4));  // 权重槽只有 4 个：限制取站数，保证存入的权重和为 1
     if (order.empty()) return w;  // no station in range: all weights stay 0
     if (take == 1 || order.front().first < 1e-3) { w.index[0] = static_cast<int>(order.front().second); w.weight[0] = 1.0f; return w; }
     double total = 0;

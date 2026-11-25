@@ -721,35 +721,8 @@ double Pack::stepOf(const std::string& key) const
 // strd 没有长波数据时退回 ta + 湿度（Brutsaert 参数化的输入）。
 std::vector<std::string> Pack::channelsFor(const std::vector<std::string>& variables) const
 {
-    std::set<std::string> keys;
-    const auto wind = [&] {
-        if (meta_.windType == "components") { keys.insert("u"); keys.insert("v"); }
-        else { keys.insert("speed"); if (meta_.windType == "speedDirection") keys.insert("dir"); }
-    };
-    const auto pressure = [&] {
-        if (meta_.pressureType == "surface") keys.insert("p");
-        else { keys.insert("z"); if (meta_.pressureType == "seaLevel") { keys.insert("p"); keys.insert("ta"); } }
-    };
-    const auto dewpoint = [&] {
-        keys.insert("hum");
-        if (meta_.humidityType != "dewpoint") { keys.insert("ta"); if (meta_.humidityType != "vapourPressure") pressure(); }
-    };
-    for (const auto& name : variables) {
-        if (name == "t2m") keys.insert("ta");
-        else if (name == "d2m") dewpoint();
-        else if (name == "sp") pressure();
-        else if (name == "u10" || name == "v10") wind();
-        else if (name == "ssrd") keys.insert("sw");
-        else if (name == "strd") {
-            if (!rawName("lw").empty()) keys.insert("lw");
-            else { keys.insert("ta"); dewpoint(); }
-        } else if (name == "skt") keys.insert("skt");
-        else if (name == "swvl1") keys.insert("swvl");
-        else if (name == "z") keys.insert("z");
-    }
-    std::vector<std::string> out;
-    for (const auto& key : keys) if (!rawName(key).empty()) out.push_back(key);
-    return out;
+    // 映射规则与站点源共用 forcingChannelKeys（forcing_resample.cpp）；这里只定义“通道存在”= 能解析到原始变量名。
+    return forcingChannelKeys(meta_, variables, [&](const std::string& key) { return !rawName(key).empty(); });
 }
 
 // 作用：检查通道 key 的原始记录能否覆盖 [firstHour, lastHour]；不能时 gap 写出第一处缺口。
@@ -769,27 +742,19 @@ bool Pack::channelCovers(const std::string& key, int64_t firstHour, int64_t last
     std::vector<double> times;
     for (const auto& item : found->second) times.push_back(static_cast<double>(item.first));
     const auto describe = [&](int64_t hour) { return raw + " 缺少 " + formatUtc(static_cast<double>(hour) * 3600.0) + "（原始记录需包住该时段，记录间隔 " + std::to_string(step) + " h）"; };
-    if (flux) {
-        for (int64_t hour = firstHour; hour <= lastHour; ++hour) {
-            bool covered = false;
-            for (const double t : times) {
-                const double end = (channel->kind == "previous" || channel->stamp == "interval_start") ? t + step : channel->stamp == "interval_mid" ? t + 0.5 * step : t;
-                if (end - step <= hour - 1 + 1e-9 && end >= hour - 1e-9) { covered = true; break; }
-            }
-            if (!covered) { gap = describe(hour); return false; }
-        }
-        return true;
-    }
     const double maxGap = forcingMaxGap(meta_.maxGapHours, step);
-    double before = std::numeric_limits<double>::quiet_NaN(), after = before;
-    for (const double t : times) { if (t <= firstHour + 1e-9) before = t; if (t >= lastHour - 1e-9 && !std::isfinite(after)) after = t; }
-    if (!std::isfinite(before)) { gap = describe(firstHour); return false; }
-    if (!std::isfinite(after)) { gap = describe(lastHour); return false; }
-    for (size_t i = 1; i < times.size(); ++i)
-        if (times[i] > before + 1e-9 && times[i - 1] < after - 1e-9 && times[i] - times[i - 1] > maxGap + 1e-9) {
-            gap = raw + " 在 " + formatUtc(times[i - 1] * 3600.0) + " 到 " + formatUtc(times[i] * 3600.0) + " 之间缺测超过 " + std::to_string(maxGap) + " h";
-            return false;
-        }
+    // 判定规则与站点源共用 checkRecordsCover；这里只负责把结果写成带原始变量名的提示。
+    const RecordsCoverResult result = checkRecordsCover(*channel, step, times, flux, maxGap, firstHour, lastHour);
+    using Kind = RecordsCoverResult::Kind;
+    switch (result.kind) {
+    case Kind::Covered: return true;
+    case Kind::FluxHourUncovered: gap = describe(result.hour); return false;
+    case Kind::NoRecordBefore: gap = describe(firstHour); return false;
+    case Kind::NoRecordAfter: gap = describe(lastHour); return false;
+    case Kind::GapTooLarge:
+        gap = raw + " 在 " + formatUtc(result.from * 3600.0) + " 到 " + formatUtc(result.to * 3600.0) + " 之间缺测超过 " + std::to_string(maxGap) + " h";
+        return false;
+    }
     return true;
 }
 
