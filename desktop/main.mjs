@@ -4,7 +4,7 @@
 // 主要模块/步骤：
 //   1. 应用身份与用户数据目录（%APPDATA%/Stream Studio），旧 HiStream Studio 配置迁移
 //   2. 单实例锁；第二实例只把已有窗口唤到前台
-//   3. 进程树清理：killProcessTree / killOrphanedChildren / stopServerProcess
+//   3. 进程树清理：killProcessTree / terminateServer / killOrphanedChildren / stopServerProcess
 //   4. 本地服务进程：serverEnvironment 组装环境，startServerProcess 用 utilityProcess
 //      启动 desktop/server-process.mjs 并处理其消息（listening / startup-error /
 //      choose-project-file）
@@ -116,7 +116,7 @@ if (!hasSingleInstanceLock) {
   // 兜底：主进程异常退出时也不留下服务进程与引擎。
   process.on('exit', () => {
     const record = serverProcess
-    if (record && !record.exited && record.pid) killProcessTree(record.pid)
+    if (record && !record.exited) terminateServer(record)
   })
 }
 
@@ -129,6 +129,15 @@ function killProcessTree(pid) {
   } else {
     try { process.kill(pid, 'SIGKILL') } catch {}
   }
+}
+
+// 作用：强制结束一个服务进程记录（record）。
+// 做法：已知 pid（spawn 事件已触发或已收到 listening）时按进程树结束；
+// 若 spawn 事件还没触发、pid 仍为 0（killProcessTree 会直接返回），改用 utilityProcess 的 child.kill()
+// 结束该进程本身，避免启动超时后留下无人管理的服务进程。此时进程尚未启动引擎，没有子进程树需要清理。
+function terminateServer(record) {
+  if (record.pid) killProcessTree(record.pid)
+  else { try { record.child.kill() } catch {} }
 }
 
 // 作用：服务进程崩溃后清理它遗留的子进程树（仅 Windows）。
@@ -160,11 +169,11 @@ function stopServerProcess(record, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       console.error('Stream Studio: 本地服务未在时限内退出，强制结束进程树')
-      killProcessTree(record.pid)
+      terminateServer(record)
       resolve()
     }, timeoutMs)
     record.child.once('exit', () => { clearTimeout(timer); resolve() })
-    try { record.child.postMessage({ type: 'shutdown' }) } catch { clearTimeout(timer); killProcessTree(record.pid); resolve() }
+    try { record.child.postMessage({ type: 'shutdown' }) } catch { clearTimeout(timer); terminateServer(record); resolve() }
   })
 }
 
@@ -224,7 +233,7 @@ function startServerProcess(environment) {
     forward(child.stderr, process.stderr, true)
     const timer = setTimeout(() => {
       reject(new Error('Stream Studio 本地服务进程启动超时'))
-      killProcessTree(record.pid)
+      terminateServer(record)
     }, 30000)
     child.once('spawn', () => { record.pid = child.pid })
     // 消息协议见 desktop/server-process.mjs 文件头；就绪后以 listening 消息里的 pid 为准。
