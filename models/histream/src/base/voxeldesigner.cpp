@@ -19,6 +19,8 @@
 
 #include "voxeldesigner.h"
 #include "voxel_boundary.h"
+#include <stdexcept>
+#include <string>
 #include <nvh/gltfscene.cpp>
 //#include "autogen/VoxelDesigner.comp.h"
 // using BufferT = nanovdb::HostBuffer;
@@ -1082,8 +1084,10 @@ bool VoxelDesigner::isInPloy(nvmath::vec2i testPoint, std::vector<nvmath::vec2f>
 
 // 模块：背景平面体元化（z=0 的一层，j、k 分别对应 x、y 方向）。
 // 输入：sceneLength、sceneWidth（米）、stepSize（米）；输出：体元整数坐标 (j, k, 0)。
-// 说明：格数用 int 截断（不是 ceil）；与 createCube 不同，这里不写入 m_voxelModel
-//       （对应赋值已被注释），所以 loadModel(PLANE) 不会更新 m_voxelModel。
+// 说明：格数用 int 截断（不是 ceil），场景尺寸不是步长整数倍时最后不足一格的部分被舍去；
+//       与 createCube 不同，这里不写入 m_voxelModel（对应赋值已被注释），所以 loadModel(PLANE) 不会更新
+//       m_voxelModel。该路径目前没有调用点（loadModel 无人调用，场景背景用 createTriBackground 或
+//       DEM 路径），因此不改取整方式，避免无依据地改变行为；若将来启用，应改为 ceil 并与背景网格对齐。
 std::vector<glm::ivec3> VoxelDesigner::createBackground(float sceneLength, float sceneWidth, float stepSize)
 {
     std::vector<glm::ivec3> discreteCoord;
@@ -1176,7 +1180,7 @@ PrimMesh VoxelDesigner::createTriBackground(float sceneLength, float sceneWidth,
 }
 
 // 模块：按 shape.shapetype 分派到 createTriCube / createTriEllipsoid 生成实体网格。
-// 说明：其他形状类型不生成任何网格，返回的 PrimMesh 未初始化（meshId 等无默认值，见 structs.h）。
+// 说明：只支持 CUBE 与 ELLIPSOID；其他形状类型（如 PLANE）不能生成实体网格，抛出异常\n//       （此前直接返回未初始化的 PrimMesh，meshId 等无默认值，后续使用属于未定义行为）。
 PrimMesh VoxelDesigner::createTriEntity(Shape shape, float stepSize)
 {
     PrimMesh voxelTriModel;
@@ -1186,9 +1190,14 @@ PrimMesh VoxelDesigner::createTriEntity(Shape shape, float stepSize)
     {
         voxelTriModel = createTriCube(shape, stepSize);
     }
-    if (shapeType == ShapeType::ELLIPSOID)
+    else if (shapeType == ShapeType::ELLIPSOID)
     {
         voxelTriModel = createTriEllipsoid(shape, stepSize);
+    }
+    else
+    {
+        throw std::runtime_error("createTriEntity: unsupported shape type " + std::to_string(static_cast<int>(shapeType)) +
+                                 " (only cube=0 and ellipsoid=1 can be meshed)");
     }
 
     return voxelTriModel;
@@ -1878,11 +1887,6 @@ PrimMesh VoxelDesigner::createTriEntitiesFromTif_wall(std::string heightPath, gl
         {
             // all the height
             float curReHeight = std::round(heightScanline[static_cast<std::size_t>(j) * static_cast<std::size_t>(nImgSizeX) + static_cast<std::size_t>(i)] / stepSize);
-
-            if(curReHeight>0)
-            {
-                int a = 10;
-            }
 
             leftReHeight = std::round(heightScanline[static_cast<std::size_t>(j) * static_cast<std::size_t>(nImgSizeX) + static_cast<std::size_t>(i - 1)] / stepSize);
             rightReHeight = std::round(heightScanline[static_cast<std::size_t>(j) * static_cast<std::size_t>(nImgSizeX) + static_cast<std::size_t>(i + 1)] / stepSize);

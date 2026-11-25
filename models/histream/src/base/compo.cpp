@@ -290,7 +290,8 @@ float Compo::calctav(float alfa,float nr)
 //       FluspectParam：Cab（叶绿素）、Cw（水）、Cdm（干物质）、Cs（棕色素）、N（叶片结构参数）。
 // 输出：spectrals（先清空，再逐波长追加 {reflectance, transmittance}）。
 // 异常：N<1 或任一参数为负/非有限时抛 std::runtime_error。
-// 说明：荧光系数 phiI_/phiII_ 虽被读取，但本函数没有计算荧光（kChlrel、s 等中间量也未输出）。
+// 说明：荧光系数 phiI_/phiII_ 虽被读取，但本函数没有计算荧光（kChlrel、s 等中间量也未输出）；
+//       这是有意保留的：当前只输出反射率/透射率，荧光尚未接入后续流程，读取这两个系数仅用于校验系数表完整。
 void Compo::fluspect(const OptCoeff& fluspectCoeff, FluspectParam fluspectParam, std::vector<Spectral>& spectrals)
 {
     float Cab         = fluspectParam.Cab;
@@ -493,7 +494,7 @@ std::vector<Spectral> Compo::resolveSpectrals(const SpectralXml& material,
 //       fixedSpectrals（固定波长 400..2400 nm 每 1 nm + 10500 nm，用于能量平衡的短波/长波，待核对用途）、
 //       canopies、leafbios、soilsets、watersets 及对应 Names 字典。
 // 说明：VoxelEB 描述符布局固定，各类属性为空时追加占位项，避免空缓冲。
-// 返回：成功路径返回 false（与 createCompOptical 相反，调用方不检查，见下方 DEFERRED 备注）。
+// 返回：成功返回 true（与 createCompOptical 一致；此前成功路径返回 false，三个调用点均不检查返回值）。
 bool Compo::createCompProperty(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO> &modelio) {
 
     auto & meshio = modelio->m_meshio;
@@ -588,8 +589,8 @@ bool Compo::createCompProperty(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
         meshio->watersetNames.insert({"water", 0});
     }
 
-    // DEFERRED[低] 可维护性: 成功路径返回 false，与 createCompOptical 返回 true 相反；理由：唯一调用点 voxeleb.cpp:124 未检查返回值，改返回值属接口语义调整，不属本轮允许项，未改。
-    return false;
+    // 返回约定与 createCompOptical 统一：成功返回 true（唯一调用点 voxeleb.cpp 不检查返回值，无行为影响）。
+    return true;
 }
 
 
@@ -597,9 +598,11 @@ bool Compo::createCompProperty(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
 // 作用：土壤 BSM（Brightness-Shape-Moisture，Verhoef 等，参考 SCOPE 实现）湿土反射率。
 // 输入：bsmCoeff（GSV 基函数 gsv1/2/3_、水吸收 kw_、水折射率 nw_）；
 //       BSMParam：BSMBrightness、BSMlat/BSMlon（光谱形状的球坐标，度）、SMC（土壤含水量）。
-// 输出：spectrals 末尾追加各波长 {rwet, 0}（土壤不透射）；调用方负责事先清空。
+// 输出：spectrals 先清空，再逐波长追加 {rwet, 0}（土壤不透射；与 fluspect 一致，开头清空输出向量）。
 // 方法：干土光谱 = GSV 基函数的加权和；湿土用水膜（film 厚度）的 Lekner–Dorf 型模型（待核对）。
 void Compo::bsm(const OptCoeff& bsmCoeff,BSMParam bsm,std::vector<Spectral>& spectrals){
+
+    spectrals.clear();
 
     const std::vector<float> &gsv1_ = bsmCoeff.gsv1_;
     const std::vector<float> &gsv2_ = bsmCoeff.gsv2_;

@@ -148,15 +148,21 @@ void Engine::input(std::string path, std::string V, std::string outputPath){
             throw std::runtime_error("Mesh specular reflection requires eRaytracing");
         // Default 32 threads, never more than this machine's logical processors.
         // 线程数：默认 32，工程 control.cpuThreads 小于 1 时回到默认，并限制不超过逻辑处理器数；
-        // 通过环境变量传给后端和软件渲染库。_putenv_s 为 Windows CRT 函数（待核对跨平台可用性）。
+        // 通过环境变量传给后端和软件渲染库。Windows 用 _putenv_s，其他平台用 setenv。
         constexpr int kDefaultCpuThreads = 32;
         const int processors = static_cast<int>((std::max)(1U, std::thread::hardware_concurrency()));
         int cpuThreads = ProjectJson::integer(project.control(), "cpuThreads", kDefaultCpuThreads);
         if (cpuThreads < 1) cpuThreads = kDefaultCpuThreads;
         cpuThreads = (std::min)(cpuThreads, processors);
         const std::string value = std::to_string(cpuThreads);
+#ifdef _WIN32
         _putenv_s("HISTREAM_CPU_THREADS", value.c_str());
         _putenv_s("LP_NUM_THREADS", value.c_str());
+#else
+        // 非 Windows：POSIX setenv（overwrite=1，与 _putenv_s 的覆盖语义一致）。
+        setenv("HISTREAM_CPU_THREADS", value.c_str(), 1);
+        setenv("LP_NUM_THREADS", value.c_str(), 1);
+#endif
     }
     // 步骤 3：Facet 模式只创建后端并记录输入/输出路径与着色器目录，由后端自行读取工程。
     if (m_mode == Mode::eFacetRT || m_mode == Mode::eFacetEB) {

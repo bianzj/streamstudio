@@ -670,6 +670,22 @@ int idOrZero(const MapType& values, const std::string& name)
     return found == values.end() ? 0 : found->second;
 }
 
+// 作用：同 idOrZero，但名称不存在时向 stderr 警告一次（每个名称只警告一次），结果仍取 0 号。
+// 用途：VoxelRT 背景的水体/土壤参数集——VoxelEB 对同一绑定名称不存在时抛异常，VoxelRT 为兼容旧工程
+//       保留回退 0 号的行为（不改计算结果），但不再静默。
+template <typename MapType>
+int idOrZeroWarn(const MapType& values, const std::string& name, const char* kind)
+{
+    const auto found = values.find(name);
+    if (found != values.end()) return found->second;
+    static std::set<std::string> reported;
+    if (reported.insert(std::string(kind) + '\n' + name).second) {
+        std::cerr << "Warning: unknown " << kind << " name '" << name
+                  << "', using the first " << kind << " entry" << std::endl;
+    }
+    return 0;
+}
+
 // A primitive building always creates wall and roof meshes. A single schema
 // binding applies to both; the optional second binding overrides the roof.
 // 作用：规整基元建筑实体——把墙/屋顶双绑定补齐为两项，并在需要时从位置文件读取实例。
@@ -2206,8 +2222,6 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
             }
             n_modelmesh++;
         }
-
-        int a = 10;
     }
 
 
@@ -2859,7 +2873,8 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
             }
 
-            // 墙体与屋顶各占一个实例编号。注意：该自增位于 if 条件内，条件不成立时实例已创建但编号不前进（疑似问题，待核对）。
+            // 墙体与屋顶各占一个实例编号。该自增位于 if 条件内，但条件恒成立：本函数只由 type==BUILDING 的实体调用，
+            // 且入口处 preparePrimitiveBuilding 已把 meshNames 补齐为 2 项（不是 1~2 项会抛异常），故实例编号不会失步。
             n_instance += 2;
 
         }
@@ -3657,7 +3672,8 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
 
             }
 
-            // 墙体与屋顶各占一个实例编号。注意：该自增位于 if 条件内，条件不成立时实例已创建但编号不前进（疑似问题，待核对）。
+            // 墙体与屋顶各占一个实例编号。该自增位于 if 条件内，但条件恒成立：本函数只由 type==BUILDING 的实体调用，
+            // 且入口处 preparePrimitiveBuilding 已把 meshNames 补齐为 2 项（不是 1~2 项会抛异常），故实例编号不会失步。
             n_instance += 2;
 
         }
@@ -3737,7 +3753,8 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     meshio->primMeshes.emplace_back(bgModel);
 
     // background model link
-    // 背景 MeshLink：光谱必须存在；热属性、水体/土壤参数集缺失时回退 0 号（不告警）；冠层固定 0。
+    // 背景 MeshLink：光谱必须存在；热属性缺失时回退 0 号（不告警）；水体/土壤参数集缺失时回退 0 号并告警一次
+    // （VoxelEB 对该绑定缺失会抛异常；此处为兼容旧工程保持回退，不改结果）；冠层固定 0。
     MeshLink bgMeshLink{};
     std::string bgThermalName = background.bgThermalName;
     bgMeshLink.thermalId =  idOrZero(meshio->thermalNames, bgThermalName);
@@ -3758,11 +3775,9 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     int bgPropIndex = 0;
     std::string bgPropName = background.bgPropName;
     if (background.type == Type::WATER) {
-        const auto propIt = meshio->watersetNames.find(bgPropName);
-        bgPropIndex = propIt == meshio->watersetNames.end() ? 0 : propIt->second;
+        bgPropIndex = idOrZeroWarn(meshio->watersetNames, bgPropName, "water property");
     } else {
-        const auto propIt = meshio->soilsetNames.find(bgPropName);
-        bgPropIndex = propIt == meshio->soilsetNames.end() ? 0 : propIt->second;
+        bgPropIndex = idOrZeroWarn(meshio->soilsetNames, bgPropName, "soil property");
     }
     bgMeshLink.bioId = bgPropIndex;
     bgMeshLink.type = static_cast<int>(background.type);

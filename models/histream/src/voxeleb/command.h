@@ -51,9 +51,10 @@ public:
 //                const std::optional<VkSemaphore> &inSemaphore, const std::optional<VkSemaphore> &outSemaphore);
 
     // 向命令缓冲录入：绑定计算管线、绑定描述符集、推送 VoxelLstSetting 常量。
-    void Command::recordCommandBuffer(VkCommandBuffer cmdBuf,
-                                      VkDescriptorSet descSet, VkPipelineLayout pipelineLayout,
-                                      VkPipeline pipeline,  VoxelLstSetting setting);
+    // （类内声明不带 Command:: 限定：GCC/Clang 视多余限定为错误，MSVC 才容忍。）
+    void recordCommandBuffer(VkCommandBuffer cmdBuf,
+                             VkDescriptorSet descSet, VkPipelineLayout pipelineLayout,
+                             VkPipeline pipeline,  VoxelLstSetting setting);
 
 //    void Command::recordCommandBuffer(VkCommandBuffer cmdBuf, VkDescriptorSet descSet, VkPipelineLayout pipelineLayout,
 //                                      std::map<VoxelEBStage, VkPipeline> pipelines, VoxelEBStage stage, VoxelLstSetting setting);

@@ -11,8 +11,8 @@
 // 数据流：FileIO（工程 XML）+ AppSetting（Vulkan 上下文）→ VoxelrtIO（运行时状态）→ 子模块 → GPU。
 // 与其他文件的关系：实现在 voxelrt.cpp；状态在 voxelrtio.h；管线在 pipeline.h；
 //   缓冲/描述符/命令分别在同目录 buffer.h、descriptor.h、command.h。
-// 注意：include 路径中的 "src/Voxelrt/..." 目录名大小写与实际目录 voxelrt 不一致，
-//   在大小写敏感的文件系统上可能找不到头文件（只报告，未修改）。
+// 说明：include 路径统一写成与实际目录、文件名一致的小写 "src/voxelrt/..."（此前误写为 Voxelrt/Voxelrtio.h，
+//   在大小写敏感的文件系统上会找不到头文件）。
 // ==========================================================================
 
 //
@@ -26,17 +26,17 @@
 #include <vector>
 #include <map>
 #include <iomanip>
-#include "src/Voxelrt/Voxelrtio.h"
+#include "src/voxelrt/voxelrtio.h"
 #include "src/base/structs.h"
 #include "src/base/geometry.h"
 #include "src/base/compo.h"
 #include "src/base/scene.h"
-#include "src/Voxelrt/pipeline.h"
+#include "src/voxelrt/pipeline.h"
 #include "src/base/virtualscreen.h"
-#include "src/Voxelrt/buffer.h"
+#include "src/voxelrt/buffer.h"
 #include "src/base/accelstruct.h"
-#include "src/Voxelrt/descriptor.h"
-#include "src/Voxelrt/command.h"
+#include "src/voxelrt/descriptor.h"
+#include "src/voxelrt/command.h"
 #include "src/base/utils.h"
 
 // 模块：VoxelRT 模式入口类。所有运行时数据保存在 VoxelrtIO，本类只持有各子模块的实例。

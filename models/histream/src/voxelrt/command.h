@@ -52,9 +52,10 @@ public:
 //                const std::optional<VkSemaphore> &inSemaphore, const std::optional<VkSemaphore> &outSemaphore);
 
     // 录制：内存屏障 + 绑定管线/描述符集 + 推送常量 VoxelRTSetting（按值传入）。
-    void Command::recordCommandBuffer(VkCommandBuffer cmdBuf,
-                                      VkDescriptorSet descSet, VkPipelineLayout pipelineLayout,
-                                      VkPipeline pipeline,  VoxelRTSetting setting);
+    // （类内声明不带 Command:: 限定：GCC/Clang 视多余限定为错误，MSVC 才容忍。）
+    void recordCommandBuffer(VkCommandBuffer cmdBuf,
+                             VkDescriptorSet descSet, VkPipelineLayout pipelineLayout,
+                             VkPipeline pipeline,  VoxelRTSetting setting);
 
 //    void Command::recordCommandBuffer(VkCommandBuffer cmdBuf, VkDescriptorSet descSet, VkPipelineLayout pipelineLayout,
 //                                      std::map<VoxelEBStage, VkPipeline> pipelines, VoxelEBStage stage, VoxelLstSetting setting);

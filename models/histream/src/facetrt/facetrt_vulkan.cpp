@@ -1732,6 +1732,9 @@ uint32_t FacetrtVulkan::recordSolve(VkCommandBuffer commandBuffer, float skyRadi
 // 返回最后一次扫描所写缓冲的下标（即当前迭代值所在缓冲）。
 // 每次扫描先清零 residual（存放本次最大变化量，float 位模式），有地面时先更新等效地面均值
 // （保证与 Jacobi 迭代一致）；indirect=true 时工作组数取自 m_spectralDispatch（光谱加速模式）。
+// 说明：residual 每次扫描都被清零，因此一个批次（iterations 次）结束后回读到的 maxDelta 只反映
+//       该批最后一次扫描的最大变化量，而不是批内各次扫描的最大值——这是有意的：收敛判据看的是
+//       相邻两次迭代之间的变化，最后一次最能代表当前残差（见 solveAccelerated 按批回读）。
 // 副作用：++m_solveGeneration，使 evaluateEnergy 不再沿用旧的热启动结果。
 uint32_t FacetrtVulkan::recordIterations(VkCommandBuffer commandBuffer, uint32_t ping, float skyRadiosity,
                                         uint32_t iterations, float relaxation, bool indirect)

@@ -509,17 +509,12 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
 
     // 【修正2】创建 CPU 端内存副本 (Deep Copy)
     // 这是解决 0xc0000005 崩溃的核心：将显存数据拷贝到 CPU，使其脱离 Vulkan 生命周期
-    float* pCpuData = new float[total_elements];
-    if (pCpuData) {
-        // 使用 memcpy 高速拷贝
-        std::memcpy(pCpuData, data, bufferSize);
-    } else {
-        // 内存分配失败处理 (通常是因为没有编译为 x64)
-        std::cerr << "Error: Failed to allocate CPU memory. Make sure to compile in x64 mode!" << std::endl;
-        modelio->m_pAlloc->unmap(pixelBuffer);
-        modelio->m_pAlloc->destroy(pixelBuffer);
-        return; // 或者适当的错误处理
-    }
+    // 用 std::vector 持有副本：new[] 分配失败会抛 std::bad_alloc 而不会返回空指针，原先的空指针判断没有作用；
+    // 改为 vector 后析构时自动释放，也不再需要手工 delete[]。
+    std::vector<float> cpuDataStorage(total_elements);
+    float* pCpuData = cpuDataStorage.data();
+    // 使用 memcpy 高速拷贝
+    std::memcpy(pCpuData, data, bufferSize);
 
     // --- 此时数据已安全在 pCpuData 中，不再依赖 pData/data 指针 ---
 
@@ -536,7 +531,6 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
     Eigen::VectorXd cx;
     Eigen::VectorXd cy;
     m_pGeometry->orthcorrect(modelio, angle.vza, angle.vaa, cx, cy);
-    std::cout << "x' = " << cx[0]<<std::endl;
     // 分配结果内存
     float *pData_orth = new float[total_elements];
     std::memset(pData_orth, 0, bufferSize);
@@ -621,7 +615,7 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
         raytracingBandNames(waves, modelio->isTemperature));
 
     // 释放内存
-    delete[] pCpuData;    // 记得释放拷贝的源数据
+    // pCpuData 由 cpuDataStorage 持有，函数结束时自动释放。
     delete[] pData_orth;  // 释放结果数据
 }
 
@@ -651,17 +645,12 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
 
     // 【修正2】创建 CPU 端内存副本 (Deep Copy)
     // 这是解决 0xc0000005 崩溃的核心：将显存数据拷贝到 CPU，使其脱离 Vulkan 生命周期
-    float* pCpuData = new float[total_elements];
-    if (pCpuData) {
-        // 使用 memcpy 高速拷贝
-        std::memcpy(pCpuData, data, bufferSize);
-    } else {
-        // 内存分配失败处理 (通常是因为没有编译为 x64)
-        std::cerr << "Error: Failed to allocate CPU memory. Make sure to compile in x64 mode!" << std::endl;
-        modelio->m_pAlloc->unmap(pixelBuffer);
-        modelio->m_pAlloc->destroy(pixelBuffer);
-        return; // 或者适当的错误处理
-    }
+    // 用 std::vector 持有副本：new[] 分配失败会抛 std::bad_alloc 而不会返回空指针，原先的空指针判断没有作用；
+    // 改为 vector 后析构时自动释放，也不再需要手工 delete[]。
+    std::vector<float> cpuDataStorage(total_elements);
+    float* pCpuData = cpuDataStorage.data();
+    // 使用 memcpy 高速拷贝
+    std::memcpy(pCpuData, data, bufferSize);
 
     // --- 此时数据已安全在 pCpuData 中，不再依赖 pData/data 指针 ---
 
@@ -724,7 +713,7 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
         raytracingBandNames(waves, modelio->isTemperature));
 
     // 释放内存
-    delete[] pCpuData;    // 记得释放拷贝的源数据
+    // pCpuData 由 cpuDataStorage 持有，函数结束时自动释放。
 }
 
 // 模块：outputAlbedo——把每个波段的平均反射率追加写入工程目录下的 albedo.txt。

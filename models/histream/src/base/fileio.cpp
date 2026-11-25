@@ -943,6 +943,8 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
                         // 环宽取 r0·sqrt(pi/k0)，内环方向数 k1 按面积比 (r1/r0)^2 缩小；
                         // 每环取中间天顶角 theta、方位角在 [0,360) 内均分（起点为半个间隔），最多 10 环；
                         // k1<=0 时补一个天顶方向 (0,0) 并结束。
+                        // 注意：环数上限 10 是硬编码（angleNum 很大时最内几环可能没生成完，天顶附近被稀疏覆盖）；
+                        // pi 取 3.1415926（float 精度下与 M_PI 的差约 1e-7，对角度生成无实际影响；为保持输出逐字节不变不改）。
                         float theta0, theta1, theta;
                         float r0, r1;
                         int k0, k1, k00;
@@ -1164,6 +1166,8 @@ SensorXml FileIO::readSensorXML(TiXmlNode *node, Mode mode){
                     const int isHemisphere = readInt(subEle, "enabled", 0);
                     const int hemiAngleNum = readInt(subEle, "angleNum", 0);
                     if (isHemisphere == 1 && hemiAngleNum > 0){
+                        // 与多光谱分支的 albedo 观测角生成完全相同（环数上限 10、pi=3.1415926 的说明见上方）；
+                        // 两处重复实现，修改时需同步。
                         float theta0, theta1, theta;
                         float r0, r1;
                         int k0, k1, k00;

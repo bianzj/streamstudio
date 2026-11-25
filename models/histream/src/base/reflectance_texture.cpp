@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -103,7 +104,7 @@ float ReflectanceVarianceTexture::sample(float u, float v) const
 
 // 作用：读取纹理文件，转成零均值、最大绝对值为 1 的线性亮度偏差图。
 // 输入：图像路径（GDAL 支持的格式）；输出：共享只读纹理，同一绝对路径复用缓存
-//       （弱引用，无人使用时会被释放；缓存未加锁，假定在单线程中加载，待核对）。
+//       （弱引用，无人使用时会被释放；缓存查找、读图与登记整个过程由静态互斥量保护，可多线程调用）。
 // 失败（无法打开、小于 2x2、无色彩波段、无有效像素、近似常数）一律抛异常。
 // 步骤：1 缓存查找与打开 → 2 读色彩通道转线性（调色板/多波段/灰度）→
 //       3 按 Rec.709 权重算亮度并求均值 → 4 去均值并按最大绝对值归一化。
@@ -113,6 +114,9 @@ std::shared_ptr<const ReflectanceVarianceTexture> loadReflectanceVarianceTexture
     const std::string key = std::filesystem::absolute(path).lexically_normal().string();
     static std::unordered_map<
         std::string, std::weak_ptr<const ReflectanceVarianceTexture>> cache;
+    // 整个函数持锁：同一路径并发加载时只有一个线程读图，其余等待后命中缓存（GDALAllRegister 也因此串行）。
+    static std::mutex cacheMutex;
+    const std::lock_guard<std::mutex> cacheLock(cacheMutex);
     const auto cached = cache.find(key);
     if (cached != cache.end()) {
         if (const auto texture = cached->second.lock()) return texture;
@@ -284,25 +288,25 @@ float physicalTextureScale(float strength, float relativeStd,
 }
 
 // 作用：三平面采样。三张投影分别对应三个世界轴向，按法向分量绝对值加权平均。
-// 输入：center 为三角形质心（世界坐标，m）；normal 为法向各分量绝对值；
+// 输入：center 为三角形质心（世界坐标，m）；absoluteNormal 为法向各分量绝对值（与头文件参数名一致）；
 //       repeatSize 为纹理重复一次对应的世界长度（m，下限 0.01）。
 // 输出：无量纲偏差（约 [-1,1]），调用方再乘 physicalTextureScale 的 scale。
 float sampleReflectanceVarianceTriplanar(const ReflectanceVarianceTexture& texture,
                                          const std::array<float, 3>& center,
-                                         const std::array<float, 3>& normal,
+                                         const std::array<float, 3>& absoluteNormal,
                                          float repeatSize)
 {
     // World axes: +X north, +Y up, +Z east. Image columns run along the
     // horizontal axis and rows downward, so walls (X- or Z-facing) take v = -y
     // and stay upright; the ground is north-up/east-right like the DEM
     // (u = east, v = south = -x).
-    const float weightSum = std::max(1.0e-6f, normal[0] + normal[1] + normal[2]);
+    const float weightSum = std::max(1.0e-6f, absoluteNormal[0] + absoluteNormal[1] + absoluteNormal[2]);
     const float inverseRepeat = 1.0f / std::max(0.01f, repeatSize);
     const float north = center[0] * inverseRepeat;
     const float up = center[1] * inverseRepeat;
     const float east = center[2] * inverseRepeat;
     return (
-        normal[0] * texture.sample(east, -up) +
-        normal[1] * texture.sample(east, -north) +
-        normal[2] * texture.sample(north, -up)) / weightSum;
+        absoluteNormal[0] * texture.sample(east, -up) +
+        absoluteNormal[1] * texture.sample(east, -north) +
+        absoluteNormal[2] * texture.sample(north, -up)) / weightSum;
 }

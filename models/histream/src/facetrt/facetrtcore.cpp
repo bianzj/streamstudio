@@ -3945,13 +3945,25 @@ std::string decodeXmlText(std::string value)
 }
 
 // 作用：取 xml 中第一个 <tag ...>内容</tag> 的内容（已解码实体）；找不到返回空串。
-// 说明：按前缀 "<tag" 查找，不检查标签名边界，也不处理嵌套同名标签（待核对：
-//       例如 ref_TIR 与 ref_TIR_wet 并存时依赖其书写顺序）。
+// 说明：按前缀 "<tag" 查找，并检查标签名边界（后一个字符必须是 '>'、'/' 或空白），
+//       因此 ref_TIR 不会误匹配 <ref_TIR_wet>；仍不处理嵌套同名标签。
 std::string firstXmlTag(const std::string& xml, const char* tag)
 {
     const std::string open = "<" + std::string(tag);
     const std::string close = "</" + std::string(tag) + ">";
-    const size_t begin = xml.find(open);
+    // 逐个候选位置查找，跳过只是前缀相同的更长标签名（如 <ref_TIR_wet>）。
+    size_t begin = xml.find(open);
+    while (begin != std::string::npos) {
+        const size_t after = begin + open.size();
+        if (after >= xml.size()) {
+            return {};
+        }
+        const unsigned char next = static_cast<unsigned char>(xml[after]);
+        if (next == '>' || next == '/' || std::isspace(next) != 0) {
+            break;
+        }
+        begin = xml.find(open, begin + 1U);
+    }
     if (begin == std::string::npos) {
         return {};
     }
@@ -5609,7 +5621,9 @@ try {
         std::lround(xmlFloat(xml, "startTimeNode", 0.0f))));
     const int endNode = std::max(startNode + 1, static_cast<int>(
         std::lround(xmlFloat(xml, "endTimeNode", static_cast<float>(startNode + 1)))));
-    const float dTime = std::max(1.0f, xmlFloat(xml, "dTime", 1800.0f));
+    // 名称带 nominal：节点循环内另有逐节点的 dTime（可能取变步长），这里仅是工程给定的名义步长，
+    // 只用于未提供气象文件时合成时间轴，避免与循环内的同名变量互相遮蔽。
+    const float nominalDTime = std::max(1.0f, xmlFloat(xml, "dTime", 1800.0f));
     std::vector<float> nodeTimeSteps;
     const auto variableSteps=firstXmlTag(xml,"nodeTimeStepsSeconds");
     if(!variableSteps.empty()) {
@@ -5662,6 +5676,8 @@ try {
         {"completed", ProjectJson::Json::array()}, {"products", ProjectJson::Json::array()}
     }};
     runIndex.write();
+    // 叶片求根未收敛诊断计数：本次运行开始时清零，结束时写入日志与 faceteb_run.json（只统计，不影响结果）。
+    facetphysics::solverDiagnostics().reset();
     // 步骤 2：读取模型选项与地理/天空参数：光谱加速宽度（1–1000，缺省 100）、植被温度方法（0/1）、
     // 土壤惯性历史、经纬度（°）、年份、时区（h）、天空温度（K，150–350，缺省 250）。
     const size_t spectralAccelerationWidth = static_cast<size_t>(std::clamp(
@@ -5751,7 +5767,7 @@ try {
         for (int node = 0; node < endNode; ++node) {
             meteorology[static_cast<size_t>(node)].node = node;
             meteorology[static_cast<size_t>(node)].julianTime =
-                1.0f + static_cast<float>(node) * dTime / 86400.0f;
+                1.0f + static_cast<float>(node) * nominalDTime / 86400.0f;
         }
     }
     if (endNode > static_cast<int>(meteorology.size())) {
@@ -8936,6 +8952,20 @@ try {
     runIndex.value["products"].push_back(std::filesystem::path(resultFile).filename().generic_string());
     runIndex.value["status"] = allNodesConverged ? "completed" : "non_converged";
     runIndex.value["finishedAt"] = utcTimestamp();
+    {
+        // 叶片求根未收敛次数（temperatureRoot：叶温牛顿-二分；coupledLeaf：叶温-气孔阻抗耦合二分）。
+        // 计数 > 0 表示有若干叶片面元的叶温/气孔阻抗取了未完全收敛的值（括号 [220,360] K 外的根或迭代用尽）。
+        const auto& diagnostics = facetphysics::solverDiagnostics();
+        const std::uint64_t rootCalls = diagnostics.temperatureRootCalls.load();
+        const std::uint64_t rootUnconverged = diagnostics.temperatureRootUnconverged.load();
+        const std::uint64_t leafCalls = diagnostics.coupledLeafCalls.load();
+        const std::uint64_t leafUnconverged = diagnostics.coupledLeafUnconverged.load();
+        runIndex.value["solverDiagnostics"] = {
+            {"temperatureRootCalls", rootCalls}, {"temperatureRootUnconverged", rootUnconverged},
+            {"coupledLeafCalls", leafCalls}, {"coupledLeafUnconverged", leafUnconverged}};
+        std::cout << "FACET_SOLVER_DIAG\t" << rootCalls << '\t' << rootUnconverged
+                  << '\t' << leafCalls << '\t' << leafUnconverged << std::endl;
+    }
     runIndex.write();
     if (shadowEnergy) {
         std::cerr << "faceteb: audited facets by class:";

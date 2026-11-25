@@ -20,6 +20,7 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -440,12 +441,33 @@ inline double inverseObukhov(double sensibleHeat, double rho, double temperature
     return std::clamp(raw * a.effectiveHeight, -5.0, 1.0) / a.effectiveHeight;
 }
 
+// 模块：叶片求根的未收敛诊断计数（进程内全局，原子计数，可在多线程求解中安全累加）。
+// 只统计、不改变任何求解结果：temperatureRoot / coupledLeaf 在未满足收敛条件而退出时各加 1，
+// 由 facetrtcore.cpp 在每次运行开始时清零、结束时写入日志与 faceteb_run.json 的 solverDiagnostics。
+struct SolverDiagnostics {
+    std::atomic<std::uint64_t> temperatureRootCalls{0};        // temperatureRoot 调用次数
+    std::atomic<std::uint64_t> temperatureRootUnconverged{0};  // 其中未收敛退出的次数（括号收窄到容差仍不满足修正条件，或 32 次用完）
+    std::atomic<std::uint64_t> coupledLeafCalls{0};            // coupledLeaf 调用次数
+    std::atomic<std::uint64_t> coupledLeafUnconverged{0};      // 其中 24 次 ln r_s 二分用完仍未满足容差的次数
+    void reset() {
+        temperatureRootCalls = 0; temperatureRootUnconverged = 0;
+        coupledLeafCalls = 0; coupledLeafUnconverged = 0;
+    }
+};
+inline SolverDiagnostics& solverDiagnostics() {
+    static SolverDiagnostics diagnostics;
+    return diagnostics;
+}
+
 // 模块：叶片温度与气孔阻抗的耦合求解。leafThermalToleranceK 为叶温内层求根容差（K）。
 inline constexpr double leafThermalToleranceK = 0.01;
 // Fixed-resistance thermal equation is monotone; safeguard Newton by its bracket.
-// DEFERRED[中] 数值: 括号固定为 [220,360] K，若真实根在区间外（强辐射下的深色屋顶/光伏、寒夜）会被静默钳在边界；32 次未收敛也直接返回当前值而不告知调用方，coupledLeaf 随后基于错误温度继续二分；建议：返回是否收敛的标志，或在端点残差同号时抛错/记录诊断。
+// 说明：括号固定为 [220,360] K。真实根在括号外（强辐射下的深色屋顶/光伏、寒夜）时会被钳在边界；
+// 32 次未收敛或括号收窄到容差仍不满足修正条件时返回当前值（求解结果保持不变）。这些情形现在会计入
+// solverDiagnostics().temperatureRootUnconverged，由调用方在日志与 faceteb_run.json 中报告。
 template<class Energy>
 double temperatureRoot(double initial, Energy&& evaluate) {
+    solverDiagnostics().temperatureRootCalls.fetch_add(1, std::memory_order_relaxed);
     // 步骤 1：在固定括号 [220, 360] K 内从 initial 起步。
     double lower = 220, upper = 360, temperature = std::clamp(initial, lower, upper);
     for (int i = 0; i < 32; ++i) {
@@ -458,13 +480,15 @@ double temperatureRoot(double initial, Energy&& evaluate) {
         // No additional evaluation or iteration is needed.
         if (std::abs(correction) <= leafThermalToleranceK)
             return std::clamp(temperature + correction, lower, upper);
-        // 步骤 3：括号已窄于容差仍未满足修正条件时停止（见上方 DEFERRED 说明）。
+        // 步骤 3：括号已窄于容差仍未满足修正条件时停止（按未收敛计数，见上方说明）。
         if (upper - lower <= leafThermalToleranceK) break;
         // 步骤 4：残差为正说明根在更高温度，据此收紧括号；牛顿试探点落在括号外则改用二分。
         if (value[0] > 0) lower = temperature; else upper = temperature;
         const double trial = temperature + value[0] / std::max(1.0, value[1]);
         temperature = trial > lower && trial < upper ? trial : .5 * (lower + upper);
     }
+    // 只有 break 或 32 次用完才会走到这里（正常收敛已在循环内返回）：计为未收敛。
+    solverDiagnostics().temperatureRootUnconverged.fetch_add(1, std::memory_order_relaxed);
     return temperature;
 }
 // 叶片状态：叶温（K）与气孔阻抗 r_s（s m-1）。
@@ -478,6 +502,7 @@ inline constexpr double leafStomatalLogTolerance = 0.01;
 // Reversing this order avoids branch jumps in humidity-only roots at fixed T.
 template<class Thermal, class Physiology>
 LeafState coupledLeaf(Thermal&& thermal, Physiology&& physiology) {
+    solverDiagnostics().coupledLeafCalls.fetch_add(1, std::memory_order_relaxed);
     // 步骤 1：在 ln r_s 空间设括号。
     double lower = std::log(1.0), upper = std::log(625000.0);
     for (int i = 0; i < leafStomatalMaxIterations; ++i) {
@@ -491,7 +516,8 @@ LeafState coupledLeaf(Thermal&& thermal, Physiology&& physiology) {
         // 步骤 3：试探值大于目标则缩小上界，否则抬高下界。
         if (middle > std::log(target)) upper = middle; else lower = middle;
     }
-    // 步骤 4：达最大迭代次数仍未满足容差时，取括号中点并重新解叶温（不向调用方报告未收敛）。
+    // 步骤 4：达最大迭代次数仍未满足容差时，取括号中点并重新解叶温（结果不变，仅计入未收敛诊断计数）。
+    solverDiagnostics().coupledLeafUnconverged.fetch_add(1, std::memory_order_relaxed);
     const double resistance = std::exp(.5 * (lower + upper));
     return {thermal(resistance), resistance};
 }

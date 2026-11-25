@@ -199,7 +199,9 @@ bool Voxelrt::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
 // 模块：把 VoxelrtIO 的运行参数填入 GPU 推送常量 modelio->setting（VoxelRTSetting）。
 // 说明：scale 为体元边长 stepsize_surface（m）；voxelSize 取自 voxelSize_XZY，
 // 其 y 分量（竖直层数）随后按场景高度重新计算；体元边长各向同性，竖直也用 stepsize_surface
-// （scene.cpp 要求 stepsize_surface == stepsize_height）。
+// （scene.cpp 要求 stepsize_surface == stepsize_height，读入时二者同取 voxelSize）。
+// 有意不改用 stepsize_height：着色器的推送常量只有一个 scale（取 stepsize_surface），三轴共用，
+// 竖直层数必须与该边长一致，否则二者不等时层数与着色器的体元坐标不符。
 bool Voxelrt::updateSetting(std::shared_ptr<VoxelrtIO> &modelio){
 
     // auto &opo = modelio->m_opo;
