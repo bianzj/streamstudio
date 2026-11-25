@@ -276,7 +276,8 @@ function normalizeMaterialItem(item = {}) {
   }
 }
 
-// 作用：补全对象的随机运动参数（缺省按车辆/船与行人区分；speed m s-1，range 活动范围 m（待核对），turnInterval s）。
+// 作用：补全对象的随机运动参数（缺省按车辆/船与行人区分；speed m s-1，range 相对出生点的活动半径 m，turnInterval 转向间隔 s）。
+//   随机移动只用于三维预览动画（scene-loader.js），引擎不读取 movement。
 function normalizeMovement(item = {}) {
   const vehicle = item.type === 'Vehicle' || item.type === 'Ship'
   const defaults = {
@@ -544,6 +545,12 @@ export function vehicleInteriorDefaults(seatType = 'fabric') {
     dashboard: { share: 0.30, capacity: 10000, hcA: 8, radArea: 1 }, seat: { share: 0.35, capacity: seat.capacity, hcA: 24, radArea: 3 },
     wheel: { share: 0.05, capacity: 2000, hcA: 2, radArea: 0.25 }, lining: { share: 0.30, capacity: 60000, hcA: 40, radArea: 8 } }
 }
+// 内饰节点参数“缺字段”时的容错值。注意这不是新工程缺省（上面 vehicleInteriorDefaults 的 0.30/0.35/0.05/0.30 等），
+// 而是引擎读取 project.json 时对缺失字段的回退值（facetrtcore.cpp 的 list(in,"share",ids,0.25f) 等，四个节点相同：
+// share 0.25、capacity 10000 J/K、hcA 4 W/K、radArea 1 m²）。校验（validateProject）与 XML 导出（materialXml）
+// 都用这一份常量，保证“缺字段”时校验结果与引擎实际采用的值一致；节点字段齐全（新工程总是齐全）时与它无关。
+export const VEHICLE_INTERIOR_NODE_IDS = ['dashboard', 'seat', 'wheel', 'lining']
+export const VEHICLE_INTERIOR_NODE_FALLBACK = Object.freeze({ share: 0.25, capacity: 10000, hcA: 4, radArea: 1 })
 // Engine block + engine-bay air: Q_eng = enginePower x engineShare split into radiator (to the bay air stream),
 // block and exhaust (underbody shell); firewallG = bulkhead conductance bay -> cabin (W/K).
 export function vehicleEngineDefaults() {
@@ -1512,10 +1519,14 @@ export function validateProject(value) {
       const inRange = (value, lo, hi, fallback) => { const v = value === undefined || value === null || value === '' ? fallback : Number(value); return Number.isFinite(v) && v >= lo && v <= hi }
       // 内饰四个节点（仪表台/座椅/方向盘/顶棚车门）的受光份额之和必须为 1，热容、hA、辐射面积需在范围内。
       if (k.interior?.enabled) {
-        const it = k.interior, nodes = ['dashboard', 'seat', 'wheel', 'lining'].map((id) => it[id] || {})
-        const shares = nodes.reduce((sum, node) => sum + (Number(node.share) || 0), 0)
+        // 份额之和与逐项范围检查使用同一缺字段容错值（VEHICLE_INTERIOR_NODE_FALLBACK，与引擎一致）：
+        // 此前求和时缺字段按 0、范围检查时按 0.25，两者不一致。
+        const fallback = VEHICLE_INTERIOR_NODE_FALLBACK
+        const it = k.interior, nodes = VEHICLE_INTERIOR_NODE_IDS.map((id) => it[id] || {})
+        const nodeShare = (node) => node.share === undefined || node.share === null || node.share === '' ? fallback.share : Number(node.share)
+        const shares = nodes.reduce((sum, node) => sum + (nodeShare(node) || 0), 0)
         if (!inRange(it.shellRadFraction, 0, 0.95, 0.45) || !inRange(it.seatEffusivity, 1, 1e4, 300) || Math.abs(shares - 1) > 1e-3 ||
-            nodes.some((node) => !inRange(node.share, 0, 1, 0.25) || !inRange(node.capacity, 10, 1e8, 10000) || !inRange(node.hcA, 0.01, 1e4, 4) || !inRange(node.radArea, 0, 1e3, 1)))
+            nodes.some((node) => !inRange(node.share, 0, 1, fallback.share) || !inRange(node.capacity, 10, 1e8, fallback.capacity) || !inRange(node.hcA, 0.01, 1e4, fallback.hcA) || !inRange(node.radArea, 0, 1e3, fallback.radArea)))
           errors.push('车辆内饰节点参数无效（份额之和 = 1，热容 ≥ 10 J/K，hA > 0）：' + m.name)
       }
       // 发动机：散热器/机体/排气三份额之和必须为 1；热容、换热与舱通风系数需在范围内。
@@ -1692,7 +1703,8 @@ function materialXml(item) {
   if (item.type === 'Vegetation') return `<property><leafBio name="${name}"><Vcmax>${number(params.Vcmax, 80)}</Vcmax><m>${number(params.m, 9)}</m><BallBerry>${number(params.BallBerry, 0.01)}</BallBerry><Type>${number(params.Type, 3)}</Type><kV>${number(params.kV, 0.6396)}</kV><Rdparam>${number(params.Rdparam, 0.015)}</Rdparam><Tparam>${xmlEscape(params.Tparam || '0.2,0.3,288,313,328')}</Tparam><Tyear>${number(params.Tyear, 25)}</Tyear><beta>${number(params.beta, 0.507)}</beta><kNPQs>${number(params.kNPQs, 0)}</kNPQs><qLs>${number(params.qLs, 1)}</qLs><stressfactor>${number(params.stressfactor, 1)}</stressfactor><Tcor>${number(params.Tcor, 0)}</Tcor></leafBio></property>`
   if (item.type === 'Water') return `<property><waterSet name="${name}"><rss>${number(params.rss, 0)}</rss><heatCapacity>${number(params.heatCapacity, 4186000)}</heatCapacity><mixingDepth>${number(params.mixingDepth, 0.5)}</mixingDepth><evaporationCoefficient>${number(params.evaporationCoefficient, 1)}</evaporationCoefficient><brdfModel>${number(params.brdfModel, 1) ? 'CoxMunk' : 'Lambert'}</brdfModel><refractiveIndex>${number(params.refractiveIndex, 1.333)}</refractiveIndex><slopeVariance>${Math.max(0, number(params.slopeVariance, 0))}</slopeVariance><diffuseFraction>${Math.max(0, Math.min(1, number(params.diffuseFraction, 0.02)))}</diffuseFraction>${waterInitialXml(params)}</waterSet></property>`
   // soilSet 分支：下面先组装可选的墙体（wall）、船舶（ship）、车辆（vehicle）片段，最后拼成 soilSet。
-  // DEFERRED[低] Bug: Tsoil 缺省值写成 0.25，其余位置（预设材质）均为 25 ℃，缺字段时初温相差两个数量级；未修复：默认数值常量属禁止修改项，需产品确认单位后统一
+  // Tsoil 缺省 25 ℃，与预设材质及引擎 fileio_json.cpp（Tsoil 缺省 25）一致；此前误写为 0.25（2026-11-25 修正，
+  // 仅影响缺 Tsoil 字段时导出的 XML，预设与新工程总带有该字段）。
   // FacetEB wall/roof slab (wallMode 'wall'); absent = thin shell, so old XML stays unchanged.
   const wall = params.wallMode === 'wall' && !item.energyModel
     ? `<wallMode>wall</wallMode><thickness>${number(params.thickness, 0.2)}</thickness><indoorTemperature>${number(params.indoorTemperature, 22)}</indoorTemperature><indoorHeatTransferCoefficient>${number(params.indoorHeatTransferCoefficient, 8)}</indoorHeatTransferCoefficient>${wallLayersXml(params.layers)}`
@@ -1722,7 +1734,7 @@ function materialXml(item) {
   // csv：按 ids 顺序取 source[id][key]（缺省 fallback），用逗号拼接成列表。
   const csv = (source, key, ids, fallback) => ids.map((id) => number(source?.[id]?.[key], fallback)).join(',')
   const interiorXml = (it) => it && it.enabled
-    ? `<vcIntModel>1</vcIntModel><vcIntShares>${csv(it, 'share', ['dashboard', 'seat', 'wheel', 'lining'], 0.25)}</vcIntShares><vcIntCapacities>${csv(it, 'capacity', ['dashboard', 'seat', 'wheel', 'lining'], 10000)}</vcIntCapacities><vcIntHcA>${csv(it, 'hcA', ['dashboard', 'seat', 'wheel', 'lining'], 4)}</vcIntHcA><vcIntRadArea>${csv(it, 'radArea', ['dashboard', 'seat', 'wheel', 'lining'], 1)}</vcIntRadArea><vcShellRadFraction>${number(it.shellRadFraction, 0.45)}</vcShellRadFraction><vcSeatEffusivity>${number(it.seatEffusivity, 300)}</vcSeatEffusivity>`
+    ? `<vcIntModel>1</vcIntModel><vcIntShares>${csv(it, 'share', VEHICLE_INTERIOR_NODE_IDS, VEHICLE_INTERIOR_NODE_FALLBACK.share)}</vcIntShares><vcIntCapacities>${csv(it, 'capacity', VEHICLE_INTERIOR_NODE_IDS, VEHICLE_INTERIOR_NODE_FALLBACK.capacity)}</vcIntCapacities><vcIntHcA>${csv(it, 'hcA', VEHICLE_INTERIOR_NODE_IDS, VEHICLE_INTERIOR_NODE_FALLBACK.hcA)}</vcIntHcA><vcIntRadArea>${csv(it, 'radArea', VEHICLE_INTERIOR_NODE_IDS, VEHICLE_INTERIOR_NODE_FALLBACK.radArea)}</vcIntRadArea><vcShellRadFraction>${number(it.shellRadFraction, 0.45)}</vcShellRadFraction><vcSeatEffusivity>${number(it.seatEffusivity, 300)}</vcSeatEffusivity>`
     : ''
   const engineXml = (en) => en && en.enabled
     ? `<vcEngModel>1</vcEngModel><vcEngWarm>${en.warm ? 1 : 0}</vcEngWarm><vcEngWarmTemp>${number(en.warmTemperature, 90)}</vcEngWarmTemp><vcEngCaps>${number(en.blockCapacity, 70000)},${number(en.bayCapacity, 15000)}</vcEngCaps><vcEngBlockBay>${number(en.blockToBay, 40)}</vcEngBlockBay><vcEngBayVent>${number(en.bayVent0, 0.04)},${number(en.bayVentK, 0.004)}</vcEngBayVent><vcEngSplit>${number(en.radiatorShare, 0.5)},${number(en.blockShare, 0.3)},${number(en.exhaustShare, 0.2)}</vcEngSplit><vcFirewallG>${number(en.firewallG, 2)}</vcFirewallG>`
@@ -1736,7 +1748,7 @@ function materialXml(item) {
   const inertia = params.inertiaHistory === 'full' ? '<inertiaHistory>full</inertiaHistory>' : ''
   // soilSet 缺省值 cs 1180、rhos 1800、lambdas 1.55 为引擎回退值（见 soilset 预设处说明）；
   //   Soil 材质的 method/inertiaHistory 由 projectToXml 按 control 覆盖。
-  return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 0.25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${inertia}${wall}${ship}${vehicle}</soilSet></property>`
+  return `<property><soilSet name="${name}"><method>${number(params.method, 1)}</method><rss>${number(params.rss, 2000)}</rss><cs>${number(params.cs, 1180)}</cs><rhos>${number(params.rhos, 1800)}</rhos><lambdas>${number(params.lambdas, 1.55)}</lambdas><Tsoil>${number(params.Tsoil, 25)}</Tsoil><SMC>${number(params.SMC, 25)}</SMC><Satwater>${number(params.Satwater, 0.45)}</Satwater>${inertia}${wall}${ship}${vehicle}</soilSet></property>`
 }
 
 // 作用：把工程转换为 HiStream 引擎读取的场景 XML 文本（<HiStreamProject>）。
