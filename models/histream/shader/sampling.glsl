@@ -222,7 +222,9 @@ float pdfTriangle(float area)
 }
 
 
-// 作用：推进一步 PCG 状态并返回 [0,1] 内的浮点数（含 1.0，因为除以 2^32-1）。
+// 作用：推进一步 PCG 状态并返回 [0,1] 内的浮点数（含 1.0：float(word) 对接近 2^32 的值舍入后可达 2^32，
+//   再除以 4294967295.0 略大于 1 的情形在 float 下舍入为 1.0）。
+// 说明（2026-11-25 核实）：着色器中没有调用本函数（遗留）；与 random.glsl 的 Rnd 同样不是严格的 [0,1)。
 float stepAndOutputRNGFloat(inout uint rngState)
 {
   // Condensed version of pcg_output_rxs_m_xs_32_32, with simple conversion to floating-point [0,1].

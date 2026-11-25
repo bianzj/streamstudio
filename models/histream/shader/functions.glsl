@@ -213,7 +213,8 @@ float thermal_inertial(float cs,float rhos,float lambdas)
 
 
 // 作用：Ball-Berry 型胞间 CO2：Ci = max(minCi·Cs, Cs·(1-1.6/(slope·RH)))；
-//       返回 vec2(Ci, gs)，gs 恒为 0，A 与 CiInput 未使用（疑似未完成的遗留函数，待核对）。
+//       返回 vec2(Ci, gs)，gs 恒为 0，A 与 CiInput 未使用——未写完的遗留函数。
+//       2026-11-25 核实：着色器中没有任何调用（biochemical*.comp 用 biochemicalIntercellularCO2），保留备查。
 vec2 BallBerry(float Cs, float RH,float A,float BallBerrySlope, float minCi,float CiInput)
 {
     float Ci = max(minCi * Cs, Cs *(1-1.6/(BallBerrySlope * RH)) );
@@ -223,7 +224,8 @@ vec2 BallBerry(float Cs, float RH,float A,float BallBerrySlope, float minCi,floa
 
 //----------------------------------------------------------
 // 模块：sel_root —— 二次方程 a·x²+b·x+c=0 求根。design>0 取 (-b+√Δ)/(2a)，否则取 (-b-√Δ)/(2a)；
-//       a==0 时退化为线性解 -c/b。不检查判别式为负，Δ<0 会产生 NaN。
+//       a==0 时退化为线性解 -c/b。判别式为负时按 0 处理（返回实部 -b/(2a)），避免 NaN（2026-11-25 加保护；
+//       本函数仅被未被调用的 computeA 使用，对现有输出无影响）。
 // quadratic formula, root of least magnitude: AX2 + BX + C = 0
 //    for the eqn ax^2 + bx + c, 
 //    if dsign is:
@@ -243,7 +245,7 @@ float sel_root(float a,float b,float c,float design)
         {
             design = -1;
         }
-        x = (-b + design *sqrt(b*b - 4*a*c))/(2*a);
+        x = (-b + design *sqrt(max(b*b - 4*a*c, 0.0)))/(2*a);
     }
     return x;
 }
@@ -333,24 +335,26 @@ float biochemicalResistance(float surfaceCO2, float intercellularCO2,
 
 // 作用：给定胞间 CO2 求净同化 A = Ag - Rd。C3（Type==3）与 C4（Type==4）分支求 Vc、Ve、Vs，
 //       再用两次二次方程（曲率 atheta 与 0.98）取较大/较小根合成 Ag。
-// 注意（待核对）：分支内重新声明了 `float Vs/Vc/Ve`，遮蔽了外层同名变量，
-//       分支外使用的 Vc、Ve、Vs 未被赋值（疑似遗留代码，未使用时无影响；只报告不修改）。
+// 说明（2026-11-25）：2026-11-25 之前分支内重新声明了 `float Vs/Vc/Ve`，遮蔽外层同名变量，而分支外
+//       的二次方程却使用外层（从未赋值）的 Vc、Ve、Vs，属真实笔误；现改为直接给外层变量赋值
+//       （Type 非 3/4 时三者为 0）。着色器中没有任何调用本函数（光合计算走 biochemical*.comp），
+//       所以该修复对现有输出没有影响。
 float computeA(float Ci, int Type, float g_m,float Vs_C3,float MM_consts,float Rd,float Vcmax,
                 float Gamma_star, float Je,float effcon, float atheta,float kpepcase)
 {
-    float Vc,Ve,Vs;
+    float Vc = 0.0, Ve = 0.0, Vs = 0.0;
     if(Type == 3)
     {
-        float Vs = Vs_C3;
-        float Vc = Vcmax *(Ci-Gamma_star)/(MM_consts + Ci);
+        Vs = Vs_C3;
+        Vc = Vcmax *(Ci-Gamma_star)/(MM_consts + Ci);
         float CO2_per_electron =(Ci-Gamma_star)/(Ci+2*Gamma_star) * effcon;
-        float Ve = Je * CO2_per_electron;
+        Ve = Je * CO2_per_electron;
     }else if(Type ==4)
     {
-        float Vc = Vcmax;
-        float Vs = kpepcase * Ci;
+        Vc = Vcmax;
+        Vs = kpepcase * Ci;
         float CO2_per_electron = effcon;
-        float Ve = Je * CO2_per_electron;
+        Ve = Je * CO2_per_electron;
     }
 
     float V = sel_root(atheta, -(Vc+Ve), Vc*Ve, 1);
@@ -463,9 +467,10 @@ float Vector2Distance(vec3 vector)
 
 
 //--------------------------------------------------------------------------------------------
-// （说明：此处的分节标题 “hotspot function proposed by Kuusk” 为历史遗留；其下实际是体元寻址函数，
-//   Kuusk 热点函数 Hotspot_Kuusk 在本文件后部。）
-// hotspot function proposed by Kuusk 
+// 分节：体元寻址（位置 → 体元下标 / 面编号）：getPassedVoxelId、getVoxelIdSemi、getVoxelIdSimple、
+//   getFaceIdSimple。
+// （原分节标题为 “hotspot function proposed by Kuusk”，是复制时遗留的错位标题——这里并没有热点函数；
+//   Kuusk 热点函数 Hotspot_Kuusk 在本文件后部。2026-11-25 已改正标题。）
 //--------------------------------------------------------------------------------------------
 
 // 作用：求射线“刚刚穿过”的体元编号：把 position 沿 direction 反向退 0.001 个体元尺寸再取 floor，
@@ -483,7 +488,8 @@ ivec3 getPassedVoxelId(vec3 position, float scale,vec3 direction)
     return voxelId;
 }
 
-// 模块：带 semiRange 的体元寻址。position 以“体元格”为单位（scale 参数在此重载中未使用），
+// 模块：带 semiRange 的体元寻址。position 以“体元格”为单位（scale 参数在此重载中未使用，
+//       保留只是为了与已有调用点的实参一致；需要不带 scale 的写法请用下面的重载），
 //       semiRange 是 x、z 方向的半域偏移（网格以原点居中，下标从 0 起算）。
 // 输出：返回值 = 沿来向微退 0.05 格所在的体元（“后”体元）；alignVoxelId = 沿前进方向微进
 //       0.05 格所在的体元（“前”体元）。y 方向的前进点若低于 0（地面以下）则 y 下标取 -1。
@@ -531,6 +537,7 @@ ivec3 getVoxelIdSemi(vec3 position,vec3 semiRange,vec3 direction, out ivec3 alig
 }
 
 // 作用：由位置直接求体元下标（int() 向零截断，负坐标不同于 floor，调用方应保证坐标为非负）。
+// 说明（2026-11-25 核实）：当前没有任何着色器调用本函数（遗留）；若今后使用且坐标可能为负，应改用 floor。
 ivec3 getVoxelIdSimple(vec3 position,vec3 semiRange, float scale)
 {
 
@@ -1429,8 +1436,8 @@ float atan2(float y,float x)
 //     return Gamma;
 // }
 
-// 注意：函数名为 cross0，实际返回两向量的点积（待核对命名；只报告不修改）。
-float cross0(vec3 A, vec3 B){
+// 作用：两个三维向量的点积 A·B（旧名 cross0 容易误读为叉积，2026-11-25 改名为 dot0，调用点同步修改）。
+float dot0(vec3 A, vec3 B){
     return A.x*B.x+A.y*B.y+A.z*B.z;
 }
 

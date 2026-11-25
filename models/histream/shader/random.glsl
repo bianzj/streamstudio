@@ -4,7 +4,7 @@
 // 主要模块：
 //   1. tea / initRandom：用 Tiny Encryption Algorithm 由（像素, 帧号）生成每像素每帧不同的种子
 //   2. pcg / pcg2d / pcg3d：PCG 系列整数哈希，用于推进状态或由坐标生成哈希
-//   3. rand / rand2 / Rnd：把 32 位整数状态转换为 [0,1) 浮点随机数
+//   3. rand / rand2 / Rnd：把 32 位整数状态转换为浮点随机数（rand/rand2 为 [0,1)，Rnd 为 [0,1]，见 Rnd）
 // 用法：先用 initRandom()/tea() 得到 seed，再反复调用 rand(seed) 或 Rnd(seed)（均会更新 seed）。
 // 注意：rand 与 Rnd 的 uint→float 转换方式不同，同一 seed 上不要混淆期望的取值范围（见 Rnd）。
 // ==========================================================================
@@ -120,10 +120,14 @@ vec2 rand2(inout uint prev)
   return vec2(rand(prev), rand(prev));
 }
 
-// Rnd(): generate a random float in [0,1) given the previous RNG state (a number).
+// Rnd(): generate a random float in [0,1] given the previous RNG state (a number).
 // recommend to use this function.
-// 说明：直接用 prev/0xffffffff 缩放。float 精度下接近 2^32-1 的状态可能舍入为 1.0，
-// 即实际取值可能包含 1.0（待核对：调用方若以 Rnd 作对数或区间索引需留意）。
+// 说明（2026-11-25 核实）：float(0xffffffffu) 在 float 中舍入为 2^32，所以 Rnd 实际是 float(prev)·2^-32；
+// float(prev) 对 prev ≥ 2^32−128 会舍入到 2^32，此时返回恰为 1.0。因此取值区间是 [0,1]（闭），
+// 不是 [0,1)；概率约 128/2^32 ≈ 3e-8/次。现有调用（samplingHemisphere、圆盘采样、bsdf 的 ±1/π 选择）
+// 对 1.0 都无害（sqrt(1-r2)=0、cos/sin 周期、比较判断）；若新增用法为 log(1-u)、int(u·N)（越界）
+// 或除以 u，需自行处理 1.0。把它改为 float(prev>>8)·2^-24 可得到严格 [0,1)，但会改变所有随机序列，
+// 使全部随机采样结果发生统计性变化，故未改。
 float Rnd(inout uint prev)
 {
   prev = pcg(prev);

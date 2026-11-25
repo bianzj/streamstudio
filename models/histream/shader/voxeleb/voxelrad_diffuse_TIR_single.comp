@@ -585,7 +585,7 @@ void main()
 
            vec3 directioni0 = DIFFUSE_DIRECTIONS[iangle];
            vec3  directioni = normalize(directioni0);
-           float abc = max(cross0(directioni, ffnormal0), 0.0);
+           float abc = max(dot0(directioni, ffnormal0), 0.0);
            if(abc <= 0.0) {continue;}
             uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
             radtemp = voxelRads[index].cumulated;
