@@ -3,7 +3,8 @@
 # 功能：案例005 宣传材料提交前的有限检查：不跑模拟，只核对发布目录 docs/cases/005-photovoltaic 的
 #       哈希、PDF 内容、网页链接、凭据泄露和暂存区范围，任一断言失败即中止。
 # 主要步骤（main）：
-#   1. 去掉 docs/cases/manifest.json 中的 README.md 条目并写回（注意：该检查会修改清单）；
+#   1. 去掉 docs/cases/manifest.json 中的 README.md 条目并写回（注意：缺省会修改清单；
+#      加 --check-only 则只在内存中去掉、不写文件，后续检查结果相同）；
 #   2. 按 promotion-manifest.json 复核每个发布文件的 SHA-256；
 #   3. 检查 report.pdf 为 3 页；前两页没有 GitHub/网盘链接，第 3 页恰好各出现一次，且含参考文献 [1]–[5]；
 #   4. 检查 index.html 不含工程文件链接、reproduce/、resource 行，并校验所有相对链接与页内锚点；
@@ -12,18 +13,21 @@
 #   7. 校验 manifest.json 中登记的哈希与当前文件一致，打印 PASS 摘要。
 # 与其他文件的关系：检查 compact_promotion005.py / publish_promotion005.py 生成的发布物。
 # 注意：第 6 步用 git diff --cached，需在已暂存改动后运行。
+#       名字虽叫 verify，缺省行为（保持不变）是会改写并保存 docs/cases/manifest.json；只想检查、不想动文件时用 --check-only。
+# 用法：python tools/case005/verify_promotion005.py [--check-only]
 # ==========================================================================
 
 """Bounded checks for the promotional-material commit, without simulations."""
-import hashlib,json,pathlib,re,subprocess
+import argparse,hashlib,json,pathlib,re,subprocess
 from pypdf import PdfReader
 REPO=pathlib.Path('C:/work/streamstudio');DEST=REPO/'docs/cases/005-photovoltaic'
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 # 作用：依次执行上面 1–7 项检查；通过时打印 JSON 摘要（status=PASS）。
-def main():
+def main(check_only=False):
     manifest=REPO/'docs/cases/manifest.json';m=json.loads(manifest.read_text(encoding='utf8'))
     m['files'].pop('README.md',None)
-    manifest.write_text(json.dumps(m,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
+    # 缺省把去掉 README.md 条目后的清单写回磁盘（原行为）；check_only 时只保留内存副本，不修改任何文件。
+    if not check_only:manifest.write_text(json.dumps(m,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     data=json.loads((DEST/'promotion-manifest.json').read_text(encoding='utf8'))
     for row in data['published_files']:assert sha(DEST/row['path'])==row['sha256'],row['path']
     pdf=PdfReader(DEST/'report.pdf');assert len(pdf.pages)==3
@@ -51,4 +55,7 @@ def main():
     for p in changed:
         row=m['files'][p.relative_to(REPO).as_posix()];assert sha(p)==row['sha256'],p
     print(json.dumps(dict(status='PASS',promotional_files=len(data['published_files'])+1,staged_files=len(tracked),report_pages=3,credential_scan='PASS',project_links_removed=True,scope='promotional_materials_only'),ensure_ascii=True))
-if __name__=='__main__':main()
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description='Bounded checks for the Case005 promotional-material commit.')
+    parser.add_argument('--check-only',action='store_true',help='do not rewrite docs/cases/manifest.json (default: it is rewritten without its README.md entry)')
+    main(parser.parse_args().check_only)

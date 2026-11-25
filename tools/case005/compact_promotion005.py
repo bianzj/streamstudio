@@ -18,10 +18,10 @@
 # 约定：PDF 页面坐标 y 自页面顶部向下计（绘制时用 1440 - y 换算）；温度单位 °C，
 #       空间图为 0.25 m 网格（72 x 72，覆盖 18 m x 18 m）；亮温波长 10.5 μm。
 # 注意：文案中的 −2.32 K、46.2 °C、5.65 K 等数值为手写常量（待核对是否与 tables/ 当前结果一致）；
-#       模块文档字符串仍写“四张卡片”，实际 CARD_COUNT=3。
+#       模块文档字符串已改为“三张”，与 CARD_COUNT=3 一致（早期草稿是四张，第 4 张图已被归档，见 main()）。
 # ==========================================================================
 
-"""Four coordinated social/editorial cards; only uses existing native outputs."""
+"""Three coordinated social/editorial cards (CARD_COUNT); only uses existing native outputs."""
 import csv,hashlib,html,json,pathlib,re,shutil,subprocess
 import numpy as np
 import matplotlib

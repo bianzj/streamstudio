@@ -9,8 +9,10 @@
 #   3. 由 references-and-downloads.json 与图件清单拼出 README.md（正文数值为手写常量）；
 #   4. 在 docs/cases/catalog.json、docs/cases/README.md、仓库根 README.md 中登记案例 005；
 #   5. 校验网页内所有相对链接，写 promotion-manifest.json，刷新 docs/cases/manifest.json。
-# 与其他文件的关系：之后由 compact_promotion005.py 把 8 图/11 页版本压缩为 3 张推广图并更新同一批清单；
-#       本脚本写入的 README 中“11页 / 7图”等描述因此已被后者替换（待核对最终发布状态）。
+# 与其他文件的关系：之后由 compact_promotion005.py 把本脚本发布的 8 图/11 页版本压缩为 3 张推广图（CARD_COUNT=3，
+#       report.pdf 也随之变为 3 页），并在 publish() 中重写同一批清单与 README（它自己的 copywriting() 另生成 README.md，
+#       catalog 里的“7图 + 动态图”被替换为“3张融合推广图”）。因此本脚本写入的 README 里“11页 / 7图”等描述只是第一版的
+#       状态，最终发布状态以 compact_promotion005.py 的输出为准；本脚本的字符串不再改动，以免与已提交的第一版文件不一致。
 # 注意：98、74 个收敛节点，−2.37 K、−2.32 K、5.65 K 等数值为手写常量，不从结果文件读取。
 # ==========================================================================
 

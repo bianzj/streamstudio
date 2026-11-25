@@ -314,8 +314,8 @@ def make_residual(config, observations, sigma_bt, sigma_gap, prior, prior_sd, pr
 
 # 作用：带界的 Gauss–Newton 类最小二乘反演（scipy least_squares，默认 trust-region reflective），
 # Jacobian 用 autograd 的解析结果；x_scale 平衡 LAI 与温度量纲；最多 60 次函数评估。
-# seed 参数目前未使用。
-def invert(config, observations, sigma_bt, sigma_gap, prior, prior_sd, initial, seed=None):
+# 求解是确定性的（给定初值与观测结果唯一），随机性只在生成合成观测时用到，所以这里不需要 seed 参数。
+def invert(config, observations, sigma_bt, sigma_gap, prior, prior_sd, initial):
     residual = make_residual(config, observations, sigma_bt, sigma_gap, prior, prior_sd)
     jac = jacobian(residual)
     lower, upper = parameter_bounds()
@@ -343,7 +343,7 @@ def demo_config():
 # 作用：合成数据的完整反演 demo。步骤：1 用真值生成观测并加高斯噪声（bt 的 σ 为 noise，gap 的 σ 为 0.02）；
 #       2 在真值处做 autograd 与中心差分的梯度校验（对象为第 1 视角第 1 波段的亮温）；
 #       3 反演并统计观测 RMSE、LAI 误差、温度误差、解处 Jacobian 条件数；4 打印 JSON。
-# 注意：噪声个数按 3 个波段（3*len(views)）写死，与 demo_config 的波段数一致。
+# 说明：亮温噪声个数 = 视角数 × 波段数（由 config 推导，demo_config 为 3 视角 × 3 波段 = 9 个，与旧写法一致）。
 def run_demo(noise, seed):
     config = demo_config()
     truth = np.array([2.5, 312.0, 302.0, 308.0, 301.0])
@@ -351,7 +351,7 @@ def run_demo(noise, seed):
     rng = np.random.default_rng(seed)
     sigma_bt, sigma_gap = noise, 0.02
     observations = clean + np.concatenate([
-        rng.normal(0.0, sigma_bt, 3 * len(config["views"])),
+        rng.normal(0.0, sigma_bt, len(config["views"]) * len(config["bands"])),
         rng.normal(0.0, sigma_gap, len(config["views"])),
     ])
     prior = np.array([2.0, 305.0, 300.0, 303.0, 300.0])
@@ -371,7 +371,7 @@ def run_demo(noise, seed):
         finite[index] = (bt_scalar(plus) - bt_scalar(minus)) / (2.0 * step[index])
     gradient_error = float(np.max(np.abs(analytic - finite) / np.maximum(np.abs(finite), 1e-12)))
 
-    fit = invert(config, observations, sigma_bt, sigma_gap, prior, prior_sd, initial, seed)
+    fit = invert(config, observations, sigma_bt, sigma_gap, prior, prior_sd, initial)
     retrieved = fit.x
     prediction = flatten(simulate(retrieved, config))
     residual = prediction - observations
@@ -406,7 +406,7 @@ def export_sample(path, noise, seed):
     clean = flatten(simulate(truth, config))
     rng = np.random.default_rng(seed)
     observations = clean + np.concatenate([
-        rng.normal(0.0, noise, 3 * len(config["views"])),
+        rng.normal(0.0, noise, len(config["views"]) * len(config["bands"])),
         rng.normal(0.0, 0.02, len(config["views"])),
     ])
     sample = {
