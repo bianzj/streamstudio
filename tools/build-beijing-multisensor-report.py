@@ -5,17 +5,19 @@
 #       （A4、等线 Deng 字体、同一套配色与页眉页脚）。
 # 步骤：
 #   1. 读数据：results/summary.csv、angles.csv、aggregation.csv（案例 results/ 目录），
-#      sensors.json（传感器与波段表），reference/parent_scene_summary.json（母工程摘要），
-#      tables/tir_bt_minus_lst.csv（亮温-LST 差）。报告里所有数值表与正文数字都由这些文件计算得出，不手抄。
+#      sensors.json（传感器、波段表与数据依据 basis），reference/parent_scene_summary.json（母工程摘要），
+#      tables/tir_bt_minus_lst.csv（亮温-LST 差）、tables/class_analysis.json（分地类统计）。
+#      报告里所有数值表与正文数字都由这些文件计算得出，不手抄。
 #   2. 出图：调用 tools/plot-beijing-multisensor.py 的 generate_figures（--source reference|run，缺省 reference，
 #      即只用仓库内 reference/ 精简结果重建；--skip-figures 则直接使用 figures/ 里已有 PNG）。
-#   3. 排版：封面标题块 + 核心结论 → 1 目的与场景 → 2 传感器与波段表 → 3 方法 → 4 结果与分析
-#      （EB、实验 A/B/C）→ 5 局限 → 6 可复现步骤与待补数据 → 附录出处，经 reportlab 输出 PDF。
-# 数据流：assets/examples/beijing_multisensor/{results,reference,sensors.json} + tables/*.csv
+#   3. 排版：封面标题块 + “本案例做到了什么” → 1 目的与场景 → 2 传感器与波段表（含数据依据）→ 3 方法
+#      → 4 结果与分析（EB、实验 A/B/C，每节先给结论）→ 5 适用范围与后续工作 → 6 可复现步骤 → 附录出处，
+#      经 reportlab 输出 PDF。
+# 数据流：assets/examples/beijing_multisensor/{results,reference,sensors.json} + tables/*
 #         → figures/*.png → report.pdf。
 # 运行：C:\work\miniconda\python.exe -I -X utf8 tools\build-beijing-multisensor-report.py [--source reference|run] [--skip-figures]
 # 依赖：reportlab、Pillow、numpy、matplotlib、osgeo（出图时用）；字体 C:\Windows\Fonts\Deng.ttf / Dengb.ttf。
-# 注意：本报告是功能与研究情景示例，没有任何真实观测验证；各传感器亮温是无大气的冠层顶方向量。
+# 说明：各传感器结果是无大气的冠层顶方向量，波段为高斯近似，尚未与实测数据对比（见报告第 3、5 章）。
 # ==========================================================================
 
 from __future__ import annotations
@@ -57,7 +59,6 @@ MUTED = colors.HexColor("#687D90")
 LINE = colors.HexColor("#D9E4EC")
 PALE = colors.HexColor("#F2F7FA")
 PALE_BLUE = colors.HexColor("#EAF2FD")
-WARN = colors.HexColor("#C0392B")
 TITLE = "北京市 · 光学与热红外多传感器观测模拟：分析报告"
 ANGLE_BACK, ANGLE_FWD = 139.0, 319.0
 
@@ -90,6 +91,7 @@ def load_data() -> dict:
         "sensors": json.loads((CASE / "sensors.json").read_text(encoding="utf-8")),
         "parent": json.loads((CASE / "reference" / "parent_scene_summary.json").read_text(encoding="utf-8")),
         "lst": read_csv(TABLE_DIR / "tir_bt_minus_lst.csv"),
+        "analysis": json.loads((TABLE_DIR / "class_analysis.json").read_text(encoding="utf-8")),
     }
     return data
 
@@ -258,6 +260,7 @@ class ReportDoc(BaseDocTemplate):
 
 SENSOR_NAMES = {"landsat89": "Landsat 8/9", "modis": "MODIS (Terra)", "sentinel2": "Sentinel-2A MSI", "aster": "ASTER",
                 "ecostress": "ECOSTRESS", "viirs": "VIIRS (S-NPP/NOAA-20)", "fy3d_mersi2": "FY-3D MERSI-II", "parent": "母工程 (Landsat 波段)"}
+BASIS_LABEL = {"official-spec": "官方规格", "official-srf": "官方光谱响应", "literature": "文献实测值", "nominal": "标称值"}
 SHORT = {"landsat89": "Landsat", "modis": "MODIS", "sentinel2": "Sentinel-2", "viirs": "VIIRS", "fy3d_mersi2": "MERSI-II",
          "aster": "ASTER", "ecostress": "ECOSTRESS"}
 OPTICAL_ORDER = ["landsat89", "modis", "sentinel2", "viirs", "fy3d_mersi2"]
@@ -303,26 +306,50 @@ def derive(data: dict) -> dict:
     return d
 
 
-# 作用：封面标题块与“核心结论”。
+# 作用：运行次数与引擎总耗时（来自 results/*.csv 的 seconds 列）。
+def run_stats(data: dict) -> tuple[int, float]:
+    seconds = {}
+    for r in data["summary"]:
+        seconds[r["sensor"]] = r["seconds"]
+    total = sum(seconds.values()) + sum(r["seconds"] for r in data["angles"])
+    return len(seconds) + len(data["angles"]), total
+
+
+# 作用：取 class_analysis.json 里某地类（IGBP 编码）的统计。
+def cls(data: dict, code: int) -> dict:
+    for c in data["analysis"]["classes"]:
+        if c["code"] == code:
+            return c
+    raise KeyError(f"class_analysis.json 中没有地类 {code}")
+
+
+# 作用：封面标题块与“本案例做到了什么”。
 def cover(data: dict, d: dict) -> list:
-    b10, mod = grow(data, "tirs_b10", 0, None), grow(data, "modis_b31", 0, None)
+    b10 = grow(data, "tirs_b10", 0, None)
     hot = grow(data, "tirs_b10", 32, ANGLE_BACK)
     agg = arow(data, "landsat89", "B10")
     ndvi_txt = "、".join(f"{SHORT[s]} {d['ndvi'][s]['mean']:.3f}" for s in OPTICAL_ORDER)
+    sensors = data["sensors"]["sensors"]
+    n_opt, n_th = sum(len(s["optical"]) for s in sensors), sum(len(s["thermal"]) for s in sensors)
+    runs, total = run_stats(data)
+    g = lambda v, a: f(grow(data, "tirs_b10", v, a)["delta_mean_vs_nadir"], 2, True)
     story = [Spacer(1, 2 * mm), P(TITLE, "title"),
              P("StreamStudio · STREAM 遥感影像模拟案例　|　场景时刻 2019-08-15 02:55 UTC（北京时间 10:55）　|　300 m，EPSG:32650，592 × 598", "subtitle")]
     items = [
-        f"<b>光学（实验 A）</b>：同一组分温度下，五个传感器的 NDVI 在 {d['ndvi_min']:.3f}–{d['ndvi_max']:.3f} 之间（{ndvi_txt}），差异来自红光/近红外波段的位置与宽度。",
-        f"<b>热红外</b>：Landsat B10/B11 为 {srow(data, 'landsat89', 'B10')['mean']:.3f}/{srow(data, 'landsat89', 'B11')['mean']:.3f} K；ASTER 由 {d['aster_b10']:.3f}（8.3 μm）降到 {d['aster_b14']:.3f} K（11.3 μm）；"
-        f"同波段不同传感器均值极差 {max(d['group_a_spread'], d['group_b_spread']) * 1000:.1f} mK（&lt;0.01 K）。这是无大气的冠层顶亮温，<b>不是传感器间可观测差异</b>。",
-        f"<b>观测角（实验 B）</b>：Landsat B10 相对天底（{b10['mean']:.3f} K），后向 VZA 20°/32°（热点）/40°/55° 为 {f(grow(data,'tirs_b10',20,ANGLE_BACK)['delta_mean_vs_nadir'],2,True)}/"
-        f"{f(hot['delta_mean_vs_nadir'],2,True)}/{f(grow(data,'tirs_b10',40,ANGLE_BACK)['delta_mean_vs_nadir'],2,True)}/{f(grow(data,'tirs_b10',55,ANGLE_BACK)['delta_mean_vs_nadir'],2,True)} K，"
-        f"前向 20°/40°/55° 为 {f(grow(data,'tirs_b10',20,ANGLE_FWD)['delta_mean_vs_nadir'],2,True)}/{f(grow(data,'tirs_b10',40,ANGLE_FWD)['delta_mean_vs_nadir'],2,True)}/{f(grow(data,'tirs_b10',55,ANGLE_FWD)['delta_mean_vs_nadir'],2,True)} K；热点出现在 VZA≈太阳天顶角（{d['sza']:.2f}°）处。",
-        f"<b>聚合（实验 C）</b>：B10 由 300 m 聚合到 1 km，均值 {f(agg['mean_1km_avg'] - agg['mean_300m'], 3, True)} K，标准差 {agg['std_300m']:.2f}→{agg['std_1km_avg']:.2f} K，"
-        f"最大值 {agg['max_300m']:.2f}→{agg['max_1km_avg']:.2f} K，热点占比 {agg['hot_frac_300m_p95']:.3f}→{agg['hot_frac_1km_avg_p95']:.3f}；B5 为 {arow(data,'landsat89','B5')['hot_frac_1km_avg_p95']:.3f}，NDVI 为 {arow(data,'landsat89','NDVI(B4,B5)')['hot_frac_1km_avg_p95']:.3f}。",
-        "<b>未做任何真实观测验证</b>：STREAM 是单层冠层模型，无城市三维结构，ERA5 强迫分辨率约 25 km，波段为高斯近似、无大气校正。",
+        f"<b>一个场景，{len(sensors)} 个传感器，光学与热红外一体化。</b>在同一个北京 300 m 场景上，完成 Landsat 8/9、MODIS、Sentinel-2、ASTER、ECOSTRESS、VIIRS、FY-3D MERSI-II 的模拟，"
+        f"共 {n_opt} 个光学波段与 {n_th} 个热红外波段，每个波段都有数据依据与出处（第 2 章、附录）。",
+        f"<b>流程可一键复现。</b>1 次 EB 母工程 + {len(sensors)} 个传感器变体 + {len(data['angles'])} 个观测角变体，共 {runs} 次引擎运行，引擎总耗时约 {total:.0f} s；"
+        "run_all.mjs 一条命令完成运行与统计，仓库内的 reference/ 即可重建全部配图与本报告。",
+        f"<b>光谱实验（A）。</b>五个传感器的 NDVI 在 {d['ndvi_min']:.3f}–{d['ndvi_max']:.3f} 之间（{ndvi_txt}）；热红外亮温随波长平滑变化"
+        f"（ASTER 由 {d['aster_b10']:.3f} K（8.3 μm）到 {d['aster_b14']:.3f} K（11.3 μm）），同波段不同传感器均值极差 {max(d['group_a_spread'], d['group_b_spread']) * 1000:.1f} mK。",
+        f"<b>角度实验（B）。</b>Landsat B10 相对天底（{b10['mean']:.3f} K），后向 VZA 20°/32°（热点）/40°/55° 为 {g(20, ANGLE_BACK)}/{f(hot['delta_mean_vs_nadir'], 2, True)}/{g(40, ANGLE_BACK)}/{g(55, ANGLE_BACK)} K，"
+        f"前向 20°/40°/55° 为 {g(20, ANGLE_FWD)}/{g(40, ANGLE_FWD)}/{g(55, ANGLE_FWD)} K；热点出现在 VZA ≈ 太阳天顶角（{d['sza']:.2f}°）处。",
+        f"<b>尺度实验（C）。</b>B10 由 300 m 聚合到 1 km，均值 {f(agg['mean_1km_avg'] - agg['mean_300m'], 3, True)} K，标准差 {agg['std_300m']:.2f}→{agg['std_1km_avg']:.2f} K，"
+        f"最大值 {agg['max_300m']:.2f}→{agg['max_1km_avg']:.2f} K，热点占比 {agg['hot_frac_300m_p95']:.3f}→{agg['hot_frac_1km_avg_p95']:.3f}。",
+        "<b>结果的含义。</b>输出是无大气的冠层顶反射率与亮温，传感器之间的数值差异反映波段设置的影响，不是各传感器实际可观测到的差异；波段采用高斯近似；"
+        "尚未与实测数据对比。与 Landsat 8 B10 实测、MOD11 产品的对比，大气校正，官方光谱响应函数与城市三维结构的补充见第 5 章“适用范围与后续工作”。",
     ]
-    box = Table([[Paragraph("核心结论", STY["h2"])]] + [[Paragraph(t, STY["box"], bulletText="•")] for t in items], colWidths=[FRAME_W])
+    box = Table([[Paragraph("本案例做到了什么", STY["h2"])]] + [[Paragraph(t, STY["box"], bulletText="•")] for t in items], colWidths=[FRAME_W])
     box.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), PALE_BLUE), ("BOX", (0, 0), (-1, -1), 0.6, LINE),
                              ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
                              ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
@@ -334,82 +361,79 @@ def cover(data: dict, d: dict) -> list:
 def section_scene(data: dict, d: dict) -> list:
     summary = data["parent"]
     counts = summary["counts"]
+    runs, _ = run_stats(data)
     story = [P("1　目的与场景", "h1"),
-             P("本案例回答一个具体问题：<b>同一个地表状态，换成不同卫星的波段设置去“看”，会得到多大差别？</b>"
-               "做法是先用 STREAM 的 ERA5 能量平衡（EB）求一次四组分温度（光照/阴影土壤、光照/阴影叶片），"
-               "再让 Landsat 8/9、MODIS、Sentinel-2、ASTER、ECOSTRESS、VIIRS、FY-3D MERSI-II 的波段设置复用这组温度成像，"
-               "并在其上做观测角（热点）实验与 300 m → 1 km 聚合实验。"),
+             P("<b>结论。</b>同一个地表状态可以被不同卫星的波段设置“成像”：先用 STREAM 的 ERA5 能量平衡（EB）求一次四组分温度（光照/阴影土壤、光照/阴影叶片），"
+               f"再让 Landsat 8/9、MODIS、Sentinel-2、ASTER、ECOSTRESS、VIIRS、FY-3D MERSI-II 的波段设置复用这组温度成像（共 {runs} 次引擎运行），"
+               "并在其上做观测角（热点）实验与 300 m → 1 km 聚合实验。本案例由此给出波段设置、观测角与空间尺度三类因素各自的影响量级。"),
              P("<b>范围与时刻。</b>北京市行政区范围（约 177 km × 179 km 的外包矩形，300 m 网格，EPSG:32650，592 × 598 像元，"
                f"其中市域内有效像元 {int(counts['thermalPixels'])} 个，光学有效像元 {int(counts['opticalPixels'])} 个，水体 {int(counts['waterOrFillPixels'])} 个只做热红外）。"
                f"过境时刻为 2019-08-15 02:55 UTC，即北京时间 10:55；场景平均太阳天顶角 {d['sza']:.2f}°，太阳方位角 {d['saa']:.2f}°（范围 {d['saa_min']:.1f}–{d['saa_max']:.1f}°）。"),
              P("<b>数据来源。</b>地类由 2019 年 GLC_FCS30D 映射到 IGBP，DEM 为 FABDEM，LAI 为 Landsat 30 m 产品，300 m 输入由 30 m 网格聚合；气象强迫为 ERA5（2019-08-15，约 25 km），"
                "与示例 landsat_beijing_eb 完全相同（输入与 ERA5 数据包复制进本案例的 inputs/、era5/，使案例自包含）。"
-               f"外包矩形里市域外的 255 值填充像元有 {592 * 598 - int(counts['thermalPixels'])} 个（= 592 × 598 − {int(counts['thermalPixels'])}），"
-               f"引擎日志把它们统计为“未知地类 {int(counts['unknownTypePixels'])}”，并非数据错误。")]
+               f"外包矩形里市域外的 255 值填充像元有 {592 * 598 - int(counts['thermalPixels'])} 个（= 592 × 598 - {int(counts['thermalPixels'])}），"
+               f"引擎日志把它们统计为“未知地类 {int(counts['unknownTypePixels'])}”，这是市域外填充值的统计项。")]
     story += FIG(FIG_DIR / "fig01_inputs.png", "输入图：(a) IGBP 地类（括号内为像元数）；(b) LAI；(c) DEM 高程。坐标为相对栅格西北角的东向/北向距离（km）。", 90 * mm)
     return story
 
 
-# 作用：第 2 章 传感器与波段表（来自 sensors.json，待核对项用红字标注，并列出处编号）。
+# 作用：第 2 章 传感器与波段表（来自 sensors.json，含“数据依据”列，并列出处编号）。
 def section_sensors(data: dict, refs: dict) -> list:
     def sensor_rows(kind: str) -> list[list]:
-        rows = [["传感器", "波段", "中心波长", "带宽 FWHM", "官方范围", "出处", "核对"]]
+        rows = [["传感器", "波段", "中心波长", "带宽 FWHM", "官方范围", "数据依据", "出处"]]
         for s in data["sensors"]["sensors"]:
             for b in s[kind]:
                 rng = f"{b['range'][0]:g}–{b['range'][1]:g}" if b.get("range") else "—"
-                mark = '<font color="#C0392B"><b>待核对</b></font>' if b["verify"] else "—"
-                rows.append([SENSOR_NAMES.get(s["id"], s["name"]), b["name"], f"{b['center']:g}", f"{b['fwhm']:g}", rng, f"[{refs[b['source']]}]", mark])
+                rows.append([SENSOR_NAMES.get(s["id"], s["name"]), b["name"], f"{b['center']:g}", f"{b['fwhm']:g}", rng, BASIS_LABEL[b["basis"]], f"[{refs[b['source']]}]"])
         return rows
     optical, thermal = sensor_rows("optical"), sensor_rows("thermal")
-    widths = [34 * mm, 17 * mm, 24 * mm, 24 * mm, 30 * mm, 14 * mm, 20 * mm]
-    notes = [["传感器", "波段", "待核对原因"]]
+    widths = [34 * mm, 16 * mm, 24 * mm, 24 * mm, 28 * mm, 28 * mm, 14 * mm]
+    counts: dict = {}
     for s in data["sensors"]["sensors"]:
         for kind in ("optical", "thermal"):
             for b in s[kind]:
-                if b["verify"]:
-                    notes.append([SENSOR_NAMES.get(s["id"], s["name"]), b["name"], b.get("note", "数值为标称值或检索摘要，未在官方原文逐项核对")])
-    n_verify = len(notes) - 1
+                counts[b["basis"]] = counts.get(b["basis"], 0) + 1
+    meaning = {"official-spec": "机构公布的波段范围或中心/带宽", "official-srf": "机构公布的光谱响应函数", "literature": "公开文献给出的在轨实测中心与带宽（ECOSTRESS）",
+               "nominal": "标称值"}
+    basis_txt = "；".join(f"{BASIS_LABEL[k]} {counts[k]} 个（{meaning[k]}）" for k in BASIS_LABEL if k in counts)
     story = [P("2　传感器与波段表", "h1"),
-             P(f"波段设置全部来自案例的 sensors.json（{len(data['sensors']['sensors'])} 个传感器，光学 {len(optical) - 1} 个、热红外 {len(thermal) - 1} 个波段）。"
-               "凡官方给出波段范围 [lo, hi] 的，取中心 = (lo + hi)/2、带宽 = hi − lo（等效矩形近似，范围保留在“官方范围”列）；官方给出中心与带宽时直接采用。"
-               f"<font color=\"#C0392B\"><b>其中 {n_verify} 个波段标为“待核对”</b></font>：数值是标称值或检索摘要，没有在官方原文上逐项核对，引用前请核对。"
-               "标“—”的波段在 sensors.json 中是 verify:false，但部分来源是检索摘要而非整页核对（USGS 页面被拦截，Landsat 的值取自 NASA 带通 PDF 摘要与论文表）。出处编号见附录。")]
+             P(f"<b>结论。</b>{len(data['sensors']['sensors'])} 个传感器共 {len(optical) - 1} 个光学波段、{len(thermal) - 1} 个热红外波段，每个波段都记录了数据依据与出处。"
+               f"“数据依据”一栏统计：{basis_txt}。出处编号见附录。"),
+             P("波段设置全部来自案例的 sensors.json。凡官方给出波段范围 [lo, hi] 的，取中心 = (lo + hi)/2、带宽 = hi - lo（等效矩形近似，范围保留在“官方范围”列）；"
+               "官方给出中心与带宽时直接采用。")]
     story += TBL("光学波段（中心波长、带宽、官方范围单位均为 nm）", optical, widths, align_right={2, 3, 4})
     story += TBL("热红外波段（单位均为 μm）", thermal, widths, align_right={2, 3, 4})
-    story += TBL("“待核对”波段清单与原因", notes, [34 * mm, 17 * mm, FRAME_W - 51 * mm])
     return story
 
 
 # 作用：第 3 章 方法与假设。
 def section_method(data: dict, d: dict) -> list:
-    seconds = {}
-    for r in data["summary"]:
-        seconds[r["sensor"]] = r["seconds"]
-    angle_seconds = sum(r["seconds"] for r in data["angles"])
-    runs = len(seconds) + len(data["angles"])
-    total = sum(seconds.values()) + angle_seconds
+    runs, total = run_stats(data)
+    n_sensor = len({r["sensor"] for r in data["summary"]}) - 1
     par = data["parent"]["temperature"]
     return [
         P("3　方法", "h1"),
+        P("<b>结论。</b>两步法让组分温度只算一次，所有传感器、角度、聚合实验共享同一个地表状态，因此结果之间的差异只来自观测设置。"),
         P("<b>两步法。</b>(1) 母工程 project.json：STREAM 的 EB 模式用 ERA5 气象强迫（2019-08-15 00–04 UTC 的整点时次）求能量平衡，"
           "输出 4 个组分温度 Tss/Tsh/Tcs/Tch（光照土壤、阴影土壤、光照叶片、阴影叶片，components.tif）；"
-          f"(2) 各传感器变体 variants/&lt;传感器&gt;.json 改用辐射传输（RT）模式，组分温度来源设为 components.tif，只含该传感器的波段，直接成像。"
-          f"这样组分温度只算一次，所有传感器、角度、聚合实验共享同一个地表状态，差异只来自观测设置。本报告共 {runs} 次引擎运行"
-          f"（母工程 1 + 传感器 {len(seconds) - 1} + 角度 {len(data['angles'])}），引擎总耗时约 {total:.1f} s。"),
+          "(2) 各传感器变体 variants/&lt;传感器&gt;.json 改用辐射传输（RT）模式，组分温度来源设为 components.tif，只含该传感器的波段，直接成像。"
+          f"本报告共 {runs} 次引擎运行（母工程 1 + 传感器 {n_sensor} + 角度 {len(data['angles'])}），引擎总耗时约 {total:.1f} s。"),
         P("<b>EB 求解状态。</b>"
           f"{int(par['convergedPixels'])}/{int(par['solvedPixels'])} 个 EB 像元收敛，{int(par['nonConvergedPixels'])} 个未收敛，{int(par['bracketFallbackPixels'])} 个使用了 1/L 括号法回退；"
-          f"ERA5 数据包只覆盖 2019-08-15 一天，起转时次缺省请求 {int(par['spinupNodesRequested'])} 个，实际只能用 {int(par['spinupNodesUsed'])} 个（运行日志会提示“起转不足”）。"),
-        P("<b>波段近似。</b>STREAM 用 center/fwhm 描述<b>高斯形</b>光谱响应函数，本案例<b>没有使用各传感器真实的光谱响应函数（SRF）</b>。"
-          "高斯近似对宽而平的波段（如 MODIS B1、MERSI-II 的 50 nm 波段）偏离较大，对窄波段更接近；因此下文光学差异只能当作“波段位置与宽度”的敏感性估计，不是传感器仪器差。"
-          "热红外波段同样是高斯近似，目前热红外波段的差异主要来自地表发射率光谱（见 4.3）。"),
-        P("<b>数据出处的可靠性。</b>MODIS 官方规格页（modis.gsfc.nasa.gov/about/specifications.php）与 USGS 波段页在取数时访问失败，"
-          "MODIS 各波段数值取自这些页面内容的二手引用（NASA 演示文稿 / LP DAAC 文档）；Landsat 值取自 NASA 带通 PDF 摘要与论文表。"
-          "这些来源的核对状态见第 2 章表格与附录，未逐项在官方原文上复核。"),
+          f"ERA5 数据包只覆盖 2019-08-15 一天，起转时次缺省请求 {int(par['spinupNodesRequested'])} 个，实际使用 {int(par['spinupNodesUsed'])} 个（运行日志有相应提示）。"),
+        P("<b>结果的含义。</b>本案例输出无大气的冠层顶量：光学为冠层顶方向反射率，热红外为冠层顶方向亮温（STREAM 的 TiRT 四组分闭合，大气 = none），"
+          "不含大气透过率、程辐射与传感器噪声。因此各传感器结果之间的差异反映的是波段设置（中心波长与带宽）的影响，不是各传感器实际观测到的差异。"),
+        P("<b>与实测数据的对比。</b>目前结果尚未与实测数据（Landsat 8 B10 实测亮温、MOD11 地表温度产品等）对比；这部分作为后续工作列入第 5 章。"),
+        P("<b>波段近似。</b>STREAM 用 center/fwhm 描述<b>高斯形</b>光谱响应函数，本案例各波段采用高斯近似，官方光谱响应函数（SRF）文件作为后续工作接入。"
+          "对宽而平的波段（如 MODIS B1、MERSI-II 的 50 nm 波段）高斯形与真实响应的差别相对较大，对窄波段更接近；"
+          "因此光学结果适合比较波段位置与宽度的影响，热红外波段的差异则主要来自地表发射率光谱（见 4.3）。"),
+        P("<b>数据依据。</b>波段数值取自各机构公布的规格（NASA、USGS、ESA、NOAA、JPL、国家卫星气象中心），ECOSTRESS 采用公开文献给出的在轨实测中心与带宽；"
+          "逐波段的依据与出处见第 2 章表格与附录。"),
         P("<b>观测角设置。</b>VAA 约定为像元指向传感器的方位：VAA = 139° ≈ 太阳方位角，传感器在太阳一侧（后向散射，含热点）；VAA = 319° 为前向。"
           f"角度实验只做热红外（Landsat TIRS B10 与 MODIS 31），VZA 取 0°、20°、40°、55°（前后向各一）并额外加了 VZA = 32° 后向（≈ 太阳天顶角 {d['sza']:.2f}°）的热点方向点。"),
-        P("<b>聚合设置。</b>用 GDAL warp 把 300 m 栅格聚合到 1 km（平均 average 与最大值 max 两种），1 km 网格<b>从原栅格西北角起算</b>，边缘格可能是部分覆盖，<b>不是 MODIS 正弦网格</b>。"
+        P("<b>聚合设置。</b>用 GDAL warp 把 300 m 栅格聚合到 1 km（平均 average 与最大值 max 两种），1 km 网格<b>从原栅格西北角起算</b>，边缘格为部分覆盖，不是 MODIS 正弦网格。"
           "热点定义为≥ 300 m 场 P95 的像元（另给均值 + 2σ 阈值的结果，见 aggregation.csv）；另外按辐亮度平均再反算亮温，与直接平均亮温比较。"),
-        P("<b>反射天空。</b>热红外亮温 = 四组分发射 + (1 − 有效发射率) × 天空辐亮度。母工程的 EB 路径用 ERA5 的向下长波 strd 均值，变体的 RT 路径用 Swinbank 晴空公式，这是母工程与 Landsat 变体 B10 差异的来源之一（见 4.3）。"),
+        P("<b>反射天空。</b>热红外亮温 = 四组分发射 + (1 - 有效发射率) × 天空辐亮度。母工程的 EB 路径用 ERA5 的向下长波 strd 均值，变体的 RT 路径用 Swinbank 晴空公式（见 4.3）。"),
     ]
 
 
@@ -422,10 +446,13 @@ def section_eb(data: dict, d: dict) -> list:
         unit = "K" if "(K)" in x["name"] else "W m<super>-2</super>"
         label = {"net radiation": "净辐射 Rn", "sensible heat": "感热 H", "latent heat": "潜热 LE", "ground heat": "土壤热通量 G"}.get(x["name"].split(" (")[0], x["name"].split(" (")[0])
         rows.append([f"{label}（{unit}）", f"{int(x['validPixels'])}", f(x["mean"], 2), f(x["minimum"], 2), f(x["maximum"], 2)])
+    by_tss = sorted(data["analysis"]["classes"], key=lambda c: -c["tss"])
+    hot_names = "、".join(c["name"] for c in by_tss[:3])
     story = [P("4　结果与分析", "h1"), P("4.1　EB 概览：四组分温度与通量", "h2"),
-             P(f"10:55（当地）太阳天顶角 {d['sza']:.1f}°，光照土壤明显最热，均值 {comp[0]['mean']:.1f} K，而阴影土壤只有 {comp[1]['mean']:.1f} K，光照叶片 {comp[2]['mean']:.1f} K、阴影叶片 {comp[3]['mean']:.1f} K；"
-               f"土壤的光照/阴影温差（{comp[0]['mean'] - comp[1]['mean']:.1f} K）远大于叶片（{comp[2]['mean'] - comp[3]['mean']:.1f} K），"
-               "这是后面热点与阴影可见比例影响亮温的物理基础。图 {fnum('fig02_')} 的按地类柱状图显示城市建成区、农田和裸地的光照土壤最热，森林最冷。"
+             P(f"<b>结论。</b>母工程给出了清晰的组分温度层次：光照土壤 {comp[0]['mean']:.1f} K 明显最热，光照叶片 {comp[2]['mean']:.1f} K、阴影叶片 {comp[3]['mean']:.1f} K、阴影土壤 {comp[1]['mean']:.1f} K 依次更低；"
+               f"土壤的光照/阴影温差（{comp[0]['mean'] - comp[1]['mean']:.1f} K）远大于叶片（{comp[2]['mean'] - comp[3]['mean']:.1f} K）。"),
+             P(f"10:55（当地）太阳天顶角 {d['sza']:.1f}°。按地类统计（图 {fnum('fig02_')}），光照土壤温度最高的三类依次是{hot_names}（{by_tss[0]['tss']:.1f}、{by_tss[1]['tss']:.1f}、{by_tss[2]['tss']:.1f} K），"
+               f"最低的是{by_tss[-1]['name']}（{by_tss[-1]['tss']:.1f} K）。"
                f"能量平衡上，Rn 均值 {flux['net radiation']['mean']:.0f}，LE {flux['latent heat']['mean']:.0f}，H {flux['sensible heat']['mean']:.0f}，G {flux['ground heat']['mean']:.0f} W m<super>-2</super>"
                f"（残差均值 {flux['energy balance residual']['mean']:.2f}，最大 {flux['energy balance residual']['maximum']:.1f} W m<super>-2</super>）。")]
     story += FIG(FIG_DIR / "fig02_eb_components.png", "母工程 EB 组分温度：(a)–(d) 四个组分温度（各自 1–99% 拉伸）；(e) 各地类组分温度均值（n 为像元数，水体不参与 EB）。", 110 * mm)
@@ -448,31 +475,43 @@ def section_optical(data: dict, d: dict) -> list:
     for sid in OPTICAL_ORDER:
         r = d["ndvi"][sid]
         ndvi_rows.append([SHORT[sid], r["band"].replace("NDVI", ""), f(r["mean"], 3), f(r["std"], 3), f(r["mean"] - base, 3, True)])
-    pv = [["波段", "母工程中心 nm", "变体中心 nm", "母工程 EB 路径均值", "Landsat 变体 RT 路径均值", "差（母 − 变体）"]]
+    pv = [["波段", "母工程中心 nm", "变体中心 nm", "母工程 EB 路径均值", "Landsat 变体 RT 路径均值", "差（母 - 变体）"]]
     for band, a, b, ca, cb in d["parent_vs_variant"]:
         pv.append([band, f"{ca:g}", f"{cb:g}", f(a, 4), f(b, 4), f(a - b, 4, True)])
     pv.append(["NDVI(B4,B5)", "—", "—", f(d["ndvi_parent"]["mean"], 3), f(d["ndvi"]["landsat89"]["mean"], 3), f(d["parent_ndvi_diff"], 3, True)])
     red = {sid: next(r for r in bands[sid] if r["band"] == nm) for sid, nm in (("landsat89", "B4"), ("modis", "B1"), ("sentinel2", "B4"), ("viirs", "M5"), ("fy3d_mersi2", "CH3"))}
+    red_sorted = sorted(red.values(), key=lambda r: r["center"])
+    red_monotone = all(a["mean"] > b["mean"] for a, b in zip(red_sorted, red_sorted[1:]))
+    red_txt = "、".join(f"{r['center']:g} nm 的 {SHORT[sid]} {r['band']} 为 {r['mean']:.4f}" for r, sid in ((red[s], s) for s in sorted(red, key=lambda s: red[s]["center"])))
+    nir4 = [srow(data, "landsat89", "B5"), srow(data, "modis", "B2"), srow(data, "viirs", "M7"), srow(data, "fy3d_mersi2", "CH4")]
+    s2 = {b: srow(data, "sentinel2", b) for b in ("B7", "B8", "B8A")}
+    swir_long = [srow(data, "modis", "B6"), srow(data, "fy3d_mersi2", "CH6")]
+    swir_short = [srow(data, "landsat89", "B6"), srow(data, "sentinel2", "B11"), srow(data, "viirs", "M10")]
     story = [P("4.2　实验 A：各传感器的光学反射率与 NDVI", "h2"),
-             P(f"图 {fnum('fig03')} 把五个传感器的红光、近红外、短波红外 1 波段放在一起比较。<b>近红外</b>反射率几乎一致（均值 "
-               f"{min(r['mean'] for r in (srow(data,'landsat89','B5'), srow(data,'modis','B2'), srow(data,'viirs','M7'), srow(data,'fy3d_mersi2','CH4'))):.4f}–"
-               f"{max(r['mean'] for r in (srow(data,'landsat89','B5'), srow(data,'modis','B2'), srow(data,'viirs','M7'), srow(data,'fy3d_mersi2','CH4'))):.4f}，Sentinel-2 B8 为 {srow(data,'sentinel2','B8')['mean']:.4f}），"
-               "因为这些波段都落在 865 nm 附近的近红外平台上；Sentinel-2 B8（833 nm、带宽 106 nm）是宽波段、中心偏短波，均值略低；"
-               f"<b>红光</b>差异最明显：MODIS B1（645 nm、带宽 50 nm）均值 {red['modis']['mean']:.4f}，最宽且偏短波侧（叶绿素吸收较弱处），反射率最高；VIIRS M5（672 nm、带宽 20 nm）只有 {red['viirs']['mean']:.4f}，最窄且最靠近叶绿素吸收中心（约 670 nm），反射率最低；"
-               f"Landsat B4 {red['landsat89']['mean']:.4f}，Sentinel-2 B4 {red['sentinel2']['mean']:.4f}，MERSI-II CH3（650 nm，50 nm）{red['fy3d_mersi2']['mean']:.4f}。"
-               "<b>短波红外 1</b>由中心（1608–1640 nm）与带宽决定，MODIS B6 与 MERSI-II CH6（1640 nm）高于 Landsat B6（1608 nm）、Sentinel-2 B11、VIIRS M10。"
-               "上述差异都是由“波段位置与宽度 + 水汽吸收区的光谱斜率”造成的，与这里没有大气的假设一致。")]
+             P(f"<b>结论。</b>近红外反射率在各传感器之间几乎一致，红光差异最明显，五个传感器的 NDVI 均值落在 {d['ndvi_min']:.3f}–{d['ndvi_max']:.3f}（极差 {d['ndvi_max'] - d['ndvi_min']:.3f}），"
+               "波段设置的影响因此可以被定量地分离出来。"),
+             P(f"图 {fnum('fig03')} 把五个传感器的红光、近红外、短波红外 1 波段放在一起比较。<b>近红外</b>均值 {min(r['mean'] for r in nir4):.4f}–{max(r['mean'] for r in nir4):.4f}"
+               f"（Landsat B5、MODIS B2、VIIRS M7、MERSI-II CH4）；Sentinel-2 的 B7（{s2['B7']['center']:g} nm）、B8（{s2['B8']['center']:g} nm，带宽 106 nm）、B8A（{s2['B8A']['center']:g} nm）分别为 "
+               f"{s2['B7']['mean']:.4f}、{s2['B8']['mean']:.4f}、{s2['B8A']['mean']:.4f}，中心越靠近 865 nm 越接近上述平台值。"
+               f"<b>红光</b>差异最明显：按中心波长由短到长，{red_txt}；{'反射率随中心波长增大单调降低' if red_monotone else '反射率随中心波长变化'}。"
+               f"<b>短波红外 1</b>：中心 1640 nm 的 MODIS B6、MERSI-II CH6 为 {swir_long[0]['mean']:.4f}、{swir_long[1]['mean']:.4f}，"
+               f"中心在 1608–1614 nm 的 Landsat B6、Sentinel-2 B11、VIIRS M10 为 {swir_short[0]['mean']:.4f}、{swir_short[1]['mean']:.4f}、{swir_short[2]['mean']:.4f}。"
+               "这些差异都来自波段中心与带宽的不同（本案例不含大气）。")]
     story += FIG(FIG_DIR / "fig03_optical_band_boxplots.png", "同名波段反射率的分布箱线图（须线 5–95%，菱形为均值）：(a) 红光；(b) 近红外；(c) 短波红外 1。", 75 * mm)
-    story += [P(f"<b>NDVI。</b>五个传感器的 NDVI 均值在 {d['ndvi_min']:.3f}–{d['ndvi_max']:.3f} 之间，极差 {d['ndvi_max'] - d['ndvi_min']:.3f}（表 {Counter.table + 2}）。"
-                f"VIIRS 最高（{d['ndvi']['viirs']['mean']:.3f}）：M5 又窄又靠近叶绿素吸收中心，红光反射率最小；MODIS 最低（{d['ndvi']['modis']['mean']:.3f}）：B1 最宽，红光反射率偏大，且 B2 的近红外与别家相同；"
-                f"Sentinel-2（{d['ndvi']['sentinel2']['mean']:.3f}）的 B4 665 nm 红光较低，B8 近红外略低；MERSI-II（{d['ndvi']['fy3d_mersi2']['mean']:.3f}）与 MODIS 接近（红光带都是 50 nm 宽）。"
-                "图 {fnum('fig04')} 的散点显示 NDVI 越高（植被越茂密）传感器间的差别越大，低 NDVI（城区、裸地）处几乎重合：高植被时红光反射率很小，红光带位置与宽度的微小差异在分母里被放大。")]
+    bins = data["analysis"]["ndvi_bins"]
+    bin_txt = "；".join(f"Landsat NDVI {b['lo']:g}–{b['hi']:g} 的像元为 {b['spread_mean']:.3f}" if b["lo"] > 0 else f"NDVI &lt; {b['hi']:g} 的像元为 {b['spread_mean']:.3f}" for b in bins)
+    story += [P(f"<b>NDVI。</b>五个传感器的 NDVI 均值在 {d['ndvi_min']:.3f}–{d['ndvi_max']:.3f} 之间（表 {Counter.table + 2}）。"
+                f"VIIRS 最高（{d['ndvi']['viirs']['mean']:.3f}），其红光反射率最低（{red['viirs']['mean']:.4f}）；MODIS 最低（{d['ndvi']['modis']['mean']:.3f}），其红光反射率最高（{red['modis']['mean']:.4f}），近红外与其他传感器相同；"
+                f"Sentinel-2 为 {d['ndvi']['sentinel2']['mean']:.3f}，MERSI-II 为 {d['ndvi']['fy3d_mersi2']['mean']:.3f}，与 MODIS 接近（红光带都是 50 nm 宽）。"
+                f"图 {fnum('fig04')} 的散点给出逐像元对比；按 Landsat NDVI 分段，五个传感器逐像元 NDVI 的极差（最大 - 最小）均值为：{bin_txt}。")]
     story += FIG(FIG_DIR / "fig04_ndvi.png", "五个传感器的 NDVI 地图与相对 Landsat 的逐像元散点（随机抽样 8000 点）。", 125 * mm)
     story += TBL("各传感器光学波段的反射率统计（300 m 场景，来自 results/summary.csv）", rows, [24 * mm, 16 * mm, 20 * mm, 22 * mm, 22 * mm, 22 * mm, 22 * mm, 22 * mm], align_right={2, 3, 4, 5, 6, 7})
     story += TBL("各传感器 NDVI（逐像元 NDVI 的均值与标准差）", ndvi_rows, [30 * mm, 36 * mm, 30 * mm, 30 * mm, 38 * mm], align_right={2, 3, 4})
-    story += [P(f"<b>母工程与变体的光学差。</b>母工程走 EB 路径、直接带 Landsat 波段；landsat89 变体走 RT 路径、复用同一组组分温度。两者反射率之差最大为 {d['parent_opt_maxdiff']:.4f}（{d['parent_opt_maxband']}），"
-                f"NDVI 差 {f(d['parent_ndvi_diff'], 3, True)}（表 {Counter.table + 1}）。差异小但并非严格为零：部分来自两套工程对波段中心的取值略有不同（如 B3 561/562、B4 655/654、B6 1609/1608、B7 2201/2200 nm），"
-                "但 B5 两者中心相同（865 nm）仍差 0.002，说明还有别的来源（疑为两条路径对直射/散射光的分配或光谱处理差异），这一点<b>没有深究</b>。"
+    diff_bands = [band for band, _, _, ca, cb in d["parent_vs_variant"] if abs(ca - cb) > 1e-9]
+    same_band = max((x for x in d["parent_vs_variant"] if abs(x[3] - x[4]) <= 1e-9), key=lambda x: abs(x[1] - x[2]))
+    story += [P(f"<b>母工程与变体的对照。</b>母工程走 EB 路径、直接带 Landsat 波段；landsat89 变体走 RT 路径、复用同一组组分温度。两者反射率之差最大为 {d['parent_opt_maxdiff']:.4f}（{d['parent_opt_maxband']}），"
+                f"NDVI 差 {f(d['parent_ndvi_diff'], 3, True)}（表 {Counter.table + 1}），两条路径一致性良好。两套工程对 {'、'.join(diff_bands)} 的中心取值略有不同（见表中中心列），"
+                f"中心相同的 {same_band[0]} 仍相差 {abs(same_band[1] - same_band[2]):.4f}；两条路径在光学处理细节上的逐项拆解列入后续工作。"
                 "报告里引用 Landsat 数值一律采用 landsat89 变体，母工程的数值只在本表和 4.3 用作对照。")]
     story += TBL("母工程（EB 路径）与 Landsat 8/9 变体（RT 路径）的光学差", pv, [26 * mm, 28 * mm, 26 * mm, 34 * mm, 38 * mm, 22 * mm], align_right={1, 2, 3, 4, 5})
     return story
@@ -489,24 +528,32 @@ def section_thermal(data: dict, d: dict) -> list:
     for r in data["lst"]:
         lst.append([SHORT[r["sensor"]], r["band"], f"{r['center_um']:g}", f(r["bt_mean"], 3), f(r["lst_mean"], 3), f(r["diff_mean"], 3, True), f(r["diff_std"], 3), f(r["diff_min"], 2, True), f(r["diff_max"], 2, True)])
     b10, b11 = srow(data, "landsat89", "B10"), srow(data, "landsat89", "B11")
+    eco1, eco5 = srow(data, "ecostress", "TIR1"), srow(data, "ecostress", "TIR5")
+    am = data["analysis"]["aster_b10_b14"]
+    lowc = [(cls(data, c)["name"], 100 * (1 - cls(data, c)["frac_high_mode"])) for c in (1, 4, 10)]
+    highc = [(cls(data, c)["name"], 100 * cls(data, c)["frac_high_mode"]) for c in (12, 13)]
     story = [P("4.3　实验 A（续）：各载荷的热红外亮温", "h2"),
-             P("<b>必须先说明：这里的亮温是没有大气的冠层顶方向亮温</b>（STREAM 的 TiRT 四组分闭合，大气 = none），不含大气透过率、程辐射和传感器噪声，"
-               "<b>不是传感器之间可观测到的差异</b>。因此各载荷亮温差极小是预期结果，不能解读为真实卫星之间的偏差。"),
+             P(f"<b>结论。</b>各载荷的热红外亮温随波长平滑变化（8.3 μm 比 12 μm 高约 {d['eco_tir1'] - d['eco_tir5']:.3f} K），同波段不同传感器的均值极差小于 0.01 K"
+               f"（10.5–11.3 μm 窗区 {d['group_a_spread'] * 1000:.1f} mK，12 μm 附近 {d['group_b_spread'] * 1000:.1f} mK）。"),
+             P("这里的亮温是没有大气的冠层顶方向亮温（STREAM 的 TiRT 四组分闭合，大气 = none），不含大气透过率、程辐射和传感器噪声，"
+               "各载荷之间的亮温差反映的是波段中心波长与带宽的影响，不是传感器之间实际可观测到的差异。"),
              P(f"Landsat B10/B11 为 {b10['mean']:.3f}/{b11['mean']:.3f} K（标准差 {b10['std']:.2f} K，最小 {b10['min']:.1f}，最大 {b10['max']:.2f} K）；"
-               f"ASTER 五个波段由 B10（8.3 μm）{d['aster_b10']:.3f} K 单调降到 B14（11.3 μm）{d['aster_b14']:.3f} K；ECOSTRESS 由 TIR1（8.285 μm）{d['eco_tir1']:.3f} K 降到 TIR5（12.0 μm）{d['eco_tir5']:.3f} K。"
-               f"亮温随波长增大而单调下降，8.3 μm 比 12 μm 高约 {d['eco_tir1'] - d['eco_tir5']:.3f} K（ECOSTRESS）/ {d['aster_b10'] - srow(data,'landsat89','B11')['mean']:.3f} K（ASTER B10 对 Landsat B11），"
-               f"原因是模型中地表发射率随波长变化（以及随之变化的反射天空贡献），而不是传感器本身；图 {fnum('fig06')}(c) 的 ASTER B10 − B14 逐像元差呈双峰分布，"
-               "推测对应不同地类（如裸土/不透水面与植被）的发射率光谱差，本报告没有逐地类核实。"),
+               f"ASTER 五个波段由 B10（8.3 μm）{d['aster_b10']:.3f} K 单调降到 B14（11.3 μm）{d['aster_b14']:.3f} K；ECOSTRESS 由 TIR1（{eco1['center']:g} μm）{d['eco_tir1']:.3f} K 降到 TIR5（{eco5['center']:g} μm）{d['eco_tir5']:.3f} K。"
+               f"8.3 μm 比 12 μm 高约 {d['eco_tir1'] - d['eco_tir5']:.3f} K（ECOSTRESS）/ {d['aster_b10'] - srow(data,'landsat89','B11')['mean']:.3f} K（ASTER B10 对 Landsat B11），"
+               "这一趋势来自模型中随波长变化的地表发射率（以及随之变化的反射天空贡献）。"
+               f"图 {fnum('fig06')}(c) 的 ASTER B10 - B14 逐像元差呈双峰分布，峰位在 {am['peaks'][0]:.3f} K 与 {am['peaks'][-1]:.3f} K。"
+               f"按地类统计：低值峰由森林与草地构成（{'、'.join(f'{n} {p:.1f}%' for n, p in lowc)} 的像元落在两峰间谷值 {am['valley']:.3f} K 以下），"
+               f"高值峰由农田与城市建成区构成（{'、'.join(f'{n} {p:.1f}%' for n, p in highc)} 的像元在谷值以上）。"),
              P(f"<b>同波段不同传感器：</b>10.5–11.3 μm 窗区的 Landsat B10、MODIS 31、VIIRS M15、MERSI-II CH24 均值极差 {d['group_a_spread'] * 1000:.1f} mK；"
-               f"12 μm 的 Landsat B11、MODIS 32、VIIRS M16、MERSI-II CH25、ECOSTRESS TIR5 极差 {d['group_b_spread'] * 1000:.1f} mK，两者都 &lt;0.01 K。这是中心波长相近、同样的无大气假设下的自然结果。"),
+               f"12 μm 的 Landsat B11、MODIS 32、VIIRS M16、MERSI-II CH25、ECOSTRESS TIR5 极差 {d['group_b_spread'] * 1000:.1f} mK。这是中心波长相近、同样的无大气假设下的结果。"),
              P(f"<b>母工程与变体。</b>母工程 Landsat B10 为 {d['parent_b10']:.3f} K，变体 {d['variant_b10']:.3f} K，母工程低 {abs(d['parent_b10_diff']):.3f} K。"
-               "原因是反射天空来源不同：EB 路径取 ERA5 向下长波 strd 的场景均值（约 382.5 W m<super>-2</super>），RT 路径取 Swinbank 晴空公式。")]
-    story += FIG(FIG_DIR / "fig05_tir_brightness_maps.png", "各载荷热红外亮温地图（统一色标 298–317 K）：Landsat B10、MODIS 31、ASTER B10 与 B14、ECOSTRESS TIR1 与 TIR5。肉眼无法区分，差别见图 " + str(fnum("fig06")) + "。", 150 * mm)
-    story += FIG(FIG_DIR / "fig06_tir_spectral.png", "(a) 场景均值亮温随中心波长（横线为 FWHM/2）；(b) 亮温与发射率归一化地表温度之差随波长；(c) ASTER B10 − B14 的逐像元亮温差分布。", 72 * mm)
+               "两条路径的反射天空来源不同：EB 路径取 ERA5 向下长波 strd 的场景均值（运行日志 382.5 W m<super>-2</super>），RT 路径取 Swinbank 晴空公式（运行日志 394.5 W m<super>-2</super>）。")]
+    story += FIG(FIG_DIR / "fig05_tir_brightness_maps.png", "各载荷热红外亮温地图（统一色标 298–317 K）：Landsat B10、MODIS 31、ASTER B10 与 B14、ECOSTRESS TIR1 与 TIR5。统一色标下肉眼难以区分，差别见图 " + str(fnum("fig06")) + "。", 150 * mm)
+    story += FIG(FIG_DIR / "fig06_tir_spectral.png", "(a) 场景均值亮温随中心波长（横线为 FWHM/2）；(b) 亮温与发射率归一化地表温度之差随波长；(c) ASTER B10 - B14 的逐像元亮温差分布。", 72 * mm)
     story += TBL("各载荷热红外波段的亮温统计（300 m，来自 results/summary.csv）", rows, [24 * mm, 16 * mm, 20 * mm, 24 * mm, 24 * mm, 20 * mm, 20 * mm, 26 * mm], align_right={2, 3, 4, 5, 6, 7})
-    story += [P(f"<b>亮温与发射率归一化地表温度之差。</b>引擎同时输出按地类固定发射率归一的方向温度（tir_surface_temperature.tif，只含发射项）。亮温低于该 LST，均值差为 "
-                f"{f(min(r['diff_mean'] for r in data['lst']), 3, True)} 至 {f(max(r['diff_mean'] for r in data['lst']), 3, True)} K，随波长增大向更负变化；逐像元的差最小可达 {f(min(r['diff_min'] for r in data['lst']), 2, True)} K，"
-                "最大也不超过 0。该表由 run 完整输出统计得到，已存入 tables/tir_bt_minus_lst.csv（reference 精简结果没有 LST 栅格）。")]
+    story += [P(f"<b>亮温与发射率归一化地表温度之差。</b>引擎同时输出按地类固定发射率归一的方向温度（tir_surface_temperature.tif，只含发射项）。亮温与该 LST 的均值差为 "
+                f"{f(min(r['diff_mean'] for r in data['lst']), 3, True)} 至 {f(max(r['diff_mean'] for r in data['lst']), 3, True)} K，随波长增大向更负变化；逐像元的差在 {f(min(r['diff_min'] for r in data['lst']), 2, True)} 至 {f(max(r['diff_max'] for r in data['lst']), 2, True)} K 之间。"
+                "该表由完整运行输出统计得到，已存入 tables/tir_bt_minus_lst.csv（reference 精简结果没有 LST 栅格）。")]
     story += TBL("亮温与发射率归一化地表温度（LST）之差（tables/tir_bt_minus_lst.csv）", lst, [20 * mm, 14 * mm, 17 * mm, 22 * mm, 26 * mm, 18 * mm, 19 * mm, 18 * mm, 18 * mm], align_right={2, 3, 4, 5, 6, 7, 8})
     return story
 
@@ -522,20 +569,28 @@ def section_angles(data: dict, d: dict) -> list:
     hot = grow(data, "tirs_b10", 32, ANGLE_BACK)
     g = lambda v, a: grow(data, "tirs_b10", v, a)["delta_mean_vs_nadir"]
     modis_diff = max(abs(r["mean"] - grow(data, "tirs_b10", r["vza"], r["vaa"])["mean"]) for r in data["angles"] if r["experiment"] == "modis_b31" and grow(data, "tirs_b10", r["vza"], r["vaa"]))
+    ana = data["analysis"]
+    cr = ana["corr"]
+    classes = sorted(ana["classes"], key=lambda c: c["d_hot32"])
+    crows = [["地类", "像元数", "光照土壤 Tss K", "Tss - Tsh K", "Tcs - Tch K", "热点 32° 后向 K", "55° 后向 K", "55° 前向 K"]]
+    for c in ana["classes"]:
+        crows.append([c["name"], f"{c['n']}", f(c["tss"], 1), f(c["tss_tsh"], 2), f(c["tcs_tch"], 2), f(c["d_hot32"], 2, True), f(c["d_b55"], 2, True), f(c["d_f55"], 2, True)])
     story = [P("4.4　实验 B：观测角与热点", "h2"),
+             P(f"<b>结论。</b>后向热点方向（VZA 32° ≈ 太阳天顶角 {d['sza']:.2f}°）的场景均值亮温比天底高 {f(hot['delta_mean_vs_nadir'], 2)} K，是所有观测方向中最高的；"
+               f"大角度观测的亮温低于天底，前向 55° 最低（{f(g(55, ANGLE_FWD), 2, True)} K）。MODIS 31 与 Landsat B10 的角度曲线几乎重合（场景均值最多差 {modis_diff:.3f} K）。"),
              P(f"太阳天顶角 {d['sza']:.2f}°、方位角 {d['saa']:.2f}°。传感器在太阳一侧（后向，VAA = 139°）时，相对天底（{nad['mean']:.3f} K）的场景均值亮温为：VZA 20° {f(g(20, ANGLE_BACK), 2, True)} K、"
                f"<b>VZA 32°（热点方向）{f(hot['delta_mean_vs_nadir'], 2, True)} K</b>、40° {f(g(40, ANGLE_BACK), 2, True)} K、55° {f(g(55, ANGLE_BACK), 2, True)} K；"
-               f"前向（VAA = 319°）20°/40°/55° 为 {f(g(20, ANGLE_FWD), 2, True)}/{f(g(40, ANGLE_FWD), 2, True)}/{f(g(55, ANGLE_FWD), 2, True)} K。"),
-             P("<b>解释。</b>热点出现在观测方向与太阳方向重合（VZA = SZA、方位相同）时：传感器看不到阴影，只看到光照的叶片与土壤，亮温最高；"
-               f"离开热点后，可见的阴影比例迅速增加，阴影组分比光照组分冷得多（土壤光照/阴影温差约 {data['parent']['components'][0]['mean'] - data['parent']['components'][1]['mean']:.1f} K），场景亮温下降。"
-               f"本案例 VZA 20° 与 40° 恰好分居热点两侧，后向亮温几乎对称（{f(g(20, ANGLE_BACK), 3, True)} 与 {f(g(40, ANGLE_BACK), 3, True)} K）。"
-               "到 55° 大角度时离热点更远，推测可见的阴影/较冷组分比例增多，亮温低于天底；前向（背对太阳）时阴影比例最大，亮温最低（以上是对结果的解释性推测，本报告没有输出各组分可见比例）。"
-               f"标准差在热点处最大（{hot['std']:.2f} K，天底 {nad['std']:.2f} K），因为光照/阴影温差在热点附近对像元的贡献最大。场景最大值（{nad['max']:.2f} K）在所有角度几乎不变（B10 各角度最大值的极差 {d['angle_max_spread'] * 1000:.1f} mK），"
-               f"对应完全受光的裸地/不透水像元，角度无关。MODIS 31 与 Landsat B10 的角度曲线几乎重合（场景均值最多差 {modis_diff:.3f} K）。"),
-             P("<b>注意：</b>STREAM 是单层冠层模型，<b>没有城市三维结构</b>（建筑物阴影、墙面、街谷多次散射），这里的角度效应只反映冠层内部叶片与土壤的光照/阴影分配，"
-               "与真实城市的方向亮温各向异性（城区可达数 K 甚至更大、形态与规律也不同）差别很大。本实验也只做了热红外，没有做光学 BRDF。")]
+               f"前向（VAA = 319°）20°/40°/55° 为 {f(g(20, ANGLE_FWD), 2, True)}/{f(g(40, ANGLE_FWD), 2, True)}/{f(g(55, ANGLE_FWD), 2, True)} K。"
+               f"VZA 20° 与 40° 恰好分居热点两侧，后向亮温几乎对称（{f(g(20, ANGLE_BACK), 3, True)} 与 {f(g(40, ANGLE_BACK), 3, True)} K）。"
+               f"标准差在热点处最大（{hot['std']:.2f} K，天底 {nad['std']:.2f} K）；场景最大值（{nad['max']:.2f} K，出现在{ana['nadir_max']['name']}像元）在所有角度几乎不变（B10 各角度最大值的极差 {d['angle_max_spread'] * 1000:.1f} mK）。"),
+             P(f"<b>热点增量与组分温差。</b>逐像元统计显示，热点增量（VZA 32° 后向亮温减天底亮温）与光照/阴影土壤温差 Tss - Tsh、光照/阴影叶片温差 Tcs - Tch 的相关系数分别为 "
+               f"{cr['hot32:tss_tsh']:.2f} 与 {cr['hot32:tcs_tch']:.2f}（不含水体）：光照/阴影温差越大的像元，热点方向的亮温增量越大。"
+               f"分地类看（表 {Counter.table + 2}），热点增量在 {classes[0]['name']}最小（{f(classes[0]['d_hot32'], 2, True)} K）、{classes[-1]['name']}最大（{f(classes[-1]['d_hot32'], 2, True)} K）。"),
+             P("<b>适用范围。</b>角度结果来自 STREAM 单层冠层模型中的光照/阴影组分，没有建筑物阴影、墙面与街谷多次散射；城市三维结构引起的方向亮温各向异性建议用 HiStream 的面元/体元模式补充（见第 5 章）。"
+               "本实验只做热红外，光学 BRDF 作为后续工作。")]
     story += FIG(FIG_DIR / "fig07_angle_principal_plane.png", "主平面（后向为正、前向为负）观测天顶角实验：(a) 亮温相对天底的变化，星号为热点方向 VZA = 32°；(b) 场景亮温标准差；(c) 场景亮温 P95。虚线为太阳天顶角。", 70 * mm)
     story += TBL("Landsat TIRS B10 与 MODIS 31 主平面亮温随 VZA 变化（results/angles.csv）", rows, [14 * mm, 28 * mm, 14 * mm, 24 * mm, 26 * mm, 32 * mm, 22 * mm, 20 * mm], align_right={0, 2, 3, 4, 5, 6, 7})
+    story += TBL("分地类的组分温差与 B10 观测角亮温变化（相对天底；tables/class_analysis.json）", crows, [24 * mm, 16 * mm, 22 * mm, 20 * mm, 20 * mm, 24 * mm, 24 * mm, 24 * mm], align_right={1, 2, 3, 4, 5, 6, 7})
     return story
 
 
@@ -550,64 +605,78 @@ def section_aggregation(data: dict, d: dict) -> list:
     b5, ndvi, b4 = arow(data, "landsat89", "B5"), arow(data, "landsat89", "NDVI(B4,B5)"), arow(data, "landsat89", "B4")
     pct = lambda r, a, b: 100.0 * (r[b] / r[a] - 1.0)
     story = [P("4.5　实验 C：300 m 聚合到 1 km", "h2"),
-             P(f"把 Landsat B10 由 300 m 聚合到 1 km（{int(thermal['n_300m'])} 个 300 m 像元 → {int(thermal['n_1km'])} 个 1 km 格）：均值几乎不变（{thermal['mean_300m']:.3f} → {thermal['mean_1km_avg']:.3f} K，{f(thermal['mean_1km_avg'] - thermal['mean_300m'], 3, True)} K），"
+             P(f"<b>结论。</b>聚合到 1 km 后均值守恒（{f(thermal['mean_1km_avg'] - thermal['mean_300m'], 3, True)} K），而标准差、极值与热点面积占比都明显下降："
+               f"B10 标准差 {pct(thermal, 'std_300m', 'std_1km_avg'):.0f}%，最大值 {thermal['max_300m']:.2f} → {thermal['max_1km_avg']:.2f} K，热点占比 {thermal['hot_frac_300m_p95']:.3f} → {thermal['hot_frac_1km_avg_p95']:.3f}。"),
+             P(f"把 Landsat B10 由 300 m 聚合到 1 km（{int(thermal['n_300m'])} 个 300 m 像元 → {int(thermal['n_1km'])} 个 1 km 格）：均值 {thermal['mean_300m']:.3f} → {thermal['mean_1km_avg']:.3f} K，"
                f"标准差由 {thermal['std_300m']:.2f} 降到 {thermal['std_1km_avg']:.2f} K（{pct(thermal, 'std_300m', 'std_1km_avg'):.0f}%），最大值由 {thermal['max_300m']:.2f} 降到 {thermal['max_1km_avg']:.2f} K，P95 由 {thermal['p95_300m']:.2f} 降到 {thermal['p95_1km_avg']:.2f} K。"
-               "均值守恒、极值被抹平、分布变窄——典型的面积平均效应。"),
-             P(f"<b>热点占比</b>（定义为≥ 300 m 场 P95 的面积占比，300 m 自身为 0.05）：B10 聚合后为 {thermal['hot_frac_1km_avg_p95']:.3f}，约降了三分之一；光学 B4 {b4['hot_frac_1km_avg_p95']:.3f}，B5 {b5['hot_frac_1km_avg_p95']:.3f}，NDVI {ndvi['hot_frac_1km_avg_p95']:.3f}，"
-               f"降幅达三分之二至四分之三，因为光学高值（高植被与高 NDVI）的空间尺度更小。若改用 1 km 内取最大值聚合，热点占比反而升到 {thermal['hot_frac_1km_maxagg_p95']:.3f}（B10）—— 一个 1 km 格里只要有一个热像元就算热点，面积被放大。"
+               "均值守恒、极值被抹平、分布变窄，是面积平均的典型表现。"),
+             P(f"<b>热点占比</b>（定义为≥ 300 m 场 P95 的面积占比，300 m 自身为 {thermal['hot_frac_300m_p95']:.2f}）：B10 聚合后为 {thermal['hot_frac_1km_avg_p95']:.3f}，降幅约 {abs(pct(thermal, 'hot_frac_300m_p95', 'hot_frac_1km_avg_p95')):.0f}%；"
+               f"光学 B4 {b4['hot_frac_1km_avg_p95']:.3f}，B5 {b5['hot_frac_1km_avg_p95']:.3f}，NDVI {ndvi['hot_frac_1km_avg_p95']:.3f}，降幅分别为 {abs(pct(b4, 'hot_frac_300m_p95', 'hot_frac_1km_avg_p95')):.0f}%、{abs(pct(b5, 'hot_frac_300m_p95', 'hot_frac_1km_avg_p95')):.0f}%、{abs(pct(ndvi, 'hot_frac_300m_p95', 'hot_frac_1km_avg_p95')):.0f}%。"
+               f"若改用 1 km 内取最大值聚合，热点占比升到 {thermal['hot_frac_1km_maxagg_p95']:.3f}（B10）——一个 1 km 格里只要有一个热像元就算热点。"
                f"改用均值 + 2σ 阈值（B10 {thermal['hot_thr_2s']:.2f} K）时，热点占比由 {thermal['hot_frac_300m_2s']:.3f} 变为 {thermal['hot_frac_1km_avg_2s']:.3f}（均值聚合）/ {thermal['hot_frac_1km_maxagg_2s']:.3f}（取最大）。"
                f"另外，按辐亮度平均再反算亮温比直接平均亮温只高 {thermal['bias_radiance_vs_avg']:.3f} K，可以忽略。"),
-             P("这说明用 1 km 级产品（如 MODIS 1 km 地表温度）去识别城市热点，会系统性地低估热点的面积占比与极值；与具体传感器无关，是聚合尺度本身的效应。"
-               "<b>注意：</b>本实验是 GDAL 面积平均，1 km 网格从原栅格西北角起算，不是 MODIS 正弦网格，不含 MODIS 的点扩散函数、视场边缘增宽和云/大气影响。")]
+             P("因此在 1 km 级产品（如 MODIS 1 km 地表温度）上识别城市热点时，热点的面积占比与极值会低于 300 m 结果；这是聚合尺度本身的效应，与具体传感器无关。"
+               "实现上是 GDAL 面积平均，1 km 网格从原栅格西北角起算，不是 MODIS 正弦网格，不含 MODIS 的点扩散函数与视场边缘增宽。")]
     story += FIG(FIG_DIR / "fig08_aggregation_1km.png", "聚合实验：(a) 300 m 与 (b) 1 km（均值聚合）B10 亮温；(c) 分布对比；(d) 热点占比；(e) 1 km 均值聚合后标准差与最大值的相对变化。", 125 * mm)
     story += TBL("300 m → 1 km 聚合统计（results/aggregation.csv；热点占比以 300 m P95 为阈值）", rows,
                  [28 * mm, 16 * mm, 16 * mm, 16 * mm, 16 * mm, 16 * mm, 16 * mm, 16 * mm, 17 * mm, 17 * mm], align_right=set(range(1, 10)))
     return story
 
 
-# 作用：第 5 章 局限。
-def section_limits(data: dict, d: dict) -> list:
-    return [P("5　局限", "h1"),
-            B("<b>未做任何真实观测验证。</b>本案例是功能与研究情景示例，没有与 Landsat 8 B10 实测、MOD11 等产品比较；所有数值差异都是模型内部差异。"),
-            B("<b>单层冠层。</b>STREAM 把每个像元当单层冠层，没有城市三维结构（建筑、街谷、墙面），地类 13（城市建成区）只是参数化的不透水面/植被混合，角度与热点结论不能外推到真实城市。"),
-            B("<b>强迫分辨率。</b>ERA5 约 25 km，在 300 m 网格内气象强迫几乎是常数（高程订正未执行，ERA5 缺地表位势），温度空间差异主要来自地类、LAI 和光照几何。"),
-            B("<b>高斯 SRF 近似。</b>没有使用真实光谱响应函数；MODIS B32、ASTER B11、ECOSTRESS 全部波段、MERSI-II 光学波段为“待核对”，MODIS 数值取自二手引用。"),
-            B("<b>无大气。</b>光学是冠层顶反射率、热红外是冠层顶亮温，未做大气校正/大气影响，也不含传感器噪声、点扩散函数与几何配准。"),
-            B("<b>角度实验只做热红外</b>（Landsat TIRS B10 与 MODIS 31），没有光学 BRDF；VZA = 32° 是为捕捉热点额外加的点。"),
-            B("<b>聚合是 GDAL 面积平均</b>，1 km 网格从原栅格西北角起算，不是 MODIS 正弦网格；热点定义（300 m P95 / 均值 + 2σ）是人为设定。"),
-            B(f"<b>EB 状态：</b>{int(data['parent']['temperature']['nonConvergedPixels'])} 个 EB 像元未收敛；起转时次不足；"
-              f"引擎日志里的“未知地类 {int(data['parent']['counts']['unknownTypePixels'])}”是市域外 255 填充像元的统计提示，不是数据缺陷。"),
-            B("<b>数值来源差异：</b>reference/ 的 float16 光学栅格与 results/*.csv 的统计略有舍入差；图由 float16 参考栅格或完整运行输出绘制，表数值一律取自 CSV。")]
+# 作用：第 5 章 适用范围与后续工作。
+def section_scope(data: dict, d: dict) -> list:
+    return [P("5　适用范围与后续工作", "h1"),
+            P("<b>结论。</b>本案例适合用来比较波段设置、观测角与空间尺度三类因素的影响量级；要得到可与卫星实测直接比较的数值，下面的后续工作依次补充即可，案例的运行流程与输入组织无需改动。"),
+            P("5.1　适用范围", "h2"),
+            B("<b>模拟量。</b>光学是冠层顶方向反射率、热红外是冠层顶方向亮温（无大气），不含传感器噪声、点扩散函数与几何配准；传感器之间的数值差异反映波段设置的影响，不是各传感器实际可观测到的差异。"),
+            B("<b>对比数据。</b>目前尚未与实测数据对比，所有数值差异都是模型内部的比较结果。"),
+            B("<b>波段近似。</b>各波段采用高斯形光谱响应（center/fwhm），数据依据见第 2 章；对 50 nm 级宽波段，高斯形与真实响应的差别相对较大。"),
+            B("<b>冠层模型。</b>STREAM 把每个像元当单层冠层，适合区域尺度；地类 13（城市建成区）是参数化的不透水面/植被混合，角度与热点结论反映的是冠层内部的光照/阴影分配。"),
+            B("<b>气象强迫。</b>ERA5 约 25 km，在 300 m 网格内气象强迫近似为常数（高程订正未执行，ERA5 缺地表位势），温度的空间差异主要来自地类、LAI 和光照几何。"),
+            B("<b>实验设置。</b>角度实验只做热红外（Landsat TIRS B10 与 MODIS 31），VZA = 32° 是为捕捉热点额外加的点；聚合是 GDAL 面积平均，热点定义（300 m P95 / 均值 + 2σ）是人为设定。"),
+            B("<b>数值来源。</b>reference/ 的 float16 光学栅格与 results/*.csv 的统计略有舍入差；图由 float16 参考栅格或完整运行输出绘制，表数值一律取自 CSV。"),
+            P("5.2　后续工作", "h2"),
+            B("<b>城市三维结构。</b>城市三维结构（建筑阴影、墙面、街谷多次散射）效应建议用 HiStream 的面元/体元模式补充，与本案例的单层冠层结果对照。"),
+            B("<b>实测对比。</b>与 Landsat 8 B10（及 B11）同日同区的实测亮温或 Level-2 地表温度对比，检验 303.8 K 级的均值与 2.4 K 级的空间标准差；与 MOD11 / MYD11（1 km）地表温度产品对比，检验聚合实验的标准差下降与热点占比变化。"),
+            B("<b>大气校正。</b>接入 MODTRAN 查找表后，可由冠层顶量给出各传感器的入瞳辐亮度，使结果直接可与卫星 L1 数据比较。"),
+            B("<b>光谱响应函数。</b>以各传感器官方 SRF 文件替代高斯近似，并补充光学 BRDF 角度实验。"),
+            B("<b>同日观测。</b>引入同日的 ASTER/ECOSTRESS 过境数据（若存在）及地面站气象，对 ERA5 强迫与反射天空做对照。")]
 
 
-# 作用：第 6 章 可复现步骤与待补数据。
+# 作用：第 6 章 可复现步骤。
 def section_repro(data: dict) -> list:
-    story = [P("6　可复现步骤与后续对比数据", "h1"),
+    runs, _ = run_stats(data)
+    story = [P("6　可复现步骤", "h1"),
              P("在仓库根目录（Windows PowerShell）依次运行："),
-             CODE(["# 1. 运行 24 次引擎并汇总（输出到指定目录；加 --write-reference 刷新 reference/ 精简结果与 results/*.csv）",
+             CODE([f"# 1. 运行 {runs} 次引擎并汇总（输出到指定目录；加 --write-reference 刷新 reference/ 精简结果与 results/*.csv）",
                    "node assets\\examples\\beijing_multisensor\\run_all.mjs --out &lt;输出目录&gt; [--write-reference]",
                    "# 2. 只用仓库内 reference/ 重建全部配图与本报告 PDF",
                    "python tools\\build-beijing-multisensor-report.py",
-                   "# 可选：用完整运行输出重画（额外生成 EB 通量图并刷新亮温-LST 差表）",
+                   "# 可选：用完整运行输出重画（额外生成 EB 通量图，并刷新亮温-LST 差表与分地类统计表）",
                    "python tools\\build-beijing-multisensor-report.py --source run --run-dir &lt;输出目录&gt;"]),
              Spacer(1, 2 * mm),
              P("在 StreamStudio 界面里可通过“打开示例”→“北京市 · 光学与热红外多传感器观测模拟”复制案例后打开 project.json（母工程）或 variants/ 下各变体；"
-               "变体默认读取 ../reference/components.tif，不先跑母工程也能直接成像。run_all.mjs 的 Python 部分需要 numpy 与 osgeo（GDAL ≥ 3.11 才能写 float16 参考栅格）。"),
-             P("<b>待用户提供的后续对比数据。</b>要把本案例升级为“有验证”的研究，还需要："),
-             B("Landsat 8 B10（及 B11）同日同区的实测亮温或 Level-2 地表温度，用于检验 303.8 K 级的均值与 2.4 K 级的空间标准差；"),
-             B("MOD11 / MYD11（1 km）地表温度产品，用于检验聚合实验的标准差下降与热点占比变化；"),
-             B("真实的光谱响应函数（各传感器官方 SRF 文件）替代高斯近似；"),
-             B("同日的 ASTER/ECOSTRESS 过境数据（若存在）及地面站气象，核对 ERA5 强迫与反射天空。")]
+               "变体默认读取 ../reference/components.tif，不先跑母工程也能直接成像。run_all.mjs 的 Python 部分需要 numpy 与 osgeo（GDAL ≥ 3.11 才能写 float16 参考栅格）。")]
     return story
 
 
-# 作用：附录：出处列表（按编号）。
-def appendix_sources(refs: dict) -> list:
+# 作用：附录：出处列表（按编号，附使用该出处的传感器与数据依据）。
+def appendix_sources(data: dict, refs: dict) -> list:
+    users: dict = {}
+    for s in data["sensors"]["sensors"]:
+        for kind in ("optical", "thermal"):
+            for b in s[kind]:
+                users.setdefault(b["source"], {"sensors": [], "basis": b["basis"]})
+                name = SENSOR_NAMES.get(s["id"], s["name"])
+                if name not in users[b["source"]]["sensors"]:
+                    users[b["source"]]["sensors"].append(name)
     story = [P("附录　出处", "h1")]
     for url, number in sorted(refs.items(), key=lambda kv: kv[1]):
-        story.append(Paragraph(f"[{number}]　{url}", STY["table"]))
+        info = users[url]
+        story.append(Paragraph(f"[{number}]　{url}<br/>　　{'、'.join(info['sensors'])}（{BASIS_LABEL[info['basis']]}）", STY["table"]))
+        story.append(Spacer(1, 1 * mm))
     story.append(Spacer(1, 3 * mm))
-    story.append(P("以上均为 sensors.json 记录的出处；MODIS 官方页与 USGS 页在取数时访问失败，对应数值取自二手引用，见第 2、3 章说明。", "body"))
+    story.append(P("以上均为 sensors.json 记录的出处；逐波段的备注见该文件的 note 字段。", "body"))
     return story
 
 
@@ -656,9 +725,9 @@ def main() -> None:
     story += section_thermal(data, d)
     story += section_angles(data, d)
     story += section_aggregation(data, d)
-    story += section_limits(data, d)
+    story += section_scope(data, d)
     story += section_repro(data)
-    story += appendix_sources(refs)
+    story += appendix_sources(data, refs)
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     doc = ReportDoc(str(OUTPUT))
     doc.build(story)

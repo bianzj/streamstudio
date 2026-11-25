@@ -39,7 +39,7 @@ CASE = ROOT / "assets" / "examples" / "beijing_multisensor"
 REPORT_DIR = ROOT / "docs" / "cases" / "beijing-multisensor"
 FIG_DIR = REPORT_DIR / "figures"
 TABLE_DIR = REPORT_DIR / "tables"
-DEFAULT_RUN = Path(r"C:\work\streamsim\scratch\bj_multisensor\run")
+DEFAULT_RUN = Path(r"C:\work\streamsim\scratch\bj_multisensor\run2")
 MAX_PX = 3000  # 全局约定：任何图片宽高都必须小于 3000 像素
 DPI = 150
 
@@ -408,6 +408,59 @@ def bt_minus_lst_table(data: Data) -> list[dict]:
         return [{k: (float(v) if k not in ("sensor", "band") else v) for k, v in row.items()} for row in csv.DictReader(f)]
 
 
+# 作用：按地类与逐像元统计 ASTER B10−B14 的双峰、各地类的组分温差与角度亮温变化，供报告直接引用（run 源计算并写出
+# tables/class_analysis.json，reference 源只读该文件，因为 reference/ 不含角度实验栅格）。
+ANALYSIS_CLASSES = (1, 4, 10, 11, 12, 13)  # 像元数 ≥100 的非水体地类
+ANGLE_RUNS = {"hot32": "angles_tirs_b10_vza32_back", "b55": "angles_tirs_b10_vza55_back", "f55": "angles_tirs_b10_vza55_fwd"}
+
+
+def class_analysis(data: Data) -> dict:
+    path = TABLE_DIR / "class_analysis.json"
+    if data.source != "run":
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    comp = data.components()
+    aster = data.thermal("aster")
+    diff = aster["B10"][1] - aster["B14"][1]
+    ok = data.valid & np.isfinite(diff)
+    nadir = raster_tools.read_bands(str(data.run_dir / "angles_tirs_b10_vza00" / "tir_brightness_temperature.tif"))[2][0]
+    delta = {k: raster_tools.read_bands(str(data.run_dir / run / "tir_brightness_temperature.tif"))[2][0] - nadir for k, run in ANGLE_RUNS.items()}
+    # B10−B14 直方图的两个峰（> 最高峰 15% 的局部极大），及以两峰间谷值为界时各地类落在高值一侧的比例
+    hist, edges = np.histogram(diff[ok], bins=80)
+    peaks = [i for i in range(1, 79) if hist[i] > hist[i - 1] and hist[i] >= hist[i + 1] and hist[i] > 0.15 * hist.max()]
+    centers = [float((edges[i] + edges[i + 1]) / 2) for i in peaks]
+    valley = float(centers[0] + (centers[-1] - centers[0]) / 2) if len(centers) >= 2 else float(np.median(diff[ok]))
+    classes = []
+    for code in ANALYSIS_CLASSES:
+        m = ok & (data.type == code)
+        classes.append({"code": code, "name": IGBP[code][0], "n": int(m.sum()), "b10_b14_mean": float(np.nanmean(diff[m])),
+                        "frac_high_mode": float((diff[m] >= valley).mean()),
+                        "tss_tsh": float(np.nanmean(comp["Tss"][m] - comp["Tsh"][m])), "tcs_tch": float(np.nanmean(comp["Tcs"][m] - comp["Tch"][m])),
+                        **{f"d_{k}": float(np.nanmean(v[m])) for k, v in delta.items()}})
+    land = ok & (data.type != 17)
+    corr = {}
+    for k, v in delta.items():
+        for name, x in (("tss_tsh", comp["Tss"] - comp["Tsh"]), ("tcs_tch", comp["Tcs"] - comp["Tch"])):
+            m = land & np.isfinite(x) & np.isfinite(v)
+            corr[f"{k}:{name}"] = float(np.corrcoef(v[m], x[m])[0, 1])
+    result = {"aster_b10_b14": {"peaks": centers, "valley": valley, "n_valid": int(ok.sum())}, "classes": classes, "corr": corr}
+    # 各地类光照土壤温度均值（Tss），以及天底亮温最大值所在像元的地类
+    for entry in result["classes"]:
+        entry["tss"] = float(np.nanmean(comp["Tss"][ok & (data.type == entry["code"])]))
+    peak = np.nanargmax(np.where(data.valid, nadir, np.nan))
+    result["nadir_max"] = {"value": float(nadir.flat[peak]), "code": int(data.type.flat[peak]), "name": IGBP.get(int(data.type.flat[peak]), ("其他",))[0]}
+    # 五个传感器逐像元 NDVI 的极差（最大 − 最小），按 Landsat NDVI 分段取均值
+    ndvis = np.stack([ndvi_array(data, sid) for sid in OPTICAL_SENSORS])
+    spread, base = ndvis.max(axis=0) - ndvis.min(axis=0), ndvis[0]
+    bins = []
+    for lo, hi in ((-1.0, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)):
+        m = data.valid & np.isfinite(spread) & (base >= lo) & (base < hi)
+        bins.append({"lo": lo, "hi": min(hi, 1.0), "n": int(m.sum()), "spread_mean": float(spread[m].mean())})
+    result["ndvi_bins"] = bins
+    TABLE_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return result
+
+
 # 作用：图 6 热红外光谱：(a) 亮温随中心波长；(b) 亮温 - 发射率归一化 LST 随波长；(c) ASTER B10-B14 的逐像元差异直方图。
 def fig_tir_spectral(data: Data, out_dir: Path) -> Path:
     fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
@@ -587,6 +640,7 @@ def generate_figures(source: str = "reference", run_dir: Path = DEFAULT_RUN, out
         path = func(data, out_dir)
         if path:
             figures[key] = path
+    class_analysis(data)
     return figures
 
 
