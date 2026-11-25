@@ -258,8 +258,8 @@ void main()
 
 
     // It is a valid position and then continue
-    // 注意：bufferId0 为 uint，此条件恒真（疑为遗留判断，待核对），仅起括号作用。
-    if(bufferId0 >=0 )
+    // 说明：有效性已在上面用 setting.voxelCount 与 voxelLinks[].isValid 判定并提前 return；
+    //   此处原有的 `if(bufferId0 >= 0)` 因 bufferId0 为 uint 恒真，已改为无条件的语句块（只起作用域作用）。
     {
         //-----------------------------------------------
         // input from CPU parameter
@@ -388,6 +388,8 @@ void main()
             ph_z = psih(z-d,L);
             ph_zr = psih(zr-d,L);
             // 参考高度低于粗糙子层顶 zr 时，ph_zr 取 ph_z，避免在 z 以上外推（此处原作者标注“注意”）。
+            // 说明：这是中性（旧版）变体保留的写法，与植被分支的旧版一致；MOST 变体城市分支改用
+            //   ph_zr = ψh(z0m/L)，不含此修正（两者设计不同，不是笔误）。z<zr 时 ph_z 与 ph_zr 相抵。
             if(z < zr) ph_zr = ph_z; /// attention !!!
 #endif
             // u* = κ·u / (ln((z−d)/z0m) − ψm)；raa = (ln((z−d)/z0m) − ψh(z−d) + ψh(参考)) / (κ·u*)。
@@ -522,8 +524,9 @@ void main()
             kh0 = kappa*ustar*(zr - d);    //Diffusivity for heat
             // Stability-corrected canopy-top diffusivity (FacetEB form).
             kh = kh0 / mostPhiH((hcmax - d) * invL);
-// CANOPY_KH：冠内阻抗用的冠顶扩散率（MOST：稳定度修正后的 kh；
-//   中性变体见 #else：用 kh0，kh 虽算出但未被使用，待核对是否为遗留）。
+// CANOPY_KH：冠内阻抗（rac、rwcs）用的冠顶扩散率。MOST 变体用稳定度修正后的 kh；
+//   中性变体（#else）有意仍用 kh0（保持与 MOST 之前的着色器逐位一致，见文件头），
+//   其 kh 仅在 0<|L|<500 时被赋值，不参与计算。
 #define CANOPY_KH kh
 #else
            // stability correction functions, friction velocity and Kh=Km=Kv
@@ -555,6 +558,9 @@ void main()
             /////////////////////////////////////////////////////////////////////////////////////////////////////
             kh0 = kappa*ustar*(zr - d);    //Diffusivity for heat
             // unstable correction
+            // 注意：kh 的稳定度修正值在中性变体里不参与计算（CANOPY_KH 取 kh0，见下），
+            //   且 L=0 或 |L|≥500 时 kh 未赋值。若要让中性变体也用 kh，需先给 kh 赋初值 kh0，
+            //   并接受 0<|L|<500 的旧版输出变化（待决定，未改）。
             if (L < 0 && L > -500) kh = kappa*ustar*(zr - d) * sqrt(1 - 16 * (hcmax - d) / L);
             // stable correction 
             if (L > 0 && L < 500) kh = kappa*ustar*(zr - d) / (1 + 5 * (hcmax - d) / L);

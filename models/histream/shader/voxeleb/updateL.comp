@@ -1,8 +1,13 @@
 // ==========================================================================
 // 文件：updateL.comp
+// 状态：已弃用——不在当前计算流程中。src/voxeleb/pipeline.cpp 仍会创建 VoxelEBStage::updateL 的管线
+//       （加载本 SPV），但 src 中没有任何 submit(VoxelEBStage::updateL, ...) 调用（2026-11-25 核实），
+//       该着色器从未被分派执行；VoxelEB 的稳定度修正改走 budget.comp 的 ebState 累加 + 主机端 MOST 迭代
+//       （见 command.cpp、aeresist.comp 的 *_most 变体），中性变体直接使用 XML 给定的 L。
 // 功能：按水平柱（x,z）计算 Monin–Obukhov 长度 L 的旧版实现：用柱内各体元的平均显热通量 H 和摩擦速度
-//       ustar 估算 L = -ρ·cp·ustar³·T / (κ·g·H)。注意：写回 aeroConds[].L 的语句目前已被注释掉，
-//       本着色器当前实际不产生任何输出（新版稳定度走 budget.comp 中的 ebState 累加）（待核对是否已弃用）。
+//       ustar 估算 L = -ρ·cp·ustar³·T / (κ·g·H)。注意：写回 aeroConds[].L 的语句已被注释掉，
+//       本着色器即使被分派也不产生任何输出；且下文 aeroConds[aeroId] 使用未赋值的 aeroId（只赋了 aeroId0）。
+//       因已弃用，这些问题均未修复（修复前需统一 aeroId 并恢复写回）。
 // 主要步骤（每个线程处理一个水平柱）：
 //   1. 由线程号得到柱坐标 (x, 0, z)，经 NanoVDB 取该柱底部体元的缓冲区下标
 //   2. 读取体元→实例→网格链接，取气动参数 aeroConds 的冠层高度 hc_veg（体元数）
@@ -63,7 +68,7 @@ void main()
     // various parameters index
     //-------------------------
     // 步骤 1：声明体元属性下标变量。注意 aeroId 在本文件中没有被赋值（只给了 aeroId0），
-    // 后面 aeroConds[aeroId] 使用的是未初始化值——疑似笔误（只报告，不修改）。
+    // 后面 aeroConds[aeroId] 使用的是未初始化值——笔误；本着色器已弃用（见文件头），保留原状。
     uint spectralId,spectralId0;  // spectral property index of a voxel
     uint canopyId,canopyId0;      // canopy structure of a voxel
     uint instanceId0, instanceId,lastInstanceId=-1; // instance information of a voxel
