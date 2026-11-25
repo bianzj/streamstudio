@@ -106,6 +106,9 @@ float psim(float z,float L)
     // unstability
     if(L < 0 && L > -500)
     {
+        // 注意：PID2 = 1.557963（≈89.26°）并不等于 π/2 = 1.570796（global.glsl，首版遗留取值），
+        //   使 ψm 整体偏小 0.0128（z/L=−0.01 时相对约 34%，−0.1 时约 4.5%，−1 时约 1%）；
+        //   为不改变旧 XML 工程（L≠0 的非 MOST 变体）的结果而保留，待决定是否改为 π/2。
         pm = 2*log(0.5 + 0.5*xz) + log(0.5+0.5*xz*xz)- 2*atan(xz) + PID2;
     }
     // stability
