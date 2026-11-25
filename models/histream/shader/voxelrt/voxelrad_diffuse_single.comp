@@ -275,8 +275,9 @@ void Scattering_phase_function_diffuse(float azimuthOffset)
 // 作用：从体元 bufferId0 的位置 voxelPos0 出发，沿 DIFFUSE_ANGLE_NUM 个漫射方向（带体元特定方位偏移）追踪，
 //       收集沿途的天空、植被（散射+热发射）和实体表面（反射+热发射）贡献，
 //       原子累加到该体元第 iangle 个方向的入射辐射 voxelRads[...].induced。
-// 输入：kwave（波段下标）、Esun（垂直光束的太阳辐照度）、Esky（天空辐照度，对应 π·L）、kiter（迭代阶数，
-//       当前多次散射被注释掉、未使用）、azimuthOffset。
+// 输入：kwave（波段下标）、Esun（垂直光束的太阳辐照度）、Esky（天空辐照度，对应 π·L）、azimuthOffset。
+//       （2026-11-25 删除了原 kiter 迭代阶数参数：多次散射代码早被注释掉，该参数从未使用；
+//       下面注释掉的 `if(kiter > 0)` 即其遗迹。）
 // 返回：恒为 false（返回值未被使用，待核对）。
 // 步骤：
 //   1. 初始化局部量与接收体类型（实体面接收体只接收其外法线半球的辐射）；
@@ -284,7 +285,7 @@ void Scattering_phase_function_diffuse(float azimuthOffset)
 //   3. 命中天空：加天空辐射并结束；命中体元内植被：累加热发射与太阳单次散射；
 //   4. 命中实体（建筑/土壤/水体）：累加太阳反射与热发射并结束；否则偏移起点继续。
 bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
- int kwave,float Esun,float Esky, int kiter, float azimuthOffset)
+ int kwave,float Esun,float Esky, float azimuthOffset)
 {
 
   float G,density;
@@ -1193,7 +1194,7 @@ void main()
               float iterationOffset = azimuthOffset
                   + float(kiter) * 2.39996323;
               voxel_raytracing_diffuse(voxelPos0, bufferId0, nanoVDBLink,
-                  kwave, Esun, Esky, kiter, iterationOffset);
+                  kwave, Esun, Esky, iterationOffset);
               // This invocation exclusively owns bufferId0's directional
               // records. Other voxels supply read-only geometry/materials.
               // Order SSBO accesses without synchronizing inactive lanes.
@@ -1209,7 +1210,11 @@ void main()
               for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
               {
                   uint index = voxelRadiationIndex(bufferId0, iangle);
-                  // 同时把各方向的 induced 拷到 cumulated（供后续迭代/调试读取，用途待核对），再按求积权重对方向求和。
+                  // 同时把各方向的 induced 拷到 cumulated，再按求积权重对方向求和。
+                  // 说明（2026-11-25 核实）：这里的 index 在方向槽 [0, DIFFUSE_ANGLE_NUM) 内，而 cumulated
+                  //   字段的另两种用途——环境辐射槽（voxelBandRadiationIndex，N+band）与奇数阶碰撞阶数槽
+                  //   （voxelOrderRadiationIndex，N+n_wave+band）——下标都在方向槽之外，三者互不重叠，没有冲突；
+                  //   voxelrt 的后续着色器也不读取方向槽的 cumulated，该拷贝只是遗留/调试用途。
                   voxelRads[index].cumulated = voxelRads[index].induced;
                   // Vegetation: fixed 2/N; solids: cosine weight over the
                   // outer hemisphere (skipped directions hold zero).

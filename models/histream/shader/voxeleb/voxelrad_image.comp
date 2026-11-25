@@ -255,8 +255,8 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
     float canopyTNum = 0;
     
 
-    float vegTemperatureSum = 0;
-    float vegNum = 0;
+    // （2026-11-25 删除了 vegTemperatureSum/vegNum：它们只被下方实体分支里注释掉的调试代码引用，
+    //   并无输出；该调试代码若要恢复需自行重新声明并累加 shadedTemperature。）
     // 步骤 2：沿视线逐步前进（最多 setting.maxStep 步）。
     for(int kstep = 0;kstep<=setting.maxStep;kstep++)
     {
@@ -362,6 +362,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 float solarG = CanopyProjection(canopy, solarDirection);
                 density = isParticipatingMedium(canopy) ? canopy.density
                     : ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
+				// 路径长度：与 voxelrad_solar/diffuse 等着色器一致，不缩放（单位：体元格）。行尾原有旧标记
+				//   “* 0.2 //!!!!需要改回去！！！”：当前 `* 0.2` 已被注释掉，行为与其他着色器一致；该标记是否为
+				//   过期的调试遗留待作者确认（2026-11-25 核实：未改动行为）。
 				float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);// * 0.2; //!!!!需要改回去！！！
                 alpha_voxel = isParticipatingMedium(canopy)
                     ? canopyVoxelTransmittance(canopy, density, G, pathLength, scale)
@@ -573,9 +576,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                         }
                     }
                 }
-                // 统计沿视线穿过的植被体元数与背阴叶温累计（当前仅被注释掉的调试代码引用）。
-                vegTemperatureSum += shadedTemperature;
-                vegNum ++;
+                // （原在此处统计穿过的植被体元数与背阴叶温累计，只被注释掉的调试代码引用，已删除。）
 				}
 
 

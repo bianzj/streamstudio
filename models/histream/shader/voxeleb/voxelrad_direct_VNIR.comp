@@ -52,13 +52,10 @@ ShadowHitPayload shadow_payload;
 
 layout(local_size_x = GROUP_SIZEX) in;
 
-#define MAXBAND    25
 #define NUM_VNIR 2001 
 #define NUM_BAND 2002
 
-// 以下两个数组在本文件中未被引用（疑似遗留声明）。
-float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
-float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
+// （2026-11-25 删除了未被引用的 MAXBAND 宏与 GammaR/GammaT 数组声明，它们是从散射着色器拷贝来的遗留物。）
 
 
 
@@ -91,10 +88,10 @@ void main()
     //---------------------------------------------------
     // Iteration in VNIR band
     //---------------------------------------------------
-    // 注：行尾旧注释（measurement height / wind speed）与变量实际含义不符；
-    // Rin 为水平面入射短波，Rli（此处未使用）为天空长波（疑似遗留注释，仅报告）。
-    float Rin = ubom.meteo.Rin;               // measurement height 
-    float Rli = ubom.meteo.Rli;               // wind speed
+    // 注：Rin 为水平面入射短波辐照（W m-2，气象输入）；Rli 为天空向下长波（W m-2），本着色器不使用。
+    //   （2026-11-25 已改正行尾旧注释，原写成 measurement height / wind speed，与变量含义不符。）
+    float Rin = ubom.meteo.Rin;               // 水平面入射短波 Rin（W m-2）
+    float Rli = ubom.meteo.Rli;               // 天空向下长波 Rli（W m-2，此处未使用）
 
     vec3 solarDirection = normalize(lightSet.direction);
     float cosSolar = abs(solarDirection.y);

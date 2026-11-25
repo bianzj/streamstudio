@@ -78,7 +78,9 @@ float sampleCoverage = 1.0;
 
 // 作用：voxelRads 缓冲中某体元某波段环境辐射 cumulated 的下标。
 // 布局：每个体元占 stride = DIFFUSE_ANGLE_NUM + 2*n_wave 个槽，前 DIFFUSE_ANGLE_NUM 个为角度项，
-//       随后第 band 个槽为该波段累计的环境辐射（后 n_wave 个槽的含义见漫射着色器，待核对）。
+//       随后 n_wave 个槽为各波段累计的环境辐射（本函数取第 band 个）；最后 n_wave 个槽是各波段按碰撞阶数
+//       交替存放的入射辐射（voxelrad_diffuse_single.comp 的 voxelOrderRadiationIndex，奇数阶用 cumulated 字段、
+//       偶数阶用 induced 字段），影像着色器不读取。
 uint voxelBandRadiationIndex(uint bufferId, uint band)
 {
     uint stride = uint(DIFFUSE_ANGLE_NUM) + 2u * uint(setting.n_wave);
@@ -289,6 +291,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 density = isParticipatingMedium(canopy) ? canopy.density
                     : ResolveTurbidDensity(bufferId, canopyId, voxelId, voxelRes);
 				// pathLength：本段射线在体元内的行程；alpha_voxel 为本体元透过率。
+				// 路径长度：与 voxelrad_solar/diffuse 等着色器一致，不缩放（单位：体元格）。行尾原有旧标记
+				//   “* 0.2 //!!!!需要改回去！！！”：当前 `* 0.2` 已被注释掉，行为与其他着色器一致；该标记是否为
+				//   过期的调试遗留待作者确认（2026-11-25 核实：未改动行为）。
 				float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);// * 0.2; //!!!!需要改回去！！！
 				alpha_voxel = isParticipatingMedium(canopy)
                     ? canopyVoxelTransmittance(canopy, density, G, pathLength, scale)

@@ -13,7 +13,7 @@
 //         输出 voxelNetRads[bufferId0].directTrad（当前恒为 0）
 // 与其他文件的关系：与 voxelrad_diffuse_TIR_single.comp（实际承担 TIR 入射长波）配套；
 //   include ../bindinglayout.h 等公共头；对应的短波版本为 voxelrad_direct_VNIR.comp
-// 注意：GammaR/GammaT 数组在本文件中未使用；return 之后的代码为不可达代码（仅报告，不改）
+// 注意：return 之后的代码为不可达的旧实现（保留作参考，见 main 中 return 处的说明）。
 // ==========================================================================
 
 #version 460
@@ -51,13 +51,10 @@ ShadowHitPayload shadow_payload;
 
 layout(local_size_x = GROUP_SIZEX) in;
 
-#define MAXBAND    25
 #define NUM_VNIR 2001 
 #define NUM_BAND 2002
 
-// 以下两个数组在本文件中未被引用（疑似从散射着色器拷贝而来的遗留声明）。
-float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
-float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
+// 以下 MAXBAND/GammaR/GammaT 已于 2026-11-25 删除（本文件未引用，是从散射着色器拷贝来的遗留声明）。
 
 
 
@@ -88,16 +85,18 @@ void main()
     // 步骤 1：清零直射 TIR 分量。
     voxelNetRads[bufferId0].directTrad = 0;
 
-    // 步骤 2：提前返回。（以下代码不可达，保留作为旧实现参考。）
+    // 步骤 2：提前返回。下面 return 之后直到文件末尾的整段旧实现是不可达的死代码，保留仅供参考：
+    //   天空向下长波是半球均匀入射，已由 voxelrad_diffuse_TIR_single.comp 计入 diffuseTrad，
+    //   这里若再按方向累加会把同一份天空通量算两次。directTrad 因此恒为 0（上一步清零）。
     // Rli is hemispherical downwelling longwave and is handled by diffuseTIR.
     // Keeping a directional component here would count the same sky flux twice.
     return;
 
 
-    // 以下为旧实现（不可达）。注：行尾旧注释（measurement height / wind speed）与变量实际
-    // 含义不符，Rli 为天空向下长波辐射（疑似遗留注释，仅报告）。
-    float Rin = ubom.meteo.Rin;               // measurement height 
-    float Rli = ubom.meteo.Rli;               // wind speed
+    // 以下为旧实现（不可达）。Rin 为水平面入射短波、Rli 为天空向下长波（W m-2）；
+    //   （2026-11-25 已改正行尾旧注释，原写成 measurement height / wind speed，与变量含义不符。）
+    float Rin = ubom.meteo.Rin;               // 水平面入射短波 Rin（W m-2，旧实现未用）
+    float Rli = ubom.meteo.Rli;               // 天空向下长波 Rli（W m-2）
     float cosSolar = abs(normalize(lightSet.direction).y);
     //---------------------------------------------------
     // Iteration in TIR band

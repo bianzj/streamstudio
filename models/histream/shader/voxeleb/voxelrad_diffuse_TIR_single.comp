@@ -87,10 +87,10 @@ bool isSolidVoxel(int bufferId)
 // 输入：voxelPos0 体元（或面元）中心位置；bufferId0 接收体元索引；nanoVDBLink 体元查找；
 //       kband 波段号；Esun 水平面太阳直射（本 pass 为 0）；Esky 天空向下长波（W m-2）。
 // 输出：写 voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].induced（原子累加），返回值恒为 false。
-// 说明：kiter 当前未使用（保留接口，单遍近似）；每个方向最多推进 setting.maxStep 步，
+// 说明：（2026-11-25 删除了原来未使用的 kiter 迭代阶数参数；单遍近似，没有迭代）。每个方向最多推进 setting.maxStep 步，
 //       每步用 ClosestHit 找下一个交点，再判断它属于植被体元、实体面元还是大气。
 bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
- int kiter,int kband,float Esun,float Esky)
+ int kband,float Esun,float Esky)
 {
   // vec3 semiRange = setting.scale * setting.voxelSize/2.0;
   float scale = setting.scale;
@@ -500,10 +500,9 @@ void main()
     // 固体体元中的面元：把追踪起点从体元中心调整到该面元位置（待核对 getFacetIdPos 的具体偏移）。
     getFacetIdPos(faceId,  voxelPos0);
 
-    // 注：以下两行行尾旧注释（measurement height / wind speed）与变量实际含义不符，
-    // Rli 为天空向下长波辐射，Rin 在本文件未使用（疑似遗留注释，仅报告）。
-    float Rin = ubom.meteo.Rin;               // measurement height 
-    float Rli = ubom.meteo.Rli;               // wind speed
+    // 注：Rli 为气象输入的天空向下长波辐射（W m-2）。（2026-11-25：删除了未使用的 Rin 变量，
+    //   并改正 Rli 的行尾旧注释——原写成 wind speed，与含义不符。）
+    float Rli = ubom.meteo.Rli;               // 天空向下长波 Rli（W m-2）
 
     // reset the voxelRads in VNIR band
     // for(uint kband=NUM_VNIR;kband < NUM_BAND;kband++)
@@ -532,9 +531,8 @@ void main()
         // Leaf and surface scattering use the gray isothermal closure, so one
         // pass gives the incident field; no iterate is read back.
         {
-            int kiter = 0;
             // 追踪完成后把各方向 induced 复制到 cumulated（供后续聚合；本遍不再迭代）。
-            voxel_raytracing_diffuse(voxelPos0, bufferId0, nanoVDBLink, kiter,kband_center,Esun,Esky);
+            voxel_raytracing_diffuse(voxelPos0, bufferId0, nanoVDBLink, kband_center,Esun,Esky);
             // Order this invocation's SSBO accesses without waiting for tail
             // or invalid lanes that have already returned.
             memoryBarrierBuffer();
