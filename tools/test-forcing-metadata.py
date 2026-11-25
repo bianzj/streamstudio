@@ -325,7 +325,17 @@ def main():
     check('error message: station without coordinates', code != 0 and '缺少经纬度' in text, text.strip().splitlines()[0][:100] if text.strip() else '')
     code, text = engine('forcing-check', data / 'station.json', '--data', data / 'station.csv', '--json')
     check('forcing-check --json has warnings array', 'warnings' in json.loads(text))
-
+    # 2026-11-25: a second station that only covers the first part of the window does not stop the run (station A covers it all) but is
+    # reported per station (the missing hours are filled by station A through the renormalised weights; the values are unchanged).
+    partial = [lines[0]] + lines[1:]
+    for row in lines[1:9]:
+        cells = row.split(',')
+        cells[1], cells[2], cells[3] = 'B', '40.1', '116.6'
+        partial.append(','.join(cells))
+    (data / 'station-partial.csv').write_text('\n'.join(partial) + '\n', encoding='utf-8')
+    code, text, s = run_case('station-partial', scene, {'soilMoisture': {'source': 'user'}, 'forcing': {'metadata': str(data / 'station.json'), 'files': [str(data / 'station-partial.csv')]}})
+    check('station with incomplete window: per-station warning, run succeeds', code == 0 and '站点 "B"' in text and '缺测小时由其他站点补位' in text,
+          text.strip().splitlines()[-1] if text.strip() else '')
 
 # 收尾：运行 main，除非 --keep 否则删除临时目录；以失败数决定退出码。
 try:

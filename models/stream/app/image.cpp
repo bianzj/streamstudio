@@ -410,7 +410,10 @@ int runImage(const std::string& configPath)
         if (!pack.covers(variables, firstHour, lastHour, gap) && !(pack.fullYear() && pack.year() == when.year))
             throw std::runtime_error("气象数据包未覆盖本次能量平衡所需时段 " + formatUtc(firstHour * 3600.0) + " – " + formatUtc(lastHour * 3600.0) +
                                      "（" + gap + "）。请补充该时段的逐小时数据后重新登记");
+        const size_t warningsBeforeLoad = pack.report().warnings.size();
         pack.load(variables, latMin, latMax, lonMin, lonMax, firstHour, lastHour);
+        // load() 期间新增的强迫警告（如站点窗口内缺测、瞬时通量重采样不守恒）同样写入日志；前面只记录了打开数据时的警告。
+        for (size_t index = warningsBeforeLoad; index < pack.report().warnings.size(); ++index) log("警告：" + pack.report().warnings[index]);
         for (const auto& note : pack.notes()) log("气象强迫：" + note);
         // Whole-hour nodes from the march start, stopping 5 min before the overpass, then the overpass node itself.
         if (requestedNodes > 0)

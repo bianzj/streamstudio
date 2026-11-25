@@ -448,14 +448,17 @@ void StationSource::load(const std::vector<std::string>& variables, double, doub
     std::map<std::string, std::vector<double>> hourly, constant;
     // 步骤 0：逐站检查窗口覆盖。covers() 只要求至少一个站点完整覆盖；其余站点缺测的小时在 at() 中被剔除，
     //         由剩余站点补位（权重重新归一）。这里对“有该通道但窗口内不完整覆盖”的站点给出警告，不改变数值。
-    for (const auto& key : keysFor(variables)) {
-        if (key == "z") continue;
-        for (const auto& station : stations_) {
+    for (const auto& station : stations_) {
+        std::string keys, firstWhy;
+        for (const auto& key : keysFor(variables)) {
             std::string why;
-            if (station.channels.count(key) && !stationCovers(station, key, firstHour, lastHour, why))
-                report_.warn("站点 \"" + station.id + "\" 的 " + key + " 通道在 " + formatUtc(static_cast<double>(firstHour) * 3600.0) + " 至 " +
-                             formatUtc(static_cast<double>(lastHour) * 3600.0) + " 内记录不完整（" + why + "），缺测小时由其他站点补位");
+            if (key == "z" || !station.channels.count(key) || stationCovers(station, key, firstHour, lastHour, why)) continue;
+            keys += (keys.empty() ? "" : "、") + key;
+            if (firstWhy.empty()) firstWhy = key + "：" + why;
         }
+        if (!keys.empty())
+            report_.warn("站点 \"" + station.id + "\" 的 " + keys + " 通道在 " + formatUtc(static_cast<double>(firstHour) * 3600.0) + " 至 " +
+                         formatUtc(static_cast<double>(lastHour) * 3600.0) + " 内记录不完整（首个问题 " + firstWhy + "），缺测小时由其他站点补位");
     }
     for (const auto& key : keysFor(variables)) {
         if (key == "z") {
