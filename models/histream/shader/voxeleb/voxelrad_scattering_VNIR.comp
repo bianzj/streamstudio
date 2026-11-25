@@ -1,3 +1,39 @@
+// ==========================================================================
+// 文件：voxelrad_scattering_VNIR.comp
+// 功能：VoxelEB 短波（VNIR，波段 0..2000，1 nm 间隔）的多次散射与漫射吸收计算。
+//       以“光谱组”（setting.scatteringBandStart..End，由 n_jump 决定宽度）为单位，
+//       在 DIFFUSE_ANGLE_NUM（=64）个离散方向上求每个体元的入射场，
+//       按散射阶数迭代，并累计体元吸收的漫射短波 diffuseVrad 与 PAR 光量子通量 diffusePnet。
+// 主要模块/步骤：
+//   1. 叶片光学与光照：boundedLeafOptics / groupOptics（组内照度加权的反射、透射、
+//      吸收加权波长）/ groupIllumination（组内水平面直射或天空辐照）
+//   2. 叶片散射核：sphericalLeafReflection（球形叶片相函数）、initializeLeafKernel
+//      （共享内存里的 64x64 归一化散射核），仅 stage 2 使用
+//   3. buildSource（stage 2）：由上一阶入射场 cumulated 和太阳一次散射项，
+//      构造每个出射方向的散射源 induced
+//   4. 追踪：traceIncoming 沿 64 个方向步进收集入射辐射；
+//      escapeSegmentSource 处理最后一次命中后穿越剩余湍流体元的路径；
+//      surfaceSource 计算固体表面命中点的反射源
+//   5. accumulateAbsorption：把入射场按方向权重积分为体元入射，乘吸收率累加；
+//      accumulateImageEnvironment 为光学图像保存环境辐照
+//   6. skyTransmittanceAt / storeSkyTransmittance：缓存与方向相关的天空间隙透过率
+//   7. main：按 setting.scatteringStage（0..4）分派
+// 阶段（stage）含义（调度见 src/voxeleb/command.cpp）：
+//   0 清零 diffuseVrad/diffusePnet；1 追踪未碰撞的天空场（光谱无关的间隙几何，
+//   并缓存天空透过率）；4 复用缓存，仅按本组天空辐照缩放；
+//   2 构造第 order 阶散射源；3 追踪第 order 阶入射场并累计吸收
+// 数据流：输入 ubom.meteo.Rin、atomConds（各波段直射/散射占比、波长）、spectralMaterials、
+//   voxelDirs.solar（日照比例）、冠层参数与 NanoVDB 网格；
+//   输出 voxelRads[].cumulated/.induced（方向辐射场，π·L）、voxelNetRads.diffuseVrad、
+//   voxelPnets.diffusePnet、voxelDirs.skyDiffuse、图像环境缓存、scatter_stats 诊断
+// 与其他文件的关系：include scatter_stats.glsl（诊断统计）、image_environment.glsl
+//   （光学图像环境辐照）、surface_brdf.glsl（固体面反射权重）；
+//   可用 -DSCATTER_TRACE_STAGE 编译为仅含 stage 0/1/3/4 的版本（省寄存器与共享内存）
+// 重要约定：方向场存的是 π·L（半球均匀时等于辐照度）；DeltaOmega = 4π/N；
+//   方向 2k+1 与 2k 互为反向（incoming ^ 1u 即反向）；光线追踪方向与光子传播方向相反；
+//   groupIllumination 中的 0.001 为光谱量单位换算（待核对）
+// ==========================================================================
+
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_scalar_block_layout : require
@@ -23,6 +59,8 @@ ShadowHitPayload shadow_payload;
 
 layout(local_size_x = GROUP_SIZEX) in;
 
+// 模块：叶片散射核的共享内存表 leafReflectionKernel[出射*N + 入射]（N = DIFFUSE_ANGLE_NUM = 64，
+//       64*64*4 B = 16 KiB）。仅 stage 2 使用，含该表的版本由 SCATTER_TRACE_STAGE 排除。
 // Exactly 16 KiB shared memory, Vulkan's minimum supported workgroup limit.
 // Columns are normalized over outgoing directions: each incident leaf beam
 // scatters exactly rho+tau in the discrete quadrature (no high-order gain).
@@ -31,12 +69,18 @@ shared float leafReflectionKernel[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 #endif
 
 #ifndef SCATTER_TRACE_STAGE
+// 作用：球形（朗伯球）叶片的散射相函数未归一化形式 sinθ + (π-θ)cosθ，θ = acos(cosine)。
+// 说明：cosine 限幅到 [-1,1]；调用方负责在离散方向上归一化。
 float sphericalLeafReflection(float cosine) {
     float c = clamp(cosine, -1.0, 1.0);
     float angle = acos(c);
     return max(sqrt(max(1.0 - c*c, 0.0)) + (PI - angle)*c, 0.0);
 }
 
+// 作用：每个线程（工作组内 local id = 入射方向序号）填充散射核的一列并按所有出射方向求和归一化，
+// 使每个入射方向散射出去的总权重为 1（乘 ρ+τ 后即离散意义下的精确能量守恒）。
+// 注意：要求工作组线程数不超过 DIFFUSE_ANGLE_NUM 且覆盖全部入射方向（待核对 GROUP_SIZEX）；
+// 最后的 barrier() 要求工作组内所有线程均执行本函数（见 main 开头）。
 void initializeLeafKernel() {
     uint incoming = gl_LocalInvocationID.x;
     float normalization = 0.0;
@@ -53,12 +97,16 @@ void initializeLeafKernel() {
 }
 #endif
 
+// 作用：取网格 meshId 在某波段的叶片 (反射率, 透射率)，截为非负并保证两者之和不超过 1。
 vec2 boundedLeafOptics(uint meshId, int band) {
     SpectralMaterial material = spectralMaterials[meshLinks[meshId].spectralId*NBAND + band];
     vec2 optics = max(vec2(material.reflectance, material.transmittance), vec2(0.0));
     return optics / max(optics.x + optics.y, 1.0);
 }
 
+// 模块：当前光谱组的光学特性，按各波段（直射+散射）照度加权。
+// 输出 vec3：xy = (反射率, 透射率)，z = 吸收加权的平均波长（nm，用于 PAR 光量子换算）。
+// 无照度时退化为组中心波段。
 // Illumination-weighted optics of the current spectral group, so the group
 // absorbs what its bands absorb (a centre sample misses e.g. the red edge).
 // x = reflectance, y = transmittance, z = absorption-weighted wavelength (nm).
@@ -83,6 +131,9 @@ vec3 groupOptics(uint meshId) {
         ? absorbedWavelength / absorbedSum : atomConds[centre].wavelength);
 }
 
+// 作用：当前光谱组的水平面辐照（Rin × 各波段占比 × 0.001 的求和）；
+// direct=true 为太阳直射，false 为天空漫射。低太阳（y<=0.01）不追踪直射束，
+// 其直射份额并入天空辐照，保证日出日落时吸收+反射之和仍为 Rin。
 float groupIllumination(bool direct) {
     // The beam is only traced for solar.y > 0.01 (solar/direct passes and the
     // primary source below). Under that cutoff the measured horizontal beam
@@ -99,6 +150,12 @@ float groupIllumination(bool direct) {
 }
 
 #ifndef SCATTER_TRACE_STAGE
+// 模块（stage 2）：为体元 voxel 构造第 scatteringOrder 阶的散射源 induced[出射方向]。
+// 输入：上一阶（或未碰撞）入射场 cumulated、光谱组光学特性、日照比例 voxelDirs.solar。
+// 输出：voxelRads[voxel*N + outgoing].induced。
+// 步骤：1 非植被直接拷贝入射场；2 植被：预处理 G 投影、介质相函数归一化；
+//       3 一阶时加入太阳束一次散射（LIDF 用精确 Gamma，介质用 HG，球叶用球形相函数）；
+//       4 对每个出射方向累加 Σ 入射×散射核（Kahan 补偿求和）。
 void buildSource(uint voxel, uint mesh) {
     if(meshLinks[mesh].type != TYPE_VEGETATION) {
         // OBJ surface normals belong to the actual intersection, not to a
@@ -110,6 +167,7 @@ void buildSource(uint voxel, uint mesh) {
         return;
     }
 
+    // 步骤 2：植被体元（叶片或参与介质）的预处理。
     Canopy canopy = canopies[meshLinks[mesh].canopyId];
     bool medium = isParticipatingMedium(canopy);
     vec2 optics = groupOptics(mesh).xy;
@@ -140,6 +198,9 @@ void buildSource(uint voxel, uint mesh) {
     float primary = setting.scatteringOrder == 1 && solar.y > 0.01
         ? groupIllumination(true) * clamp(voxelDirs[voxel].solar, 0.0, 1.0)
             / max(abs(solar.y), 0.001) : 0.0;
+    // 步骤 3：太阳束一次散射项（仅 scatteringOrder==1 且太阳足够高）。
+    // primary = 组直射辐照 × 日照比例 / |sun.y|（水平面辐照换算到垂直于光束）；
+    // 准备各出射方向的相函数及其归一化量。
     float sunNormalization = 0.0;
     float sunGammaR[DIFFUSE_ANGLE_NUM];
     float sunGammaT[DIFFUSE_ANGLE_NUM];
@@ -173,6 +234,8 @@ void buildSource(uint voxel, uint mesh) {
     }
 
     for(uint outgoing = 0; outgoing < DIFFUSE_ANGLE_NUM; ++outgoing) {
+        // 步骤 4：逐出射方向：Σ_入射 入射场×散射核（介质：反照率×HG；叶片：ρ·反射核 + τ·反向核，
+        // 再乘 G 之比），加上太阳一次散射 primary 项，写入 induced。
         float source = 0.0;
         float correction = 0.0;
         for(uint incoming = 0; incoming < DIFFUSE_ANGLE_NUM; ++incoming) {
@@ -210,6 +273,10 @@ void buildSource(uint voxel, uint mesh) {
 }
 
 #endif
+// 模块：固体表面命中点沿 outgoing（指向射线起点，即光子出射方向）的反射源。
+// 输入：命中面元 voxel/mesh、命中点法向 normal；输出：反射辐射（π·L 约定，含 checked 限幅）。
+// 方法：对 N 个入射方向做余弦与 BRDF 权重（surfaceReflectanceWeight）求和（权 4/N），
+//       一阶时再加太阳束（组直射辐照为水平面值，故乘 dot(n,sun)/sun.y）。
 float surfaceSource(uint voxel, uint mesh, vec3 outgoing, vec3 normal) {
     vec3 n = normalize(normal);
     if(dot(n, outgoing) < 0.0) n = -n;
@@ -239,6 +306,13 @@ float surfaceSource(uint voxel, uint mesh, vec3 outgoing, vec3 normal) {
     return checkedScatteringRadiance(result);
 }
 
+// 模块：最后一次命中（逃逸）后，沿射线继续穿过湍流体元直到域边界的贡献。
+// 输入：start 起点、direction 方向、angle 方向序号、skyZero（stage 1：只统计透过率、
+//       不读取散射源）、inout throughput 累计透过率；
+// 输出：返回沿途各体元散射源对入射场的贡献，并更新 throughput。
+// 方法：3D DDA（体元网格步进）；每格 T = exp(-extinction·段长)，
+//       贡献 = throughput·(1-T)·该格朝向射线起点的散射源（方向 angle^1）。
+// 周期边界：周期方向不限范围，穿越的周期副本数不超过 periodicLimit。
 // After the last hit the ray still crosses turbid cells up to the domain
 // boundary (at least the far half of the last hit cell). Each crossed cell
 // attenuates the field and contributes its own scattering source.
@@ -254,6 +328,8 @@ float escapeSegmentSource(vec3 start, vec3 direction, uint angle, bool skyZero,
     bool periodic = periodicLimit > 0;
     vec3 semi = vec3(floor(setting.voxelSize.x * 0.5 + 0.5), 0.0,
                      floor(setting.voxelSize.z * 0.5 + 0.5));
+    // 步骤 1：平移到非负网格坐标；求射线与网格盒的交区间 [t0,t1]
+    // （周期边界只裁剪竖直方向，非周期最长 4096）。
     vec3 a = start + semi;
     vec3 dir = normalize(direction);
     vec3 hi = vec3(setting.voxelSize);
@@ -273,6 +349,7 @@ float escapeSegmentSource(vec3 start, vec3 direction, uint angle, bool skyZero,
     }
     if(t1 <= t0) return 0.0;
 
+    // 步骤 2：初始化 DDA：起始体元 cell、步进方向、到下一格边界的距离 tMax 与每格增量 tDelta。
     vec3 p = a + dir * t0;
     ivec3 cell = ivec3(floor(p + dir * 1.0e-5));
     ivec3 stepCell = ivec3(sign(dir));
@@ -291,6 +368,8 @@ float escapeSegmentSource(vec3 start, vec3 direction, uint angle, bool skyZero,
     float incoming = 0.0;
     float correction = 0.0;
     float t = t0;
+    // 步骤 3：逐格推进（有格数预算）；周期情形把查找下标折回中央网格；
+    // 累计该格的衰减与源贡献，吞吐量过低（<1e-12）则提前退出。
     for(int i = 0; i < cellBudget && t < t1; ++i) {
         float segmentEnd = min(min(min(tMax.x, tMax.y), tMax.z), t1);
         ivec3 lookup = cell;
@@ -321,6 +400,11 @@ float escapeSegmentSource(vec3 start, vec3 direction, uint angle, bool skyZero,
     return incoming;
 }
 
+// 模块（stage 1/3）：沿方向 angle 追踪，返回该方向的入射辐射（π·L 约定）。
+// 输入：voxel0 接收体元、origin 起点；输出：skyTransmittance（仅 stage 1 且方向向上：
+//       到天空的透过率）。skyZero（stage==1）时只统计天空场，不读取散射源。
+// 终止码 termination：0 正常（逃逸或撞到固体面），1 透过率<0.01，2 达到步数上限
+//       （不会虚构与天空的连接，详见下方 recordScatteringRay 统计）。
 float traceIncoming(uint voxel0, uint angle, vec3 origin, NanoVDBLink nano,
                     out float skyTransmittance) {
     bool skyZero = setting.scatteringStage == 1;
@@ -347,6 +431,7 @@ float traceIncoming(uint voxel0, uint angle, vec3 origin, NanoVDBLink nano,
             termination = 0;
             break;
         }
+        // 步骤 1：命中点→体元编号；voxel 为交点所在湍流体元，aligned 为用于判断固体表面的体元。
         ShadeState state = GetShadeState(prd);
         ivec3 aligned;
         ivec3 id = getVoxelIdSemi(state.position, semiRange, setting.scale, direction, aligned);
@@ -377,6 +462,7 @@ float traceIncoming(uint voxel0, uint angle, vec3 origin, NanoVDBLink nano,
                 }
             }
         }
+        // 步骤 2：撞到非植被固体表面（且不是接收体元自身边界）：累加表面反射源并终止。
         int surface = nanovdbGet(nano, aligned);
         if(surface >= 0 && surface < setting.voxelCount) {
             surface = ResolveVoxelSurfaceState(surface, state.normal);
@@ -396,6 +482,7 @@ float traceIncoming(uint voxel0, uint angle, vec3 origin, NanoVDBLink nano,
                 }
             }
         }
+        // 步骤 3：继续前进，起点沿法向（射线一侧）微小偏移避免自相交。
         ray.origin = OffsetRay(state.position,
             dot(direction, state.normal) > 0.0 ? state.normal : -state.normal);
     }
@@ -403,6 +490,10 @@ float traceIncoming(uint voxel0, uint angle, vec3 origin, NanoVDBLink nano,
     return checkedScatteringRadiance(incoming);
 }
 
+// 模块：为光学图像保存“已碰撞”环境辐照（按组照度归一化，使 voxelrad_image.comp 能把它
+// 重标定到本组内的每个传感器波段）。第 1 阶覆盖前一节点值，之后各阶累加。
+// 输入：collided 本阶入射（吸收率之前）、optics 反射/透射；非介质植被再乘光谱不变量
+//       leafSpectralInvariant 使其与光谱无关（待核对）。
 // Collided incident shortwave of this order (radiation of accumulateAbsorption
 // before the absorptance, i.e. the skyDiffuse convention; the last order
 // carries the spectral-invariant tail) for the optical image, normalized so
@@ -428,6 +519,11 @@ void accumulateImageEnvironment(uint voxel, uint mesh, bool vegetation,
     }
 }
 
+// 模块：把体元 64 个方向的入射场 cumulated 积分为入射辐射，乘吸收率累加到 diffuseVrad/diffusePnet。
+// 步骤：1 按受体类型加权求入射（叶片：2G_i/ΣG 或 2/N；固体：余弦加权半球平均）；
+//       2 stage 1 时存 skyDiffuse = 入射/天空辐照；3 求吸收率（介质或 1-ρ-τ），
+//       最后一阶对更高阶用几何级数尾项修正；4 保存图像环境；5 写 diffuseVrad 与 PAR。
+// 说明：每个体元只由一个线程写，故无需原子操作。
 void accumulateAbsorption(uint voxel, uint mesh) {
     bool vegetation = meshLinks[mesh].type == TYPE_VEGETATION;
     float radiation = 0.0;
@@ -460,11 +556,14 @@ void accumulateAbsorption(uint voxel, uint mesh) {
         }
         radiation = cosineSum > 0.0 ? radiation / cosineSum : 0.0;
     }
+    // 步骤 2：stage 1 的入射场只含未碰撞的天空，与光谱无关，故归一化后存为 skyDiffuse。
     if(setting.scatteringStage == 1) {
         // The uncollided sky field is gap geometry only, hence spectrally neutral.
         float sky = groupIllumination(false);
         if(sky > 0.0) voxelDirs[voxel].skyDiffuse = radiation / sky;
     }
+    // 步骤 3：吸收率。参与介质用其自身吸收；叶片在最后一阶按光谱不变量几何级数补偿高阶散射：
+    // q = p·(ρ+τ)（上限 0.9），吸收与入射均除以 (1-q)（tailGain）。
     vec3 optics = groupOptics(mesh);
     float absorption = 1.0 - optics.x - optics.y;
     float tailGain = 1.0;
@@ -482,10 +581,13 @@ void accumulateAbsorption(uint voxel, uint mesh) {
             tailGain = 1.0 / (1.0 - q);
         }
     }
+    // 步骤 4：仅 stage 3 且开启图像环境辐照时，保存供光学图像使用的环境项。
     if(setting.scatteringStage == 3 && setting.imageEnvironment != 0)
         accumulateImageEnvironment(voxel, mesh, vegetation, radiation * tailGain, optics.xy);
     radiation *= max(absorption, 0.0);
     float wavelength = optics.z;
+    // 步骤 5：PAR（400–700 nm，对应波段索引 0..300）才换算光量子通量；
+    // 组的划分保证不会跨越 301 这个边界（见 command.cpp）。
     float par = setting.scatteringBandEnd <= 301
         ? absorbedParPhotonFlux(radiation, wavelength) : 0.0;
     // Exactly one invocation owns this voxel; no cross-voxel atomic is needed.
@@ -494,6 +596,9 @@ void accumulateAbsorption(uint voxel, uint mesh) {
     recordScatteringAbsorption(scatteringStatsSlot(), radiation, par);
 }
 
+// 模块：天空间隙透过率缓存的读写。stage 1 存、stage 4 读；
+// 共享 voxelRads 缓冲区中紧跟辐射场之后的额外区域，每个 VoxelRad 条目存两个方向
+// （偶数方向放 cumulated，奇数方向放 induced）。
 // Sky gap transmittance per voxel and direction, stored after the radiance
 // field in the same buffer (buffer.cpp allocates N*64 extra floats), two
 // directions per VoxelRad entry.
@@ -511,6 +616,9 @@ void storeSkyTransmittance(uint voxel, uint angle, float value) {
 }
 
 
+// 模块：主入口，每线程一个体元；按 setting.scatteringStage 分派（含义见文件头）。
+//   stage 0 清零；stage 2 构造散射源；stage 4 复用缓存的天空场；
+//   stage 1/3 对每个方向 traceIncoming；最后统一 accumulateAbsorption。
 // Two builds of this file share every line of ray tracing code. The default
 // build keeps all stages and serves stage 2 (scattering source of the order);
 // -DSCATTER_TRACE_STAGE drops stage 2 (its 64-entry per-voxel arrays and the
@@ -523,6 +631,7 @@ void main() {
 #endif
     uint voxel = gl_GlobalInvocationID.x;
     if(voxel >= uint(setting.voxelCount) || voxelLinks[voxel].isValid == 0) return;
+    // stage 0：清零本体元的漫射短波吸收与 PAR 累加量，下面各阶段在此基础上累加。
     if(setting.scatteringStage == 0) {
         voxelNetRads[voxel].diffuseVrad = 0.0;
         voxelPnets[voxel].diffusePnet = 0.0;
@@ -537,8 +646,10 @@ void main() {
 #endif
     vec3 semiRange = vec3(floor(setting.voxelSize.x/2.0 + 0.5), 0.0,
                          floor(setting.voxelSize.z/2.0 + 0.5));
+    // 追踪起点：体元最小角点（体元坐标，已平移到场景中心），getFacetIdPos 再按面元编号调整。
     vec3 origin = vec3(voxelLinks[voxel].voxelId) - semiRange;
     getFacetIdPos(voxelLinks[voxel].faceId, origin);
+    // stage 4：不再追踪，由缓存的间隙透过率 × 本组天空辐照得到未碰撞天空场。
     if(setting.scatteringStage == 4) {
         // Uncollided sky field of a later spectral group: the gap geometry
         // traced by stage 1 of the first group is spectrally neutral, so only
@@ -550,6 +661,7 @@ void main() {
         accumulateAbsorption(voxel, mesh);
         return;
     }
+    // stage 1 / 3：对每个方向追踪入射辐射；stage 1 同时缓存天空间隙透过率。
     NanoVDBLink nano = nanovdbInit();
     ConfigureTurbidGrid(nano);
     for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle) {

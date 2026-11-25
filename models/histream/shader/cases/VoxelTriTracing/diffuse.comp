@@ -1,3 +1,28 @@
+// ==========================================================================
+// 文件：VoxelTriTracing/diffuse.comp
+// 功能：VoxelTriTracing（体元 + 三角面混合追踪）方案的“漫射/多次散射”计算着色器。每个工作项对应一个体元，
+//   对 DIFFUSE_ANGLE_NUM 个离散半球方向做射线穿越，累加该体元沿各方向收到的诱导辐亮度 induced，
+//   再在每轮迭代结束后令 cumulated = induced，实现多次散射迭代（Jacobi 式更新）。
+// 主要模块/步骤：
+//   1. 扩展、宏与包含；全局 prd / shadow_payload；引入 traceray_comp.glsl（rayQuery 求交封装）
+//   2. 相函数表 GammaR/GammaT（方向间散射）与 GammaSR/GammaST（太阳→各方向）
+//   3. Scattering_phase_function_solar_diffuse / Scattering_phase_function_diffuse：填表
+//   4. Voxel_raytracing_diffuse：对每个漫射方向沿射线逐步穿越，按命中的植被（湍流介质）
+//      或土壤（面元地面）累加直射与多次散射贡献，命中天空则结束该方向
+//   5. main：判断是否需要多次散射（maxIteration > 1）→ 填相函数表 → 迭代 maxIteration-1 次
+//      {漫射求解 → 屏障 → 把 induced 拷到 cumulated}
+// 数据流：输入 voxelLinks/instanceLinks/canopies/spectralMaterials/thermalMaterials、solar.comp 写出的
+//   voxelDirs[].solar（体元到太阳的透过率）、lightSet、settingxml、topLevelAS、NanoVDB 体元网格；
+//   输出 voxelRads[loc].induced 与 .cumulated，
+//   loc = bufferId0*DIFFUSE_ANGLE_NUM*waveNum + kband*DIFFUSE_ANGLE_NUM + iangle。
+// 与其他文件的关系：之前由 solar.comp 完成一次散射（太阳直射）项；之后由 outImageTri.comp 读取 voxelRads
+//   成像；DIFFUSE_DIRECTIONS、scattering_phase_function_direct_XZY、Hotspot_Kuusk、HSPOT 在共用头文件中。
+// 重要约定：波长 μm（> 50 视为 nm 除以 1000）；> 2.5 μm 只计热发射，≤ 2.5 μm 只计太阳散射；
+//   alpha_* 为透过率（0–1）：alpha_voxel 为当前体元内、alpha_toVoxel 为到当前体元的累计、
+//   alpha_toSolar 为体元到太阳；冠层透过率 = exp(-density*G*pathLength)。
+// 归档说明：cases/ 为历史变体副本，include 的 "../xxx" 相对 shader/<子目录>（待核对）。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -18,6 +43,7 @@
 #extension GL_KHR_memory_scope_semantics:require
 #extension GL_EXT_shader_atomic_float: require 
 
+// 模式开关宏：被共用头文件用来选择体元+三角面追踪分支。
 #define VOXELTRITRACING 1
 
 #include "../bindinglayout.h"
@@ -29,18 +55,25 @@
 #include "../shade_state_voxel.glsl"
 #include "../random.glsl"
 
+// 计算着色器没有 payload 机制，prd / shadow_payload 作为全局变量，供 traceray_comp.glsl 使用。
 PtPayload        prd;
 ShadowHitPayload shadow_payload;
 
 #include "../traceray_comp.glsl"
 
+// 一维工作组：一个工作项处理一个体元。
 layout(local_size_x = GROUP_SIZEX) in;
+// MAXSTEP、MAXBAND、NUM_* 在本文件未使用（实际步数上限为 settingxml.maxStep）；
+// DIFFUSE_ANGLE_NUM 为半球漫射离散方向数（DIFFUSE_DIRECTIONS 定义在共用头文件）。
 #define MAXSTEP   100
 #define DIFFUSE_ANGLE_NUM 32
 #define MAXBAND    25
 #define NUM_VNIR 2001 
 #define NUM_BAND 2162
 #define NUM_TIR 162
+// 相函数表：γ 的 x 分量为反射、y 分量为透射（见 scattering_phase_function_direct_XZY）。
+// GammaR/GammaT[i*N+j]：方向 i 与方向 j 之间的散射；GammaSR/GammaST[j]：太阳方向到方向 j。
+// 为线程私有数组，每个工作项都重算一遍。
 // from traveled direction to selected direction
 float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];    // gamma relflectance
 float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];    // gamma transmittance
@@ -49,6 +82,7 @@ float GammaSR[DIFFUSE_ANGLE_NUM];           // gamma sun relflectance
 float GammaST[DIFFUSE_ANGLE_NUM];           // gamma sun transmittance
 
 // calculate the scattering phase function from solar angle to N angles.
+// 作用：计算太阳方向 → 各漫射方向 j 的散射相函数，写入 GammaSR/GammaST。
 void Scattering_phase_function_solar_diffuse()
 {
     vec3 directioni = normalize(lightSet.direction);
@@ -62,6 +96,9 @@ void Scattering_phase_function_solar_diffuse()
 }
 
 // calculate the scattering phase function from N angles to N angles.
+// 作用：计算 N×N 漫射方向两两之间的散射相函数。
+// 注意：循环里两行都写 GammaR（第二行写 gamma.y），GammaT 从未被赋值，因此后面读到的
+//   GammaT 恒为未初始化/0；按命名应为 GammaT[...] = gamma.y（疑似笔误，待核对）。
 void Scattering_phase_function_diffuse()
 {
     for(int iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
@@ -78,6 +115,15 @@ void Scattering_phase_function_diffuse()
 }
 
 // calculate the diffuse term.
+// 作用：对一个体元，沿每个漫射方向 i 从体元中心发射线逐步穿越场景，累加到该方向的
+//   诱导辐亮度 voxelRads[loc].induced（每一轮迭代先清零再累加）。
+// 输入：voxelPos0 体元中心；bufferId0 本体元的缓冲索引；nanoVDBLink NanoVDB 句柄。
+// 命中分类：
+//   - 射出场景（天空）：本方向结束（天空贡献的代码已被注释，天空项在 solar 阶段处理，待核对）；
+//   - 植被体元：按 exp(-density*G*pathLength) 衰减，累加太阳直射/热发射 + 其他方向
+//     cumulated 的多次散射；
+//   - 土壤（地面面元）：累加太阳反射 refl/π 与漫射反射，然后结束本方向。
+// 返回值恒为 false（调用方不使用）。
 bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBLink)
 {
     vec3 directioni0, directioni, directionj0, directionj;
@@ -91,6 +137,8 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
     Canopy canopy;
     vec2 gammart;
     // float cosThetaSun = abs(normalize(lightSet.direction).y); // XZY
+    // 太阳天顶角的余弦（这里 CosThetaTangent 取 |v.z|；注释掉的旧写法取 |y|，
+    //   两者坐标轴不同，需确认 lightSet.direction 的坐标约定，待核对）。
     float cosThetaSun = CosThetaTangent(normalize(lightSet.direction));
     float pl_toSolar, pl_toVoxel;
 
@@ -99,6 +147,7 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
     ////////////////////////////////////
     for(int iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
     {
+        // 步骤 1：对第 iangle 个漫射方向 i，从体元中心出发，初始透过率均为 1，并先把 induced 清零。
         directioni0 = DIFFUSE_DIRECTIONS[iangle];
         directioni = normalize(directioni0);
         float cosThetai = CosThetaTangent(directioni); // attention
@@ -114,11 +163,13 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
             voxelRads[loc].induced = 0.0;
         }
 
+        // 步骤 2：逐步穿越，最多 settingxml.maxStep + 1 次求交。每次命中后把射线起点移到命中点（沿法线偏移避免自相交）继续。
         // iteration in travel step.
         vec3 ffnormal;
         for(int kstep = 0; kstep <= settingxml.maxStep; kstep++)
         {
             alpha_voxel = 1.0;
+            // 求最近交点（含周期边界与地面补全，见 traceray_comp.glsl）。
             ClosestHit(ray);
 
             //////////////////////////////
@@ -126,6 +177,7 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
             /// (sky -> i).
             /// hit sky and return, this direction is done.
             /////////////////////////////
+            // 射线射出场景（看到天空）：结束该方向。
             if(prd.hitT == INFINITY)
             {
                 // if(directioni.y > 0)
@@ -160,6 +212,8 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
             /// Turbid or facet ground case (j -> i).
             /////////////////////////////
             /// get hit information.
+            // 步骤 3：命中后还原着色状态，并求射线刚穿过的体元（getPassedVoxelId），
+            //   通过 NanoVDB 取其缓冲索引；bufferId < 0 表示空体元（无介质，直接继续前进）。
             ShadeState sstate = GetShadeState(prd);
             voxelId = getPassedVoxelId(sstate.position, scale, normalize(ray.direction));
             bufferId = nanovdbGet(nanoVDBLink, voxelId);
@@ -174,6 +228,9 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
                 thermalId = instanceLinks[instanceId].thermalId;
                 canopy = canopies[canopyId];
 
+                // 植被（湍流介质）分支：
+                //   alpha_voxel = exp(-density*G*pathLength) 是穿过该体元的透过率；累计 alpha_toVoxel；
+                //   累计透过率 < 0.001 时提前结束（贡献可忽略）。
                 if(typeId == TYPE_VEGETATION)
                 {
                     float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
@@ -182,6 +239,9 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
                     alpha_toSolar = voxelDirs[bufferId].solar;
                     if(alpha_toVoxel < 0.001) break;
 
+                    // 热点效应：用到太阳和观察方向的光学路径长度 pl_toSolar / pl_toVoxel（= -ln α / G），
+                    //   由 Hotspot_Kuusk 给出太阳-观察方向重合时的增强因子；透过率 < 1e-4 时路径长度取 10000 封顶。
+                    //   （G 项的分母 1.0 为占位，待核对）
                     // get the phase function for solar direction to induced direction.
                     gammart.x = GammaSR[iangle];
                     gammart.y = GammaST[iangle];
@@ -203,6 +263,11 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
                         // (sun -> j -> i) + else-emitter(j -> i).
                         /////////////////////////////
                         float radianceDirect = 0.0;
+                        // 步骤 4a：太阳直射项 + 其他体元自身发射项（sun → j → i）。
+                        //   gamma 为合成的单次散射系数，由反射/透射相函数与 refl、trans 加权后限幅到 [0,1]（待核对）。
+                        //   热波段（> 2.5 μm）：向阳/阴影温度按 hotspot 与 (alpha_toVoxel - hotspot) 混合，
+                        //   乘发射率 (1 - refl - trans) 与体元截获概率 (1 - alpha_voxel)；
+                        //   短波波段：lightSet.direct * alpha_toSolar * |cosθ_sun| * (1-alpha_voxel) * gamma * alpha_toVoxel。
                         float gamma = abs(gammart.x) * (refl + trans) + abs(gammart.y) * trans;
                         gamma = clamp(gamma, 0, 1);
                         if(settingxml.isTemperature == 1)
@@ -247,6 +312,11 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
                         uint loc = bufferId0 * DIFFUSE_ANGLE_NUM * sensorMatrix.waveNum + kband * DIFFUSE_ANGLE_NUM + iangle; 
                         for(int jangle = 0; jangle < DIFFUSE_ANGLE_NUM; jangle++)
                         {
+                            // 步骤 4b：多次散射项（sky→j→i 与 jj→j→i 的首次累计），对所有方向 j 求和。
+                            //   注意：radiancej 读的是 voxelRads[loc]（下标由 iangle 决定、在 jangle 循环内不变），
+                            //   且 loc 属于本体元 bufferId0 而非被穿越的体元；按“入射方向 j 的辐亮度”的物理含义
+                            //   应与 jangle 与被穿越体元相关（疑似问题，待核对）。
+                            //   密度与 1/(2π·N) 为方向积分的归一化因子（待核对）。
                             float radiancej = voxelRads[loc].cumulated;
                             directionj0 = DIFFUSE_DIRECTIONS[jangle];
                             directionj = normalize(directionj0);
@@ -265,13 +335,20 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
                         {
                             radianceDiffuse += radianceDiffuse0;///weight;
                         }
+                        // 把本体元对该方向、波段的直射与多次散射贡献累加到 induced（非原子加法，
+                        //   各工作项写的是各自 bufferId0 的区域，不会冲突）。
                         voxelRads[loc].induced += radianceDirect + radianceDiffuse;
                     }
                 }
 
+                // 土壤（面元地面）分支：一次反射后结束该方向。
+                //   地面与太阳在同侧（inSameSide）时才有太阳反射 lightSet.direct*alpha_toSolar*|cosθ_sun|*refl/π；
+                //   热波段取向阳/阴影温度的混合发射；多次散射项对与法线同侧的方向 j 求和：
+                //   radiancej*|cosθ_j|*refl/π*alpha_toVoxel。
                 if(typeId == TYPE_SOIL)
                 {
                     ffnormal = sstate.normal;
+                    // 判断射线方向 i 与太阳是否在地面的同一侧（太阳反射只在同侧发生）。
                     bool inSameSide = IsSameSide(directioni, lightSet.direction, ffnormal);
 
                     // this is used for the hotspot effect
@@ -365,6 +442,7 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
             }
 
             //// change ray origin position to hit position; and avoid self collide.
+            // 步骤 5：未终止则从命中点继续沿方向 i 前进。
             ray = Ray(sstate.position, directioni);
             ffnormal = sstate.normal;
             ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
@@ -374,6 +452,10 @@ bool Voxel_raytracing_diffuse(vec3 voxelPos0,uint bufferId0,NanoVDBLink nanoVDBL
     return false;
 }
 
+// 作用：计算着色器入口，一个工作项处理一个体元，执行多次散射迭代。
+// 步骤：1 取体元并求体元位置；2 maxIteration > 1 时填相函数表；
+//       3 迭代 maxIteration-1 次：漫射求解 → 屏障 → induced 拷贝到 cumulated。
+// 说明：一次散射（太阳直射）由 solar 阶段完成，故 maxIteration ≤ 1 时本着色器什么也不做。
 void main()
 {
     //------------------------------------------------------------
@@ -388,6 +470,8 @@ void main()
     // get center postion of a voxel
     float scale = settingxml.scale;
     vec3 semiRange = settingxml.scale * settingxml.voxelSize/2.0;
+    // 体元中心位置。注意这里是 voxelId + scale/2，而 solar.comp 中是 voxelId*scale - semiRange，
+    //   两处约定不一致（semiRange 在本函数内计算但未使用，疑似问题，待核对）。
     vec3 voxelPos0 = vec3(voxelId0.x + scale/2.0, voxelId0.y + scale/2.0, voxelId0.z + scale/2.0);
 
     // maxIteration is scattering times.
@@ -400,12 +484,15 @@ void main()
         // calculate the scattering phase function from N angles to N angles.
         Scattering_phase_function_diffuse();
 
+        // 多次散射迭代：第 k 轮的 induced 来自第 k-1 轮的 cumulated。
         float iterationNum = settingxml.maxIteration - 1;
         for(int kiter = 0; kiter < iterationNum; kiter++)
         {
             // calculate the diffuse term.
             Voxel_raytracing_diffuse(voxelPos0, bufferId0, nanoVDBLink);
 
+            // 注意：groupMemoryBarrier/barrier 只同步同一工作组内的工作项，不能保证跨工作组的
+            //   voxelRads 写入对其他工作组可见，而漫射求解需要读到其他体元的 cumulated（待核对）。
             // groupMemoryBarrier waits on the completion of all memory accesses 
             // performed by an invocation of a compute shader
             // relative to the same access performed by other invocations 

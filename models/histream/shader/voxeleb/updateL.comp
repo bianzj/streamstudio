@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：updateL.comp
+// 功能：按水平柱（x,z）计算 Monin–Obukhov 长度 L 的旧版实现：用柱内各体元的平均显热通量 H 和摩擦速度
+//       ustar 估算 L = -ρ·cp·ustar³·T / (κ·g·H)。注意：写回 aeroConds[].L 的语句目前已被注释掉，
+//       本着色器当前实际不产生任何输出（新版稳定度走 budget.comp 中的 ebState 累加）（待核对是否已弃用）。
+// 主要步骤（每个线程处理一个水平柱）：
+//   1. 由线程号得到柱坐标 (x, 0, z)，经 NanoVDB 取该柱底部体元的缓冲区下标
+//   2. 读取体元→实例→网格链接，取气动参数 aeroConds 的冠层高度 hc_veg（体元数）
+//   3. 对柱内 0..hvmax 的所有有效体元，按受阳比例混合 Hsunlit/Hshaded 求平均 H
+//   4. 计算 L（写回已注释）
+// 数据流：输入 voxelHeatFlux、voxelDirs.solar、aeroConds.ustar、ubom.meteo.Ta；输出（已注释）aeroConds.L。
+// 约定：L 单位 m，不稳定时 H>0 → L<0；Ta 为 °C，公式里加 273.15 转 K；hvmax 以体元数计。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -28,8 +42,10 @@
 #include "../functions.glsl"
 #include "../nanovdb_info.glsl"
 
+// 二维工作组：gl_GlobalInvocationID.xy 对应水平体元坐标 (x, z)。
 layout(local_size_x = GROUP_SIZEXY,local_size_y = GROUP_SIZEXY) in;
 
+// 模块：单个水平柱的 Obukhov 长度计算（见文件头）。
 void main()
 {
     //------------------------------------------------------------
@@ -46,12 +62,15 @@ void main()
     //-------------------------
     // various parameters index
     //-------------------------
+    // 步骤 1：声明体元属性下标变量。注意 aeroId 在本文件中没有被赋值（只给了 aeroId0），
+    // 后面 aeroConds[aeroId] 使用的是未初始化值——疑似笔误（只报告，不修改）。
     uint spectralId,spectralId0;  // spectral property index of a voxel
     uint canopyId,canopyId0;      // canopy structure of a voxel
     uint instanceId0, instanceId,lastInstanceId=-1; // instance information of a voxel
     uint aeroId,aeroId0;          // aerodynamic property index of a voxel
     uint typeId,typeId0;          // voxel type: vegetation, soil...
     uint bufferId,bioId;
+    // 取该柱 y=0 体元的缓冲区下标；柱底无体元（<0）时整个柱跳过。
     int bufferId0 = nanovdbGet(nanoVDBLink,voxelId);
     if(bufferId0 < 0) 
     {
@@ -79,6 +98,8 @@ void main()
   //  hvmax = 15;
 
     
+    // 步骤 2：hvmax 为柱最高植被体元数（取自 aeroCond.hc_veg）；hcmax 是以 m 为单位的高度，
+    // 目前未被使用；voxelMaxY 为向上遍历体元的上限。
     float hcmax = 1.0 * hvmax * setting.scale;
     int voxelMaxY = int(hvmax);
     // float Ltemp = bufferId0;
@@ -94,6 +115,8 @@ void main()
     //-----------------------------------------------   
     // update L
     //-----------------------------------------------
+    // 步骤 3：沿柱对有效体元（nanovdbGet >= 0）累加显热通量：
+    // H = solar·Hsunlit + (1 - solar)·Hshaded（solar 为体元受阳比例），再取算术平均。
     float Hsum = 0;
     float Ssum = 0;
     for(int hi = 0;hi<=voxelMaxY;hi++)
@@ -106,6 +129,8 @@ void main()
         Ssum = Ssum + 1;
     }
     float H = 1.0*Hsum/Ssum;
+    // 步骤 4：Obukhov 长度 L = -ρ·cp·u*³·T/(κ·g·H)（m）。H 接近 0 时 L→±∞，
+    // 且这里没有除零保护；Ssum 在柱内无有效体元时也为 0（实际不会出现，因柱底已检查）。
     float L = -RHOA * CP * pow(aeroCond.ustar, 3) * (ubom.meteo.Ta + 273.15)/(KAPPA * GEARTH * H);
     //-----------------------------------------------   
     // save back

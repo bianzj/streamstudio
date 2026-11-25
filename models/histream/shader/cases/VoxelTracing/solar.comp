@@ -1,3 +1,28 @@
+// ==========================================================================
+// 文件：VoxelTracing/solar.comp
+// 功能：VoxelTracing（体元追踪，旧方案）的“太阳可见度”计算着色器：每个工作项对应一个体元
+//   （voxelLinks[gl_GlobalInvocationID.x]），沿太阳方向做射线求交，得到该体元到太阳的透过率
+//   alpha_toSolar，并把漫射辐射缓冲 voxelRads 的 cumulated/induced 清零。
+// 现状（重要）：文件的大部分是被注释掉的旧实现（逐步穿越体元、冠层透过率 exp(-density*G*pathLength)、
+//   voxel_raytracing_diffuse_single 的漫射角循环等）。仍有效的代码只做：
+//   “沿太阳方向求最近交点；射线射出场景则 solar = 1，写回 voxelDirs[].solar”。
+//   此外 traversalDirection 的 for 循环后只有一个 `}`，函数体括号看上去未闭合，
+//   该文件很可能无法按原样编译（疑似问题，待核对）。
+// 主要模块/步骤：
+//   1. 扩展、宏与包含（含 traceray_comp.glsl 的 rayQuery 求交封装）；工作组 GROUP_SIZEX × 1
+//   2. traversalDirection：沿给定方向穿越体元，估计体元到该方向（太阳）的透过率
+//   3. LookUpAABB / LookUpNanoValue：调试用的 AABB 与 NanoVDB 查询小函数
+//   4. main：确定体元中心位置 → traversalDirection(太阳方向) → 清零 voxelRads
+// 数据流：输入 voxelLinks/instanceLinks（体元索引、实例、地物类型）、settingxml（scale、voxelSize、
+//   maxStep、maxBand）、lightSet.direction（太阳方向）、topLevelAS；
+//   输出 voxelDirs[bufferId0].solar（太阳透过率，0–1）与清零后的 voxelRads。
+// 与其他文件的关系：与 ../VoxelTriTracing 目录的同名着色器对应（那里有完整的漫射/出图实现，待核对）。
+// 约定：位置按格距 scale 缩放，体元中心 = voxelId*scale - semiRange（x、z），y = voxelId.y*scale；
+//   semiRange = scale*voxelSize/2 为场景半宽；voxelRads 下标 = bufferId*DIFFUSE_ANGLE_NUM*maxBand
+//   + kband*DIFFUSE_ANGLE_NUM + iangle。
+// 归档说明：cases/ 为历史变体副本，include 的 "../xxx" 相对 shader/<子目录>（待核对）。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -18,6 +43,7 @@
 #extension GL_KHR_memory_scope_semantics:require
 #extension GL_EXT_shader_atomic_float: require 
 
+// 模式开关宏：被共用头文件用来选择体元追踪分支。
 #define VOXELTRACING 1
 
 #include "../bindinglayout.h"
@@ -29,12 +55,17 @@
 // #include "../shade_state_voxel.glsl"
 #include "../random.glsl"
 
+// 计算着色器没有 payload 机制，prd / shadow_payload 作为全局变量，供 traceray_comp.glsl 使用。
 PtPayload        prd;
 ShadowHitPayload shadow_payload;
 
 #include "../traceray_comp.glsl"
 
+// 一维工作组：一个工作项处理一个体元。
 layout(local_size_x = GROUP_SIZEX) in;
+// MAXSTEP 在本文件未使用（实际步数上限取 settingxml.maxStep）；DIFFUSE_ANGLE_NUM 为
+// 半球漫射离散方向数；MAXBAND 为最大波段数；NUM_VNIR/NUM_BAND/NUM_TIR 为高光谱波段数
+// （可见-近红外 2001 + 热红外 162 = 2163，与 NUM_BAND = 2162 不一致，待核对），本文件未使用。
 #define MAXSTEP   100
 #define DIFFUSE_ANGLE_NUM 32
 #define MAXBAND    25
@@ -42,6 +73,11 @@ layout(local_size_x = GROUP_SIZEX) in;
 #define NUM_BAND 2162 // number of VNIR+TIR bands
 #define NUM_TIR 162  // number of TIR bands
 
+// 作用：从当前体元中心出发沿 direction（太阳方向）射线穿越场景，估计到太阳的透过率。
+// 输入：direction 世界坐标的指向太阳的方向（本函数内部归一化）；
+// 输出：返回 false 表示射线射出场景（此时 voxelDirs[bufferId0].solar = alpha_toSolar 并返回）；
+//   其余路径返回 true（逐体元累计透过率的实现已被注释，solar 不会被写入）。
+// 副作用：写 voxelDirs[bufferId0].solar；修改全局 prd。
 // calculate the transmittance from voxel to solar
 // To check the access of a voxel to a long distance along a direction
 bool traversalDirection(vec3 direction)
@@ -64,7 +100,10 @@ bool traversalDirection(vec3 direction)
     uint instanceId, alignInstanceId,canopyId,lastInstanceId,typeId;
     VoxelInstanceLink instanceLink;
     Canopy canopy;
+    // 避免自相交的最小距离（以体元尺寸缩放）；目前使用它的 ClosestHit(ray, shortDistance) 已被注释。
     float shortDistance = SHORTDISTANCE*scale;
+    // 步骤 1：确定射线起点。普通体元取体元中心位置（x、z 以 scale 为单位并减去 semiRange 居中）；
+    //   土壤体元起点放在其底面中心（x、z 各加一格偏移，待核对）。
     // the center position of a voxel 
     vec3 voxelPos0 =  vec3((voxelId0.x)*scale-semiRange.x, (voxelId0.y)*scale,(voxelId0.z)*scale-semiRange.z ); 
     // if type is soil, the position is located at bottom facet center.
@@ -80,12 +119,15 @@ bool traversalDirection(vec3 direction)
     // This is a process toward direction step by step 
     int kstep = 0;
     vec3 ffnormal;
+  // 步骤 2：逐步前进的主循环，最多 settingxml.maxStep 步。
+  //   有效代码只剩“求最近交点、未命中则写 solar 并返回”，之后的命中处理均被注释。
   for(kstep = 0;kstep<settingxml.maxStep;kstep++)
   {
     // the transmittance inside a voxel 
     alpha_voxel = 1.0;
     // avoid hit itself for the original voxel
     // ClosestHit(ray, shortDistance);
+    // 求最近交点；hitT == INFINITY 表示射线射出场景（看到太阳），透过率保持 alpha_toSolar = 1。
     ClosestHit(ray);
     if(prd.hitT == INFINITY)
     {
@@ -97,6 +139,8 @@ bool traversalDirection(vec3 direction)
     // // get hit information
     // ShadeState sstate = GetShadeState(prd);
     vec3 hitPos = ray.origin + ray.direction * prd.hitT;
+    // 由命中点换算所在体元的整数索引 voxelId（沿射线方向取整，避免落在体元边界）；
+    //   当前 voxelId 之后没有被使用（后续处理已被注释）。
     voxelId = getVoxelId(hitPos, semiRange, settingxml.scale, normalize(direction));
 
 
@@ -157,6 +201,9 @@ bool traversalDirection(vec3 direction)
   return true;
 }
 
+// 以下至 LookUpAABB 之前为整段被注释的旧实现 voxel_raytracing_diffuse_single：
+//   对 DIFFUSE_ANGLE_NUM 个漫射方向，射线穿越体元，命中天空时累加天空辐射，
+//   命中植被时累乘冠层透过率并累加热发射。当前不参与编译，仅供参考。
 // // It is used for single-scattering term. Solar term to scatter term
 // bool voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0,uint typeId0, NanoVDBLink nanoVDBLink)
 // {
@@ -379,12 +426,15 @@ bool traversalDirection(vec3 direction)
 // }
 
 
+// 调试辅助：读取第 loc 个体元的 AABB（aabbs 缓冲）。本文件内未被调用。
 AllAabb LookUpAABB(int loc)
 {
 	AllAabb aabb = aabbs[loc];
 	return aabb;
 }
 
+// 调试辅助：按整数体元坐标查询 NanoVDB，返回其值（缓冲下标，空体元为 -1，初值 -10000 仅作占位）。
+//   本文件内未被调用。
 float LookUpNanoValue(ivec3 pos)
 {
 	float value = -10000;
@@ -393,6 +443,9 @@ float LookUpNanoValue(ivec3 pos)
 	return value;
 }
 
+// 作用：每个工作项处理一个体元：求到太阳的透过率，并清零漫射辐射缓冲。
+// 步骤：1 读取体元索引/实例/类型并求体元中心；2 沿太阳方向调用 traversalDirection；
+//       3 把本体元所有 (波段, 方向) 的 cumulated 与 induced 清零。
 void main()
 {
     //------------------------------------------------------------
@@ -416,11 +469,14 @@ void main()
     }
 
     // solar direction.
+    // 太阳方向（lightSet.direction 为指向太阳的世界坐标方向，由 offline.rgen 中“向太阳发阴影光线”可推知）。
     vec3 directions = normalize(lightSet.direction);
     
     // calculate the transmittance from voxel to solar.
+    // 步骤 2：求体元到太阳的透过率；结果通过 voxelDirs[bufferId0].solar 写出，返回值未使用。
     traversalDirection(directions);
 
+    // 步骤 3：清零。induced 为本轮入射辐射，cumulated 为多次散射累积量；后续漫射迭代以它们为起点。
     // initialize induced and cumulated, both are set 0.
     for(int kband=0;kband<settingxml.maxBand;kband++)
     {

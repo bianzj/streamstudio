@@ -1,3 +1,15 @@
+// ==========================================================================
+// 文件：RayTracing_Hapke/shadow.rmiss
+// 功能：阴影光线（payload location 1，miss 索引 1）的 miss 着色器。
+// 主要模块：main() 把 ShadowHitPayload.isHit 置为 false，表示光线沿途无遮挡。
+// 数据流：offline.rgen 的 AnyHit() 发射前先令 isHit = true，并跳过最近命中着色器；
+//   只有光线什么也没打中才会进入本着色器，把 isHit 改回 false，
+//   于是 isHit 的最终值即“是否被遮挡”。
+// 与其他文件的关系：ShadowHitPayload 定义在 ../settings.h；与 rmiss.rmiss（主光线 miss）配套。
+// 归档说明：cases/ 下是各方法的历史变体副本，CMake 当前编译的是 shader/RayTracing、voxeleb、voxelrt 等目录；
+//   include 用 "../xxx" 相对 shader/<子目录> 书写，故变体需复制到该层级目录后才能编译（shadersCompile.py 用 versionName 选目录，待核对）。
+// ==========================================================================
+
 /*
  * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -36,9 +48,11 @@
 // Miss shader for the shadow rayPayloadInEXT
 //
 
+// payload 与 offline.rgen 中 shadow_payload（location = 1）对应。
 layout(location = 1) rayPayloadInEXT ShadowHitPayload payload;
 
 void main()
 {
+  // 未命中任何几何 → 光线未被遮挡。
   payload.isHit = false;
 }

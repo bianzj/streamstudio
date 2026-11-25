@@ -1,3 +1,23 @@
+// ==========================================================================
+// 文件：fluid_lbm.comp
+// 功能：VoxelEB 流体耦合的一个 LBM（D3Q19，BGK 碰撞 + Guo 外力项）时间步，同时对温度/烟/水汽
+//       标量做半拉格朗日平流、扩散并与地表/介质体元交换热量。读 A 缓冲区，写 B 缓冲区。
+// 主要步骤（每个流体格一个线程）：
+//   1. 固体格：重置为静止平衡态，温度取耦合体元的表面温度，直接返回
+//   2. 拉取（pull）流入分布 pullPopulation：固体/底面/切向边界反弹，顶部与下游零梯度，
+//      入流边界给平衡分布；得到密度与动量，异常密度则重置为环境风平衡态
+//   3. 标量平流 advectScalar：回溯采样 + 邻居扩散 + 与表面体元的热交换 + 源/入流边界
+//   4. 外力：热浮力（温度高于地形背景气温）、植被格的二次阻力（∝ LAD·|u|·u），限幅
+//   5. 边界速度修正（入流设环境风，非出流边界去掉法向分量），物理风速上限
+//   6. BGK 碰撞（松弛时间限制在 [0.52, 1.95]）加 Guo 强迫项，写入 fluidLbmB/Density/VelocityB/ScalarB
+// 数据流：fluidLbmA、fluidScalarA、fluidMeta、fluidParameters → fluidLbmB、fluidDensity、
+//         fluidVelocityB、fluidScalarB；之后由 fluid_lbm_commit.comp 把 B 提交回 A。
+// 与其他文件：fluid_common.glsl（网格/边界/插值）、fluid_coupling.glsl（背景温度、体元耦合）。
+// 约定：格子单位下速度上限 sources.y（0.01–0.18）；物理速度 = 格子速度 × sources.w（m/s 每格子速度）；
+//         标量 scalar.x 温度（K）、.y 烟浓度[0,1]、.z 水汽压（hPa）；FluidCellMeta.kind：
+//         1 固体，2 植被（有阻力），3、4 为固定温度的介质/热源格（见 advectScalar，待核对含义）。
+// ==========================================================================
+
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 #extension GL_EXT_scalar_block_layout : enable
@@ -13,6 +33,8 @@
 
 layout(local_size_x = GROUP_SIZEX) in;
 
+// 模块：D3Q19 格子常量。C 为 19 个离散速度方向（0 为静止，1–6 沿轴，7–18 为面对角），
+// OPPOSITE 给出反向速度的下标（用于反弹），W 为平衡分布权重（1/3、1/18、1/36）。
 const ivec3 D3Q19_C[19] = ivec3[19](
     ivec3(0,0,0),
     ivec3(1,0,0), ivec3(-1,0,0),
@@ -38,11 +60,13 @@ const float D3Q19_W[19] = float[19](
     1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,
     1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0);
 
+// 分布函数在 fluidLbmA/B 中的存储：每格连续 19 个方向。
 uint populationIndex(uint cellIndex, int direction)
 {
     return cellIndex * 19u + uint(direction);
 }
 
+// 把格子速度限幅到 sources.y（夹在 [0.01, 0.18]）：LBM 要求低马赫数（小于约 0.18）以保持稳定。
 vec3 limitedLatticeVelocity(vec3 velocity)
 {
     float limit = clamp(fluidParameters.sources.y, 0.01, 0.18);
@@ -50,6 +74,7 @@ vec3 limitedLatticeVelocity(vec3 velocity)
     return speed > limit ? velocity * (limit / speed) : velocity;
 }
 
+// 二阶平衡分布 f_eq = w·ρ·(1 + 3 c·u + 4.5 (c·u)² - 1.5 u²)（c_s² = 1/3 的格子单位）。
 float equilibrium(int direction, float density, vec3 velocity)
 {
     float cu = dot(vec3(D3Q19_C[direction]), velocity);
@@ -58,12 +83,16 @@ float equilibrium(int direction, float density, vec3 velocity)
         * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * uu);
 }
 
+// 环境风（m/s）折算为格子速度：除以 sources.w（每格子速度对应的 m/s，至少 1），并限幅。
 vec3 ambientLatticeVelocity()
 {
     float velocityScale = max(fluidParameters.sources.w, 1.0);
     return limitedLatticeVelocity(fluidParameters.ambientWind.xyz / velocityScale);
 }
 
+// 模块：拉取式迁移。取上游格 cell - c_i 的第 i 个方向分布；上游为固体则取本格反向分布（半步反弹）；
+// 上游在网格外：底面反弹，顶面零梯度，水平边界按环境风法向速度判断——入流给平衡分布，
+// 出流零梯度，切向反弹（原注释见下）。
 float pullPopulation(uint index, ivec3 cell, int direction)
 {
     ivec3 sourceCell = cell - D3Q19_C[direction];
@@ -94,6 +123,12 @@ float pullPopulation(uint index, ivec3 cell, int direction)
     return fluidLbmA[populationIndex(index, D3Q19_OPPOSITE[direction])];
 }
 
+// 模块：标量（温度/烟/水汽）的半拉格朗日平流 + 扩散 + 源汇。返回新的 (T, smoke, vapor, w)。
+//   步骤 1：沿速度回溯一个 dt 取出发点位置，三线性采样；温度无效（<150 K 或 NaN）则用本格旧值；
+//   步骤 2：与六邻居平均值按扩散系数 physics.w·dt/h² 混合（上限 0.25 保证稳定）；
+//   步骤 3：与耦合的稀疏体元表面温度按 1 - exp(-physics.z·dt/60) 做指数松弛；
+//   步骤 4：kind 3 格取固定温度（至少 900 K）并持续释放烟，kind 4 格取固定介质温度、烟下限 0.35；
+//   步骤 5：入流边界恢复为地形背景温度/水汽、烟为 0；水汽限在饱和值内，烟限在 [0,1]。
 vec4 advectScalar(ivec3 cell, vec3 physicalVelocity, FluidCellMeta meta)
 {
     float dt = max(fluidParameters.spacingTime.w, 0.001);
@@ -148,6 +183,7 @@ vec4 advectScalar(ivec3 cell, vec3 physicalVelocity, FluidCellMeta meta)
     return scalar;
 }
 
+// 模块：LBM 单步更新入口（见文件头的步骤 1–6）。
 void main()
 {
     uint index = gl_GlobalInvocationID.x;
@@ -170,6 +206,8 @@ void main()
         return;
     }
 
+    // 步骤 2：拉取 19 个方向的分布并累加密度与动量；密度越界 [0.2, 5] 或非有限时
+    // 重置为环境风平衡态（数值故障保护）。
     float populations[19];
     float density = 0.0;
     vec3 momentum = vec3(0.0);
@@ -194,6 +232,9 @@ void main()
     vec3 physicalVelocity = latticeVelocity * velocityScale;
     vec4 scalar = advectScalar(cell, physicalVelocity, meta);
 
+    // 步骤 4：外加加速度（m s-2）。竖直方向的浮力 = physics.x·(T - 同高度背景温度)，
+    // 植被格（kind 2）再减去二次阻力 physics.y·LAD·|u|·u。折算到格子单位并限制幅值
+    // 不超过 0.25×格子速度上限，随后用半步力修正速度（Guo 方案）。
     vec3 physicalAcceleration = vec3(
         0.0,
         max(fluidParameters.physics.x, 0.0)
@@ -214,6 +255,8 @@ void main()
     latticeVelocity = limitedLatticeVelocity(
         momentum / density + 0.5 * latticeAcceleration);
 
+    // 步骤 5：边界速度。入流边界固定为环境风与密度 1；其它水平边界格去掉法向速度分量（出流除外）；
+    // 再按 sources.z 限制物理风速上限。
     if (fluidIsInlet(cell)) {
         density = 1.0;
         latticeVelocity = ambientLatticeVelocity();
@@ -233,6 +276,8 @@ void main()
         latticeVelocity = physicalVelocity / velocityScale;
     }
 
+    // 步骤 6：BGK 碰撞。格子粘度 = 物理粘度/(速度尺度·格距)，松弛时间 τ = 0.5 + 3ν（限幅防不稳定），
+    // f ← f - ω(f - f_eq) + 强迫项（Guo 形式）；入流边界直接写平衡分布。
     float latticeViscosity = max(fluidParameters.physics.w, 0.0)
         / max(velocityScale * spacing.x, 0.001);
     float relaxationTime = clamp(0.5 + 3.0 * latticeViscosity, 0.52, 1.95);

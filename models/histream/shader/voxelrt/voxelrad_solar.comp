@@ -1,3 +1,19 @@
+// ==========================================================================
+// 文件：voxelrad_solar.comp
+// 功能：VoxelRT（体元辐射）模式下，逐体元计算“直射太阳光可见度/透过率”voxelDirs[i].solar。
+// 主要模块/步骤：
+//   1. 头部：扩展、宏与 include（绑定布局、BSDF、NanoVDB 体元索引、traceray_comp、solar_steps）
+//   2. SolarVisibilityFromOrigin：从给定起点沿太阳方向逐步追踪，累乘冠层透过率，遇土壤/建筑/水体则为 0
+//   3. TraversalDirection：按体元类型（建筑面/普通面元）选择射线起点，取可见度并写入 solar
+//   4. main：每个线程处理一个体元（gl_GlobalInvocationID.x = voxelLinks 缓冲下标）
+// 数据流：voxelLinks/instanceLinks/meshLinks（体元→实例→网格类型）+ lightSet.direction（太阳方向）
+//         → 本着色器 → voxelDirs[].solar（0~1），后续漫射/成像着色器读取。
+// 与其他文件：与 VoxelEB 的直射逻辑一致（solar_steps.glsl 的步数上限、SOLAR_TRANSMITTANCE_CUTOFF）；
+//         voxelrad_image.comp、voxelrad_diffuse_single.comp 使用本文件写出的 solar。
+// 约定：坐标为体元网格坐标（射线起点以体元边长为单位，每个体元占 1 个单位；单位换算待核对）；y 轴向上；
+//       lightSet.direction 指向太阳（y<0.01 视为夜间/地平线以下，solar=0）。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -29,12 +45,14 @@
 #include "../shade_state_voxel.glsl"
 #include "../random.glsl"
 
+// 全局：光线载荷（ClosestHit 的结果 prd）与阴影载荷，由 traceray_comp.glsl 使用。
 PtPayload        prd;
 ShadowHitPayload shadow_payload;
 
 #include "../traceray_comp.glsl"
 #include "../solar_steps.glsl"
 
+// 一维工作组；GammaR/GammaT 为漫射角度离散的反射/透射表（本文件未使用，与其他体元着色器共用声明）。
 layout(local_size_x = GROUP_SIZEX) in;
 // #define DIFFUSE_ANGLE_NUM 32
 #define MAXBAND    800
@@ -46,6 +64,12 @@ float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 // As VoxelEB: the straight solar ray is followed until it leaves the scene
 // (SolarStepLimit, at least setting.maxStep = clamp(128*depth, 128, 2048));
 // it stops at transmittance <= SOLAR_TRANSMITTANCE_CUTOFF (1e-4) and keeps that value.
+// 作用：从 origin 出发沿 lightDirection 逐步追踪，返回到达太阳的透过率（0~1）。
+// 输入：origin（体元网格坐标）、lightDirection（单位向量，指向太阳）、nanoVDBLink、semiRange（水平半范围）。
+// 说明：每次 ClosestHit 命中后，若所在体元为植被则乘以冠层体元透过率（参与介质模型或
+//       空间交互 ResolveSpatialInteraction）；若沿光线对齐的体元是土壤/建筑/水体则完全遮挡返回 0；
+//       射线飞出场景则乘以 TurbidEscapeTransmittance（浑浊介质的逃逸透过率）后返回；
+//       透过率降到 SOLAR_TRANSMITTANCE_CUTOFF（1e-4）以下即停止并保持该值。
 float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
                                 NanoVDBLink nanoVDBLink, vec3 semiRange)
 {
@@ -58,6 +82,7 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
     Ray ray = Ray(origin, lightDirection);
     int stepLimit = SolarStepLimit(lightDirection, setting.maxStep);
 
+    // 步骤 1：沿光线逐段步进，最多 stepLimit 步（由 SolarStepLimit 按方向与 setting.maxStep 给出）。
     for(int step = 0; step < stepLimit; ++step)
     {
         float alphaVoxel = 1.0;
@@ -65,12 +90,14 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
         if(prd.hitT == INFINITY)
             return alphaToSolar * TurbidEscapeTransmittance(ray.origin, ray.direction);
 
+        // 步骤 2：由命中点求所在体元 voxelId 及沿光线对齐的体元 alignVoxelId（对齐方式待核对）。
         ShadeState sstate = GetShadeState(prd);
         ivec3 alignVoxelId;
         ivec3 voxelId = getVoxelIdSemi(
             sstate.position, semiRange, setting.scale,
             normalize(lightDirection), alignVoxelId);
         int bufferId = nanovdbGet(nanoVDBLink, voxelId);
+        // 步骤 3：命中体元里是植被时，按冠层 G 函数与密度求本段透过率（其余类型本段不衰减）。
         if(bufferId >= 0)
         {
             uint instanceId = voxelLinks[bufferId].instanceId;
@@ -90,6 +117,7 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
             }
         }
 
+        // 步骤 4：对齐体元是不透光地物（土壤/建筑/水体）→ 直射被完全遮挡。
         int alignBufferId = nanovdbGet(nanoVDBLink, alignVoxelId);
         if(alignBufferId >= 0)
         {
@@ -100,6 +128,7 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
                 return 0.0;
         }
 
+        // 步骤 5：累乘透过率，达到截止阈值即提前结束；否则把起点沿法线（朝向光线一侧）偏移后继续。
         alphaToSolar *= alphaVoxel;
         if(alphaToSolar <= SOLAR_TRANSMITTANCE_CUTOFF) return alphaToSolar;
         vec3 ffnormal = sstate.normal;
@@ -110,6 +139,9 @@ float SolarVisibilityFromOrigin(vec3 origin, vec3 lightDirection,
     return alphaToSolar;
 }
 
+// 作用：为当前体元选择太阳射线起点，计算可见度并写入 voxelDirs[].solar。
+// 返回：可见度是否已低于截止阈值（即基本无直射）。
+// 说明：建筑体元（faceId==0）与其他体元的射线起点选择不同，见下面三种情形。
 bool TraversalDirection(vec3 lightDirection)
 {
     uint bufferId0 = uint(gl_GlobalInvocationID.x);
@@ -120,6 +152,7 @@ bool TraversalDirection(vec3 lightDirection)
     int faceId = voxelLinks[bufferId0].faceId;
     NanoVDBLink nanoVDBLink = nanovdbInit();
     ConfigureTurbidGrid(nanoVDBLink);
+    // 体元网格以 x/z 居中（半范围取体素数一半四舍五入），y 自 0 起；voxelMinimum 为当前体元的最小角点。
     vec3 semiRange = vec3(
         floor(setting.voxelSize.x / 2.0 + 0.5), 0.0,
         floor(setting.voxelSize.z / 2.0 + 0.5));
@@ -130,6 +163,7 @@ bool TraversalDirection(vec3 lightDirection)
     float visibility;
     vec3 storedNormal = vec3(voxelLinks[bufferId0].normalX, voxelLinks[bufferId0].normalY,
                              voxelLinks[bufferId0].normalZ);
+    // 情形 A：建筑且保存了面元法线——从法线穿出的立方体面中心出发，使墙面/屋顶从外侧看太阳。
     if(typeId0 == TYPE_BUILDING && faceId == 0 && length(storedNormal) > 0.5)
     {
         // As VoxelEB: start on the cube face that the stored facet normal
@@ -140,6 +174,7 @@ bool TraversalDirection(vec3 lightDirection)
         visibility = SolarVisibilityFromOrigin(
             origin, normalize(lightDirection), nanoVDBLink, semiRange);
     }
+    // 情形 B：建筑但无法线——分别取顶面中心与迎光侧面中心两个起点，取较大的可见度。
     else if(typeId0 == TYPE_BUILDING && faceId == 0)
     {
         vec3 direction = normalize(lightDirection);
@@ -161,6 +196,7 @@ bool TraversalDirection(vec3 lightDirection)
     }
     else
     {
+        // 情形 C：其他体元——起点为该面（faceId）在体元上的位置（getFacetIdPos）。
         vec3 origin = voxelMinimum;
         getFacetIdPos(faceId, origin);
         visibility = SolarVisibilityFromOrigin(
@@ -171,6 +207,7 @@ bool TraversalDirection(vec3 lightDirection)
     return visibility <= SOLAR_TRANSMITTANCE_CUTOFF;
 }
 
+// 入口：每线程处理一个体元；无效体元直接跳过，太阳在地平线附近或以下（y<0.01）时 solar=0。
 void main()
 {
   // solar direction

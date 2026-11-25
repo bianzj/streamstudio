@@ -1,6 +1,35 @@
+// ==========================================================================
+// 文件：facetrt/spectral.comp（FacetRT 光谱波段求解的 GPU 辅助着色器）
+// 功能：在 GPU 上按波段（band）准备面元光学参数、控制间接调度的迭代批次，并把求得的辐射度
+//   整理成输出光谱/状态（亮部、阴影）。与 CPU 参考实现 facetrtcore.cpp 逐项对应（CPU parity）。
+// 主要模块/步骤（由推送常量 pc.phase 选择，每次 dispatch 只做其中一个阶段）：
+//   1. Hapke 背景模型辅助函数：H 函数、反射率/发射率的方向性修正、查表双线性采样
+//   2. phase 0：由材料光谱（反射/透射/发射）与背景模型生成每侧 SurfaceOptics 与发射 emission
+//   3. phase 4：只做漫射求解时清除直射辐照度与光学波段的光束项
+//   4. phase 5/6：加速模式下初始化/更新间接调度参数（迭代批次、收敛判据）
+//   5. phase 2：收敛后输出物理辐射度，并拆出亮部/阴影状态（含 Hapke 背景成像修正）
+//   6. phase 3：漫射输出，把直射部分 = 总输出 − 漫射输出写入第 3 段
+// 数据流：facetrtcore.cpp 填充 Facets/Materials（FacetrtVulkan::beginSpectral）
+//   → 本着色器 phase 0 写 Optical/Emission → radiosity.comp/incident.comp 迭代求解 →
+//   本着色器 phase 2/3 读 RadiosityA/B 写 Output（readSpectralOutput 读回）。
+// 约定：每个面元记录 F 为 12 个 float：[0..2] 法线；[3] 反射率纹理系数；[4] 材料索引；
+//   [5] 1=物体（叶/建筑等）0=背景（地面）；[6][7] 两侧受太阳直射的比例；[8] mu0 = 太阳入射余弦；
+//   [9] Hapke 冲击（opposition）因子 B；[10] |法线 y|（热发射方向形状用）；[11] mu = 天顶观测余弦。
+//   Materials 每（波段, 材料）一个 vec4 = (反射率, 透射率, 日照侧热辐射, 阴影侧热辐射)；
+//   侧编号 s = 2*facet + (0 正面 | 1 背面)；n = 2*facets；thermal 波段的 beam 为 2.5–6 um 太阳项。
+//   Output 布局：[band*n+s] 物理辐射度（乘 scale）；[bands*n + 2*(band*n+s) + {0,1}] 亮/阴状态；
+//   [3*bands*n+s] 漫射模式下的直射分量。
+// 注意：带 precise 的变量刻意禁止乘加合并，并按 CPU 的运算次序展开，以与 CPU 结果一致。
+// ==========================================================================
+
 #version 460
 layout(local_size_x=64) in;
+// 每侧光学参数：反射率、透射率、自发射、直射辐照度（与 radiosity.comp 的缓冲布局一致）。
 struct SurfaceOptics { float reflectance,transmittance,emission,directIrradiance; };
+// 缓冲区：F = 面元记录（每面元 12 个 float，其后接 Hapke 查表），M = 材料光谱，
+// optics/emission = 每侧光学参数与（亮, 阴）发射，A/B = 辐射度双缓冲，
+// previous = 上一次物理辐射度（用于热启动），outputData = 输出，
+// dispatchData = 间接调度参数，residual = 迭代最大变化量位模式。
 layout(std430,binding=0) readonly buffer Facets { float F[]; };
 layout(std430,binding=1) readonly buffer Materials { vec4 M[]; };
 layout(std430,binding=2) buffer Optical { SurfaceOptics optics[]; };
@@ -11,16 +40,26 @@ layout(std430,binding=6) buffer Previous { float previous[]; };
 layout(std430,binding=7) buffer Output { float outputData[]; };
 layout(std430,binding=8) buffer Dispatch { uint dispatchData[]; };
 layout(std430,binding=9) readonly buffer Residual { uint residual[]; };
+// 推送常量：phase 阶段号；band 当前波段；facets 面元数；materials 材料数；
+// sunX/Y/Z 太阳方向；strength Hapke 背景强度 [0,1]（0 = 朗伯背景）；beam 光束法向辐照度；
+// scale 输出缩放；thermal 非 0 表示热红外波段；ping 当前解所在缓冲；bands 波段总数。
 layout(push_constant) uniform Push {
     uint phase,band,facets,materials;
     float sunX,sunY,sunZ,strength,beam,scale;
     uint thermal,ping,bands,reserved;
 } pc;
 
+// 作用：Hapke 多次散射 H 函数的近似 H(mu) = (1+2mu)/(1+2mu·γ)，γ = sqrt(1−w)。
+// w 为单次散射反照率；γ 的下限 1e-6 防止 w=1 时除零。
 float hapkeH(float mu,float w) {
     float gamma=sqrt(max(1.0-w,1e-6));
     return (1.0+2.0*mu)/(1.0+2.0*mu*gamma);
 }
+// 作用：背景（地面）面元的 Hapke 反射率修正（非能量守恒的旧版本）。main 中仅当 strength<=0 时调用，
+//   此时按 strength 混合后结果退化为限幅后的基准反照率（待核对：疑为兼容保留）。
+// 步骤：由朗伯基准反照率 base 反推单次散射反照率 w = 4·base/(1+base)²；
+//   用 mu0、mu、opposition 算方向性反射并按 strength 与朗伯基准线性混合。
+// 说明：归一化因子 reference 为 mu0=mu=1、无冲击项时的参考值；限幅 [0,1] 防止数值越界。
 float backgroundReflectance(float value,uint f) {
     const float pi=3.14159265358979323846;
     float base=clamp(value,0.0,0.999);
@@ -34,28 +73,36 @@ float backgroundReflectance(float value,uint f) {
     precise float result=base+(hapke-base)*clamp(pc.strength,0.0,1.0);
     return result;
 }
+// 作用：热发射的方向形状（相对半球发射率的角度依赖），由发射率 base 反推 w = 1 − base²。
+// mu 为视线余弦；公式形式来自 Hapke 型发射近似（待核对其文献来源）。
 float directionalEmission(float base,float mu) {
     float root=sqrt(1.0-clamp(1.0-base*base,1e-5,0.999));
     precise float value=root*(1.0+2.0*mu/1.5)/(1.0+2.0*mu/1.5*root);
     return value;
 }
+// 作用：背景面元的方向性发射率（旧版本，同上仅在 strength<=0 时被调用）：
+//   把天顶观测的发射形状按 strength 与半球发射率混合，strength=0 时即 base。
 float backgroundEmissivity(float value,uint f) {
     float base=clamp(value,0.0,1.0);
     float hapke=clamp(base*directionalEmission(base,clamp(F[f+10],1e-4,1.0))/max(directionalEmission(base,1.0),1e-6),0.0,1.0);
     precise float result=base+(hapke-base)*clamp(pc.strength,0.0,1.0);
     return result;
 }
+// 作用：输出后处理：乘缩放系数并截断为非负（表观反射率在向阳面可超过 1，不做上限）。
 float finish(float value) {
     // Apparent reflectance may exceed 1 on sun-facing facets; keep it.
     // Must match appendSurfaceStates() in facetrtcore.cpp (CPU parity).
     return max(0.0,value*pc.scale);
 }
+// 模块：Hapke 反照率查表（保守背景模型）。表接在面元记录之后（索引 = facets*12 + 偏移）：
+// 方向反照率 A[base][mu]、双半球反照率 A_bh[base]、热半球平均发射形状 [emissivity]。
 // Hapke tables after the facet records (HapkeAlbedoTable::append): directional
 // albedo A[base][mu] (101 x 65), bihemispherical A_bh[base] (101), thermal
 // hemispherical mean of the emission shape [emissivity] (101). Present only
 // when pc.strength > 0. Bilinear sampling as on the CPU.
 const uint HAPKE_BASES=101u,HAPKE_MUS=65u;
 float hapkeTable(uint index) { return F[pc.facets*12u+index]; }
+// 作用：对方向反照率表双线性插值；base 在 [0,0.999] 映射到 101 档，mu0 在 [0,1] 映射到 65 档。
 float sampleDirectional(float base,float mu0) {
     precise float x=clamp(base/0.999,0.0,1.0)*float(HAPKE_BASES-1u);
     precise float y=clamp(mu0,0.0,1.0)*float(HAPKE_MUS-1u);
@@ -66,6 +113,7 @@ float sampleDirectional(float base,float mu0) {
     precise float value=(1.0-fx)*((1.0-fy)*a00+fy*a01)+fx*((1.0-fy)*a10+fy*a11);
     return value;
 }
+// 作用：对双半球（白天空）反照率表线性插值。
 float sampleBihemispherical(float base) {
     precise float x=clamp(base/0.999,0.0,1.0)*float(HAPKE_BASES-1u);
     int b0=min(int(x),int(HAPKE_BASES)-2);
@@ -74,6 +122,7 @@ float sampleBihemispherical(float base) {
     precise float value=(1.0-fx)*hapkeTable(o)+fx*hapkeTable(o+1u);
     return value;
 }
+// 作用：对热发射形状的半球平均表线性插值（发射率 0..1 映射到 101 档）。
 float sampleThermal(float emissivity) {
     precise float x=clamp(emissivity,0.0,1.0)*float(HAPKE_BASES-1u);
     int b0=min(int(x),int(HAPKE_BASES)-2);
@@ -86,6 +135,9 @@ float sampleThermal(float emissivity) {
 // x = white-sky albedo for the solve (Lambert base), y = beam albedo
 // base*A(mu0)/A_bh, z = image BRF of the beam factor*base/A_bh, w = image
 // reflectance for diffuse light base*A(mu)/A_bh; all blended by strength.
+// 输出分量：x = 求解用白天空反照率（朗伯基准），y = 光束反照率 base·A(mu0)/A_bh，
+//   z = 光束成像 BRF，w = 漫射光成像反射率 base·A(mu)/A_bh；后三者按 strength 混合。
+// 输入 value 为材料反射率，f 为面元记录起点；与 CPU 的 backgroundHapkeSpectral 对应。
 vec4 backgroundHapke(float value,uint f) {
     const float pi=3.14159265358979323846;
     float base=clamp(value,0.0,0.999);
@@ -113,14 +165,20 @@ float imageEmissivity(float value,uint f) {
     return result;
 }
 // Material reflectance/transmittance of side s before the background model.
+// 作用：取该面元材料在当前波段的 (反射率, 透射率)，反射率乘纹理系数（热红外不乘），
+// 透射率限制在 1−r 以内以保证 r+t ≤ 1（背景模型修正之前的值）。
 vec2 materialOptics(uint f,bool thermal) {
     vec4 material=M[pc.band*pc.materials+uint(F[f+4])];
     float r=clamp(material.x*(thermal?1.0:F[f+3]),0.0,1.0);
     float t=clamp(material.y,0.0,1.0-r);
     return vec2(r,t);
 }
+// 入口：线程号 s 对应一侧（共 n = 2*facets 侧）；phase 5/6 只用线程 0，其余阶段见文件头。
 void main() {
     uint s=gl_GlobalInvocationID.x,n=2u*pc.facets;
+    // 步骤 1：加速模式的间接调度控制（单线程）。
+    //   dispatchData[0] 为工作组数（0 表示已收敛，后续批次空转）；[3] 累计迭代数；
+    //   [4] 最近一批的残差位模式。phase 5 初始化；phase 6 在每批 8 次迭代后累加并判收敛。
     if(pc.phase==5u || pc.phase==6u) {
         if(s!=0u)return;
         if(pc.phase==5u) {
@@ -129,24 +187,31 @@ void main() {
             dispatchData[3]=0u;dispatchData[4]=0u;
         } else if(dispatchData[0]!=0u) {
             dispatchData[3]+=8u;dispatchData[4]=residual[0];
+            // 收敛判据：一批迭代后最大变化量 ≤ 1e-4 即停止后续批次。
             if(uintBitsToFloat(residual[0])<=1e-4)dispatchData[0]=0u;
         }
         return;
     }
     if(s>=n)return;
+    // 步骤 2：定位面元记录起点 f 与另一侧 other；以下阶段 0/4/2/3 共用。
     uint f=(s/2u)*12u,other=s^1u;
     vec3 normal=vec3(F[f],F[f+1],F[f+2]);
+    // cosine = 面元法线与太阳方向的点积（正面朝向太阳为正）。
     // Spell out the CPU dot-product order and disable multiply-add contraction.
     precise float cosine=normal.x*pc.sunX+normal.y*pc.sunY+normal.z*pc.sunZ;
+    // 步骤 3（phase 0）：生成本波段每侧光学参数。顺序：取材料 r/t → 发射率 e = 1−r−t →
+    //   背景面元按 Hapke 路径修正 r（光学）或 e（热红外）→ 计算直射辐照度与光束项。
     if(pc.phase==0u) {
         vec4 material=M[pc.band*pc.materials+uint(F[f+4])];
         bool thermal=pc.thermal!=0u,object=F[f+5]!=0.0;
         float r=clamp(material.x*(thermal?1.0:F[f+3]),0.0,1.0);
         float t=clamp(material.y,0.0,1.0-r);
         float e=max(0.0,1.0-r-t);
+        // 只有背景（非物体）面元且 strength>0 才用保守 Hapke 模型；物体面元保持朗伯。
         bool hapke=!object&&pc.strength>0.0;
         float eImage=e,beamReflectance=-1.0;
         if(hapke) {
+            // 求解阶段用半球量保证能量守恒；beamReflectance 保存光束反照率，用于后面的光束项。
             // Conserving solve (hemispherical albedo/emissivity); the
             // zenith-view shape only enters the image states (phase 2).
             if(thermal){r=clamp(1.0-t-e,0.0,1.0);eImage=imageEmissivity(e,f);}
@@ -155,9 +220,11 @@ void main() {
             if(thermal){e=backgroundEmissivity(e,f);r=clamp(1.0-t-e,0.0,1.0);eImage=e;}
             else r=backgroundReflectance(r,f);
         }
+        // 写出 r、t（t 限幅保证 r+t ≤ 1）与发射：热红外为 (亮部, 阴影) 的 Planck 辐射乘发射率。
         SurfaceOptics o;
         o.reflectance=r;o.transmittance=min(t,1.0-r);
         emission[s]=thermal?vec2(eImage*material.z,eImage*material.w):vec2(0.0);
+        // 热红外自发射：按两侧受日照比例之和 lit 混合日照/阴影温度的 Planck 辐射。
         float lit=clamp(F[f+6]+F[f+7],0.0,1.0);
         precise float mixed=lit*(e*material.z)+(1.0-lit)*(e*material.w);
         // Thermal bands: pc.beam is the 2.5-6 um solar beam (radiance units,
@@ -170,18 +237,23 @@ void main() {
         o.emission=thermal?mixed:(beamReflectance>=0.0?beamExtra:0.0);
         optics[s]=o;
     } else if(pc.phase==4u) {
+        // 步骤 4（phase 4）：漫射模式 —— 去掉直射辐照度；光学波段同时去掉 Hapke 光束源项。
         optics[s].directIrradiance=0.0;
         if(pc.thermal==0u) optics[s].emission=0.0; // Hapke beam term
     } else {
+        // 步骤 5（phase 2/3）：读取收敛后的当前缓冲辐射度 raw（ping 选择 A 或 B）。
         float raw=pc.ping==0u?A[s]:B[s];
         if(pc.phase==2u) {
+            // phase 2：保存物理辐射度（供下一次热启动）、写总输出，并拆解亮部/阴影状态。
             previous[s]=raw; // Physical radiosity, before output normalization.
             outputData[pc.band*n+s]=finish(raw);
             SurfaceOptics o=optics[s];
+            // 扣除直射反射、透射和自发射后剩下的共享漫射辐射度 diffuseShared。
             precise float diffuseShared=raw-o.reflectance*o.directIrradiance-o.transmittance*optics[other].directIrradiance-o.emission;
             float own=max(0.0,(s&1u)==0u?cosine:-cosine)*pc.beam;
             float opposite=max(0.0,(s&1u)==0u?-cosine:cosine)*pc.beam;
             uint k=pc.bands*n+2u*(pc.band*n+s);
+            // 背景面元启用 Hapke：漫射与光束分别用成像反射率重算亮/阴状态（对应 CPU appendSurfaceStates）。
             if(F[f+5]==0.0&&pc.strength>0.0) {
                 // Hapke background image: zenith-view reflection of the solved
                 // diffuse field and of the beam (appendSurfaceStates, CPU).
@@ -202,11 +274,13 @@ void main() {
                 precise float shadeImage=diffuse+emission[s].y;
                 outputData[k]=finish(litImage);outputData[k+1u]=finish(shadeImage);
             } else {
+                // 常规面元：亮部 = 漫射 + 反射的本侧直射 + 透射的另一侧直射 + 亮部发射；阴影 = 漫射 + 阴影发射。
                 precise float lit=diffuseShared+o.reflectance*own+o.transmittance*opposite+emission[s].x;
                 precise float shade=diffuseShared+emission[s].y;
                 outputData[k]=finish(lit);outputData[k+1u]=finish(shade);
             }
         } else if(pc.phase==3u) {
+            // phase 3：漫射输出；第 3 段存“直射分量” = 总输出（band 0）− 漫射输出，限幅为非负。
             outputData[3u*pc.bands*n+s]=max(0.0,outputData[s]-finish(raw));
         }
     }

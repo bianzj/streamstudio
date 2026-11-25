@@ -1,3 +1,22 @@
+// ==========================================================================
+// 文件：lidf_common.h
+// 功能：叶倾角分布（LIDF）的叶片投影函数 G 与双朗伯面积散射相函数 Gamma，
+//       GLSL 4.60 / C++17 共用代码（原作者的详细约定见下方原注释）。
+// 主要模块：
+//   1. 语言适配宏（LIDF_CONST / LIDF_FN / LIDF_ARRAY / LIDF_OUT / LIDF_TABLE）
+//   2. 13 个 SAIL 倾角类的中心角 cos/sin 表
+//   3. lidfClassProjection / lidfProjection：单类与 LIDF 加权的叶片投影 G(mu)
+//   4. lidfVolscatt：SAIL volscatt 核（单倾角类的方位积分，输出 frho、ftau）
+//   5. lidfGamma：对 13 类加权求 GammaR、GammaT（面积散射相函数）
+//   6. （仅 C++ 宿主端）sailCumulative / sailLeafAngleFrequencies：由 Verhoef 双参数
+//      (a, b) 计算 13 类频率
+// 数据流：宿主端用 sailLeafAngleFrequencies 填写每个冠层的 13 个频率 → 着色器端
+//         用 lidfProjection / lidfGamma 求消光与散射；tools/test-lidf-gamma.cpp 用同一代码做数值校验。
+// 与其他文件关系：被 VoxelRT/VoxelEB 着色器包含；Canopy.diffuseG 等由本文件函数计算（待核对）。
+// 约定：角度 deg 仅用于宿主端 SAIL 累积函数，其余为 rad / 余弦；方向向量为单位向量，+y 向上；
+//       lidf[i] 为第 i 类单面叶面积占比（总和 1）。
+// ==========================================================================
+
 // Leaf inclination distribution (LIDF), leaf projection function G and
 // bi-Lambertian area scattering phase function Gamma for turbid foliage.
 //
@@ -25,8 +44,11 @@
 #ifndef LIDF_COMMON_H
 #define LIDF_COMMON_H
 
+// SAIL 倾角类个数（中心 5,15,...,75,81,83,85,87,89°）。
 #define LIDF_CLASS_COUNT 13
 
+// 模块：语言适配。C++ 下进入 namespace lidf 并把数组/输出参数/常量表映射为 C++ 写法；
+//       GLSL 下用 out 参数与 float[] 构造。这样同一份源码在两种语言中编译。
 #ifdef __cplusplus
 #include <algorithm>
 #include <cmath>
@@ -53,6 +75,7 @@ using std::sqrt;
 
 LIDF_CONST float LIDF_PI = 3.14159265358979f;
 
+// 模块：13 个倾角类中心角的 cos/sin 查表（常量，避免着色器里重复调用三角函数）。
 // cos/sin of the SAIL class centres 5,15,...,75,81,83,85,87,89 deg.
 #define LIDF_COS_VALUES 0.99619470f, 0.96592583f, 0.90630779f, 0.81915204f, \
     0.70710678f, 0.57357644f, 0.42261826f, 0.25881905f, 0.15643447f, \
@@ -63,6 +86,8 @@ LIDF_CONST float LIDF_PI = 3.14159265358979f;
 LIDF_TABLE(LIDF_CLASS_COS, LIDF_COS_VALUES);
 LIDF_TABLE(LIDF_CLASS_SIN, LIDF_SIN_VALUES);
 
+// 作用：单个倾角类对天顶余弦 mu 方向的平均投影（SAIL 的 chi_s）。
+// 说明：叶面不会翻到与该方向侧向（cs >= ss）时就是 cosL·mu；否则用 Ross 闭式。
 // Projection of one inclination class (cosL, sinL) for a direction with
 // |cos zenith| mu (SAIL chi_s). Equals cosL*mu when the leaf never turns
 // edge-on to the direction, otherwise the Ross closed form.
@@ -76,6 +101,7 @@ LIDF_FN float lidfClassProjection(float cosL, float sinL, float mu)
     return 2.0f / LIDF_PI * ((beta - 0.5f * LIDF_PI) * cs + sin(beta) * ss);
 }
 
+// 作用：LIDF 加权的叶片投影 G(mu) = Σ frequency[i]·psi_i；mu 取绝对值并限到 [0,1]。
 LIDF_FN float lidfProjection(LIDF_ARRAY(frequency), float mu)
 {
     float m = min(abs(mu), 1.0f);
@@ -85,6 +111,10 @@ LIDF_FN float lidfProjection(LIDF_ARRAY(frequency), float mu)
     return g;
 }
 
+// 作用：SAIL volscatt（Verhoef 1998）：一个倾角类在给定太阳/观测几何下，
+//       对方位角积分后的反射（frho）与透射（ftau）权重。
+// 输入：cts/sts、cto/sto（源/观测方向天顶角的 cos/sin）、cospsi/psi（相对方位）、
+//       costl/sintl（叶倾角 cos/sin）。
 // SAIL volscatt for one class: bidirectional reflection (frho) and
 // transmission (ftau) weights. cts >= 0 (source above the horizon), cto is
 // signed (cto < 0: observer below the horizon), psi = relative azimuth in
@@ -96,6 +126,8 @@ LIDF_FN void lidfVolscatt(float cts, float sts, float cto, float sto, float cosp
     float co = costl * cto;
     float ss = sintl * sts;
     float so = sintl * sto;
+    // 步骤 1：求叶面“翻转角” bts/bto（acos(-cs/ss)）；|cosbt|>=1（叶不会翻转）时用哨兵值 5，
+    //       并取 bts/bto 为 π 或 0 的极限形式（对应 ds/doo 的不同取值）。
     float cosbts = 5.0f;
     if (abs(ss) > 1.0e-6f) cosbts = -cs / ss;
     float cosbto = 5.0f;
@@ -115,6 +147,7 @@ LIDF_FN void lidfVolscatt(float cts, float sts, float cto, float sto, float cosp
         bto = 0.0f;
         doo = -co;
     }
+    // 步骤 2：把方位角 psi 与过渡角 btran1/btran2 比较并排序成 bt1<=bt2<=bt3。
     float btran1 = abs(bts - bto);
     float btran2 = LIDF_PI - abs(bts + bto - LIDF_PI);
     float bt1 = btran1;
@@ -127,6 +160,7 @@ LIDF_FN void lidfVolscatt(float cts, float sts, float cto, float sto, float cosp
         bt2 = btran2;
         bt3 = psi;
     }
+    // 步骤 3：按 SAIL 公式合成 t1、t2，frho/ftau 除以 2π²，并截断为非负（数值上的微小负值置 0）。
     float t1 = 2.0f * cs * co + ss * so * cospsi;
     float t2 = 0.0f;
     if (bt2 > 0.0f) t2 = sin(bt2) * (2.0f * ds * doo + ss * so * cos(bt1) * cos(bt3));
@@ -135,6 +169,8 @@ LIDF_FN void lidfVolscatt(float cts, float sts, float cto, float sto, float cosp
     ftau = max((-bt2 * t1 + t2) / denom, 0.0f);
 }
 
+// 作用：LIDF 冠层的面积散射相函数。输入：LIDF 频率、指向光源的单位向量 s、指向观测者的单位向量 o；
+// 输出：gammaR、gammaT（Gamma = rho·GammaR + tau·GammaT）。
 // Area scattering phase function of a LIDF canopy. towardSource (s) and
 // towardObserver (o) are unit vectors, +y is up. Returns GammaR and GammaT
 // (Gamma = rho * GammaR + tau * GammaT) in the Ross normalization above.
@@ -142,12 +178,14 @@ LIDF_FN void lidfGamma(LIDF_ARRAY(frequency), float sx, float sy, float sz,
                float ox, float oy, float oz,
                LIDF_OUT(float) gammaR, LIDF_OUT(float) gammaT)
 {
+    // 步骤 1：利用对水平面镜像的对称性，保证光源在上半球（sy>=0）。
     // A two-sided, azimuthally uniform foliage is symmetric under a mirror
     // in the horizontal plane; keep the source in the upper hemisphere.
     if (sy < 0.0f) {
         sy = -sy;
         oy = -oy;
     }
+    // 步骤 2：求源/观测的天顶 cos/sin 与相对方位角 psi（水平投影过短时视为同方位，cospsi=1）。
     float cts = min(sy, 1.0f);
     float cto = max(min(oy, 1.0f), -1.0f);
     float sts = sqrt(max(1.0f - cts * cts, 0.0f));
@@ -160,6 +198,7 @@ LIDF_FN void lidfGamma(LIDF_ARRAY(frequency), float sx, float sy, float sz,
     float psi = acos(cospsi);
     float r = 0.0f;
     float t = 0.0f;
+    // 步骤 3：对 13 个倾角类按频率加权累加 frho/ftau，跳过频率为 0 的类。
     for (int i = 0; i < LIDF_CLASS_COUNT; ++i) {
         if (frequency[i] <= 0.0f) continue;
         float frho = 0.0f;
@@ -169,11 +208,16 @@ LIDF_FN void lidfGamma(LIDF_ARRAY(frequency), float sx, float sy, float sz,
         r += frequency[i] * frho;
         t += frequency[i] * ftau;
     }
+    // 步骤 4：乘 π（volscatt 输出为 GammaR/T_i / π，见头部约定）。
     gammaR = LIDF_PI * r;
     gammaT = LIDF_PI * t;
 }
 
 #ifdef __cplusplus
+// 模块（仅宿主端 C++）：Verhoef 双参数 LIDF 的累积分布函数。
+// 作用：返回倾角 thetaDeg（度）以内叶面积累计占比（SCOPE dcum）。
+// 说明：a>1 取球形分布 F = 1 - cos(θ)；否则对 x 做不动点迭代（收敛判据 |dx|<1e-10，
+//       最多 100000 次）后用 (2y+θ2)/π。
 // Host side: Verhoef's two-parameter LIDF integrated over the SAIL classes
 // (SCOPE leafangles/dcum). a > 1 selects the spherical distribution
 // F = 1 - cos(theta) (SCOPE convention). Returns false for parameters
@@ -194,6 +238,9 @@ inline double sailCumulative(double a, double b, double thetaDeg)
     return (2.0 * y + theta2) / 3.14159265358979323846;
 }
 
+// 作用：由 (a, b) 计算 13 类的叶面积频率（对类边界累积函数做差并归一化）。
+// 输出：frequency；参数不在 SAIL 域（|a|+|b|<=1）、含非有限数或归一化和过小时返回 false。
+// 说明：类边界为 10..80° 每 10°，再 82..90° 每 2°；末类累积直接取 1。
 inline bool sailLeafAngleFrequencies(double a, double b, float frequency[LIDF_CLASS_COUNT])
 {
     for (int i = 0; i < LIDF_CLASS_COUNT; ++i) frequency[i] = 0.0f;

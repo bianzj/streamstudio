@@ -1,3 +1,29 @@
+// ==========================================================================
+// 文件：voxelrad_diffuse_single.comp
+// 功能：VoxelRT（体元辐射）模式的漫射辐射传输着色器：对每个体元，沿 DIFFUSE_ANGLE_NUM 个离散漫射方向追踪，
+//       计算到达该体元的环境（漫射）入射辐射，写入 voxelRads 供 voxelrad_image.comp 成像时读取。
+// 主要模块/步骤：
+//   1. 头部：扩展、include、全局表（GammaR/GammaT）
+//   2. voxelRads 缓冲寻址与碰撞阶数存取（voxelRadiationIndex、voxelOrderRadiationIndex、
+//      readCollisionOrder/writeCollisionOrder），光学/热红外波段判据 isThermalWavelength
+//   3. 接收体求积权重：实体面余弦权重（solidHemisphereCosineSum）、植被叶投影权重
+//      （leafReceiverProjectionSum）、receiverQuadratureWeight；isSolidVoxel/isOwnSolidCell
+//   4. 表面发射/发射率（voxelSurfaceEmission、voxelSurfaceEmissivity）与方位偏移
+//      （rotateDiffuseAzimuth、diffuseAzimuthOffset）
+//   5. voxel_raytracing_diffuse：单波段一阶漫射追踪（旧路径）；
+//      voxel_raytracing_diffuse_packet：同一几何同时评估 ≤4 个波段（新路径）
+//   6. voxel_collision_order_packet / runCollisionOrder：第 k≥2 阶碰撞，含最后一阶的几何级数余项
+//   7. main：按 collisionOrder / spectralBatchSize / maxIteration 选择路径
+// 数据流：voxelLinks（体元→实例）、instanceLinks/meshLinks（网格类型、光谱/热/冠层 id）、
+//         voxelDirs[].solar（由 voxelrad_solar.comp 写入的直射可见度）、lightSet（太阳/天空辐照度）
+//         → voxelRads[].induced（各方向入射）→ cumulated（各波段环境辐射）与按阶数的存储；
+//         band 0 同步写 voxelNetRads[].diffuseTrad。
+// 与其他文件：与 VoxelEB 的漫射/多次散射约定一致（见各处“as VoxelEB”注释）；成像见 voxelrad_image.comp。
+// 约定：场量为 π·L（辐照度量级），Esun 为垂直光束的辐照度，Esky 为水平天空辐照度；
+//       热红外波段为 Planck 辐亮度 W m-2 sr-1 μm-1，温度 K；波长 ≤2.5 或 50~2500（nm）视为光学波段；
+//       漫射方向 DIFFUSE_DIRECTIONS 为上半球离散方向，各体元绕 y 轴再加独立的方位偏移。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -18,6 +44,7 @@
 #extension GL_KHR_memory_scope_semantics:require
 #extension GL_EXT_shader_atomic_float: require 
 
+// 编译开关：VOXEL_RT_BIND_ININDEX 与 VOXELRT 供 bindinglayout.h 等选择体元辐射的绑定布局（具体含义待核对）。
 #define VOXEL_RT_BIND_ININDEX
 #define VOXELRT 1
 
@@ -32,11 +59,14 @@
 #include "../water_brdf.glsl"
 #include "../shade_state_voxel.glsl"
 
+// 全局：光线载荷与阴影载荷，供 traceray_comp.glsl 的 ClosestHit 使用。
 PtPayload        prd;
 ShadowHitPayload shadow_payload;
 
 #include "../traceray_comp.glsl"
 
+// 一维工作组：每个线程负责一个体元（gl_GlobalInvocationID.x = voxelLinks 下标）。
+// GammaR/GammaT：本线程的“方向 i → 方向 j”叶片散射相函数反射/透射表（DIFFUSE_ANGLE_NUM²）。
 layout(local_size_x = GROUP_SIZEX) in;
 
 #define MAXBAND    800
@@ -50,6 +80,7 @@ float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 
 // Opaque cells end a diffuse ray; turbid vegetation planes do not (a plane's
 // front cell is its own vegetation voxel).
+// 作用：判断体元是否为不透光实体（建筑/土壤/水体）；漫射射线遇到它即终止。bufferId<0（空体元）返回 false。
 bool isSolidVoxel(int bufferId)
 {
     if (bufferId < 0) return false;
@@ -57,11 +88,16 @@ bool isSolidVoxel(int bufferId)
     return type == TYPE_BUILDING || type == TYPE_SOIL || type == TYPE_WATER;
 }
 
+// 作用：voxelRads 缓冲寻址。每个体元占 stride = DIFFUSE_ANGLE_NUM + 2*n_wave 个槽：
+//   [0, N)             ：各漫射方向的入射（induced）辐射；
+//   [N, N+n_wave)      ：各波段累计的环境辐射（cumulated，影像着色器读取）；
+//   [N+n_wave, N+2n_wave)：各波段按碰撞阶数交替存放的入射辐射（见 voxelOrderRadiationIndex）。
 uint voxelRadiationIndex(uint bufferId, uint offset)
 {
     return bufferId * (uint(DIFFUSE_ANGLE_NUM) + 2u * uint(setting.n_wave)) + offset;
 }
 
+// 作用：某体元某波段“累计环境辐射”槽的下标（布局见 voxelRadiationIndex）。
 uint voxelBandRadiationIndex(uint bufferId, uint band)
 {
     return voxelRadiationIndex(bufferId, uint(DIFFUSE_ANGLE_NUM) + band);
@@ -75,12 +111,14 @@ uint voxelOrderRadiationIndex(uint bufferId, uint band)
         uint(DIFFUSE_ANGLE_NUM) + uint(setting.n_wave) + band);
 }
 
+// 作用：读第 order 阶的入射辐射；奇数阶存在 cumulated 字段，偶数阶存在 induced 字段，结果取非负有限值。
 float readCollisionOrder(uint bufferId, uint band, int order)
 {
     VoxelRad record = voxelRads[voxelOrderRadiationIndex(bufferId, band)];
     return finiteNonnegative((order & 1) == 1 ? record.cumulated : record.induced);
 }
 
+// 作用：写第 order 阶入射辐射，字段选择规则同 readCollisionOrder。
 void writeCollisionOrder(uint bufferId, uint band, int order, float value)
 {
     uint index = voxelOrderRadiationIndex(bufferId, band);
@@ -92,17 +130,21 @@ void writeCollisionOrder(uint bufferId, uint band, int order, float value)
 // names: <= 2.5 um is a normalized-illumination band, longer wavelengths are
 // Planck-radiance bands (accepts nm or um). Previously this pass used 5000 nm,
 // so 2.5-5 um bands were optical here but thermal in the image.
+// 作用：判断波段是否按热红外（Planck 辐亮度）处理，否则为光学（归一化光照）波段。
 bool isThermalWavelength(float wavelength)
 {
     return !(wavelength <= 2.5 || (wavelength > 50.0 && wavelength <= 2500.0));
 }
 
+// 前向声明：绕 y 轴旋转方向向量（定义见后）。
 vec3 rotateDiffuseAzimuth(vec3 direction, float angle);
 
 // Solid receivers integrate the incident field over the hemisphere of their
 // stored outward normal, cosine weighted (irradiance per facet area; equals
 // pi*L for an isotropic field), as VoxelEB's diffuse TIR / scattering do.
 // Vegetation keeps the fixed 2/N weight (two-face total).
+// 作用：实体接收面的余弦权重和 Σ max(n·ω_k, 0)（ω_k 为带方位偏移的漫射离散方向），用作半球积分的归一化分母。
+// 返回值下限 1e-6，防除零。
 float solidHemisphereCosineSum(vec3 normal, float azimuthOffset)
 {
     float sum = 0.0;
@@ -116,6 +158,8 @@ float solidHemisphereCosineSum(vec3 normal, float azimuthOffset)
 // leaf projection G(Omega_i) of their LIDF: weights 2 G_i / sum_j G_j keep the
 // isotropic-field total of the fixed 2/N weights (constant G gives 2/N).
 // Returns 0 when the receiver needs no LIDF weighting.
+// 作用：植被接收体的叶投影和 Σ G(Ω_i)（取各漫射方向的预计算 CanopyDiffuseG）。
+// 非植被、LIDF 无效或参与介质冠层时返回 0（表示不需要 LIDF 加权，使用固定权重）。
 float leafReceiverProjectionSum(uint bufferId, float azimuthOffset)
 {
     uint meshId = instanceLinks[voxelLinks[bufferId].instanceId].meshId;
@@ -128,6 +172,10 @@ float leafReceiverProjectionSum(uint bufferId, float azimuthOffset)
     return max(sum, 1.0e-6);
 }
 
+// 作用：某漫射方向对接收体的求积权重。
+//   - 实体面：max(n·ω,0)/Σ max(n·ω_k,0)；
+//   - 植被（有 LIDF）：2·G_k/ΣG（常数 G 时退化为 2/N）；
+//   - 其余：DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT。
 float receiverQuadratureWeight(bool surfaceReceiver, vec3 normal,
                                float cosineSum, vec3 direction,
                                uint bufferId, float leafProjectionSum)
@@ -144,6 +192,7 @@ float receiverQuadratureWeight(bool surfaceReceiver, vec3 normal,
 // A solid receiver's own cell is where its field is sampled, not an external
 // reflector/emitter (as VoxelEB traceIncoming): outward rays that start
 // behind the cell's own facet must pass through it.
+// 作用：判断射线命中的对齐体元是否就是接收体自身的实体格（同实例同 voxelId）。
 bool isOwnSolidCell(bool surfaceReceiver, uint bufferId0, int alignBufferId)
 {
     return surfaceReceiver && alignBufferId >= 0
@@ -151,6 +200,8 @@ bool isOwnSolidCell(bool surfaceReceiver, uint bufferId0, int alignBufferId)
         && all(equal(voxelLinks[alignBufferId].voxelId, voxelLinks[bufferId0].voxelId));
 }
 
+// 作用：表面热发射 = [f·B(T_sunlit) + (1-f)·B(T_shaded)]·ε·τ（f=光照比例，τ=路径透过率）。
+// 单位：Planck 为 W m-2 sr-1 μm-1，温度 K；光学波段返回 0。
 float voxelSurfaceEmission(float wavelength, float sunlitTemperature,
                            float shadedTemperature, float sunlitFraction,
                            float emissivity, float pathTransmittance)
@@ -165,6 +216,7 @@ float voxelSurfaceEmission(float wavelength, float sunlitTemperature,
         * clamp(pathTransmittance, 0.0, 1.0);
 }
 
+// 作用：表面在 outgoingDirection 方向的发射率；水体 = 1 - 方向反射率 - 透射率，其余走 surfaceThermalEmissivity。
 float voxelSurfaceEmissivity(MeshLink surface, int band,
                              vec3 outgoingDirection, vec3 normal)
 {
@@ -178,6 +230,7 @@ float voxelSurfaceEmissivity(MeshLink surface, int band,
             surface.angularEffectStrength);
 }
 
+// 作用：绕 y 轴旋转方向向量 angle（弧度），保持 direction.y 不变。
 vec3 rotateDiffuseAzimuth(vec3 direction, float angle)
 {
     float c = cos(angle);
@@ -187,6 +240,7 @@ vec3 rotateDiffuseAzimuth(vec3 direction, float angle)
                -s * direction.x + c * direction.z);
 }
 
+// 作用：由体元坐标哈希出 [0, 2π) 的方位角偏移（Cranley–Patterson 旋转），使各体元的漫射方向集互相独立。
 float diffuseAzimuthOffset(ivec3 voxelId)
 {
     // Independent Cranley-Patterson rotations provide unbiased samples for
@@ -198,6 +252,7 @@ float diffuseAzimuthOffset(ivec3 voxelId)
 
 
 // calculate the scattering phase function from N angles to N angles.
+// 输出：GammaR/GammaT[i*N+j]，由离散方向 i 到 -j 的叶片散射相函数（scattering_phase_function_direct_XZY_paper）。
 void Scattering_phase_function_diffuse(float azimuthOffset)
 {
     for(int iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
@@ -216,12 +271,25 @@ void Scattering_phase_function_diffuse(float azimuthOffset)
 }
 
 // calculate the diffuse term.
+// 函数：voxel_raytracing_diffuse（单波段版本，逐波段调用；多波段版本见 voxel_raytracing_diffuse_packet）
+// 作用：从体元 bufferId0 的位置 voxelPos0 出发，沿 DIFFUSE_ANGLE_NUM 个漫射方向（带体元特定方位偏移）追踪，
+//       收集沿途的天空、植被（散射+热发射）和实体表面（反射+热发射）贡献，
+//       原子累加到该体元第 iangle 个方向的入射辐射 voxelRads[...].induced。
+// 输入：kwave（波段下标）、Esun（垂直光束的太阳辐照度）、Esky（天空辐照度，对应 π·L）、kiter（迭代阶数，
+//       当前多次散射被注释掉、未使用）、azimuthOffset。
+// 返回：恒为 false（返回值未被使用，待核对）。
+// 步骤：
+//   1. 初始化局部量与接收体类型（实体面接收体只接收其外法线半球的辐射）；
+//   2. 逐漫射方向发射射线，逐次命中累积；
+//   3. 命中天空：加天空辐射并结束；命中体元内植被：累加热发射与太阳单次散射；
+//   4. 命中实体（建筑/土壤/水体）：累加太阳反射与热发射并结束；否则偏移起点继续。
 bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
  int kwave,float Esun,float Esky, int kiter, float azimuthOffset)
 {
 
   float G,density;
   float scale = setting.scale;
+    // semiRange：体元网格 x/z 方向的半范围（网格以 x/z 居中，y 自 0 起），用于世界坐标 → 体元 id。
     vec3 semiRange = vec3(floor(setting.voxelSize.x/2.0+0.5),0,floor(setting.voxelSize.z/2.0+0.5));
   // semiRange = vec3(0,0,0);
   // i:induced direction for the selected voxel; 0 original
@@ -253,12 +321,14 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
   uint meshId0 = instanceLinks[instanceId0].meshId;
   uint typeId0 = meshLinks[meshId0].type;
   
+  // 步骤 1：确定接收体：建筑/土壤/水体按其外法线（solidSurfaceNormal）接收半球辐射，植被按 y 向上（仅占位）。
   bool isvegfirst = true;
   bool surfaceReceiver = typeId0 == TYPE_BUILDING || typeId0 == TYPE_SOIL || typeId0 == TYPE_WATER;
   vec3 receiverNormal = surfaceReceiver ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
   ////////////////////////////////////////////////////////
   //  Iteration in difuse angle
   ////////////////////////////////////////////////////////
+  // 步骤 2：逐漫射方向（带体元特定的方位偏移）发射射线。
   for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
   {
     directioni0 = rotateDiffuseAzimuth(
@@ -271,6 +341,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
     // Leaf phase function sun -> receiver for the canopy last hit. Scattered
     // light propagates back along -directioni, i.e. directioni is the ray.
     uint gammaCanopyId = 0xffffffffu;
+	  // 先清零该方向的入射辐射，之后只通过 atomicAdd 累加。
 	  voxelRads[voxelRadiationIndex(bufferId0, iangle)].induced = 0.0;
 
     // A solid surface only receives radiance through the hemisphere of its
@@ -284,6 +355,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
     /////////////////////////////////////////////////////
     int kstep = 0;
     vec3 ffnormal;
+    // 步骤 3：沿射线逐步命中（最多 maxStep 次）。
     for(kstep = 0;kstep<=setting.maxStep;kstep++)
     //  for(kstep = 0;kstep<=5;kstep++)
     { 
@@ -297,6 +369,8 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
 
         // add save the sky contribution
         // sky contribution: lightSet.Rli*waveSets[kwave].diffuse*0.001
+        // 射线离开场景：乘上浑浊介质逃逸透过率；仅向上半球方向（y>=0）加天空辐射 alpha_toVoxel·Esky（原子加），
+        // 然后结束本方向的追踪。
         alpha_toVoxel *= TurbidEscapeTransmittance(ray.origin, ray.direction);
         if(directioni0.y >= 0)
         {
@@ -317,6 +391,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
       ShadeState sstate = GetShadeState(prd);
 
       // get voxelId and alignVoxelId
+      // 由命中点得到体元 id 及沿射线对齐的体元 alignVoxelId；缓冲下标 <0 表示空体元。
       voxelId = getVoxelIdSemi(sstate.position,semiRange,scale,directioni,alignVoxelId);
       // get bufferId and alignBufferId;
       // if bufferId/alignBufferId = -1, this voxel is blank;
@@ -343,6 +418,8 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
           //////////////////////////////
           /// Trubid case
           /////////////////////////////
+          // 植被体元：求视线方向叶投影 G、体元透过率 alpha_voxel（参与介质或湍流叶片）与太阳可见度，
+          // 再把本体元的发射/散射按 alpha_toVoxel（体元到接收体的累计透过率）加权累加。
           if(typeId == TYPE_VEGETATION)
           {
 
@@ -376,6 +453,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
               trans = spectralMaterials[spectralId*n_wave+kwave].transmittance;
               refl = spectralMaterials[spectralId*n_wave+kwave].reflectance;
               emis = 1 - trans - refl;
+              // 叶片散射相函数项 gamma = |Γ_R|·(ρ+τ) + Γ_T·τ，限幅 [0,1]；emis = 1-τ-ρ 为叶片吸收（发射）率。
               float gamma = clamp(abs(gammart.x)*(refl + trans) + gammart.y*trans, 0.0, 1.0);
               float radiance = 0;
                //////////////////////////////
@@ -399,6 +477,8 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
               // emitter
               /////////////////////////////
               // thermalRadiance = 100;
+              // (a) 参与介质：吸收份额按 Planck 发射；散射份额按 HG 相函数散射太阳直射
+              //     （场量为 π·L，Esun 垂直光束，故 π·p·E，不再除 cos(sza)）。
               if(isParticipatingMedium(canopy)) {
                 float removedFraction = 1.0 - alpha_voxel;
                 float scatteringFraction = removedFraction * clamp(canopy.scatteringAlbedo, 0.0, 1.0);
@@ -414,6 +494,8 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
                 radiance += alpha_toSolar * Esun * PI
                     * scatteringFraction * scatteringPhase * alpha_toVoxel;
               } else {
+                // (b) 湍流叶片：热红外波段按光照比例（alpha_toSolar）混合光照/阴影叶温的 Planck 发射，
+                //     乘叶片截获率 (1-alpha_voxel)、发射率与 alpha_toVoxel；
                 if(isThermalWavelength(wavelength)){
                   sunlitRadiance = Planck(wavelength,sunlitTemperature);
                   shadedRadiance = Planck(wavelength,shadedTemperature);
@@ -421,6 +503,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
                   radiance+= (thermalRadiance*(1-alpha_voxel)*emis* alpha_toVoxel);
                 }
               // Single scattering of the beam, same as the image pass: pi*L = Gamma/G * E * interception.
+              //     再加太阳直射的单次散射：π·L = Γ/G · E · 截获率（与成像着色器一致）。
               radiance += alpha_toSolar * gamma / max(G, 0.000001) * Esun * alpha_toVoxel * (1 - alpha_voxel);
               }
               //////////////////////////////
@@ -431,12 +514,15 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
               /////////////////////////////
               atomicAdd(voxelRads[voxelRadiationIndex(bufferId0, iangle)].induced,radiance,
                   gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+            // 累乘透过率；剩余透过率小于 0.01 时提前结束该方向（贡献可忽略）。
             alpha_toVoxel = alpha_toVoxel * alpha_voxel;
             if(alpha_toVoxel < 0.01) break; 
           }  
       }// if vegetation
 
 
+      // 实体表面：对齐体元为不透光地物（且不是接收体自身的格子）→ 计算该面的太阳反射 + 热发射并结束。
+      // 先按法线解析体元缓冲下标（ResolveVoxelSurfaceState）；背向太阳的面视为阴影。
       if (isSolidVoxel(alignBufferId)
           && !isOwnSolidCell(surfaceReceiver, bufferId0, alignBufferId))
       {
@@ -461,6 +547,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
         vec3 wo = directioni;  // FROM SELECTED VOXEL OUT TO HIT FACET  
         vec3 wi = lightSet.direction; // FROM SELECTED VOXEL OUT TO SOLAR
         vec3 ffnormal = sstate.normal;
+        // inSameSides：出射方向 wo 与太阳方向 wi 是否在表面同侧；只有同侧时才有太阳直射的反射贡献。
         bool inSameSides = IsSameSide(wo,wi,ffnormal);
         // THERMAL
         sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
@@ -503,6 +590,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
           }
           // A solid hit occludes everything behind it, but its own thermal
           // emission reaches this voxel through the preceding medium.
+          // 实体会遮挡其后的一切，但其自身热发射经前面的介质（alpha_toVoxel）到达本体元。
           radiance += voxelSurfaceEmission(wavelength, sunlitTemperature,
               shadedTemperature, alpha_toSolar, emis, alpha_toVoxel);
           //////////////////////////////
@@ -517,6 +605,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
       }// if facet
 
 
+      // 步骤 4：本次命中未终止 → 起点移到命中点并沿法线偏移，避免自相交，继续追踪。
       ray = Ray(sstate.position,directioni);
       ffnormal  = sstate.normal;
       ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
@@ -530,11 +619,22 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
   return false;
 }
 
+// 光谱包大小：一次几何追踪同时评估相邻 4 个波段。
 #define SPECTRAL_PACKET_SIZE 4
 
 // Trace geometry once and evaluate up to four adjacent wavelengths along the
 // same ordered intersections. Structural extinction is wavelength-independent
 // in this model; only material scattering/emission is evaluated per band.
+// 函数：voxel_raytracing_diffuse_packet
+// 作用：与 voxel_raytracing_diffuse 的物理相同，但一次几何追踪同时评估 bandCount（≤4）个相邻波段，
+//       节省重复的光线求交（结构消光与波长无关，仅材料散射/发射逐波段计算）。
+// 输入：receiver 体元 bufferId0、起点 voxelPos0、firstBand/bandCount、各波段 Esun/Esky、方位偏移；
+// 输出：packetRadiance[]（各波段在全部漫射方向上按求积权重加权后的入射辐射，
+//       细节见函数内，待核对）。
+// 步骤：
+//   1. 初始化接收体类型、求积分母（实体面余弦和 / 植被叶投影和）；
+//   2. 逐方向追踪，用补偿求和（compensatedAdd）累加各波段贡献；
+//   3. 按求积权重汇总到 packetRadiance。
 void voxel_raytracing_diffuse_packet(
     vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
     int firstBand, int bandCount,
@@ -557,10 +657,13 @@ void voxel_raytracing_diffuse_packet(
   vec3 receiverNormal = surfaceReceiver ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
   float cosineSum = surfaceReceiver ? solidHemisphereCosineSum(receiverNormal, azimuthOffset) : 1.0;
   float leafProjectionSum = surfaceReceiver ? 0.0 : leafReceiverProjectionSum(bufferId0, azimuthOffset);
+  // 步骤 1：接收体类型与求积分母（实体面：外半球余弦和；植被：叶投影和）；solarDirection 供叶片相函数使用。
   vec3 solarDirection = normalize(lightSet.direction);
 
   for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; ++iangle)
   {
+    // 步骤 2：逐漫射方向追踪。directionalRadiance 为本方向各波段累加值，directionalCorrection 为补偿求和的误差项，
+    //       以减小单精度累加误差。背向外法线的方向（实体面接收体）直接跳过。
     float directionalRadiance[SPECTRAL_PACKET_SIZE];
     float directionalCorrection[SPECTRAL_PACKET_SIZE];
     for(int bandOffset = 0; bandOffset < SPECTRAL_PACKET_SIZE; ++bandOffset) {
@@ -589,6 +692,7 @@ void voxel_raytracing_diffuse_packet(
       if(prd.hitT == INFINITY)
       {
         alphaToVoxel *= TurbidEscapeTransmittance(ray.origin, ray.direction);
+        // 离开场景：向上半球方向（y>=0）加天空辐射 alphaToVoxel·Esky（各波段不同，热波段为 Planck 天空 + 短波太阳散射）。
         if(direction0.y >= 0) {
           for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset)
             compensatedAdd(directionalRadiance[bandOffset],
@@ -629,6 +733,8 @@ void voxel_raytracing_diffuse_packet(
                     canopy, density, leafG, pathLength, scale)
               : ResolveSpatialInteraction(bufferId, density, leafG,
                     sstate.lastPosition, sstate.position, scale).x;
+          // 植被体元：太阳可见度 alphaToSolar；叶片相函数 CanopyPhase 对同一冠层只算一次（参与介质不需要）。
+          // 逐波段累加：参与介质按 Planck 发射 + HG 散射；湍流叶片按光照比例混合 Planck 发射 + 太阳单次散射。
           float alphaToSolar = voxelDirs[bufferId].solar;
           if(canopyId != gammaCanopyId && !isParticipatingMedium(canopy)) {
             gammaCanopy = CanopyPhase(canopy, solarDirection, direction);
@@ -690,6 +796,7 @@ void voxel_raytracing_diffuse_packet(
                 directionalCorrection[bandOffset], radiance);
           }
 
+          // 累乘透过率；剩余透过率小于 0.01 时结束该方向。
           alphaToVoxel *= alphaVoxel;
           if(alphaToVoxel < 0.01) break;
         }
@@ -704,6 +811,8 @@ void voxel_raytracing_diffuse_packet(
         MeshLink surface = meshLinks[meshId];
         uint typeId = surface.type;
         uint spectralId = surface.spectralId;
+        // 实体表面（对齐体元为建筑/土壤/水体，且不是接收体自身格）：逐波段累加热发射 + 太阳反射，随后终止该方向。
+        // 背向太阳的面太阳可见度取 0；仅当出射方向与太阳在表面同侧才有太阳反射项。
         ThermalMaterial thermal = thermalMaterials[surface.thermalId];
 
         float alphaToSolar = dot(sstate.normal, lightSet.direction) > 0.0
@@ -739,6 +848,7 @@ void voxel_raytracing_diffuse_packet(
         break;
       }
 
+      // 未终止：起点移到命中点并沿法线偏移后继续。
       ray = Ray(sstate.position, direction);
       vec3 faceNormal = sstate.normal;
       ray.origin = OffsetRay(
@@ -749,6 +859,7 @@ void voxel_raytracing_diffuse_packet(
     // Step limit: unresolved path, never a sky connection (see above).
 
     for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset)
+      // 步骤 3：按该方向对接收体的求积权重 quadratureWeight 汇总到输出。
       packetRadiance[bandOffset] += directionalRadiance[bandOffset]
           * quadratureWeight;
   }
@@ -760,6 +871,11 @@ void voxel_raytracing_diffuse_packet(
 // pass. On the last explicit order the remaining orders are added as the
 // geometric tail q/(1-q) of each scatterer, q = p * w, with p the canopy-scale
 // recollision probability (spectral invariants).
+// 函数：voxel_collision_order_packet
+// 作用：计算第 order（≥2）阶碰撞到达本体元的入射辐射：沿各漫射方向追踪，
+//       读取沿途其他体元第 order-1 阶的入射场，经植被各向同性散射（w·0.5·E）或表面反射后到达本体元。
+// 输出：packetRadiance[]（本阶贡献）、packetTail[]（最后一阶才计算的高阶余项）。
+// 余项：几何级数 q/(1-q)，q = min(pCanopy·w, 0.9)，pCanopy = calReCor(lai)（冠层尺度再碰撞概率）。
 void voxel_collision_order_packet(
     vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
     int firstBand, int bandCount, int order, float azimuthOffset,
@@ -770,6 +886,7 @@ void voxel_collision_order_packet(
     packetRadiance[bandOffset] = 0.0;
     packetTail[bandOffset] = 0.0;
   }
+  // lastOrder：已是显式计算的最后一阶，此时用几何级数项折算更高阶的贡献。
   bool lastOrder = order >= setting.collisionOrders;
   float scale = setting.scale;
   vec3 semiRange = vec3(floor(setting.voxelSize.x / 2.0 + 0.5), 0,
@@ -786,6 +903,7 @@ void voxel_collision_order_packet(
     vec3 direction0 = rotateDiffuseAzimuth(DIFFUSE_DIRECTIONS[iangle], azimuthOffset);
     vec3 direction = normalize(direction0);
     if(surfaceReceiver && dot(direction, receiverNormal) <= 0.0) continue;
+    // 对每个漫射方向：沿射线逐个命中体元；植被取 w·0.5·incident，实体表面取 BRDF 权重·incident 后终止。
     float quadratureWeight = receiverQuadratureWeight(
         surfaceReceiver, receiverNormal, cosineSum, direction,
         bufferId0, leafProjectionSum);
@@ -824,6 +942,7 @@ void voxel_collision_order_packet(
                     Vector2Distance(sstate.position - sstate.lastPosition), scale)
               : ResolveSpatialInteraction(bufferId, density, CanopyG(meshLink.canopyId, direction),
                     sstate.lastPosition, sstate.position, scale).x;
+          // （植被）散射到本体元的辐射 = alphaToVoxel·(1-alphaVoxel)·w·0.5·incident；w=ρ+τ（限幅 0.999）或参与介质的散射反照率。
           float pCanopy = medium ? 0.0 : calReCor(canopy.lai);
           for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset)
           {
@@ -857,6 +976,8 @@ void voxel_collision_order_packet(
           uint materialIndex = surface.spectralId * uint(setting.n_wave) + uint(kwave);
           float refl = spectralMaterials[materialIndex].reflectance;
           float trans = spectralMaterials[materialIndex].transmittance;
+          // （实体表面）表面存储的是半球余弦加权辐照度，反射的 π·L = 权重·E（不再乘 0.5，与成像着色器一致）；
+          // 热红外波段用热反射率权重，光学波段用 BRDF（水体 Cox–Munk）权重。
           float incident = readCollisionOrder(uint(alignBufferId), uint(kwave), order - 1);
           float weight;
           if(isThermalWavelength(wave[kwave])) {
@@ -892,6 +1013,8 @@ void voxel_collision_order_packet(
 
 // Runs one collision order k >= 2 for up to four bands and accumulates it
 // (plus the recollision tail on the last order) into the environment field.
+// 实现：用 5 组方位偏移（每组再旋转黄金角 2.39996323 rad）取平均降噪，
+//       结果写入第 order 阶存储并累加到环境场 cumulated（最后一阶再加余项）。
 void runCollisionOrder(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
                        int firstBand, int bandCount, float azimuthOffset)
 {
@@ -925,6 +1048,11 @@ void runCollisionOrder(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
   }
 }
 
+// 入口：每线程负责一个体元、一批相邻波段（起点 kwave = setting.n_jump）。
+// 步骤 1：越界/无效体元退出；确定体元起点 voxelPos0（面元按 faceId 偏移）与方位角偏移。
+// 步骤 2：setting.collisionOrder > 1 → 只做高阶碰撞（runCollisionOrder）后返回。
+// 步骤 3：spectralBatchSize > 1 → 多波段包版本（一阶漫射 + 5 组采样平均）后返回。
+// 步骤 4：否则逐波段的旧路径（见下，含多次迭代 maxIteration）。
 void main()
 {
   //------------------------------------------------------------
@@ -944,6 +1072,7 @@ void main()
   uint spectralId = meshLinks[meshId].spectralId;
   uint n_wave = setting.n_wave;
   uint spectralIdBase = spectralId * n_wave;
+  // kwave：本次派发处理的起始波段下标（由主机逐批设置 n_jump，待核对）。
   int kwave = setting.n_jump;
   if(kwave < 0 || kwave >= setting.n_wave || kwave >= MAXBAND) return;
 
@@ -954,7 +1083,9 @@ void main()
   vec3 voxelPos0 = vec3(voxelId0.x - semiRange.x,
                         voxelId0.y,
                         voxelId0.z - semiRange.z);
+  // voxelPos0：体元最小角点（x/z 居中后）；getFacetIdPos 按面元编号把它移到具体面上的位置。
   getFacetIdPos(faceId, voxelPos0);
+  // 各体元独立的方位角偏移，使漫射方向集在体元间互不相关。
   float azimuthOffset = diffuseAzimuthOffset(voxelId0);
 
   if(setting.collisionOrder > 1)
@@ -995,6 +1126,8 @@ void main()
           : lightSet.diffuse;
     }
 
+    // 5 组方位偏移采样（每组相差黄金角）取平均；热波段 Esun/Esky：Planck 天空 + 6 μm 以下的太阳束与散射天空，
+    // 光学波段 Esun=lightSet.direct，Esky=lightSet.diffuse。结果写入 cumulated 与第 1 阶存储。
     const int diffuseSampleSets = 5;
     for(int kiter = 0; kiter < diffuseSampleSets; ++kiter) {
       float iterationOffset = azimuthOffset + float(kiter) * 2.39996323;
@@ -1044,6 +1177,8 @@ void main()
             Esky = Planck(wavelength, lightSet.skyTemperature) + thermalSolar.y;
           }
 
+          // 步骤 4（旧路径，maxIteration>1）：先确定 Esun/Esky（热波段为 Planck 天空 + 6 μm 以下的太阳束与散射天空），
+          // 再做 5 组方位偏移采样：每组调用 voxel_raytracing_diffuse 填充 induced，用求积权重加权求和，最后取平均。
           bool surfaceReceiver0 = isSolidVoxel(int(bufferId0));
           vec3 receiverNormal0 = surfaceReceiver0
               ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
@@ -1062,6 +1197,7 @@ void main()
               // This invocation exclusively owns bufferId0's directional
               // records. Other voxels supply read-only geometry/materials.
               // Order SSBO accesses without synchronizing inactive lanes.
+              // （上一调用已写 induced：此处用缓冲屏障保证本线程读到自己写的值。）
               memoryBarrierBuffer();
 
               float cosineSum0 = surfaceReceiver0
@@ -1073,6 +1209,7 @@ void main()
               for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
               {
                   uint index = voxelRadiationIndex(bufferId0, iangle);
+                  // 同时把各方向的 induced 拷到 cumulated（供后续迭代/调试读取，用途待核对），再按求积权重对方向求和。
                   voxelRads[index].cumulated = voxelRads[index].induced;
                   // Vegetation: fixed 2/N; solids: cosine weight over the
                   // outer hemisphere (skipped directions hold zero).
@@ -1088,11 +1225,13 @@ void main()
 
           // Preserve incoming spectral radiance. Surface absorptance and
           // reflectance are applied later by the image pass.
+          // （5 组采样取平均得到该体元该波段的入射环境辐射。）
           diffuseRadiance = sampledRadiance / float(diffuseSampleSets);
     }
 
     // Reuse the existing directional buffer for one environment value per
     // band, avoiding an additional per-voxel GPU allocation.
+    // 步骤 5：把结果写入该体元该波段的环境辐射槽与第 1 阶存储；波段 0 同步写 diffuseTrad。
     uint bandIndex = voxelBandRadiationIndex(bufferId0, uint(kwave));
     voxelRads[bandIndex].cumulated = diffuseRadiance;
     writeCollisionOrder(bufferId0, uint(kwave), 1, diffuseRadiance);

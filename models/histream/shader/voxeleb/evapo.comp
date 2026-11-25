@@ -1,3 +1,20 @@
+// ==========================================================================
+// 文件：evapo.comp
+// 功能：VoxelEB 体元的显热 H、潜热 LE 和热储通量 G 的计算，同时更新叶表面水汽压 es 与 CO2 浓度 cs。
+// 主要步骤（每个体元一个线程，阴/阳两个节点各一轮）：
+//   1. 取体元的类别（植被/土壤/建筑/水体）与局部气象；参与介质冠层通量置 0
+//   2. 由叶/地表温度求饱和水汽压，按空气动力阻抗 ra 与表面阻抗 rss 求 H、LE
+//   3. 更新叶表面水汽压 es、CO2 浓度 cs（供 biochemical_m12.comp 下一轮使用）
+//   4. 按类别求热储 G：水体混合层、土壤热惯量/多层模型、船体钢板、method 0 交给 budget.comp
+//   5. 原子写回 voxelHeatFlux
+// 数据流：输入 voxelTempes/voxelRsss/voxelRaas/voxelTlasts/soilSets/waterSets/局部气象；
+//         输出 voxelHeatFlux.H*/LE*/G*、voxelAirs.es/cs。
+// 与其他文件：budget.comp 用本文件的通量做残差并更新温度；updateTp.comp 在节点结束时提交历史温度；
+//         fluid_coupling.glsl 提供局部气象与船体钢板/土壤记忆函数；aeresist.comp 提供 ra。
+// 约定：温度 K（部分 Tlast 以 °C 存放，故用 Tc-273.15 比较）；通量 W m-2；阻抗 s m-1；
+//         植被的 H、LE 为单叶面通量，故 rss 乘 2（两面叶片）。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -34,6 +51,12 @@ layout(local_size_x = GROUP_SIZEX) in;
 
 
 
+// 模块：VoxelEB 体元的显热 H、潜热 LE 与地表/水体热储通量 G 的计算（每个体元一个线程）。
+// 输入：voxelTempes（叶/地表温度，K）、voxelRsss（表面阻抗）、voxelRaas（空气动力阻抗）、
+//       局部气温/水汽压/CO2、soilSets/waterSets 参数、voxelTlasts（历史温度）。
+// 输出：voxelHeatFlux 的 H*/LE*/G*（W m-2，向上为正，G 向下进入地面/水体为正），
+//       以及更新 voxelAirs 的叶表面水汽压 es 与 CO2 浓度 cs（供下一轮光合使用）。
+// 说明：受阳/阴两个节点各算一次（issunlit=0 阴，1 阳）；温度更新在 budget.comp 中完成。
 void main()
 {
     //------------------------------------------------------------
@@ -63,6 +86,7 @@ void main()
     canopyId = meshLink.canopyId;
     bioId = meshLink.bioId;
     typeId = meshLink.type;
+    // 参与介质冠层不做体元能量平衡，所有通量置 0 后直接返回（与 budget.comp 保持一致）。
     if(typeId == TYPE_VEGETATION && isParticipatingMedium(canopies[canopyId])) {
         voxelHeatFlux[bufferId].Hsunlit = 0.0;
         voxelHeatFlux[bufferId].Hshaded = 0.0;
@@ -85,6 +109,8 @@ void main()
     // ca: CO2 concentration for ambient air 
     // PSI: leaf water potential 
     // Gsoil: soil heat storage
+	// 步骤 1：声明局部量。e_to_q 把水汽压（hPa）折算成比湿（kg/kg）；dtime_[i] 为第 i 个历史节点
+	// 到当前的时间间隔（dtime·(i+1)），用于土壤热惯量的历史积分。
 	float lambda, ei, qi, qa, Tc, PSI;
     // this is used only for under soil 
 	float Tprof[TLASTNUM],Tproflast[TLASTNUM]; // temperature profile
@@ -98,10 +124,12 @@ void main()
     float Ta = localAirTemperatureC(bufferId);
     // Ship hull below its waterline: water-side exchange (aeresist.comp
     // supplies the resistance), referenced to the scene water temperature.
+    // 船体吃水线以下的建筑体元按水侧交换处理：参考温度改用场景水温，不加自由对流，潜热为 0。
     bool shipWet = typeId == TYPE_BUILDING && shipSubmerged(bufferId, bioId);
     float shipWaterC = shipWet ? shipWaterTemperatureC(Ta) : Ta;
     float ca = localAmbientCo2Ppm(bufferId);
     float ci;
+    // 注意：下面两行原注释的“latent/sensible”与变量名相反，实际 H 为显热通量、LE 为潜热通量（见后文公式）。
     float H; // latent heat flux
     float LE;  // sensible heat flux
     // new,new-1,new-2....old
@@ -109,6 +137,8 @@ void main()
     //
     uint TlastId = bufferId*TLASTNUM;
 
+    // 步骤 2：对阴（issunlit=0）、阳（issunlit=1）节点循环：取叶/地表温度与表面阻抗。
+    // 植被的 H、LE 是单面通量，整叶阻抗 rss 需乘 2（与空气动力阻抗 raa 的处理一致）。
     for(int issunlit = 0;issunlit < 2;issunlit++)
     {
         // get surface temperature 
@@ -127,6 +157,7 @@ void main()
 
         //PSI = 0;
         //ei = es_fun(Tc-273.15)*exp(1E-3*PSI*MH20 / R / (Tc-273.15));
+        // 步骤 3：表面饱和水汽压 ei（叶内/土壤孔隙视为饱和），与环境水汽压 ea 一起转比湿。
         ei = es_fun(Tc - 273.15);
         qi = ei * e_to_q;
         qa = ea * e_to_q;
@@ -134,6 +165,8 @@ void main()
         //-------------------------
         // heat fluxes: H, LE
         //-------------------------
+        // 步骤 4：通量。ra 下限 1 s m-1；地表高于气温时叠加自由对流（groundExchangeRaa）；
+        // H = ρ·cp/ra·(Tc - Ta)，LE = ρ/(ra+rss)·λ·(qi - qa)，λ 为水的汽化潜热（J kg-1）。
         raa = voxelRaas[bufferId].raa;
         lambda = (2.501 - 0.002361*(Tc-273.15))*1E6;
         
@@ -145,6 +178,7 @@ void main()
         H = (RHOA * CP) / raa * (Tc-273.15 - (shipWet ? shipWaterC : Ta));
         LE = RHOA / (raa + rss) * lambda * (qi - qa);
 
+        // 按类别修正潜热：水体乘蒸发系数（限制在 [0,1]）；建筑和体积含水量 < 0.03 的干土无蒸发。
         if (typeId == TYPE_WATER)
         {
             LE *= clamp(waterSets[bioId].evaporationCoefficient, 0.0, 1.0);
@@ -162,6 +196,8 @@ void main()
         //-------------------------
         // update es and cs of this conditional component
         //-------------------------
+        // 步骤 5：更新该节点的叶表面水汽压 es 和 CO2 浓度 cs（沿 ra/(ra+rss) 分配的梯度）。
+        // 若 rss 或 ci 缺测（NaN/Inf），回退到环境值，避免把缺测值带进之后每一轮迭代。
         ci = voxelAirs[bufferId].ci[issunlit];
         // A missing surface resistance restarts es from ambient vapour, as cs
         // does below, so one invalid physiology pass cannot lock the m12 path.
@@ -173,6 +209,9 @@ void main()
             ? ca : ca - (ca - ci) * raa/(raa+rss);
 
         
+        // 步骤 6：热储通量 Gst（W m-2）。水体：Qw = 比热容·混合层深度·ΔT/Δt（混合层深度下限 0.01 m）。
+        // 土壤/建筑：按 soilSets.method 分三种——船体钢板隐式板模型 / method 0 由 budget.comp 乘 GST /
+        // method 1 半无限固体热惯量卷积 / 其余 Soilheatflux 多层模型。
         float Gst = 0;
         float ssum = 0;
         float GAM = 0;
@@ -218,6 +257,9 @@ void main()
                 // then carries its own history (updateTp commits the same
                 // transfer at the end of this node). An unchanged fraction
                 // keeps the original summation verbatim (bitwise results).
+                // method 1：热惯量法 G = 2·Γ/√π·Σ[ΔT_k/Δt·(√t_k - √(t_k-Δt))]（Γ 为热惯量），
+                // 按 TLASTNUM 个历史温度做 Duhamel 卷积。若体元的受阳比例相对存储时已变化，
+                // 先用 sunlitStateTransfer 把历史温度在阳/阴状态间转移；未变化时保持原求和（结果逐位一致）。
                 float storedSolar = voxelTempes[bufferId].solarFraction;
                 float currentSolar = clamp(voxelDirs[bufferId].solar, 0.0, 1.0);
                 if(!(storedSolar >= 0.0) || storedSolar == currentSolar)
@@ -273,6 +315,7 @@ void main()
                 // History older than TLASTNUM nodes (control.soilInertiaHistory
                 // = "full"): sum-of-exponentials modes, transferred between the
                 // sunlit and shaded states like the stored temperatures.
+                // inertiaHistory == 1（"full"）：用多指数模态补上超出 TLASTNUM 个节点的更早历史。
                 if(soilSets[bioId].inertiaHistory == 1)
                 {
                     uint memoryId = bufferId * SOIL_MEMORY_MODES;
@@ -287,6 +330,7 @@ void main()
                 }
                 Gst = GAM /sqrt(PI)* 2 * ssum;
             }else{
+                // 其余 method：取分层历史温度与各层含水分数，由 Soilheatflux 求表面热通量 Gst（同时给出新廓线）。
                 float ToldProfile[TLASTNUM],Mprofile[TLASTNUM],TnewProfile[TLASTNUM];
                 for(int kdepth = 0;kdepth <TLASTNUM;kdepth++){
                     if(issunlit == 0) ToldProfile[kdepth] = voxelTlasts[TlastId+kdepth].shaded;
@@ -306,6 +350,7 @@ void main()
         //--------------------------
         // Save H,LE and G
         //--------------------------
+        // 步骤 7：把 H、LE、G 以原子存储写回 voxelHeatFlux（阳/阴各自的槽位）。
         if (issunlit > 0)
         {
             atomicStore(voxelHeatFlux[bufferId].Hsunlit,H , gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);

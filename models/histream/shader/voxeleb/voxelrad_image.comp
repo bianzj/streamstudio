@@ -1,3 +1,32 @@
+// ==========================================================================
+// 文件：voxelrad_image.comp
+// 功能：VoxelEB 的传感器成像着色器。每个线程对应一个像素，沿传感器视线穿过体元场景，
+//       用前面各 pass 得到的体元温度、日照比例、漫射/散射场，计算每个传感器波段的像元值：
+//       光学波段（<= 2500 nm）输出半球-方向反射因子 HDRF（π·L / 水平面总辐照），
+//       热红外波段输出由 Planck 计算的辐亮度（单位待核对）。
+// 主要模块/步骤：
+//   1. 光谱辐照度工具函数：isOpticalBand / atmosphereBand / direct|diffuse|reference
+//      SpectralIrradiance / thermalSolar*（2.5–6 µm 太阳项）/ collidedEnvironment /
+//      incidentLongwaveEnvironmentTemperature
+//   2. Voxel_raytracing：单条视线的步进追踪，累计 Radiance[]：
+//      天空（逃逸）→ 植被体元（参与介质 / 叶片 + Kuusk 热点）→ 实体面元（BRDF + 热发射）
+//   3. SamplePixel：由相机矩阵与子像素抖动生成视线和射线锥，调用 Voxel_raytracing
+//   4. main：像素内多次采样平均；全部落空的边缘像素用 4x4 分层采样补救；
+//      按覆盖率加权平均，光学波段除以参考辐照得 HDRF，写入 outImage
+// 数据流：
+//   输入：voxelTempes（向阳/背阴温度，K）、voxelDirs.solar/.skyDiffuse、voxelNetRads.diffuseTrad、
+//         图像环境缓存（由 voxelrad_scattering_VNIR.comp 保存）、冠层/材料参数、
+//         specMaterials（已重采样到传感器波段）、sensorMatrix、ubom.meteo、lightSet
+//   输出：outImage[波段序号*像素数 + 像素索引]
+// 与其他文件的关系：include image_environment.glsl、mwir_solar.glsl（中红外太阳项）、
+//   surface_brdf.glsl（固体面反射权重/热发射率）；上游为 voxelrad_solar / direct / scattering /
+//   diffuse_TIR_single 等 pass 与能量平衡温度解；VoxelRT 对应版本见 ../voxelrt/voxelrad_image.comp
+// 重要约定：视线 ray.direction 由传感器指向场景，viewDirection 为反向；
+//   辐照以水平面为参考，需乘 beamNormalScale 才是垂直于光束的辐照；
+//   光学项使用 π·L 约定（相函数 ×π），中红外/热红外项除以 π 还原为 L；
+//   体元温度为 K；波长 <= 2.5 视为 µm，否则为 nm
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -38,24 +67,31 @@ ShadowHitPayload shadow_payload;
 
 #include "../traceray_comp.glsl"
 
+// 工作组为二维（每线程一个像素/样本），与逐体元的其他 voxelrad_* 着色器不同。
 layout(local_size_x = GROUP_SIZEXY, local_size_y = GROUP_SIZEXY) in;
 
+// MAXBAND：每像素最多同时模拟的传感器波段数（Radiance 数组长度）；
+// NUM_VNIR=2001 为 400..2400 nm（1 nm）的短波波段数，其后的索引 2001 为 TIR 波段。
 #define MAXBAND    800
 #define NUM_VNIR 2001
 #define NUM_BAND 2002
 
+// Radiance：当前样本各传感器波段的累计辐亮度；RadianceSum：多个样本的累加（用于平均）。
 float Radiance[MAXBAND];
 float RadianceSum[MAXBAND];
 // Fraction of the current sample covered by the scene (1 - transmittance
 // that escaped to an unmodelled sky or past the step budget).
 float sampleCoverage = 1.0;
 
+// 作用：判断传感器波长是否属于光学（<= 2500 nm）波段。波长 <= 2.5 视为 µm，否则视为 nm。
 bool isOpticalBand(float wavelength)
 {
     float wavelengthNm = wavelength <= 2.5 ? wavelength * 1000.0 : wavelength;
     return wavelengthNm <= 2500.0;
 }
 
+// 作用：把传感器波长映射到大气/气象谱的波段索引：400 nm 对应索引 0，1 nm 一档，
+//       范围 [0, NUM_VNIR-1]；> 2500 nm 返回 NUM_VNIR（热红外）。
 int atmosphereBand(float wavelength)
 {
     float wavelengthNm = wavelength <= 2.5 ? wavelength * 1000.0 : wavelength;
@@ -63,6 +99,9 @@ int atmosphereBand(float wavelength)
     return clamp(int(round(wavelengthNm - 400.0)), 0, NUM_VNIR - 1);
 }
 
+// 模块：光谱辐照度工具函数。solarBeamActive 判断太阳是否高于截止角；
+// directSpectralIrradiance / diffuseSpectralIrradiance 给出传感器波长处的水平面直射/
+// 漫射辐照（Rin × 波段占比 × 0.001，0.001 的单位含义待核对）。
 // The solar pass only computes visibility for y > 0.01 (and the direct/
 // scattering passes skip the beam below it). Below that cutoff the measured
 // horizontal beam share Rin*direct is moved into the isotropic diffuse share,
@@ -89,6 +128,7 @@ float diffuseSpectralIrradiance(float wavelength)
 
 // Rin*direct is horizontal irradiance (as in the energy balance); scattering
 // and facet illumination need the irradiance normal to the beam.
+// 作用：水平面辐照→垂直光束辐照的换算系数 1/max(sun.y, 0.05)（下限防止低太阳角发散）。
 float beamNormalScale()
 {
     return 1.0 / max(normalize(lightSet.direction).y, 0.05);
@@ -97,6 +137,7 @@ float beamNormalScale()
 // Optical output is the hemispherical-directional reflectance factor:
 // pi*L divided by the global horizontal irradiance (beam + diffuse; the
 // beam share is already folded into diffuse below the solar cutoff).
+// 作用：参考（总水平）辐照 = 直射 + 漫射，用作光学反射因子的分母。
 float referenceIrradiance(float wavelength)
 {
     return directSpectralIrradiance(wavelength) + diffuseSpectralIrradiance(wavelength);
@@ -108,6 +149,9 @@ float referenceIrradiance(float wavelength)
 // diffuseSpectralIrradiance. The image accumulates L in thermal bands, so the
 // optical pi*L terms are reused with these values divided by pi. Exactly 0
 // at night (Rin = 0) and outside 2.5-6 um.
+// 模块：2.5–6 µm 中红外波段的太阳贡献（mwir_solar.glsl），形状函数 mwirSolarShape。
+//       thermalSolarDirect / thermalSolarDiffuse 与光学波段的直射/漫射划分规则一致，
+//       天空漫射份额取 MWIR_SKY_SOLAR_RATIO。
 float thermalSolarDirect(float wavelength)
 {
     if(!solarBeamActive()) return 0.0;
@@ -132,6 +176,9 @@ float thermalSolarDiffuse(float wavelength)
 // is referenceIrradiance (optical, per nm) or the 2.5-6 um solar spectral
 // irradiance (W m-2 um-1). The uncollided sky and the beam are the separate
 // single-scattering terms, so nothing is counted twice. 0 at night.
+// 作用：读取散射 pass 为本传感器波段所属光谱组存下的“已碰撞”环境辐照系数，
+//       乘以当前波长的照度，叶片再乘光谱不变量因子。输入 illumination 为参考辐照；
+//       未启用图像环境、体元无效或系数非法时返回 0。
 float collidedEnvironment(int bufferId, int kwave, float illumination,
                           bool leaf, float albedo, float recollision)
 {
@@ -146,6 +193,9 @@ float collidedEnvironment(int bufferId, int kwave, float illumination,
 // needs the incident field, so undo that factor before inverting to a
 // brightness temperature; low-emissivity metal roofs were otherwise far too
 // cold in reflection. Vegetation stores the two-face total; one face sees half.
+// 作用：由体元的入射长波 diffuseTrad（已乘吸收率）还原入射长波，换算为环境亮温（K），
+//       用于面元反射天空/环境长波的计算；吸收率过小（<1e-3）时回退到 Rli；
+//       植被存的是两面总量，单面取一半。
 float incidentLongwaveEnvironmentTemperature(int bufferId, uint spectralId, bool vegetation)
 {
     SpectralMaterial tir = spectralMaterials[spectralId * NBAND + NUM_VNIR];
@@ -156,6 +206,12 @@ float incidentLongwaveEnvironmentTemperature(int bufferId, uint spectralId, bool
     return Inv_Stefen_Boltzmann(incident * (vegetation ? 0.5 : 1.0), 1);
 }
 
+// 模块：沿传感器视线步进（相机→场景）累计各传感器波段的辐亮度 Radiance[]。
+// 输入：ray 传感器射线；输出：Radiance[]、sampleCoverage（场景覆盖率）；
+//       返回 true 表示射线终止（逃逸/不透明）。
+// 步骤：1 初始化；2 每步 ClosestHitPeriodic 找交点；3 未命中：天空反射或天空 Planck 辐射；
+//       4 命中：转体元编号，植被体元按叶片+热点+多次散射，实体面元按 BRDF+发射，
+//       累乘透过率 alpha_toSensor，< 阈值结束。（具体见各步骤注释）
 bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 {
     ResetHexRay();
@@ -166,6 +222,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
     for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
         Radiance[kwave] = 0.0;
     }
+    // 步骤 1：初始化。Radiance 清零；sampleCoverage 初值为 1，后续在射线逃逸到未建模天空时减小。
     sampleCoverage = 1.0;
     vec3 ffnormal;
     ivec3 voxelId;
@@ -180,6 +237,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
     // ray.direction points from the sensor into the scene.  Hotspot_Kuusk
     // uses the scene-to-sensor direction, while the leaf phase function
     // uses the corresponding radiance propagation direction.
+    // 视线方向约定：ray.direction 从传感器指向场景；热点函数需要“场景→传感器”方向 viewDirection。
     vec3 solarDirection = normalize(lightSet.direction);
     vec3 viewDirection = normalize(-ray.direction);
     // Leaf phase function of the canopy last hit (it depends on its LIDF).
@@ -199,6 +257,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 
     float vegTemperatureSum = 0;
     float vegNum = 0;
+    // 步骤 2：沿视线逐步前进（最多 setting.maxStep 步）。
     for(int kstep = 0;kstep<=setting.maxStep;kstep++)
     {
         alpha_voxel = 1.0;
@@ -209,6 +268,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 		/// hit sky or out of scene, then return true. 
 		/// the sky contribution is added in solar file.
 		///////////////////////////////////////////////////
+        // 步骤 3：射线逃逸到天空/场景之外。skyboxEnabled==0：不建模天空，保留已累积贡献，
+        //       并把逃逸的透过率记为未覆盖（sampleCoverage）；否则光学波段加天空反射率×参考辐照，
+        //       热红外波段加天空 Planck 辐射。
         if(prd.hitT == INFINITY)
         {
             if(setting.skyboxEnabled == 0) {
@@ -239,6 +301,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 		/// Turbid or facet ground case (j -> sensor).
 		///////////////////////////////////////////////////
 		/// get hit information.
+		// 步骤 4：命中点→体元（湍流体元 voxelId，实体对齐体元 alignVoxelId）。
 		ShadeState sstate = GetShadeState(prd);
 		//voxelId = getPassedVoxelId(sstate.position, scale, normalize(ray.direction));
         ivec3 alignVoxelId;
@@ -255,6 +318,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
         // return false;
         
    
+        // 步骤 5：命中点处存在湍流（植被）体元：取该体元的网格/光谱/冠层属性，
+        // 再按“参与介质”或“叶片”两种模型累计辐亮度。spectralBase 按传感器波段数索引（specMaterials
+        // 已重采样到传感器波段）；envTemp 为该体元的环境入射长波亮温。
         if(bufferId >= 0)
 		{
             
@@ -290,6 +356,8 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 // return true;
 
                 // Leaf projection along the view ray (extinction) and to the sun.
+                // 步骤 5a：沿视线的叶投影 G、太阳方向的叶投影 solarG；密度取介质密度或叶面密度；
+                // 按路径长度求本体元的视线透过率 alpha_voxel；alpha_toSolar 为该体元到太阳的透过率。
                 G = CanopyG(canopyId, ray.direction);
                 float solarG = CanopyProjection(canopy, solarDirection);
                 density = isParticipatingMedium(canopy) ? canopy.density
@@ -313,12 +381,16 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 // // // // LST = voxelNetRads[bufferId].diffuseTrad;
                 // return true;
                 
+				// 视线累计透过率已很小：后面的贡献可忽略，直接结束该射线。
 				if(alpha_toSensor < 0.001) {
                     return true;
                 }
 
 				if(isParticipatingMedium(canopy))
 				{
+					// 步骤 5b：参与介质（雾/粒子）模型。被移除的光分成散射与吸收两部分：
+					// 吸收部分按介质温度发射；光学波段的散射部分为太阳束一次散射（HG 相函数）+ 天空漫射 + 已碰撞环境，
+					// 热红外波段的散射部分按环境亮温发射（灰体近似），中红外另加太阳散射项。
 					float removedFraction = 1.0 - alpha_voxel;
 					float scatteringFraction = removedFraction
 						* clamp(canopy.scatteringAlbedo, 0.0, 1.0);
@@ -370,6 +442,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 				}
 				else
 				{
+				// 步骤 5c：叶片模型。先计算热点（Kuusk）所需的太阳/视线光学路径 pl_toSolar、pl_toSensor：
+				// 路径 = -ln(透过率)/(G·密度)，透过率过小时取 10000（视为完全遮挡）；
+				// 再得到太阳-传感器联合间隙概率 hotspot，用于单次散射的向阳叶比例与直射散射项。
 				// this is used for the hotspot effect
                 float solarDensity = max(HexHotspotDensity(bufferId, solarDirection, density, solarG), 0.000001);
                 float viewDensity = max(HexHotspotDensity(bufferId, viewDirection, density, G), 0.000001);
@@ -385,15 +460,18 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 hotspotGs = safeSolarG;
                 hotspotGv = safeG;
                 hotspotLeafSize = hspot;
+				// Hotspot_Kuusk 需要的特征叶长度 hspot 单位为米（见上）；联合概率非有限值时后续置 0。
 				float hotspot = Hotspot_Kuusk(solarDirection, viewDirection, pl_toSolar, pl_toSensor, sqrt(solarDensity * viewDensity), hspot, safeSolarG, safeG);
                 if (!isnan(hotspot) && !isinf(hotspot)) {
                     hotspot = clamp(hotspot, 0.0, 1.0);
                 }
+                // 太阳与视线方向重合（热点中心）：太阳与视线透过率应相同，联合概率取 alpha_toSensor。
                 if (checkSameDirection(solarDirection, viewDirection) && abs(alpha_toSolar - alpha_toSensor) < EPSION_2)
                 {
                     alpha_toSolar = alpha_toSensor;
                     hotspot = alpha_toSensor;
                 }
+                // 路径哨兵值（>999，即上面的 10000）表示几乎完全遮挡，此时热点概率置 0。
                 if ((pl_toSensor > 999) || (pl_toSolar>999))
                 {
                     hotspot = 0.0;
@@ -410,6 +488,8 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 }
 
                 // get sunlit and shaded fraction and mixed them for an average result.
+                // 步骤 5d：取向阳/背阴叶温度（K）；非法或超出 [TMIN, TMAX] 阈值时回退
+                // （背阴→气温 Ta+273.15，向阳→背阴温度）；固定温度的介质直接用固定温度。
                 float sunlitTemperature = voxelTempes[bufferId].sunlit;
                 float shadedTemperature = voxelTempes[bufferId].shaded;
                 float fallbackTemperature = max(
@@ -430,6 +510,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                     }
                 }
 
+                // 叶片相函数 gamma 只在冠层改变时重算（与 LIDF 有关，沿射线通常不变）。
                 if (canopyId != gammaCanopyId) {
                     gamma = CanopyPhase(canopy, solarDirection, -viewDirection);
                     gammaCanopyId = canopyId;
@@ -439,6 +520,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 float recollision = calReCor(canopy.lai);
                 for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
                     float wavelength = wave[kwave];
+                    // 步骤 5e：逐传感器波段累计叶片辐亮度。光学波段：天空漫射一次散射 + 已碰撞环境 + 太阳束单次散射
+                    // （相函数×热点）；热红外波段：叶片发射（向阳/背阴温度按向阳比例混合）+ 反射的环境长波，
+                    //       中红外再加太阳散射项（除以 π 把 π·L 项还原为 L）。a、s 为叶片吸收率与散射率。
                     float refl = clamp(specMaterials[spectralBase + kwave].reflectance, 0.0, 1.0);
                     float trans = clamp(specMaterials[spectralBase + kwave].transmittance, 0.0, 1.0);
                     // Leaf single-scattering albedo. Attenuation through the voxel already
@@ -489,16 +573,20 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                         }
                     }
                 }
+                // 统计沿视线穿过的植被体元数与背阴叶温累计（当前仅被注释掉的调试代码引用）。
                 vegTemperatureSum += shadedTemperature;
                 vegNum ++;
 				}
 
 
+				// 步骤 5f：视线透过率累乘本体元透过率。
 				alpha_toSensor = alpha_toSensor * alpha_voxel;
 			}
 
 		}
 
+        // 步骤 6：命中点所在的实体面元（建筑/土壤/水体等）：按 BRDF 与光谱计算反射太阳束、
+        //       天空漫射与自身热发射，累加到 Radiance。
         if(alignBufferId >= 0)
 		{
             alignBufferId = ResolveVoxelSurfaceState(alignBufferId, sstate.normal);
@@ -523,6 +611,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
             // // LST = voxelRsss[alignBufferId].shaded;
             // return true;
 
+            // 步骤 6a：命中实体面元（建筑/土壤/水体）。实体不透明：累加该点的辐亮度后直接返回，
+            // 不再继续前进。贡献由 BRDF 加权的天空漫射、已碰撞环境、受热点概率调制的太阳直射，
+            // 以及热红外下的自身发射 + 反射环境长波组成。
             if((typeId == TYPE_BUILDING) || (typeId == TYPE_SOIL) || (typeId == TYPE_WATER)){
 
 // if (vegNum==0) vegNum=1;
@@ -551,10 +642,13 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 
 
 
+				// 太阳透过率：用该面元的日照比例，背向太阳的面元强制为 0（阴影）。
 				alpha_toSolar = voxelDirs[alignBufferId].solar;
 				// Solar visibility is stored per voxel; a facet turned away from the sun is shaded.
 				if (dot(sstate.normal, solarDirection) <= 0.0) alpha_toSolar = 0.0;
 
+				// 热点（Kuusk）：沿用视线上最后一个湍流体元的冠层参数（hotspotDensity/G/叶尺寸），
+				// 无植被时为缺省常量；hotspot 取不超过太阳、视线两条路径透过率的较小值，保证物理上界。
 				// this is used for the hotspot effect
 				if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
 				else pl_toSolar = -log(alpha_toSolar) / hotspotGs / hotspotDensity;
@@ -581,6 +675,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 // return true;
 
                 // get sunlit and shaded fraction and mixed them for an average result.
+                // 向阳/背阴表面温度（K）；非有限或 <=0 时回退到气温 Ta+273.15（背阴）/背阴温度（向阳）。
                 float sunlitTemperature = voxelTempes[alignBufferId].sunlit;
                 float shadedTemperature = voxelTempes[alignBufferId].shaded;
                 float fallbackTemperature = max(
@@ -600,6 +695,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
                 // resolved objects still follow the sun.
                 float sunlitFraction = clamp(
                     hotspot / max(alpha_toSensor, 0.000001), 0.0, 1.0);
+                // 步骤 6b：逐传感器波段。光学波段：漫射项 ρ-BRDF 权重×(天空漫射+已碰撞环境)，
+                // 直射项 权重×直射辐照×cos(入射角)×hotspot；热红外：混合温度的 Planck 辐射×发射率
+                //  + 环境亮温的 Planck 辐射×热反射率，中红外再加太阳散射项（÷π）。
                 float cosIncidence = max(dot(normalize(sstate.normal), solarDirection), 0.0);
                 for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
                     float wavelength = wave[kwave];
@@ -673,15 +771,22 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
         // LST = 55;
         // break;
 		//// change ray origin position to hit position; and avoid self collide.
+		// 步骤 7：未终止时前进到命中点，起点沿法向微小偏移（朝射线侧）避免自相交。
 		ray = Ray(sstate.position, ray.direction);
 		ffnormal = sstate.normal;
 		ray.origin = OffsetRay(ray.origin, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
     }
     // Step budget exhausted: the remaining transmittance is unresolved.
+    // 循环结束仍有剩余透过率（步数耗尽）：这部分按未覆盖处理。
     sampleCoverage = 1.0 - alpha_toSensor;
     return true;
 }
 
+// 模块：对一个像素内的一个子像素位置生成视线并追踪。
+// 输入：imageCoords 像素坐标；sizeImage 图像尺寸；subpixel_jitter 子像素偏移（0..1）。
+// 输出：Radiance[]/sampleCoverage 全局数组；返回 Voxel_raytracing 的结果。
+// 步骤：1 像素坐标→NDC；2 用 viewInverse/projInverse 得到射线原点与方向；
+//       3 以像素立体角为射线锥宽 ConfigureCone（pixelDiameter、halfAngle）；4 追踪。
 bool SamplePixel(vec2 imageCoords,vec2 sizeImage,vec2 subpixel_jitter)
 {
 	// 计算样本的波动，范围 [-1 .. 1]
@@ -709,6 +814,7 @@ bool SamplePixel(vec2 imageCoords,vec2 sizeImage,vec2 subpixel_jitter)
 	//Ray ray = Ray(origin.xyz + randomAperturePos, finalRayDir);
     vec3 directionv = normalize(direction.xyz);
 	Ray ray = Ray(origin.xyz, directionv);
+    // 射线锥：像素直径取 x、y 方向较大者（投影逆矩阵缩放/像素数），半角由焦距换算。
     float pixelDiameter = max(
         abs(sensorMatrix.projInverse[0][0]) * 2.0 / sizeImage.x,
         abs(sensorMatrix.projInverse[1][1]) * 2.0 / sizeImage.y);
@@ -724,6 +830,10 @@ bool SamplePixel(vec2 imageCoords,vec2 sizeImage,vec2 subpixel_jitter)
 // were all uncovered.
 const int UNCOVERED_STRATA = 4;
 
+// 模块：主入口，每线程一个像素。
+// 步骤：1 初始化随机种子与累加数组；2 n_sample 次子像素采样（首个固定在像素中心）；
+//       3 若全部落空则做 UNCOVERED_STRATA² 分层补救采样；
+//       4 按覆盖率加权平均，光学波段换算为 HDRF，写入 outImage。
 void main()
 {
     // image imageSize
@@ -734,6 +844,7 @@ void main()
     
     uint n_pixel = uint(imageRes.x * imageRes.y);
     uint temp = uint(setting.imageSize.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x);
+    // 步骤 1：随机种子由像素序号与帧号决定，保证各像素、各帧的采样序列不同。
     prd.seed = tea(temp, setting.frame * setting.n_sample);
     for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
         RadianceSum[kwave] = 0.0;
@@ -746,6 +857,7 @@ void main()
     // atomicStore(outImage[bufferId], LST, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
 
 
+    // 步骤 2：多次采样；返回 true 的样本才计入平均，coveredWeight 累计其场景覆盖率。
     for(int smpl = 0; smpl< setting.n_sample; smpl++)
     {
         // 每次光线的随机/波动进行光滑
@@ -785,6 +897,7 @@ void main()
     // Coverage-weighted mean of the covered pixel part; uncovered pixels stay
     // 0 for the host sky fill.
     for(int kwave = 0; kwave < setting.n_wave; ++kwave) {
+        // 步骤 4：覆盖像元取覆盖权重平均；HDRF = 平均辐亮度（π·L）/ 参考水平辐照。
         float value = covered
             ? RadianceSum[kwave] / coveredWeight
             : 0.0;
@@ -795,6 +908,7 @@ void main()
             float hdrf = reference > EPSION ? value / reference : 0.0;
             value = (isnan(hdrf) || isinf(hdrf)) ? 0.0 : max(hdrf, 0.0);
         }
+        // 输出布局：outImage 按波段优先，索引 = 波段序号×像素数 + 行×宽 + 列。
         int bufferId = int(n_pixel * uint(kwave)
             + uint(imageCoords.y * imageRes.x + imageCoords.x));
         atomicStore(outImage[bufferId], value,

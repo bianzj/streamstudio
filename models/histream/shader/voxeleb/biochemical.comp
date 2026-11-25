@@ -1,3 +1,23 @@
+// ==========================================================================
+// 文件：voxeleb/biochemical.comp（VoxelEB：体元能量平衡中的叶片光合与气孔阻力）
+// 功能：对每个体元计算碳过程（GPP/NPP，阳叶/阴叶）和叶片表面气孔（含土壤/水体表面）阻力 rss，
+//   结果写入 voxelHeatFlux（GPP/NPP）、voxelRsss（阻力）、voxelAirs.ci（胞间 CO2）。
+//   方法对应 SCOPE 的 biochemical.m（C3/C4 Farquhar–Collatz 光合 + Ball–Berry 气孔模型）。
+// 主要模块/步骤：
+//   1. ballBerryLeaf：给定叶温 Tc、吸收 PAR Q、叶表面 CO2 和水汽压，求光合速率与气孔阻力
+//   2. dampedResistance：能量迭代中对新旧阻力做几何平均阻尼，抑制湿度-气孔振荡
+//   3. main：按体元类型分支——土壤/建筑/水体直接给表面阻力；植被体元计算阴叶与阳叶
+//      3a. 阴叶：只吸收漫射 PAR，单一状态
+//      3b. 阳叶：按叶片朝向分 SUNLIT_CLASSES 类，每类做 LEAF_TEMPERATURE_STEPS 步叶片能量平衡
+//          牛顿迭代，再合成阳叶平均的 GPP/NPP/有效阻力
+// 数据流：voxelPnets（直射/漫射 PAR）、voxelNetRads（吸收辐射）、voxelTempes（叶温）、
+//   voxelAirs（叶面 CO2、水汽压，前一轮能量迭代）、ubom.meteo（氧、气压）、leafBios（叶片生化参数）
+//   → 本着色器 → voxelHeatFlux.GPP/NPP*、voxelRsss、voxelAirs.ci；之后 evapo.comp/budget.comp 使用阻力。
+// 约定：温度 K（输入小于 100 的值按 °C 处理并加 273.15）；PAR 单位 umol m-2 s-1；
+//   水汽压 hPa；阻力 rcw/rss 单位 s m-1，上限 625000；无效结果写入 biochemicalMissing() 标记值；
+//   setting.energyIteration==0 表示本节点能量迭代第一轮，用环境空气值而非上一轮叶面值。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -18,6 +38,7 @@
 #extension GL_KHR_memory_scope_semantics:require
 #extension GL_EXT_shader_atomic_float: require 
 
+// 编译开关：选择 VoxelEB 的绑定布局（体元列表按输入索引绑定，待核对）。
 #define VOXEL_LST_BIND_ININDEX
 #define VOXELLST 1
 
@@ -26,6 +47,8 @@
 #include "../global.glsl"
 #include "../functions.glsl"
 #include "../nanovdb_info.glsl"
+// fluid_coupling.glsl 提供本地空气状态读取（localAmbientCo2Ppm、localVaporPressureHpa 等）
+// 以及 biochemical* 辅助函数（二次方程根、胞间 CO2、阻力、有限性判断）。
 #include "fluid_coupling.glsl"
 
 layout(local_size_x = GROUP_SIZEX) in;
@@ -34,9 +57,15 @@ layout(local_size_x = GROUP_SIZEX) in;
 // Sunlit foliage is resolved into orientation classes inside the physiology:
 // a single mean sunlit leaf closes its stomata all at once under heat stress,
 // whereas leaves at grazing sun angles stay cool and keep transpiring.
+// 阳叶朝向类数：均值阳叶会在高温时一次性关闭气孔，而掠射角的叶片仍保持较低温度和蒸腾，
+// 故把阳叶按朝向分类分别求解；LEAF_TEMPERATURE_STEPS 为每类叶温牛顿迭代步数。
 #define SUNLIT_CLASSES 8
 #define LEAF_TEMPERATURE_STEPS 6
 
+// 叶片生化参数：type 3=C3、4=C4；vcmax25 25°C 最大羧化速率；slope Ball–Berry 斜率 m；
+// rdPerVcmax25 暗呼吸/Vcmax25；intercept Ball–Berry 截距 g0；stress 水分胁迫因子 [0,1]；
+// slti/shti/thl/thh 低/高温抑制参数；trdm 呼吸温度参数；tcor 温度修正开关；
+// oxygen 氧含量（‰，待核对）；pressure 气压（hPa）。
 struct LeafParameters
 {
     float type, vcmax25, slope, rdPerVcmax25, intercept, stress;
@@ -45,17 +74,25 @@ struct LeafParameters
     float oxygen, pressure;
 };
 
+// 叶片求解结果：gross 总光合 Ag；net 净光合 A = Ag − Rd；ciPpm 胞间 CO2；
+// rcw 气孔阻力（s m-1）；valid 数值是否有效。
 struct LeafState
 {
     float gross, net, ciPpm, rcw;
     bool valid;
 };
 
+// 作用：Ball–Berry/Collatz 叶片光合与气孔阻力（对应 SCOPE biochemical.m）。
+// 输入：叶温 Tc（K）、吸收 PAR Q、叶表面 CO2（ppm）、叶表面水汽压 eb（hPa）、参数 P。
+// 输出：LeafState；任何中间量非有限/越界时 valid=false，由调用方写入缺测标记。
+// 说明：光合 = Rubisco 限制 Vc、光限制 Ve 的非直角双曲线（θ=0.8）再与碳输出 Vs 的
+//   非直角双曲线（0.98）取较小根；Ci 由 b=0 的 Ball–Berry 平衡关系给出。
 // Ball-Berry/Collatz leaf photosynthesis and stomatal resistance (SCOPE biochemical.m).
 // Tc in K, Q absorbed PAR (umol m-2 leaf s-1), CO2 at the surface in ppm, eb in hPa.
 LeafState ballBerryLeaf(LeafParameters P, float Tc, float Q, float surfaceCO2, float eb)
 {
     LeafState leaf;
+    // 步骤 1：单位换算（ppm → bar；氧分压；C4 不考虑氧抑制故 O=0）及 SCOPE 默认常数。
     float ppm2bar = 1E-6 * (P.pressure * 1E-3);
     float Cs = surfaceCO2 * ppm2bar;
     float O = (P.oxygen * 1E-3) * (P.pressure * 1E-3);
@@ -73,6 +110,7 @@ LeafState ballBerryLeaf(LeafParameters P, float Tc, float Q, float surfaceCO2, f
     float rhoa = 1.2047;
     float Mair = 28.96;
 
+    // 步骤 2：温度修正：Q10 型指数（qt）调整 Kc、Ko、Vcmax、Rd 等，高/低温抑制项 TH、TL。
     float qt = 0.1*(Tc-Tref)*float(P.tcor);
     float TH = 1.0 + float(P.tcor) * exp(P.shti*(Tc-P.thh));
     float TL = 1.0 + float(P.tcor) * exp(P.slti*(P.thl-Tc));
@@ -91,9 +129,12 @@ LeafState ballBerryLeaf(LeafParameters P, float Tc, float Q, float surfaceCO2, f
     float Vs_C3 = P.type < 3.5 ? (P.vcmax25/2.0) * exp(log(1.8)*qt) : 0.0;
     float minCi = P.type < 3.5 ? 0.3 : 0.1;
 
+    // 步骤 3：叶面相对湿度 RH = eb / 叶温下饱和水汽压；用 Ball–Berry 平衡求胞间 CO2 Ci，
+    //   下限 minCi·Cs 防止 Ci 过小。
     float RH = clamp(eb/es_fun(Tc-273.15), 0.0, 1.0);
     // Ball-Berry with b = 0 at equilibrium: Ci = Cs(1 - 1.6/(m RH)).
     float Ci = biochemicalIntercellularCO2(Cs, minCi * Cs, P.slope, RH, 1.0);
+    // 步骤 4：C3 与 C4 分别求 Rubisco 限制速率 Vc、光限制速率 Ve、输出限制 Vs。
     float Vc, Ve, Vs;
     if(P.type < 3.5) {
         Vs = Vs_C3;
@@ -106,11 +147,14 @@ LeafState ballBerryLeaf(LeafParameters P, float Tc, float Q, float surfaceCO2, f
         Vs = Kpepcase * Ci;
         Ve = Je * effcon;
     }
+    // 步骤 5：非直角双曲线求总光合 Ag；光/CO2/湿度/斜率/胁迫任一为 0 时 Ag=0；A = Ag − Rd。
     float V = biochemicalQuadraticRoot(atheta, -(Vc+Ve), Vc*Ve, sign(-Vc));
     float Ag = biochemicalQuadraticRoot(0.98, -(V+Vs), V*Vs, -1.0);
     if(Q == 0.0 || Cs == 0.0 || P.slope == 0.0 || RH == 0.0 || P.stress == 0.0)
         Ag = 0.0;
     float A = Ag - Rd;
+    // 步骤 6：由净光合反推气孔阻力 rcw，并把 Ball–Berry 截距 g0（转成 m s-1）作为并联导度，
+    //   使 A 过零时阻力连续；阻力上限 625000 s m-1。
     float rcw = biochemicalResistance(Cs, Ci, A, rhoa, Mair, P.pressure * 100.0);
     // Ball-Berry intercept g0 [mol m-2 s-1] in parallel (m s-1), which also
     // keeps the resistance continuous where A crosses zero.
@@ -118,6 +162,7 @@ LeafState ballBerryLeaf(LeafParameters P, float Tc, float Q, float surfaceCO2, f
     float openConductance = A > 0.0 && rcw < 625000.0 ? 1.0 / max(rcw, 1.0) : 0.0;
     if(openConductance + residualConductance > 0.0)
         rcw = min(1.0 / (openConductance + residualConductance), 625000.0);
+    // 步骤 7：有效性检查：所有中间量必须有限且在物理范围内，否则 valid=false。
     float ciPpm = Ci / ppm2bar;
     bool ratesValid = biochemicalFinite(Vcmax) && Vcmax >= 0.0 &&
         biochemicalFinite(ppm2bar) && ppm2bar > 0.0 &&
@@ -138,6 +183,8 @@ LeafState ballBerryLeaf(LeafParameters P, float Tc, float Q, float surfaceCO2, f
     return leaf;
 }
 
+// 作用：对新气孔阻力与上一轮能量迭代的阻力取几何平均（仅在 energyIteration>0 且
+//   两者都有效时），抑制湿度–气孔阻力的振荡；第一轮直接用新值。
 // Leaf-surface relaxation of a new resistance toward the previous energy
 // iteration damps the humidity/stomata oscillation; each node starts afresh.
 float dampedResistance(float rcw, float previousRcw)
@@ -149,6 +196,8 @@ float dampedResistance(float rcw, float previousRcw)
     return rcw;
 }
 
+// 入口：一线程一体元。非植被体元写表面阻力；植被体元按阴叶/阳叶求光合与阻力。
+// 副作用：写 voxelHeatFlux 的 GPP/NPP、voxelRsss、voxelAirs.ci。
 void main()
 {
     uint bufferId0 = uint(gl_GlobalInvocationID.x);
@@ -157,6 +206,7 @@ void main()
     ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
     MeshLink meshLink0 = meshLinks[instanceLinks[voxelLinks[bufferId0].instanceId].meshId];
 
+    // 步骤 1：先把碳通量清零，使非植被体元输出为 0；再按体元类型分支。
     // Carbon-process output shares the existing per-voxel flux buffer.  Set
     // non-vegetation voxels to zero before the vegetation branch below.
     voxelHeatFlux[bufferId0].GPPsunlit = 0.0;
@@ -174,6 +224,8 @@ void main()
     uint typeId = meshLink0.type;
     float rss;
 
+    // 步骤 2：土壤/建筑由局部土壤阻力模型给出表面阻力，水体取水体参数 rss；
+    //   阳/阴两侧取同一值。
     if(typeId == TYPE_SOIL || typeId == TYPE_BUILDING)
     {
         rss = localSoilResistance(bufferId0, bioId);
@@ -186,6 +238,7 @@ void main()
         atomicStore(voxelRsss[bufferId0].sunlit, rss, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
         atomicStore(voxelRsss[bufferId0].shaded, rss, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
     }
+    // 步骤 3：植被体元。参与介质（isParticipatingMedium）的冠层不在此处理，直接返回。
     else if(typeId == TYPE_VEGETATION)
     {
         Canopy canopy = canopies[canopyId];
@@ -194,10 +247,12 @@ void main()
                              voxelId0.y +0.5,
                              voxelId0.z +0.5 -semiRange.z);
         float hcmax = canopy.height;
+        // xl = 体元相对冠层顶的深度（0 为冠顶，−1 为冠底）；Vcmax25 随深度按 exp(kV·xl) 衰减。
         // xl: relative depth below the canopy top, [0,-1]
         float xl = clamp(hcmax > 0.0 ? -(hcmax - voxelPos.y*scale)/hcmax : 0.0, -1.0, 0.0);
 
         LeafParameters P;
+        // 步骤 4：装配叶片参数 P（Vcmax 随冠层深度衰减，其余来自 leafBios 与气象强迫）。
         P.type = leafBios[bioId].Type;
         float kV = leafBios[bioId].kV;
         // Vertical decline of the carboxylation capacity.
@@ -215,6 +270,8 @@ void main()
         P.oxygen = ubom.meteo.Oa;
         P.pressure = ubom.meteo.p;
 
+        // 步骤 5：取体元吸收的直射/漫射 PAR，并统一检查所有参数的有限性与取值范围。
+        //   任一不合法则 parametersValid=false，后面的叶片求解全部输出缺测标记。
         float directPar = voxelPnets[bufferId0].directPnet;
         float diffusePar = voxelPnets[bufferId0].diffusePnet;
         bool parametersValid =
@@ -236,6 +293,7 @@ void main()
         float missing = biochemicalMissing();
 
         //---------------------------------------------
+        // 步骤 6：阴叶：只受漫射 PAR，一个状态；叶温来自 voxelTempes.shaded。
         // Shaded leaves: one state with diffuse light only.
         //---------------------------------------------
         {
@@ -243,6 +301,7 @@ void main()
             if(Tc < 100.0) Tc += 273.15;
             // Each node's first pass starts from this node's ambient air, not
             // the leaf-surface values left by the previous node.
+            // 首轮用本体元环境空气的 CO2/水汽压；之后用 evapo.comp 更新的叶面值（cs/es）。
             bool firstPass = setting.energyIteration == 0;
             float Cs = firstPass ? localAmbientCo2Ppm(bufferId0) : voxelAirs[bufferId0].cs[0];
             float Es = firstPass ? localVaporPressureHpa(bufferId0) : voxelAirs[bufferId0].es[0];
@@ -268,6 +327,8 @@ void main()
         }
 
         //---------------------------------------------
+        // 步骤 7：阳叶：分 SUNLIT_CLASSES 个朝向类。球形叶角分布下 |cos(叶法线, 太阳)| 在 [0,1]
+        //   均匀，第 k 类获得的直射为平均阳叶直射的 2(k+0.5)/N 倍（exposure）。
         // Sunlit leaves: orientation classes, each with its own leaf energy
         // balance at the class's absorbed beam. |cos(leaf normal, sun)| is
         // uniform on [0,1] for spherical foliage, so class k receives
@@ -279,6 +340,7 @@ void main()
             float Cs = setting.energyIteration == 0 ? localAmbientCo2Ppm(bufferId0) : voxelAirs[bufferId0].cs[1];
             bool valid = parametersValid && biochemicalFinite(Tclass) && Tclass > 0.0 &&
                 biochemicalFinite(Cs) && Cs >= 0.0;
+            // 准备叶片能量平衡输入：空气动力阻抗 raa（下限 1 s m-1）、气温、水汽压、热红外发射率 emis。
             float raa = max(voxelRaas[bufferId0].raa, 1.0);
             float Ta = localAirTemperatureC(bufferId0);
             float ea = localVaporPressureHpa(bufferId0);
@@ -286,12 +348,16 @@ void main()
             SpectralMaterial thermal = spectralMaterials[spectralId*NBAND + NUM_VNIR];
             float emis = clamp(1.0 - thermal.reflectance - thermal.transmittance, 0.0, 1.0);
             // Absorbed by both faces per one-sided leaf area, as in budget.comp.
+            // 吸收辐射 = 短波（V）+ 热红外（T），按单侧叶面积记（与 budget.comp 一致）。
             float diffuseAbsorbed = voxelNetRads[bufferId0].diffuseVrad + voxelNetRads[bufferId0].diffuseTrad;
             float directAbsorbed = voxelNetRads[bufferId0].directVrad + voxelNetRads[bufferId0].directTrad;
             float previousRcw = voxelRsss[bufferId0].sunlit;
+            // 迭代起始阻力：沿用上一次有效值，否则取缺省 300 s m-1。
             float startRcw = biochemicalFinite(previousRcw) && previousRcw > 0.0 && previousRcw <= 625000.0
                 ? previousRcw : 300.0;
             float gross = 0.0, net = 0.0, ci = 0.0, conductance = 0.0, vapourFlux = 0.0;
+            // 步骤 8：逐朝向类求解：该类吸收辐射与 PAR 按 exposure 缩放，
+            //   从类平均叶温出发做 LEAF_TEMPERATURE_STEPS 步叶温–气孔阻力联合迭代。
             for(int k = 0; k < SUNLIT_CLASSES && valid; ++k)
             {
                 float exposure = 2.0 * (float(k) + 0.5) / float(SUNLIT_CLASSES);
@@ -305,6 +371,7 @@ void main()
                 {
                     float TC = T - 273.15;
                     float ei = es_fun(TC);
+                    // 叶面水汽压：在 raa 与 2·rcw 的串联阻力分压下，由空气 ea 与叶内饱和 ei 内插。
                     float eb = ea + (ei - ea) * raa / (raa + 2.0 * rcw);
                     leaf = ballBerryLeaf(P, T, Q, Cs, max(eb, 0.0));
                     if(!leaf.valid) break;
@@ -313,14 +380,18 @@ void main()
                     // aerodynamic raa and stomatal 2*rcw (evapo.comp convention).
                     float g = 1.0 / (raa + 2.0 * rcw);
                     float lambda = (2.501 - 0.002361 * TC) * 1E6;
+                    // 叶片能量平衡残差 = 吸收辐射 − 长波发射 − 显热 − 潜热（两面各一份，故系数 2）；
+                    //   derivative 为残差对 T 的导数（符号取为正，用于牛顿更新）。
                     float residual = absorbed - 2.0 * Stefen_Boltzmann(T, emis)
                         - 2.0 * RHOA * CP * (TC - Ta) / raa
                         - 2.0 * RHOA * lambda * eToQ * (ei - ea) * g;
                     float derivative = 8.0 * emis * SIGMASB * T * T * T + 2.0 * RHOA * CP / raa
                         + 2.0 * RHOA * lambda * eToQ * max(s_fun(ei, TC), 0.0) * g;
+                    // 牛顿更新：单步温度改变限幅 ±5 K，结果限制在 [TMIN_THRESHOLD, TMAX_THRESHOLD]。
                     T = clamp(T + clamp(residual / derivative, -5.0, 5.0),
                               float(TMIN_THRESHOLD), float(TMAX_THRESHOLD));
                 }
+                // 汇总各朝向类的结果（总光合限幅为非负；conductance、vapourFlux 用于有效阻力）。
                 valid = valid && leaf.valid;
                 gross += max(0.0, leaf.gross);
                 net += leaf.net;
@@ -332,6 +403,8 @@ void main()
             if(valid)
             {
                 float n = float(SUNLIT_CLASSES);
+                // 步骤 9：合成阳叶平均量。有水汽亏缺时，取使类平均蒸腾等于各类平均蒸腾的有效阻力，
+                //   否则退化为导度平均；再换算成单面 classRcw，经 dampedResistance 阻尼后写出。
                 // Effective class resistance reproducing the mean class
                 // transpiration at the class temperature; the conductance mean
                 // where there is no vapour deficit.

@@ -1,3 +1,15 @@
+// ==========================================================================
+// 文件：facetrt/ground_mean.comp（FacetRT）
+// 功能：求“等效地面”辐射度：当前 Jacobi 迭代解中，朝上的地面侧按面积加权的平均辐射度。
+// 主要模块/步骤：
+//   1. 每个线程跨步累加 groundWeights[i] * radiosity[groundSides[i]]
+//   2. 共享内存折半归约（固定顺序，结果逐位可复现）
+//   3. 线程 0 写出 groundMean[0]；无地面面元时退回天空辐射度
+// 数据流：radiosity.comp/incident.comp 读取 groundMean[0]，作为向下逃逸射线所见的下边界辐射度
+// 注意：单个工作组（256 线程）；权重已在主机端归一化（和为 1）
+// 注意：ping 选择当前迭代解在 radiosityA 还是 radiosityB
+// ==========================================================================
+
 #version 460
 // Equivalent-ground radiosity for downward escapes: the area-weighted mean
 // radiosity of the upward ground sides of the current Jacobi iterate. One
@@ -9,6 +21,8 @@ layout(std430, set = 0, binding = 6) readonly buffer RadiosityB { float radiosit
 layout(std430, set = 0, binding = 10) readonly buffer GroundSides { uint groundSides[]; };
 layout(std430, set = 0, binding = 11) readonly buffer GroundWeights { float groundWeights[]; };
 layout(std430, set = 0, binding = 12) writeonly buffer GroundMean { float groundMean[]; };
+// 推送常量：facetCount 面元数；ping 当前解所在缓冲（0=A，1=B）；
+// skyRadiosity 天空辐射度；relaxation 松弛因子（本着色器未用）；groundSideCount 地面侧个数。
 layout(push_constant) uniform SolvePush {
     uint facetCount;
     uint ping;
@@ -17,16 +31,20 @@ layout(push_constant) uniform SolvePush {
     uint groundSideCount;
 } pc;
 
+// 工作组内的部分和，用于折半归约
 shared float partial[256];
 
+// 入口：单工作组归约，输出 groundMean[0]。
 void main()
 {
     const uint thread = gl_LocalInvocationID.x;
+    // 步骤 1：线程按步长 256 跨步累加加权辐射度（权重 × 当前迭代的辐射度）。
     float sum = 0.0;
     for (uint i = thread; i < pc.groundSideCount; i += 256u) {
         const uint side = groundSides[i];
         sum += groundWeights[i] * (pc.ping == 0u ? radiosityA[side] : radiosityB[side]);
     }
+    // 步骤 2：共享内存折半归约；固定的相加顺序保证重复运行逐位一致。
     partial[thread] = sum;
     memoryBarrierShared();
     barrier();
@@ -35,6 +53,7 @@ void main()
         memoryBarrierShared();
         barrier();
     }
+    // 步骤 3：线程 0 输出结果（无地面面元时的缺省处理见下）。
     // Without ground facets (not produced by the scene loaders) the lower
     // boundary falls back to the sky value, the historical behaviour.
     if (thread == 0u) groundMean[0] = pc.groundSideCount == 0u ? pc.skyRadiosity : partial[0];

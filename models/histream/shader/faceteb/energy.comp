@@ -1,7 +1,39 @@
+// ==========================================================================
+// 文件：faceteb/energy.comp（FacetEB 面元能量平衡的 GPU 求解器）
+// 功能：对每个面元（一个线程一个面元），在“日照 / 阴影”两个状态下计算各通量并更新表面温度；
+//   叶片面元同时二分求解气孔阻力与叶温（光合–气孔–能量平衡耦合）。
+// 主要模块/步骤（由 pc.phase 选择，主机 facetrt_vulkan.cpp 依次调度）：
+//   1. phase 2：由当前温度更新长波光学参数 optics（发射 = ε·σ·(w·T_亮⁴ + (1−w)·T_阴⁴)）
+//      （随后主机做长波辐射度 Jacobi 迭代，得到入射辐照度 H）
+//   2. phase 0：用入射 H 计算净辐射、显热、潜热、储热/导热、光伏等通量及其对温度的斜率，
+//      并统计残差（最大值、能量不闭合面元数）
+//   3. phase 1：用 phase 0 写出的通量做牛顿更新温度（单步限幅 ±5 K，松弛 pc.relax）
+// 数据流：主机上传 P（面元参数）、I（每状态每侧输入）→ 本着色器写 T（温度）、F（通量）、stats、
+//   optics → radiosity.comp/incident.comp 求长波入射 H → 回到本着色器 phase 0。
+// 约定：面元 f 的两侧 side = 2f、2f+1；状态 state 0 = 日照部分、1 = 阴影部分；
+//   T[state*surfaces + side]；物体（f < pc.objects，含叶片、墙、水、船体）只有一个温度，两侧共用，
+//   非物体为地面面元，两侧分别有温度；I/F 每（状态,侧）12 个 float。
+//   P[32]：[0] 植被、[1] 光伏、[2] 热容、[3] 对流尺度、[4..6] 光伏 η25/γ/双面系数、[7] 表面阻力、
+//   [8] 土壤干燥标志、[9] 土壤温度方法、[10..26] 叶片生化参数、[27] 地面土壤侧标记（1+局部侧号）、
+//   [28] 模式（物体：0 薄壳/1 水体混合层/2 墙板；地面：1 中性/2 MOST）、[29] 水体蒸发系数或墙外侧、
+//   [30][31] 水下船体总导度与参考温度；非叶物体 [23] 热源 (W m-2)、[24] 净辐射系数。
+//   I[12]：[0] 上步温度、[1] 吸收短波、[2] 吸收 PAR 光量子、[3] 入射短波、[4] 叶阻力 rb、[5] 土壤阻力、
+//   [6] 冠层相对深度、[7][8] 土壤/墙导热斜率与偏移、[9][10] 反射/透射率、[11] 日照比例 w。
+//   F[12]：[0] 净辐射、[1] 显热、[2] 显热斜率、[3] 潜热、[4] 潜热斜率、[5] 储热/导热、[6] 其斜率、
+//   [7] 光伏功率、[8] 其斜率、[9] 叶片温度步长、[10] 气孔失配、[11] 叶：rs；非叶：热源。
+//   stats：[0] 最大 |残差|、[1] 最大 |残差|/响应、[2] 最大气孔失配、[3] 最大叶残差、
+//   [4] 最大温度步长、[5] 错误标志（bit0 非有限值，bit1 生理目标无效）、[6] 能量不闭合面元数。
+// 注意：能量闭合判据为 |残差| < 2 W m-2；叶片 F[9] 直接给出温度步长而不是由残差/响应求得。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_gpu_shader_fp64 : require
 #extension GL_GOOGLE_include_directive : require
+// 一线程一面元（工作组 64）。
 layout(local_size_x=64) in;
+// 缓冲区：P 面元参数（只读，32 float/面元）；I 每（状态,侧）输入（只读，12 float）；
+// T 温度（读写）；F 通量（读写）；optics 光学参数（读写，供辐射度求解）；
+// H 长波入射辐照度（只读）；stats 统计量（原子写）。
 layout(std430,binding=0) readonly buffer Parameters { float P[]; };
 layout(std430,binding=1) readonly buffer Inputs { float I[]; };
 layout(std430,binding=2) buffer Temperatures { float T[]; };
@@ -10,20 +42,31 @@ struct Optics { float reflectance,transmittance,emission,directIrradiance; };
 layout(std430,binding=4) buffer Optical { Optics optics[]; };
 layout(std430,binding=5) readonly buffer Incident { float H[]; };
 layout(std430,binding=6) buffer Statistics { uint stats[]; };
+// 推送常量：facets 面元数；objects 物体（叶/墙/水等）面元数，其余为地面；method 气孔模型
+// （0 Collatz，其它 Farquhar）；phase 阶段；air 气温 K；rho 空气密度；pressure 气压 hPa；
+// vapor 水汽压 hPa；dt 时间步 s；co2 ppm；relax 温度松弛因子；reserved 实际存放风速 m/s。
 layout(push_constant) uniform EnergyPush {
     uint facets,objects,method,phase;
     float air,rho,pressure,vapor,dt,co2,relax,reserved;
 } pc;
+// Stefan–Boltzmann 常数（W m-2 K-4）；energy_math.glsl 依赖 SIGMA、P、pc。
 const float SIGMA=5.670374419e-8;
 #include "energy_math.glsl"
+// 作用：向 stats[k] 原子累计最大值（非负 float 的位序即数值序）；
+//   v 非有限则置错误标志 stats[5] bit0（主机会报错）。
 void maximum(uint k,float v) { if(isnan(v)||isinf(v)) atomicOr(stats[5],1u); else atomicMax(stats[k],floatBitsToUint(max(0.0,v))); }
+// 入口：一线程处理一个面元的全部（状态, 侧）。副作用：写 optics/T/F/stats。
 void main() {
     uint f=gl_GlobalInvocationID.x;
     if(f>=pc.facets) return;
+    // 步骤 1：定位面元：s0 = 第 0 侧编号，p = P 偏移，object = 物体面元，
+    //   leaf = 植被叶片（P[0]>0.5）；faces 为能量平衡中参与长波发射的面数（用于响应系数）。
     uint s0=2u*f,p=f*32u,surfaces=2u*pc.facets;
     bool object=f<pc.objects,leaf=object&&P[p]>0.5;
     // Faces whose emission enters the balance: both of a thin facet, the outdoor face of a wall slab.
     float faces=object?(P[p+28u]>1.5?4.0:8.0):4.0;
+    // phase 2：更新长波光学参数：反射/透射取自输入，发射 = ε·σ·(日照与阴影温度四次方的加权和)，
+    //   温度限幅 [1,1000] K 防止 pow 溢出；直射辐照度置 0（长波无直射项）。
     if(pc.phase==2u) {
         for(uint s=s0;s<s0+2u;++s) {
             uint b=s*12u; float e=clamp(1.0-I[b+9u]-I[b+10u],0.0,1.0),w=I[b+11u];
@@ -31,23 +74,30 @@ void main() {
         }
         return;
     }
+    // 步骤 2：对日照(0)与阴影(1)两个状态循环；index 为该状态下第 0 侧在 T/I/F 中的位置。
     bool energyViolation=false;
     for(uint state=0u;state<2u;++state) {
         uint index=state*surfaces+s0,b=index*12u,z=index*12u;
+        // phase 1：牛顿更新温度。残差 = 净辐射 − 显热 − 潜热 − 储热 − 光伏 (+ 非叶物体热源)，
+        //   响应 = 辐射斜率 + 各通量对 T 的斜率；单步限幅 ±5 K，结果限制在 [220,360] K。
+        //   叶片的步长已由 phase 0 求得（F[9]），此处直接加；物体两侧共用同一温度。
         if(pc.phase==1u) {
             for(uint side=0u;side<(object?1u:2u);++side) {
                 uint k=index+side,j=k*12u; float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
                 float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0)+(object&&!leaf?F[j+11u]:0.0);
                 float response=faces*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
+                // 阻尼牛顿：先限幅步长再限幅温度；松弛因子 pc.relax 只作用于非叶面元。
                 float candidate=clamp(temp+clamp(residual/max(1.0,response),-5.0,5.0),220.0,360.0);
                 float next=temp+(leaf?F[j+9u]:pc.relax*(candidate-temp));
                 maximum(4u,abs(next-temp)); T[k]=next; if(object) T[k+1u]=next;
             }
+            // 地面面元的土壤侧不参与平衡：直接取上侧温度。
             // The soil-facing back side of a ground facet is not an energy
             // balance surface: it carries the temperature of the upper side.
             if(!object&&P[p+27u]>0.5) { uint down=uint(P[p+27u]+0.5)-1u; T[index+down]=T[index+(down^1u)]; }
             continue;
         }
+        // phase 0 步骤 3：各侧净辐射 = 吸收短波 + ε·H（长波入射）− ε·σ·T⁴；并清零 F。
         float net[2];
         for(uint side=0u;side<2u;++side) {
             uint j=(index+side)*12u,s=s0+side;float temp=T[index+side];
@@ -56,6 +106,8 @@ void main() {
             for(uint k=0u;k<12u;++k) F[j+k]=0.0;
         }
         float temp=T[index];
+        // 步骤 4：物体面元：两侧合并为一个平衡（净辐射 rn = 两侧之和；墙板只取外侧）。
+        //   依次算对流导度、显热、储热、光伏、水体潜热或叶片气孔/叶温耦合求解。
         if(object) {
             float rn=net[0]+net[1],rb=I[b+4u],depth=I[b+6u],previous=I[b];
             // P[28]: 0 thin shell, 1 water mixed layer (one face exchanges with the
@@ -68,25 +120,35 @@ void main() {
             // their internal heat through the slab I[7], I[8]).
             float source=0.0;
             if(!leaf) { rn*=P[p+24u]; source=wall?0.0:P[p+23u]; }
+            // 显热导度：叶片 ρ·cp·对流尺度/rb；其余物体用经验换热系数 (5.8 + 4.1·√U)·尺度，
+            //   水体/墙只算一个交换面故系数 1，薄壳两面故系数 2；风速下限 0.1 m/s。
             float conductance=leaf?pc.rho*1005.0*P[p+3u]/rb:(water||wall?1.0:2.0)*(5.8+4.1*sqrt(max(.1,pc.reserved)))*P[p+3u];
             // P[30] > 0: ship-hull facet below the waterline, total sensible
             // conductance P[30] towards the reference temperature P[31] (host).
             bool submerged=!leaf&&P[p+30u]>0.0;
             if(submerged) conductance=P[p+30u];
+            // 显热 h = 导度 × (温度 − 参考温度)；储热 = 热容/dt × (T − 上步 T)，墙板用导热斜率与偏移。
             float h=conductance*(temp-(submerged?P[p+31u]:pc.air)),ss=wall?I[b+7u]:max(0.0,P[p+2u])/pc.dt;
             float storage=wall?ss*(temp-previous)+I[b+8u]:ss*(temp-previous);
+            // 光伏：入射 = 正面入射 + 双面系数 × 背面入射；原始发电 = η25·(1+γ(T−298.15))·入射，
+            //   限幅在 [0, 两侧吸收短波]；ps 为未限幅时对 T 的斜率。
             float inc=I[b+3u]+P[p+6u]*I[b+15u],available=I[b+1u]+I[b+13u];
             float raw=P[p+4u]*(1.0+P[p+5u]*(temp-298.15))*inc;
             float power=P[p+1u]>.5?clamp(raw,0.0,max(0.0,available)):0.0;
             float ps=P[p+1u]>.5&&raw>0.0&&raw<available?P[p+4u]*P[p+5u]*inc:0.0;
             float le=0.0,ls=0.0,step=0.0,mismatch=0.0,stomatal=0.0;
+            // 水体：潜热由开放水面蒸发（阻力 P[7]，蒸发系数 P[29]），ra 为空气动力阻力。
             if(water) {
                 float ra=pc.rho*1005.0/max(1.0e-6,conductance);
                 le=P[p+29u]*latent(temp,ra,P[p+7u]); ls=P[p+29u]*latentSlope(temp,ra,P[p+7u]);
             }
+            // 叶片：对 ln(rs) 在 [0, ln 625000] 二分；每个试探 rs 先由 thermal 求叶温 trial，再由
+            //   physiology 得目标气孔阻力，使 ln(rs) 与 ln(target) 之差 ≤ 容差；
+            //   最多 24 次，不收敛则取区间中点。目标无效（NaN/≤0）置 stats[5] bit1。
             if(leaf) {
                 float par=max(0.0,I[b+2u]+I[b+14u]);
                 double eps=double(clamp(1.0-I[b+9u]-I[b+10u],0.0,1.0)+clamp(1.0-I[b+21u]-I[b+22u],0.0,1.0));
+                // 二分区间：rs ∈ [1, 625000] s m-1（对数域）。
                 double lo=0.0lf,hi=dlog(625000.0lf);
                 double rs=0.0lf,trial=0.0lf;
                 bool stomatalConverged=false;
@@ -104,32 +166,41 @@ void main() {
                 if(!stomatalConverged) {
                     rs=dexp(.5lf*(lo+hi)); trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
                 }
+                // 叶温步长：向 trial 靠拢，限幅 ±5 K，乘松弛因子；mismatch 为当前 T 下 ln(rs/rs目标) 的绝对值。
                 step=pc.relax*float(clamp(trial-double(temp),-5.0lf,5.0lf));
                 le=latent(temp,rb,float(rs)); ls=latentSlope(temp,rb,float(rs)); stomatal=float(rs);
                 mismatch=float(abs(dlog(rs/double(physiology(f,double(temp),rs,par,rb,depth)))));
             }
             for(uint side=0u;side<2u;++side) {
                 uint j=(index+side)*12u;
+                // 把结果写入两侧（物体共用一份通量）。slot 11：叶片存 rs（供 CPU 审计），其余存热源。
                 F[j]=rn;F[j+1u]=h;F[j+2u]=conductance;F[j+3u]=le;F[j+4u]=ls;
                 F[j+5u]=storage;F[j+6u]=ss;F[j+7u]=power;F[j+8u]=ps;F[j+9u]=step;F[j+10u]=mismatch;F[j+11u]=leaf?stomatal:source; // leaf: slot 11 reports r_s for the CPU audit (the leaf heat source is 0)
             }
         } else {
+            // 步骤 5：地面面元（非物体）：每侧各算净辐射、显热（含自由对流修正）、潜热与储热。
             for(uint side=0u;side<2u;++side) {
                 // Back side of a ground facet: no fluxes (zeroed above).
                 if(P[p+27u]>0.5&&side==uint(P[p+27u]+0.5)-1u) continue;
                 uint k=index+side,j=k*12u;float temp=T[k],extra;
                 // Free convection of a side warmer than the air (P[28]: 1 neutral, 2 MOST).
+                // 地面显热阻力 = groundExchange(土壤阻力 I[5], 比气温暖的 excess, 模式 P[28])。
                 float rb=groundExchange(I[j+5u],temp-pc.air,P[p+28u],extra),conductance=pc.rho*1005.0/rb;
                 F[j]=net[side]; F[j+1u]=conductance*(temp-pc.air); F[j+2u]=extra>0.0?conductance+pc.rho*1005.0*extra:conductance;
+                // 土壤很干（P[8]=1）时不蒸发；否则潜热用 rb 与表面阻力 P[7]。
                 F[j+3u]=P[p+8u]>.5?0.0:latent(temp,rb,P[p+7u]);
                 F[j+4u]=P[p+8u]>.5?0.0:latentSlope(temp,rb,P[p+7u]);
+                // 储热/地中热通量：土壤温度方法 0 取 0.35×净辐射（经验比例，斜率 I[7]=0）；
+                //   方法 1/2 用线性化土壤响应 斜率·T + 偏移。
                 F[j+6u]=I[j+7u]; F[j+5u]=P[p+9u]<.5?.35*net[side]:I[j+7u]*temp+I[j+8u];
             }
         }
+        // 步骤 6：重新计算残差与响应，更新统计量（用同一公式与 phase 1 一致）。
         for(uint side=0u;side<(object?1u:2u);++side) {
             uint k=index+side,j=k*12u;float temp=T[k],e=clamp(1.0-I[j+9u]-I[j+10u],0.0,1.0);
             float residual=F[j]-F[j+1u]-F[j+3u]-F[j+5u]-(object?F[j+7u]:0.0)+(object&&!leaf?F[j+11u]:0.0);
             float response=faces*e*SIGMA*pow(temp,3.0)+F[j+2u]+F[j+4u]+F[j+6u]+(object?F[j+8u]:0.0);
+            // 统计：最大残差、最大“残差/响应”（等效温度偏差 K）、能量不闭合判据 |残差| ≥ 2 W m-2。
             maximum(0u,abs(residual));maximum(1u,abs(residual)/max(1.0,response));
             energyViolation=energyViolation||abs(residual)>=2.0;
             if(leaf) {maximum(2u,F[j+10u]);maximum(3u,abs(residual));}

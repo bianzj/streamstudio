@@ -1,3 +1,22 @@
+// ==========================================================================
+// 文件：voxelrad_direct_VNIR.comp
+// 功能：VoxelEB 体元的太阳直射短波（VNIR，波段 0..NUM_VNIR-1）吸收计算：
+//       输出体元吸收的直射短波辐射 directVrad（W m-2）和直射光合有效辐射光量子通量 directPnet。
+// 主要模块/步骤：
+//   1. 编译期设置：扩展、include、波段常量（NUM_VNIR=2001 个 VNIR 波段，NUM_BAND=2002）
+//   2. main 步骤 1：取体元属性并清零 directVrad/directPnet
+//   3. main 步骤 2：太阳高度过低（sin 高度 <= 0.01）则直接返回
+//   4. main 步骤 3：把水平面辐照 Rin·direct 换算为吸收元件上的辐照（投影因子 projection）
+//   5. main 步骤 4：逐波段累加吸收辐射；400–700 nm 同时累加 PAR 光量子通量
+// 数据流：输入 ubom.meteo.Rin（水平面总入射短波）、atomConds[].direct（各波段直射占比）、
+//         spectralMaterials（反射/透射）、lightSet.direction（太阳方向）、冠层参数；
+//         输出 voxelNetRads[].directVrad、voxelPnets[].directPnet
+// 与其他文件的关系：不含遮挡（voxelDirs.solar 的遮蔽比例在后续作为向阳面比例使用）；
+//   散射/漫射部分见 voxelrad_scattering_VNIR.comp；天空下低太阳角的直射并入其各向同性天空源
+// 重要约定：太阳方向 lightSet.direction 指向太阳，y 为天顶方向；Rin 为水平面辐照；
+//   直射项刻意不乘 alpha_toSolar，使“向阳”条件温度不受冠层遮蔽影响
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -37,11 +56,15 @@ layout(local_size_x = GROUP_SIZEX) in;
 #define NUM_VNIR 2001 
 #define NUM_BAND 2002
 
+// 以下两个数组在本文件中未被引用（疑似遗留声明）。
 float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 
 
 
+// 模块：主入口，每线程处理一个体元（bufferId0）。
+// 输出：voxelNetRads[bufferId0].directVrad（吸收的直射短波，W m-2）、
+//       voxelPnets[bufferId0].directPnet（吸收的 PAR 光量子通量，单位见 absorbedParPhotonFlux）。
 void main()
 {
     //------------------------------------------------------------
@@ -61,18 +84,22 @@ void main()
     uint spectralIdBase = spectralId * NUM_BAND;
     uint canopyId = meshLinks[meshId].canopyId;
     Canopy canopy = canopies[canopyId];
+    // 步骤 1：结果先清零，之后任何提前返回都保持 0。
     voxelNetRads[bufferId0].directVrad = 0.0;
     voxelPnets[bufferId0].directPnet = 0.0;
 
     //---------------------------------------------------
     // Iteration in VNIR band
     //---------------------------------------------------
+    // 注：行尾旧注释（measurement height / wind speed）与变量实际含义不符；
+    // Rin 为水平面入射短波，Rli（此处未使用）为天空长波（疑似遗留注释，仅报告）。
     float Rin = ubom.meteo.Rin;               // measurement height 
     float Rli = ubom.meteo.Rli;               // wind speed
 
     vec3 solarDirection = normalize(lightSet.direction);
     float cosSolar = abs(solarDirection.y);
     float alpha_toSolar = voxelDirs[bufferId0].solar;
+    // 步骤 2：太阳高度截止。不用 alpha_toSolar 对直射项设门限的原因见下方说明。
     // Sunlit/shaded temperatures are conditional components.  Always solve
     // the sunlit component with unobstructed direct irradiance; voxelDirs.solar
     // is applied later as the moving sunlit fraction. Gating the direct term
@@ -85,6 +112,9 @@ void main()
     // Rin*direct is horizontal irradiance. Convert it to the irradiance on the
     // absorbing element: G(sun)/cos(sza) per one-sided leaf area for foliage,
     // cos(incidence)/cos(sza) for a solid facet.
+    // 步骤 3：投影因子 projection，把水平面辐照换算为吸收元件上的辐照：
+    // 叶片 G(sun)/cosSolar；参与介质用 alpha_toSolar/cosSolar；固体面 cos(入射角)/cosSolar。
+    // cosSolar 下限取 0.05 防止低太阳角时除零/放大过大。
     float projection = 1.0;
     bool medium = isParticipatingMedium(canopy);
     if(typeId == TYPE_VEGETATION && !medium) {
@@ -95,6 +125,7 @@ void main()
         projection = max(dot(solidSurfaceNormal(int(bufferId0)), solarDirection), 0.0)
             / cosSolar;
     }
+    // 参与介质的体元吸收分数：单位路径长度被移除的透过率分数 × (1 - 散射反照率)。
     float mediumAbsorption = medium
         ? (1.0 - canopyVoxelTransmittance(canopy, 0.0, 0.0, 1.0, setting.scale))
             * (1.0 - clamp(canopy.scatteringAlbedo, 0.0, 1.0))
@@ -102,6 +133,8 @@ void main()
 
     float absorbed = 0.0;
     float absorbedPar = 0.0;
+    // 步骤 4：逐 VNIR 波段累加吸收辐射：Rin · direct · 0.001（单位换算，待核对）· projection · 吸收率；
+    // 400–700 nm 的部分再换算为光量子通量累加到 absorbedPar。
     for(int kband = 0; kband < NUM_VNIR; ++kband)
     {
         SpectralMaterial material = spectralMaterials[spectralIdBase + kband];

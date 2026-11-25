@@ -1,9 +1,24 @@
+// ==========================================================================
+// 文件：faceteb/direct_resolve.comp（FacetEB）
+// 功能：统计每个面元侧在当前视角下的“总命中数”和“可见（最近）命中数”，用于求直射可见比例。
+// 主要模块/步骤：
+//   1. 读取该像素的 A-buffer 片元列表（visibility.frag 写入）
+//   2. 对每个中心瓦片片元累加 totalCounts；周期复制片元只参与遮挡，不计数
+//   3. 按（depthBits, cameraSide）取最近片元，累加 visibleCounts
+// 数据流：visibility.frag 写 records/pixelCounts → 本着色器 → totalCounts/visibleCounts（binding 4/5，由主机读回，visible/total 即该侧在此视角下的可见比例）
+// 注意：每个线程负责一个像素；同深度时用 cameraSide 最小者，保证结果与 GPU 调度顺序无关
+// 注意：MAX_FRAGMENTS 必须不小于主机配置的 HISTREAM_FACET_RASTER_LAYERS
+// ==========================================================================
+
 #version 460
 
+// 片元列表容量上限（着色器端硬上限，与主机每像素层数配置配套）
 #define MAX_FRAGMENTS 256u  // must cover HISTREAM_FACET_RASTER_LAYERS (64/128/256); same as facetrt
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// A-buffer 片元记录：depthBits = gl_FragCoord.z 的 float 位模式（深度 ∈ [0,1]，
+// 位序即数值序）；cameraSide = 朝向相机的面元侧编号，最高位为周期复制标记。
 struct FragmentRecord {
     uint depthBits;
     uint cameraSide;
@@ -22,6 +37,9 @@ layout(std430, set = 0, binding = 5) buffer VisibleCounts {
     uint visibleCounts[];
 };
 
+// 推送常量（与 visibility.* 共用）：viewProjection 视图投影矩阵；viewDirection 视线方向；
+// raster = (宽, 高, 每像素最大层数, 边哈希表容量——本着色器只用前三项)；
+// periodic.xy = 周期平铺在 x、z 方向的步长。
 layout(push_constant) uniform VisibilityPush {
     mat4 viewProjection;
     vec4 viewDirection;
@@ -29,6 +47,8 @@ layout(push_constant) uniform VisibilityPush {
     vec4 periodic;
 } pc;
 
+// 入口：一个线程处理一个像素，遍历该像素的片元列表并累加计数。
+// 副作用：对 totalCounts/visibleCounts 做 atomicAdd（跨像素累加，顺序无关）。
 void main()
 {
     const uint pixel = gl_GlobalInvocationID.x;
@@ -37,11 +57,14 @@ void main()
         return;
     }
 
+    // 步骤 1：片元数同时受 A-buffer 层数与 MAX_FRAGMENTS 限幅；溢出的片元在
+    //   visibility.frag 中已被丢弃并记入统计，这里不再处理。
     const uint count = min(min(pixelCounts[pixel], pc.raster.z), MAX_FRAGMENTS);
     if (count == 0u) {
         return;
     }
 
+    // 步骤 2：遍历片元；周期复制体（高位标记）参与遮挡，但不是接收面，不计入计数。
     // Periodic replicas (high bit) occlude but are not receivers.
     const uint REPLICA_BIT = 0x80000000u;
     uint nearestDepth = 0xffffffffu;

@@ -1,3 +1,12 @@
+// ==========================================================================
+// 文件：fluid_lbm_commit.comp
+// 功能：LBM 时间步的“提交”：把 fluid_lbm.comp 写入的 B 缓冲区（新分布、速度、标量）
+//       复制回 A 缓冲区，作为下一步的输入（双缓冲，避免同一步内读写冲突）。
+// 主要步骤：每个流体格一个线程，复制 19 个方向的分布 fluidLbmB→fluidLbmA，
+//       再复制 fluidVelocityB→A、fluidScalarB→A；网格未启用（grid.w == 0）时直接返回。
+// 注意：fluidDensity 在 fluid_lbm.comp 中已直接写入，不需要在这里复制。
+// ==========================================================================
+
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 #extension GL_EXT_scalar_block_layout : enable
@@ -12,6 +21,8 @@
 
 layout(local_size_x = GROUP_SIZEX) in;
 
+// 模块：双缓冲提交。必须在 fluid_lbm.comp 全部完成后（同步屏障之后）再调度，
+// 否则会读到尚未写完的 B 缓冲区。
 void main()
 {
     uint index = gl_GlobalInvocationID.x;

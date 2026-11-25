@@ -1,3 +1,23 @@
+// ==========================================================================
+// 文件：biochemical_m12.comp
+// 功能：VoxelEB 的叶片光合—气孔耦合（Farquhar C3 / von Caemmerer C4 + Ball-Berry），
+//       对每个植被体元的受阳/阴两个节点求总初级生产力 GPP、净同化 A（NPP 槽位）、
+//       叶片（表面）阻抗 rss 和胞间 CO2（ci）。荧光产额（MD12）部分已被注释掉，当前不输出荧光。
+// 主要步骤（一个线程处理一个体元）：
+//   1. 读取体元→实例→网格链接，按类别（土壤/建筑/水体/植被）分流；非植被只写 rss
+//   2. 植被：检查叶片生化参数有效性；按冠层深度指数衰减 Vcmax（Vcmo = Vcmax·exp(kv·xl)）
+//   3. 对受阳（kt=0）/阴（kt=1）节点：取叶温 Tc、吸收辐射 Q、叶面水汽压与 CO2
+//   4. 温度订正（Arrhenius + 高温失活，Q10）→ 电子传输 J → C3/C4 同化 A
+//   5. 由 cs、Ci、A 求叶片阻抗 rss；有效性检查，无效则写缺测（NaN）
+//   6. 把 GPP/NPP、rss、ci 写回 voxelHeatFlux / voxelRsss / voxelAirs
+// 数据流：输入 voxelTempes、voxelPnets、voxelAirs、leafBios、ubom.meteo；
+//         输出 voxelHeatFlux.GPP*/NPP*、voxelRsss、voxelAirs.ci（供后续能量平衡着色器使用）。
+// 与其他文件：公共辅助函数（biochemical*）在 shader/functions.glsl；
+//         fluid_coupling.glsl 提供 localSoilResistance、localVaporPressureHpa 等本地环境量。
+// 约定：温度 K（输入若 < 100 视为摄氏度并转换）；CO2/O2 分压内部用 bar；
+//         光合速率 µmol m-2 s-1；活化能 kJ/mol；缺测值用 NaN（biochemicalMissing）。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -28,6 +48,8 @@
 #include "../nanovdb_info.glsl"
 #include "fluid_coupling.glsl"
 //#include "../shade_state.glsl"
+// 模块：每个体元一个线程（gl_GlobalInvocationID.x = 体元缓冲区下标 bufferId0）。
+// 对植被体元的受阳(sunlit)/阴(shaded)两个节点各求一次光合—气孔耦合（见 main 内步骤）。
 layout(local_size_x = GROUP_SIZEX) in;
 
 void main()
@@ -43,6 +65,8 @@ void main()
 		Wc, Wj, W, Ag, Ja, Cm, Rs, Rm, gam, Vpc, Vp, dum3, dum4, dum5, dum6,vcmax,
 		dum7, dum8, dum9, dum10, a, b, c, d, Ac, Aj, ps, cs, A, p, Q, xl, rs, vcmo, Rdparam, Type, kNPQs, beta, leafM;
 
+	// 步骤 1：声明局部量。kv 为冠层内 Vcmax 随深度的衰减系数，stress 为水分胁迫因子；
+	// 植被体元会用 leafBios 里的值覆盖这里的全局缺省（RHOA/MAIR/STRESS/KV）。
 	float rhoa,Mair,stress,kv;
 	float rss,hcmax,Tsunlit,Tshaded;
 	//int matId,type,structId,leafId,soilId;
@@ -53,12 +77,15 @@ void main()
 	stress = STRESS;
 	kv = KV;
     O = ubom.meteo.Oa;
+    // 气压：meteo.p 单位 hPa，乘 100 后为 Pa。
     p = ubom.meteo.p * 100;
 
 
   ivec3 semiRange = ivec3(floor(setting.voxelSize.x/2.0 + 0.5),
                             floor(setting.voxelSize.y/2.0 + 0.5),
                             floor(setting.voxelSize.z/2.0 + 0.5)); 
+   // 步骤 2：由线程号取体元链接，越界或无效（isValid==0）体元直接退出，
+   // 并按体元 id 还原体元中心位置 voxelPos0（以体元为单位，x/z 以场景中心为原点，y 自地面向上）。
    uint spectralId,canopyId,bioId,typeId;
    uint bufferId0 = uint(gl_GlobalInvocationID.x);
    if(bufferId0 >= uint(setting.voxelCount)) return;
@@ -70,6 +97,7 @@ void main()
 					(voxelId0.y+0.5),
 					(voxelId0.z+0.5)-semiRange.z );
     
+    // 步骤 3：体元 → 实例 → 网格，取得材质/冠层/生化参数下标与体元类别。
     InstanceLink instanceLink0 = instanceLinks[instanceId0];
     MeshLink meshLink0 = meshLinks[instanceLink0.meshId];
 
@@ -79,6 +107,7 @@ void main()
     bioId = meshLink0.bioId;
     typeId = meshLink0.type;
 
+    // 说明：GPP/NPP 的输出复用 voxelHeatFlux 缓冲区；先全部清零，保证非植被体元输出为 0。
     // Carbon-process output shares the existing per-voxel flux buffer.  Set
     // non-vegetation voxels to zero before the vegetation branch below.
     voxelHeatFlux[bufferId0].GPPsunlit = 0.0;
@@ -86,6 +115,8 @@ void main()
     voxelHeatFlux[bufferId0].NPPsunlit = 0.0;
     voxelHeatFlux[bufferId0].NPPshaded = 0.0;
 
+    // 步骤 4：按体元类别分支。土壤/建筑：只写本地土壤表面阻抗 rss（受阳、阴同值），不做光合；
+    // 水体：用水体参数的 rss（不小于 0）；植被：进入下面的光合—气孔耦合计算。
     if(typeId == TYPE_SOIL || typeId == TYPE_BUILDING)
     {
         rss = localSoilResistance(bufferId0, bioId);
@@ -101,6 +132,7 @@ void main()
     else if(typeId == TYPE_VEGETATION)
     {
         canopy = canopies[canopyId];
+        // 参与介质冠层（按介质方式处理）不在此算叶片生化，直接退出（待核对）。
         if(isParticipatingMedium(canopy)) return;
         qLs = leafBios[bioId].qLs;
         NPQs = leafBios[bioId].kNPQs;
@@ -114,6 +146,8 @@ void main()
 		stress = leafBios[bioId].stressfactor;
 		hcmax = canopy.height;
 
+        // 步骤 5：检查叶片生化参数的有效性（有限值、范围、光合途径 Type 只能为 3 或 4）。
+        // 任何一项无效都会让后面该体元的输出写成缺测值（biochemicalMissing），而不是带着坏参数计算。
         bool leafParametersValid = biochemicalFinite(qLs) && qLs >= 0.0 && qLs <= 1.0 &&
             biochemicalFinite(NPQs) && NPQs >= 0.0 &&
             biochemicalFinite(vcmax) && vcmax >= 0.0 &&
@@ -124,16 +158,21 @@ void main()
             biochemicalFinite(stress) && stress >= 0.0 && stress <= 1.0 &&
             biochemicalFinite(hcmax) && hcmax > 0.0 && (Type == 3.0 || Type == 4.0);
 
+        // 步骤 6：冠层内 Vcmax 随深度指数衰减：xl = -(冠层顶深度)/冠高 ∈ [-1,0]，
+        // 即顶部 xl=0、底部 xl=-1；Vcmo = Vcmax·exp(kv·xl)，kv 通常为正，故越深 Vcmax 越小（待核对符号）。
+        // voxelPos0.y*scale 为体元中心高度（m）；参数无效时 xl 取 0 避免除以非法冠高。
         xl = leafParametersValid ? (hcmax - voxelPos0.y*scale)*(-1.0)/hcmax : 0.0;
 		xl = clamp(xl,-1,0);
         Vcmo = vcmax * exp(kv*xl);
  
+        // 步骤 7：取受阳/阴叶温。数值 < 100 判为摄氏度并加 273.15 转成 K（兼容两种单位的输入）。
         float Tsunlit,Tshaded;
         Tsunlit = voxelTempes[bufferId0].sunlit < 100.0 ?
             voxelTempes[bufferId0].sunlit + 273.15 : voxelTempes[bufferId0].sunlit;
         Tshaded = voxelTempes[bufferId0].shaded < 100.0 ?
             voxelTempes[bufferId0].shaded + 273.15 : voxelTempes[bufferId0].shaded;
 
+		// 步骤 8：对两个节点循环：kt=0 受阳叶，kt=1 阴叶。
 		for(int kt = 0;kt<2;kt++)
 		{
 			
@@ -146,20 +185,28 @@ void main()
 			}
 
 			// kt = 0 is sunlit; VoxelAir indexes [0] shaded, [1] sunlit.
+			// voxelAirs 的状态下标与 kt 相反：[0] 阴、[1] 阳，故 state = 1 - kt。
 			int state = 1 - kt;
 			// Each node's first pass starts from this node's ambient air, not the
 			// leaf-surface values left by the previous node.
+			// 叶表面水汽压 es（hPa）与 CO2 浓度 cs（ppm）：能量迭代第 0 轮用体元环境空气值，
+			// 之后沿用上一轮结果（叶表面值）。注意：RH 用叶温下的饱和水汽压归一并限制在 [0,1]。
 			float esLeaf = setting.energyIteration == 0 ? localVaporPressureHpa(bufferId0) : voxelAirs[bufferId0].es[state];
 			float csLeaf = setting.energyIteration == 0 ? localAmbientCo2Ppm(bufferId0) : voxelAirs[bufferId0].cs[state];
 			RH = clamp(esLeaf / es_fun(Tc-273.15), 0.0, 1.0);
+            // 单位换算：p(Pa)·1e-6 为 ppm 折算的分压(Pa)，再 ×1e-5 得 bar，合 p·1e-11（ppm → bar）。
             float ppmToBar = p * 1e-11;
 			cs = csLeaf * ppmToBar;
 
 			O = ubom.meteo.Oa;
+			// O2 浓度（meteo.Oa，单位应为 mmol/mol）折算成分压（bar）。
 			O = O * p * 1e-8;
+			// 吸收辐射 Q（来自 voxelPnets，是否为 PAR 待核对）：阴叶只接受散射部分，阳叶额外加上直射部分。
 			Q = voxelPnets[bufferId0].diffusePnet;
 			if(kt == 0) Q += voxelPnets[bufferId0].directPnet;
 
+            // 步骤 9：输入检查。叶温、气压、浓度、辐射任一非有限或越界，则该节点的 GPP、NPP、
+            // voxelRsss（阻抗）与胞间 CO2（ci）全部写成缺测值，并跳过本节点（continue）。
             if(!leafParametersValid || !biochemicalFinite(Tc) || Tc <= 0.0 ||
                !biochemicalFinite(p) || p <= 0.0 ||
                !biochemicalFinite(ppmToBar) || ppmToBar <= 0.0 ||
@@ -187,6 +234,9 @@ void main()
                 continue;
             }
 
+			// 步骤 10：设定参考温度（25°C）下的光合参数：呼吸 Rdopt 为 Vcmo 的比例；
+			// C3 的 Jmo = 2.68·Vcmo；C4 的 Jmo = 40/6·Vcmo，另有 PEP 羧化 Vpmo 与 bundle sheath 导度 gbs。
+			// SCOOP 为 Rubisco 对 CO2/O2 的特异性因子（待核对单位）。
 			SCOOP = 2862;
 			Rdopt = Rdparam * Vcmo;
 			if(Type < 3.5)
@@ -203,6 +253,9 @@ void main()
 
 			//---------------------------------------------------------------------------------------------------------
 			//% Parameters for voxelTempe corrections
+			// 步骤 11：温度响应参数。各 HA*/HD* 为活化/失活能（kJ/mol），DELTAS* 为熵项（kJ/mol/K），
+			// C3 取 Kattge & Knorr (2007)、Bernacchi et al. (2001)，C4 取 Massad et al. (2007)、Chen et al. (1994)。
+			// Tyear 用于熵项的温度驯化（仅 C3）。
 			TREF = 25 + 273.15;                             // [K]            reference voxelTempe for photosynthetic processes
 
 			HARD = 46.39;                                 // [kJ/mol]       activation energy of Rd
@@ -257,12 +310,16 @@ void main()
 
 			//---------------------------------------------------------------------------------------------------------
 			//% Corrections for effects of voxelTempe and non-stomatal limitations
+			// 步骤 12：温度订正。dum1 = R·Tc、dum2 = R·TREF（kJ/mol，R 为气体常数 J/mol/K）。
+			// Rd 用 Arrhenius 形式；SCO（Rubisco 对 CO2 特异性）随叶温订正（Bernacchi et al. 2001）。
 			dum1 = R / 1000 * Tc;                                  // [kJ/mol]
 			dum2 = R / 1000 * TREF;                               // [kJ/mol]
 
 			Rd = Rdopt*exp(CRD - HARD / dum1);                  // [umol/m2/s]    mitochondrial respiration rates adjusted for voxelTempe (Bernacchi et al. 2001)
 			SCO = SCOOP / exp(CGSTAR - HAGSTAR / dum1);            // []             Rubisco specificity for CO2 adjusted for voxelTempe (Bernacchi et al. 2001)
 
+			// Jmax / Vcmax：Arrhenius 活化项 × 高温失活的峰值型修正（Kattge & Knorr 2007；Massad et al. 2007），
+			// 乘 (1+exp(..TREF..)) 再除 (1+exp(..Tc..)) 保证 Tc=TREF 时回到参考值 Jmo / Vcmo。
 			Jmax = Jmo * exp(HAJ*(Tc - TREF) / (TREF*dum1));
 			Jmax = Jmax*(1. + exp((TREF*DELTASJ - HDJ) / dum2));
 			Jmax = Jmax / (1. + exp((Tc*DELTASJ - HDJ) / dum1));     // [umol e-/m2/s] max electron transport rate at leaf voxelTempe (Kattge and Knorr 2007; Massad et al. 2007)
@@ -277,6 +334,9 @@ void main()
 			if (Type < 3.5)
 			{
 				// C3// species
+				// 步骤 13：Michaelis 常数订正。C3 用 Arrhenius（Kc、Ko），Kc/Ko 先乘 1e-11·p、1e-8·p
+				// 由 µmol/mol、mmol/mol 折算为 bar；C4 另算 PEP 羧化酶最大速率 Vpmax，
+				// Kc、Ko、Kp 用 Q10 形式（pow(Q10, (Tc-TREF)/10)）。
 				CKC = 1000 * HAKC / (R*TREF);                     // []             scaling factor in KC response to voxelTempe
 				Kc = KCOP*exp(CKC - HAKC / dum1)*1e-11*p;     // [bar]          Michaelis constant of carboxylation adjusted for voxelTempe (Bernacchi et al. 2001)
 
@@ -300,6 +360,9 @@ void main()
 
 			//---------------------------------------------------------------------------------------------------------
 			//% Define electron transport and fluorescence parameters
+			// 步骤 14：PSII 电子传递与荧光参数（速率常数 s-1）。qLs（开放反应中心比例）与 NPQs
+			// 把胁迫情景下的光化学速率 kps、热耗散 kDs、潜在电子传输上限 Jms 都折减；
+			// THETA 为光响应曲线的凸度（Genty et al. 1989；Porcar-Castell 2011）。
 			kf = 3.E7;                                    // [s-1]         rate constant for fluorescence
 			kD = 1.E8;                                   // [s-1]         rate constant for thermal deactivation at Fm
 			kd = 1.95E8;                                    // [s-1]         rate constant of energy dissipation in closed RCs (for theta=0.7 under un-stressed conditions)
@@ -317,6 +380,8 @@ void main()
 
 																	//---------------------------------------------------------------------------------------------------------
 																	//% Calculation of electron transport rate
+			// 步骤 15：电子传输速率 J：Q2 为被 PSII 吸收并转化的激发（beta 为 PSII 分配比例，po0 为量子产额），
+			// J 取 theta·J² - (Q2+Jms)·J + Q2·Jms = 0 的较小根（数值稳定实现见 functions.glsl）。
 			Q2 = beta * Q * po0;
 			J = biochemicalElectronTransport(Q2, Jms, THETA);
 
@@ -325,6 +390,9 @@ void main()
 			if (Type < 3.5)                                           // C3 species, based on Farquhar model (Farquhar et al. 1980)
 			{
 
+				// 步骤 16a（C3，Farquhar 模型）：CO2 补偿点 GSTAR、由 Ball-Berry 得胞间 Ci（下限取 GSTAR），
+				// Wc（Rubisco 限制）与 Wj（电子传递限制）取小者；Ag = (1 - GSTAR/Cc)·W，A = Ag - Rd；
+				// Ja 为实际使用的电子传输速率，用于后面的 PSII 产额（Cc>0 的保护避免除零）。
 				GSTAR = 0.5*O / SCO;                             // [bar]             CO2 compensation point in the absence of mitochondrial respiration
 				Ci = biochemicalIntercellularCO2(cs, GSTAR, leafM, RH, stress);
 				// [bar]             intercellular CO2 concentration from Ball-Berry model (Ball et al. 1987)
@@ -341,6 +409,9 @@ void main()
 			}
 			else                                             // C4 species, based on von Caemmerer model (von Caemmerer 2000)
 			{
+				// 步骤 16b（C4，von Caemmerer 2000 完整模型）：Ci 下限 9.9e-6·p·1e-5（约 9.9 ppm 折算为 bar），
+				// Ac（酶限制）与 Aj（光限制）各自求一元二次方程（a、b、c 系数中 dum1~dum10 为复用的中间量），
+				// A 取二者较小者；两者任一无效则记缺测。
 				Ci = biochemicalIntercellularCO2(cs, 9.9e-6*(p*1e-5), leafM, RH, stress);
 				// [bar]             intercellular CO2 concentration from Ball-Berry model (Ball et al. 1987)
 				Cm = Ci;                                     // [bar]             mesophyll CO2 concentration (neglecting mesophyll resistance)
@@ -379,6 +450,8 @@ void main()
 				Ja = J;                                      // [umole-/m2/s]     actual electron transport rate, CO2-limited
 
 
+				// 若 A 受 Ac 限制，需重新由二次方程反求实际电子传输速率 Ja（上限不超过 J）；
+				// 系数已整体乘以 A，避免补偿点附近 1/A 奇异（见下方原注释）。
 				if (biochemicalFinite(A) && A == Ac && J > 0.0)
 				{
 
@@ -410,14 +483,19 @@ void main()
 
             // Closed stomata and darkness have zero gross assimilation while
             // mitochondrial respiration continues. This also covers qLs=0.
+            // 步骤 17：黑暗或气孔关闭等极端情形的统一处理：总同化为 0、净同化 = -Rd（呼吸仍进行）。
             if(Q == 0.0 || J == 0.0 || leafM == 0.0 || RH == 0.0 || stress == 0.0 || cs == 0.0)
             {
                 Ag = 0.0;
                 A = -Rd;
                 Ja = 0.0;
             }
+            // 步骤 18：由 cs、Ci 和净同化 A 反推叶片阻抗 rss（A<=0 时取 625000 的大阻抗，
+            // 单位为 s m-1，待核对）；ciPpm 为胞间 CO2 折回 ppm，供后续步骤写回 voxelAirs。
             rss = biochemicalResistance(cs, Ci, A, rhoa, Mair, p);
             float ciPpm = Ci / ppmToBar;
+            // 步骤 19：结果有效性检查：先检查中间速率（ratesValid），再检查输出（resultValid）。
+            // 任何一项非有限或越界，Ag、A、Ci、ciPpm、rss 全部置缺测（NaN），避免把假的碳通量传给下游。
             bool ratesValid = biochemicalFinite(Vcmo) && Vcmo >= 0.0 &&
                 biochemicalFinite(Vcmax) && Vcmax >= 0.0 &&
                 biochemicalFinite(Jmax) && Jmax >= 0.0 &&
@@ -454,6 +532,7 @@ void main()
 
 			//---------------------------------------------------------------------------------------------------------
 			//% Calculation of PSII quantum yield and fluorescence
+			// PSII 实际量子产额 ps（当前只算出，后面荧光产额 fs 的计算已被注释掉，未写出）。
 			ps = beta*Q > 0.0 ? Ja / (beta*Q) : 0.0;
 														//fs   = MD12(ps,Ja,Jms,kps,kf,kds,kDs);            // [E/E]         PSII fluorescence yield
 														// eta    = fs/fo0;                                   // []            scaled PSII fluorescence yield
@@ -469,6 +548,8 @@ void main()
 			{
 				atomicStore( voxelRsss[bufferId0].shaded,rss, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
 			}
+			// 步骤 20：写回 rss（voxelRsss.sunlit/shaded，已在上面按 kt 写出）与胞间 CO2（ppm，按 state 下标），
+			// 供能量平衡迭代读取，并在下一轮能量迭代中作为叶表面 CO2/阻抗的初值（待核对读取方）。
 			atomicStore( voxelAirs[bufferId0].ci[state],ciPpm, gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
 
 		}

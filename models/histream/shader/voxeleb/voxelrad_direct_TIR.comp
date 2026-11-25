@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：voxelrad_direct_TIR.comp
+// 功能：VoxelEB 中热红外（TIR）波段的“直射”长波分量（directTrad）计算着色器。
+//       当前实现已禁用：天空向下长波 Rli 被视为半球均匀入射，由 voxelrad_diffuse_TIR_single.comp
+//       计入 diffuseTrad，为避免重复计算，本文件在清零 directTrad 后立即 return。
+// 主要模块/步骤：
+//   1. 编译期设置：扩展、include、波段常量（NUM_VNIR=2001 为 TIR 波段起点，NUM_BAND=2002）
+//   2. main：每线程一个体元；读取体元/网格/光谱属性；
+//      清零 voxelNetRads[].directTrad；随即 return（return 之后为保留的旧实现，不会执行）
+//   3. （死代码）旧实现：对 TIR 波段按 Rli·direct·带宽×吸收率累加到 directTrad，
+//      植被按太阳天顶余弦与 LAI 做修正
+// 数据流：输入 voxelLinks、meshLinks、spectralMaterials、voxelDirs、atomConds、ubom.meteo；
+//         输出 voxelNetRads[bufferId0].directTrad（当前恒为 0）
+// 与其他文件的关系：与 voxelrad_diffuse_TIR_single.comp（实际承担 TIR 入射长波）配套；
+//   include ../bindinglayout.h 等公共头；对应的短波版本为 voxelrad_direct_VNIR.comp
+// 注意：GammaR/GammaT 数组在本文件中未使用；return 之后的代码为不可达代码（仅报告，不改）
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -37,11 +55,14 @@ layout(local_size_x = GROUP_SIZEX) in;
 #define NUM_VNIR 2001 
 #define NUM_BAND 2002
 
+// 以下两个数组在本文件中未被引用（疑似从散射着色器拷贝而来的遗留声明）。
 float GammaR[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 float GammaT[DIFFUSE_ANGLE_NUM * DIFFUSE_ANGLE_NUM];
 
 
 
+// 模块：主入口，每线程处理一个体元（bufferId0）。
+// 输入：体元索引与光谱材料；输出：voxelNetRads[bufferId0].directTrad（当前被清零后直接返回）。
 void main()
 {
     //------------------------------------------------------------
@@ -64,13 +85,17 @@ void main()
     int faceId = voxelLinks[bufferId0].faceId;
     // if(primId0 - faceid0*10 == 0) return; 
     uint canopyId = meshLinks[meshId].canopyId;
+    // 步骤 1：清零直射 TIR 分量。
     voxelNetRads[bufferId0].directTrad = 0;
 
+    // 步骤 2：提前返回。（以下代码不可达，保留作为旧实现参考。）
     // Rli is hemispherical downwelling longwave and is handled by diffuseTIR.
     // Keeping a directional component here would count the same sky flux twice.
     return;
 
 
+    // 以下为旧实现（不可达）。注：行尾旧注释（measurement height / wind speed）与变量实际
+    // 含义不符，Rli 为天空向下长波辐射（疑似遗留注释，仅报告）。
     float Rin = ubom.meteo.Rin;               // measurement height 
     float Rli = ubom.meteo.Rli;               // wind speed
     float cosSolar = abs(normalize(lightSet.direction).y);
@@ -78,6 +103,8 @@ void main()
     // Iteration in TIR band
     //---------------------------------------------------
     float alpha_toSolar = voxelDirs[bufferId0].solar; 
+    // 步骤 3（旧实现）：遍历 TIR 波段；带宽由相邻波长差得到，
+    // rad = Rli · atomConds.direct · 0.001 · 带宽（0.001 的单位换算待核对），再乘吸收率。
     for(int kband = NUM_VNIR; kband < NUM_BAND; kband++)
     {
         // solar direct radiance: lightSet.Rin*atomCondss[kband].direct*0.001
@@ -89,6 +116,8 @@ void main()
         float bandwidth = atomConds[kband].wavelength - band0;
         float rad = Rli * atomConds[kband].direct * 0.001 * bandwidth;//  * absorb;
 
+        // 植被：把水平面辐照按太阳天顶余弦折算到垂直入射面（cosSolar 下限 0.05 防止除零），
+        // 再乘 0.5（随机叶向的一面受照）；变量 s、a 等为未使用的中间量。
         if (typeId == TYPE_VEGETATION){
             if (cosSolar > 0.05){ //
                 rad = rad / cosSolar;

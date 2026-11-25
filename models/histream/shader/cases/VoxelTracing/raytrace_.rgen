@@ -1,3 +1,19 @@
+// ==========================================================================
+// 文件：VoxelTracing/raytrace_.rgen
+// 功能：VoxelTracing 旧方案中用 RT 管线做的“命中探测/调试”raygen 着色器：每个像素发一条相机主射线，
+//   把命中着色器/miss 着色器写入 payload 的数值（hitID.id）原样写入 outImage。
+// 主要模块/步骤：
+//   1. 声明 payload hitID（location 0）
+//   2. main：由 sensorMatrix 的逆矩阵生成像素中心的针孔相机射线 → traceRayEXT →
+//      把 hitID.id 写入该像素所有波段（id > 9999999 视为无效，写 -99）
+//   3. 文件末尾是被注释掉的两条固定探测射线（调试遗留）
+// 数据流：输入 sensorMatrix、settingxml.imageSize、topLevelAS；输出 outImage[bufferId + kband]，
+//   bufferId = waveNum*(y*宽+x)。hitID.id 由 raytrace_.rchit（命中：-70）/ raytrace_.rmiss（未命中：-80）
+//   设置，因此输出图像是命中分类图而非辐亮度（raytrace2_.rchit 可改为输出命中距离）。
+// 与其他文件的关系：同目录 raytrace_.rchit / raytrace2_.rchit / raytrace_.rmiss / raytraceShadow_.rmiss。
+// 归档说明：cases/ 为历史变体副本，include 的 "../xxx" 相对 shader/<子目录>（待核对）。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -18,6 +34,7 @@
 #extension GL_KHR_memory_scope_semantics:require
 #extension GL_EXT_shader_atomic_float: require 
 
+// 模式开关宏：被共用头文件用来选择体元追踪分支。
 #define VOXELTRACING 1
 
 #include "../bindinglayout.h"
@@ -29,8 +46,11 @@
 #include "../shade_state_voxel.glsl"
 #include "../random.glsl"
 
+// 主光线载荷：hitValue.id 由 closest-hit / miss 着色器写入，raygen 读取后输出。
 layout(location = 0) rayPayloadEXT hitValue hitID;
 
+// 作用：每个像素发射一条相机主射线，并把 hitID.id 写入 outImage 的各波段。
+// 步骤：1 计算缓冲下标；2 取像素中心 → NDC（d ∈ [-1,1]）→ 相机射线；3 traceRayEXT；4 写输出。
 void main()
 {
     vec2 imageRes    = settingxml.imageSize;
@@ -48,6 +68,8 @@ void main()
 	vec4 target    = sensorMatrix.projInverse * vec4(d.x, d.y, 1, 1);
 	vec4 direction = sensorMatrix.viewInverse * vec4(normalize(target.xyz), 0);
 
+    // 步骤 3：只需知道是否命中，故命中即终止（不要求最近交点）。最小距离 0.001，最大 INFINITY。
+    //   missIndex = 0：未命中时由 raytrace_.rmiss 把 id 设为 -80。
     uint  rayFlags = gl_RayFlagsTerminateOnFirstHitEXT;//gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT;
     float tMin     = 0.001;
     float tMax     = INFINITY;
@@ -68,6 +90,7 @@ void main()
     for(int kband = 0; kband < sensorMatrix.waveNum;kband++)
     {
         //Radiance[kband] = prd.primitiveID;
+        // 步骤 4：id 作为输出值；大于 9999999 的视为无效（如未初始化/极大值），统一写 -99。
         float abc = hitID.id;
         if(abc > 9999999)
         {

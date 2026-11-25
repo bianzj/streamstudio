@@ -1,3 +1,36 @@
+// ==========================================================================
+// 文件：RayTracing_Hapke/offline.rgen
+// 功能：RayTracing 模式（Hapke 版）的离线光线生成着色器（Vulkan RT raygen）。每个发射线程对应
+//       传感器图像的一个像素，对该像素做 maxSample 次蒙特卡洛路径追踪，输出每个波段的平均辐亮度。
+//       “Hapke 版”指土壤/建筑的热发射率用 Hapke 方向发射率 Emissivity_Hapke(cosθ, SSA, POROSITY)，
+//       而不是 Lambert 版的固定发射率（见 ../RayTracing_Lambert/offline.rgen）。
+// 主要模块/步骤：
+//   1. 扩展与全局包含（global/parameters/bsdf/shade_state/bindinglayout），声明两个光线载荷
+//      prd（location 0，主光线）与 shadow_payload（location 1，阴影光线）
+//   2. ClosestHit / AnyHit：对 traceRayEXT 的封装（求最近交点 / 遮挡测试）
+//   3. DirectLighting：下一事件估计，累加太阳直射、地物热发射、天空漫射三项贡献
+//   4. InDirectLighting：BSDF 采样下一方向，并更新各波段路径吞吐量 Throughput
+//   5. PathTrace：路径循环（俄罗斯轮盘赌、命中天空时加天空热辐射、直接+间接光照）
+//   6. SamplePixel：生成像素内抖动的相机光线并调用 PathTrace
+//   7. main：多次采样平均，并以原子写入把各波段辐亮度写到 outImage 缓冲
+// 数据流：
+//   输入：sensorMatrix（视图/投影逆矩阵、波段数 waveNum）、sensorWaveInds/waveSets（波段与波长）、
+//         spectralMaterials（反射/透射率）、thermalMaterials（向阳/阴影面温度）、lightSet（太阳方向、
+//         直射/漫射比例、天空温度）、settingxml（图像尺寸、采样数、最大深度、是否计算温度）；
+//   输出：outImage[bufferId + kBand]，bufferId = waveNum*(y*宽+x)，即按像素-波段交错存放。
+// 与其他文件的关系：同目录 rmiss.rmiss / shadow.rmiss 为主光线与阴影光线的 miss 着色器；
+//   最近命中着色器见共用着色器；BSDF 采样、Planck、Emissivity_Hapke 等在 ../bsdf.glsl 与
+//   ../functions.glsl；材质/场景绑定见 ../bindinglayout.h。
+// 重要约定：
+//   - 波长单位 μm；若读到的波长 > 50 则按 nm 处理并除以 1000；
+//   - 波长 < 7.5 μm 的波段计入太阳反射/透射（短波），波长 > 2.5 μm 的波段计入热发射，
+//     2.5–7.5 μm 两项叠加（中红外）；
+//   - 世界坐标系 y 轴向上（upWorld = (0,1,0)）；切线空间法线为 +z，CosThetaTangent = |v.z|；
+//   - CoefficientOfBSDF/SampleBSDF 返回 ±1/π：符号随机，+ 表示反射分支、- 表示透射分支，
+//     各占 50%（见 ../bsdf.glsl）；
+//   - 辐亮度的物理单位由 Planck 与光照输入决定（待核对）。
+// ==========================================================================
+
 #version 460
 #extension GL_GOOGLE_include_directive : enable         // To be able to use #include
 #extension GL_EXT_ray_tracing : require                 // This is about ray tracing
@@ -26,14 +59,23 @@
 #include "../shade_state.glsl"
 #include "../bindinglayout.h"
 
+// 光线载荷：prd 用于主光线（命中信息、随机数种子），shadow_payload 用于阴影光线。
 layout(location = 0) rayPayloadEXT PtPayload prd;
 layout(location = 1) rayPayloadEXT ShadowHitPayload shadow_payload;
 
+// 线程私有的逐波段数组（最多 25 个波段）：
+// Radiance    - 当前一次采样的辐亮度累计；
+// RadianceSum - 多次采样的辐亮度之和；
+// Throughput  - 路径吞吐量（沿路径累乘的 BSDF·cosθ/pdf），每次采样起点为 1。
 float Radiance[25];
 float RadianceSum[25];
 float Throughput[25];
 
 //  call vulkan API to get collision information.
+// 作用：沿射线求最近交点（调用 Vulkan 光追管线），结果写入 prd（hitT 等）。
+// 输入：射线 r（origin/direction），最小距离 Lmin（避免自相交）；
+// 说明：hitT 先置为 INFINITY，没有命中时由 miss 着色器保持该值，调用方据此判断射线是否射出场景。
+//       只用 Opaque 标志，不区分透明材质（透射由 BSDF 采样处理）。
 void ClosestHit(Ray r,float Lmin)
 {
 	// uint rayFlags = gl_RayFlagsNoneEXT;
@@ -54,6 +96,9 @@ void ClosestHit(Ray r,float Lmin)
 }
 
 //  used in ray tracing pipeline, similar to cloestHit().
+// 作用：阴影/遮挡测试，返回射线沿方向是否被场景挡住。
+// 说明：先假设被遮挡（isHit = true），由 shadow miss 着色器（missIndex = 1）在未命中时改为 false；
+//       最小距离 0.011 用于跳过出发面自身。maxDist 形参未使用，射线最大距离固定为 INFINITY。
 bool AnyHit(Ray r, float maxDist)
 {
     shadow_payload.isHit = true;      // Asume hit, will be set to false if hit nothing (miss shader)
@@ -78,6 +123,13 @@ bool AnyHit(Ray r, float maxDist)
 }
 
 // wi: in direction; wo: out direction; *World: direction in world coordinates.
+// 作用：在命中点做下一事件估计（NEE），把三项直接贡献累加进 Radiance[]：
+//   (a) 太阳直射的反射/透射（波长 < 7.5 μm）；
+//   (b) 地物自身热发射（isTemperature == 1 且波长 > 2.5 μm），向阳/阴影面用不同温度；
+//   (c) 天空漫射（lightSet.direct < 0.99 时），用 BSDF 采样 + MIS 权重。
+// 输入：position 命中点；woWorld 出射（观察）方向；sstate 命中点着色状态；kDepth 当前深度（未使用）。
+// 约定：wi 为入射方向（指向光源），wo 为出射方向；带 World 后缀为世界坐标，否则为切线空间。
+// 副作用：修改全局数组 Radiance[]，并消耗 prd.seed 的随机数。
 bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
 {
   uint matIndex0 = sstate.spectralId * sensorMatrix.waveNum;  // spectral index of band0 for spectralId
@@ -86,11 +138,14 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
   vec3 emitterWi = World2Tangent(sstate.normal, sstate.tangent, sstate.binormal, emitterWiWorld); // sun direction in local coordinates.
 
   // Judge whether it is exposed to the sun (to avoid self collision, perform small translation of the origin position)
+  // 步骤 1：向太阳方向发阴影光线。ffnormal 为朝向太阳一侧的法线，起点沿它偏移一小段以避免自相交。
   vec3 ffnormal = dot(sstate.normal, emitterWiWorld) <= 0.0 ? -sstate.normal : sstate.normal;
   vec3 origin = OffsetRay(position, ffnormal);
   Ray shadowRay = Ray(origin, emitterWiWorld);
   bool inLightShadow = AnyHit(shadowRay, OUTER);
   
+  // 步骤 2：太阳直射项。仅当该点未被遮挡时累加；波长 < 7.5 μm 的波段才有太阳辐射。
+  //   观察方向与太阳在表面同侧用反射率，否则用透射率（叶片透射）；|bsdf0| = 1/π（朗伯）。
   // sun distribution
   if(!inLightShadow)
   {
@@ -121,6 +176,10 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
 
   }
 
+  // 步骤 3：热发射项。只在 isTemperature == 1 时计算；向阳点取 sunlitTemperature，阴影点取
+  //   shadedTemperature。植被发射率 = 1 - 反射率 - 透射率（基尔霍夫定律）；土壤/建筑用
+  //   Hapke 方向发射率，随观察天顶角变化（SSA = 单次散射反照率，POROSITY 为孔隙度因子）。
+  //   注意 inSameSide 在本段未被使用。
   // emission distribution
   if(settingxml.isTemperature == 1)
   {
@@ -168,9 +227,15 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
     }
   }
 
+  // 步骤 4：天空漫射项（lightSet.direct < 0.99 时才有漫射成分）。
+  //   对天空半球做两次独立的余弦加权采样：emitter 采样（上面一块）与 scatter 采样（下面一块），
+  //   分别用 weight = 0.5 与 PowerHeuristic(scatterPr, emitterPr) 做多重重要性采样权重；
+  //   方向若朝下（与 upWorld 点积 <= 0）则取反，保证射向天空半球。
+  //   天空辐亮度取 lightSet.diffuse/π（各向同性漫射）。
   // sky distribution
   if(lightSet.direct < 0.99)
   {
+    // 此处重新声明的 emitterWi / emitterWiWorld 遮蔽了前面太阳方向的同名变量，仅在本块内有效。
     vec3 emitterWi, scatterWi;
     float emitterBsdf0, emitterPr, emitterBsdf;
     float scatterBsdf0, scatterPr, scatterBsdf;
@@ -218,6 +283,8 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
       }
     }
 
+    // 第二次采样（scatter）：只有第一次采样 pdf 非零时才进行。注意下面循环用 waveSets[kBand]
+    // 而非 sensorWaveInds[kBand].value 取波长（与上面 emitter 循环不一致，疑似遗漏，待核对）。
     if(emitterPr != 0.0)
     {
       SampleBSDF(prd.seed, scatterWi, scatterBsdf0, scatterPr);
@@ -263,6 +330,14 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
   return true;
 }
 
+// 作用：对 BSDF 采样出下一段路径方向 wiWorld，并把本次散射的 bsdf·cosθ/pdf 累乘到各波段 Throughput。
+// 输入：命中点 position、出射方向 woWorld、着色状态 sstate；输出：wiWorld（世界坐标下一方向）。
+// 说明：
+//   - 透射率 < EPSION 的不透明材质：植被取反射率；土壤/建筑取 1 - Hapke 发射率（基尔霍夫
+//     定律下的 Hapke 半球反射率近似）；
+//   - 否则按 bsdf0 的符号选透射(-)/反射(+)，吞吐量多乘一个 2.0（因随机二选一的概率为 0.5）；
+//   - 若采样方向与分支（反射/透射）和出射方向的同侧关系不一致，则把方向取反，
+//     保证反射时回到入射侧、透射时穿到对侧。
 bool InDirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth, out vec3 wiWorld)
 {
   float bsdf0, pr;
@@ -318,11 +393,17 @@ bool InDirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth
   return true;
 }
 
+// 作用：路径追踪主循环，直到深度达到 settingxml.maxDepth 或被俄罗斯轮盘赌终止。
+// 返回值：false 表示相机光线（深度 0）就没打到场景；true 表示路径已处理（含射向天空）。
+// 每个深度的步骤：RR 终止 → 求最近交点 → 射出场景则加天空热辐射 → 否则直接光照 +
+// 采样下一方向并更新起点。
 // Cyclic iteration of ray collisions.
 bool PathTrace(Ray r)
 {
   for(int kDepth = 0; kDepth < settingxml.maxDepth; kDepth++)
   {
+    // 步骤 1：俄罗斯轮盘赌，只从第 10 次弹射起启用。继续概率 = 1 - max 吞吐量，且停止概率
+    // 不低于 0.05；幸存路径把吞吐量除以 (1 - pCont) 以保持无偏。
     // Russian roulette termination.
     if(kDepth >= 10)
     {
@@ -344,8 +425,12 @@ bool PathTrace(Ray r)
       }
     }
 
+    // 步骤 2：求最近交点（最小距离 1e-4）。
     ClosestHit(r, 0.0001);
 
+    // 步骤 3：射线射出场景。首跳（kDepth == 0）即未命中 → 该采样无效；
+    //   之后射出场景表示看见天空：热波段（> 2.5 μm）加天空温度对应的 Planck 辐亮度。
+    //   （短波的天空辐射已经在 DirectLighting 里以 NEE 方式计入，这里不重复。）
     // if hit outside the scene(PS: the started data segment is 0.)
     if(prd.hitT == INFINITY)
     {
@@ -364,6 +449,8 @@ bool PathTrace(Ray r)
       return true;
     }
 
+    // 步骤 4：由命中信息构造着色状态（位置/法线/材质/上一位置），woWorld 为从上一点指向本点的方向，
+    //   然后依次做直接光照与间接光照（采样下一方向），最后把新射线起点沿法线偏移避免自相交。
     ShadeState sstate = GetShadeState(prd);
     vec3 position = sstate.position;
     vec3 normal = sstate.normal;
@@ -384,6 +471,10 @@ bool PathTrace(Ray r)
   return true;
 }
 
+// 作用：对一个像素做一次采样：生成相机射线，清零 Radiance/Throughput，调用 PathTrace。
+// 说明：第 0 次采样取像素中心，其余随机抖动，实现像素内抗锯齿/面积平均。
+//       光圈/焦距部分（focalPoint、randomAperturePos、finalRayDir）已计算但最终射线用的是
+//       未扰动的 direction（即退化为针孔相机），景深参数实际未生效。
 void SamplePixel(int kSample, ivec2 imageCoords, ivec2 imageResolution)
 {
   // For each sampling of a pixel, its inital postion and direction are randomly generated.
@@ -412,11 +503,15 @@ void SamplePixel(int kSample, ivec2 imageCoords, ivec2 imageResolution)
     Throughput[kBand] = 1.0;
   }
 
+  // 注意：此处用 direction 而非 finalRayDir，因此上面的景深计算不影响结果。
   Ray ray = Ray(origin.xyz, direction.xyz);
   PathTrace(ray);
 
 }
 
+// 作用：raygen 入口。每个线程处理一个像素：多次采样并平均，把各波段辐亮度写入 outImage。
+// 步骤：1 初始化随机数种子（由像素坐标和帧号决定）；2 循环 maxSample 次采样并累加；
+//       3 取平均；4 原子写入输出缓冲。
 void main()
 {
 	uint64_t start = clockRealtimeEXT();  // Debug - Heatmap
@@ -433,6 +528,9 @@ void main()
     RadianceSum[kBand] = 0.0;
   }
 
+  // 步骤 2：多次采样累加。只有某次采样存在 Radiance > EPSION 的波段才计为有效采样，
+  //   平均时除以有效采样数 validNum（没射中场景的采样不稀释结果；
+  //   若 validNum == 0 会除以 0，得到 NaN/Inf，待核对）。
   int validNum = 0;
   for(int kSample = 0; kSample < settingxml.maxSample; kSample++)
   {
@@ -456,6 +554,7 @@ void main()
 		Radiance[kBand] = RadianceSum[kBand]/validNum;
 	}
 
+	// 步骤 4：用原子 store 把各波段结果写入 outImage（Release 语义，保证后续计算着色器可见）。
 	// Write result into _bufferstorage(layout buffer)
 	for(int kBand = 0; kBand < sensorMatrix.waveNum; kBand++)
 	{

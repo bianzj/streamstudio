@@ -1,12 +1,29 @@
+// ==========================================================================
+// 文件：faceteb/radiosity.comp（FacetEB）
+// 功能：FacetEB 辐射度（radiosity）的一次 Jacobi/松弛迭代：每个面元两侧同时更新。
+// 主要模块/步骤：
+//   1. CSR 边表（visibility_resolve.comp 生成）按射线数加权求各侧入射辐射 incoming()
+//   2. 加直射辐照度得到总入射 h；由反射/透射/自发射得到目标辐射度 target
+//   3. 用松弛因子混合新旧值（mix），写入另一个缓冲（ping-pong）
+//   4. 用 atomicMax 记录本轮最大变化量，供主机判断收敛
+// 数据流：visibility_resolve.comp 的 rowOffsets/edges/denominators/skyCounts/groundCounts → 本着色器（反复调用）→ radiosityA/B；ground_mean.comp 每轮先更新 groundMean；收敛后 incident.comp 求入射辐照度
+// 注意：一个线程处理一个面元（两侧一起算，因为透射项耦合两侧）
+// 注意：ping=0 时读 A 写 B，ping=1 时读 B 写 A
+// 注意：maxDeltaBits 存的是非负 float 的位模式，uint 的 atomicMax 与数值序一致
+// ==========================================================================
+
 #version 460
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// CSR 边：neighbor = 邻接面元侧编号；count = 该方向采样射线数（权重）。
 struct CsrEdge {
     uint neighbor;
     uint count;
 };
 
+// 每侧光学参数：reflectance 反射率；transmittance 透射率（穿到另一侧）；
+// emission 自发射辐射出射度；directIrradiance 直射辐照度。
 struct SurfaceOptics {
     float reflectance;
     float transmittance;
@@ -14,6 +31,8 @@ struct SurfaceOptics {
     float directIrradiance;
 };
 
+// 缓冲区：CSR 行偏移 rowOffsets（每侧一行）、边表 edges、分母 denominators
+// （该侧射线总数）、skyCounts（直达天空的射线数）、optics（光学参数）。
 layout(std430, set = 0, binding = 0) readonly buffer RowOffsets {
     uint rowOffsets[];
 };
@@ -29,6 +48,7 @@ layout(std430, set = 0, binding = 3) readonly buffer SkyCounts {
 layout(std430, set = 0, binding = 4) readonly buffer Optics {
     SurfaceOptics optics[];
 };
+// 辐射度双缓冲 A/B（ping-pong）；Residual.maxDeltaBits 记录本轮最大变化量的位模式。
 layout(std430, set = 0, binding = 5) buffer RadiosityA {
     float radiosityA[];
 };
@@ -48,8 +68,11 @@ layout(std430, set = 0, binding = 12) readonly buffer GroundMean {
     float groundMean[];
 };
 
+// 哨兵：groundCounts 取此值表示该侧不是接收面。
 const uint INACTIVE_SIDE = 0xffffffffu;
 
+// 推送常量：facetCount 面元数；ping 当前读缓冲（0=A，1=B）；
+// skyRadiosity 天空辐射度；relaxation 松弛因子（1 为纯 Jacobi，<1 阻尼）。
 layout(push_constant) uniform SolvePush {
     uint facetCount;
     uint ping;
@@ -57,11 +80,13 @@ layout(push_constant) uniform SolvePush {
     float relaxation;
 } pc;
 
+// 读取当前迭代解（由 ping 选择 A 或 B）。
 float readRadiosity(uint side)
 {
     return pc.ping == 0u ? radiosityA[side] : radiosityB[side];
 }
 
+// 写入下一轮迭代解（与读缓冲相反）。
 void writeRadiosity(uint side, float value)
 {
     if (pc.ping == 0u) {
@@ -71,6 +96,9 @@ void writeRadiosity(uint side, float value)
     }
 }
 
+// 作用：某一侧的入射辐射（不含直射）= 各方向射线所见辐射度的射线数加权平均。
+// 构成：天空射线 × skyRadiosity + 向下逃逸射线 × 等效地面均值 + 邻面射线 × 邻面辐射度。
+// 特殊：地面背面返回 0；分母为 0（无射线）时视为全天空，返回 skyRadiosity。
 float incoming(uint side)
 {
     const uint ground = groundCounts[side];
@@ -93,6 +121,7 @@ float incoming(uint side)
     return value / float(denominator);
 }
 
+// 入口：一个线程更新一个面元的两侧并上报本轮最大变化量。
 void main()
 {
     const uint facet = gl_GlobalInvocationID.x;
@@ -102,9 +131,11 @@ void main()
 
     const uint side0 = facet * 2u;
     const uint side1 = side0 + 1u;
+    // 步骤 1：两侧各自的总入射辐照度 h = 散射入射 + 直射辐照度。
     const float h0 = incoming(side0) + optics[side0].directIrradiance;
     const float h1 = incoming(side1) + optics[side1].directIrradiance;
 
+    // 步骤 2：目标辐射度 = 自发射 + 反射率×本侧入射 + 透射率×另一侧入射（薄面元透射耦合）。
     const float target0 = optics[side0].emission
                         + optics[side0].reflectance * h0
                         + optics[side0].transmittance * h1;
@@ -112,6 +143,7 @@ void main()
                         + optics[side1].reflectance * h1
                         + optics[side1].transmittance * h0;
 
+    // 步骤 3：按松弛因子混合新旧值并写入另一缓冲。
     const float old0 = readRadiosity(side0);
     const float old1 = readRadiosity(side1);
     const float next0 = mix(old0, target0, pc.relaxation);
@@ -119,6 +151,7 @@ void main()
     writeRadiosity(side0, next0);
     writeRadiosity(side1, next1);
 
+    // 步骤 4：上报本轮最大变化量（非负 float 的位序等于数值序，可用 uint atomicMax）。
     const float delta = max(abs(next0 - old0), abs(next1 - old1));
     atomicMax(maxDeltaBits, floatBitsToUint(delta));
 }

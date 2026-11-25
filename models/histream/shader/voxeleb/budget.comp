@@ -1,3 +1,22 @@
+// ==========================================================================
+// 文件：budget.comp
+// 功能：VoxelEB 体元表面能量平衡的温度更新核。对每个体元的受阳/阴两个节点，
+//       由净辐射与上一轮的 H、LE、G 通量构造残差，再用阻尼牛顿步更新叶/地表温度。
+// 主要步骤：
+//   1. 读取体元、网格类别；空体元与参与介质冠层（固定温度）提前返回
+//   2. 组装入射辐射、发射率与出射长波，得受阳/阴净辐射 Rn
+//   3. 估算土壤储热 G（简单比例法时直接 G = GST·Rn）
+//   4. 计算显热、潜热、辐射、储热对温度的斜率，按类别（植被/水体/土壤建筑）做牛顿更新
+//   5. 统计未收敛个数 ebState.count，累计稳定度所需的显热、水温偏差
+//   6. 限幅并写回 voxelTempes
+// 数据流：输入 voxelNetRads/voxelHeatFlux/voxelRaas/voxelRsss/voxelTempes/土壤水体参数；
+//         输出 voxelTempes、voxelHeatFlux.G*（method 0）、ebState 计数器。
+// 与其他文件：通量本身由 evapo.comp 计算（H、LE、G），本文件只用其斜率更新温度；
+//         fluid_coupling.glsl 提供局部气温/湿度/土壤水分等；阻抗来自 biochemical_m12.comp。
+// 约定：温度 K（Ta 为 °C）；辐射/通量 W m-2；斜率 W m-2 K-1；
+//         体元温度采用 ±TMIN/TMAX_THRESHOLD 限幅；植被按叶片两面计算。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -29,11 +48,18 @@
 #include "../nanovdb_info.glsl"
 #include "fluid_coupling.glsl"
 
+// 光谱材质表中的下标约定：每种材质占 NUM_BAND(2002) 个条目，NUM_VNIR(2001) 为热红外之前
+// 最后一个条目的偏移，这里借它读取热红外波段的 reflectance/transmittance 以求发射率（待核对）。
 #define NUM_VNIR 2001 
 #define NUM_BAND 2002
 
 layout(local_size_x = GROUP_SIZEX) in;
 
+// 模块：VoxelEB 体元能量平衡的一次牛顿式温度更新（每个体元一个线程）。
+// 输入：voxelNetRads（入射短波/长波）、voxelHeatFlux（上一轮 H/LE/G）、voxelRaas（空气动力阻抗）、
+//       voxelRsss（表面阻抗）、voxelTempes（上一轮温度，K）；
+// 输出：更新 voxelTempes 的 sunlit/shaded 温度及相关通量（见后半段）。
+// 说明：受阳(sunlit)与阴(shaded)两个节点分别平衡；由 setting.energyIteration 控制迭代阻尼。
 void main()
 {
     //------------------------------------------------------------
@@ -60,8 +86,11 @@ void main()
     canopyId = meshLink.canopyId;
     bioId = meshLink.bioId;
     typeId = meshLink.type;
+    // 步骤 2：取体元类别；空体元直接退出。
     if(typeId == TYPE_NULL) return;
     Canopy mediumCanopy = canopies[canopyId];
+    // 参与介质冠层不做体元能量平衡：温度固定为 fixedTemperature（>0 时，K）否则取气温，
+    // 显热/潜热/储热通量置 0，直接返回。
     if(typeId == TYPE_VEGETATION && isParticipatingMedium(mediumCanopy)) {
         float fixedTemperature = mediumCanopy.fixedTemperature > 0.0
             ? mediumCanopy.fixedTemperature : ubom.meteo.Ta + 273.15;
@@ -79,17 +108,22 @@ void main()
     // various parameters associated with radiation 
     //-------------------------
     // in: incident direct+diffuse VNIR+TIR radiance
+    // 步骤 3：入射辐射。阴节点只接收散射短波(V)与散射长波(T)；阳节点再加直射部分。
     float inShadedRad = voxelNetRads[bufferId].diffuseVrad + voxelNetRads[bufferId].diffuseTrad;
     float inSunlitRad = inShadedRad + voxelNetRads[bufferId].directTrad + voxelNetRads[bufferId].directVrad;
     float TsunlitOld,TshadedOld;
     TsunlitOld = voxelTempes[bufferId].sunlit;
     TshadedOld = voxelTempes[bufferId].shaded;
+    // Ta 为体元局部气温（°C）。船体吃水线以下的建筑体元改用水温作为交换温度，
+    // 且不叠加自由对流（exchangeType 置 TYPE_NULL），与 evapo.comp 保持一致。
     float Ta = localAirTemperatureC(bufferId);
     // Ship hull below its waterline: water-side exchange against the scene
     // water temperature, no free-convection add-on (see evapo.comp).
     const bool shipWet = typeId == TYPE_BUILDING && shipSubmerged(bufferId, bioId);
     const float TaH = shipWet ? shipWaterTemperatureC(Ta) : Ta;
     const uint exchangeType = shipWet ? uint(TYPE_NULL) : typeId;
+    // 步骤 4：上一轮温度若为 NaN/Inf 或超出 [TMIN, TMAX] 阈值（如首轮未初始化），
+    // 回退到气温 +2 K（阳）/ +1 K（阴）作为起点，防止异常值传入迭代。
     float fallbackSunlit = Ta + 2.0 + 273.15;
     float fallbackShaded = Ta + 1.0 + 273.15;
     if (isnan(TsunlitOld) || isinf(TsunlitOld)
@@ -101,6 +135,7 @@ void main()
         TshadedOld = fallbackShaded;
     }
     // in: thermal emittance radiance 
+    // 步骤 5：发射率 emis = 1 - 反射率 - 透射率（Kirchhoff 近似），限制在 [0,1]。
     uint spectralBase = spectralId * NUM_BAND;
     float refl = spectralMaterials[spectralBase + NUM_VNIR].reflectance;
     float trans = spectralMaterials[spectralBase + NUM_VNIR].transmittance;
@@ -112,6 +147,8 @@ void main()
     //---------------------------------------------
     // Calculate net radiation for sunlit/shaded veg/soil
     //---------------------------------------------
+    // 步骤 6：净辐射 = 入射 - 出射长波。植被叶片两面都发射长波，故出射乘 2；
+    // 散射分量按整球吸收，直射只落在向阳面。土壤/建筑/水体为单面。
     float netSunlitRad,netShadedRad;
     if(typeId == TYPE_VEGETATION)
     { 
@@ -141,6 +178,8 @@ void main()
     }// IF TYPE
 
     // soil heat storage 
+    // 步骤 7：土壤热储。船体钢板（shipPlate）的 G 由 evapo.comp 的隐式板模型给出；
+    // 其余土壤/建筑在 method==0（简单比例法）时取 G = GST·Rn 并写回，其他方法保留已有 G。
     float Gsunlit = voxelHeatFlux[bufferId].Gsunlit;
     float Gshaded = voxelHeatFlux[bufferId].Gshaded;
     // Ship hull steel plate: G comes from evapo.comp (implicit plate); the
@@ -180,6 +219,7 @@ void main()
     //-------------------------------------------------------
     //  Update surface temperature : new
     //-------------------------------------------------------
+    // 步骤 8：新方案的表面温度更新（上方被注释的是旧的简单松弛法）。
     float Tsunlit,Tshaded;
     float e_to_q = MH20 / MAIR / ubom.meteo.p;
     float TsunlitC = TsunlitOld - 273.15;
@@ -189,6 +229,7 @@ void main()
     float ei_shaded = es_fun(TshadedC);
     float s_shaded = s_fun(ei_shaded, TshadedC);
     float innovation1 = 0,innovation2 = 0;
+    // 空气动力阻抗下限 1 s m-1，防止除零；地面温度高于气温时再并联自由对流（groundExchangeRaa）。
     float raa = max(voxelRaas[bufferId].raa, 1.0);
     // Same per-state effective resistance as evapo.comp (free convection on
     // ground surfaces warmer than the air; vegetation unchanged).
@@ -205,6 +246,7 @@ void main()
     float diffSunlitRad, diffShadedRad;
     // float diffSunlitRad = netSunlitRad - (voxelHeatFlux[bufferId].LEsunlit + Gsunlit + voxelHeatFlux[bufferId].Hsunlit);
     // float diffShadedRad = netShadedRad - (voxelHeatFlux[bufferId].LEshaded + Gshaded + voxelHeatFlux[bufferId].Hshaded);
+    // 水的汽化潜热 λ(T) = (2.501 - 0.002361·T)·1e6 J kg-1（T 为 °C）。
     float lambdas_sunlit = (2.501 - 0.002361 * TsunlitC) * 1E6;
     float lambdas_shaded = (2.501 - 0.002361 * TshadedC) * 1E6;
     // Damping of the Newton step. The ground/building/water denominators
@@ -216,6 +258,8 @@ void main()
     // damping tightens with the iteration count so the few states that
     // limit-cycle under a large step (neighbour longwave / flow coupling)
     // still settle within the 50-iteration budget.
+    // 牛顿步阻尼 wc：非植被的分母已含完整局部线性化，起始可接近无阻尼；植被的气孔阻抗
+    // 随叶温变化，阻尼更强；迭代次数越多阻尼越小，以抑制极限环（见上方原注释）。
     int iteration = setting.energyIteration;
     float wc = typeId == TYPE_VEGETATION
         ? (iteration < 8 ? 0.5 : (iteration < 20 ? 0.3 : 0.2))
@@ -236,10 +280,14 @@ void main()
             groundFreeConductanceExtraSlope(TshadedOld - 273.15 - TaH);
 #endif
     }
+    // 步骤 9：各通量对表面温度的斜率（W m-2 K-1），用于牛顿分母：
+    // 显热 ρ·cp/ra（地面在 groundFreeConvectionApplies 时再加自由对流增量）；
+    // 潜热 ρ·λ·e_to_q·s/(ra+rss)，s 为饱和水汽压对温度的斜率，e_to_q 把 hPa 换成比湿。
     float latentDerivativeSunlit = RHOA * lambdas_sunlit * e_to_q *
         max(s_sunlit, 0.0) / max(raaSunlit + max(rss_sunlit, 0.0), 1.0);
     float latentDerivativeShaded = RHOA * lambdas_shaded * e_to_q *
         max(s_shaded, 0.0) / max(raaShaded + max(rss_shaded, 0.0), 1.0);
+    // 建筑和干土（体积含水量 < 0.03）不蒸发，潜热斜率置 0；水体潜热按 evaporationCoefficient ∈ [0,1] 折减。
     if(typeId == TYPE_BUILDING ||
        (typeId == TYPE_SOIL &&
         localSoilMoisture(bufferId, bioId) < 0.03))
@@ -254,6 +302,9 @@ void main()
         latentDerivativeSunlit *= evaporationCoefficient;
         latentDerivativeShaded *= evaporationCoefficient;
     }
+    // 步骤 10：土壤/建筑的储热斜率与辐射项缩放，按 soilSets.method 区分：
+    //   船体钢板：由隐式板模型给出表面斜率；method 0：G = GST·Rn，辐射项乘 (1-GST)；
+    //   method 1：半无限固体热惯量 2·I/√(π·dt)；其余：多层土壤热通量对表面温度的导数。
     float storageDerivative = 0.0;
     float radiativeScale = 1.0;
     if(typeId == TYPE_SOIL || typeId == TYPE_BUILDING)
@@ -302,6 +353,10 @@ void main()
     // Tshaded = TshadedOld + diffShadedRad * wc / ((RHOA*CP)/raa + (RHOA*CP)/raa + 4*SIGMASB*pow(TshadedOld,3));
     // Tsunlit = TsunlitOld + diffSunlitRad * wc / ((RHOA*CP)/raa + 4*SIGMASB*pow(TsunlitOld,3));
     // Tshaded = TshadedOld + diffShadedRad * wc / ((RHOA*CP)/raa + 4*SIGMASB*pow(TshadedOld,3));
+    // 步骤 11：按类别做阻尼牛顿更新 T_new = T_old + wc·残差/斜率和（斜率和下限 1 W m-2 K-1 防止除零）。
+    // 植被：残差 = Rn - 2(H+LE)（两面交换，无土壤储热）；水体：把受阳/阴按 voxelDirs.solar 混合成
+    // 单一水温，残差 Rn = H + LE + Qw 并加入混合层储热 ρcp·h/dt；土壤/建筑：残差 Rn - (H+LE+G)，
+    // 可加船舱内热源 shipInternalSource。
     if(typeId == TYPE_VEGETATION)
     { 
         // Sensible and latent exchange also occur on both leaf faces.  Soil
@@ -367,6 +422,8 @@ void main()
             max(denominatorShaded, 1.0);
     }// IF TYPE
     // Non-finite residuals are never converged.
+    // 步骤 12：收敛统计。残差非有限或绝对值大于 RAD_THRESHOLD 的节点计入未收敛数 count（0~2），
+    // 之后累加到 ebState.count，由宿主端据此决定是否继续迭代。
     int count = int(isnan(diffSunlitRad) || isinf(diffSunlitRad) ||
                     abs(diffSunlitRad) > RAD_THRESHOLD) +
                 int(isnan(diffShadedRad) || isinf(diffShadedRad) ||
@@ -377,6 +434,8 @@ void main()
     // (scale^2) and summed in fixed point. Leaves: 2 faces x LAD x scale^3
     // of leaf area; solid/water states: one scale^2 surface element.
 #ifdef VOXELEB_MOST
+    // 步骤 13：把本轮显热通量折算到格元足迹（scale²）后以定点数（0.1 W 精度，限幅 ±20000）累加到
+    // ebState.sensible，供 Monin–Obukhov 稳定度更新使用；植被显热乘 2×LAD×scale³ 的叶面积。
     if (stabilityCorrectionEnabled() && setting.energyFinalize == 0)
     {
         float sunlitFraction = clamp(voxelDirs[bufferId].solar, 0.0, 1.0);
@@ -394,6 +453,7 @@ void main()
     }
 #endif
 
+    // 最终评估轮：温度已导出，只统计闭合情况（累计 count）而不再改写温度。
     if(setting.energyFinalize != 0)
     {
         // All input fluxes now use the exported temperatures. Retain these
@@ -407,6 +467,7 @@ void main()
     //-----------------------------------------
     // adjust bad temperature 
     //-----------------------------------------
+    // 步骤 14：坏值保护：新温度非有限则保留旧值，再限幅到 [TMIN_THRESHOLD, TMAX_THRESHOLD]。
     if (isnan(Tsunlit) || isinf(Tsunlit)) Tsunlit = TsunlitOld;
     if (isnan(Tshaded) || isinf(Tshaded)) Tshaded = TshadedOld;
     Tsunlit = clamp(Tsunlit, float(TMIN_THRESHOLD), float(TMAX_THRESHOLD));
@@ -418,6 +479,8 @@ void main()
     //------------------------------------------- 
 
     
+    // 步骤 15：写回温度。水体体元还统计相对场景水温的偏差（0.01 K 定点、限幅 ±20 K）与个数，
+    // 用于船体吃水线以下水侧交换的场景水温更新。
     voxelTempes[bufferId].sunlit = Tsunlit;
     voxelTempes[bufferId].shaded = Tshaded;
     if(typeId == TYPE_WATER && fluidParameters.localExchange.w > 1.0)

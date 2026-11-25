@@ -1,3 +1,23 @@
+// ==========================================================================
+// 文件：voxeleb/aeresist.comp（VoxelEB：体元空气动力阻抗 raa）
+// 功能：对每个体元计算热量/水汽交换用的空气动力阻抗 raa（s m-1），写入 voxelRaas。
+//   植被体元：冠层上方惯性层 + 粗糙子层 + 冠内 + 叶边界层串联；土壤/水体：
+//   惯性层 + 粗糙子层 + 冠内 + 土壤表层 + 土壤边界层串联；方法类似 SCOPE 的 resistances.m。
+// 主要模块/步骤：
+//   1. 稳定度修正函数：VOXELEB_MOST 变体用 fluid_coupling.glsl 的 MOST 函数与场景 1/L；
+//      中性（默认）变体保留旧版 psim/psih/phstar（与 MOST 之前的着色器逐位一致）
+//   2. columnCanopy：沿体元上方网格列统计植被叶面积指数、冠顶高度与叶宽（给地面格使用）
+//   3. main：读取体元类型/冠层/气动参数 → 局部空气闭合分支（流体耦合开启时直接给出 raa）
+//      → 常规剖面分支：粗糙度、零平面位移、各层阻抗、稳定度修正 → 写 raa
+// 数据流：voxelLinks/meshLinks/canopies/aeroConds（几何与参数）、setting（尺度、体元数）、
+//   fluidParameters（局部交换开关）→ 本着色器 → voxelRaas[].raa；
+//   VOXELEB_MOST 下另向 ebState 累加地面列统计（u*、有效高度）供主机更新场景 1/L。
+//   之后 budget.comp / evapo.comp / biochemical.comp 使用 raa。
+// 约定：长度 m；Monin–Obukhov 长度 L（m），|L| ≥ 500 或 L=0 视为中性；
+//   ebState 中 u* 以 1e4 倍、高度以 100 倍取整后累加到整型原子计数（定点数，避免浮点原子累加）。
+// 注意：本文件的剖面公式仅适用于“平面”下垫面（原注释：THIS IS ONLY FOR PLANE SURFACE）。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -18,6 +38,7 @@
 #extension GL_KHR_memory_scope_semantics:require
 #extension GL_EXT_shader_atomic_float: require 
 
+// 编译开关：选择 VoxelEB 的绑定布局（体元列表按输入索引绑定，待核对）。
 #define VOXEL_LST_BIND_ININDEX
 #define VOXELLST 1
 
@@ -26,16 +47,23 @@
 #include "../global.glsl"
 #include "../functions.glsl"
 #include "../nanovdb_info.glsl"
+// fluid_coupling.glsl：局部风速、MOST 稳定度函数、stabilityCorrectionEnabled() 等。
 #include "fluid_coupling.glsl"
 
 layout(local_size_x = GROUP_SIZEX) in;
 
+// 模块：稳定度修正的两种编译变体。
+//   VOXELEB_MOST：用 Monin–Obukhov 相似理论（MOST），1/L 由场景迭代给出；
+//   否则（#else）：旧版中性管线，按 XML 给定的 L 做 psim/psih/phstar 修正。
 #ifdef VOXELEB_MOST
 // aeresist_most.comp.spv (compiled with -DVOXELEB_MOST, control.stabilityCorrection).
 // Stability functions: mostPsiM/mostPsiH/mostPhiH in fluid_coupling.glsl
 // (port of src/facetrt/energyphysics.h). The scene inverse Obukhov length
 // comes from the MOST iteration in command.cpp (control.stabilityCorrection);
 // otherwise a legacy XML <L> with |L| < 500 m is honoured, else neutral.
+// 作用：取场景的逆 Obukhov 长度 1/L（m-1）。
+//   启用稳定度修正时用 command.cpp 的 MOST 迭代结果（fluidParameters.localExchange.z）；
+//   否则沿用旧 XML 的 L（仅当 0 < |L| < 500 m），其余按中性（1/L = 0）。
 float sceneInverseObukhov(float legacyL)
 {
     if (stabilityCorrectionEnabled()) return fluidParameters.localExchange.z;
@@ -43,6 +71,9 @@ float sceneInverseObukhov(float legacyL)
 }
 
 // Ground-column statistics for the scene 1/L update (fixed point).
+// 作用：向 ebState 累加地面列的 u*（摩擦速度）与有效高度，供主机据此更新场景 1/L（不动点迭代）。
+// 说明：浮点值取整放大后做整型原子加（u* 限幅 0–20 m/s，放大 1e4；高度限幅 0–2000 m，
+//   放大 100），分桶（bin）以减少原子竞争；非有限值直接丢弃。
 void reportGroundColumn(uint bufferId, float ustar, float effectiveHeight)
 {
     if (!stabilityCorrectionEnabled()) return;
@@ -58,6 +89,9 @@ void reportGroundColumn(uint bufferId, float ustar, float effectiveHeight)
 #else
 // Neutral pipeline: kept token-identical to the pre-MOST shader so that runs
 // without stability correction reproduce earlier results bit for bit.
+// 作用：动量的积分稳定度修正函数 ψm(z/L)。输入 z（m）、L（m）；L=0 或 |L|≥500 返回 0。
+//   不稳定（L<0）用 Paulson 形式：x=(1−16z/L)^(1/4)，
+//   ψm = 2ln((1+x)/2)+ln((1+x²)/2)−2·atan(x)+π/2；稳定（L>0）：ψm = −5z/L。
 // The integrated stability correction to eddy diffusivity 
 // for momentum at height zr - d
 float psim(float z,float L)
@@ -82,6 +116,8 @@ float psim(float z,float L)
     return pm;
 }
 
+// 作用：热量与水汽的积分稳定度修正函数 ψh(z/L)。
+//   不稳定：ψh = 2ln((1+x²)/2)；稳定：ψh = −5z/L；L=0 或 |L|≥500 返回 0。
 // The integrated stability correction to eddy diffusivity 
 // for heat and water vapour at height z
 float psih(float z,float L)
@@ -104,6 +140,9 @@ float psih(float z,float L)
 }
 
 
+// 作用：粗糙子层修正函数 φ*（对应 SCOPE resistances.m 的 phstar，来源待核对）。
+//   输入：z 高度，zr 参考高度，d 零平面位移（m），L 为 Monin–Obukhov 长度。
+//   不稳定：(z−d)/(zr−d)·(x²−1)/(x²+1)；稳定：−5z/L；L=0 或 |L|≥500 返回 0。
 float phstar(float z,float zr,float d,float L)
 {
     if (L==0) return 0;
@@ -126,6 +165,7 @@ float phstar(float z,float zr,float d,float L)
 
 #endif
 
+// 模块：空气动力阻抗串联公式说明（沿用原作者的分层命名）。
 // from 2D to 1D 
 
 
@@ -146,6 +186,10 @@ float phstar(float z,float zr,float d,float L)
 
 // Leaf area index, canopy-top height above the cell and leaf width of the
 // vegetation standing in the grid column above a ground cell.
+// 作用：沿体元 voxelId0 正上方（+y）的网格列统计植被：返回叶面积指数 lai（m2 m-2），
+//   同时输出冠顶高度 top（相对该体元，m）与列内最大叶宽 leafwidth（m）。
+// 说明：只计非参与介质（isParticipatingMedium 为假）的植被体元；最多扫描 2048 格；
+//   叶面积指数 = Σ 体元叶面积密度 × 体元尺度（累加纵向积分）。
 float columnCanopy(NanoVDBLink nanoVDBLink, ivec3 voxelId0, out float top, out float leafwidth)
 {
     float lai = 0.0;
@@ -168,12 +212,16 @@ float columnCanopy(NanoVDBLink nanoVDBLink, ivec3 voxelId0, out float top, out f
     return lai;
 }
 
+// 入口：一线程一体元，求空气动力阻抗 raa。
+// 步骤总览：1 取索引与类型；2 读气动/冠层参数；3 局部空气闭合（若启用）直接返回；
+//   4 地面格改用其上方植被列参数；5 常规剖面：粗糙度/位移 → 各层阻抗 → 稳定度修正 → raa。
 void main()
 {
 
     //------------------------------------------------------------
     // Initialization for the position and SSBO index
     //------------------------------------------------------------
+    // 步骤 1：取体元缓冲下标与体元网格坐标；无效体元直接返回。
     uint bufferId0 = gl_GlobalInvocationID.x;
     if(bufferId0 >= uint(setting.voxelCount)) return;
     if(voxelLinks[bufferId0].isValid==0) return;
@@ -210,12 +258,14 @@ void main()
 
 
     // It is a valid position and then continue
+    // 注意：bufferId0 为 uint，此条件恒真（疑为遗留判断，待核对），仅起括号作用。
     if(bufferId0 >=0 )
     {
         //-----------------------------------------------
         // input from CPU parameter
         //-----------------------------------------------
 
+        // 步骤 2：读取实例/气动条件/网格链接与冠层参数。
         // various indexes
         instanceId = voxelLinks[bufferId0].instanceId;
         aeroId = voxelLinks[bufferId0].aeroId;
@@ -232,6 +282,7 @@ void main()
         L = aeroConds[aeroId].L;
 #endif
         canopy = canopies[canopyId];
+        // 步骤 3：冠层高度、LAI、叶宽：气动条目有正值则覆盖，否则取冠层自身值（带下限防奇异）。
         // A positive aerodynamic entry overrides the canopy; otherwise use the
         // canopy's own height, LAI and leaf width (zero LAI would create an
         // infinite boundary resistance).
@@ -241,6 +292,11 @@ void main()
             ? aeroConds[aeroId].lai : max(canopy.lai, 0.001);
         leafwidth = aeroConds[aeroId].leafwidth > 0.0001
             ? aeroConds[aeroId].leafwidth : max(canopy.leafwidth, 0.0001);
+        // 步骤 4：局部空气闭合（流体耦合 localExchange.x>0.5，植被/土壤体元）：
+        //   不再用冠层上方风廓线，直接用局部风速 u 算 raa 后返回。
+        //   植被：整叶边界层阻抗 70·sqrt(w/u)，两面各算一份故 ×2；
+        //   土壤：中性对数近似 ln²(h/0.01)/(κ²u)（h 为首格半高），属粗略的体块近似。
+        //   下限：风速 0.05 m/s、raa ≥ 1 s m-1。
         // Optional local-air closure. Never pass an in-canopy resolved speed
         // through the above-canopy wind profile again. The same closure can
         // use prescribed local air with fluid.enabled=false for paired runs.
@@ -261,9 +317,12 @@ void main()
             }
             return;
         }
+        // 土壤边界层阻抗 rbs 的缺省值（原代码固定为 10；单位待核对）。
         rbs = 10; 
         if(typeId == TYPE_SOIL || typeId == TYPE_WATER)
         {
+            // 步骤 5：土壤/水体格不用自身材料的冠层，而是用其上方网格列中的实际植被
+            //   （冠顶高度、LAI、叶宽）；列内无植被且气动条目未指定 LAI 时视为裸地（hcmax=0）。
             // Ground cells are sheltered by the vegetation actually above them,
             // not by the canopy entry of their own material; open ground is bare.
             float columnTop, columnLeafwidth;
@@ -297,6 +356,8 @@ void main()
         //  L = surfLs[surf1DId].L;
 
 
+        // 步骤 6：参考高度 z 与参考风速 u（来自气象强迫 ubom.meteo）。
+        //   z 必须高于零平面位移，故不低于 hcmax + max(2, 0.5·hcmax)；u 下限 0.05 m/s。
         // dynamic variable in time
         // The aerodynamic reference level must be above displacement height.
         z = max(ubom.meteo.z, hcmax + max(2.0, 0.5 * hcmax));
@@ -307,11 +368,14 @@ void main()
         u = max(ubom.meteo.u, 0.05);
         kappa = KAPPA; 
 
+        // 步骤 7：城市类气动条件：整个冠层按建筑高度 hc_build 处理，直接用对数廓线 + 稳定度修正
+        //   求 u* 与 raa 后返回，不再走下面的植被冠层剖面。
         if(aerotype == AEROTYPE_URBAN){
             // Building canopy: reference height, displacement and roughness all
             // follow the building height, so z - d > z0m holds by construction.
             hcmax = max(aeroConds[aeroId].hc_build, 0.0);
             z = max(ubom.meteo.z, hcmax + max(2.0, 0.5 * hcmax));
+            // 城市冠层经验取值：位移高度 d = 2h/3，粗糙长度 z0m = h/10（下限 0.01 m），zr = 2h。
             d = hcmax * 2.0 / 3.0;
             z0m = max(hcmax / 10.0, 0.01);
             zr = hcmax * 2.0;
@@ -323,8 +387,11 @@ void main()
             pm_z = psim(z-d,L);
             ph_z = psih(z-d,L);
             ph_zr = psih(zr-d,L);
+            // 参考高度低于粗糙子层顶 zr 时，ph_zr 取 ph_z，避免在 z 以上外推（此处原作者标注“注意”）。
             if(z < zr) ph_zr = ph_z; /// attention !!!
 #endif
+            // u* = κ·u / (ln((z−d)/z0m) − ψm)；raa = (ln((z−d)/z0m) − ψh(z−d) + ψh(参考)) / (κ·u*)。
+            //   稳定度修正导致分母 ≤ 0 或 raa 非有限/小于 1 时，退回中性廓线（见下）。
             float logz = log((z - d) / z0m);
             // friction wind speed
             ustar = max(0.001, kappa*u / (logz - pm_z));
@@ -340,13 +407,16 @@ void main()
                 reportGroundColumn(bufferId0, ustar, z - d);
 #endif
 
+            // 把 u* 写回气动条件（后续阶段或主机统计可读取，待核对用途）。
             aeroConds[aeroId].ustar = ustar;
+            // 建筑类体元（含船体等刚体表面）：按 shipHullRaa 对 raa 做表面修正（定义见 fluid_coupling.glsl，待核对）。
             if(typeId == TYPE_BUILDING) raa = shipHullRaa(bufferId0, uint(meshLink.bioId), raa);
             voxelRaas[bufferId0].raa = raa;
             return;
         }
 
 
+        // 步骤 8：植被/裸地/地面通用的垂直剖面（非城市）。先确定粗糙度参数，再分裸地与有冠层两种情形。
         canopy = canopies[canopyId];
         //--------------------------------------------------------
         // Attention! The bottom layer cantain the toppest height.
@@ -355,10 +425,14 @@ void main()
         //---------------------------------------------------------
 
 
+        // 缺省粗糙长度 z0m=0.01 m；zr = 2.5h 为粗糙子层顶（其上为惯性子层）。
         z0m = 0.01;                     // Roughness lenght for momentum for the vegetation  
         zr = hcmax * 2.5;               // top of roughness sublayer, bottom of intertial sublayer
+        // n：冠内风速/扩散率指数衰减系数 n = CD·LAI/(2κ²)（SCOPE resistances.m 形式，待核对）。
         n = CD*laimax / (2 * kappa*kappa);
 
+        // 分支 A：裸地/无冠层（冠高 ≤ 0.01 m）：位移 d、z0m、zr 取 0.01 m，只算上方对数廓线，
+        //   raa 非有限或 <1 时取缺省 50 s m-1。
         if(hcmax <= 0.01)
         {
             //------------------------
@@ -400,12 +474,16 @@ void main()
         }
         else
         {
+            // 分支 B：有植被冠层：阻抗 = 惯性子层 rai + 粗糙子层 rar + 冠内 rac [+ 冠下 rwc] + 叶边界层 rbc
+            //   （土壤再加 rbs）。以下依次求位移高度、u*、各层阻抗。
             //voxelRaas[bufferId0].raa = surf1DId;
             /////----------------------------------------------------------
             ///// The toppest vegetation layer 
             /////----------------------------------------------------------
             float kh,kh0,sq,g1,uh,uz0,rac;
             /// zom and h (m): roughness lenght for momentum and zero plane displacement
+            // 零平面位移 d = h(1 − (1−e^{−√(CD1·LAI/2)})/√(CD1·LAI/2))，粗糙长度
+            //   z0m = (h−d)·exp(−κ·g1 + PSICOR)；CD1、CSSOIL、CD、PSICOR 为全局常数（待核对来源）。
             sq = sqrt(CD1 * laimax/2.0);
             g1 = max(3.3, sqrt(CSSOIL + CD * laimax /2.0));
             d = hcmax*(1 - (1 - exp(-sq))/sq);
@@ -440,9 +518,12 @@ void main()
                 rai = 0;
                 rar = 1.0 / (kappa*ustar)*((z - hcmax) / (z - d) * roughnessPhi);
             }
+            // 冠顶扩散率 Kh = κ·u*·(zr−d)；MOST 变体再除以 φH(冠顶) 作稳定度修正。
             kh0 = kappa*ustar*(zr - d);    //Diffusivity for heat
             // Stability-corrected canopy-top diffusivity (FacetEB form).
             kh = kh0 / mostPhiH((hcmax - d) * invL);
+// CANOPY_KH：冠内阻抗用的冠顶扩散率（MOST：稳定度修正后的 kh；
+//   中性变体见 #else：用 kh0，kh 虽算出但未被使用，待核对是否为遗留）。
 #define CANOPY_KH kh
 #else
            // stability correction functions, friction velocity and Kh=Km=Kv
@@ -479,6 +560,8 @@ void main()
             if (L > 0 && L < 500) kh = kappa*ustar*(zr - d) / (1 + 5 * (hcmax - d) / L);
 #define CANOPY_KH kh0
 #endif
+            // 冠内：uh 冠顶风速（≥0.01）、uz0 为 z0m+d 高度风速（按 n 指数衰减）；
+            //   rac = 冠内混合层阻抗（∝ sinh(n)/(n·Kh) 的对数积分），rbc = 70/LAI·√(w/uz0) 叶边界层阻抗。
             //  wind speed at height h and z0m
             uh = max(ustar / kappa*(log((hcmax - d) / z0m) - pm_h), 0.01);  
             uz0 = uh*exp(n*((z0m + d) / hcmax - 1));               
@@ -501,6 +584,8 @@ void main()
             /////----------------------------------------------------------
             ///// The toppest vegetation layer 
             /////----------------------------------------------------------
+            // 步骤 9：按体元类型汇总 raa（单位 s m-1）：土壤/水体 → 加冠下阻抗；建筑 → 对流换热系数；
+            //   植被 → 单面叶片阻抗乘 2（H 与 LE 按两面分别计算）。
             float rwcs = 0, h1max, hctemp, laitemp, leafwidthtemp, sqtemp, g1temp, dtemp, z0mtemp;
             float y1 = z0m + d;
             float y2 = 0.01;
@@ -509,6 +594,7 @@ void main()
             {
                 // for soil under overstory vegetation 
                 y2 = 0.01;
+                // 冠下阻抗 rwcs：冠内扩散率从土面 y2=0.01 m 积分到 y1=z0m+d。
                 rwcs = hcmax*sinh(n) / (n*CANOPY_KH) * 
                         (log((exp(n*(y1) / hcmax) - 1) / (exp(n*(y1) / hcmax) + 1)) -
                         log((exp(n*(y2) / hcmax) - 1) / (exp(n*(y2) / hcmax) + 1))); 
@@ -533,6 +619,8 @@ void main()
                 // the flow field is on) speed directly, not through a profile.
                 float uLocal = max(localWindSpeed(bufferId0), 0.05);
                 float localWind = max(uh, 0.5 * max(uLocal, 0.1));
+                // 建筑/暴露固体：换热系数 h = 8.3 + 4.1·U（W m-2 K-1，经验强迫对流式）；
+                //   raa = ρ·cp / h；枝干类（thermalClass==1）用圆柱式 convectiveScale·(18 + 8U)。
                 float heatTransfer = 8.3 + 4.1 * localWind;
                 if(soilSets[meshLink.bioId].thermalClass == 1)
                 {
@@ -550,6 +638,8 @@ void main()
                 // for vegetation under overstory vegetation 
                 // information for other layer 
                 canopy = canopies[canopyId];
+                // 林下植被判定：体元自身冠高 hctemp ≥ hcmax 为最上层冠层，直接用整层串联阻抗；
+                //   否则按林下植被处理，用其自身高度算冠下阻抗 rwcs（底部高度 y2）。
                 hctemp = canopy.height;
 
                 if(hctemp >= hcmax){
@@ -564,6 +654,8 @@ void main()
                 leafwidthtemp = canopy.leafwidth;
                 laitemp = canopy.lai;
                 // d and tom 
+                // 林下植被自身的位移高度/粗糙长度（下限 0.01 m），用于确定其底部高度 y2 = d + z0m；
+                //   注意：此处 sqrt(CD1·LAI) 无上面 sq 的 /2 因子（疑似不一致，待核对）。
                 sqtemp = sqrt(CD1*laitemp);
                 g1temp = max(3.3, sqrt(CSSOIL + CD*laitemp / 2.0));
                 dtemp= max(hctemp*(1 - (1 - exp(-sqtemp)) / sqtemp),0.01);   //

@@ -1,3 +1,10 @@
+// ==========================================================================
+// 文件：RayTracing/shadow.rmiss
+// 功能：阴影光线的 miss 着色器：阴影光线未命中任何几何时，把 ShadowHitPayload.isHit 置 false。
+// 约定：raygen 发射阴影光线前先把 isHit 设为 true；有命中时本着色器不执行，isHit 保持 true。
+// 数据流：payload 位于 location=1，与主光线负载（location=0）分开。
+// ==========================================================================
+
 /*
  * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -38,6 +45,7 @@
 
 layout(location = 1) rayPayloadInEXT ShadowHitPayload payload;
 
+// 未遮挡：太阳/光源方向可见。
 void main()
 {
   payload.isHit = false;

@@ -1,3 +1,14 @@
+// ==========================================================================
+// 文件：random.glsl
+// 功能：着色器内使用的伪随机数发生器（源自 NVIDIA vk_raytracing 示例，Apache-2.0）。
+// 主要模块：
+//   1. tea / initRandom：用 Tiny Encryption Algorithm 由（像素, 帧号）生成每像素每帧不同的种子
+//   2. pcg / pcg2d / pcg3d：PCG 系列整数哈希，用于推进状态或由坐标生成哈希
+//   3. rand / rand2 / Rnd：把 32 位整数状态转换为 [0,1) 浮点随机数
+// 用法：先用 initRandom()/tea() 得到 seed，再反复调用 rand(seed) 或 Rnd(seed)（均会更新 seed）。
+// 注意：rand 与 Rnd 的 uint→float 转换方式不同，同一 seed 上不要混淆期望的取值范围（见 Rnd）。
+// ==========================================================================
+
 /*
  * Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -47,6 +58,7 @@ uint tea(in uint val0, in uint val1)
   return v0;
 }
 
+// 作用：由屏幕像素坐标和帧号生成随机种子（像素线性编号与 frame 一起做 TEA 混合）。
 uint initRandom(in uvec2 resolution, in uvec2 screenCoord, in uint frame)
 {
   return tea(screenCoord.y * resolution.x + screenCoord.x, frame);
@@ -66,6 +78,7 @@ uint pcg(inout uint state)
 
 //-----------------------------------------------------------------------
 //-----------------------------------------------------------------------
+// PCG 二维/三维哈希（无状态）：输入整数向量，输出混合后的整数向量。
 uvec2 pcg2d(uvec2 v)
 {
   v = v * 1664525u + 1013904223u;
@@ -95,6 +108,7 @@ uvec3 pcg3d(uvec3 v)
 //-----------------------------------------------------------------------
 // Generate a random float in [0, 1) given the previous RNG state
 //-----------------------------------------------------------------------
+// 作用：取 PCG 输出的高 23 位作尾数，构造 [1,2) 的浮点数再减 1，得到严格的 [0,1) 均匀随机数。
 float rand(inout uint seed)
 {
   uint r = pcg(seed);
@@ -108,6 +122,8 @@ vec2 rand2(inout uint prev)
 
 // Rnd(): generate a random float in [0,1) given the previous RNG state (a number).
 // recommend to use this function.
+// 说明：直接用 prev/0xffffffff 缩放。float 精度下接近 2^32-1 的状态可能舍入为 1.0，
+// 即实际取值可能包含 1.0（待核对：调用方若以 Rnd 作对数或区间索引需留意）。
 float Rnd(inout uint prev)
 {
   prev = pcg(prev);

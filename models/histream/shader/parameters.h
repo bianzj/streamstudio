@@ -1,3 +1,18 @@
+// ==========================================================================
+// 文件：parameters.h
+// 功能：着色器（GLSL）侧共用的输入参数与状态结构体定义，以及几个与冠层介质相关的小函数。
+// 主要模块：
+//   1. 材料/冠层参数：SpectralMaterial、ThermalMaterial、Canopy（含介质消光与 HG 相函数）
+//   2. 几何与传感器：Sphere、AllAabb、VertexAttribute、SensorMatrix
+//   3. 光源与链接表：LightSet、AtomCond、MeshLink、InstanceLink、VoxelLink、VoxelHex
+//   4. 体元状态（VoxelEB 等）：VoxelDir/Tempe/Rad/NetRad/Pnet/Air/Raa/Rss/HeatFlux/Tlast、EBState
+//   5. 流体与生化参数：FluidCellMeta、FluidParameters、LeafBio、SoilSet、WaterSet、Meteo
+// 数据流：主机端（C++）按相同内存布局填充缓冲区，各着色器 #include 本文件后直接读写。
+// 与其他文件的关系：布局须与 src/base/structs_cg.h 中同名结构体保持一致（各结构体处另有注明）；
+//   依赖 global.glsl（类型与常量）；lidf_common.h 使用 Canopy 的 lidf/lidfValid。
+// 注意：结构体字段顺序/数量即缓冲区布局，修改任一字段必须同步主机端定义。
+// ==========================================================================
+
 #ifndef STRUCTURE
 #define STRUCTURE 1
 
@@ -23,10 +38,12 @@
 // Entity /Component Property
 //--------------------------------------------------------------------------------------------
 
+// 模块：输入参数（按实体/组件分类）。以下各结构体由主机端写入 GPU 缓冲区，按材料/网格/体元 id 索引。
 // Wavelength link to sunlight source and camera metric as well as optical material
 
 
 // reflectance and transmittance
+// 光谱材料：反射率、透射率，以及镜面反射占比与粗糙度（供 specular/surface BRDF 使用）。
 struct SpectralMaterial
 {
 	float reflectance;
@@ -35,6 +52,7 @@ struct SpectralMaterial
     float specularRoughness;
 };
 // sunlit and shaded temperature
+// 热材料：直接给定的向阳/背阴表面温度，单位 K。
 struct ThermalMaterial
 {
 	float sunlitTemperature;
@@ -42,6 +60,9 @@ struct ThermalMaterial
 };
 
 // canopy information
+// 冠层/介质参数。structureType 区分冠层(0)、刚体(1)、火/烟(2)、雾(3)；
+// 2、3 视为参与介质，用 extinction/scatteringAlbedo/asymmetry/emissionScale/fixedTemperature 描述。
+// lai/density 等为叶面积指数与叶面积密度，G 为叶倾角投影函数，hspot 为热点参数。
 struct Canopy
 {
 	float lai;
@@ -68,11 +89,15 @@ struct Canopy
 	float diffuseG[32];
 };
 
+// 是否为参与介质（火/烟或雾），此类体元按体消光/发射/散射处理，而非叶片截获。
 bool isParticipatingMedium(Canopy canopy)
 {
 	return canopy.structureType == 2 || canopy.structureType == 3;
 }
 
+// 作用：体元内沿射线路径的透过率 exp(-光学厚度)。
+// 输入：冠层参数、叶面积密度 density、投影函数 G、路径长度 pathLength、尺度因子 scale；输出：0~1 的透过率。
+// 说明：刚体（structureType==1）完全不透；介质用 extinction，植被用 density*G。
 float canopyVoxelTransmittance(Canopy canopy, float density, float G, float pathLength, float scale)
 {
 	if(canopy.structureType == 1) return 0.0;
@@ -86,6 +111,8 @@ float canopyVoxelTransmittance(Canopy canopy, float density, float G, float path
 	return exp(-opticalDepth);
 }
 
+// 作用：Henyey–Greenstein 相函数，按 4π 归一化（12.5663706144 = 4π）。
+// 输入：不对称因子 asymmetry（限幅到 ±0.99 防止分母为零）、散射角余弦 cosTheta；输出：相函数值（sr-1）。
 float mediumPhaseHG(Canopy canopy, float cosTheta)
 {
 	float g = clamp(canopy.asymmetry, -0.99, 0.99);
@@ -93,6 +120,7 @@ float mediumPhaseHG(Canopy canopy, float cosTheta)
 	return (1.0 - g * g) / (12.5663706144 * pow(denominator, 1.5));
 }
 
+// 模块：几何实例（球、AABB）与顶点/传感器结构体。
 // sphere instance defination
 struct Sphere
 {
@@ -125,6 +153,7 @@ struct VertexAttribute
 	vec2 txt;
 };
 
+// 传感器（相机）参数：视图/投影逆矩阵用于由像素生成射线；focalDist、aperture 描述景深；n_wave 为波段数。
 struct SensorMatrix
 {
 	mat4 viewInverse;
@@ -137,6 +166,8 @@ struct SensorMatrix
 };
 
 
+// 光源集合：太阳方向 direction、直射 direct/散射 diffuse 辐照度（W m-2，按波段/条件取值）；
+// Rin/Rli 为入射短波/长波（待核对具体含义）；skyTemperature、solarTemperature 为天空/太阳等效温度（K）。
 struct LightSet
 {
 	vec3  direction;
@@ -148,6 +179,7 @@ struct LightSet
 	float solarTemperature;
 };
 
+// 单个波长条件（"原子条件"）：波长及对应的直射/散射太阳辐照分量。
 struct AtomCond
 {
 	float wavelength;
@@ -155,6 +187,7 @@ struct AtomCond
 	float diffuse;
 };
 
+// 模块：链接表。网格→材料/热/冠层/生化 id，实例→网格 id，体元→实例/空气动力/面元 id。
 // obj model link
 struct MeshLink
 {
@@ -178,6 +211,9 @@ struct InstanceLink
 
 
 // voxel link
+// 体元链接：体元网格坐标 voxelId、所属实例 instanceId、空气动力 aeroId、面元 faceId、
+// 有效标志 isValid；leafDensity 为几何导出的叶面积密度（0 表示使用 Canopy 的 density）；
+// normalX/Y/Z 为单状态实心 OBJ 单元的外法线（全 0 表示水平面）。
 struct VoxelLink
 {
     ivec3 voxelId;
@@ -193,6 +229,7 @@ struct VoxelLink
 	float normalZ;
 };
 
+// 体元六面体（Hex）参数：ax/ay/az、rho、a/b/c、model 以及 8 个子单元 children（含义待核对，见 src/base/structs_cg.h）。
 struct VoxelHex
 {
     float ax;
@@ -206,6 +243,7 @@ struct VoxelHex
     vec4 children[8];
 };
 
+// 模块：体元能量平衡（VoxelEB）逐体元状态。向阳/背阴（sunlit/shaded）两种条件分别存储。
 // transmittance
 struct VoxelDir
 {
@@ -215,6 +253,7 @@ struct VoxelDir
     float skyDiffuse;
 };
 
+// 体元温度（K）：向阳、背阴；solarFraction 记录土壤方法 1 历史项上次写入时的向阳比例。
 struct VoxelTempe
 {
     float sunlit;
@@ -232,6 +271,7 @@ struct VoxelRad
     float induced;
 };
 
+// 净辐射分量：直射/散射、短波(Vrad)/长波(Trad)四项（W m-2，待核对符号约定）。
 // net radiance
 struct VoxelNetRad
 {
@@ -248,6 +288,7 @@ struct VoxelPnet
 };
 
 
+// 叶面气体状态：CO2 与水汽压，用于光合/气孔导度迭代。数组下标约定 [0]=背阴，[1]=向阳。
 // Leaf-surface state per conditional component: [0] shaded, [1] sunlit.
 struct VoxelAir
 {
@@ -270,6 +311,7 @@ struct VoxelRss
     float shaded;   // surface resistance at shaded surface in this voxel
 };
 
+// 空气动力条件：类型、Obukhov 长度 L(m)、摩擦速度 ustar(m s-1)、植被/建筑高度 hc_*、LAI、叶宽、覆盖度。
 struct AeroCond
 {
 	int type;
@@ -282,6 +324,8 @@ struct AeroCond
     float cover;
 };
 
+// 体元热通量（W m-2）：能量平衡残差 Rn - H - LE - G = 0 的各项，向阳/背阴分开；
+// 同时携带光合量 GPP/NPP（umol CO2 m-2 leaf s-1）。
 // Rn - H - LE - G = 0. For water, G stores mixed-layer heat storage Qw.
 struct VoxelHeatFlux
 {
@@ -303,6 +347,8 @@ struct VoxelTlast
 	float shaded;
 };
 
+// 模块：EBState — MOST（Monin–Obukhov 相似理论）全场 1/L 归约用的整数定点累加器。
+// 用整数原子加而非浮点原子加，结果与线程完成顺序无关；各量的定点单位见字段注释。
 // Integer (fixed-point) accumulators keep the MOST reductions deterministic:
 // float atomics would make 1/L depend on the thread completion order.
 // Keep in sync with EBState in src/base/structs_cg.h. The neutral VoxelEB
@@ -334,6 +380,7 @@ struct EBState
 };
 #endif
 
+// 模块：流体（风场/烟气）网格单元元数据与全局参数。
 struct FluidCellMeta
 {
     int surfaceIndex;
@@ -360,6 +407,7 @@ struct FluidParameters
 
 
 
+// 模块：叶片生化参数（光合 Vcmax、Ball-Berry 气孔导度、暗呼吸与温度响应）。
 struct LeafBio
 {
     float Vcmax;		// maximum carboxylation capacity (at optimum temperature)
@@ -379,6 +427,8 @@ struct LeafBio
     //FluspectParam fp;
 };
 
+// 土壤/不透水面参数：热方法 method、阻抗 rss、热容 cs、密度 rhos、导热 lambdas、
+// 初始温度 Tsoil、含水量 SMC，Hapke BRDF 参数，以及船体（航速、吃水线、钢板、内热源）相关参数。
 struct SoilSet
 {
     int method;
@@ -415,6 +465,7 @@ struct SoilSet
     //BSMParam bsm;
 };
 
+// 水体参数：热容、混合层深度、蒸发系数、BRDF 模型、折射率、波面斜率方差及漫射比例。
 struct WaterSet
 {
     float rss;
@@ -428,6 +479,8 @@ struct WaterSet
 };
 
 
+// 气象强迫（单时刻）：参考高度 z、时间 t、风速 u、气压 p、入射短/长波 Rin/Rli、
+// 气温 Ta、土壤湿度 sm、水汽压 ea、CO2 Ca、O2 Oa、时间步长 dtime（单位待核对，见 docs/forcing-metadata.md）。
 struct Meteo
 {
 	float z;

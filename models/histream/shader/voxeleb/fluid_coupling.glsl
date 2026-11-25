@@ -1,11 +1,33 @@
+// ==========================================================================
+// 文件：fluid_coupling.glsl
+// 功能：VoxelEB 体元（稀疏辐射体元）与流体网格（LBM 风场/温度场/水汽场）之间的耦合辅助函数库，
+//       也包含船体、地表自由对流和 Monin–Obukhov（MOST）相似函数。仅被 include，不含 main。
+// 主要模块：
+//   1. 局部大气量：局部 CO2、地形背景气温/水汽、土壤含水量与土壤表面阻抗
+//   2. 流体网格索引 fluidLinearIndex，及从流体格取体元邻近的气温、水汽压、风速
+//   3. 船体：吃水线判断、水侧交换阻抗、钢板隐式多层导热（线性通量 G(Ts)）
+//   4. 地表自由对流有效阻抗 groundExchangeRaa（MOST 与非 MOST 两个版本）
+//   5. MOST 稳定度函数 mostPsiM / mostPsiH / mostPhiH（仅 VOXELEB_MOST 编译）
+// 数据流：体元坐标 voxelId → 流体网格格点（按两套网格间距换算）→ 读 fluidScalarA/fluidVelocityA；
+//         固体格（fluidMeta.kind == 1）取其六邻居非固体格的平均；越界/非有限值回退到背景值。
+// 与其他文件：被 biochemical_m12/budget/evapo 等体元着色器与 fluid_common.glsl 包含；
+//         参数来自 fluidParameters（grid、couplingSpacing、spacingTime、heightProfile、localExchange）。
+// 约定：fluidScalarA.x 为温度（K）、.z 为水汽压（hPa）；fluidVelocityA.xyz 为风速（m/s）；
+//         网格线性索引 = x + nx·(z + nz·y)（y 为竖直方向）；EB 着色器取气温时返回 °C。
+// ==========================================================================
+
 #ifndef HISTREAM_FLUID_COUPLING_GLSL
 #define HISTREAM_FLUID_COUPLING_GLSL
 
+// 局部环境 CO2（ppm）= 气象背景 Ca + 体元所在位置的 CO2 超额（流体输运得到）。
 float localAmbientCo2Ppm(uint sparseIndex)
 {
     return ubom.meteo.Ca + voxelAirs[sparseIndex].co2ExcessPpm;
 }
 
+// 地形背景气温（°C）：打开 heightProfile 时按直减率 y 从参考高度 z 外推，否则取气象站 Ta。
+// terrainSaturationHpa 为 Magnus 式饱和水汽压（hPa），温度限幅 ±80 °C。
+// terrainBackgroundVaporHpa 让水汽压随高度按标高 w 指数衰减，并不超过饱和值。
 float terrainBackgroundTemperatureC(float heightM)
 {
     return ubom.meteo.Ta - (fluidParameters.heightProfile.x > 0.5
@@ -27,6 +49,9 @@ float terrainBackgroundVaporHpa(float heightM, float temperatureC)
         0.0, terrainSaturationHpa(temperatureC));
 }
 
+// 土壤体积含水量：体元无局部值（<0）时用材质 SMC（>1 视为百分数，乘 0.01）。
+// localSoilResistance：有局部含水量时按“材质参考 rss × 参考SMC / 局部SMC”缩放，
+// 是一个预设的水分可用性近似（下限 0.001 防除零）。
 float localSoilMoisture(uint sparseIndex, uint bioId)
 {
     float local = voxelAirs[sparseIndex].soilMoisture;
@@ -47,6 +72,7 @@ float localSoilResistance(uint sparseIndex, uint bioId)
         / max(localSoilMoisture(sparseIndex, bioId), 0.001);
 }
 
+// 流体网格线性索引（越界返回 -1）；与 fluid_common.glsl 的 fluidCellFromLinear 互逆。
 int fluidLinearIndex(ivec3 cell)
 {
     ivec3 size = fluidParameters.grid.xyz;
@@ -55,6 +81,10 @@ int fluidLinearIndex(ivec3 cell)
     return cell.x + size.x * (cell.z + size.z * cell.y);
 }
 
+// 以下三个 local* 函数的共同做法：
+//   步骤 1：体元中心（voxelId+0.5）×辐射网格间距 → 流体网格格点（voxelId.y<0 的地下体元取第一层中心）；
+//   步骤 2：若该格为流体格，直接读取；若为固体格，取六邻居中非固体、值有效者的平均；
+//   步骤 3：都失败则回退到背景/气象值。
 // Air temperature adjacent to a sparse radiative voxel. Solid cells use
 // their surrounding air. The return value is Celsius for EB shaders.
 float localAirTemperatureC(uint sparseIndex)
@@ -94,6 +124,8 @@ float localAirTemperatureC(uint sparseIndex)
     return count > 0.0 ? sum / count - 273.15 : background;
 }
 
+// 局部水汽压（hPa）：未启用 heightProfile 时用气象 ea；否则在中心格及其六邻居中取有效水汽，
+// 中心格有效则直接返回，否则邻居平均，结果不超过当地饱和水汽压。
 float localVaporPressureHpa(uint sparseIndex)
 {
     if (fluidParameters.heightProfile.x < 0.5) return ubom.meteo.ea;
@@ -155,6 +187,7 @@ float localWindSpeed(uint sparseIndex)
     return count > 0.0 ? sum / count : ubom.meteo.u;
 }
 
+// 模块：船体（BUILDING 类型的 Ship 材质）。吃水线判断 → 水侧/风侧换热阻抗 → 钢板导热。
 // Ship hull (BUILDING voxels of a Ship material; SoilSet ship* fields, all 0
 // = off and the code below returns its input unchanged).
 // Voxels whose centre lies below the material waterline exchange heat with
@@ -167,6 +200,7 @@ bool shipSubmerged(uint sparseIndex, uint bioId)
         < soilSets[bioId].waterlineHeight;
 }
 
+// 场景水温（°C）：宿主未设置（<=1 K）时退回气温。
 float shipWaterTemperatureC(float airTemperatureC)
 {
     float kelvin = fluidParameters.localExchange.w;
@@ -202,6 +236,8 @@ bool shipPlateOn(uint bioId)
     return soilSets[bioId].plateThickness > 0.0;
 }
 
+// 钢板隐式导热的追赶（消元）：从内侧向外表面消元，得到系数 e_k、h_k，使表面通量线性于表面温度，
+// k=0 层半格距外表面，故用 2g（半格导热）；a 为热容项，gin 为内侧总换热导纳。
 void shipPlateElimination(uint bioId, in float Told[TLASTNUM], float dtime,
                           out float e[TLASTNUM], out float h[TLASTNUM])
 {
@@ -257,6 +293,8 @@ float shipPlateSurfaceSlope(uint bioId, float h0)
 // instead: MOST governs forced/mixed convection, the free-convection floor
 // only takes over in the windless limit. The neutral pipelines keep the
 // pre-MOST code token for token (bit-identical results).
+// 自由对流适用的类别：土壤、水体、建筑；植被不适用。
+// groundFreeConductance(x) = 0.0025·x·(x²+1)^(-1/3)，x 为表面-气温差（K，限幅 [0,60]）。
 bool groundFreeConvectionApplies(uint typeId)
 {
     return typeId == TYPE_SOIL || typeId == TYPE_WATER || typeId == TYPE_BUILDING;
@@ -279,6 +317,8 @@ float groundFreeConductanceExtraSlope(float excess)
     return x * dg;
 }
 
+// MOST 版本：stabilityCorrectionEnabled 由宿主在 localExchange.y 中打开；
+// groundExchangeRaa 在 MOST 开启时取 1/ra 与自由对流导纳的较大者，避免浮力重复计入。
 #ifdef VOXELEB_MOST
 // y lane: MOST active for this node (cleared when the scene has no ground
 // column to define a surface layer); z lane: scene 1/L [m-1].
@@ -312,6 +352,8 @@ float groundFreeExchangeExtraSlope(float raa, float surfaceTemperatureK,
 // Monin-Obukhov similarity functions, the GLSL port of
 // src/facetrt/energyphysics.h (Paulson unstable / linear stable, valid
 // for -5 <= zeta = z/L <= 1).
+// MOST 稳定度修正函数：zeta = z/L 限幅在 [-5, 1]；不稳定时 psi_M 用 Paulson 形式，
+// 稳定时用线性（-5ζ）；psiH、phiH 为对应的热量修正与无量纲梯度函数。
 float mostPsiM(float zeta)
 {
     zeta = clamp(zeta, -5.0, 1.0);
@@ -333,6 +375,7 @@ float mostPhiH(float zeta)
     return zeta >= 0.0 ? 1.0 + 5.0 * zeta : 1.0 / sqrt(1.0 - 16.0 * zeta);
 }
 #else
+// 非 MOST（中性）版本：始终把自由对流导纳与 1/ra 并联（见上方长注释）。
 float groundExchangeRaa(float raa, float surfaceTemperatureK,
                         float airTemperatureC, uint typeId)
 {

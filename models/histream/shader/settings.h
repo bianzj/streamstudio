@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：settings.h
+// 功能：着色器端的 push constant 运行设置、光线负载（payload）与着色状态结构体定义。
+// 主要模块：
+//   1. RayRTSetting / VoxellstSetting / VoxelrtSetting：三类管线（RayTracing、体元 LST/EB、
+//      体元 RT）的 push constant 参数
+//   2. PtPayload / ShadowHitPayload：光线追踪命中着色器与 raygen 之间传递的负载
+//   3. Ray、ShadeState：射线与命中点着色状态（法线、切线、材料 id 等，世界系/局部系）
+// 数据流：主机端把设置打包为 push constant；raygen/compute 着色器读取；命中信息经 PtPayload 回传，
+//   shade_state.glsl 将其还原成 ShadeState。
+// 注意：字段顺序与主机端 C++ 同名结构体一一对应（push constant 布局），修改需同步；
+//   VoxellstSetting 中 VOXELLST 宏下的字段仅在对应管线编译时存在。
+// ==========================================================================
+
 #ifndef SETTINGS
 #define SETTINGS
 
@@ -6,6 +20,8 @@
 //////////////////////////////////////////////////////////////
 //    Pushconstant
 //////////////////////////////////////////////////////////////
+// 模块：push constant 设置。RayRTSetting 用于 RayTracing 管线（图像 imageSize、帧号 frame、
+// 最大反弹深度 maxDepth、采样数 n_sample、波段数 n_wave、周期邻域数 periodicNeighborCount 等）。
 //  Radiative transfer setting
 struct RayRTSetting
 {
@@ -31,6 +47,8 @@ struct RayRTSetting
 	float sceneTop;
 };
 
+// 体元（LST/EB 相关）管线的设置：体元网格尺寸 voxelSize（xzy 顺序）、尺度 scale、散射阶数与阶段等；
+// VOXELLST 宏下额外字段用于多次散射的辐亮度缓冲与能量平衡迭代。
 struct VoxellstSetting
 {
 
@@ -66,6 +84,7 @@ struct VoxellstSetting
 #endif
 };
 
+// VoxelRT 管线的设置：与 VoxellstSetting 类似，另含 spectralBatchSize 与碰撞阶数（collisionOrders/collisionOrder）。
 struct VoxelrtSetting
 {
 
@@ -92,6 +111,7 @@ struct VoxelrtSetting
 };
 
 
+// PtPayload：closest-hit 写回的命中信息（命中距离、图元/实例 id、重心坐标、物体↔世界矩阵、射线起点）。
 // 光线追踪过程中光线信息
 struct PtPayload
 {
@@ -120,6 +140,7 @@ struct Ray
   vec3 direction;
 };
 
+// 命中点着色状态：世界系位置/法线/切线/副法线，同时保留物体局部系的法线与切线，及实例、光谱、热、类型 id。
 struct ShadeState
 {
 	vec3 normal;

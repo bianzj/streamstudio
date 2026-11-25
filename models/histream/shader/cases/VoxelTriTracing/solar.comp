@@ -1,3 +1,22 @@
+// ==========================================================================
+// 文件：cases/VoxelTriTracing/solar.comp（VoxelRT：体元三角形追踪变体的“太阳/初始项”计算着色器）
+// 功能：对每个体元（一个线程一个体元）计算：(a) 体元中心沿太阳方向的透过率 voxelDirs.solar；
+//   (b) 沿 DIFFUSE_ANGLE_NUM 个漫射方向发射射线，得到零阶（单次）诱导辐射 voxelRads.induced，
+//   即天空辐射 + 其它体元/土壤的热发射；并把 cumulated 初始化为 induced。
+// 主要模块/步骤：
+//   1. TraversalDirection：沿太阳方向逐步穿过体元，累乘植被透过率（Beer–Lambert），土壤遮挡为 0
+//   2. Voxel_raytracing_diffuse_single：对每个漫射方向追踪射线，累加天空项与热发射项到 induced
+//   3. main：清零 cumulated/induced → 求太阳透过率 → 求单次项 → cumulated = induced
+// 数据流：voxelLinks（体元→实例/类型）、canopies（密度 density、叶倾角函数 G）、spectralMaterials/
+//   thermalMaterials、lightSet（太阳方向、漫射、天空温度）、settingxml（体元尺度、最大步数、是否算温度）
+//   → 本着色器 → voxelDirs[].solar、voxelRads[].induced/cumulated（下标见约定）
+//   → 后续 diffuse.comp（多次散射迭代）、outImageTri.comp（成像）读取。
+// 约定：y 轴向上（ray.direction.y > 0 视为上半球/天空）；voxelRads 下标 =
+//   (体元 * waveNum + 波段) * DIFFUSE_ANGLE_NUM + 漫射方向；lightSet.direction 为指向太阳的方向（待核对）；
+//   波长 > 50 视为 nm 并换算为 um；波长 > 2.5 um 视为热红外波段（只算热发射，光学波段本阶段为 0）。
+// 注意：本着色器 TIR 项只考虑发射，不含反射太阳光；太阳散射在 diffuse.comp 中处理（待核对）。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -18,8 +37,11 @@
 #extension GL_KHR_memory_scope_semantics:require
 #extension GL_EXT_shader_atomic_float: require 
 
+// 编译开关：选择“体元 + 三角形追踪”变体，供下面 include 的公共文件按宏分支。
 #define VOXELTRITRACING 1
 
+// 公共头：缓冲区绑定布局、参数、全局量、BSDF、辅助函数、NanoVDB 体元索引、
+// 体元着色状态、随机数。
 #include "../bindinglayout.h"
 #include "../parameters.h"
 #include "../global.glsl"
@@ -29,12 +51,15 @@
 #include "../shade_state_voxel.glsl"
 #include "../random.glsl"
 
+// 全局射线负载：prd 供 ClosestHit 写入命中信息；shadow_payload 为阴影射线负载。
 PtPayload        prd;
 ShadowHitPayload shadow_payload;
 
 #include "../traceray_comp.glsl"
 
 layout(local_size_x = GROUP_SIZEX) in;
+// 常量：DIFFUSE_ANGLE_NUM 为漫射方向数（上下半球各一半，故天空占 N/2 个方向）；
+// MAXSTEP/MAXBAND/NUM_* 为波段数相关上限（本文件实际步数取 settingxml.maxStep）。
 #define MAXSTEP   100
 #define DIFFUSE_ANGLE_NUM 32
 #define MAXBAND    25
@@ -42,12 +67,18 @@ layout(local_size_x = GROUP_SIZEX) in;
 #define NUM_BAND 2162 // number of VNIR+TIR bands
 #define NUM_TIR 162  // number of TIR bands
 
+// 作用：从本线程体元中心沿 lightDirection（太阳方向）逐步追踪，求体元到太阳的透过率，
+//   写入 voxelDirs[bufferId0].solar（无量纲，0~1）。
+// 规则：植被体元 alpha = exp(-density·G·光程)；土壤遮挡（非起点处）使透过率为 0；
+//   累计透过率 ≤ 0.01 时提前终止（此时保留小值，不置 0）。
+// 返回：射线逃逸出场景返回 false，其余（被挡/步数用尽）返回 true；main 不使用返回值。
 bool TraversalDirection(vec3 lightDirection)
 {
     //------------------------------------------------------------
     // Initialization for the position and SSBO index
     //------------------------------------------------------------
     // get bufferId, voxelId, instanceId and typeId
+    // 步骤 1：取本线程体元（一线程一体元），计算体元中心位置（单位同 scale）。
     uint bufferId0 = uint(gl_GlobalInvocationID.x);
     ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
     // uint instanceId0 = voxelLinks[bufferId0].instanceId;
@@ -67,11 +98,13 @@ bool TraversalDirection(vec3 lightDirection)
     float alpha_voxel = 1.0;
     
     // ray cast from the center position of a voxel along a specific direction
+    // 步骤 2：从体元中心沿太阳方向发射射线，逐段穿过后续体元。
     Ray ray = Ray(voxelPos0, normalize(lightDirection));
 
     // This is a process toward direction step by step
     int kstep = 0;
     vec3 ffnormal;
+    // 步骤 3：逐步追踪；每步命中一个表面，换算为所穿过的体元并累乘该体元的透过率。
     for(kstep = 0; kstep<settingxml.maxStep; kstep++)
     {
         // the transmittance inside a voxel
@@ -81,10 +114,12 @@ bool TraversalDirection(vec3 lightDirection)
         // hit nothing and return false.
         if(prd.hitT == INFINITY)
         {
+            // 射线逃逸出场景：体元到太阳无进一步遮挡，记录累计透过率。
             voxelDirs[bufferId0].solar = alpha_toSolar;
             return false;
         }
 
+        // 命中点 → 所属体元 voxelId → 缓冲下标 bufferId（<0 表示该点不在任何有效体元内）。
         // get hit information, especially get ffnormal to avoid hit self.
         ShadeState sstate = GetShadeState(prd);
         voxelId = getPassedVoxelId(sstate.position, scale, normalize(lightDirection));
@@ -96,6 +131,8 @@ bool TraversalDirection(vec3 lightDirection)
             instanceId = voxelLinks[bufferId].instanceId;
             typeId = instanceLinks[instanceId].type;
             canopyId = instanceLinks[instanceId].canopyId;
+            // 土壤：起点体元（kstep==0，自身）不挡光；之后遇土壤视为被地形遮挡，透过率置 0 并结束。
+            // 植被：按 Beer–Lambert 定律，光程 × 叶面积密度 × G 函数（叶倾角投影系数）。
             // if soil, this voxel transmittance is 1.
             if(typeId == TYPE_SOIL)
             {
@@ -117,6 +154,7 @@ bool TraversalDirection(vec3 lightDirection)
         if(alpha_toSolar <= 0.01) break;
         // avoid hit self.
         ffnormal  = sstate.normal;
+        // 把射线起点沿法线推出命中点，避免下一步又命中同一表面（自相交）。
         ray.origin = OffsetRay(sstate.position, dot(ray.direction, ffnormal) > 0 ? ffnormal : -ffnormal);
     }
 
@@ -125,6 +163,12 @@ bool TraversalDirection(vec3 lightDirection)
     return true;
 }
 
+// 作用：计算体元的“单次/零阶”诱导辐射：对每个漫射方向 iangle、每个波段 kband，
+//   把沿该方向射线所见的天空辐射和其它体元/土壤的热发射累加到 voxelRads[loc].induced。
+// 输入：体元中心 voxelPos0、体元缓冲下标 bufferId0、NanoVDB 索引；输出：无（写 voxelRads）。
+// 说明：光学波段此阶段只计天空（上半球）漫射，植被/土壤的光学散射留给 diffuse.comp；
+//   热红外波段计天空 Planck 辐射与沿途植被/土壤的热发射（含热点效应修正）。
+//   返回值恒为 false，调用方不使用。
 // It is used for single scattering term. solar term.
 bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink)
 {
@@ -145,6 +189,8 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
     Canopy canopy;
     float pl_toSolar, pl_toVoxel;
 
+    // 步骤 1：遍历漫射方向；alpha_toVoxel 是射线从起点到当前位置累计的透过率，
+    //   alpha_toSolar 取被命中体元自身的太阳透过率（供热点函数使用）。
     for(int iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
     {
         directioni0 = DIFFUSE_DIRECTIONS[iangle];
@@ -163,6 +209,7 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
             alpha_voxel = 1.0;
             ClosestHit(ray);
 
+            // 步骤 2：kstep==0 的第一次命中是体元自身表面，仅用于推出射线起点，不累加任何贡献。
             // avoid itself
             if(kstep == 0) 
             {
@@ -173,6 +220,9 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
                 continue;
             }
             ///////////////////////////////////////////////////
+            // 步骤 3：射线逃逸 → 看到天空。仅上半球（direction.y>0）有贡献：
+            //   热红外波段用天空温度的 Planck 辐射；光学波段用漫射天空 lightSet.diffuse 平均分到
+            //   上半球 N/2 个方向；均乘以射线到体元的透过率 alpha_toVoxel。
             /// sky case (sky -> i).
             /// sky only exists in the upper hemisphere space. 
             /// so the direction number is N/2.
@@ -214,6 +264,7 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
             }
 
             ///////////////////////////////////////////////////
+            // 步骤 4：射线命中体元（j → i）：按类型累加热发射；植被继续穿透，土壤终止。
             /// Turbid or facet ground case (j -> i).
             ///////////////////////////////////////////////////
             /// get hit information.
@@ -238,6 +289,8 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
 
                     if(alpha_toVoxel < 0.001) break;
 
+                    // 热点效应（Kuusk 模型）：用太阳透过率与射线透过率反推等效光程，
+                    //   光程用 -ln(alpha)/G 估算；透过率 < 1e-4 时取 10000 表示“很长”以避免 log(0)。
                     // this is used for the hotspot effect
                     if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
                     else pl_toSolar = -log(alpha_toSolar) / canopy.G / 1.0;
@@ -265,6 +318,8 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
                                 // hot spot
                                 float thermalRadiance = Planck(wavelength, sunlitTemperature) * hotspot
                                                         + Planck(wavelength, shadedTemperature) * (alpha_toVoxel - hotspot);
+                                // 植被热发射 = 日照/阴影 Planck 辐射混合 × 发射率 (1−ρ−τ) × 该体元吸收比例 (1−alpha_voxel)。
+                                //   日照部分权重 = 热点因子 hotspot，阴影部分 = alpha_toVoxel − hotspot（待核对）。
                                 radiance += thermalRadiance * (1 - refl - trans) * (1 - alpha_voxel);
                                 // // get sunlit and shaded fraction and mixed them for an average result.
                                 // float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
@@ -284,6 +339,7 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
                             radiance += 0.0;
                         }
 
+                        // 把本方向、本波段的贡献累加到 induced（线程独占该体元的这段内存，故无需原子操作）。
                         // add diffuse angle direction scattering term to induced.
                         uint loc = bufferId0 * DIFFUSE_ANGLE_NUM * sensorMatrix.waveNum 
                                     + kband * DIFFUSE_ANGLE_NUM + iangle;
@@ -291,8 +347,11 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
                         voxelRads[loc].induced += radiance;
                     }
                     
+                    // 穿过该植被体元后，更新射线到后续体元的累计透过率。
                     alpha_toVoxel = alpha_toVoxel * alpha_voxel;
                 }
+                // 土壤：不透明（alpha_voxel=1 仅作占位），按热发射累加后终止本方向射线。
+                //   注意：此分支用 canopy.G 估算光程，canopy 取自土壤实例的 canopyId（可能无意义，待核对）。
                 if(typeId == TYPE_SOIL)
                 {
                     alpha_voxel = 1.0;
@@ -325,6 +384,7 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
                                 // hotspot
                                 float thermalRadiance = Planck(wavelength, sunlitTemperature) * hotspot 
                                                         + Planck(wavelength, shadedTemperature) * (alpha_toVoxel - hotspot);
+                                // 土壤热发射 = 日照/阴影 Planck 辐射混合 × 发射率 (1−ρ−τ)。
                                 radiance += thermalRadiance * (1 - refl - trans);
                                 // // get sunlit and shaded fraction and mixed them for an average result.
                                 // float sunlitTemperature = thermalMaterials[thermalId].sunlitTemperature;
@@ -353,6 +413,7 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
                 }
             }
 
+            // 步骤 5：从命中点继续同方向前进（推出表面避免自相交），进入下一步追踪。
             //// change ray origin position to hit position; and avoid self collide.
             ray = Ray(sstate.position, directioni);
             ffnormal = sstate.normal;
@@ -369,12 +430,14 @@ bool Voxel_raytracing_diffuse_single(vec3 voxelPos0, uint bufferId0, NanoVDBLink
 
 
 
+// 入口：一线程一体元。顺序：太阳透过率 → 清零 → 单次项 → cumulated 初始化。
 void main()
 {
     //------------------------------------------------------------
     // Initialization for the position and SSBO index
     //------------------------------------------------------------
     // get bufferId, voxelId, instanceId and typeId
+    // 步骤 1：取本线程体元并计算其中心位置。
     uint bufferId0 = uint(gl_GlobalInvocationID.x);
     ivec3 voxelId0 = voxelLinks[bufferId0].voxelId;
     // Get nanoVDBLink: from voxelId to bufferId
@@ -388,9 +451,11 @@ void main()
     // solar direction.
     vec3 lightDirection = normalize(lightSet.direction);
     
+    // 步骤 2：求体元到太阳的透过率（写入 voxelDirs.solar，后续单次项与其它着色器使用）。
     // calculate the transmittance from voxel to solar.
     TraversalDirection(lightDirection);
 
+    // 步骤 3：清零本体元所有（波段 × 方向）的 induced/cumulated。
     // initialize induced and cumulated, both are set 0.
     for(int kband = 0; kband<sensorMatrix.waveNum; kband++)
     {
@@ -403,9 +468,11 @@ void main()
         }
     }
 
+    // 步骤 4：求零阶项（天空 + 其它体元热发射）写入 induced。
     // calculate the primary scattering term and store in voxelRads.induced.
     Voxel_raytracing_diffuse_single(voxelPos0, bufferId0, nanoVDBLink);
 
+    // 步骤 5：cumulated = induced，作为 diffuse.comp 多次散射迭代的初值。
     // set cumulate as induced.
     // here is voxel zero scattering, receive the sky contribution and other voxel emittering term.
     // induced = Lsky + Le(j), cumulated  = induced.

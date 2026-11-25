@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：updateTp.comp
+// 功能：在一个能量平衡时间节点结束时，提交体元的“温度历史”voxelTlasts（以及土壤记忆项），
+//       供下一节点的土壤热储通量（evapo.comp）使用。只对土壤/建筑/水体体元有效。
+// 主要步骤（每个体元一个线程）：
+//   1. 越界/无效体元返回；参与介质冠层直接写固定温度后返回；其余植被不处理
+//   2. 水体：历史向后移一格，阳/阴温度合并为同一水温，写入历史首格（°C）
+//   3. 船体钢板：用当前受阳比例混合出的表面温度，推进隐式钢板温度廓线
+//   4. 土壤 method 1（热惯量法）：先提交 evapo.comp 已应用的阳/阴面积转移，必要时更新指数记忆模态，
+//      再把历史后移一格并写入本节点温度（异常温度回退到气温+2/+1 K）
+//   5. 土壤 method 2（单一土柱廓线）：用混合表面温度调用 Soilheatflux 推进温度廓线
+// 数据流：输入 voxelTempes、voxelDirs.solar、soilSets、局部气温/含水量；
+//         输出 voxelTlasts（°C，TLASTNUM 个历史节点；下标 0 为最新）、soilMemories、solarFraction。
+// 与其他文件：evapo.comp 读取这些历史计算 G；budget.comp 更新当前温度；
+//         fluid_coupling.glsl 提供船体钢板与局部气象函数。
+// 约定：voxelTempes 为 K，voxelTlasts 为 °C；method 0（G = GST·Rn）无历史，不做任何处理。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -31,6 +49,7 @@
 layout(local_size_x = GROUP_SIZEX) in;
 
 
+// 模块：温度历史提交（见文件头）。必须在该节点的 budget.comp / evapo.comp 完成之后调度。
 void main()
 {
     //------------------------------------------------------------
@@ -54,6 +73,7 @@ void main()
     canopyId = meshLink.canopyId;
     bioId = meshLink.bioId;
     typeId = meshLink.type;
+    // 步骤 1：参与介质冠层温度固定：写固定温度（>0）否则取气温，不保留历史。
     if(typeId == TYPE_VEGETATION && isParticipatingMedium(canopies[canopyId])) {
         float fixedTemperature = canopies[canopyId].fixedTemperature > 0.0
             ? canopies[canopyId].fixedTemperature : ubom.meteo.Ta + 273.15;
@@ -66,8 +86,10 @@ void main()
     float Ts,Gst;
 
 
+    // 该体元的历史温度在 voxelTlasts 中的起点（每体元 TLASTNUM 个节点，下标 0 为最新）。
     uint TlastId = bufferId * TLASTNUM;
  
+    // 只有土壤、建筑、水体需要历史温度（类别用浮点近似比较，等价于相等判断）。
     bool type = (abs(typeId*1.0 - TYPE_SOIL*1.0) < 0.1)
                 || (abs(typeId*1.0 - TYPE_BUILDING*1.0) < 0.1)
                 || (abs(typeId*1.0 - TYPE_WATER*1.0) < 0.1);
@@ -78,6 +100,8 @@ void main()
         // voxelrad_image.comp.  Mixing on both sides preserves the previous
         // shadow as a false thermal footprint in successive TIFF images.
 
+        // 步骤 2：水体。历史整体后移（最旧的丢弃），阳/阴取平均作为单一水温（水体不区分阳/阴），
+        // 把 °C 值写入历史首格；水的热储 Qw 用相邻两节点的温差计算（见 evapo.comp）。
         if(typeId == TYPE_WATER)
         {
             for(int i = TLASTNUM - 1; i > 0; i--)
@@ -93,6 +117,9 @@ void main()
             return;
         }
 
+        // 步骤 3：船体钢板。表面温度异常（NaN/越界）时回退到气温 +2 K（阳）/ +1 K（阴）；
+        // 按当前受阳比例混合出表面温度与旧廓线，由 shipPlateElimination 的系数
+        // 自外向内逐层推进：T_k = e_k + (1 - h_k)·T_{k-1}；阳/阴两个槽位存同一列。
         if(typeId == TYPE_BUILDING && shipPlateOn(bioId))
         {
             // Ship steel plate: advance the implicit column with the surface
@@ -121,10 +148,13 @@ void main()
             return;
         }
 
+        // 步骤 4：土壤 method 1（热惯量卷积法）。
         if(abs(soilSets[bioId].method-1)<0.1)
         {
             // Commit the sunlit/shaded area transfer evapo.comp applied to
             // the stored history during this node, then append this node.
+            // 先把 evapo.comp 在本节点已应用的“阳/阴面积转移”提交到存储的历史（受阳比例变化时才执行；
+            // storedSolar < 0 表示尚无记录）。
             float storedSolar = voxelTempes[bufferId].solarFraction;
             float currentSolar = clamp(voxelDirs[bufferId].solar, 0.0, 1.0);
             for(int i = 0; i < TLASTNUM && storedSolar >= 0.0 && storedSolar != currentSolar; i++)
@@ -138,6 +168,8 @@ void main()
             // Older history (control.soilInertiaHistory = "full"): commit the
             // same transfer, then let the change between the two oldest
             // stored nodes (T_{n-7} - T_{n-8}) enter the exponential modes.
+            // inertiaHistory == 1（"full"）：对最老两个节点的温差 leaving 引入指数记忆模态，
+            // 按 decay 衰减旧值并加入 leaving，使超出 TLASTNUM 个节点的更早历史仍有贡献。
             if(soilSets[bioId].inertiaHistory == 1)
             {
                 uint memoryId = bufferId * SOIL_MEMORY_MODES;
@@ -152,6 +184,8 @@ void main()
                         soilMemories[memoryId + j], storedSolar, currentSolar) + leaving;
                 }
             }
+            // 记录本节点的受阳比例；历史后移一格，再写入本节点温度（°C）。
+            // 温度超出 [TMIN, TMAX] 阈值时，阳/阴一并回退到气温 +2/+1 K，防止异常值污染历史。
             voxelTempes[bufferId].solarFraction = currentSolar;
             for(int i =TLASTNUM-1; i>0; i--)
             {   
@@ -175,6 +209,8 @@ void main()
             voxelTlasts[TlastId].sunlit = Tsunlit-273.15;
             voxelTlasts[TlastId].shaded = Tshaded-273.15;
         }
+        // 步骤 5：土壤 method 2。阳/阴槽位表示同一物理土柱，用受阳比例混合的表面温度作为上边界，
+        // 调用 Soilheatflux 推进各层温度，并把新廓线同时写入两个槽位。
         if(soilSets[bioId].method == 2){ // 单一实际土柱温度廓线
             float sunlitFraction = clamp(voxelDirs[bufferId].solar, 0.0, 1.0);
             float actualSurfaceTemperature = mix(

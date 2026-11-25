@@ -1,12 +1,31 @@
+// ==========================================================================
+// 文件：facetrt/visibility_resolve.comp（FacetRT）
+// 功能：把 A-buffer 片元列表解析为面元侧之间的“可见性图”（稀疏边表 + 各侧射线计数）。
+// 主要模块/步骤：
+//   1. 每个线程处理一个像素：读出片元列表并按（深度, 侧编号）插入排序
+//   2. 统计分母 denominators：每个中心瓦片片元给其两侧各加权 2
+//   3. 最近片元的朝向侧看到天空（skyCounts），最远片元的背面看到地面（groundCounts）
+//   4. 相邻片元之间建边：近片元背面 ↔ 远片元朝向侧，写入哈希表 edgeKeys/edgeCounts
+// 数据流：visibility.frag 写的 records/pixelCounts → 本着色器
+//   → edgeKeys/edgeCounts/denominators/skyCounts/groundCounts/statistics
+//   → 主机压缩为 CSR 边表 → radiosity.comp、incident.comp
+// 约定：每个像素相当于一条沿视线的射线，射线数就是辐射交换的权重（视角因子的光栅估计）；
+//   周期复制体（cameraSide 最高位）只遮挡与发射，不作为接收面，边权按中心成员数计；
+//   边哈希表：键 = (min(side)<<32 | max(side))，空槽为 EMPTY_KEY，容量 raster.w 须为 2 的幂。
+// ==========================================================================
+
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require
 
 #define MAX_FRAGMENTS 256u
+// 哈希表空槽标记（64 位全 1；有效键不会取该值）。
 #define EMPTY_KEY 0xfffffffffffffffful
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// A-buffer 片元记录：depthBits = gl_FragCoord.z 的 float 位模式；
+// cameraSide 见 visibility.vert。
 struct FragmentRecord {
     uint depthBits;
     uint cameraSide;
@@ -18,6 +37,9 @@ layout(std430, set = 0, binding = 0) readonly buffer FragmentBuffer {
 layout(std430, set = 0, binding = 1) readonly buffer PixelCounts {
     uint pixelCounts[];
 };
+// 输出缓冲：edgeKeys/edgeCounts 为开放寻址哈希表（无向边 → 射线数）；
+// denominators 每侧射线总数；skyCounts 直达天空的射线数；
+// statistics[1] 记录哈希表溢出次数（主机据此扩容并重算，待核对）。
 layout(std430, set = 0, binding = 2) buffer EdgeKeys {
     uint64_t edgeKeys[];
 };
@@ -40,6 +62,8 @@ layout(std430, set = 0, binding = 7) buffer GroundCounts {
     uint groundCounts[];
 };
 
+// 推送常量：raster = (宽, 高, 每像素最大层数, 哈希表容量（2 的幂）)；
+// 其余字段本着色器未用。
 layout(push_constant) uniform VisibilityPush {
     mat4 viewProjection;
     vec4 viewDirection;
@@ -47,6 +71,7 @@ layout(push_constant) uniform VisibilityPush {
     vec4 periodic;
 } pc;
 
+// 作用：64 位边键的异或-乘法混合哈希（类 MurmurHash3 终结步），折叠为 32 位槽号。
 uint hashKey(uint64_t key)
 {
     key ^= key >> 33;
@@ -55,6 +80,9 @@ uint hashKey(uint64_t key)
     return uint(key) ^ uint(key >> 32);
 }
 
+// 作用：向无向边哈希表累加 weight（射线数）；键按（小, 大）排序，A–B 与 B–A 同键。
+// 副作用：对 edgeKeys 做 atomicCompSwap、对 edgeCounts 做 atomicAdd；
+// 探测超限则 statistics[1] += 1，由主机发现并处理。
 void addEdge(uint sideA, uint sideB, uint weight)
 {
     // A facet seeing its own periodic replica links its two sides (2f, 2f+1),
@@ -83,11 +111,13 @@ void addEdge(uint sideA, uint sideB, uint weight)
     atomicAdd(statistics[1], 1u);
 }
 
+// 周期复制体标记位（与 visibility.vert 的 outCameraSide 最高位一致）。
 const uint REPLICA_BIT = 0x80000000u;
 
 uint sideOf(FragmentRecord record) { return record.cameraSide & ~REPLICA_BIT; }
 uint centralWeight(FragmentRecord record) { return (record.cameraSide & REPLICA_BIT) == 0u ? 1u : 0u; }
 
+// 入口：一个线程处理一个像素（一条沿视线的射线）。
 void main()
 {
     const uint pixel = gl_GlobalInvocationID.x;
@@ -101,11 +131,14 @@ void main()
         return;
     }
 
+    // 步骤 1：把该像素的片元读入私有数组（栈上最多 MAX_FRAGMENTS 条，故前面需限幅）。
     FragmentRecord localRecords[MAX_FRAGMENTS];
     for (uint i = 0u; i < count; ++i) {
         localRecords[i] = records[pixel * pc.raster.z + i];
     }
 
+    // 步骤 2：按（depthBits 升序, cameraSide 升序）插入排序；深度相同时以侧编号定序，
+    // 使结果不依赖 GPU 片元到达顺序。
     // Private-memory insertion sort; depth is in [0,1], so float bit order is valid.
     for (uint i = 1u; i < count; ++i) {
         const FragmentRecord value = localRecords[i];
@@ -119,6 +152,7 @@ void main()
         localRecords[j] = value;
     }
 
+    // 步骤 3：累加分母（只有中心瓦片片元是接收面）。
     // Only central-tile fragments receive. Counts are doubled so that a pair
     // of fragments weighs (number of central members): periodic replicas are
     // identical, so this keeps the undirected edge table reciprocal while the
@@ -131,11 +165,14 @@ void main()
         atomicAdd(denominators[cameraSide ^ 1u], weight);
     }
 
+    // 步骤 4：最近片元的朝向侧看到天空；最远片元的背面（^1）看到下边界（地面）。
     if (centralWeight(localRecords[0]) != 0u)
         atomicAdd(skyCounts[sideOf(localRecords[0])], 2u);
     if (centralWeight(localRecords[count - 1u]) != 0u)
         atomicAdd(groundCounts[sideOf(localRecords[count - 1u]) ^ 1u], 2u);
 
+    // 步骤 5：相邻片元对建边：近片元的背面 ↔ 远片元的朝向侧，
+    // 权重为两者中心成员数之和。
     for (uint i = 0u; i + 1u < count; ++i) {
         const uint nearBackSide = sideOf(localRecords[i]) ^ 1u;
         const uint farCameraSide = sideOf(localRecords[i + 1u]);

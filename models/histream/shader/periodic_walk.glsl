@@ -1,3 +1,18 @@
+// ==========================================================================
+// 文件：periodic_walk.glsl
+// 功能：周期边界（沿世界 x、z 方向重复的矩形计算域）下的射线遍历工具，
+//   RayTracing 与体元模式（VoxelRT/VoxelEB）共用。
+// 主要模块：
+//   1. 特化常量：PERIODIC_BOUNDARY_ENABLED、PERIODIC_CROSSING_LIMIT 与 periodicCrossingLimit()
+//   2. PeriodicWalk 结构体：记录当前所在副本（tile）与下一次穿越边界的射线参数
+//   3. periodicWalkBegin / SegmentEnd / Shift / Advance：类似 2D DDA 的逐副本步进
+//   4. periodicTopEntry / periodicEscapedAbove：场景顶面之上空区的快速跳过与提前终止
+// 数据流：调用方（traceray/offline.rgen 等）在每个副本内把射线原点平移 periodicWalkShift()，
+//   只在射线参数区间 [segmentStart, segmentEnd] 内查询，命中位置仍用中央域坐标。
+// 约定：x/z 为水平轴、y 向上；射线参数 t 沿 direction 计（长度单位 m，方向向量为单位向量）；
+//   tile=(0,0) 为中央域；穿越次数上限由 setting.periodicNeighborCount 给出（最大 20）。
+// ==========================================================================
+
 #ifndef PERIODIC_WALK_GLSL
 #define PERIODIC_WALK_GLSL
 
@@ -14,6 +29,7 @@
 // a later one. "crossings" counts boundary passages; callers stop at
 // periodicTraversalCount (setting.periodicNeighborCount).
 
+// 表示"永远不会穿越该边界"（射线与该轴平行）的大数。
 const float PERIODIC_WALK_HUGE = 1.0e30;
 
 // Specialization constant 0: false when the run has no periodic boundaries
@@ -33,12 +49,15 @@ layout(constant_id = 0) const bool PERIODIC_BOUNDARY_ENABLED = true;
 layout(constant_id = 1) const int PERIODIC_CROSSING_LIMIT = -1;
 
 // Crossings allowed per query: 0 disables periodic traversal.
+// 作用：返回本次查询允许的穿越次数。特化常量已知时直接取常量；
+// 否则在周期启用时把 requested 限幅到 [0, 20]，未启用则为 0。
 int periodicCrossingLimit(int requested)
 {
   if(PERIODIC_CROSSING_LIMIT >= 0) return PERIODIC_CROSSING_LIMIT;
   return PERIODIC_BOUNDARY_ENABLED ? clamp(requested, 0, 20) : 0;
 }
 
+// 遍历状态：nextCrossing / crossingStep 分别为 x、z 方向下一次穿越边界的射线参数及相邻边界间距。
 struct PeriodicWalk
 {
   vec2 low;            // world x/z of the domain minimum corner
@@ -50,6 +69,10 @@ struct PeriodicWalk
   float segmentStart;  // ray parameter at which the current copy is entered
 };
 
+// 作用：在射线参数 tStart 处初始化遍历。
+// 步骤：1) 求 tStart 处位置落在哪个副本 tile；2) 按方向符号确定 x/z 的前进方向（|d|<1e-8 视为平行）；
+//   3) 计算到下一条 x/z 边界的射线参数 nextCrossing 与边界间隔 crossingStep（平行轴取 HUGE）。
+// size 下限取 1e-4 避免除零。
 PeriodicWalk periodicWalkBegin(vec3 origin, vec3 direction, float tStart,
                                vec2 low, vec2 size)
 {

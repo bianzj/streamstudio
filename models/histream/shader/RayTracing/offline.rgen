@@ -1,3 +1,20 @@
+// ==========================================================================
+// 文件：RayTracing/offline.rgen
+// 功能：RayTracing 模式（光线追踪辐射，含热红外发射）的 ray-generation 着色器：
+//   对每个像素做多样本蒙特卡洛路径追踪，输出各波段的表观反射率（HDRF）或辐亮度/亮温。
+// 主要模块：
+//   1. 路径状态与材料反射率：Radiance/RadianceSum/Throughput、纹理系数、MaterialReflectance
+//   2. 求交封装：ClosestHit、AnyHitSegment，周期边界下的 ClosestHitPeriodic / AnyHit
+//      （rayQuery 逐副本查询）
+//   3. 光照：DirectLighting（太阳直射、热发射、天空漫射的下一事件估计）、InDirectLighting（散射采样）
+//   4. PathTrace：路径主循环（俄罗斯轮盘赌、天空盒/天空温度、逐顶点着色）
+//   5. SamplePixel / main：相机射线生成、多样本平均、HDRF/亮温转换与输出写入
+// 数据流：setting/sensorMatrix/lightSet/材料缓冲区 → 路径追踪 → outImage（按波段分平面，
+//   原子写入）；closestHit.rchit 填 PtPayload，shade_state.glsl 还原几何。
+// 约定：波长 > 50 视为 nm，换算为 µm；≤2.5 µm 为短波（输出 HDRF = π·L/E_ref，
+//   E_ref = direct·cos(太阳天顶角) + 0.5·diffuse），> 2.5 µm 为热红外；场景长度单位为 m，y 轴向上。
+// ==========================================================================
+
 #version 460
 #extension GL_GOOGLE_include_directive : enable         // To be able to use #include
 #extension GL_EXT_ray_tracing : require                 // This is about ray tracing
@@ -19,6 +36,7 @@
 #extension GL_EXT_shader_atomic_float: enable
 #extension GL_EXT_ray_query : require
 
+// RAYTRACING 宏：让共用头文件（bindinglayout.h 等）选择 RayTracing 模式的绑定与结构。
 #define RAYTRACING 1
 
 #include "../global.glsl"
@@ -32,19 +50,24 @@
 #include "../bindinglayout.h"
 #include "../periodic_walk.glsl"
 
+// 光线负载：location 0 为主光线（命中信息），location 1 为阴影光线（是否被遮挡）。
 layout(location = 0) rayPayloadEXT PtPayload prd;
 layout(location = 1) rayPayloadEXT ShadowHitPayload shadow_payload;
 
+// 每个波段的逐路径累计量（线程私有数组，容量 800 > n_wave 上限；超出会越界，待核对上限检查）：
+//   Radiance 当前样本辐亮度，RadianceSum 所有样本之和，Throughput 路径吞吐量（BSDF·cos/pdf 的累乘）。
 float Radiance[800];
 float RadianceSum[800];
 float Throughput[800];
 
 // Physical-texture factor of the current hit triangle (1 = untextured).
+// 全局状态：当前命中三角形的物理纹理系数；specularPathEncountered 记录路径是否遇到镜面材料。
 float surfaceTextureFactor = 1.0;
 bool specularPathEncountered = false;
 
 const uint NO_TEXTURE_OFFSET = 0xFFFFFFFFu;
 
+// 作用：读取当前命中三角形的纹理系数（实例未绑定纹理时为 1）。
 float HitTextureFactor()
 {
   uint offset = instanceTextureOffsets[prd.instanceCustomIndex];
@@ -53,6 +76,9 @@ float HitTextureFactor()
 
 // Reflectance after the physical texture, kept within 1 - T. Thermal bands
 // (> 2.5 um) are never modulated.
+// 作用：材料在波段 kBand 的反射率（可含纹理调制）。
+// 说明：波长大于 50 视为 nm 并换算为 µm；热红外波段（> 2.5 µm）不做纹理调制；
+//   调制后反射率限幅到 1-T，避免 R+T>1。
 float ShortwaveReflectance(uint index, int kBand)
 {
   float reflectance = spectralMaterials[index].reflectance;
@@ -63,6 +89,7 @@ float ShortwaveReflectance(uint index, int kBand)
              max(0.0, 1.0 - spectralMaterials[index].transmittance));
 }
 
+// 作用：返回方向相关的反射率权重：有镜面分量（specularFraction>0）用改进 Phong，否则用背景 Hapke 角度效应（强度 angularStrength）。
 float MaterialReflectance(uint index, int band, vec3 wi, vec3 wo, vec3 normal, float angularStrength)
 {
   float r = ShortwaveReflectance(index, band);
@@ -77,6 +104,7 @@ float MaterialReflectance(uint index, int band, vec3 wi, vec3 wo, vec3 normal, f
 }
 
 // One TLAS query over [Lmin, Lmax].
+// 作用：单次 TLAS 求交（traceRayEXT），结果经 closest-hit 写入 prd；未命中时 hitT 保持 INFINITY（rmiss 为空）。
 void ClosestHit(Ray r, float Lmin, float Lmax)
 {
 	uint rayFlags = gl_RayFlagsOpaqueEXT;
@@ -87,6 +115,7 @@ void ClosestHit(Ray r, float Lmin, float Lmax)
 
 // Visibility query: any opaque hit answers it, so stop at the first one
 // instead of searching for the closest.
+// 作用：区间 [Lmin, Lmax] 内是否有遮挡（首次命中即终止）。isHit 预设 true，由 shadow.rmiss 在未命中时置 false。
 bool AnyHitSegment(Ray r, float Lmin, float Lmax)
 {
     uint rayFlags = gl_RayFlagsOpaqueEXT
@@ -99,6 +128,7 @@ bool AnyHitSegment(Ray r, float Lmin, float Lmax)
     return shadow_payload.isHit;
 }
 
+// 周期穿越次数上限：setting.periodicNeighborCount 限幅到 [0, 20]，0 表示无周期边界。
 int PeriodicLimit()
 {
   return clamp(setting.periodicNeighborCount, 0, 20);
@@ -108,6 +138,8 @@ int PeriodicLimit()
 // the copy walk (nested in the path loop) silently lost hits of camera rays
 // on the driver, while the same queries issued once were exact; ray queries
 // have no SBT/payload round trip. Opaque flags match ClosestHit/AnyHitSegment.
+// 作用：用 rayQuery 在一个周期副本内求交；firstHitOnly 时只判断有无命中（阴影），
+//   否则把最近命中写入 prd。返回是否命中。
 bool QueryPeriodicSegment(vec3 origin, vec3 direction, float tMin, float tMax,
                           bool firstHitOnly)
 {
@@ -139,6 +171,7 @@ bool QueryPeriodicSegment(vec3 origin, vec3 direction, float tMin, float tMax,
 }
 
 // The domain is centred on the origin: x in [-X/2, X/2], z in [-Y/2, Y/2].
+// 作用：初始化周期遍历。RayTracing 的场景尺寸 sceneSize 单位为 m；域下限为 -0.5·size。
 PeriodicWalk BeginPeriodicWalk(Ray r, float tStart)
 {
   vec2 size = max(setting.sceneSize, vec2(0.01));
@@ -152,6 +185,9 @@ PeriodicWalk BeginPeriodicWalk(Ray r, float tStart)
 // periodicTraversalCount boundaries. Crossings never consume scattering
 // depth. prd.hitT stays the distance along the original ray and the hit
 // position is in central-domain coordinates.
+// 作用：周期场景下的最近命中（含无周期时的退化）。
+// 步骤：1) 无周期则单次查询；2) 在场景顶面之上且不下降的射线直接逃逸（hitT=INFINITY）；
+//   3) 从上方来的射线先推进到顶面，避免在空区消耗穿越次数；4) 逐副本查询，直到命中、逃逸或超出穿越次数。
 void ClosestHitPeriodic(Ray r, float Lmin)
 {
   int limit = PeriodicLimit();
@@ -189,6 +225,8 @@ void ClosestHitPeriodic(Ray r, float Lmin)
 // ClosestHitPeriodic, and every per-copy query still terminates on its first
 // hit. The origin is already offset by OffsetRay; a 1 mm tmin no longer
 // skips nearby occluders such as overlapping leaves, needles and blades.
+// 作用：阴影/天空可见性判断，周期场景下沿射线逐副本查询；返回是否被遮挡。
+// 输入：射线 r、最大距离 maxDist（OUTER 表示足够远）；最小距离 1 mm（shadowMinimum）。
 bool AnyHit(Ray r, float maxDist)
 {
   const float shadowMinimum = 0.001;
@@ -222,6 +260,8 @@ bool AnyHit(Ray r, float maxDist)
 // (light.shortwaveIrradiance in lightSet.Rin, else clear sky), so
 // scale*direct*shape is the beam-normal and scale*diffuse*shape
 // the sky value in W m-2 um-1, used exactly like lightSet.direct/diffuse.
+// 作用：热红外波段的反射太阳光缩放系数 = 全球短波辐射（W m-2）/ 归一化参考照度；
+//   参考 = direct·cosZ + 0.5·diffuse。参考为 0 时返回 0。
 float ThermalSolarScale()
 {
   float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
@@ -231,12 +271,17 @@ float ThermalSolarScale()
 }
 
 // wi: in direction; wo: out direction; *World: direction in world coordinates.
+// 作用：在路径顶点做下一事件估计（next-event estimation）：直射太阳 + 热发射 + 各向同性天空散射，累加到 Radiance[]。
+// 输入：命中点位置、出射方向（世界系）、着色状态、当前深度；输出：始终返回 true，结果累加进全局 Radiance[]（kDepth 未使用）。
+// 步骤：1) 向太阳发射阴影射线；2) 向阳时按波段累加太阳直射（BSDF·cosθ·beam）；
+//   3) > 2.5 µm 波段累加表面热发射（向阳/背阴温度 × 发射率）；4) 累加天空漫射。
 bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
 {
   uint matIndex0 = sstate.spectralId * setting.n_wave;  // spectral index of band0 for spectralId
   float angularStrength = meshLinks[
     instanceLinks[sstate.instanceId].meshId].angularEffectStrength;
   
+  // 步骤 1：太阳方向变到局部（切线）系；法线朝向取与太阳同侧，射线原点沿法线偏移避免自遮挡。
   vec3 emitterWiWorld = normalize(lightSet.direction);  // sun direction in world coordinates.
   vec3 emitterWi = World2Tangent(sstate.normal, sstate.tangent, sstate.binormal, emitterWiWorld); // sun direction in local coordinates.
 
@@ -252,6 +297,8 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
   // terms correctly include multiple scattering without double counting.
   // Thermal bands below 6 um receive the absolute solar beam (same BRDF and
   // shadow ray as the optical bands); elsewhere it is exactly zero.
+  // 步骤 2：太阳直射。可见光/近红外（≤2.5 µm）beam=direct；更长波段用 solarScale·direct·mwirSolarShape(λ)。
+  //   背向太阳一侧（!inSameSide）取透射率，同侧取方向反射率。
   float solarScale = ThermalSolarScale();
   if(!inLightShadow)
   {
@@ -289,6 +336,7 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
   }
 
   // emission distribution
+  // 步骤 3：热发射（λ>2.5 µm）。向阳/背阴分别取 sunlitTemperature/shadedTemperature，乘发射率。
   // Always solve thermal radiance; the output switch only selects radiance
   // versus inverse-Planck brightness temperature.
   {
@@ -322,6 +370,9 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
     }
   }
 
+  // 步骤 4：天空漫射。用一次余弦加权采样估计天空可见因子；采样方向若朝下则翻到上半球；
+  //   可见（天空射线无遮挡）时按波段累加 sky·0.5·(R 或 T)/π，其中 0.5 是 direct/diffuse 比值定义所用的上半球积分；
+  //   热红外波段的天空太阳反射用 MWIR_SKY_SOLAR_RATIO 缩放（见 mwir_solar.glsl）。
   // Isotropic diffuse sky at every path vertex.  One cosine-weighted sample
   // estimates the sky-view factor.  The 0.5 term is the upper-hemisphere
   // integral used by the input direct/diffuse ratio.
@@ -366,6 +417,11 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
   return true;
 }
 
+// 作用：路径的下一次散射——采样新方向并更新各波段吞吐量 Throughput[]。
+// 输入：命中点、出射方向 woWorld、着色状态；输出：wiWorld（下一段射线方向，世界系），返回 true。
+// 步骤：1) 按 BSDF 采样切线系方向，bsdf0 的符号决定反射/透射；
+//   2) 若任一波段有透射（T>=EPSION），所有波段共用同一次反射/透射选择，估计量乘 2（各 50%）；
+//   3) 反射取方向反射率，透射取 T，吞吐量乘 bsdf·cosθ/pr；4) 按反射/透射把方向翻到正确半球。
 bool InDirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth, out vec3 wiWorld)
 {
   float bsdf0, pr;
@@ -417,6 +473,10 @@ bool InDirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth
 }
 
 // Cyclic iteration of ray collisions.
+// 作用：沿相机射线逐顶点追踪一条路径，累加辐亮度到 Radiance[]；返回 false 表示主射线逃逸且天空盒关闭（该样本不计入平均）。
+// 步骤：1) 第 3 次反弹后俄罗斯轮盘赌（存活概率取最大波段吞吐量，下限 0.05，存活时吞吐量除以概率保持无偏）；
+//   2) 求最近命中（含周期遍历）；3) 未命中：主射线按天空盒给出天空反射/温度，二次射线加天空热辐射；
+//   4) 命中：还原 ShadeState，做直接光照与散射采样，沿新方向继续，深度 kDepth 仅在散射时加 1。
 bool PathTrace(Ray r)
 {
   bool cameraPath = true;
@@ -449,6 +509,7 @@ bool PathTrace(Ray r)
 
     ClosestHitPeriodic(r, 0.0001);
 
+    // 步骤 3：逃逸出场景。波长单位：> 50 的数值按 nm 换算成 µm；> 2.5 µm 为热红外波段。
     // if hit outside the scene(PS: the started data segment is 0.)
     if(prd.hitT == INFINITY)
     {
@@ -492,6 +553,7 @@ bool PathTrace(Ray r)
       // }
       // return true;
 
+    // 步骤 4：woWorld 为入射行进方向（命中点 - 上一位置，未归一化）。
     ShadeState sstate = GetShadeState(prd);
     surfaceTextureFactor = HitTextureFactor();
     vec3 position = sstate.position;
@@ -511,6 +573,10 @@ bool PathTrace(Ray r)
   return true;
 }
 
+// 作用：对像素内一个子像素位置做一次路径采样，结果留在全局 Radiance[]；返回 PathTrace 的结果。
+// 步骤：1) 由子像素位置经 projInverse/viewInverse 生成相机射线（focalDist<0 表示主机端给定的平行投影，
+//   原点沿传感器平面移动）；2) 按景深参数计算光圈采样（finalRayDir，当前未用于射线，待核对）；
+//   3) 清零 Radiance、吞吐量置 1 后追踪。
 bool SamplePixel(vec2 subPixel_jitter, ivec2 imageCoords, ivec2 imageResolution)
 {
 
@@ -552,10 +618,16 @@ bool SamplePixel(vec2 subPixel_jitter, ivec2 imageCoords, ivec2 imageResolution)
 
 }
 
+// 入口：每个线程负责一个像素（可按 imageOffsetY 分块），对 n_sample 个子像素样本取平均并输出各波段结果。
+// 步骤：1) 初始化随机种子；2) 逐样本调用 SamplePixel，首个样本在像素中心，其余随机抖动，未覆盖场景的样本不计入平均；
+//   3) 全部样本都落空的边缘像素补做 4×4 分层采样；4) 后处理：≤2.5 µm 转为表观反射率 HDRF = π·L/E_ref，
+//   热红外且 isTemperature==1 时用逆普朗克转为亮温（K）；5) 按波段分平面原子写入 outImage。
+// 单位：辐亮度为 W m-2 sr-1 µm-1（待核对）；HDRF 无量纲。
 void main()
 {
 	uint64_t start = clockRealtimeEXT();  // Debug - Heatmap
 	ivec2 imageRes    = setting.imageSize;
+	// 线程索引 + 行偏移 imageOffsetY 得到全图像素坐标；越界线程直接返回。
 	ivec2 imageCoords = ivec2(gl_LaunchIDEXT.xy)
 		+ ivec2(0, setting.imageOffsetY);
 	if(any(greaterThanEqual(imageCoords, imageRes))) return;
@@ -572,6 +644,7 @@ void main()
     Radiance[kBand] = 0.0;
     RadianceSum[kBand] = 0.0;
   }
+  // 步骤 2：逐样本累加；coveredSamples 为有效样本数。
   // A primary ray that escapes while the sky box is off sees no modelled
   // radiance: it is excluded from the mean instead of averaging in a zero,
   // which darkened every object edge seen against the sky. Pixels without
@@ -606,6 +679,7 @@ void main()
 
 	for(int kBand = 0; kBand <  setting.n_wave; kBand++)
 	{
+		// 步骤 4：求平均并后处理（无有效样本则为 0，由主机端填天空值）。
 		Radiance[kBand] = coveredSamples > 0
       ? RadianceSum[kBand] / float(coveredSamples) : 0.0;
 
@@ -640,6 +714,7 @@ void main()
 		float value = Radiance[kBand];
 
     // value = lightSet.direct / PI;
+    // 步骤 5：输出缓冲区布局：按波段分平面，每平面 imageRes.x × imageRes.y，行优先。
     uint bufferId =  (n_pixel * kBand) + (imageCoords.y * imageRes.x + imageCoords.x );
 		atomicStore(outImage[bufferId], value, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
 	}

@@ -1,10 +1,35 @@
+// ==========================================================================
+// 文件：bindingLayout.h
+// 功能：histream 各 Vulkan 着色器管线的描述符绑定（binding）布局与 push constant 声明。
+//       通过编译宏选择当前着色器所属的管线，每个宏段声明一套 B_* 绑定号与对应的
+//       buffer/uniform/加速结构接口块。
+// 主要模块：
+//   1. RAYTRACING 段：RayTracing 模式（光谱/热材料、TLAS、传感器、光源、波长集、输出图像、
+//      物理纹理偏移与因子）；push constant 为 RayRTSetting
+//   2. VOXELLST 段：体元能量平衡（体元温度、冠层、风场/流体、土壤、水体、通量等）；
+//      push constant 为 VoxellstSetting（宏名与模式对应关系待核对）
+//   3. VOXELRT 段：VoxelRT 体元辐射（体元方向/辐射缓冲、冠层、NanoVDB、LAD、水体等）；
+//      push constant 为 VoxelrtSetting
+// 数据流：宿主端（C++/Vulkan）按相同的绑定号创建描述符集并写入缓冲；着色器通过本文件中
+//         声明的名字（如 spectralMaterials、voxelDirs、outImage）访问。
+// 与其他文件关系：依赖 settings.h（各 *Setting 结构体）与 parameters.h（材料、体元等数据结构）；
+//         宿主端描述符布局必须与本文件的 B_* 编号一致（见 models/histream/src 中对应的管线创建代码）。
+// 约定：各宏段互相独立，B_* 编号只在所属段内有意义（同名宏编号可不同，如 B_THERMAL 在
+//       RAYTRACING 与 VOXELRT 中均为 1，而 VOXELLST 中为 2）；每段的 `// 1-5` 之类行内编号注释
+//       是历史遗留的分组提示，不一定与实际编号一致，以 #define 为准。
+// ==========================================================================
+
 #ifndef BINDINGLAYOUT
 #define BINDINGLAYOUT
 
+// 依赖：settings.h 提供 RayRTSetting / VoxellstSetting / VoxelrtSetting 等 push constant 结构；
+//       parameters.h 提供材料、体元、冠层等 GPU 数据结构。
 #include "settings.h"
 #include "parameters.h"
 
 
+// 模块：RayTracing 管线绑定（B_SPECTRAL..B_TEXFACTOR，共 11 个）。
+// 说明：行尾的 `// --` 为原作者标记，含义不明（待核对）。
 #ifdef RAYTRACING
 #define B_SPECTRAL 0
 #define B_THERMAL 1
@@ -28,11 +53,14 @@ layout(binding = B_SENSOR) uniform _SensorMatrix { SensorMatrix sensorMatrix; };
 layout(binding = B_LIGHT) uniform _LightSet { LightSet lightSet; };                          // -- 
 layout(binding = B_WAVE) buffer _bufferWAVE { float waveSets[]; };                         // --
 layout(binding = B_STORAGE) buffer _bufferstorage { float outImage[]; };
+// 物理纹理：按 TLAS 实例给出每三角形因子的起始偏移，0xFFFFFFFF 表示该实例无纹理因子。
 // Physical texture: offset per TLAS instance (0xFFFFFFFF = none) into per-triangle factors.
 layout(binding = B_TEXOFFSET) buffer _bufferTextureOffset { uint instanceTextureOffsets[]; };
 layout(binding = B_TEXFACTOR) buffer _bufferTextureFactor { float textureFactors[]; };
+// 顶点/索引缓冲通过 buffer_reference（物理地址）访问，不占用描述符绑定号。
 layout(buffer_reference, scalar) buffer Vertices { VertexAttribute v[]; };
 layout(buffer_reference, scalar) buffer Indices { uvec3 i[]; };
+// push constant：RayTracing 的运行参数 RayRTSetting（每次 dispatch 传入）。
 layout(push_constant) uniform _RtxState
 {
   RayRTSetting setting;
@@ -42,6 +70,10 @@ layout(push_constant) uniform _RtxState
 
 
 
+// 模块：VOXELLST 管线绑定（B_SPECTRAL..B_SOILMEMORY，共 42 个）。
+// 说明：此段包含体元温度/能量平衡所需的全部缓冲：材料、冠层、体元链接、NanoVDB、
+//       方向/辐射、气象、空气动力学、土壤、水体、体元热通量、上一时刻温度（Tlast）、
+//       EBState、LAD 及流体（LBM/速度/标量）场。
 #ifdef VOXELLST
 
 #define B_SPECTRAL 0
@@ -85,6 +117,7 @@ layout(push_constant) uniform _RtxState
 #define B_FLUID_META 38
 #define B_FLUID_PARAMETERS 39
 #define B_HEX 40
+// 土壤方法 1 的指数和（sum-of-exponentials）历史项缓冲，见下方原注释。
 // Soil method-1 sum-of-exponentials history: SOIL_MEMORY_MODES (sunlit, shaded)
 // pairs per voxel; a single element unless some soil set uses it.
 #define B_SOILMEMORY 41
@@ -107,12 +140,15 @@ layout(binding = B_WAVE) buffer _bufferWAVE { float wave[]; };
 layout(binding = B_LIGHT) uniform _LightSet { LightSet lightSet; };
 layout(binding = B_ATOM) buffer _bufferWAVEset { AtomCond atomConds[]; };
 layout(binding = B_DIR) buffer _bufferDir { VoxelDir voxelDirs[]; };
+// 注意：本段的体元辐射 voxelRads 不走描述符绑定（B_RADS=15 仅为占位，未声明对应缓冲），
+//       而是通过 push constant 中的 radianceAddress 物理地址访问，避免超过 4 GiB 的限制。
 // Physical addresses allow the 64-direction scratch field to exceed 4 GiB.
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer VoxelRadianceBuffer {
   VoxelRad values[];
 };
 #define voxelRads VoxelRadianceBuffer(setting.radianceAddress).values
 //12 -20
+// 体元净辐射（voxelNetRads）等缓冲；此处的行内分组注释 `12 -20` 为旧编号提示，以 #define 为准。
 layout(binding = B_NETRAD) buffer _bufferNET {VoxelNetRad voxelNetRads[];}; //
 layout(binding = B_PNET) buffer _bufferPNRad { VoxelPnet voxelPnets[]; };
 layout(binding = B_STORAGE) buffer _bufferstorage { float outImage[]; };
@@ -139,11 +175,13 @@ layout(binding = B_FLUID_LBM_B) buffer FLUIDLBMB{float fluidLbmB[];};
 layout(binding = B_FLUID_DENSITY) buffer FLUIDRHO{float fluidDensity[];};
 layout(binding = B_FLUID_META) buffer FLUIDMETA{FluidCellMeta fluidMeta[];};
 layout(binding = B_FLUID_PARAMETERS) uniform FLUIDPARAMS{FluidParameters fluidParameters;};
+// VoxelHex 体元数据缓冲（具体含义待核对）。
 layout(binding = B_HEX) buffer _bufferHex { VoxelHex voxelHexs[]; };
 layout(binding = B_SOILMEMORY) buffer _bufferSoilMemory { vec2 soilMemories[]; };
 
 layout(buffer_reference, scalar) buffer Vertices { VertexAttribute v[]; };
 layout(buffer_reference, scalar) buffer Indices { uvec3 i[]; };
+// push constant：VOXELLST 的运行参数 VoxellstSetting（含 radianceAddress 等物理地址）。
 layout(push_constant) uniform _RtxState
 {
   VoxellstSetting setting;
@@ -154,6 +192,8 @@ layout(push_constant) uniform _RtxState
 
 
 
+// 模块：VoxelRT 管线绑定（B_SPECTRAL..B_WATERSET，共 18 个）。
+//       与 VOXELLST 相比去掉了气象/土壤/流体等能量平衡相关缓冲，且 voxelRads 为普通 SSBO。
 #ifdef VOXELRT
 
 #define B_SPECTRAL 0
@@ -191,6 +231,7 @@ layout(binding = B_SENSOR) uniform _CameraMatrix { SensorMatrix sensorMatrix; };
 layout(binding = B_WAVE) buffer _bufferWAVE { float wave[]; };
 layout(binding = B_LIGHT) uniform _LightSet { LightSet lightSet; };
 layout(binding = B_DIR) buffer _bufferDir { VoxelDir voxelDirs[]; };
+// 体元辐射缓冲：这里直接绑定为 SSBO（VOXELLST 段则用物理地址）。
 layout(binding = B_RADS) buffer _bufferRad { VoxelRad voxelRads[]; };
 //12 -20
 //20-25
@@ -204,6 +245,7 @@ layout(binding = B_WATERSET) buffer _bufferWater { WaterSet waterSets[]; };
 
 layout(buffer_reference, scalar) buffer Vertices { VertexAttribute v[]; };
 layout(buffer_reference, scalar) buffer Indices { uvec3 i[]; };
+// push constant：VoxelRT 的运行参数 VoxelrtSetting。
 layout(push_constant) uniform _RtxState
 {
   VoxelrtSetting setting;

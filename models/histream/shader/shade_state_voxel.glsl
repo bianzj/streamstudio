@@ -1,3 +1,16 @@
+// ==========================================================================
+// 文件：shade_state_voxel.glsl
+// 功能：体元模式（VoxelRT/VoxelEB 等）下，把三角网格光线命中的 PtPayload 还原成 ShadeState。
+// 主要步骤：
+//   1. 由实例 → 网格链接取顶点/索引缓冲区，读取命中三角形三个顶点
+//   2. 重心坐标插值位置并变到世界系；几何法线用 worldToObject 逆转置变换
+//   3. 切线/副法线在物体系构造后用 objectToWorld 变换（与 shade_state.glsl 的差别）
+//   4. 填入 spectralId/thermalId/typeId（取自 meshLinks）
+// 与其他文件的关系：面元模式的对应版本是 shade_state.glsl，两者导出同名函数 GetShadeState，
+//   同一着色器只会包含其中之一；文件末尾被注释掉的 GetShadeState0 是按体元编号取状态的旧草稿。
+// 约定：使用几何（面）法线；世界系位置单位 m。
+// ==========================================================================
+
 #ifndef SHADE_STATE_VOXEL_GLSL
 #define SHADE_STATE_VOXEL_GLSL
 
@@ -8,6 +21,7 @@
 
 //---------------------------------------------------------------------
 //-----------------------------------------------------------------------
+// 作用：由命中负载 hstate 构造着色状态（世界系位置/法线/切线 + 局部系基 + 材料 id）。
 ShadeState GetShadeState(in PtPayload hstate)
 {
   ShadeState sstate;
@@ -17,6 +31,7 @@ ShadeState GetShadeState(in PtPayload hstate)
   const vec3 bary   = vec3(1.0 - hstate.baryCoord.x - hstate.baryCoord.y, hstate.baryCoord.x, hstate.baryCoord.y);
 
 
+  // 步骤 1：实例 → 网格 → 顶点/索引缓冲区（设备地址），取命中三角形的三个顶点。
   int meshId = instanceLinks[instanceId].meshId;
   // Primitive buffer addresses
   Indices  indices  = Indices(meshLinks[meshId].indexAddress);
@@ -30,6 +45,7 @@ ShadeState GetShadeState(in PtPayload hstate)
   VertexAttribute attr2 = vertices.v[tri.z];
 
   // Vertex of the triangle
+  // 步骤 2：重心坐标插值物体系位置，并经 objectToWorld 变到世界系。
   const vec3 pos0           = attr0.position.xyz;
   const vec3 pos1           = attr1.position.xyz;
   const vec3 pos2           = attr2.position.xyz;
@@ -37,6 +53,8 @@ ShadeState GetShadeState(in PtPayload hstate)
   const vec3 world_position = vec3(hstate.objectToWorld * vec4(position, 1.0));
 
   // Normal
+  // 步骤 3：几何法线 + 切线坐标系。法线用逆转置变换（支持旋转/非均匀缩放实例）；
+  // 切线、副法线直接用 objectToWorld 变换（非均匀缩放下可能与世界法线不严格正交，待核对）。
   vec3 geom_normal  = normalize(cross(pos1 - pos0, pos2 - pos0));
   // Normals transform by inverse transpose, including rotated/nonuniformly
   // scaled instances. Multiplication by objectToWorld as a row was incorrect.
@@ -50,6 +68,7 @@ ShadeState GetShadeState(in PtPayload hstate)
   vec3 wgeom_binormal = normalize(vec3(mat4(hstate.objectToWorld) * vec4(geom_binormal.xyz, 0)));
   vec3 world_lastPosition = vec3(hstate.objectToWorld * vec4(hstate.lastPosition, 1.0));
 
+  // 步骤 4：填充输出；材料类 id 取自网格链接。
   sstate.position       = world_position;
   sstate.lastPosition   = world_lastPosition;
   sstate.normal         = wgeom_normal;
@@ -69,6 +88,7 @@ ShadeState GetShadeState(in PtPayload hstate)
 }
 
 
+// 以下为已停用的旧草稿（按体元编号取 ShadeState，引用的 primitiveId/bary/hstate 未定义，不可直接启用）。
 // ShadeState GetShadeState0(uint voxelId)
 // {
 //   ShadeState sstate;

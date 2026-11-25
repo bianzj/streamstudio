@@ -1,7 +1,20 @@
+// ==========================================================================
+// 文件：facetrt/incident.comp（FacetRT）
+// 功能：辐射度迭代收敛后，计算每个面元侧的入射辐照度 H（直射 + 天空 + 地面 + 邻面散射）。
+// 主要模块/步骤：
+//   1. 对每个面元侧：天空项 + 向下逃逸的地面项 + 可见邻面（CSR 边表）加权平均
+//   2. 再加直射辐照度 directIrradiance，结果限幅为非负并写入 H
+// 数据流：radiosity.comp 迭代得到 radiosityA/B → 本着色器 → Incident 缓冲 H（由主机读回，供能量平衡/统计使用）
+// 注意：累加用 double（需要 GL_ARB_gpu_shader_fp64），避免大量邻边累加的舍入误差
+// 注意：公式与 radiosity.comp 的 incoming() 一致，只是最后不再乘反射/透射率
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_gpu_shader_fp64 : require
 layout(local_size_x=64) in;
+// CSR 边：neighbor = 邻接面元侧编号；count = 该方向采样射线数（权重）。
 struct CsrEdge { uint neighbor,count; };
+// 每侧光学参数：反射率、透射率、自发射（辐射出射度）、直射辐照度（由直射求解得到）。
 struct SurfaceOptics { float reflectance,transmittance,emission,directIrradiance; };
 layout(std430,binding=0) readonly buffer Rows { uint rows[]; };
 layout(std430,binding=1) readonly buffer Edges { CsrEdge edges[]; };
@@ -13,12 +26,19 @@ layout(std430,binding=6) readonly buffer RadiosityB { float B[]; };
 layout(std430,binding=8) writeonly buffer Incident { float H[]; };
 layout(std430,binding=9) readonly buffer GroundCounts { uint groundCounts[]; };
 layout(std430,binding=12) readonly buffer GroundMean { float groundMean[]; };
+// 推送常量：facets 面元数；ping 当前解所在缓冲（0=A，1=B）；
+// skyRadiosity 天空辐射度；relaxation 本着色器未用。
 layout(push_constant) uniform Push { uint facets,ping;float skyRadiosity,relaxation; } pc;
+// groundCounts 中的哨兵值：地面面元朝土壤的背面，不是接收面（无天空、无交换）。
 const uint INACTIVE_SIDE=0xffffffffu;
+// 入口：一个线程处理一个面元侧（共 2*facets 个）。输出 H[s]，单位同辐射度/辐照度。
 void main() {
     uint s=gl_GlobalInvocationID.x; if(s>=2u*pc.facets) return;
+    // 特殊分支：地面背面只保留直射辐照度，不参与散射交换。
     // Soil-facing back side of a ground facet: not a receiving surface.
     if(groundCounts[s]==INACTIVE_SIDE) { H[s]=max(0.0,optics[s].directIrradiance); return; }
+    // 缺省：分母为 0（没有任何射线）时，整个半空间视为天空，取 skyRadiosity。
+    // 否则 v = (天空射线数×天空辐射度 + 地面射线数×地面均值 + Σ边权×邻面辐射度) / 分母。
     double v=double(pc.skyRadiosity);
     if(denom[s]!=0u) {
         v=double(sky[s])*double(pc.skyRadiosity);

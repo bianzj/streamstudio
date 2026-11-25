@@ -1,3 +1,26 @@
+// ==========================================================================
+// 文件：VoxelTriTracing/outImageTri.comp
+// 功能：VoxelTriTracing（体元 + 三角面混合追踪）方案的“成像”计算着色器：每个工作项对应传感器图像的一个
+//   像素，沿相机射线穿越体元场景，把沿途植被（湍流介质）与地面（土壤面元）的辐射贡献累加成该像素各波段的
+//   辐亮度，多次采样平均后写入 outImage。
+// 主要模块/步骤：
+//   1. 扩展、宏与包含；全局 prd / shadow_payload；引入 traceray_comp.glsl（rayQuery 求交封装）
+//   2. Voxel_raytracing：沿射线逐步穿越，植被体元累加直射/热发射/多次散射并衰减传感器方向透过率，
+//      土壤累加太阳反射、热发射与漫射反射后终止
+//   3. SamplePixel：生成针孔相机射线（支持亚像素抖动）并调用 Voxel_raytracing
+//   4. main：初始化随机种子 → maxSample 次采样平均 → 原子写入 outImage
+// 数据流：输入 sensorMatrix（viewInverse/projInverse/waveNum）、settingxml、lightSet、voxelLinks/
+//   instanceLinks/canopies/spectralMaterials/thermalMaterials、voxelDirs[].solar（solar 阶段写出）、
+//   voxelRads[].cumulated（diffuse.comp 迭代结果）、NanoVDB 体元网格；
+//   输出 outImage[waveNum*(y*宽+x) + kBand]，像素-波段交错。
+// 与其他文件的关系：solar.comp 先算体元到太阳的透过率与一次散射；diffuse.comp 迭代多次散射；
+//   本着色器最后读取它们的结果成像。
+// 重要约定：波长 μm（> 50 视为 nm 除以 1000）；> 2.5 μm 只计热发射，≤ 2.5 μm 只计太阳散射；
+//   天空辐射已在 solar 阶段并入体元，故本着色器射线射出场景时不再加贡献；
+//   alpha_toSensor 为传感器到当前体元入口的透过率（处理完当前体元后才乘以 alpha_voxel）。
+// 归档说明：cases/ 为历史变体副本，include 的 "../xxx" 相对 shader/<子目录>（待核对）。
+// ==========================================================================
+
 #version 460
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier : enable
@@ -18,6 +41,7 @@
 #extension GL_KHR_memory_scope_semantics:require
 #extension GL_EXT_shader_atomic_float: require 
 
+// 模式开关宏：被共用头文件用来选择体元+三角面追踪分支。
 #define VOXELTRITRACING 1
 
 #include "../bindinglayout.h"
@@ -29,18 +53,28 @@
 #include "../shade_state_voxel.glsl"
 #include "../random.glsl"
 
+// 计算着色器没有 payload 机制，prd / shadow_payload 作为全局变量，供 traceray_comp.glsl 使用。
 PtPayload        prd;
 ShadowHitPayload shadow_payload;
 
 #include "../traceray_comp.glsl"
 
+// 二维工作组：一个工作项处理一个像素（gl_GlobalInvocationID.xy）。
 layout(local_size_x = GROUP_SIZEXY, local_size_y = GROUP_SIZEXY) in;
 #define MAXSTEP   100
 #define DIFFUSE_ANGLE_NUM 32
 #define MAXBAND    25
+// 线程私有的逐波段数组：Radiance 为当前采样的辐亮度，RadianceSum 为多次采样之和。
+// MAXSTEP 为穿越体元的最大步数（此处用宏，而非 settingxml.maxStep）；
+// DIFFUSE_ANGLE_NUM 为漫射方向数，必须与 diffuse.comp 一致；MAXBAND 为最大波段数。
 float Radiance[MAXBAND];
 float RadianceSum[MAXBAND];
 
+// 作用：沿传感器射线逐步穿越体元场景，累加各波段辐亮度到全局 Radiance[]。
+// 输入：ray 相机射线；nanoVDBLink NanoVDB 句柄（由世界位置查体元缓冲索引）。
+// 输出：Radiance[kband]；返回 true 表示射线射出场景，false 表示步数用尽或遇到土壤后终止。
+// 每步：求最近交点 → 射出场景则结束 → 还原着色状态并找到刚穿过的体元 →
+//   植被：累加贡献并衰减 alpha_toSensor；土壤：累加贡献后 break；→ 继续沿原方向前进。
 bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 {
 	// initial the transmittance and accumulated radiance.
@@ -66,9 +100,11 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 		Radiance[kband] = 0.0;
 	}
 
+	// 步骤 1：逐步穿越主循环（最多 MAXSTEP 步）。
 	for(int kstep = 0; kstep < MAXSTEP; kstep++)
 	{
 		alpha_voxel = 1.0;
+		// 求最近交点（含周期边界与地面补全，见 traceray_comp.glsl）。
 		ClosestHit(ray);
 
 		///////////////////////////////////////////////////
@@ -76,6 +112,7 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 		/// hit sky or out of scene, then return true. 
 		/// the sky contribution is added in solar file.
 		///////////////////////////////////////////////////
+		// 步骤 2：射出场景（天空方向）。天空贡献已在 solar 阶段并入体元，这里不再累加（+= 0）。
 		if(prd.hitT == INFINITY)
 		{
 			for(int kband=0; kband < sensorMatrix.waveNum; kband++)
@@ -89,6 +126,8 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 		/// Turbid or facet ground case (j -> sensorxml).
 		///////////////////////////////////////////////////
 		/// get hit information.
+		// 步骤 3：还原着色状态；用 getPassedVoxelId 求射线刚穿过的体元，通过 NanoVDB 取缓冲索引，
+		//   bufferId < 0 表示空体元（无介质），直接继续前进。
 		ShadeState sstate = GetShadeState(prd);
 		voxelId = getPassedVoxelId(sstate.position, scale, normalize(ray.direction));
 		bufferId = nanovdbGet(nanoVDBLink, voxelId);
@@ -102,8 +141,11 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 			thermalId = instanceLinks[instanceId].thermalId;
 			canopy = canopies[canopyId];
 
+			// 植被（湍流介质）分支：alpha_voxel = exp(-density*G*pathLength) 是穿过该体元的透过率；
+			//   传感器方向累计透过率 < 0.001 时提前结束（贡献可忽略）。
 			if(typeId == TYPE_VEGETATION)
 			{
+				// pathLength 为射线在该体元内的路径长度（命中点与上一位置之间的距离）。
 				float pathLength = Vector2Distance(sstate.position - sstate.lastPosition);
 				alpha_voxel = exp(-canopies[canopyId].density * canopies[canopyId].G * pathLength);
 
@@ -111,6 +153,8 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 
 				if(alpha_toSensor < 0.001) break;
 
+				// 热点效应：pl_toSolar / pl_toSensor 为太阳与传感器方向的光学路径长度（= -ln α / G），
+				//   透过率 < 1e-4 时取 10000 封顶；Hotspot_Kuusk 给出太阳-观察方向重合时的增强因子（待核对）。
 				// this is used for the hotspot effect
 				if(alpha_toSolar < 0.0001) pl_toSolar = 10000.0;
 				else pl_toSolar = -log(alpha_toSolar) / canopy.G / 1.0;
@@ -123,6 +167,10 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 					float refl = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].reflectance;
                     float trans = spectralMaterials[spectralId * sensorMatrix.waveNum + kband].transmittance;
 
+					// 步骤 4a：直射项。gamma 为太阳→传感器方向的单次散射系数（反射/透射相函数按 refl、trans 加权后
+					//   限幅 [0,1]，待核对）。热波段（> 2.5 μm）：向阳/阴影温度按 hotspot 与
+					//   (alpha_toSensor - hotspot) 混合，乘发射率 (1 - refl - trans) 与截获概率 (1 - alpha_voxel)；
+					//   短波波段：lightSet.direct*|cosθ_sun|*(1-alpha_voxel)*gamma*hotspot（此处用 hotspot 取代 alpha_toSolar，待核对）。
 					//// solar and emitter direct case, primary scattering term of solar and self emitter term.
 					//// (sun -> i -> o) + emitter(i -> o)
 					float radianceDirect = 0.0;
@@ -162,6 +210,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 					float radianceDiffuse0 = 0.0;
 					if(settingxml.maxIteration != 0)
 					{
+						// 步骤 4b：多次散射项。对 DIFFUSE_ANGLE_NUM 个方向 j，读取 diffuse.comp 迭代得到的
+						//   该体元 voxelRads[...].cumulated，乘相函数、冠层密度与 1/(2π·N)（方向积分归一化）及
+						//   alpha_toSensor。maxIteration == 0 时跳过。weight 仅用于判断是否有有效方向（归一化被注释）。
 						//// diffuse direction contribution
 						//// (sky ->i -> o) + emitter(j -> i -> o) + .et al.
 						float weight = 0.0;
@@ -192,11 +243,18 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 				}
 
 				
+				// 步骤 4c：处理完本体元的贡献后，才把传感器方向透过率乘以本体元透过率（供更远处的体元使用）。
 				alpha_toSensor = alpha_toSensor * alpha_voxel;
 				// break;				// debug
 			}
+			// 土壤（地面面元）分支：累加后 break，不再继续前进。
+			//   太阳直射反射 = lightSet.direct*|cosθ_sun|*alpha_toSolar*refl/π*alpha_toSensor；
+			//   热波段取向阳/阴影温度的混合发射 * (1 - refl - trans)；漫射项为 cumulated 的半球平均反射。
+			//   注意：土壤的热点计算用了 canopy.G，而 canopy 取自土壤实例的 canopyId（待核对其含义）；
+			//   这里没有像漫射植被那样做 inSameSide 判断（待核对）。
 			if(typeId == TYPE_SOIL)
 			{
+				// 体元到太阳的透过率，由 solar 阶段写入。
 				alpha_toSolar = voxelDirs[bufferId].solar;
 
 				// this is used for the hotspot effect
@@ -282,6 +340,9 @@ bool Voxel_raytracing(Ray ray, NanoVDBLink nanoVDBLink)
 	return false;
 }
 
+// 作用：对一个像素做一次采样：生成相机射线并调用 Voxel_raytracing，结果在全局 Radiance[]。
+// 输入：imageCoords 像素坐标；sizeImage 图像尺寸；smpl 采样序号。
+// 说明：第 0 次采样取像素中心，其余随机抖动做面积平均；景深代码已被注释，实际为针孔相机。
 void SamplePixel(vec2 imageCoords,vec2 sizeImage,int smpl)
 {
     // 每次光线的随机/波动进行光滑
@@ -320,11 +381,14 @@ void SamplePixel(vec2 imageCoords,vec2 sizeImage,int smpl)
     vec3 directionv = normalize(direction.xyz);
 	Ray ray = Ray(origin.xyz, directionv);
 
+    // 用相机射线求该采样的各波段辐亮度。
     Voxel_raytracing(ray, nanoVDBLink);
 }
 
 
 
+// 作用：计算着色器入口。每个工作项处理一个像素：多次采样并平均，把各波段结果写入 outImage。
+// 步骤：1 缓冲下标与随机种子；2 maxSample 次采样累加；3 取平均；4 原子写入。
 void main()
 {
     // image imageSize.
@@ -334,6 +398,7 @@ void main()
 	int bufferId = int(sensorMatrix.waveNum * (imageCoords.y*imageRes.x + imageCoords.x));
     uint temp = uint(settingxml.imageSize.x * gl_GlobalInvocationID.y + gl_GlobalInvocationID.x);
     // random.
+    // 随机种子：由像素线性序号与（帧号×每像素采样数）经 tea 哈希得到。
     prd.seed = tea(temp,settingxml.frame * settingxml.maxSample);
 
 	// Average value after multiple sampling.
@@ -344,6 +409,7 @@ void main()
 		RadianceSum[kBand] = 0.0;
 	}
 
+	// 步骤 2：只有存在 Radiance > EPSION 的波段才算有效采样，平均时除以有效采样数 validNum。
 	int validNum = 0;
 	for(int kSample = 0; kSample < settingxml.maxSample; kSample++)
 	{
@@ -361,6 +427,7 @@ void main()
 
 		if(isValid) validNum += 1;
 	}
+	// 步骤 3：平均；validNum == 0 时输出 0，避免除零。
 	// Do accumulation over sample
 	for(int kBand = 0; kBand < sensorMatrix.waveNum; kBand++)
 	{
@@ -368,6 +435,7 @@ void main()
 		if(validNum > 0) Radiance[kBand] = RadianceSum[kBand]/validNum;
 	}
 
+	// 步骤 4：用原子 store 把各波段结果写入 outImage（Release 语义）。
 	// Write result into _bufferstorage(layout buffer)
 	for(int kBand = 0; kBand < sensorMatrix.waveNum; kBand++)
 	{
