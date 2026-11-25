@@ -652,9 +652,6 @@ function previewOnNextFrame(key, render) {
   pendingFramePreviews.set(key, render)
 }
 
-// 兼容旧名：updateXml 即 syncProjectText（工程已改为 JSON，名称沿用）。
-function updateXml() { syncProjectText() }
-
 function fileName(path) {
   if (!path) return '未打开工程'
   return path.replaceAll('\\', '/').split('/').pop()
@@ -1632,6 +1629,16 @@ function cruisePointToWorld(point, config) {
   )
 }
 
+// 作用：由航向（度，北为 0，向东增大）求飞机绕预览 Y 轴的偏航角（弧度）。
+// 说明：预览 x = 场景 x（北）、预览 z = 场景 y（东），航向 h 的前进方向为 (x,z) = (cos h, sin h)，
+//   观测箭头与足迹用的也是这一向量。飞机机头在局部 +Z，Three.js 中绕 Y 轴转 θ 后局部 +Z 指向
+//   (x,z) = (sin θ, cos θ)，令其等于 (cos h, sin h) 得 θ = 90° − h。
+//   （旧写法 θ = h + 90° 只在航向 0°/180° 正确，90°/270° 时机头与箭头相反；已用 three 实测核对。）
+//   createCruiseAircraft 与 updateCruiseAnimation 共用本函数，保证两处朝向一致。
+function cruiseAircraftYaw(headingDegrees) {
+  return THREE.MathUtils.degToRad(90 - headingDegrees)
+}
+
 // 作用：用基本几何体拼一架简化飞机（机身、机头、机翼、尾翼、座舱）并带一个朝向相机的图标。
 // 输入：size 为机身尺度（预览单位）、headingDegrees 为航向（度，北为 0，向东增大）。
 // 说明：真实尺寸在公里级场景里会小到看不见，因此额外保留一个始终面向相机的 ✈ 圆形标记；
@@ -1640,7 +1647,7 @@ function createCruiseAircraft(size, headingDegrees) {
   const aircraft = new THREE.Group()
   aircraft.name = 'cruise-aircraft'
   aircraft.userData.kind = 'sensor'
-  aircraft.rotation.y = THREE.MathUtils.degToRad(headingDegrees + 90)
+  aircraft.rotation.y = cruiseAircraftYaw(headingDegrees)
 
   const white = new THREE.MeshStandardMaterial({ color: 0xf4f7fa, roughness: 0.42, metalness: 0.1, transparent: true, opacity: 0.86 })
   const blue = new THREE.MeshStandardMaterial({ color: 0x83acd2, roughness: 0.46, metalness: 0.08, transparent: true, opacity: 0.84 })
@@ -1993,7 +2000,7 @@ function updateObservationFootprint(data, origin, headingDegrees) {
 // 步骤：1 移除旧可视化；2 求巡航点（开启巡航时用 sensorCruisePositions，否则单点：
 //   传感器位置，航向取 vaa）；3 画航线段与标记点；4 创建飞机、观测方向箭头与足迹；
 //   5 把动画所需数据存入 group.userData，供 updateCruiseAnimation 使用。
-// 说明：相邻两点在 x 或 y 上跳变超过场景一半视为周期边界回绕（待核对），不画连线；标记点最多约 512 个；
+// 说明：相邻两点在 x 或 y 上跳变超过场景一半视为周期边界回绕（引擎 wrapCoordinate 把航线坐标按场景尺寸取模，与 project-schema 的 sensorCruisePositions 一致），不画连线；标记点最多约 512 个；
 //   动画周期 = clamp((点数-1)·0.5, 2.5, 12) 秒；巡航时 vaa 为相对航向的方位角，
 //   固定位置时 vaa 即绝对航向（relativeVaa 取 0）。
 function updateCruiseVisualization(config) {
@@ -2126,7 +2133,7 @@ function updateCruiseAnimation(now) {
   const worldPoint = cruisePointToWorld(point, state.config)
   if (count > 1) worldPoint.y += Math.sin(now * 0.004) * data.aircraftSize * 0.035
   data.aircraft.position.copy(worldPoint)
-  data.aircraft.rotation.y = THREE.MathUtils.degToRad(currentHeading + 90)
+  data.aircraft.rotation.y = cruiseAircraftYaw(currentHeading)
   data.viewArrow.position.copy(worldPoint)
   const viewAzimuth = THREE.MathUtils.degToRad(currentHeading + data.relativeVaa)
   data.viewArrow.setDirection(new THREE.Vector3(
@@ -2323,7 +2330,9 @@ const thermalBaseColors = new WeakMap()
 // 输入：state.config.scene（voxel 体元边长 m；x/y/height 场景尺寸 m）；world 中的网格。
 // 输出：返回提示文字（网格尺寸、占用体元数，是否粗化显示）；无可显示对象时返回空串。
 // 单位：显示坐标 = 米 × world.userData.displayScale，故 cellSize 以显示单位计，提示时再除回。
-// 说明：纯预览，不参与引擎计算；单元数上限 150000，超限则 cellSize 翻倍重试（最多 8 次）。
+// 说明：纯预览，不参与引擎计算；单元数超过 150000 或累计采样点超过 sampleBudget（6e6）时，
+//   本轮作废、cellSize 翻倍后重试（最多 8 轮），提示文字会注明“粗化显示”；
+//   三角形总数过大时仍按 stride 隔点抽样（见下），这一项是近似，结果只作预览。
 function buildVoxelPreview() {
   const c = state.config
   if (!c) return ''
@@ -2398,14 +2407,16 @@ function buildVoxelPreview() {
           }
           samples += (steps + 1) * (steps + 2) / 2
           if (cells.size > maximumCells) { overflow = true; break }
-          // 超出采样预算：中止当前实例的三角形遍历（不触发粗化重试）。
-          if (samples > sampleBudget) break
+          // 超出采样预算：与单元数超限一样，按粗化重试处理（细分数随 cellSize 增大而减少，
+          //   翻倍后采样量约降为 1/4）；此前只中断当前实例遍历，其余实例被静默截断。
+          if (samples > sampleBudget) { overflow = true; break }
         }
       }
       if (overflow) break
     }
     if (!overflow) break
-    cellSize *= 2
+    // 最后一轮仍超限时保持 cellSize 不变：cells 的键是按当前 cellSize 计算的，再翻倍会使方块尺寸与键不符。
+    if (attempt < 7) cellSize *= 2
   }
   if (!cells?.size) return ''
   // 步骤 3：每个占用单元画一个略小（0.94 倍）的方块，避免相邻方块边界重叠闪烁。
@@ -2532,7 +2543,10 @@ function libraryCard(title, subtitle, values, kind, index) {
 
 // 作用：把“物化属性”预设（item）转成卡片展示的 [名称, 值] 列表。
 // 说明：按 energyModel（光伏/木质/薄膜）与 type（植被/水体/船舶/载具/其他）分支；
-// 墙体厚度 0.2 m、室内 22 ℃、h=8、水侧 h=500、座舱 0.5 ACH 等缺省值仅用于界面显示（待核对是否与引擎一致）。
+// 墙体厚度 0.2 m、室内 22 ℃、h=8 W/(m²·K)、船舶水侧 h=500、座舱通风 0.5 ACH、空调 3500 W / 24 ℃、
+// 水体初温 20 ℃ 等缺省值已对照引擎核实一致（fileio_json.cpp 的船体墙板与水线、facetrtcore.cpp 写 XML 处
+// 的 thickness/indoorTemperature/ventilationACH/acPower/acSetpoint 缺省），与 project-schema 缺省也相同；
+// 这里只在字段缺失时用于界面显示，不改变传给引擎的值。
 function physicalValues(item) {
   const p = item.params || {}
   if (item.energyModel === 'photovoltaic') return [['模型','光伏热电耦合'],['参考效率',p.eta25],['温度系数',p.gamma],['背面系数',p.bifaciality],['面热容',p.heatCapacityPerArea],['对流倍率',p.convectiveScale]]
@@ -2696,7 +2710,7 @@ function remapGpuIndex(previousMode, nextMode) {
   const gpu = state.devices.gpus.find((item) => item[fromKey] === current)
   if (gpu && gpu[toKey] >= 0 && gpu[toKey] !== current) {
     control.gpu = gpu[toKey]
-    updateXml()
+    syncProjectText()
   }
 }
 
@@ -3050,10 +3064,10 @@ function finiteInputNumber(input) {
 }
 
 // 作用：给输入框 #id 绑定 change 事件，把值写回配置。
-// 参数：target(value) 写入配置；selector 为旧 XML 路径标识（updateXml 现已忽略参数，仅触发
-// 项目文本同步）；converter 把输入转为目标类型（兼作限幅）；rebuildScene 为真则重建实际场景。
+// 参数：target(value) 写入配置；converter 把输入转为目标类型（兼作限幅）；rebuildScene 为真则重建实际场景。
+// 说明：写回后调用 syncProjectText 同步工程文本（旧版曾传入 XML 选择器字符串，现已无用并删除）。
 // 说明：空串/非有限值会恢复上一次有效值，避免 Number('') === 0 被静默写成 0。
-function bindValue(id, target, selector, converter = Number, rebuildScene = false) {
+function bindValue(id, target, converter = Number, rebuildScene = false) {
   const input = $(`#${id}`)
   if (!input) return
   let previous = input.value
@@ -3067,17 +3081,17 @@ function bindValue(id, target, selector, converter = Number, rebuildScene = fals
       value = converter(previous)
     }
     if (typeof value === 'number' && !Number.isFinite(value)) { input.value = previous; return }
-    target(value); input.value = String(value); previous = input.value; updateXml(selector, value)
+    target(value); input.value = String(value); previous = input.value; syncProjectText()
     refreshFromState(rebuildScene)
     if (rebuildScene) restoreActualScene()
   })
 }
 
 // 作用：给开关按钮 #id 绑定点击事件：取反配置值、更新按钮外观并同步工程文本。
-function bindSwitch(id, getter, setter, selector, rebuildScene = false) {
+function bindSwitch(id, getter, setter, rebuildScene = false) {
   const button = $(`#${id}`)
   button?.addEventListener('click', () => {
-    const next = !getter(); setter(next); button.classList.toggle('on', next); button.setAttribute('aria-checked', String(next)); updateXml(selector, next ? 1 : 0); refreshFromState(rebuildScene)
+    const next = !getter(); setter(next); button.classList.toggle('on', next); button.setAttribute('aria-checked', String(next)); syncProjectText(); refreshFromState(rebuildScene)
     if (rebuildScene) restoreActualScene()
   })
 }
@@ -3097,12 +3111,12 @@ function bindInspector() {
   if (!c) return
   // DEFERRED[中|Bug]: sceneX/sceneY/sceneHeight/voxelSize/rayDepth/couplingIterations/sensorX/sensorY 等只校验“有限数”，不校验 min（HTML min 属性不阻止 change 提交），0 或负值会写进 project.json 交给引擎（体元 0 m、分辨率 0、尺寸负数）；预览侧 generateWorld 用 Math.max 兜底掩盖了问题；建议：为这些字段传入带下限/取整的 converter，与 project-schema 的 normalize 规则保持一致 —— bindValue 已能拦住空串/非有限值（回退原值），但“下限”需要为每个字段新增数值约束并与服务端 normalize 对齐，本轮禁止新增/修改数值常量
   // 场景尺寸与体元大小：修改后需重建场景，并让 VoxelEB 的步数上限随质量档位重算。
-  bindValue('sceneX', (v) => followQualityPresetScene(() => c.scene.x = v), 'Scene sceneSizeX', Number, true); bindValue('sceneY', (v) => followQualityPresetScene(() => c.scene.y = v), 'Scene sceneSizeY', Number, true)
-  bindValue('sceneHeight', (v) => followQualityPresetScene(() => c.scene.height = v), 'Scene Height', Number, true); bindValue('voxelSize', (v) => followQualityPresetScene(() => c.scene.voxel = v), 'Scene voxelSize'); bindValue('voxelFillThreshold', (v) => c.scene.voxelFillThreshold = Math.min(1, Math.max(0, v)), 'Scene voxelFillThreshold')
+  bindValue('sceneX', (v) => followQualityPresetScene(() => c.scene.x = v), Number, true); bindValue('sceneY', (v) => followQualityPresetScene(() => c.scene.y = v), Number, true)
+  bindValue('sceneHeight', (v) => followQualityPresetScene(() => c.scene.height = v), Number, true); bindValue('voxelSize', (v) => followQualityPresetScene(() => c.scene.voxel = v)); bindValue('voxelFillThreshold', (v) => c.scene.voxelFillThreshold = Math.min(1, Math.max(0, v)))
   // 计算域偏移：输入过程中实时更新边界辅助框，并用 280 ms 防抖重建实际场景；
   // change 提交时取消待执行的防抖（bindValue 已做完整重建）。
   for (const [id, key] of [['sceneOffsetX', 'offsetX'], ['sceneOffsetY', 'offsetY'], ['sceneOffsetZ', 'offsetZ']]) {
-    bindValue(id, (value) => c.scene[key] = value, `Scene ${key}`, Number, true)
+    bindValue(id, (value) => c.scene[key] = value, Number, true)
     $(`#${id}`)?.addEventListener('input', (event) => {
       const value = Number(event.target.value)
       if (!Number.isFinite(value)) return
@@ -3130,25 +3144,25 @@ function bindInspector() {
     scheduleProjectTextSync()
   })
   // 计算控制：各深度/采样/阶数字段限幅并带缺省值；改动受管参数时 markQualityCustom 把档位记为“自定义”。
-  bindValue('rayDepth', (v) => c.control.depth = Math.max(1, Math.min(16, Math.round(v))), 'Control rayTracingDepth', (value) => Math.max(1, Math.min(16, Math.round(Number(value) || 4))))
-  bindValue('raytracingDepth', (v) => { c.control.raytracingDepth = v; markQualityCustom('raytracingDepth') }, 'Control raytracingDepth', (value) => Math.max(1, Math.min(64, Math.round(Number(value) || 16))))
-  bindValue('radiationMaxSteps', (v) => { c.control.radiationMaxSteps = v; markQualityCustom('radiationMaxSteps') }, 'Control radiationMaxSteps', (value) => Math.max(16, Math.min(4096, Math.round(Number(value) || 64))))
-  bindValue('shortwaveScatteringOrders', (v) => { c.control.shortwaveScatteringOrders = v; markQualityCustom('shortwaveScatteringOrders') }, 'Control shortwaveScatteringOrders', (value) => Math.max(1, Math.min(3, Math.round(Number(value)) || 1)))
-  bindValue('sampleCount', (v) => { c.control.samples = Math.min(1024, Math.max(1, Math.round(v))); markQualityCustom('samples') }, 'Control sampleCount', (value) => Math.min(1024, Math.max(1, Math.round(Number(value) || 32))))
+  bindValue('rayDepth', (v) => c.control.depth = Math.max(1, Math.min(16, Math.round(v))), (value) => Math.max(1, Math.min(16, Math.round(Number(value) || 4))))
+  bindValue('raytracingDepth', (v) => { c.control.raytracingDepth = v; markQualityCustom('raytracingDepth') }, (value) => Math.max(1, Math.min(64, Math.round(Number(value) || 16))))
+  bindValue('radiationMaxSteps', (v) => { c.control.radiationMaxSteps = v; markQualityCustom('radiationMaxSteps') }, (value) => Math.max(16, Math.min(4096, Math.round(Number(value) || 64))))
+  bindValue('shortwaveScatteringOrders', (v) => { c.control.shortwaveScatteringOrders = v; markQualityCustom('shortwaveScatteringOrders') }, (value) => Math.max(1, Math.min(3, Math.round(Number(value)) || 1)))
+  bindValue('sampleCount', (v) => { c.control.samples = Math.min(1024, Math.max(1, Math.round(v))); markQualityCustom('samples') }, (value) => Math.min(1024, Math.max(1, Math.round(Number(value) || 32))))
   bindValue('periodicTraversalCount', (count) => {
     c.control.periodicTraversalCount = count
-  }, 'Control periodicNeighborCount', (value) => {
+  }, (value) => {
     const parsed = Number(value)
     return Math.max(0, Math.min(20, Math.round(Number.isFinite(parsed) ? parsed : 0)))
   })
   bindSwitch('skyboxSwitch', () => Boolean(c.control.skyboxEnabled), (value) => {
     c.control.skyboxEnabled = value
     updateSceneSkybox(c)
-  }, 'Control skyboxEnabled')
-  bindSwitch('heterogeneousVoxelSwitch', () => Boolean(c.control.heterogeneousVoxel), (v) => c.control.heterogeneousVoxel = v, 'Control heterogeneousVoxel')
-  bindValue('voxelCollisionOrders', (v) => { c.control.voxelCollisionOrders = v; markQualityCustom('voxelCollisionOrders') }, 'Control voxelCollisionOrders', (value) => Math.max(2, Math.min(5, Math.round(Number(value)) || 2)))
-  bindValue('radiationSolver', (v) => c.control.radiationSolver = v, 'Control radiationSolver', (value) => value === 'accelerated' ? 'accelerated' : 'traditional')
-  bindValue('couplingIterations', (v) => { c.control.couplingIterations = v; markQualityCustom('couplingIterations') }, 'Control couplingIterations')
+  })
+  bindSwitch('heterogeneousVoxelSwitch', () => Boolean(c.control.heterogeneousVoxel), (v) => c.control.heterogeneousVoxel = v)
+  bindValue('voxelCollisionOrders', (v) => { c.control.voxelCollisionOrders = v; markQualityCustom('voxelCollisionOrders') }, (value) => Math.max(2, Math.min(5, Math.round(Number(value)) || 2)))
+  bindValue('radiationSolver', (v) => c.control.radiationSolver = v, (value) => value === 'accelerated' ? 'accelerated' : 'traditional')
+  bindValue('couplingIterations', (v) => { c.control.couplingIterations = v; markQualityCustom('couplingIterations') })
   // 质量档位与单次运行上限。
   $('#qualityPreset')?.addEventListener('change', (event) => applyQualityPreset(event.target.value))
   // 留空或 0 = 服务端默认；其他值取整并限制在 1–1440 分钟。
@@ -3162,18 +3176,19 @@ function bindInspector() {
     addLog(minutes ? `单次运行上限设为 ${minutes} 分钟` : '单次运行上限恢复为服务端默认')
   })
   // RT–EB 耦合与温度方法：光谱加速宽度限幅 1–1000 nm；土壤方法同时写入所有 Soil 物化属性的 params.method。
-  bindValue('spectralAccelerationWidth', (v) => c.control.spectralAccelerationWidth = Math.max(1, Math.min(1000, v)), 'Control spectralAccelerationWidth', (value) => Math.max(1, Math.min(1000, Number(value) || 100)))
-  bindValue('temperatureTolerance', (v) => c.control.temperatureTolerance = v, 'Control temperatureTolerance')
-  bindValue('temperatureRelaxation', (v) => c.control.temperatureRelaxation = v, 'Control temperatureRelaxation')
-  bindValue('stabilityCorrection', (v) => c.control.stabilityCorrection = v === 1, 'Control stabilityCorrection')
+  bindValue('spectralAccelerationWidth', (v) => c.control.spectralAccelerationWidth = Math.max(1, Math.min(1000, v)), (value) => Math.max(1, Math.min(1000, Number(value) || 100)))
+  bindValue('temperatureTolerance', (v) => c.control.temperatureTolerance = v)
+  bindValue('temperatureRelaxation', (v) => c.control.temperatureRelaxation = v)
+  bindValue('stabilityCorrection', (v) => c.control.stabilityCorrection = v === 1)
   bindValue('soilTemperatureMethod', (v) => {
     c.control.soilTemperatureMethod = Math.max(0, Math.min(2, Math.round(v)))
     c.materials.filter((item) => item.type === 'Soil').forEach((item) => { item.params.method = c.control.soilTemperatureMethod })
-  }, 'Control soilTemperatureMethod', (value) => Math.max(0, Math.min(2, Math.round(Number(value) || 0))))
-  bindValue('soilInertiaHistory', (v) => { c.control.soilInertiaHistory = v }, 'Control soilInertiaHistory', (value) => value === 'full' ? 'full' : 'truncated')
-  bindValue('vegetationTemperatureMethod', (v) => c.control.vegetationTemperatureMethod = Math.max(0, Math.min(1, Math.round(v))), 'Control vegetationTemperatureMethod', (value) => Math.max(0, Math.min(1, Math.round(Number(value) || 0))))
+  }, (value) => Math.max(0, Math.min(2, Math.round(Number(value) || 0))))
+  bindValue('soilInertiaHistory', (v) => { c.control.soilInertiaHistory = v }, (value) => value === 'full' ? 'full' : 'truncated')
+  bindValue('vegetationTemperatureMethod', (v) => c.control.vegetationTemperatureMethod = Math.max(0, Math.min(1, Math.round(v))), (value) => Math.max(0, Math.min(1, Math.round(Number(value) || 0))))
   // 流体力学参数：数值各自限幅（如最大速度 0.1–200 m/s、时间步 0.1–60 s）；
-  // 风向规范到 [0, 360) °。fluidPressureIterations 在当前面板中没有对应输入框（疑似旧版残留，待核对）。
+  // 风向规范到 [0, 360) °。压力迭代次数（fluid.pressureIterations）在当前面板中没有输入框，已删除旧绑定；
+// 该字段仍由 project-schema 的 normalize 保留（缺省 20，范围 2–100），以兼容引擎与旧工程。
   const fluid = c.fluid || (c.fluid = {})
   $('#fluidSwitch')?.addEventListener('click', () => {
     fluid.enabled = !fluid.enabled
@@ -3181,26 +3196,25 @@ function bindInspector() {
     refreshFromState(false)
     renderInspector()
   })
-  bindValue('fluidWindDirection', (v) => fluid.windDirection = ((v % 360) + 360) % 360, 'Fluid windDirection', (value) => ((Number(value) % 360) + 360) % 360)
-  bindValue('fluidVoxelSize', (v) => fluid.voxelSize = Math.max(0.1, v), 'Fluid voxelSize', (value) => Math.max(0.1, Number(value) || Number(c.scene.voxel) || 1), true)
-  bindValue('fluidTimeStep', (v) => fluid.timeStep = Math.max(0.1, Math.min(60, v)), 'Fluid timeStep', (value) => Math.max(0.1, Math.min(60, Number(value) || 5)))
-  bindValue('fluidPressureIterations', (v) => fluid.pressureIterations = Math.max(2, Math.min(100, 2 * Math.round(v / 2))), 'Fluid pressureIterations', (value) => Math.max(2, Math.min(100, 2 * Math.round((Number(value) || 20) / 2))))
-  bindValue('fluidBuoyancy', (v) => fluid.buoyancy = Math.max(0, v), 'Fluid buoyancy', (value) => Math.max(0, Number(value) || 0))
-  bindValue('fluidDrag', (v) => fluid.dragCoefficient = Math.max(0, v), 'Fluid dragCoefficient', (value) => Math.max(0, Number(value) || 0))
-  bindValue('fluidThermalCoupling', (v) => fluid.thermalCoupling = Math.max(0, v), 'Fluid thermalCoupling', (value) => Math.max(0, Number(value) || 0))
-  bindValue('fluidDiffusivity', (v) => fluid.diffusivity = Math.max(0, v), 'Fluid diffusivity', (value) => Math.max(0, Number(value) || 0))
-  bindValue('fluidSmokeEmission', (v) => fluid.smokeEmission = Math.max(0, v), 'Fluid smokeEmission', (value) => Math.max(0, Number(value) || 0))
-  bindValue('fluidMaxVelocity', (v) => fluid.maxVelocity = Math.max(0.1, Math.min(200, v)), 'Fluid maxVelocity', (value) => Math.max(0.1, Math.min(200, Number(value) || 30)))
-  bindValue('fluidOutputHeight', (v) => fluid.outputHeight = Math.max(0.1, v), 'Fluid outputHeight', (value) => Math.max(0.1, Number(value) || 2))
-  bindSwitch('fluidWindOutputSwitch', () => Boolean(fluid.outputWind), (v) => fluid.outputWind = v, 'Fluid outputWind')
-  bindSwitch('fluidTemperatureOutputSwitch', () => Boolean(fluid.outputAirTemperature), (v) => fluid.outputAirTemperature = v, 'Fluid outputAirTemperature')
+  bindValue('fluidWindDirection', (v) => fluid.windDirection = ((v % 360) + 360) % 360, (value) => ((Number(value) % 360) + 360) % 360)
+  bindValue('fluidVoxelSize', (v) => fluid.voxelSize = Math.max(0.1, v), (value) => Math.max(0.1, Number(value) || Number(c.scene.voxel) || 1), true)
+  bindValue('fluidTimeStep', (v) => fluid.timeStep = Math.max(0.1, Math.min(60, v)), (value) => Math.max(0.1, Math.min(60, Number(value) || 5)))
+  bindValue('fluidBuoyancy', (v) => fluid.buoyancy = Math.max(0, v), (value) => Math.max(0, Number(value) || 0))
+  bindValue('fluidDrag', (v) => fluid.dragCoefficient = Math.max(0, v), (value) => Math.max(0, Number(value) || 0))
+  bindValue('fluidThermalCoupling', (v) => fluid.thermalCoupling = Math.max(0, v), (value) => Math.max(0, Number(value) || 0))
+  bindValue('fluidDiffusivity', (v) => fluid.diffusivity = Math.max(0, v), (value) => Math.max(0, Number(value) || 0))
+  bindValue('fluidSmokeEmission', (v) => fluid.smokeEmission = Math.max(0, v), (value) => Math.max(0, Number(value) || 0))
+  bindValue('fluidMaxVelocity', (v) => fluid.maxVelocity = Math.max(0.1, Math.min(200, v)), (value) => Math.max(0.1, Math.min(200, Number(value) || 30)))
+  bindValue('fluidOutputHeight', (v) => fluid.outputHeight = Math.max(0.1, v), (value) => Math.max(0.1, Number(value) || 2))
+  bindSwitch('fluidWindOutputSwitch', () => Boolean(fluid.outputWind), (v) => fluid.outputWind = v)
+  bindSwitch('fluidTemperatureOutputSwitch', () => Boolean(fluid.outputAirTemperature), (v) => fluid.outputAirTemperature = v)
   // DEM 地形开关与地形水热经验场（terrainEnvironment）参数；开关切换需重建场景。
-  bindSwitch('terrainSwitch', () => c.scene.terrain, (v) => c.scene.terrain = v, 'Control isDEM', true)
+  bindSwitch('terrainSwitch', () => c.scene.terrain, (v) => c.scene.terrain = v, true)
   const terrainEnvironment = c.scene.terrainEnvironment || (c.scene.terrainEnvironment = normalizeTerrainEnvironment())
-  bindSwitch('terrainAirSwitch', () => terrainEnvironment.airEnabled, (v) => terrainEnvironment.airEnabled = v, 'Scene TerrainEnvironment')
-  bindSwitch('terrainSoilSwitch', () => terrainEnvironment.soilEnabled, (v) => terrainEnvironment.soilEnabled = v, 'Scene TerrainEnvironment')
+  bindSwitch('terrainAirSwitch', () => terrainEnvironment.airEnabled, (v) => terrainEnvironment.airEnabled = v)
+  bindSwitch('terrainSoilSwitch', () => terrainEnvironment.soilEnabled, (v) => terrainEnvironment.soilEnabled = v)
   for (const key of ['referenceHeight', 'temperatureLapseRate', 'vaporScaleHeight', 'drainageHeight', 'soilDry', 'soilValley', 'soilScaleHeight']) {
-    bindValue(`terrainEnv_${key}`, (v) => terrainEnvironment[key] = v, 'Scene TerrainEnvironment')
+    bindValue(`terrainEnv_${key}`, (v) => terrainEnvironment[key] = v)
   }
 
   // 大气 LUT 参数：水汽 0.5–5 cm、能见度 10–50 km 限幅；开关同时启用/禁用其余输入框。
@@ -3214,31 +3228,31 @@ function bindInspector() {
       const input = $(`#${id}`)
       if (input) input.disabled = !atmosphere.enabled
     }
-    updateXml('Atmosphere enabled', atmosphere.enabled ? 1 : 0)
+    syncProjectText()
     refreshFromState(false)
   })
-  bindValue('atmosphereModel', (value) => atmosphere.model = value, 'Atmosphere model', String)
-  bindValue('atmosphereWaterVapor', (value) => atmosphere.waterVapor = Math.max(0.5, Math.min(5, value)), 'Atmosphere waterVapor', (value) => Math.max(0.5, Math.min(5, Number(value) || 2)))
-  bindValue('atmosphereAerosol', (value) => atmosphere.aerosol = value, 'Atmosphere aerosol', String)
-  bindValue('atmosphereVisibility', (value) => atmosphere.visibility = Math.max(10, Math.min(50, value)), 'Atmosphere visibility', (value) => Math.max(10, Math.min(50, Number(value) || 23)))
+  bindValue('atmosphereModel', (value) => atmosphere.model = value, String)
+  bindValue('atmosphereWaterVapor', (value) => atmosphere.waterVapor = Math.max(0.5, Math.min(5, value)), (value) => Math.max(0.5, Math.min(5, Number(value) || 2)))
+  bindValue('atmosphereAerosol', (value) => atmosphere.aerosol = value, String)
+  bindValue('atmosphereVisibility', (value) => atmosphere.visibility = Math.max(10, Math.min(50, value)), (value) => Math.max(10, Math.min(50, Number(value) || 23)))
   // 背景属性：光谱/温度/物化绑定、镜面反射开关与 Hapke 角度效应强度（0–1，关闭时写 0）。
   const background = c.scene.background || (c.scene.background = {})
-  const bindBackground = (id, key, selector) => $(`#${id}`)?.addEventListener('change', (event) => {
+  const bindBackground = (id, key) => $(`#${id}`)?.addEventListener('change', (event) => {
     background[key] = event.target.value
-    updateXml(selector, event.target.value)
+    syncProjectText()
     if (key === 'materialName') {
       const material = c.materials.find((item) => item.name === event.target.value)
       background.materialType = material?.type || background.materialType || 'Soil'
-      updateXml('Scene bgBioType', background.materialType)
+      syncProjectText()
     }
     refreshFromState(false)
   })
-  bindBackground('backgroundSpectral', 'spectralName', 'Scene bgSpectral')
-  bindBackground('backgroundThermal', 'thermalName', 'Scene bgThermal')
-  bindBackground('backgroundMaterial', 'materialName', 'Scene bgBioName')
+  bindBackground('backgroundSpectral', 'spectralName')
+  bindBackground('backgroundThermal', 'thermalName')
+  bindBackground('backgroundMaterial', 'materialName')
   bindSwitch('backgroundSpecularSwitch', () => Boolean(background.specularEnabled), (value) => {
     background.specularEnabled = value
-  }, 'Scene backgroundSpecularEnabled')
+  })
   const heterogeneitySwitch = $('#backgroundHeterogeneitySwitch')
   heterogeneitySwitch?.addEventListener('click', () => {
     const enabled = !Boolean(background.heterogeneityEnabled)
@@ -3247,9 +3261,7 @@ function bindInspector() {
     heterogeneitySwitch.setAttribute('aria-checked', String(enabled))
     const strengthInput = $('#backgroundAngularStrength')
     if (strengthInput) strengthInput.disabled = !enabled
-    updateXml('Scene backgroundHeterogeneity', enabled ? 'Hapke' : 'None')
-    updateXml('Scene backgroundAngularStrength', enabled
-      ? Math.max(0, Math.min(1, Number(background.angularEffectStrength ?? 0.5))) : 0)
+    syncProjectText()
     refreshFromState(false)
   })
   const angularStrengthInput = $('#backgroundAngularStrength')
@@ -3257,7 +3269,7 @@ function bindInspector() {
     const value = Math.max(0, Math.min(1, Number(angularStrengthInput.value)))
     background.angularEffectStrength = value
     $('#backgroundAngularStrengthValue').textContent = value.toFixed(2)
-    updateXml('Scene backgroundAngularStrength', background.heterogeneityEnabled ? value : 0)
+    syncProjectText()
   })
   angularStrengthInput?.addEventListener('change', () => refreshFromState(false))
   // 太阳天顶/方位角输入；方位角变化且启用主平面采样时需同步传感器采样设置。
@@ -3275,20 +3287,20 @@ function bindInspector() {
       previewOnNextFrame('sun', () => updateSun(c))
     })
     input?.addEventListener('change', () => {
-      updateXml('Geometry Light light directScatteringRatio', c.light.direct)
+      syncProjectText()
       refreshFromState(false)
     })
   }
   bindLightFraction('directLight', 'direct'); bindLightFraction('diffuseLight', 'diffuse')
   $('#diffuseFractionMode')?.addEventListener('change', (event) => {
     c.light.diffuseFractionMode = event.target.value === 'erbs' ? 'erbs' : 'fixed'
-    updateXml('Geometry Light light diffuseFractionMode', c.light.diffuseFractionMode)
+    syncProjectText()
     refreshFromState(false)
   })
-  bindValue('skyTemperature', (v) => c.light.skyTemperature = v, 'Geometry Light light skyTemperature')
-  bindValue('shortwaveIrradiance', (v) => c.light.shortwaveIrradiance = Math.max(0, Math.min(2000, v)), 'Geometry Light light shortwaveIrradiance')
+  bindValue('skyTemperature', (v) => c.light.skyTemperature = v)
+  bindValue('shortwaveIrradiance', (v) => c.light.shortwaveIrradiance = Math.max(0, Math.min(2000, v)))
   // 传感器：图像分辨率、波段、投影方式、位置/视场角与航点巡航参数。
-  bindValue('sensorX', (v) => c.sensor.x = v, 'Geometry Sensor sensor pixelResolutionX'); bindValue('sensorY', (v) => c.sensor.y = v, 'Geometry Sensor sensor pixelResolutionY')
+  bindValue('sensorX', (v) => c.sensor.x = v); bindValue('sensorY', (v) => c.sensor.y = v)
   $('#sensorBands')?.addEventListener('change', (event) => { c.sensor.bands = event.target.value; syncSensorSamplingXml(); renderInspector() })
   const bindSensorNumber = (id, key, minimum = -Infinity) => $(`#${id}`)?.addEventListener('change', (event) => {
     const value = finiteInputNumber(event.target)
@@ -3309,8 +3321,7 @@ function bindInspector() {
     if (!Number.isFinite(Number(c.sensor.positionX))) c.sensor.positionX = Number(c.scene.x) / 2
     if (!Number.isFinite(Number(c.sensor.positionY))) c.sensor.positionY = Number(c.scene.y) / 2
     if (!(Number(c.sensor.height) > 0)) c.sensor.height = 3000
-    updateXml('Geometry Sensor sensor projection', c.sensor.projection)
-    updateXml('Geometry Sensor sensor sensorPosition', `${c.sensor.positionX},${c.sensor.positionY},${c.sensor.height}`)
+    syncProjectText()
     syncSensorSamplingXml()
     refreshFromState(false)
     renderInspector()
@@ -3319,7 +3330,7 @@ function bindInspector() {
     const value = finiteInputNumber(event.target)
     if (value === null) { event.target.value = String(c.sensor[key] ?? ''); return }
     c.sensor[key] = value
-    updateXml('Geometry Sensor sensor sensorPosition', `${c.sensor.positionX},${c.sensor.positionY},${c.sensor.height}`)
+    syncProjectText()
     refreshFromState(false)
     renderInspector()
   })
@@ -3347,28 +3358,30 @@ function bindInspector() {
   bindView('viewZenith', 'vza'); bindView('viewAzimuth', 'vaa')
   // 模拟产出开关：能量平衡模式下“过程输出”= 辐射过程或能量过程任一开启；其他模式仅看辐射过程。
   const energyOutputMode = state.mode === 'eFacetEB' || state.mode === 'eVoxelEB'
-  const syncActiveProcess = () => updateXml('Control isProcess',
-    (energyOutputMode ? (c.sensor.radiationProcess || c.sensor.energyProcess) : c.sensor.radiationProcess) ? 1 : 0)
-  bindSwitch('imageSwitch', () => c.sensor.image, (v) => c.sensor.image = v, 'Control isImage')
-  bindSwitch('radiationProcessSwitch', () => c.sensor.radiationProcess, (v) => { c.sensor.radiationProcess = v; syncActiveProcess() }, 'Control isRadiationProcess')
-  bindSwitch('energyProcessSwitch', () => c.sensor.energyProcess, (v) => { c.sensor.energyProcess = v; syncActiveProcess() }, 'Control isEnergyProcess')
-  bindSwitch('temperatureSwitch', () => c.sensor.temperature, (v) => c.sensor.temperature = v, 'Control isTemperature'); bindSwitch('albedoSwitch', () => c.sensor.albedo, (v) => c.sensor.albedo = v, 'Control isAlbedo')
+  const syncActiveProcess = () => syncProjectText()
+  bindSwitch('imageSwitch', () => c.sensor.image, (v) => c.sensor.image = v)
+  bindSwitch('radiationProcessSwitch', () => c.sensor.radiationProcess, (v) => { c.sensor.radiationProcess = v; syncActiveProcess() })
+  bindSwitch('energyProcessSwitch', () => c.sensor.energyProcess, (v) => { c.sensor.energyProcess = v; syncActiveProcess() })
+  bindSwitch('temperatureSwitch', () => c.sensor.temperature, (v) => c.sensor.temperature = v); bindSwitch('albedoSwitch', () => c.sensor.albedo, (v) => c.sensor.albedo = v)
   // 气象时间与站点参数：开始节点改动后若结束节点不大于它，则自动置为开始节点 + 1。
   // converter 同时是缺省值来源：dTime 1800 s、年份 2019、时区 8（UTC+8）、土壤初温 300 K（范围 150–400 K）；
-  // 这些缺省仅在输入无效时使用（待核对与引擎/旧工程缺省是否一致）。
+  // 这四项缺省已对照 fileio_json.cpp（dTime 1800、year 2019、timezone 8、Tsold 300）与 project-schema 的
+  // 气象缺省核实一致。缺省仅在输入无效时使用（空串/非数值由 bindValue 先恢复上次有效值）；
+  // 纬度/经度/高度/饱和水汽的 converter 兜底值（0）与引擎缺省（40°、116°、15 m、0.45）不同，
+  // 但因 bindValue 已拦截无效输入，实际不会触发。
   bindValue('meteoStart', (v) => {
     c.meteo.start = v
-    if (!(Number(c.meteo.end) > v)) { c.meteo.end = v + 1; updateXml('Meteorology endTimeNode', c.meteo.end); $('#meteoEnd').value = String(c.meteo.end) }
-  }, 'Meteorology startTimeNode', (value) => Math.max(0, Math.round(Number(value) || 0)))
-  bindValue('meteoEnd', (v) => c.meteo.end = v, 'Meteorology endTimeNode', (value) => Math.max(Number(c.meteo.start) + 1, Math.round(Number(value) || 0)))
-  bindValue('meteoDTime', (v) => c.meteo.dTime = v, 'Meteorology dTime', (value) => Math.max(1, Number(value) || 1800))
-  bindValue('meteoLatitude', (v) => c.meteo.latitude = v, 'Meteorology Latitude', (value) => Math.max(-90, Math.min(90, Number(value) || 0)))
-  bindValue('meteoLongitude', (v) => c.meteo.longitude = v, 'Meteorology Longitude', (value) => Math.max(-180, Math.min(180, Number(value) || 0)))
-  bindValue('meteoYear', (v) => c.meteo.year = v, 'Meteorology Year', (value) => Math.max(-2000, Math.min(6000, Math.round(Number(value)) || 2019)))
-  bindValue('meteoTimezone', (v) => c.meteo.timezone = v, 'Meteorology TimeZone', (value) => { const hours = Number(value); return Number.isFinite(hours) ? Math.max(-12, Math.min(14, hours)) : 8 })
-  bindValue('meteoHeight', (v) => c.meteo.z = v, 'Meteorology z', (value) => Math.max(0, Number(value) || 0))
-  bindValue('meteoSoilTemperature', (v) => c.meteo.Tsold = v, 'Meteorology Tsold', (value) => Math.max(150, Math.min(400, Number(value) || 300)))
-  bindValue('meteoSatWater', (v) => c.meteo.SatWater = v, 'Meteorology SatWater', (value) => Math.max(0, Math.min(1, Number(value) || 0)))
+    if (!(Number(c.meteo.end) > v)) { c.meteo.end = v + 1; syncProjectText(); $('#meteoEnd').value = String(c.meteo.end) }
+  }, (value) => Math.max(0, Math.round(Number(value) || 0)))
+  bindValue('meteoEnd', (v) => c.meteo.end = v, (value) => Math.max(Number(c.meteo.start) + 1, Math.round(Number(value) || 0)))
+  bindValue('meteoDTime', (v) => c.meteo.dTime = v, (value) => Math.max(1, Number(value) || 1800))
+  bindValue('meteoLatitude', (v) => c.meteo.latitude = v, (value) => Math.max(-90, Math.min(90, Number(value) || 0)))
+  bindValue('meteoLongitude', (v) => c.meteo.longitude = v, (value) => Math.max(-180, Math.min(180, Number(value) || 0)))
+  bindValue('meteoYear', (v) => c.meteo.year = v, (value) => Math.max(-2000, Math.min(6000, Math.round(Number(value)) || 2019)))
+  bindValue('meteoTimezone', (v) => c.meteo.timezone = v, (value) => { const hours = Number(value); return Number.isFinite(hours) ? Math.max(-12, Math.min(14, hours)) : 8 })
+  bindValue('meteoHeight', (v) => c.meteo.z = v, (value) => Math.max(0, Number(value) || 0))
+  bindValue('meteoSoilTemperature', (v) => c.meteo.Tsold = v, (value) => Math.max(150, Math.min(400, Number(value) || 300)))
+  bindValue('meteoSatWater', (v) => c.meteo.SatWater = v, (value) => Math.max(0, Math.min(1, Number(value) || 0)))
   // 文件导入、对象列表（选中/属性/分布/删除/篷布罩）与材质库（新增/编辑/筛选）的事件绑定。
   $('#demFile')?.addEventListener('change', (event) => importDem(event.target.files?.[0]))
   $('#meteoFile')?.addEventListener('change', (event) => importMeteo(event.target.files?.[0]))
@@ -3599,7 +3612,7 @@ async function importMeteo(file) {
     const project = ensureProjectState()
     state.config.meteo.path = imported.relativePath || imported.path
     project.configuration = state.config
-    updateXml('Meteorology filePath', imported.path)
+    syncProjectText()
     const projectSaved = await saveXml(true)
     if (projectSaved === null) return
     if (!projectSaved) throw new Error('工程配置保存失败')
@@ -3919,7 +3932,9 @@ function isMobileAgentType(type) {
 }
 
 // 作用：随机移动的缺省参数；车辆/船舶 speed 8.3 m/s、人 1.3 m/s，
-// range / turnInterval 的物理含义与单位以动态更新代码为准（待核对）。
+// 单位：speed / speedVariation 为 m/s；range 为相对出生点的最大游走半径（m）；turnInterval 为转向间隔（s，
+// 实际每次取 0.5–1.5 倍随机）；seed 为随机种子。随机移动目前只用于三维预览动画（scene-loader.js 的
+// attachRandomMovement / updateSceneDynamics），引擎不读取 movement，用户手册 8.5 节也明确“不是交通流求解器”。
 function defaultMovement(type) {
   const vehicle = type === 'Vehicle' || type === 'Ship'
   return {
@@ -4015,7 +4030,8 @@ function applyDistributionOffset(points, distribution) {
 // 作用：按分布参数生成实例点列表 [{x, y, z, scale, rotation}]（最后统一加整体偏移）。
 // 模式：manual 读自定义坐标；single 取范围中心、缩放取 scaleMin；
 // grid 按范围宽高比选列数 ceil(√(N·w/h))、行数 ceil(N/列数)，等间距铺点（只取前 N 个）；
-// random 在范围内均匀随机，缩放在 [scaleMin, scaleMax]，旋转 0–360（度，待核对）。
+// random 在范围内均匀随机，缩放在 [scaleMin, scaleMax]，旋转 0–360 度（位置文件 rotation 单位为度：
+// 预览用 degToRad 转换，引擎 scene.cpp 的旋转面积掩码也按 rotationDegrees 处理）。
 // 说明：范围与缩放的上下限先排序，容忍用户把 min/max 填反；grid 会回写 d.rows/d.columns（仅局部副本）。
 function generateDistribution(distribution) {
   const d = { ...defaultDistribution(), ...distribution }
@@ -5146,12 +5162,17 @@ function preparePendingObject(result, content, metadata = {}) {
 // 作用：几何体对话框提交：生成 OBJ → 导入工程 → 建单实例分布 → 登记材质/冠层 → 加入对象列表
 // → 保存工程并刷新场景。成功后打开对象属性对话框；失败时 toast 报错，按钮恢复可用。
 // 步骤见下方各“步骤 n”。
-// 注意：此流程在导入 OBJ 之后才保存工程，保存失败时已导入的文件不会回滚（待核对）。
+// 注意：此流程在导入 OBJ 之后才保存工程。保存失败时，内存配置里新加的对象条目与计数会撤销
+//   （否则重试会因“对象名称已存在”被拒）；但已写入工程目录的 OBJ 与位置文件不会删除——
+//   服务端目前没有删除工程内文件的接口（/api/project/* 只有导入/保存/读取），属于已知遗留，
+//   残留文件只占磁盘，不影响工程。
 async function generateGeometryObject(event) {
   event.preventDefault()
   const submit = $('#geometryForm button[type="submit"]')
   const drawPlacement = state.drawPlacement
   state.drawPlacement = null
+  let addedItem = null
+  let projectPersisted = false
   try {
     submit.disabled = true
     ensureProjectState()
@@ -5239,6 +5260,7 @@ async function generateGeometryObject(event) {
     // 步骤 8：加入对象列表、保存工程；保存失败则报错，用户取消（返回 null）则静默退出。
     // 随后关闭对话框、选中新对象、重新载入场景并打开属性对话框。
     state.config.objects.items.push(item)
+    addedItem = item
     state.config.objects.count = state.config.objects.items.length
     state.config.objects.names = state.config.objects.items.map((entry) => entry.name)
     state.project.configuration = state.config
@@ -5246,6 +5268,7 @@ async function generateGeometryObject(event) {
     const projectSaved = await saveXml(true)
     if (projectSaved === null) return
     if (!projectSaved) throw new Error('PRIM 原型保存失败')
+    projectPersisted = true
     hideGeometryDialog()
     state.panel = 'objects'
     state.selectedObjectIndex = state.config.objects.items.length - 1
@@ -5257,7 +5280,16 @@ async function generateGeometryObject(event) {
     const triangleCount = values.mode === 'chaos' ? chaosTriangleCount(values) : surfaceTriangleCount(values)
     addLog(`${medium ? '参与介质' : 'PRIM 原型'}已生成并加入场景：${values.name}${medium ? ' · VoxelRT / VoxelEB' : ` · ${triangleCount} 个三角面元`}`, 'success')
     toast(medium ? '参与介质对象已创建' : 'PRIM 原型生成完成', `${values.name} · 已显示在场景中`)
-  } catch (error) { toast('几何体生成失败', error.message, 'error') }
+  } catch (error) {
+    // 工程尚未保存成功就失败：撤销内存里新加的对象条目（保存成功后的刷新类错误不撤销，条目已落盘）。
+    if (addedItem && !projectPersisted) {
+      const added = state.config.objects.items.indexOf(addedItem)
+      if (added >= 0) state.config.objects.items.splice(added, 1)
+      state.config.objects.count = state.config.objects.items.length
+      state.config.objects.names = state.config.objects.items.map((entry) => entry.name)
+    }
+    toast('几何体生成失败', error.message, 'error')
+  }
   finally { submit.disabled = false }
 }
 
@@ -5745,7 +5777,8 @@ async function savePreset(event) {
 // 作用：材质对话框提交（导入 OBJ 的最后一步）：复制 OBJ、生成实例分布与位置文件、
 // 按需新建光谱/热学/物理预设、建立每个网格组的属性绑定、写入对象条目并保存工程。
 // stage 变量记录当前阶段，出错时拼进提示信息。出错回滚：对象列表还原（新增则移除，
-// 替换则恢复旧条目）、预设列表还原为快照；已复制到工程的 OBJ 与位置文件不会删除。
+// 替换则恢复旧条目）、预设列表还原为快照；已复制到工程的 OBJ 与位置文件不会删除
+// （服务端没有删除工程内文件的接口，残留文件只占磁盘，不影响工程）。
 // 步骤见下方各“步骤 n”。
 async function saveImportedObject(event) {
   event.preventDefault()
@@ -6224,7 +6257,9 @@ async function addTarpCover(index) {
 }
 
 // 作用：从场景删除第 index 个对象并保存工程；同步修正选中索引与计数。
-// 保存失败则把对象插回原位并恢复选中项。注意：不删除磁盘上的 OBJ / 位置文件。
+// 保存失败则把对象插回原位并恢复选中项。注意：不删除磁盘上的 OBJ / 位置文件——
+//   服务端没有删除工程内文件的接口，且位置文件/OBJ 可能仍被旧版工程或其他对象引用，
+//   所以只从配置中移除条目，文件留在工程目录（已知遗留，不影响计算）。
 async function deleteSceneObject(index) {
   const item = state.config?.objects?.items?.[index]
   if (!item) return
@@ -6813,7 +6848,8 @@ function colorCompositeRaster(rasters) {
 // 作用：解析模拟时间标签为 {day, hour, minute}。
 // 两种写法：纯数字（整数部分为日序，小数部分为当天的比例，按 1440 分钟折算并处理进位）；
 // 或文本中形如 “DOY123 … 12-30” 的日序与时分。无法识别返回 null。
-// 数字写法的日序含义以引擎输出为准（待核对）。
+// 数字写法即引擎的儒略日 t：整数部分为年积日 DOY、小数部分为当天比例（voxeleb.cpp/fileio.cpp 生成文件名
+// DOY<d>_<HH>-<MM> 用同一换算，分钟四舍五入后进位到 1440 则 DOY 加 1）；文本写法正对应该文件名格式。
 function simulationTimeParts(value) {
   const text = String(value ?? '').trim()
   if (!text) return null
@@ -7445,6 +7481,9 @@ function showVoxel3D(result, file, metric = result.metrics?.[0]?.id) {
     faceColors[vertex * 3 + 2] = brightness
   }
   geometry.setAttribute('color', new THREE.Float32BufferAttribute(faceColors, 3))
+  // 说明：与其他结果视图（面元/影像，设 ACES 色调映射）不同，本函数的渲染器没有设置色调映射
+  //   （保持默认 NoToneMapping），材质 toneMapped:false 只是显式保证指标色标颜色不被色调映射改变，
+  //   所以不设色调映射是有意的、也无害。
   const material = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true, transparent: false, opacity: 1, depthTest: true, depthWrite: true, alphaTest: 0, alphaToCoverage: false, toneMapped: false })
   // 步骤 5：用实例化网格一次绘制全部体元；每个体元设平移矩阵与指标颜色
   //   （HSL 色相 (1 − t)·0.67，蓝=小 → 红=大，非有限值为深灰）。
@@ -8803,7 +8842,7 @@ $('#computeDevice').addEventListener('change', (event) => {
   if (backend === 'gpu') control.gpu = Number(value.slice(4))
   control.computeBackend = backend
   control.facetBackend = backend
-  updateXml()
+  syncProjectText()
   renderComputeDevices()
   addLog(`计算设备：${event.target.selectedOptions[0]?.textContent || value}`)
 })
@@ -8811,7 +8850,7 @@ $('#cpuThreads').addEventListener('change', (event) => {
   const control = state.config?.control
   if (!control) return
   control.cpuThreads = normalizeCpuThreads(event.target.value)
-  updateXml()
+  syncProjectText()
   renderComputeDevices()
 })
 $('#refreshDevicesBtn').addEventListener('click', () => loadComputeDevices(true))
@@ -8948,18 +8987,21 @@ $('#closeReferenceBtn').addEventListener('click', hideReferenceDialog)
 $('#referenceDialog').addEventListener('click', (event) => { if (event.target === $('#referenceDialog')) hideReferenceDialog() })
 $('#openHistreamProxyBtn').addEventListener('click', openHistreamProxyDialog)
 // 菜单栏：带 data-scene-command 的菜单项在 STREAM 工作区打开时转交给工作区处理
-//   （route 返回 true 即已接管）；streamWorkspace 在下一行才创建，route 只在点击时调用。
+//   （route 返回 true 即已接管）。streamWorkspace 先声明为 null、稍后创建；菜单栏必须先于工作区
+//   注册键盘捕获处理器（见 menubar.js 步骤 5，保证 Esc 先关菜单），所以不能调换创建顺序，
+//   route 里显式判空，创建完成前的点击视为“未接管”。
+let streamWorkspace = null
 createMenubar({
   root: $('#menubar'),
   route: (item) => {
-    if (!item.dataset.sceneCommand || !streamWorkspace.isOpen()) return false
+    if (!item.dataset.sceneCommand || !streamWorkspace?.isOpen()) return false
     streamWorkspace.command(item.dataset.sceneCommand)
     return true
   }
 })
 // STREAM（遥感像元尺度）工作区：data-stream-command 的菜单项 'show' 打开工作区，
 //   其余命令转发给工作区；data-solution-mode 的菜单项先关闭工作区再切换计算模式。
-const streamWorkspace = createStreamWorkspace({ toast })
+streamWorkspace = createStreamWorkspace({ toast })
 for (const item of document.querySelectorAll('[data-stream-command]')) {
   item.addEventListener('click', () => {
     if (item.dataset.streamCommand === 'show') streamWorkspace.open()
