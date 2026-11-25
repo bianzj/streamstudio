@@ -74,7 +74,9 @@ vec2 PeriodicDomainSize()
 
 // Top of the voxel grid (cell units, + one cell margin). Every interaction
 // needs a grid cell (nanovdbGet), so nothing above it can affect a ray.
-// 场景顶面高度（格）；无湍流网格时返回 HUGE，表示不启用"顶面之上提前终止"。
+// 场景顶面高度，单位：体元格（不是米），y 以地面为 0：TurbidGridTop() = NanoVDB 根节点索引包围盒
+// 最大 y 下标 + 1（占用体元的顶面，functions.glsl），再加 1 格余量；无湍流网格（turbidGridReady 为假，
+// 或未定义 TURBID_GRID_AVAILABLE）时返回 PERIODIC_WALK_HUGE，表示不启用"顶面之上提前终止"。
 float PeriodicSceneTop()
 {
 #ifdef TURBID_GRID_AVAILABLE
@@ -113,7 +115,8 @@ bool QueryClosestPeriodic(Ray r, float minLength, uint rayFlags,
   // shaders as fast as before.
   // 步骤 2：非周期遍历时不使用顶面判定。
   float sceneTop = walking ? PeriodicSceneTop() : PERIODIC_WALK_HUGE;
-  bool found = false;
+  // 副本遍历（步骤 2、3）：任何一段查询命中都在循环内直接 return true（result 已写入），
+  //   所以循环正常结束就表示遍历范围内没有命中。
   if(!walking || !periodicEscapedAbove(r.origin, r.direction, 0.0, sceneTop))
   {
     PeriodicWalk walk = periodicWalkBegin(r.origin, r.direction,
@@ -136,7 +139,9 @@ bool QueryClosestPeriodic(Ray r, float minLength, uint rayFlags,
       periodicWalkAdvance(walk);
     }
   }
-  if(walking && !found && periodicMode == PERIODIC_QUERY_IMAGE && r.direction.y < -1.0e-6)
+  // 步骤 4：仅传感器图像模式的地面补查；groundHit 记录补查是否命中，也是本函数其余路径的返回值。
+  bool groundHit = false;
+  if(walking && periodicMode == PERIODIC_QUERY_IMAGE && r.direction.y < -1.0e-6)
   {
     // 步骤 4 的地面补查：以射线与 y=0 地面的交点为中心，沿射线取 ±rayMargin（垂直容差 verticalMargin，
     //   至少 1 格或周期的 2%）的小区间，把原点平移到落地点所在副本后查询。
@@ -153,12 +158,12 @@ bool QueryClosestPeriodic(Ray r, float minLength, uint rayFlags,
         float(tile.x) * size.x, 0.0, float(tile.y) * size.y);
       float verticalMargin = max(1.0, max(size.x, size.y) * 0.02);
       float rayMargin = verticalMargin / max(-r.direction.y, 1.0e-6);
-      found = QueryClosestSegment(queryOrigin, r.direction,
-                                  max(minLength, groundT - rayMargin),
-                                  groundT + rayMargin, rayFlags, result);
+      groundHit = QueryClosestSegment(queryOrigin, r.direction,
+                                      max(minLength, groundT - rayMargin),
+                                      groundT + rayMargin, rayFlags, result);
     }
   }
-  return found;
+  return groundHit;
 }
 
 // 入口：仅中央域的最近命中，结果写入 prd。（与下方带 minLength 的重载同名。）
@@ -184,12 +189,10 @@ void ClosestHitPeriodic(Ray r, float minLength)
 // Shoot a ray an return the information of the closest hit, in the
 // PtPayload structure (PRD)
 //
-// 入口：与 ClosestHit(Ray) 等价（仅中央域）。
+// 入口：与 ClosestHit(Ray) 等价（仅中央域）；函数体原与 ClosestHit(Ray) 完全相同，2026-11-25 改为转调，行为不变。
 void ClosestHitT(Ray r)
 {
-  PtPayload result;
-  QueryClosestPeriodic(r, 0.0, gl_RayFlagsNoneEXT, PERIODIC_QUERY_CENTRAL, result);
-  prd = result;
+  ClosestHit(r);
 }
 
 // 以下为已停用的旧版 ClosestHit（不经周期遍历，含 AABB 处理），保留作参考。

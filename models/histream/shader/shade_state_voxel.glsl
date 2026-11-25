@@ -4,7 +4,7 @@
 // 主要步骤：
 //   1. 由实例 → 网格链接取顶点/索引缓冲区，读取命中三角形三个顶点
 //   2. 重心坐标插值位置并变到世界系；几何法线用 worldToObject 逆转置变换
-//   3. 切线/副法线在物体系构造后用 objectToWorld 变换（与 shade_state.glsl 的差别）
+//   3. 切线/副法线在物体系构造后用 objectToWorld 变换（与 shade_state.glsl 的差别；仅在实例均匀缩放时保持正交）
 //   4. 填入 spectralId/thermalId/typeId（取自 meshLinks）
 // 与其他文件的关系：面元模式的对应版本是 shade_state.glsl，两者导出同名函数 GetShadeState，
 //   同一着色器只会包含其中之一；文件末尾被注释掉的 GetShadeState0 是按体元编号取状态的旧草稿。
@@ -54,7 +54,13 @@ ShadeState GetShadeState(in PtPayload hstate)
 
   // Normal
   // 步骤 3：几何法线 + 切线坐标系。法线用逆转置变换（支持旋转/非均匀缩放实例）；
-  // 切线、副法线直接用 objectToWorld 变换（非均匀缩放下可能与世界法线不严格正交，待核对）。
+  // 切线、副法线直接用 objectToWorld 变换。
+  // 说明（2026-11-25 核实）：本工程的实例变换由 scene.cpp 用“标量缩放 + 旋转 + 平移”构造
+  //   （scale0 → glm::vec3(scale0)，背景缩放恒为 1），只有均匀缩放，此时 objectToWorld 的线性部分是
+  //   旋转×常数，切线/副法线/法线保持正交（面元版 shade_state.glsl 用世界法线重新构造切线，
+  //   切线的具体朝向与此处不同，但同样正交）。
+  //   若今后允许非均匀缩放实例，三者可能不再正交，需改为用 wgeom_normal 重新调用
+  //   createCoordinateSystem 构造世界系切线/副法线（localTangent/localBinormal 仍保持物体系）。
   vec3 geom_normal  = normalize(cross(pos1 - pos0, pos2 - pos0));
   // Normals transform by inverse transpose, including rotated/nonuniformly
   // scaled instances. Multiplication by objectToWorld as a row was incorrect.

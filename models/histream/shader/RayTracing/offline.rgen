@@ -272,7 +272,9 @@ float ThermalSolarScale()
 
 // wi: in direction; wo: out direction; *World: direction in world coordinates.
 // 作用：在路径顶点做下一事件估计（next-event estimation）：直射太阳 + 热发射 + 各向同性天空散射，累加到 Radiance[]。
-// 输入：命中点位置、出射方向（世界系）、着色状态、当前深度；输出：始终返回 true，结果累加进全局 Radiance[]（kDepth 未使用）。
+// 输入：命中点位置、出射方向（世界系）、着色状态、当前深度；输出：始终返回 true，结果累加进全局 Radiance[]。
+// 说明（2026-11-25 核实）：kDepth 参数未使用，返回值恒为 true 且调用点（PathTrace）不使用返回值，
+//   均为遗留；保留以维持与 InDirectLighting 对称的签名，删除不影响结果。
 // 步骤：1) 向太阳发射阴影射线；2) 向阳时按波段累加太阳直射（BSDF·cosθ·beam）；
 //   3) > 2.5 µm 波段累加表面热发射（向阳/背阴温度 × 发射率）；4) 累加天空漫射。
 bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
@@ -575,7 +577,7 @@ bool PathTrace(Ray r)
 
 // 作用：对像素内一个子像素位置做一次路径采样，结果留在全局 Radiance[]；返回 PathTrace 的结果。
 // 步骤：1) 由子像素位置经 projInverse/viewInverse 生成相机射线（focalDist<0 表示主机端给定的平行投影，
-//   原点沿传感器平面移动）；2) 按景深参数计算光圈采样（finalRayDir，当前未用于射线，待核对）；
+//   原点沿传感器平面移动）；2) 按景深参数计算光圈采样（finalRayDir，当前未用于射线，是遗留代码，见下方说明）；
 //   3) 清零 Radiance、吞吐量置 1 后追踪。
 bool SamplePixel(vec2 subPixel_jitter, ivec2 imageCoords, ivec2 imageResolution)
 {
@@ -596,6 +598,11 @@ bool SamplePixel(vec2 subPixel_jitter, ivec2 imageCoords, ivec2 imageResolution)
   }
 
   // Parallel projection and central projection. ?if use?, can removed????
+  // 说明（2026-11-25 核实）：景深（光圈采样）是遗留代码，当前不生效——主机端 geometry.cpp 中 sensor.aperture
+  //   恒为 0（针孔），HEX LOD 锥体追踪时为 -4（仅作标记），没有 aperture>0 的工程；finalRayDir 算出后
+  //   不被使用，射线始终用 Ray(origin, direction)。不能删掉下面两次 rand(prd.seed)：它们推进了每像素的
+  //   随机序列，删除会改变之后所有随机采样的结果（统计意义上等价，但不再逐字节一致）。
+  //   若今后要启用景深：把 Ray 的方向改用 finalRayDir（并按 focalDist 处理原点），且 aperture<0 时需跳过。
   vec3 focalPoint = sensorMatrix.focalDist * direction.xyz;
   float cam_r1 = rand(prd.seed) * M_TWO_PI;
   float cam_r2 = rand(prd.seed) * sensorMatrix.aperture;
