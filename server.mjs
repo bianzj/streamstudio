@@ -715,6 +715,11 @@ function emit(payload) {
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]'])
 // Largest legitimate payload is a 64 MB DEM sent as base64 inside JSON.
 const MAX_REQUEST_BYTES = 160 * 1024 * 1024
+// DEM 导入上限：解码后 64 MB（前端 src/renderer/src/main.js 的 importDem 同值）；
+// base64 文本长度上限由它推出（每 3 字节编码为 4 字符，向上取整），用于在解码前先拒绝过大的请求，
+// 解码后仍按字节数再检查一次。
+const MAX_DEM_BYTES = 64 * 1024 * 1024
+const MAX_DEM_BASE64_CHARS = Math.ceil(MAX_DEM_BYTES / 3) * 4
 const LARGE_REQUEST_BYTES = 4 * 1024 * 1024
 
 function isLoopbackHostname(value) {
@@ -793,11 +798,11 @@ function normalizeSpectrumContent(value) {
 }
 
 // 模块：宿主机路径换算。Linux 下把 Windows 盘符路径转成 /mnt/<盘符>/…；Windows 下把 WSL 路径转回盘符路径；
-// 其余原样返回。注意函数内局部变量 windowsPath 遮蔽了同名全局函数（仅作正则匹配结果用）。
+// 其余原样返回。（盘符匹配结果的局部变量叫 driveMatch，避免与下面的全局函数 windowsPath 同名。）
 function normalizeHostPath(value) {
   const source = String(value || "").trim()
-  const windowsPath = source.match(/^([A-Za-z]):(.*)$/)
-  if (process.platform === "linux" && windowsPath) return "/mnt/" + windowsPath[1].toLowerCase() + "/" + windowsPath[2].replaceAll("\\", "/").replace(/^\/+/, '')
+  const driveMatch = source.match(/^([A-Za-z]):(.*)$/)
+  if (process.platform === "linux" && driveMatch) return "/mnt/" + driveMatch[1].toLowerCase() + "/" + driveMatch[2].replaceAll("\\", "/").replace(/^\/+/, '')
   const wslPath = source.match(/^\/mnt\/([A-Za-z])\/(.*)$/)
   if (process.platform === "win32" && wslPath) return wslPath[1].toUpperCase() + ":" + String.fromCharCode(92) + wslPath[2].replaceAll("/", String.fromCharCode(92))
   return source
@@ -1320,17 +1325,27 @@ function outputAngleToken(value) {
   return Number.isFinite(number) ? number.toFixed(2) : '0.00'
 }
 
+// 文件名时间标记的共用格式化：totalMinutes 为整数分钟，dayOfYear 为年内日（null 表示不带日期）。
+// 分钟满 1440 时（日期非空才）进位到后续日，并取一天内的分钟数；输出 [DOY<d>_]HH-MM。
+// outputTimeToken（儒略日）与 writeRadiosityTiffForAngle 的 clockToken（秒）共用，保证两处命名一致。
+function formatClockToken(totalMinutes, dayOfYear = null) {
+  let minutes = totalMinutes
+  let day = dayOfYear
+  if (minutes >= 1440) {
+    if (day != null) day += Math.floor(minutes / 1440)
+    minutes %= 1440
+  }
+  const hour = String(Math.floor(minutes / 60)).padStart(2, '0')
+  const minute = String(minutes % 60).padStart(2, '0')
+  return (day == null ? '' : 'DOY' + day + '_') + hour + '-' + minute
+}
+
 // 把儒略日（年内日 + 日小数）转成文件名时间标记 DOY<d>_HH-MM；分钟满 1440 时进位到下一天。
 function outputTimeToken(julianTime) {
   const value = Number(julianTime)
   if (!Number.isFinite(value)) return ''
-  let day = Math.floor(value)
-  let minutes = Math.round((value - day) * 1440)
-  if (minutes >= 1440) { day += Math.floor(minutes / 1440); minutes %= 1440 }
-  if (minutes < 0) minutes = 0
-  const hour = String(Math.floor(minutes / 60)).padStart(2, '0')
-  const minute = String(minutes % 60).padStart(2, '0')
-  return 'DOY' + day + '_' + hour + '-' + minute
+  const day = Math.floor(value)
+  return formatClockToken(Math.max(0, Math.round((value - day) * 1440)), day)
 }
 
 // 作用：生成结果 TIFF 文件名。EB 模式：T=<时间>_VZA=_VAA=；RT 模式：SZA=_SAA=_VZA=_VAA=；
@@ -2261,17 +2276,7 @@ function writeRadiosityTiffForAngle(jsonPath, inputPath, mode, viewAngleOverride
   const startNode = step ? step.node : Math.max(0, Math.round(Number(meteo.start) || 0))
   const endNode = step ? step.node + 1 : Math.max(startNode + 1, Math.round(Number(meteo.end) || startNode + 1))
   const dTime = Math.max(1, Number(meteo.dTime) || 1800)
-  const clockToken = (seconds, dayOfYear = null) => {
-    let totalMinutes = Math.round(seconds / 60)
-    let day = dayOfYear
-    if (totalMinutes >= 1440) {
-      if (day != null) day += Math.floor(totalMinutes / 1440)
-      totalMinutes %= 1440
-    }
-    const hour = String(Math.floor(totalMinutes / 60)).padStart(2, '0')
-    const minute = String(totalMinutes % 60).padStart(2, '0')
-    return (day == null ? '' : 'DOY' + day + '_') + hour + '-' + minute
-  }
+  const clockToken = (seconds, dayOfYear = null) => formatClockToken(Math.round(seconds / 60), dayOfYear)
   const configuredMeteo = String(meteo.path || '')
   const meteoFile = configuredMeteo && configuredMeteo !== 'defined/meteo.txt' && configuredMeteo !== 'HiStream 内置气象数据'
     ? (isAbsolute(configuredMeteo) ? configuredMeteo : resolve(dirname(inputPath), configuredMeteo))
@@ -2304,12 +2309,8 @@ function writeRadiosityTiffForAngle(jsonPath, inputPath, mode, viewAngleOverride
     }
     return {}
   }
-  const angleToken = (value) => {
-    const number = Number(value)
-    return Number.isFinite(number) ? number.toFixed(2) : '0.00'
-  }
-  const vza = angleToken(namingViewAngles[0])
-  const vaa = angleToken(namingViewAngles[1])
+  const vza = outputAngleToken(namingViewAngles[0])
+  const vaa = outputAngleToken(namingViewAngles[1])
   // 非耦合（静态辐射度）结果：每个波段取 bandRadiosity 中对应切片；只有没有 bandRadiosity 的旧宽波段文件才用 radiosity。
   const staticRadiosity = metrics.find(([id]) => id === 'radiosity')?.[2]
   const surfaceValueCount = facetCount * 2
@@ -3413,7 +3414,11 @@ function filenameToken(stem, key) {
 // 步骤 2：读入全部数据；波段名取自 band names。
 // 步骤 3：由文件名里的 T/VZA/VAA/SZA/SAA 生成标准 TIFF 名（能量平衡模式用时间 + 观测角，
 //         辐射模式用太阳角 + 观测角）；字段不全则沿用原文件名并补几何后缀。
-// 步骤 4：写 TIFF；Voxel 与 Raytracing 模式转换后删除 ENVI 原文件（面元模式保留，原因待核对）。
+// 步骤 4：写 TIFF；转换成功后删除 ENVI 原文件（.hdr + .img，内容已完整进入 TIFF，避免结果目录里同一影像有两份；
+//         转换失败会在写 TIFF 之前抛错，原文件因此保留）。守卫条件列出的 eVoxelRT/eVoxelEB/eRaytracing 正是会产出
+//         ENVI 的全部模式；面元模式（eFacetRT/eFacetEB）的结果是 JSON 经 writeRadiosityTiff 直接出 TIFF，
+//         不会走本函数（见 /api/run 里 radiosityJsonPath 分支），并不是“面元模式刻意保留 ENVI”。
+//         （git 历史只有初始快照，无更早的提交可追溯，以上依据来自调用关系。）
 // Throws a descriptive Error when the ENVI pair cannot be converted; the caller
 // (convertEnviResults) records it as a visible per-file failure.
 function convertEnviToTiff(headerPath, mode) {
@@ -3771,10 +3776,11 @@ function listResults(value) {
 }
 
 // 作用：解析 ENVI .hdr 的 `key = value` 行，键转小写，值去首尾空白。
-// 说明：多行花括号块（如 band names）只取同一行内容；`=` 后无空白且值以 { 开头时不会匹配（待核对）。
+// 说明：多行花括号块（如 band names = {\n a,\n b}）只取 `=` 所在行的内容；`key={a,b}`（`=` 后无空白、值以 { 开头）
+//       与 `key = {a,b}` 一样会匹配。旧正则把 `=` 后紧跟的 { 排除在值首字符之外，导致无空白写法被漏掉。
 function enviMetadata(content) {
   const result = {}
-  for (const match of content.matchAll(/^\s*([^=\r\n]+?)\s*=\s*([^\r\n{][^\r\n]*)/gm)) result[match[1].trim().toLowerCase()] = match[2].trim()
+  for (const match of content.matchAll(/^[ \t]*([^=\r\n]+?)[ \t]*=[ \t]*([^\r\n]+)/gm)) result[match[1].trim().toLowerCase()] = match[2].trim()
   return result
 }
 
@@ -4494,9 +4500,11 @@ function inspectAsciiGrid(data, includeValues = false) {
 
 // 模块：构造 DEM 高度采样器 (north, east) → 相对 DEM 最低点的高度（m）。
 // 输入：configuration.scene（terrain 开关、demFile、场景尺寸 x、y）；无地形/无 DEM 时返回 null。
-// 说明：north/east 为场景内的米制坐标；这里用 north/scene.x、east/scene.y 归一化
-//       （即 x 方向对应南北、y 对应东西，待核对与引擎一致）。缺测像元按最低值处理，
-//       坐标夹在场景范围内，并做双线性插值；与引擎的 demHeightAboveMinimum 保持一致。
+// 说明：参数名 north/east 即场景水平两个坐标：north = 第一个坐标（位置文件的 x，尺寸 scene.x，用户手册称 X=南北），
+//       east = 第二个坐标（位置文件的 y，尺寸 scene.y，手册称东西）。用 north/scene.x 映射为 DEM 行（翻转，
+//       行 0 为北缘），east/scene.y 映射为 DEM 列（向东），与引擎 base/scene.cpp 的 demHeightAboveMinimum
+//       完全相同（该函数的“轴约定是否应转置”是引擎侧遗留问题，这里只保持一致）。缺测像元按最低值处理，
+//       坐标夹在场景范围内，并做双线性插值。
 // Full-resolution terrain height above the DEM minimum, sampled exactly like the
 // engine's demHeightAboveMinimum (bilinear, row 0 = north edge, columns eastward).
 function demHeightSampler(configuration, baseDir = projectDir) {
@@ -4878,9 +4886,9 @@ async function api(request, response, url) {
       if (!sourceName || !new Set(['.tif', '.tiff', '.asc']).has(extension))
         throw new Error('DEM 仅支持单波段 GeoTIFF（TIF/TIFF）或 ESRI ASCII Grid（ASC）')
       const encoded = String(data.contentBase64 || '')
-      if (!encoded || encoded.length > 90 * 1024 * 1024) throw new Error('DEM 文件为空或超过 64MB')
+      if (!encoded || encoded.length > MAX_DEM_BASE64_CHARS) throw new Error('DEM 文件为空或超过 64MB')
       const content = Buffer.from(encoded, 'base64')
-      if (!content.length || content.length > 64 * 1024 * 1024) throw new Error('DEM 文件为空或超过 64MB')
+      if (!content.length || content.length > MAX_DEM_BYTES) throw new Error('DEM 文件为空或超过 64MB')
       const terrainDir = join(targetProjectDir, 'terrain')
       mkdirSync(terrainDir, { recursive: true })
       const stem = sourceName.slice(0, -extension.length).replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '') || 'terrain'
@@ -5684,6 +5692,8 @@ else if (workerData?.kind === 'task-once') {
 
 // 导出给桌面进程使用（desktop/server-process.mjs）：HTTP 服务对象与引擎停止函数。
 export { server, stopEngines }
+// 供测试（tools/test-server-fixes-20261125.mjs）直接调用的纯函数：ENVI 头解析/转换与输出文件名标记。
+export { convertEnviToTiff, enviMetadata, outputAngleToken, outputTimeToken, outputTiffName }
 
 // 作用：停止所有后台工作：面元出图线程、后台线程池、正在运行的 histream 子进程（Windows 用 taskkill
 // 终止整棵进程树，同步等待）以及 STREAM 服务；已经退出只剩后处理的运行不再杀进程。
