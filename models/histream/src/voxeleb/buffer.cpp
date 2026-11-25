@@ -764,9 +764,10 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     // air
     // 叶面空气状态初值：cs = Ca、ci = 0.7·Ca（ppm），es = ea（hPa），向阳/背阴相同；
     // 再叠加地形环境给出的 CO2 超额 co2ExcessPpm（cs 全加，ci 按 0.7 倍加）。
-    // 说明：这里用的是第 0 个气象节点，而前面的温度初值用 initialNode（起始节点）；
-    //       当 startTimeNode ≠ 0 时两者可能不一致（疑似问题，待核对）。
-    const Meteo& firstMeteo = voxellstio->meteos[0];
+    // 说明：取起始气象节点 initialNode，与前面的温度初值、风速、水汽压初值使用同一节点
+    //       （此前误取第 0 个节点，startTimeNode ≠ 0 时与温度初值不一致，2026-11-25 修正；
+    //       实测改后输出逐字节不变：es、cs 在 evapo 每轮迭代中按当前节点气象重写，初值未见影响）。
+    const Meteo& firstMeteo = voxellstio->meteos[initialNode];
     const VoxelAir initialAir{{firstMeteo.Ca, firstMeteo.Ca},
                               {0.7f * firstMeteo.Ca, 0.7f * firstMeteo.Ca},
                               {firstMeteo.ea, firstMeteo.ea}};

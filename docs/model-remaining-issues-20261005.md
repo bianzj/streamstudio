@@ -1,5 +1,11 @@
 # Stream Studio 尚存问题核查（2026-10-05）
 
+## 2026-11-25 VoxelEB 叶面空气状态初值（fixhost）
+
+### 已修正（2026-11-25）
+
+- 叶面空气状态（`VoxelAir` 的 cs/ci/es）初值原取第 0 个气象节点，温度初值取起始节点 `startTimeNode`，起始节点不为 0 时不一致；现统一取起始节点（`voxeleb/buffer.cpp`）。实测 `veb_urban`、`veb_forest`、`veb_forest_periodic`、`veb_urban_ship_plate` 输出逐字节不变（es、cs 在 evapo 每轮迭代中按当前节点气象重写，初值未见影响），无数值影响。
+
 ## 2026-11-24 FacetEB 车辆座舱与车内温度（vehicle）
 
 ### 已修正（2026-11-24）
