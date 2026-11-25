@@ -318,6 +318,8 @@ def render_heatmap(values: np.ndarray, destination: Path, title: str,
     rgb = colorize(np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=0.0))
     rgb[~valid] = (225, 229, 233)
     image = Image.fromarray(rgb, "RGB")
+    # max_side 只决定“小图放大到多大”：下面 scale 取 max(1.0, …)，最长边已超过 1500 px 的栅格不缩小、保持原尺寸。
+    # 这是现有报告图的输出行为，刻意保持不变（改成同时缩小大图会改变已生成的 PNG）。
     max_side = 1500
     scale = min(max_side / max(1, image.width), max_side / max(1, image.height))
     scale = max(1.0, scale)
@@ -482,7 +484,8 @@ def read_raster_with_pillow(image: Image.Image) -> tuple[np.ndarray, float | Non
                 frames.append(array[:, :, channel])
                 descriptions.append(f"band_{len(frames)}")
     if not frames:
-        raise ValueError(f"无法读取 TIFF 像元：{path}")
+        # 本函数只拿到 Image 对象，没有 path 参数；文件名取自 Pillow 打开文件时记录的 filename（可能为空）。
+        raise ValueError(f"无法读取 TIFF 像元：{getattr(image, 'filename', '') or '<未知文件>'}")
     nodata = image.tag_v2.get(42113)
     try:
         nodata = float(str(nodata).strip("\x00")) if nodata is not None else None

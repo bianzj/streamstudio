@@ -5,7 +5,7 @@
 // 主要步骤：
 //   1. 读取参数并建立输出目录 .test/examples-run/<时间戳>/（日志与 summary.json，不入库）
 //   2. 工具函数：log/appendLog（控制台与逐示例日志）、api（JSON 请求）、openSse（采集事件流）
-//   3. 清单读取辅助：newestManifest、readManifest、waitForManifestAt
+//   3. 清单读取辅助：readManifest、waitForManifestAt
 //   4. runExample：打开示例 → STREAM 示例走 /api/stream/*，其余走 /api/run，等待结束并记录
 //   5. 主流程：GET /api/examples 取目录，逐个运行，写 summary.json 并在控制台打印汇总
 // 数据流：服务端 /api/examples/open 在 examplesRoot 下生成工程 → 提交运行 → 轮询 run-manifest.json
@@ -19,8 +19,8 @@
 // 用法: node review/run-examples.mjs <baseUrl> [exampleId]
 // 结果写入 .test/examples-run/<timestamp>/（项目忽略目录，原始日志不入库）
 
-import { mkdirSync, writeFileSync, readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
-import { join, dirname, resolve } from 'node:path'
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -92,30 +92,6 @@ async function openSse(path, id) {
     } catch { /* abort 时正常退出 */ }
   })()
   return { close: () => { controller.abort(); return done } }
-}
-
-// ---- 递归找最新的 run-manifest.json ----
-// 作用：在 root 下最多 4 层深度内，找修改时间不早于 since 的最新 run-manifest.json。
-// 说明：跳过 node_modules 与 .histream-runtime；当前文件内未被调用（待核对是否遗留）。
-function newestManifest(root, since) {
-  let best = null
-  const walk = (dir, depth) => {
-    if (depth > 4) return
-    let entries
-    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
-    for (const entry of entries) {
-      if (entry.name === 'node_modules' || entry.name === '.histream-runtime') continue
-      const full = join(dir, entry.name)
-      if (entry.isDirectory()) { walk(full, depth + 1); continue }
-      if (entry.name !== 'run-manifest.json') continue
-      let stats
-      try { stats = statSync(full) } catch { continue }
-      if (stats.mtimeMs < since) continue
-      if (!best || stats.mtimeMs > best.mtimeMs) best = { path: full, mtimeMs: stats.mtimeMs }
-    }
-  }
-  walk(root, 0)
-  return best
 }
 
 function readManifest(path) {
@@ -206,13 +182,14 @@ async function runExample(entry) {
       const runInfo = await api('POST', '/api/run', { inputPath: projectPath, mode: entry.recommendedMode })
       step('提交运行', true, `${entry.recommendedMode} runId=${runInfo.runId}`)
       record.outputDir = runInfo.outputDir
-      const { manifest, timeout } = await waitForManifestAt(runInfo.outputDir, id)
+      const { manifest, path: manifestFile, timeout } = await waitForManifestAt(runInfo.outputDir, id)
       if (timeout) { record.status = 'timeout'; step('运行结束', false, '超时'); try { await api('POST', '/api/stop', {}) } catch {} }
       else {
         record.status = manifest?.status || 'unknown'
         record.exitCode = manifest?.exitCode ?? null
         record.error = manifest?.error || null
-        record.outputDir = manifest?.outputDir || (path ? dirname(path) : null)
+        // 清单里没有 outputDir 时，用刚读到的 run-manifest.json 所在目录。
+        record.outputDir = manifest?.outputDir || (manifestFile ? dirname(manifestFile) : null)
         const passed = record.exitCode === 0 || ['completed', 'finished', 'done'].includes(record.status)
         step('运行结束', passed, `status=${record.status} exitCode=${record.exitCode}${record.error ? ' error=' + record.error : ''}`)
       }
