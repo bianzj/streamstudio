@@ -1,3 +1,14 @@
+// ==========================================================================
+// 文件：heat_conduction.h
+// 功能：土壤热状态结构与地表热通量接口的声明（实现见 heat_conduction.cpp）
+// 主要内容：
+//   1. SoilThermalState：7 h 表面温度历史与 2 m 土柱剖面（以及 G(T) 线性化缓存）
+//   2. ThermalMaterial：导热率、体积热容与热惰性
+//   3. surfaceHeatFlux(T)：历史卷积法（surface）；depthHeatFlux：土柱法（depth）
+//   4. initializeColumn / advanceThermalState：初始化与逐步推进
+// 约定：G 为进入土壤的热通量（W m-2）；时间步 dtSeconds 内部至少取 1 s
+// ==========================================================================
+
 #pragma once
 #include "dual.h"
 
@@ -18,6 +29,7 @@ struct SoilThermalState {
     mutable double depthIntercept = 0.0, depthSlope = 0.0;
 };
 
+// 结构：土壤热物性，缺省值与 energy 的 soilConductivity / soilVolumetricCapacity 缺省一致。
 struct ThermalMaterial {
     double conductivity = 1.55;           // W m-1 K-1
     double volumetricCapacity = 1.298e6;  // J m-3 K-1

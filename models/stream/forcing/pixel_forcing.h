@@ -1,9 +1,26 @@
+// ==========================================================================
+// 文件：pixel_forcing.h
+// 功能：单像元气象强迫（PixelForcing）与接收面短波结果（SurfaceShortwave）的声明
+// 主要模块：
+//   1. approximateCosZenith / approximateSunAzimuth：NOAA 近似太阳位置（实现在 pixel_forcing.cpp）
+//   2. SurfaceShortwave：地形下接收面短波、漫射占比与有效入射余弦
+//   3. PixelForcing：在 ForcingSource 上取像元插值权重，给出任意时刻的 Forcing 与接收面短波
+// 数据流：ForcingSource（标准量，整点）→ PixelForcing.at / surfaceShortwave → physics/energy 的 EB 求解
+// 约定：时间为 Unix 秒（UTC）；构造参数中的角度为度、内部成员为弧度；方位角自北顺时针；
+//   elevationShift 为像元高程减数据源海拔（m）；辐射 W m-2
+// 注意：水平像元保持旧算法逐位不变（tilted=false）；surfaceShortwave 有 NOAA 与 SPA 两个入口
+//   （FIX 2026-11-21 C10），后者用调用方的太阳位置
+// 与其他文件：实现见 pixel_forcing.cpp；数据接口见 forcing_source.h；
+//   漫射份额与晴空 DNI 上限见 physics/shortwave.h
+// ==========================================================================
+
 #pragma once
 #include "forcing_source.h"
 #include "../physics/energy.h"
 
 namespace stream {
 
+// 模块：太阳位置的近似函数（只用于强迫的时间插值与旧路径，不用于 EB 步进的主太阳位置）。
 // Cosine of the solar zenith angle from the NOAA general solar position formulas; only used to
 // interpolate hourly shortwave between hour centres.
 double approximateCosZenith(double latitudeDeg, double longitudeDeg, double unixSeconds);

@@ -1,9 +1,23 @@
+// ==========================================================================
+// 文件：spa.h
+// 功能：NREL 太阳位置算法（SPA）的接口：输入/输出结构 spa_data、功能选择枚举、SPACalc 类。
+// 主要模块：
+//   1. 枚举：选择输出内容（天顶/方位、含坡面入射角、含日出日落、全部）
+//   2. spa_data：输入（日期时间、经纬度、海拔、气压气温、坡面）、中间量与最终输出
+//   3. SPACalc::spa_calculate：计算入口（实现见 spa.cpp，返回错误码，0 表示成功）
+// 用法：填写 spa_data 输入字段与 function → 调用 SPACalc{}.spa_calculate(&spa) → 读 zenith / azimuth 等。
+// 关系：被 app/image.cpp、app/thermal_view.cpp 使用。
+// 约定：角度为度；经度东正、纬度北正；azimuth 从北顺时针 0–360，azimuth180 从南向西 -180..180；
+//       timezone 为东正小时；pressure 单位 mbar，temperature 为 °C；输入范围与错误码见字段注释。
+// ==========================================================================
+
 #ifndef SPA_H
 #define SPA_H
 
 //#include <Arduino.h>
 
 enum {
+    // 功能选择：SPA_ZA 仅天顶/方位；SPA_ZA_INC 另算坡面入射角；SPA_ZA_RTS 另算日出/日中/日落与时差；SPA_ALL 全部。
     SPA_ZA,           //calculate zenith and azimuth
     SPA_ZA_INC,       //calculate zenith, azimuth, and incidence
     SPA_ZA_RTS,       //calculate zenith, azimuth, and sun rise/transit/set values
@@ -12,6 +26,7 @@ enum {
 
 typedef struct
 {
+    // 结构体 spa_data：error 为计算结果错误码（0 正常）；下面三段依次为输入、中间量、最终输出。
     int error;
     //----------------------INPUT VALUES------------------------
 
@@ -122,6 +137,7 @@ typedef struct
 
 } spa_data;
 
+// 类 SPACalc：无状态封装，spa_calculate 返回 spa->error；成功时输出字段已填入 spa。
 class SPACalc {
   private:
 

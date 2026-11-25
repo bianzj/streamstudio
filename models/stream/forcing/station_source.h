@@ -1,3 +1,15 @@
+// ==========================================================================
+// 文件：station_source.h
+// 功能：站点 CSV 气象强迫源 StationSource 的声明（实现见 station_source.cpp）
+// 主要内容：
+//   1. StationSource：实现 ForcingSource 接口，读入一个或多个站点 CSV，重采样到整点，
+//      按最近站或距离反比（IDW，每个位置最多 4 站）做空间插值
+//   2. 内部结构 Series / Station：每站每通道的 SI 时间序列与站点坐标、海拔
+//   3. readHeader：只读表头，供 forcing-check 校验列名
+// 关系：元数据由 forcing_metadata.h 提供；接口见 forcing_source.h；规格见 docs/forcing-metadata.md 3.3
+// 约定：standardised() 恒为 true（输出已是 ERA5 命名的 SI 标准量）；fullYear() 恒为 false
+// ==========================================================================
+
 #pragma once
 // Station CSV forcing (docs/forcing-metadata.md 3.3): one or several stations, resampled to the whole-hour grid and interpolated
 // in space by nearest station or inverse-distance weights (at most four stations per location).
@@ -13,9 +25,11 @@ namespace stream {
 
 class StationSource : public ForcingSource {
 public:
+    // 构造：读入并校验全部 CSV（失败即抛 std::runtime_error）。
     // Reads and validates the CSV files; throws std::runtime_error with the standard messages.
     StationSource(const ForcingMetadata& metadata, const std::vector<std::filesystem::path>& files);
 
+    // 以下为 ForcingSource 接口的实现；loaded/first/lastHour 描述 load() 已加载的窗口。
     const ForcingMetadata& metadata() const override { return meta_; }
     bool standardised() const override { return true; }
     const std::string& product() const override { return meta_.name; }
@@ -37,10 +51,14 @@ public:
     double lapseRate() const override { return meta_.lapseRateKPerKm / 1000.0; }
     size_t stationCount() const { return stations_.size(); }
 
+    // 注：返回 CSV 表头的列名列表（不加载数据）。
     // The station a header list of a CSV would need: used by forcing-check to validate files without running.
     static std::vector<std::string> readHeader(const std::filesystem::path& file, const ForcingMetadata& metadata);
 
 private:
+    // 内部数据：Series 为按时间排序的原始记录（times 为自 1970 起的小时数，values 为 SI）；
+    //       Station 保存站点 id、来源文件、经纬度（度）、海拔（m）与各通道序列；
+    //       data_ 为 load() 后的标准量（[小时 × 站点数 + 站点]，float）。
     struct Series { std::vector<double> times, values; };  // values in SI
     struct Station {
         std::string id, file;

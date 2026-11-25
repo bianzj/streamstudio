@@ -1,3 +1,25 @@
+// ==========================================================================
+// 文件：era5.cpp
+// 功能：气象强迫网格数据包（ERA5 / ERA5-Land 及其他规则经纬网 NetCDF）的登记、读取与插值
+// 主要模块：
+//   1. NetCDF 访问封装：NcFile（RAII）、时间单位解析、规则坐标轴 Axis、文件扫描 scanFile、
+//      变量布局 layoutOf、按窗口读帧 readFrame
+//   2. 数据包登记：registerPack（ERA5，kind=stream-era5-pack）、
+//      registerForcingPack（元数据驱动，kind=stream-forcing-pack），写索引 JSON
+//   3. Pack::open：读索引、确定元数据、校验文件并建立“变量 → 时刻 → 文件/时间下标”表
+//   4. 覆盖检查：covers / channelCovers / leadHours / available
+//   5. 加载：load（行/列窗口）→ ERA5 原路径逐帧读入，或 loadGeneric 按元数据换算、重采样、标准化
+//   6. 取值：weights（双线性权重）、sample / at（NaN 感知加权）、hourlyFlux（累积通量 → W m-2）
+// 数据流：NetCDF + 索引 JSON → Pack.load 读入窗口内逐小时场（float，NaN=缺测）→
+//   pixel_forcing 用 weights/at/hourlyFlux 取像元强迫 → EB 能量平衡求解
+// 约定：时间为自 1970-01-01 UTC 起的整小时数；标准量为 ERA5 命名、SI 单位；
+//   ERA5 的 ssrd/strd 是逐小时累积（J m-2），ERA5-Land 自 00 UTC 累积，hourlyFlux 统一转为 W m-2
+// 注意：恒等 ERA5 布局（generic_=false）走原读取路径，结果与引入元数据层前逐位一致；
+//   元数据路径要求记录在整点（亚小时数据需先重采样）
+// 与其他文件：forcing_metadata.h（元数据与标准化）、forcing_resample.h（通量重采样）、
+//   forcing_source.h（接口）、utc.h（时间换算）、pixel_forcing.cpp（调用方）
+// ==========================================================================
+
 #include "era5.h"
 #include "forcing_resample.h"
 #include "utc.h"
@@ -30,6 +52,9 @@ namespace {
 namespace fs = std::filesystem;
 constexpr float kMissing = std::numeric_limits<float>::quiet_NaN();
 
+// 作用：把 fs::path 转成 netCDF 能打开的本地路径字符串。
+// 说明：Windows 下 netCDF 走 ANSI 代码页，含非 ASCII 字符的路径改用 8.3 短文件名；
+// 拿不到纯 ASCII 短名时直接报错，提示用户把数据移到英文路径。其余平台原样返回。
 std::string nativePath(const fs::path& path)
 {
 #ifdef _WIN32
@@ -50,6 +75,9 @@ std::string nativePath(const fs::path& path)
 #endif
 }
 
+// 模块：netCDF 文件的 RAII 封装（打开即校验，析构时关闭）。
+// 提供：按名字/别名列表找变量、整变量读 double、读文本/数值属性、取维度名。
+// 所有 nc_* 返回码在此处理：打开失败抛 runtime_error（提示 GRIB 需先转换）。
 class NcFile {
 public:
     explicit NcFile(const fs::path& path) : path_(path)
@@ -157,11 +185,15 @@ void timeUnits(const std::string& units, double& scale, double& epoch)
     epoch = static_cast<double>(daysFromCivil(year, static_cast<unsigned>(month), static_cast<unsigned>(day))) * 86400.0 + clock;
 }
 
+// 模块：规则坐标轴（经度或纬度）。first 为首格点坐标（度），step 为间隔（度，纬度可为负，
+// 即北→南存储），count 为格点数。
 struct Axis {
     double first = 0, step = 0;
     int count = 0;
 };
 
+// 作用：由坐标变量的取值构造 Axis，并要求等间距（容差 1e-4 × max(1, |step|)）。
+// 说明：规则经纬网是双线性插值与按下标取窗口的前提，不等间距直接报错。
 Axis regularAxis(const std::vector<double>& values, const std::string& label, const fs::path& file)
 {
     if (values.size() < 2) throw std::runtime_error("ERA5 " + label + " 至少需要 2 个格点：" + utf8FromPath(file));
@@ -174,6 +206,8 @@ Axis regularAxis(const std::vector<double>& values, const std::string& label, co
 
 bool sameAxis(const Axis& a, const Axis& b) { return a.count == b.count && std::abs(a.first - b.first) < 1e-6 && std::abs(a.step - b.step) < 1e-6; }
 
+// 模块：单个 NetCDF 文件的扫描结果（坐标轴、时间序列、包含的目标变量）。
+// invariant：不随时间变化的变量（如地形位势 z），登记/读取时不按小时检查覆盖。
 struct FileScan {
     Axis latitude, longitude;
     std::vector<int64_t> hours;  // per time index, hours since epoch
@@ -182,6 +216,7 @@ struct FileScan {
     std::set<std::string> invariant;
 };
 
+// 模块说明：Names 的缺省值就是 ERA5 的命名；元数据驱动的数据包用元数据中的别名覆盖。
 // Coordinate names and the reading rules of one pack: the ERA5 defaults, or what the forcing metadata declares.
 struct Names {
     std::vector<std::string> time{"valid_time", "time"}, latitude{"latitude", "lat"}, longitude{"longitude", "lon"};
@@ -190,6 +225,10 @@ struct Names {
     std::set<std::string> orography{"z"};
 };
 
+// 作用：读取文件的经纬度轴与时间轴，并找出 wanted 中实际存在的变量。
+// 输入：文件、坐标命名规则 names、需要的变量名列表；输出：FileScan（时间为自 1970-01-01 UTC 的整小时数）。
+// 步骤 1：读经纬度轴并校验等间距；步骤 2：读时间变量（必须一维），按 units 换算为小时；
+// 步骤 3：逐个目标变量判断是否含时间维，不含者记为 invariant。
 FileScan scanFile(const NcFile& file, const Names& names, const std::vector<std::string>& wanted)
 {
     FileScan scan;
@@ -197,8 +236,11 @@ FileScan scanFile(const NcFile& file, const Names& names, const std::vector<std:
     const int latitude = file.firstVariable(names.latitude);
     const int longitude = file.firstVariable(names.longitude);
     if (latitude < 0 || longitude < 0) throw std::runtime_error("ERA5 文件缺少 latitude/longitude：" + utf8FromPath(file.path()));
+    // 步骤 1：读取并校验纬度/经度轴。
     scan.latitude = regularAxis(file.readAll(latitude), "纬度", file.path());
     scan.longitude = regularAxis(file.readAll(longitude), "经度", file.path());
+    // 步骤 2：解析时间轴。ERA5 新版文件用 valid_time，旧版用 time；单位来自 units 属性，
+    // 元数据可通过 names.timeUnits 覆盖。
     const int time = file.firstVariable(names.time);
     int timeDimension = -1;
     if (time >= 0) {
@@ -217,6 +259,8 @@ FileScan scanFile(const NcFile& file, const Names& names, const std::vector<std:
             scan.hours.push_back(static_cast<int64_t>(std::llround(hours)));
         }
     }
+    // 步骤 3：逐个目标变量判断是否随时间变化。只有 1 个时刻的地形变量（names.orography）
+    // 也按不随时间变化处理。
     for (const auto& name : wanted) {
         const int varid = file.variable(name.c_str());
         if (varid < 0) continue;
@@ -231,6 +275,8 @@ FileScan scanFile(const NcFile& file, const Names& names, const std::vector<std:
     return scan;
 }
 
+// 模块：单个变量的维度布局（各维长度、时间/纬度/经度所在轴号）与打包参数
+// （scale_factor、add_offset、_FillValue、missing_value）。
 struct Layout {
     int varid = -1;
     std::vector<size_t> lengths;
@@ -239,6 +285,8 @@ struct Layout {
     bool hasFill = false, hasMissing = false;
 };
 
+// 作用：查询变量 name 的维度顺序，按维度名识别经/纬度轴（须与别名同名），并读取打包属性。
+// 说明：维度名不在 names 别名列表中时报“缺少经纬度维”；时间维取自时间变量的维度。
 Layout layoutOf(const NcFile& file, const std::string& name, const Names& names)
 {
     Layout layout;
@@ -270,6 +318,10 @@ Layout layoutOf(const NcFile& file, const std::string& name, const Names& names)
 }
 
 // Reads one time step over the window; extra axes (expver, number) keep the first valid member.
+// 作用：读取一个时间索引在 [row0, row0+rows) × [column0, column0+columns) 窗口内的二维场。
+// 输出：out 按 [行][列] 排列的 float（NaN 表示缺测）；已应用 scale_factor/add_offset。
+// 说明：多出的维度（如 ERA5 的 expver、number）取第一个有效成员——先出现的有效值不被覆盖；
+// _FillValue、missing_value 与 |值|>1e30 均视为缺测。
 void readFrame(const NcFile& file, const Layout& layout, size_t timeIndex, int row0, int rows, int column0, int columns, float* out)
 {
     const size_t axes = layout.lengths.size();
@@ -281,6 +333,7 @@ void readFrame(const NcFile& file, const Layout& layout, size_t timeIndex, int r
     count[layout.longitudeAxis] = static_cast<size_t>(columns);
     size_t total = 1;
     for (const size_t length : count) total *= length;
+    // 步骤：一次读入窗口内所有维度（含多余维度），再按多维下标折回到 [行][列] 二维。
     std::vector<double> raw(total);
     if (nc_get_vara_double(file.id(), layout.varid, start.data(), count.data(), raw.data()) != NC_NOERR)
         throw std::runtime_error("读取 ERA5 数据失败：" + utf8FromPath(file.path()));
@@ -310,6 +363,7 @@ std::string isoNow()
 
 }  // namespace
 
+// 作用：EB 运行必需的标准量（ERA5 短名）：风分量、气温、露点、气压、向下短波与长波。
 const std::vector<std::string>& requiredVariables()
 {
     // FIX(2026-11-24): skt and stl1 are no longer required. The EB initial values come from the 2 m air temperature; skt is
@@ -318,12 +372,20 @@ const std::vector<std::string>& requiredVariables()
     return names;
 }
 
+// 作用：可选标准量：地表温度 skt（仅水体像元用）、土壤温度 stl1/stl2（模型已不再使用，仅保留兼容）、
+// 表层土壤水分 swvl1、地表位势 z（用于 DEM 高程订正）。
 const std::vector<std::string>& optionalVariables()
 {
     static const std::vector<std::string> names{"skt", "stl1", "stl2", "swvl1", "z"};
     return names;
 }
 
+// 模块：登记 ERA5 / ERA5-Land 数据包（stream era5-register）。
+// 输入：NetCDF 文件列表、索引 JSON 输出路径、产品名（空或 auto 时按网格间距判断）。
+// 输出：写出 kind=stream-era5-pack 的索引（网格、公共时段、逐变量完整性、文件清单）；
+// 返回值为“必需变量在公共时段内逐小时连续”。
+// 步骤 1：逐文件扫描，校验网格一致并统计各变量的整点集合；步骤 2：确定产品与公共时段；
+// 步骤 3：逐变量检查完整性；步骤 4：写索引并在日志里汇总。
 bool registerPack(const std::vector<std::string>& files, const fs::path& index, const std::string& requestedProduct)
 {
     if (files.empty()) throw std::runtime_error("请提供 ERA5 NetCDF 文件");
@@ -332,6 +394,8 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
     std::set<std::string> invariant;
     std::map<int, size_t> yearCounts;
     CPLJSONArray fileList;
+    // 步骤 1：扫描所有文件。各文件须共用同一经纬网；不随时间变化的变量记入 invariant，
+    // 其余变量记录每个整点；以 t2m 的时刻按年计数（用于判断数据是否含小时记录）。
     for (size_t position = 0; position < files.size(); ++position) {
         const fs::path path = pathFromUtf8(files[position]);
         if (!fs::is_regular_file(path)) throw std::runtime_error("ERA5 文件不存在：" + files[position]);
@@ -351,6 +415,8 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
                 }
             }
         }
+        // 文件清单项：索引同目录内的文件写相对路径（数据包连同工程拷贝后仍有效），否则写绝对路径；
+        // 同时记录字节数，供 Pack::open 检测登记后文件是否被改动。
         CPLJSONObject entry;
         const fs::path absolute = fs::absolute(path);
         const fs::path local = absolute.lexically_relative(fs::absolute(index).parent_path());
@@ -365,6 +431,8 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
         std::cout << "STREAM\tprogress\t" << (100.0 * (position + 1) / files.size()) << "\t扫描 ERA5 文件\n";
     }
     if (yearCounts.empty()) throw std::runtime_error("ERA5 文件中没有逐小时的 2 m 气温 t2m");
+    // 步骤 2：确定产品。auto 时按纬向步长判断：小于 0.15° 视为 ERA5-Land（0.1° 网格），
+    // 否则 ERA5（0.25° 网格）；两者的辐射累积方式不同（见 Pack::hourlyFlux）。
     const std::string product = !requestedProduct.empty() && requestedProduct != "auto" ? requestedProduct
                               : std::abs(latitude.step) < 0.15 ? "era5-land" : "era5";
     if (product != "era5" && product != "era5-land") throw std::runtime_error("ERA5 产品须为 era5 或 era5-land");
@@ -384,6 +452,8 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
     const int64_t yearFirst = daysFromCivil(year, 1, 1) * 24;
     const bool fullYear = periodFirst <= yearFirst && periodLast >= yearFirst + (isLeapYear(year) ? 366 : 365) * 24 - 1;
 
+    // 步骤 3：逐个变量统计公共时段内的小时数。不随时间变化的变量直接记完整；
+    // 必需变量缺失或小时数不等于期望值时 complete=false，并列入 missing / incomplete。
     CPLJSONObject variables;
     CPLJSONArray missing, incomplete;
     bool complete = true;
@@ -416,6 +486,8 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
     period.Add("end", formatUtc(static_cast<double>(periodLast) * 3600.0));
     period.Add("hours", static_cast<GInt64>(expected));
 
+    // 步骤 4：组装并保存索引 JSON（schemaVersion 1）。year 取公共时段起始所在年份；
+    // fullYear 表示公共时段覆盖整个日历年。
     CPLJSONObject grid, latitudeItem, longitudeItem;
     latitudeItem.Add("first", latitude.first); latitudeItem.Add("step", latitude.step); latitudeItem.Add("count", latitude.count);
     longitudeItem.Add("first", longitude.first); longitudeItem.Add("step", longitude.step); longitudeItem.Add("count", longitude.count);
@@ -446,6 +518,7 @@ bool registerPack(const std::vector<std::string>& files, const fs::path& index, 
 
 namespace {
 
+// 作用：ERA5 原路径需要扫描的变量名（必需 + 可选）。
 std::vector<std::string> legacyWanted()
 {
     std::vector<std::string> wanted = requiredVariables();
@@ -453,6 +526,8 @@ std::vector<std::string> legacyWanted()
     return wanted;
 }
 
+// 作用：把元数据里声明的时间/经纬度变量别名、时间单位覆盖和地形变量名转成扫描规则 Names。
+// 说明：元数据驱动的数据包要求记录在整点（strictHours）。
 Names namesOf(const ForcingMetadata& meta)
 {
     Names names;
@@ -466,6 +541,7 @@ Names namesOf(const ForcingMetadata& meta)
     return names;
 }
 
+// 作用：收集元数据所有已声明通道的源变量名（含别名），作为需要扫描的变量清单。
 std::vector<std::string> wantedOf(const ForcingMetadata& meta)
 {
     std::vector<std::string> wanted;
@@ -476,6 +552,8 @@ std::vector<std::string> wantedOf(const ForcingMetadata& meta)
     return wanted;
 }
 
+// 作用：由一组时刻（小时）求相邻间隔的中位数（小时）；少于 2 个时刻返回 1。
+// 说明：键为 int64 最小值的条目是“不随时间变化”的占位，不参与间隔统计。
 double medianStep(const std::map<int64_t, int>& hours)
 {
     std::vector<double> steps;
@@ -494,6 +572,12 @@ double medianStep(const std::map<int64_t, int>& hours)
 
 }  // namespace
 
+// 作用：打开数据包索引，确定元数据与读取路径，校验各文件并建立“变量 → 时刻 → 文件/时间索引”的表。
+// 输入：索引 JSON（kind 为 stream-era5-pack 或 stream-forcing-pack，schemaVersion 1）、
+// 可选元数据（缺省时依次取索引中的 metadata 键、产品对应的预设）。
+// 步骤 1：读索引并决定元数据；步骤 2：读网格并判断经度是否全球环绕/0–360；
+// 步骤 3：逐文件校验（存在、字节数未变）并扫描；
+// 步骤 4：ERA5 原路径校验必需变量并计算 fullYear_；元数据路径校验变量名、记录间隔须为整小时。
 void Pack::open(const fs::path& index, const ForcingMetadata* metadata)
 {
     CPLJSONDocument document;
@@ -502,6 +586,7 @@ void Pack::open(const fs::path& index, const ForcingMetadata* metadata)
     const std::string kind = root.GetString("kind", "");
     if ((kind != "stream-era5-pack" && kind != "stream-forcing-pack") || root.GetInteger("schemaVersion", 0) != 1)
         throw std::runtime_error("不是气象数据包索引：" + utf8FromPath(index));
+    // 步骤 1：缺省产品为 era5（兼容旧索引）。元数据优先级：调用方传入 > 索引 metadata 键 > 产品预设。
     indexProduct_ = root.GetString("product", "era5");
     year_ = root.GetInteger("year", 0);
     if (metadata) meta_ = *metadata;
@@ -510,12 +595,16 @@ void Pack::open(const fs::path& index, const ForcingMetadata* metadata)
         meta_.origin = "pack";
     } else meta_ = forcingMetadataForProduct(indexProduct_);
     if (meta_.station()) throw std::runtime_error("气象强迫元数据 \"" + meta_.name + "\" 是站点形态，不能用于网格数据包：" + utf8FromPath(index));
+    // generic_：元数据不是恒等的 ERA5 布局时走标准化路径；ERA5-Land 仅在原路径下由
+    // “短波为累计量（cumulative）”识别。
     generic_ = !meta_.era5Layout();
     land_ = !generic_ && meta_.shortwaveDown.kind == "cumulative";
     product_ = generic_ ? meta_.name : indexProduct_;
     for (const auto& text : meta_.warnings) report_.warn(text);
     for (const auto& text : meta_.notes) report_.info(text);
     for (const auto& name : meta_.ignored) report_.ignored.push_back(name);
+    // 步骤 2：读网格。globalLongitude_：经度范围覆盖约 360°，插值时允许东西向环绕；
+    // longitude360_：经度以 0–360 存储（最大值超过 180°），取值前需把查询经度折算过来。
     const auto grid = root.GetObj("grid");
     latitude0_ = grid.GetObj("latitude").GetDouble("first", 0);
     latitudeStep_ = grid.GetObj("latitude").GetDouble("step", 0);
@@ -528,6 +617,7 @@ void Pack::open(const fs::path& index, const ForcingMetadata* metadata)
     const double lastLongitude = longitude0_ + longitudeStep_ * (longitudeCount_ - 1);
     longitude360_ = std::max(longitude0_, lastLongitude) > 180.0 + 1e-6;
 
+    // 步骤 3：逐文件扫描并登记。不随时间变化的变量以 int64 最小值作时刻键，便于任意小时共用。
     const Names names = generic_ ? namesOf(meta_) : Names{};
     const std::vector<std::string> wanted = generic_ ? wantedOf(meta_) : legacyWanted();
     std::vector<std::string> dataNames;
@@ -535,6 +625,7 @@ void Pack::open(const fs::path& index, const ForcingMetadata* metadata)
     for (int position = 0; position < list.Size(); ++position) {
         const auto item = list[position];
         fs::path path = pathFromUtf8(item.GetString("path", ""));
+        // 说明：登记后文件字节数变化视为被修改，要求重新登记，避免用到与索引不符的数据。
         // Relative entries belong to the index's folder, so a pack shipped inside a project stays valid when copied.
         if (path.is_relative()) path = fs::absolute(index).parent_path() / path;
         if (!fs::is_regular_file(path)) throw std::runtime_error("气象数据包中的文件不存在：" + utf8FromPath(path));
@@ -550,6 +641,7 @@ void Pack::open(const fs::path& index, const ForcingMetadata* metadata)
             for (size_t time = 0; time < scan.hours.size(); ++time) map.emplace(scan.hours[time], Source{position, time});
         }
     }
+    // 步骤 4a：ERA5 原路径。必需变量必须全部存在；fullYear_ 由 covers() 检查全年 8760/8784 小时得到。
     if (!generic_) {
         std::string absent;
         for (const auto& name : requiredVariables()) if (!sources_.count(name)) absent += (absent.empty() ? "" : "、") + name;
@@ -559,6 +651,8 @@ void Pack::open(const fs::path& index, const ForcingMetadata* metadata)
         fullYear_ = covers(requiredVariables(), yearFirst, yearFirst + (isLeapYear(year_) ? 366 : 365) * 24 - 1, gap);
         return;
     }
+    // 步骤 4b：元数据路径。按元数据核对数据里的变量名，报错则中止，警告写入 report_；
+    // 再核对声明步长与检测到的间隔，并要求各通道间隔为整数小时（亚小时数据请先重采样）。
     ForcingIssues issues;
     checkForcingAgainstNames(meta_, dataNames, issues);
     if (!issues.ok()) throw std::runtime_error(issues.errorText() + "：" + utf8FromPath(index));
@@ -581,6 +675,8 @@ void Pack::open(const fs::path& index, const ForcingMetadata* metadata)
     fullYear_ = false;
 }
 
+// 作用：把内部通道键（ta 气温、hum 湿度、p 气压、u/v/speed/dir 风、sw/lw 短/长波、
+// skt、swvl 土壤水分、z 地形）映射到元数据中的通道声明；未知键返回 nullptr。
 const ForcingChannel* Pack::channelOf(const std::string& key) const
 {
     if (key == "ta") return &meta_.airTemperature;
@@ -598,6 +694,7 @@ const ForcingChannel* Pack::channelOf(const std::string& key) const
     return nullptr;
 }
 
+// 作用：返回该通道在数据包中实际存在的第一个源变量名（别名按声明顺序）；未声明或不存在返回空串。
 std::string Pack::rawName(const std::string& key) const
 {
     const ForcingChannel* channel = channelOf(key);
@@ -606,6 +703,7 @@ std::string Pack::rawName(const std::string& key) const
     return "";
 }
 
+// 作用：该通道的记录间隔（小时）。优先级：通道自身 stepHours > 元数据 time.stepHours > 由数据中位间隔检测。
 double Pack::stepOf(const std::string& key) const
 {
     const ForcingChannel* channel = channelOf(key);
@@ -618,6 +716,9 @@ double Pack::stepOf(const std::string& key) const
     return medianStep(hours);
 }
 
+// 作用：由需要的标准量（t2m、d2m 等）推出必须读取的通道键集合，只保留数据包里存在的通道。
+// 说明：d2m 依湿度类型可能还需要 ta 与气压；气压为海平面或无气压时需要地形 z；
+// strd 没有长波数据时退回 ta + 湿度（Brutsaert 参数化的输入）。
 std::vector<std::string> Pack::channelsFor(const std::vector<std::string>& variables) const
 {
     std::set<std::string> keys;
@@ -651,6 +752,11 @@ std::vector<std::string> Pack::channelsFor(const std::vector<std::string>& varia
     return out;
 }
 
+// 作用：检查通道 key 的原始记录能否覆盖 [firstHour, lastHour]；不能时 gap 写出第一处缺口。
+// 规则：不随时间变化的通道恒覆盖。通量类（sw/lw 且 kind 非 instant）：每个小时 [h−1, h]
+// 须落在某条记录代表的时段内（记录终点由 kind/stamp 决定：previous 或 interval_start 为 t+步长，
+// interval_mid 为 t+步长/2，其余为 t）。
+// 瞬时类：区间两端各需一条记录，且区间内相邻记录间隔不得超过允许的最大缺口 maxGap。
 bool Pack::channelCovers(const std::string& key, int64_t firstHour, int64_t lastHour, std::string& gap) const
 {
     const std::string raw = rawName(key);
@@ -687,6 +793,9 @@ bool Pack::channelCovers(const std::string& key, int64_t firstHour, int64_t last
     return true;
 }
 
+// 作用：检查 variables 中每个标准量在 [firstHour, lastHour]（自 1970-01-01 UTC 的小时数）是否都能构造。
+// 元数据路径：逐个标准量展开为所需通道，用 channelCovers 判断；ERA5 原路径：要求每个整点都有记录
+// （不随时间变化的变量除外）。不满足时 gap 给出第一个缺口的描述。
 bool Pack::covers(const std::vector<std::string>& variables, int64_t firstHour, int64_t lastHour, std::string& gap) const
 {
     if (generic_) {
@@ -707,6 +816,8 @@ bool Pack::covers(const std::vector<std::string>& variables, int64_t firstHour, 
     return true;
 }
 
+// 作用：首个所需小时之前还要多覆盖的小时数。累积通量要逐时差分，故需要前一条记录：
+// ERA5-Land（自 00 UTC 累积）为 1；元数据路径中 cumulative 通道取记录间隔向上取整；其余为 0。
 int64_t Pack::leadHours() const
 {
     if (!generic_) return land_ ? 1 : 0;
@@ -716,6 +827,8 @@ int64_t Pack::leadHours() const
     return lead;
 }
 
+// 作用：标准量 variable 在该数据包中能否得到。元数据路径下按通道声明判断：
+// 气压类型为 none 时 sp 由海拔估算，恒可得；长波缺失但声明了 brutsaert 回退时 strd 也可得。
 bool Pack::available(const std::string& variable) const
 {
     if (!generic_) return sources_.count(variable) > 0;
@@ -731,6 +844,11 @@ bool Pack::available(const std::string& variable) const
     return false;
 }
 
+// 作用：把 variables 在经纬度窗口与 [firstHour, lastHour] 内读入内存 data_（ERA5 原路径或元数据路径）。
+// 步骤 1：由窗口换算行/列范围，两侧各多取 2 格以保证双线性插值的邻点；
+// 全球经度包（globalLongitude_）窗口越界或跨度过半时取全部经度；窗口完全在数据包外则报错。
+// 步骤 2：元数据路径转 loadGeneric；ERA5 原路径逐变量读帧。
+// 输出布局：随时间变化的变量为 [小时][行][列]（float，NaN 缺测）；不随时间变化者仅一帧。
 void Pack::load(const std::vector<std::string>& variables, double latitudeMin, double latitudeMax, double longitudeMin,
                 double longitudeMax, int64_t firstHour, int64_t lastHour)
 {
@@ -756,6 +874,7 @@ void Pack::load(const std::vector<std::string>& variables, double latitudeMin, d
     if (generic_) { loadGeneric(variables, firstHour, lastHour); return; }
 
     const size_t frame = static_cast<size_t>(rows_) * columns_;
+    // 步骤 2：ERA5 原路径。逐变量：不随时间变化者读一帧；其余按小时逐帧读入。
     const Names names;
     std::map<int, std::unique_ptr<NcFile>> opened;
     const auto file = [&](int position) -> const NcFile& {
@@ -784,6 +903,8 @@ void Pack::load(const std::vector<std::string>& variables, double latitudeMin, d
             auto source = map.find(hour);
             if (source == map.end()) {
                 exact[static_cast<size_t>(hour - firstHour)] = 0;
+                // 该小时没有记录时，在 ±72 h 内取最近的记录代替（前后等距时取后者），并记入 notes_；
+                // exact_ 置 0 以标记“非原始记录”。超出 72 h 仍无数据则报错。
                 auto next = map.lower_bound(hour);
                 auto best = map.end();
                 if (next != map.end() && next->first - hour <= 72) best = next;
@@ -806,6 +927,12 @@ void Pack::load(const std::vector<std::string>& variables, double latitudeMin, d
     }
 }
 
+// 作用：元数据路径的加载：把各原始通道读入、换算、重采样到逐小时，再由 standardiseQuantities
+// 合成标准量（t2m、d2m、sp、u10、v10、ssrd、strd 等）写入 data_。
+// 步骤 1：对每个所需通道读取相关时间范围的原始帧，并做缺测标记、scale/offset、range、单位换算（convert）；
+// 步骤 2：按通道类型逐格点重采样到整点——时段通量用 distributeFlux、瞬时辐照度平移半小时后插值、
+// previous 零阶保持、其余瞬时量线性插值；步骤 3：标准化为标准量。
+// 单位：通量通道输出为该小时平均通量 W m-2，其他为 SI 单位。
 void Pack::loadGeneric(const std::vector<std::string>& variables, int64_t firstHour, int64_t lastHour)
 {
     constexpr double kNotANumber = std::numeric_limits<double>::quiet_NaN();
@@ -831,6 +958,8 @@ void Pack::loadGeneric(const std::vector<std::string>& variables, int64_t firstH
         const std::string raw = rawName(key);
         const auto& map = sources_.at(raw);
         long long removed = 0;
+        // 单点换算：缺测标记 → NaN；value = 原始值 × scale + offset；超出声明范围的值 → NaN；
+        // 最后做单位换算到 SI。被 missing / range 剔除的个数累计到 removed，写入运行报告。
         const auto convert = [&](float input) {
             if (!std::isfinite(input)) return kNotANumber;
             double value = input;
@@ -859,6 +988,7 @@ void Pack::loadGeneric(const std::vector<std::string>& variables, int64_t firstH
         }
         const double step = stepOf(key);
         const double maxGap = forcingMaxGap(meta_.maxGapHours, step);
+        // 只读取窗口前后各 pad 小时内的记录：足以覆盖允许插值的最大缺口与相邻时段，避免读整个数据包。
         const double pad = std::max(maxGap, 2.0 * step) + 1.0;
         std::vector<double> times;
         std::vector<std::vector<float>> frames;
@@ -869,6 +999,8 @@ void Pack::loadGeneric(const std::vector<std::string>& variables, int64_t firstH
             frames.emplace_back();
             read(item.second, frames.back());
         }
+        // 逐格点重采样（下面的 if 链）：时段通量（intervals）按太阳（短波）或平滑（长波）形状分配到小时；
+        // 瞬时辐照度把时刻平移 +0.5 h 使 (h−1, h] 取 h−0.5 处的值；通量结果截断为不小于 0。
         const bool fluxChannel = key == "sw" || key == "lw";
         const bool intervals = fluxChannel && channel.kind != "instant";
         auto& output = hourly[key];
@@ -901,6 +1033,7 @@ void Pack::loadGeneric(const std::vector<std::string>& variables, int64_t firstH
         }
         if (removed) report_.removed[key] += removed;
     }
+    // 步骤 3：由逐小时通道数据合成标准量。地形 z 不随时间变化，故不设逐小时的“原始记录”标记。
     std::map<std::string, std::vector<float>> standard;
     standardiseQuantities(meta_, hourly, constant, hours, frame, variables, report_, standard);
     for (auto& item : standard) {
@@ -908,6 +1041,9 @@ void Pack::loadGeneric(const std::vector<std::string>& variables, int64_t firstH
         if (item.first != "z") exact_[item.first].assign(hours, 1);
     }
 }
+// 作用：计算位置 (latitude, longitude)（度）在已加载窗口内的双线性插值权重。
+// 说明：index 为窗口内 行×列数+列 的一维偏移；纬度越界夹到窗口边缘；
+// 全球经度包且窗口含全部经度时经度环绕，否则夹到边缘；0–360 存储的数据先折算负经度。
 Weights Pack::weights(double latitude, double longitude) const
 {
     if (longitude360_ && longitude < 0) longitude += 360.0;
@@ -929,6 +1065,9 @@ Weights Pack::weights(double latitude, double longitude) const
     return w;
 }
 
+// 作用：对 values 中偏移 offset 起的一帧，按 4 个权重做 NaN 感知的加权平均。
+// 说明：缺测（非有限）格点的权重被剔除并重新归一；权重和过小（<1e-6）时退而取第一个有效格点；
+// 全部缺测返回 NaN。
 float Pack::sample(const std::vector<float>& values, size_t offset, const Weights& weights) const
 {
     double sum = 0, total = 0;
@@ -943,6 +1082,8 @@ float Pack::sample(const std::vector<float>& values, size_t offset, const Weight
     return kMissing;
 }
 
+// 作用：取标准量 variable 在整点 hour 的插值值。hour 超出已加载范围时夹到端点；
+// 不随时间变化的变量（只有一帧）忽略 hour。变量未加载返回 NaN。
 float Pack::at(const std::string& variable, int64_t hour, const Weights& weights) const
 {
     const auto found = data_.find(variable);
@@ -953,6 +1094,9 @@ float Pack::at(const std::string& variable, int64_t hour, const Weights& weights
     return sample(found->second, static_cast<size_t>(clamped - firstHour_) * frame, weights);
 }
 
+// 作用：返回截至 hour 的前一小时平均向下通量（W m-2），variable 为 ssrd 或 strd；结果不小于 0。
+// 三种情形：元数据路径已是 W m-2，仅截断；ERA5 为逐小时累积（J m-2），除以 3600；
+// ERA5-Land 为自 00 UTC 累积，需与前一小时差分（01 UTC 时的累积本身即首小时通量）。
 float Pack::hourlyFlux(const std::string& variable, int64_t hour, const Weights& weights) const
 {
     hour = std::clamp(hour, firstHour_, lastHour_);
@@ -965,6 +1109,8 @@ float Pack::hourlyFlux(const std::string& variable, int64_t hour, const Weights&
         if (!std::isfinite(current)) return kMissing;
         return std::max(0.0f, current / 3600.0f);
     }
+    // 说明：差分需要连续两个来自数据包的小时；落在补全小时（exact_=0）旁边的小时不可差分，
+    // 此时由近及远改用最近的可差分小时（先向前后向，距离相等时取前者）。
     // ERA5-Land accumulates from 00 UTC: the hour ending at 01 UTC is the accumulation itself, every other
     // hour the difference to the previous one. Differences need two hours read from the pack, so hours
     // next to filled-in ones (outside the pack's period) use the nearest hour that can be de-accumulated.
@@ -989,6 +1135,12 @@ float Pack::hourlyFlux(const std::string& variable, int64_t hour, const Weights&
     return std::max(0.0f, (current - previous) / 3600.0f);
 }
 
+// 模块：登记元数据驱动的网格数据包（stream forcing-register）。写出 kind=stream-forcing-pack 的索引，
+// 其中保存 metadataSpec（预设名或元数据 JSON），之后 Pack::open 会据此还原元数据。
+// 步骤 1：逐文件扫描，校验经纬网一致、收集文件内全部变量名与各变量时刻；
+// 步骤 2：按元数据核对变量名，错误中止，警告打印；
+// 步骤 3：以气温、湿度、短波三个必需通道的时刻交集作为公共时段；步骤 4：写索引。
+// 与 registerPack 的差别：不判断逐小时连续，因为原始记录间隔可大于 1 h，覆盖检查推迟到运行时。
 bool registerForcingPack(const std::vector<std::string>& files, const fs::path& index, const ForcingMetadata& meta, const std::string& metadataSpec)
 {
     if (files.empty()) throw std::runtime_error("请提供气象强迫 NetCDF 文件");
@@ -1026,6 +1178,8 @@ bool registerForcingPack(const std::vector<std::string>& files, const fs::path& 
     checkForcingAgainstNames(meta, dataNames, issues);
     if (!issues.ok()) throw std::runtime_error(issues.errorText());
     for (const auto& text : issues.warnings) std::cout << "[STREAM] 警告：" << text << "\n";
+    // 步骤 3：公共时段只取气温、湿度、短波三个通道（每个通道取第一个存在的源变量名）的时刻交集；
+    // 长波可有 Brutsaert 回退，其余量可选，故不参与。
     int64_t periodFirst = std::numeric_limits<int64_t>::min(), periodLast = std::numeric_limits<int64_t>::max();
     for (const ForcingChannel* c : {&meta.airTemperature, &meta.humidity, &meta.shortwaveDown}) {
         for (const auto& name : c->source) {

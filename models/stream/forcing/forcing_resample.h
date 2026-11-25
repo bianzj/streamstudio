@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：forcing_resample.h
+// 功能：气象强迫时间标准化的接口（网格读取与站点读取共用）
+// 主要模块：
+//   1. FluxRecord / FluxShape：时段平均通量记录与分配形状（Solar 短波 / Smooth 长波）
+//   2. resampleInstant、fluxRecordsFrom、distributeFlux：瞬时量插值与通量重采样
+//   3. standardiseQuantities、forcingChannelKeys：由逐小时通道合成标准量并推导所需通道
+//   4. recordsCover、forcingMaxGap：覆盖检查与最大缺口规则
+// 数据流：era5.cpp（网格）/ station_source.cpp（站点）读出原始记录 → 本模块 → 逐小时标准量
+// 约定：时间为自 1970-01-01 UTC 起的小时数；瞬时量取整点值，通量为截至该整点的前一小时平均（W m-2）；
+//   缺测为 NaN
+// 与其他文件：实现见 forcing_resample.cpp；规格见 docs/forcing-metadata.md 4.2–4.6
+// ==========================================================================
+
 #pragma once
 // Temporal standardisation shared by the gridded and the station reader (docs/forcing-metadata.md 4.5 / 4.6):
 // every source ends up on the whole-hour grid, instantaneous values at the hour and fluxes as the mean over the hour
@@ -13,6 +27,7 @@
 
 namespace stream {
 
+// 模块：通量时段记录。mean 为区间 [start, end]（小时）上的平均通量，单位 W m-2。
 struct FluxRecord {
     double start = 0, end = 0;  // interval the mean applies to (hours)
     double mean = 0;            // W m-2

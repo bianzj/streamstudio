@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：raster.cpp
+// 功能：STREAM 栅格输入输出：用 GDAL 读取与地表类型网格对齐的 GeoTIFF 波段/常数，计算像元经纬度，
+//       写出多波段 float32 GeoTIFF，并给出波段统计。
+// 主要模块：
+//   1. requireAlignedGrid：检查输入栅格与参考网格（地表类型栅格）的坐标系与地理变换一致
+//   2. UTF-8 路径转换 pathFromUtf8 / utf8FromPath
+//   3. readField / openRaster / readBand / fieldRaster：配置字段 {file, band} 或 {value} 的读取
+//   4. gridIsGeographic / geographicFromGrid：判断地理坐标系；求每个像元中心的 WGS84 纬度/经度
+//   5. writeTiff：写结果 GeoTIFF（DEFLATE 压缩，nodata = NaN，波段名写入描述）
+//   6. bandStatistics：有效像元数、最小、均值、最大（写入 scene_summary.json）
+// 数据流：run-config 中的栅格字段 → fieldRaster → std::vector<float>（行优先，nodata → NaN）；
+//       结果波段 → writeTiff。
+// 关系：声明在 raster.h；被 classes.cpp、app/image.cpp、forcing/* 使用。
+// 约定：所有输入必须与地表类型栅格同网格（同尺寸、同坐标系、同地理变换），不做重投影或重采样；
+//       数据按行优先存放，nodata 与 scale/offset 在读入时处理；经度/纬度为 WGS84，度。
+// ==========================================================================
+
 #include "raster.h"
 
 #include <ogr_spatialref.h>
@@ -9,6 +27,12 @@ namespace stream {
 
 namespace {
 
+// 作用：检查数据集与参考网格 grid 对齐，不一致则抛带 label 的中文错误（要求先对齐到同一网格）。
+// 步骤 1：两者要么都有坐标系、要么都没有；有则用 GDAL 的 IsSame 比较（传统 GIS 轴序，避免经纬度顺序影响）；
+// 步骤 2：地理变换有无须一致；都没有时直接通过（允许显式给纬度/经度的无地理参考网格）；
+// 步骤 3：参考变换须可逆；
+// 步骤 4：比较四个角点的位移，换算成参考像元数，容差 1e-6 像元：可容忍舍入误差，
+//         但拒绝平移、旋转或缩放过的网格。
 void requireAlignedGrid(GDALDataset& dataset, const Grid& grid, const std::string& label)
 {
     const auto mismatch = [&](const std::string& reason) {
@@ -53,6 +77,7 @@ void requireAlignedGrid(GDALDataset& dataset, const Grid& grid, const std::strin
 
 }  // namespace
 
+// UTF-8 字符串与 std::filesystem::path 互转（Windows 下路径含中文时保证正确）。
 std::filesystem::path pathFromUtf8(const std::string& text) { return std::filesystem::path(std::u8string(text.begin(), text.end())); }
 
 std::string utf8FromPath(const std::filesystem::path& path)
@@ -61,6 +86,8 @@ std::string utf8FromPath(const std::filesystem::path& path)
     return std::string(text.begin(), text.end());
 }
 
+// 作用：读取形如 {"file":"…","band":n} 或 {"value":x} 的栅格字段；键不存在或不是对象时返回空 Field。
+// 说明：value 必须是 JSON 数字（null 视为未给），字符串/布尔等明确报错，不再静默当作缺失（2026-11-24 C3）。
 Field readField(const CPLJSONObject& parent, const std::string& key)
 {
     Field field;
@@ -77,6 +104,7 @@ Field readField(const CPLJSONObject& parent, const std::string& key)
     return field;
 }
 
+// 作用：以只读方式打开 GDAL 栅格；文件不存在或 GDAL 无法识别时抛错。
 GDALDatasetUniquePtr openRaster(const std::string& file, const std::string& label)
 {
     if (!std::filesystem::is_regular_file(pathFromUtf8(file))) throw std::runtime_error(label + "文件不存在：" + file);
@@ -85,6 +113,9 @@ GDALDatasetUniquePtr openRaster(const std::string& file, const std::string& labe
     return dataset;
 }
 
+// 作用：读取第 band 波段（1 起）为 float 数组（行优先）。
+// 步骤 1：尺寸与对齐检查；2：波段号检查；3：读取；4：nodata → NaN；
+// 步骤 5：若声明了 scale/offset（如 MODIS LAI 以 ×10 的整型存储），在 nodata 判定之后再应用 value*scale+offset。
 std::vector<float> readBand(GDALDataset& dataset, int band, const Grid& grid, const std::string& label)
 {
     if (dataset.GetRasterXSize() != grid.width || dataset.GetRasterYSize() != grid.height)
@@ -111,6 +142,8 @@ std::vector<float> readBand(GDALDataset& dataset, int band, const Grid& grid, co
     return values;
 }
 
+// 作用：把 Field 展开成整幅栅格：来自文件则读取（波段缺省为 1）；给常数则整幅填该值；
+//       都没有时，required 为真则报错，否则整幅填 fallback。
 std::vector<float> fieldRaster(const Field& field, const Grid& grid, const std::string& label, double fallback, bool required)
 {
     if (field.fromFile()) {
@@ -122,6 +155,7 @@ std::vector<float> fieldRaster(const Field& field, const Grid& grid, const std::
     return std::vector<float>(grid.size(), static_cast<float>(fallback));
 }
 
+// 作用：判断网格坐标系是否为地理坐标（像元大小单位为度而不是米）；无坐标系或无法解析时返回 false。
 bool gridIsGeographic(const Grid& grid)
 {
     if (grid.projection.empty()) return false;
@@ -130,6 +164,9 @@ bool gridIsGeographic(const Grid& grid)
     return source.IsGeographic() != 0;
 }
 
+// 作用：由网格地理变换与坐标系计算每个像元中心的 WGS84 纬度/经度（度），失败像元为 NaN。
+// 步骤 1：检查有地理参考；2：建立到 WGS84 的坐标变换（传统 GIS 轴序，x = 经度、y = 纬度）；
+// 步骤 3：按行批量变换像元中心（列、行各加 0.5）。
 void geographicFromGrid(const Grid& grid, std::vector<float>& latitude, std::vector<float>& longitude)
 {
     if (!grid.hasTransform || grid.projection.empty()) throw std::runtime_error("地表类型文件没有地理参考，请提供纬度/经度栅格或常数");
@@ -161,6 +198,8 @@ void geographicFromGrid(const Grid& grid, std::vector<float>& latitude, std::vec
     }
 }
 
+// 作用：把若干波段写成 float32 GeoTIFF（DEFLATE 压缩）；带地理变换/坐标系；nodata 设为 NaN。
+// 说明：波段名同时写入每个波段的描述与 TIFFTAG_IMAGEDESCRIPTION（格式 band names = {a, b, …}）。
 void writeTiff(const std::filesystem::path& path, const Grid& grid, const std::vector<std::vector<float>>& bands,
                const std::vector<std::string>& names)
 {
@@ -189,6 +228,7 @@ void writeTiff(const std::filesystem::path& path, const Grid& grid, const std::v
         throw std::runtime_error("写入结果失败（刷盘或关闭文件出错，磁盘空间不足？）：" + utf8FromPath(path));
 }
 
+// 作用：统计有限值的个数、最小、均值、最大，返回 JSON 条目；没有有限值时只含 name 与 validPixels。
 CPLJSONObject bandStatistics(const std::string& name, const std::vector<float>& values)
 {
     double sum = 0, minimum = std::numeric_limits<double>::infinity(), maximum = -minimum;

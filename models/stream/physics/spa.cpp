@@ -1,7 +1,27 @@
+// ==========================================================================
+// 文件：spa.cpp
+// 功能：NREL 太阳位置算法 SPA（Reda & Andreas 2004，Solar Position Algorithm for Solar Radiation
+//       Applications）的 C++ 实现：由日期、时间、经纬度、海拔等求太阳天顶角/方位角（可选坡面入射角、
+//       日出/日中/日落与时差）。不确定度约 ±0.0003°；本文件为 NREL 公开算法的移植，不含 STREAM 自有物理。
+// 主要模块：
+//   1. 常数与周期项表：地球日心经度 L、纬度 B、向径 R 的 Heliocentric 周期项；章动 Y_TERMS / PE_TERMS
+//   2. 通用辅助：弧度/角度换算、角度归一化（0–360、±180、0–180、0–1、分钟）、三次多项式
+//   3. 输入检查 validate_inputs 与儒略日/世纪/历书日/千年计算
+//   4. 地球日心位置 → 太阳地心位置（章动、真黄赤交角、光行差、视黄经、恒星时、赤经赤纬）
+//   5. 观测者站心修正（时角、视差）、站心高度角（含大气折射）、天顶角、方位角、坡面入射角
+//   6. 时差 EOT 与日出/日中/日落（RTS）
+//   7. SPACalc::spa_calculate：总入口，按 spa->function 决定输出项
+// 数据流：调用者填充 spa_data 的输入字段 → spa_calculate → zenith / azimuth（及可选输出）。
+// 关系：接口在 spa.h；被 app/image.cpp、app/thermal_view.cpp 用于太阳天顶/方位角。
+// 约定：角度除非注明均为度；方位角 azimuth 为从北顺时针（0–360），azimuth180 为从南向西（-180..180）；
+//       经度东正；timezone 为东正小时；pressure 单位 mbar，temperature 为 °C；错误码见 spa.h。
+// ==========================================================================
+
 #include "spa.h"
 #include <math.h>
 #include <utility>
 
+// 常数：SUN_RADIUS 为太阳视半径（度），用于日出日落判定与折射阈值；*_COUNT 为各周期项表的层数与最大项数。
 #define PI         3.1415926535897932384626433832795028841971
 #define SUN_RADIUS 0.26667
 
@@ -14,6 +34,8 @@
 #define B_MAX_SUBCOUNT 5
 #define R_MAX_SUBCOUNT 40
 
+// 下标枚举：周期项的 (A,B,C) 三列；章动用的五个基本角 X0..X4；PE 表四列；
+// 三个儒略日（前一日、当日、后一日）；日中/日出/日落。
 enum {TERM_A, TERM_B, TERM_C, TERM_COUNT};
 enum {TERM_X0, TERM_X1, TERM_X2, TERM_X3, TERM_X4, TERM_X_COUNT};
 enum {TERM_PSI_A, TERM_PSI_B, TERM_EPS_C, TERM_EPS_D, TERM_PE_COUNT};
@@ -22,10 +44,13 @@ enum {SUN_TRANSIT, SUN_RISE, SUN_SET, SUN_COUNT};
 
 #define TERM_Y_COUNT TERM_X_COUNT
 
+// 表：L/B/R 各阶（L0..L5、B0..B1、R0..R4）实际使用的项数。
 const int l_subcount[L_COUNT] = {64,34,20,7,3,1};
 const int b_subcount[B_COUNT] = {5,2};
 const int r_subcount[R_COUNT] = {40,10,6,2,1};
 
+// 表：地球日心经度 L 的周期项 (A, B, C)，贡献为 A·cos(B + C·JME)；单位 1e-8 弧度。
+// B_TERMS（日心纬度）、R_TERMS（日心向径，单位 1e-8 AU）同一形式。数值取自 SPA 论文附表，不要改动。
 const double L_TERMS[L_COUNT][L_MAX_SUBCOUNT][TERM_COUNT]=
 {
     {
@@ -263,6 +288,8 @@ const double R_TERMS[R_COUNT][R_MAX_SUBCOUNT][TERM_COUNT]=
 ///  Periodic Terms for the nutation in longitude and obliquity
 ////////////////////////////////////////////////////////////////
 
+// 表：章动的 63 项参数组合（X0..X4 的整数系数，SPA 论文表 A4.3）；PE_TERMS 为对应的黄经/交角振幅
+// (psi 的 a、b，epsilon 的 c、d)，单位 0.0001 角秒，使用时除以 36000000 得度。
 const int Y_TERMS[Y_COUNT][TERM_Y_COUNT]=
 {
     {0,0,0,0,1},
@@ -396,6 +423,9 @@ const double PE_TERMS[Y_COUNT][TERM_PE_COUNT]={
     {-3,0,0,0},
 };
 
+// 通用辅助：rad2deg / deg2rad 角度换算；limit_degrees 归一到 [0,360)；limit_degrees180pm 归一到 [-180,180]；
+// limit_degrees180 归一到 [0,180)；limit_zero2one 归一到 [0,1)；limit_minutes 把时差折到 ±20 分钟内；
+// dayfrac_to_local_hr 把世界时日分数转为地方时小时；third_order_polynomial 为三次多项式（秦九韶法）。
 double rad2deg(double radians)
 {
     return (180.0/PI)*radians;
@@ -471,6 +501,8 @@ double third_order_polynomial(double a, double b, double c, double d, double x)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////
+// 作用：检查输入范围，返回 0 表示合法，否则返回 spa.h 中约定的错误码 1–16。
+// 说明：24 点只允许 24:00:00；坡面参数 slope、azm_rotation 仅在需要入射角（SPA_ZA_INC / SPA_ALL）时检查。
 int validate_inputs(spa_data *spa)
 {
     if ((spa->year        < -2000) || (spa->year        > 6000)) return 1;
@@ -501,6 +533,8 @@ int validate_inputs(spa_data *spa)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////
+// 作用：儒略日 JD（世界时）。tz 为地方时相对 UTC 的小时数，输入地方时先减 tz 换成 UTC。
+// 说明：1、2 月按上一年的 13、14 月计；JD > 2299160 时加格里高利历修正。
 double julian_day (int year, int month, int day, int hour, int minute, int second, double tz)
 {
     double day_decimal, julian_day, a;
@@ -522,6 +556,8 @@ double julian_day (int year, int month, int day, int hour, int minute, int secon
     return julian_day;
 }
 
+// 时间尺度：儒略世纪 JC（自 J2000.0），儒略历书日 JDE = JD + delta_t/86400，
+// 历书世纪 JCE 与千年 JME（= JCE/10）。delta_t 为地球自转时与地球时之差（秒）。
 double julian_century(double jd)
 {
     return (jd-2451545.0)/36525.0;
@@ -542,6 +578,8 @@ double julian_ephemeris_millennium(double jce)
     return (jce/10.0);
 }
 
+// 作用：对一阶周期项求和 Σ A·cos(B + C·JME)。earth_values 再按 JME 的幂次把各阶合成（Σ term_i·JME^i）
+// 并除以 1e8，得到弧度（L、B）或 AU（R）。
 double earth_periodic_term_summation(const double terms[][TERM_COUNT], int count, double jme)
 {
     int i;
@@ -566,6 +604,7 @@ double earth_values(double term_sum[], int count, double jme)
     return sum;
 }
 
+// 地球日心经度 L（度，归一到 [0,360)）、日心纬度 B（度）、向径 R（AU）。
 double earth_heliocentric_longitude(double jme)
 {
     double sum[L_COUNT];
@@ -602,6 +641,7 @@ double earth_radius_vector(double jme)
 
 }
 
+// 地心黄经 theta = L + 180°、地心黄纬 beta = -B（太阳相对地球的方向与地球相对太阳相反）。
 double geocentric_longitude(double l)
 {
     double theta = l + 180.0;
@@ -616,6 +656,8 @@ double geocentric_latitude(double b)
     return -b;
 }
 
+// 章动用的五个基本角（度，JCE 的三次多项式）：月日平均距角 X0、日平近点角 X1、月平近点角 X2、
+// 月球纬度参数 X3、月球升交点黄经 X4。
 double mean_elongation_moon_sun(double jce)
 {
     return third_order_polynomial(1.0/189474.0, -0.0019142, 445267.11148, 297.85036, jce);
@@ -641,6 +683,7 @@ double ascending_longitude_moon(double jce)
     return third_order_polynomial(1.0/450000.0, 0.0020708, -1934.136261, 125.04452, jce);
 }
 
+// 作用：第 i 个章动项的辐角 Σ X_j·Y_TERMS[i][j]（度）。
 double xy_term_summation(int i, double x[TERM_X_COUNT])
 {
     int j;
@@ -652,6 +695,8 @@ double xy_term_summation(int i, double x[TERM_X_COUNT])
     return sum;
 }
 
+// 作用：章动黄经 del_psi 与交角章动 del_epsilon（度）：逐项累加 (a + b·JCE)·sin(辐角)、(c + d·JCE)·cos(辐角)，
+//       再除以 36000000（把 0.0001 角秒换成度）。
 void nutation_longitude_and_obliquity(double jce, double x[TERM_X_COUNT], double *del_psi,
                                                                           double *del_epsilon)
 {
@@ -668,6 +713,7 @@ void nutation_longitude_and_obliquity(double jce, double x[TERM_X_COUNT], double
     *del_epsilon = sum_epsilon / 36000000.0;
 }
 
+// 黄赤交角：平交角 epsilon0（角秒，用 u = JME/10 的 10 次多项式）、真交角 epsilon = epsilon0/3600 + del_epsilon（度）。
 double ecliptic_mean_obliquity(double jme)
 {
     double u = jme/10.0;
@@ -681,6 +727,7 @@ double ecliptic_true_obliquity(double delta_epsilon, double epsilon0)
     return delta_epsilon + epsilon0/3600.0;
 }
 
+// 光行差修正 del_tau = -20.4898″/(3600·R)（度）；视太阳黄经 lamda = theta + del_psi + del_tau。
 double aberration_correction(double r)
 {
     return -20.4898 / (3600.0*r);
@@ -691,6 +738,7 @@ double apparent_sun_longitude(double theta, double delta_psi, double delta_tau)
     return theta + delta_psi + delta_tau;
 }
 
+// 格林尼治平恒星时 nu0（度）与真恒星时 nu = nu0 + del_psi·cos(epsilon)。
 double greenwich_mean_sidereal_time (double jd, double jc)
 {
     return limit_degrees(280.46061837 + 360.98564736629 * (jd - 2451545.0) +
@@ -702,6 +750,7 @@ double greenwich_sidereal_time (double nu0, double delta_psi, double epsilon)
     return nu0 + delta_psi*cos(deg2rad(epsilon));
 }
 
+// 太阳地心赤经 alpha（度，归一到 [0,360)）与赤纬 delta（度），由视黄经 lamda、黄纬 beta、真交角求得。
 double geocentric_sun_right_ascension(double lamda, double epsilon, double beta)
 {
     double lamda_rad   = deg2rad(lamda);
@@ -720,6 +769,7 @@ double geocentric_sun_declination(double beta, double epsilon, double lamda)
                         cos(beta_rad)*sin(epsilon_rad)*sin(deg2rad(lamda))));
 }
 
+// 观测者时角 H = nu + 经度 - alpha（度，归一到 [0,360)）；太阳赤道地平视差 xi = 8.794″/(3600·R)。
 double observer_hour_angle(double nu, double longitude, double alpha_deg)
 {
     return limit_degrees(nu + longitude - alpha_deg);
@@ -730,6 +780,8 @@ double sun_equatorial_horizontal_parallax(double r)
     return 8.794 / (3600.0 * r);
 }
 
+// 作用：站心修正：计算视差引起的赤经改正 delta_alpha 与站心赤纬 delta_prime（度）。
+// 说明：0.99664719 为地球极扁率因子 (1-f)；6378140 m 为地球赤道半径；elevation 为海拔（m）。
 void sun_right_ascension_parallax_and_topocentric_dec(double latitude, double elevation,
              double xi, double h, double delta, double *delta_alpha, double *delta_prime)
 {
@@ -761,6 +813,7 @@ double topocentric_local_hour_angle(double h, double delta_alpha)
     return h - delta_alpha;
 }
 
+// 站心高度角（未修正折射）e0：sin e0 = sinφ·sinδ' + cosφ·cosδ'·cos H'（H' 为站心时角）。
 double topocentric_elevation_angle(double latitude, double delta_prime, double h_prime)
 {
     double lat_rad         = deg2rad(latitude);
@@ -770,6 +823,8 @@ double topocentric_elevation_angle(double latitude, double delta_prime, double h
                         cos(lat_rad)*cos(delta_prime_rad) * cos(deg2rad(h_prime))));
 }
 
+// 作用：大气折射修正 del_e（度），随气压/气温缩放（以 1010 mbar、10 °C 为基准）；
+//       太阳低于地平线约 (SUN_RADIUS + atmos_refract) 时不修正（del_e = 0）。
 double atmospheric_refraction_correction(double pressure, double temperature, double atmos_refract, double e0)
 {
     double del_e = 0;
@@ -786,11 +841,13 @@ double topocentric_elevation_angle_corrected(double e0, double delta_e)
     return e0 + delta_e;
 }
 
+// 天顶角 = 90° - 修正后高度角。
 double topocentric_zenith_angle(double e)
 {
     return 90.0 - e;
 }
 
+// 方位角：先求从南向西为正的 azimuth180（-180..180），再 +180° 得从北顺时针的 azimuth（0..360）。
 double topocentric_azimuth_angle_neg180_180(double h_prime, double latitude, double delta_prime)
 {
     double h_prime_rad = deg2rad(h_prime);
@@ -805,6 +862,8 @@ double topocentric_azimuth_angle_zero_360(double azimuth180)
     return azimuth180 + 180.0;
 }
 
+// 作用：太阳光线对倾斜面（坡度 slope、法线方位 azm_rotation，从南向西为正）的入射角（度）：
+//       cos I = cosθz·cosS + sinS·sinθz·cos(A - A_rot)。
 double surface_incidence_angle(double zenith, double azimuth180, double azm_rotation,
                                                                double slope)
 {
@@ -815,6 +874,7 @@ double surface_incidence_angle(double zenith, double azimuth180, double azm_rota
                         sin(slope_rad )*sin(zenith_rad) * cos(deg2rad(azimuth180 - azm_rotation))));
 }
 
+// 太阳平黄经 M（度），用于时差 EOT = 4·(M - 0.0057183 - alpha + del_psi·cos eps)（分钟，折到 ±20 分钟）。
 double sun_mean_longitude(double jme)
 {
     return limit_degrees(280.4664567 + jme*(360007.6982779 + jme*(0.03032028 +
@@ -826,6 +886,8 @@ double eot(double m, double alpha, double del_psi, double epsilon)
     return limit_minutes(4.0*(m - 0.0057183 - alpha + del_psi*cos(deg2rad(epsilon))));
 }
 
+// 日中/日出/日落的辅助：近似日中时刻（日分数）、日出日落时角 h0（太阳中心到达 h0_prime 的时角，
+// 极昼极夜无解时返回 -99999）、由近似值得到日出日落近似时刻。
 double approx_sun_transit_time(double alpha_zero, double longitude, double nu)
 {
     return (alpha_zero - longitude - nu) / 360.0;
@@ -853,6 +915,7 @@ void approx_sun_rise_and_set(double *m_rts, double h0)
     m_rts[SUN_TRANSIT] = limit_zero2one(m_rts[SUN_TRANSIT]);
 }
 
+// 作用：在前一日、当日、后一日的赤经/赤纬之间做二阶内插，n 为日分数。
 double rts_alpha_delta_prime(double *ad, double n)
 {
     double a = ad[JD_ZERO] - ad[JD_MINUS];
@@ -864,6 +927,7 @@ double rts_alpha_delta_prime(double *ad, double n)
     return ad[JD_ZERO] + n * (a + b + (b-a)*n)/2.0;
 }
 
+// 日出日落迭代用的高度角、以及由近似时刻修正得到精确日出/日落时刻（日分数）。
 double rts_sun_altitude(double latitude, double delta_prime, double h_prime)
 {
     double latitude_rad    = deg2rad(latitude);
@@ -882,6 +946,9 @@ double sun_rise_and_set(double *m_rts,   double *h_rts,   double *delta_prime, d
 // Calculate required SPA parameters to get the right ascension (alpha) and declination (delta)
 // Note: JD must be already calculated and in structure
 ////////////////////////////////////////////////////////////////////////////////////////////////
+// 作用：由 JD 算太阳地心赤经 alpha 与赤纬 delta（并保留中间量写入 spa 结构）。
+// 步骤 1：时间尺度（JC、JDE、JCE、JME）；2：地球日心 L、B、R；3：转地心黄经黄纬；
+// 步骤 4：章动与黄赤交角；5：光行差、视黄经、恒星时；6：赤经赤纬。
 void calculate_geocentric_sun_right_ascension_and_declination(spa_data *spa)
 {
     double x[TERM_X_COUNT];
@@ -923,6 +990,9 @@ void calculate_geocentric_sun_right_ascension_and_declination(spa_data *spa)
 // Calculate Equation of Time (EOT) and Sun Rise, Transit, & Set (RTS)
 ////////////////////////////////////////////////////////////////////////
 
+// 作用：计算时差 EOT 与日出/日中/日落（RTS，地方时小数小时，约 ±30 秒）。
+// 步骤 1：EOT；2：取当日 0 时 UT，在前一日/当日/后一日各算 alpha、delta（delta_t 置 0）；
+// 步骤 3：近似日中与日出日落，再用内插的赤经赤纬、恒星时修正；4：全天无日出（极昼/极夜）时输出置 -99999。
 void calculate_eot_and_sun_rise_transit_set(spa_data *spa)
 {
     spa_data sun_rts;
@@ -937,6 +1007,7 @@ void calculate_eot_and_sun_rise_transit_set(spa_data *spa)
     m        = sun_mean_longitude(spa->jme);
     spa->eot = eot(m, spa->alpha, spa->del_psi, spa->epsilon);
 
+    // RTS 以当日 0 时 UT（timezone = 0）为基准计算，不受调用者输入时刻影响。
     sun_rts.hour = sun_rts.minute = sun_rts.second = 0;
     sun_rts.timezone = 0.0;
 
@@ -957,6 +1028,7 @@ void calculate_eot_and_sun_rise_transit_set(spa_data *spa)
     m_rts[SUN_TRANSIT] = approx_sun_transit_time(alpha[JD_ZERO], spa->longitude, nu);
     h0 = sun_hour_angle_at_rise_set(spa->latitude, delta[JD_ZERO], h0_prime);
 
+    // h0 < 0（代码用 -99999 表示 acos 参数超出 [-1,1]）即该日无日出日落，else 分支输出 -99999。
     if (h0 >= 0) {
 
         approx_sun_rise_and_set(m_rts, h0);
@@ -985,6 +1057,9 @@ void calculate_eot_and_sun_rise_transit_set(spa_data *spa)
 
 }
 
+// 作用：SPA 总入口。返回 spa->error（0 为成功）；成功时 zenith、azimuth、azimuth180 等已写入 spa。
+// 步骤 1：检查输入；2：JD 与太阳地心赤经赤纬；3：时角与视差 → 站心赤纬赤经、站心时角；
+// 步骤 4：站心高度角 + 折射修正 → 天顶角、方位角；5：按 function 可选输出入射角与 RTS/时差。
 int SPACalc::spa_calculate(spa_data *spa)
 {
     spa->error = validate_inputs(spa);

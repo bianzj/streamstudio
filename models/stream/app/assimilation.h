@@ -1,3 +1,19 @@
+// ==========================================================================
+// 文件：assimilation.h
+// 功能：STREAM“同化”模式的接口声明：EB 求解回调、输入/结果结构体与 runAssimilation。
+// 主要模块：
+//   1. EbControls / EbOutcome / EbSolver：EB 背景下，给定控制量（土壤湿度、Vcmax、LAI）
+//      重解单像元能量平衡并返回温度、通量及温度对控制量的梯度
+//   2. AssimilationInputs：同化所需的全部只读输入（配置、类表、栅格、地形、光谱表、
+//      行列范围、进度区间、可选的反射天空长波）
+//   3. AssimilationResult：分析组分温度与控制量、分析标记、产品列表、统计摘要
+//   4. runAssimilation：入口函数
+// 数据流：主流程组装 AssimilationInputs（及背景组分温度）→ runAssimilation（assimilation.cpp）
+//   → AssimilationResult，产品写入 config.outputDir 的 analysis_* / background_* 文件。
+// 约定：温度 K，通量 W m-2，土壤湿度 m3 m-3；组分顺序 Tss/Tsh/Tcs/Tch；
+//   AssimilationInputs 的各栅格向量与 grid 同大小、行优先；指针成员为空表示该输入缺失。
+// ==========================================================================
+
 #pragma once
 // Run mode "同化": MAP Gauss-Newton analysis of one pixel at a time with the built-in differentiable operator.
 //
@@ -24,6 +40,8 @@
 
 namespace stream {
 
+// 模块：EB 背景下的控制量与求解结果。EbOutcome::gradient[k][c] = dT_k / d(控制量 c)，
+// c 依次为 土壤湿度、Vcmax、LAI；gradientValid 为 false 表示线性化不可用，分析应拒绝。
 struct EbControls { double moisture = 0, vcmax = 0, lai = 0; };
 struct EbOutcome {
     bool gradientValid = false;  // false means the analysis must reject the linearization
@@ -34,6 +52,11 @@ struct EbOutcome {
 // Re-solves the energy balance of one pixel at the given controls and linearises it; false if it fails.
 using EbSolver = std::function<bool(size_t pixel, const EbControls& controls, EbOutcome& outcome)>;
 
+// 模块：同化输入（全部为引用/指针，调用期间须保持有效）。
+// 说明：行列范围 [startRow,endRow) × [startColumn,endColumn)（半开区间）；
+// progressStart/progressSpan 为本阶段在总进度条中的起点与跨度；
+// diffuse/shortwave 仅 EB 提供，用于光学观测算子的漫射比例；
+// soilBandReflectance 按土壤湿度步（见 assimilation.cpp 的 kMoistureSteps）和光学波段索引。
 struct AssimilationInputs {
     const ImageConfig& config;
     const ClassTable& classes;
@@ -63,6 +86,7 @@ struct AssimilationInputs {
     const std::vector<float>* skyLongwave = nullptr;
 };
 
+// 模块：同化输出。未被分析的像元：components 保持背景值，其余分析量为 NaN。
 struct AssimilationResult {
     std::array<std::vector<float>, 4> components;  // analysis (background where not analysed)
     std::vector<float> lai, soilMoisture, vcmax;   // analysis controls (vcmax: EB only, NaN elsewhere)

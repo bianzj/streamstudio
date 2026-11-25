@@ -1,3 +1,32 @@
+// ==========================================================================
+// 文件：image.cpp
+// 功能：STREAM 影像引擎的计算主链路 runImage：一次过境时刻的整景模拟，输出光学方向反射率、
+//       热红外亮温与发射率归一化表面温度；组分温度来自 RT（给定）或 EB（气象强迫驱动的能量平衡），
+//       可选 LST/LSCT 反演或同化，并写出 GeoTIFF 与 scene_summary.json
+// 主要模块/步骤（runImage 内按“步骤 n”标注）：
+//   1. 读取配置、地类表，应用 BSM 土壤亮度与土壤发射率覆盖
+//   2. 读取地表输入栅格（地类、LAI、观测几何、DEM、经纬度），确定处理区域
+//   3. 气象强迫数据源：确定起转起点与节点序列，载入强迫（EB）
+//   4. 土壤水分栅格（强迫的 swvl1 或用户输入）
+//   5. 光谱准备：PROSPECT 叶片光谱、BSM 土壤光谱（按含水量分档）、光学波段权重
+//   6. 组分温度：RT 读入；EB 逐像元起转推进到过境时刻（含同化用的隐式导数求解器 EbSolver）
+//   7. 热红外反射天空项的下行长波 L↓
+//   8. 成像准备：输出缓冲、土壤 Hapke 方向发射率表
+//   9. LST/LSCT 反演（可选，inversion.cpp）
+//  10. 同化（可选，assimilation.cpp）
+//  11. 逐像元成像：光学 canopyReflectance、热红外 thermalPixel（thermal_view.cpp）
+//  12. 写出结果影像与 scene_summary.json
+// 数据流：config.json → readImageConfig → 栅格/强迫 → 组分温度 → 成像 → 输出目录下的 GeoTIFF
+// 输出：optical_reflectance.tif、tir_brightness_temperature.tif、tir_surface_temperature.tif、
+//       solar_geometry.tif；EB 另有 components.tif/.json、eb_forcing.tif、eb_fluxes.tif；
+//       反演/同化产品由各自模块写出，在此登记到 summary
+// 与其他文件的关系：main.cpp 调用 runImage；config.cpp 解析配置；thermal_view.cpp 为成像、反演、
+//       同化共用的热红外观测算子；forcing/、physics/、scene/ 提供强迫、物理核与栅格读写
+// 约定：温度 K；栅格行优先（像元序号 = row × width + column）；region 行列从 0 起、终点不包含；
+//       角度为度，方位角自北起顺时针；进度行 `STREAM\tprogress\t百分比\t阶段`，日志行以 [STREAM] 开头；
+//       并行：OpenMP 按行并行，异常经 ParallelError 汇总后重抛
+// ==========================================================================
+
 #include "image.h"
 #include "parallel_error.h"
 #include "assimilation.h"
@@ -44,11 +73,14 @@
 #endif
 
 namespace stream {
+// 匿名命名空间：本文件内部使用的小工具（进度/日志输出、光谱权重、土壤含水量分档、组分温度栅格读取）。
 namespace {
 
 namespace fs = std::filesystem;
+// 土壤含水量（0–1）量化为 1000 档（步长 0.001）：每档只计算一次 BSM 土壤光谱/热红外分档并缓存。
 constexpr int kMoistureSteps = 1000;
 
+// 输出约定：进度行 `STREAM\tprogress\t<百分比>\t<阶段>`（服务端解析）；日志行以 [STREAM] 开头。
 void progress(double percent, const std::string& stage)
 {
     std::cout << "STREAM\tprogress\t" << std::fixed << std::setprecision(1) << percent << '\t' << stage << '\n';
@@ -72,6 +104,8 @@ bool isMainThread()
 #endif
 }
 
+// 作用：读取单列数值文本（参考太阳光谱 Esun_.dat / Esky_.dat，每行一个值），至少 minimumCount 个，
+// 多余的截断；文件缺失或行数不足时抛出错误。
 std::vector<float> readColumn(const fs::path& file, size_t minimumCount)
 {
     std::ifstream input(file);
@@ -84,6 +118,9 @@ std::vector<float> readColumn(const fs::path& file, size_t minimumCount)
     return values;
 }
 
+// 作用：光学波段 → 光谱采样点权重。输入波段（中心波长 nm、半高宽 FWHM）与参考辐照度；
+// 输出每个波段一组（光谱索引, 归一化权重）：FWHM < 1 nm 视为单波长；否则取高斯响应
+// σ = FWHM / (2√(2 ln 2))，只取 ±3.5σ 内、再乘参考太阳辐照度并归一化。
 // Gaussian spectral response weighted by the reference solar irradiance (direct + diffuse).
 std::vector<std::vector<std::pair<int, double>>> opticalWeights(const std::vector<SpectralBand>& bands, const std::vector<float>& irradiance)
 {
@@ -117,8 +154,12 @@ double bandAverage(const std::vector<float>& spectrum, const std::vector<std::pa
     return sum;
 }
 
+// 作用：土壤含水量（限幅到 0–1）→ 分档序号 0–kMoistureSteps。
 int moistureStep(float moisture) { return static_cast<int>(std::lround(std::clamp(moisture, 0.0f, 1.0f) * kMoistureSteps)); }
 
+// 作用：读取 RT 模式的某个组分温度栅格（K）。文件来源：单波段文件直接用；24 波段文件按过境时刻
+// UTC 小时（四舍五入，上限 23）取第 hour+1 波段，并通过 automaticBand 回传；其他多波段文件必须
+// 在配置里指定波段。常数来源铺满全网格；两者都没有时报缺少输入。
 std::vector<float> componentRaster(const Field& field, const Grid& grid, const std::string& label, double overpass, int& automaticBand)
 {
     if (field.fromFile()) {
@@ -141,8 +182,13 @@ std::vector<float> componentRaster(const Field& field, const Grid& grid, const s
 
 }  // namespace
 
+// 模块：runImage——一次影像运行的总流程（见文件头的步骤 1–12）。
+// 输入：stream-image-config v2 配置文件路径；输出：写出 outputDir 下的各产品，返回 0。
+// 异常：配置或输入错误抛 std::runtime_error，由 main() 捕获并以非零退出码结束。
+// 副作用：向 stdout 写进度行与 [STREAM] 日志。
 int runImage(const std::string& configPath)
 {
+    // 步骤 1：读取配置与地类参数表，设置线程数，并按配置覆盖 BSM 土壤亮度与土壤干端发射率。
     const auto started = std::chrono::steady_clock::now();
     const ImageConfig config = readImageConfig(configPath);
 #ifdef _OPENMP
@@ -175,6 +221,10 @@ int runImage(const std::string& configPath)
     std::vector<std::string> spinupNotes; // shortfall notice for scene_summary.json temperature.notes
     log("过境时刻 " + formatUtc(overpass) + "，温度来源：" + (eb ? "EB（气象强迫驱动能量平衡）" : "RT（给定组分温度）"));
 
+    // 步骤 2：读取地表输入栅格（地类、LAI、观测天顶角/方位角、DEM、经纬度），以地类栅格定义网格；
+    //         经度统一到 [-180, 180)；确定处理区域并统计 LAI 无效的植被像元。
+    //         后续步骤：3 气象强迫、4 土壤水分、5 光谱、6 组分温度、7 反射天空、8 成像准备、
+    //         9 反演、10 同化、11 逐像元成像、12 写出结果。
     progress(1, "读取地表输入");
     Grid grid;
     auto typeDataset = openRaster(config.type.file, "地表类型");
@@ -210,6 +260,7 @@ int runImage(const std::string& configPath)
         }
     if (longitudeWrapped) log("经度已从 0–360 制换算到 ±180，共 " + std::to_string(longitudeWrapped) + " 个像元");
 
+    // 处理区域：行列从 0 起、终点不包含；未配置 region 时为整景。区域外的像元保持空值。
     int startRow = 0, endRow = grid.height, startColumn = 0, endColumn = grid.width;
     if (config.region) {
         startRow = config.startRow; endRow = config.endRow; startColumn = config.startColumn; endColumn = config.endColumn;
@@ -235,12 +286,16 @@ int runImage(const std::string& configPath)
     if (laiOutOfRange) log("警告：" + std::to_string(laiOutOfRange) + " 个植被像元的 LAI 超出有效范围 [0, 20]（常见于未声明 nodata 的整型填充码经 scale 后变成 24.9–25.4），按无效输入处理");
     if (laiNoData) log("提示：" + std::to_string(laiNoData) + " 个植被像元的 LAI 为 nodata，按无效输入处理");
 
+    // 步骤 3：气象强迫数据源（仅 EB 使用；RT 时用一个空的占位数据包）。
     // ---------------- ERA5 pack (EB) ----------------
     era5::Pack idlePack;                         // stands in for the source when the run is not an energy balance
     std::unique_ptr<ForcingSource> forcingHolder;
     std::vector<double> nodes;
     bool elevationCorrection = false;
     bool waterSkinMissing = false;  // water pixels present but the pack has no skt: they take the 2 m air temperature
+    // 作用：按强迫元数据创建数据源：站点型元数据 → StationSource（CSV 文件取自配置 forcing.files，
+    // 缺省则用元数据里各站登记的文件，相对路径按 forcingBaseDir 或元数据所在目录解析）；
+    // 否则打开网格数据包 era5::Pack（ERA5 / ERA5-Land / 其他网格来源）。
     const auto makeSource = [&]() -> std::unique_ptr<ForcingSource> {
     std::unique_ptr<ForcingSource> result;
     ForcingMetadata forcingMetadata;
@@ -270,6 +325,8 @@ int runImage(const std::string& configPath)
             for (const auto& text : pack.report().infos) log("气象强迫：" + text);
             for (const auto& text : pack.report().warnings) log("警告：" + text);
         }        const UtcTime when = utcFromSeconds(overpass);
+        // 步骤 3a：统计处理区域内有效像元的经纬度范围，并检查是否含水体（水体取 skt），
+        //          用于只向数据包载入覆盖该范围的强迫数据。
         double latMin = 90, latMax = -90, lonMin = 180, lonMax = -180;
         bool waterPresent = false;
         for (int row = startRow; row < endRow; ++row)
@@ -283,6 +340,8 @@ int runImage(const std::string& configPath)
                 lonMin = std::min<double>(lonMin, longitude[pixel]); lonMax = std::max<double>(lonMax, longitude[pixel]);
             }
         if (latMin > latMax) throw std::runtime_error("计算范围内没有可用的像元（地类或经纬度无效）");
+        // 步骤 3b：确定要读取的强迫变量：必需量，加可选的 swvl1（土壤水分来源为强迫）、
+        //          skt（有水体像元）、z（按 DEM 做高程订正）；缺少可选量时降级并警告。
         std::vector<std::string> variables = era5::requiredVariables();
         if (config.soilMoistureFromEra5) {
             if (!pack.available("swvl1")) throw std::runtime_error("土壤水分来源为气象强迫，但气象强迫数据里没有土壤水分（variables.soilMoisture）；请把 temperature.soilMoisture.source 设为 user 并提供土壤水分栅格");
@@ -303,6 +362,9 @@ int runImage(const std::string& configPath)
         if (elevationCorrection) variables.push_back("z");
         else if (config.elevationCorrection && config.dem.present())
             log("警告：已要求按 DEM 订正气温与气压，但气象强迫数据没有地表位势/海拔（variables.orography 或站点海拔），本次不做高程订正");
+        // 步骤 3c：确定能量平衡的时间栅格。起转节点数 N = temperature.spinupHours（整点时次个数），
+        //          起点相对过境往前数（不是固定 00 UTC）；过境前 5 min 内的整点由过境节点代替；
+        //          数据包不覆盖起点时退到连续覆盖的最早时次并警告（见 README“起转节点数”）。
         // Hours the solver reads: the march start through the hour after the overpass (flux interpolation);
         // ERA5-Land de-accumulation also needs the hour before the start.
         int64_t lastHour = static_cast<int64_t>(std::ceil(overpass / 3600.0)) + 1;
@@ -339,6 +401,9 @@ int runImage(const std::string& configPath)
         marchStartHour = startHour;
         marchStart = requestedNodes > 0 ? static_cast<double>(startHour) * 3600.0 : overpass;
         spinupUsedHours = (overpass - marchStart) / 3600.0;
+        // 步骤 3d：检查数据包对 [firstHour, lastHour] 的覆盖（整年数据包允许年边界外沿用最近一小时），
+        //          然后只载入所需范围与变量，并生成节点序列 nodes = 整点起转节点 + 过境节点。
+        //          leadHours 为 ERA5-Land 累积辐射差分需要的起点之前的小时数。
         const int64_t firstHour = startHour - pack.leadHours();
         std::string gap;
         // A whole-year pack keeps the year-edge rule: hours just outside the year reuse the nearest one.
@@ -357,6 +422,8 @@ int runImage(const std::string& configPath)
             std::to_string(nodes.size()) + " 个时次" + (elevationCorrection ? "，按 DEM 与气象强迫网格的地形高度差订正气温与气压" : ""));
     }
 
+    // 步骤 4：土壤水分栅格。EB 且来源为强迫时取过境时刻 swvl1（限幅 0–1，无值像元用地类缺省值）；
+    //         否则读用户栅格/常数（> 1 视为百分数，限幅 0.05–0.55，对应 BSM 的有效范围）。
     // ---------------- soil moisture ----------------
     std::vector<float> soilMoisture;
     long long moistureFallback = 0;
@@ -390,6 +457,9 @@ int runImage(const std::string& configPath)
         }
     }
 
+    // 步骤 5：光谱准备。统计用到的地类 → 参考太阳光谱与光学波段权重 → PROSPECT 叶片光谱（按地类并行）
+    //         → BSM 土壤光谱（按含水量分档并行，只算用到的档；同化时全部分档，因需相邻档求导）。
+    //         光学成像用波段平均的反射率；EB 用按太阳光谱分组（solarBins）的光谱。
     // ---------------- spectra ----------------
     std::vector<char> typeUsed(256, 0);
     for (int row = startRow; row < endRow; ++row)
@@ -486,12 +556,17 @@ int runImage(const std::string& configPath)
             } catch (...) { errorsBsm.capture(); }
         }
         errorsBsm.rethrow("BSM 土壤光谱");
+        // 平地面地类：把常数地面反射率铺成分档光谱（EB 短波用）。注意：此循环遍历的是植被地类 leafTypes，
+        // 非植被的 Flat 地类是否也会进入 flatGroundBins 待核对（后面用 flatGroundBins.at(code) 读取）。
         for (const int code : leafTypes)
             if (classes.classes[code].groundKind == GroundKind::Flat)
                 flatGroundBins[code] = std::vector<float>(solarBins.size(), classes.classes[code].groundReflectance);
     }
 
     const size_t pixels = grid.size();
+    // 步骤 6：组分温度 [Tss, Tsh, Tcs, Tch]（土壤光照/阴影、叶片光照/阴影，K）。
+    //         RT：读用户给定的栅格/常数；EB：逐像元求解四组分能量平衡并从起转起点推进到过境时刻。
+    //         LSCT 反演与同化把这里得到的组分温度作为背景场。
     // ---------------- component temperatures ----------------
     std::array<std::vector<float>, 4> components;
     std::vector<std::vector<float>> forcingOut, fluxOut;
@@ -507,8 +582,13 @@ int runImage(const std::string& configPath)
     const bool assimilate = config.assimilation.enabled();
     const bool needComponents = config.thermalEnabled || eb || lsctInversion || assimilate;
     const UtcTime overpassTime = utcFromSeconds(overpass);
+    // 过境日在年内的序号（1 起）。
     const int dayOfYear = static_cast<int>(daysFromCivil(overpassTime.year, overpassTime.month, overpassTime.day) -
                                            daysFromCivil(overpassTime.year, 1, 1)) + 1;
+    // 步骤 6a：地形辐射输入（可选）。Hill/Ridge：读坡度/密度（/走向）栅格并校验，无效像元置 0，坡度须在 0–90°；
+    //          Single：常数或栅格的单一坡；Facet：由 DEM 的 3×3 Sobel 算子求逐像元坡度与坡向
+    //          （坡向为下坡方向方位角，自北起顺时针，度；按行向南的栅格约定，待核对）。
+    //          经纬度坐标的 DEM 先按纬度把像元尺寸换算成米；栅格最外一圈无 8 邻域，坡度保持 0。
     // Optional receiving-surface orientation for the shortwave forcing: one plane, a per-pixel DEM
     // slope/aspect field, or a statistical cone + density composite. Elevation correction is independent.
     std::vector<float> terrainSlope, terrainAspect, coneSlope, coneDensity, ridgeSlope, ridgeAspect, ridgeDensity;
@@ -617,6 +697,8 @@ int runImage(const std::string& configPath)
                           " 个这样的像元；如需地形，请让 DEM 比研究区大一圈");
         }
     }
+    // 步骤 6b：EB 像元求解用到的辅助闭包（像元强迫、地表参数、光谱分档、初始状态等），
+    //          正向求解与同化重解共用同一套实现。
     // ---- EB pixel machinery: one implementation for the forward solve and the assimilation re-solve ----
     const std::vector<float> noSpectrum;
     // Fallback initial temperature (only when the 2 m air temperature at the march start is invalid): mean 2 m air temperature
@@ -628,6 +710,9 @@ int runImage(const std::string& configPath)
         return std::isfinite(f.ta) && std::isfinite(f.ea) && std::isfinite(f.p) && std::isfinite(f.wind) &&
                std::isfinite(f.shortwave) && std::isfinite(f.longwave);
     };
+    // 作用：构造某像元的 PixelForcing（强迫的空间双线性、时间线性插值）。有 z 且给出 DEM 时，
+    // 高程差 shift = DEM − 强迫网格海拔（orography = z / g），用于气温与气压的高程订正；
+    // 同时传入坡面/山包/山脊的地形参数与直射/散射分配比例。
     const auto pixelForcing = [&](size_t pixel) {
         double shift = 0.0;
         if (elevationCorrection && std::isfinite(dem[pixel])) {
@@ -645,6 +730,9 @@ int runImage(const std::string& configPath)
                             ridgeDensity.empty() ? 0.0 : ridgeDensity[pixel],
                             config.terrainEndFraction);
     };
+    // 作用：由地类参数、LAI、土壤含水量与 Vcmax 组装能量平衡输入 EnergySurface。
+    // 土壤地类：宽带发射率按含水量在干端与饱和端之间插值，导热率/体积热容与土壤阻抗取自配置
+    // （可选由含水量按 Johansen 公式给出）；冰雪地类设组分温度上限为融化点，多余能量记为融化热汇。
     const auto buildSurface = [&](const ClassParameters& entry, double leafArea, double moisture, double vcmax) {
         EnergySurface surface;
         surface.lai = leafArea;
@@ -690,6 +778,7 @@ int runImage(const std::string& configPath)
         surface.maxStabilityIterations = config.maxStabilityIterations;
         return surface;
     };
+    // 作用：地面反射率的分档光谱：平地面取该地类的常数谱，土壤按含水量分档取 BSM 谱。
     const auto groundBins = [&](const ClassParameters& entry, int code, double moisture) -> const std::vector<float>& {
         return entry.groundKind == GroundKind::Flat ? flatGroundBins.at(code) : soilBins[moistureStep(static_cast<float>(moisture))];
     };
@@ -699,6 +788,8 @@ int runImage(const std::string& configPath)
         tau = leafTau != leafTauBins.end() ? &leafTau->second : &noSpectrum;
     };
     std::atomic<long long> initialLaterHour{0}, initialDayMean{0};  // pixels whose t2m at the march start was invalid
+    // 作用：EB 起转起点的初始温度。土壤、叶片与土壤热历史的初温全部取起点 2 m 气温 t2m；
+    // 起点值无效时依次退回起点后第一个有效 t2m、首个模拟日平均气温（计数，并只在日志警告一次）。
     const auto initialState = [&](const PixelForcing& forcing) {
         // FIX(2026-11-24): every initial temperature of the EB march (soil sunlit/shaded, leaf sunlit/shaded, the soil heat
         // history of the semi-infinite method and every layer of the `depth` column) is the 2 m air temperature t2m at the
@@ -737,6 +828,9 @@ int runImage(const std::string& configPath)
         }
         return state;
     };
+    // 结构：单个像元 EB 推进到过境时刻的结果：过境节点诊断 result、进入过境节点前的状态 before
+    // （同化隐式导数需要冻结的土壤热历史）、过境节点的强迫 meteo 与短波吸收 shortwave、
+    // 射束入射角 sza（水平面 = 太阳天顶角）、时间步 dt（s）、是否受光 lit。
     struct EbRun {
         EnergyDiagnostics result;
         double partitionLimited = 0.0, diffuse = std::numeric_limits<double>::quiet_NaN();
@@ -746,8 +840,12 @@ int runImage(const std::string& configPath)
         double sza = 0.0, dt = 3600.0;  // sza: beam incidence angle of the receiving surface (= SZA when flat)
         bool lit = false;
     };
+    // 模块：单像元 EB 起转推进。输入像元、地表参数、光谱、LAI、像元强迫，输出 state（过境时刻的组分温度与热历史）
+    // 与 run；沿 nodes（起转整点 + 过境）逐节点求解。返回 false：太阳位置失败或强迫无效。
+    // 正向求解（逐像元并行）与同化的重解（EbSolver）共用本函数，保证背景与分析使用同一能量平衡。
     const auto marchNodes = [&](size_t pixel, const EnergySurface& surface, const OpticalSpectra& spectra, double leafArea,
                                 const PixelForcing& forcing, EnergyState& state, EbRun& run) {
+        // 步骤 1：冰雪类的初温不得高于融化点（起点气温高于 273.15 K 时统一取融化点）。
         if (surface.temperatureCap > 0.0 && state.soilSunlit > surface.temperatureCap) {
             // Snow / ice that starts warmer than the melting point (warm 2 m air at the march start): the uniform start
             // state (components and soil heat history) is the melting point instead.
@@ -760,6 +858,8 @@ int runImage(const std::string& configPath)
                 state.soilShadeState.profile = state.soilSunState.profile;
             }
         }
+        // 步骤 2：逐节点推进。每个节点：太阳位置 → 该节点的年序日 → 强迫 → 水平/坡面短波与吸收 → 求解。
+        //         时间步 dt = 与上一节点的间隔；节点 0 固定 3600 s（假定起点前一小时起等温，见 README）。
         for (size_t node = 0; node < nodes.size(); ++node) {
             const double time = nodes[node];
             const Sun sun = solarPosition(time, latitude[pixel], longitude[pixel], dem[pixel]);
@@ -801,6 +901,7 @@ int runImage(const std::string& configPath)
             }
             run.partitionLimited = shortwave.partitionLimited ? 1.0 : 0.0;
             const double dt = node ? time - nodes[node - 1] : 3600.0;
+            // 最后一个节点即过境节点：保存进入该节点前的状态与该节点强迫，供同化的隐式导数使用。
             if (node + 1 == nodes.size()) {
                 run.before = state;
                 run.meteo = meteo;
@@ -809,10 +910,15 @@ int runImage(const std::string& configPath)
                 run.lit = beamLit;
                 run.dt = dt;
             }
+            // 最后一个参数 bracketFallback：仅过境节点启用 1/L 括号法回退，起转节点不用（见 energy.h）。
             run.result = solveEnergyNode(surface, meteo, shortwave, beamZenith, beamLit, dt, state, node + 1 == nodes.size());
         }
         return true;
     };
+    // 模块：EbSolver（供同化使用）。输入像元与控制量 controls（LAI、土壤水分、Vcmax），
+    // 输出过境时刻的组分温度、四个能量通量，以及组分温度对三个控制量的隐式导数 outcome.gradient（最多 4×3）。
+    // 只处理植被类（含裸地/冰雪等陆面）有效像元；返回 false 表示无法求解；
+    // 返回 true 而 gradientValid=false 表示温度有效但导数被拒绝（融化钳制、主元过小或非有限）。
     // Assimilation: re-solve one pixel at the analysed controls and linearise the overpass energy balance.
     // R(T, x) = 0 at the converged node, so dT/dx = -(dR/dT)^-1 dR/dx; R, dR/dT and dR/dx come from one Dual
     // evaluation of the same component balances (soil moisture: soil emissivity, soil resistance, Johansen inertia,
@@ -822,6 +928,7 @@ int runImage(const std::string& configPath)
         outcome.gradientValid = false;
         const auto* entry = classes.find(type[pixel]);
         if (!entry || entry->surface != SurfaceKind::Vegetation || !validLocation(pixel)) return false;
+        // 步骤 1：按控制量重建地表，与正向相同地起转推进到过境时刻，得到收敛的组分温度与通量。
         const double leafArea = std::clamp(controls.lai, 0.0, kMaxLai);
         const double moisture = std::clamp(controls.moisture, 0.0, 1.0);
         const PixelForcing forcing = pixelForcing(pixel);
@@ -844,6 +951,8 @@ int runImage(const std::string& configPath)
         for (auto& row : outcome.gradient) row.fill(0.0);
         if (run.result.meltLimited) return true;   // a melt-capped component does not respond to the controls: no implicit derivative
 
+        // 步骤 2：以收敛状态为展开点构造 Dual 输入：组分温度（种子 0–3）与控制量
+        //         土壤水分（4）、Vcmax（5）、LAI（6）；土壤发射率与热惯量随土壤水分变化。
         const EnergyInputsT<double> base = energyInputs(surface, run.shortwave, state);
         EnergyInputsT<Ad> x;
         x.soilSunlit = Ad::seed(base.soilSunlit, 0);
@@ -861,6 +970,7 @@ int runImage(const std::string& configPath)
             johansenSoilThermal<Ad>(surface.ground.saturatedMoisture, x.soilMoisture, conductivity, capacity);
             x.soilInertia = ad::sqrt(conductivity * capacity);
         } else x.soilInertia = Ad(base.soilInertia);
+        // 有短波时重算各吸收分量（对 LAI 与土壤水分可微）；夜间不需要。
         if (run.meteo.shortwave > 0.0) {
             // BSM soil albedo per solar bin, with its moisture slope from the neighbouring tabulated steps.
             std::vector<Ad> soilSpectrum(ground.size());
@@ -884,6 +994,8 @@ int runImage(const std::string& configPath)
             x.soilSunlitFraction = sw.soilSunlitFraction;
             x.laiSunlit = sw.laiSunlit;
         }
+        // 步骤 3：用同一组分平衡的 Dual 残差 R 得到 ∂R/∂T（矩阵 a，有叶 4×4、无叶 2×2）
+        //         与 −∂R/∂x（矩阵 b，三列对应三个控制量）。
         const auto residual = energyResiduals<Ad>(surface, x, run.meteo, run.sza, run.lit, run.dt, run.before,
                                                   state.inverseObukhov, state.sceneSensible);
         const int size = leaves ? 4 : 2;
@@ -892,6 +1004,8 @@ int runImage(const std::string& configPath)
             for (int j = 0; j < size; ++j) a[i][j] = residual[i].d[j];
             for (int c = 0; c < 3; ++c) b[i][c] = -residual[i].d[4 + c];
         }
+        // 步骤 4：Gauss-Jordan（部分选主元）解 a · dT/dx = −∂R/∂x，即 dT/dx = −(∂R/∂T)⁻¹ ∂R/∂x；
+        //         主元 ≤ 1e-9 或非有限时放弃导数（温度仍有效）。
         for (int column = 0; column < size; ++column) {
             int pivot = column;
             for (int row = column + 1; row < size; ++row)
@@ -919,6 +1033,8 @@ int runImage(const std::string& configPath)
     };
 
     if (eb) {
+        // 步骤 6（EB 分支）：准备输出缓冲 forcingOut（7 个强迫量：气温、水汽压、气压、风速、水平面短波、
+        // 长波、土壤水分）与 fluxOut（18 个通量/诊断波段，场景含冰雪且开启融化时再加第 19 波段）。
         progress(10, "能量平衡求解");
         for (auto& band : components) band.assign(pixels, kNaN);
         forcingOut.assign(7, std::vector<float>(pixels, kNaN));
@@ -934,6 +1050,8 @@ int runImage(const std::string& configPath)
         fluxOut.assign(kFluxBands, std::vector<float>(pixels, kNaN));
         std::atomic<int> rowsDone{0}; int progressMark = 0;  // FIX(2026-11-24 E2): main thread only; reports whenever it finishes a row after enough rows are done
         const int rowCount = endRow - startRow;
+        // 逐像元并行求解 EB（每行一个线程；进度只由主线程上报）。每个像元：检查地类/位置/LAI/强迫 →
+        // 记录过境时刻强迫 → 水体直接取表皮温度 → 其他地类组装地表、起转推进 → 写组分温度与通量。
         ParallelError errorsEb;
         #pragma omp parallel for schedule(dynamic, 2) reduction(+:ebPixels, ebConverged, ebStable, ebWaterPixels, ebFailed, ebNoForcing, ebClamped, iceMeltPixels, iceCappedPixels)
         for (int row = startRow; row < endRow; ++row) {
@@ -957,6 +1075,7 @@ int runImage(const std::string& configPath)
                                                                  overpassSun.azimuth).horizontal;
                 const double values[7] = {atOverpass.ta, atOverpass.ea, atOverpass.p, atOverpass.wind, overpassShortwave, atOverpass.longwave, soilMoisture[pixel]};
                 for (int k = 0; k < 7; ++k) forcingOut[k][pixel] = static_cast<float>(values[k]);
+                // 水体：不求能量平衡，四组分取过境时刻 skt（数据包没有 skt 时取 2 m 气温）。
                 if (entry->surface == SurfaceKind::Water) {
                     const float skin = static_cast<float>(forcing.temperature(waterSkinMissing ? "t2m" : "skt", overpass));
                     for (auto& band : components) band[pixel] = skin;
@@ -985,6 +1104,9 @@ int runImage(const std::string& configPath)
                 components[3][pixel] = static_cast<float>(state.leafShaded);
                 if (!(leafArea > 0.0f)) { components[2][pixel] = kNaN; components[3][pixel] = kNaN; }
                 const double obukhov = std::isfinite(result.obukhovLength) ? result.obukhovLength : std::numeric_limits<double>::quiet_NaN();
+                // eb_fluxes 波段顺序：1 Rn、2 H、3 LE、4 G、5 迭代次数、6 是否收敛、7 Obukhov 长度、8 u*、
+                // 9 稳定度是否收敛、10 能量残差、11 稳定度残差、12 稳定度限幅、13 阵风残差、14 空气密度、
+                // 15 气动粗糙度、16 位移高度、17 冠层权重、18 短波限幅标记；第 19 波段为融化热通量（仅含冰雪时）。
                 double fluxes[kBaseFluxBands + 1] = {
                     result.netRadiation, result.sensible, result.latent, result.ground,
                     static_cast<double>(result.iterations), result.converged ? 1.0 : 0.0,
@@ -1032,6 +1154,7 @@ int runImage(const std::string& configPath)
             log("警告：起转起点的 2 m 气温无效，初值改取起点后第一个有效时次 " + std::to_string(initialLaterHour.load()) + " 个像元、改取首个模拟日平均气温 " +
                 std::to_string(initialDayMean.load()) + " 个像元");
     } else if (config.thermalEnabled || lsctInversion || assimilate) {
+        // RT 分支：组分温度来自 4 波段文件（Tss、Tsh、Tcs、Tch），或逐组分的栅格/常数（24 波段文件按 UTC 小时选）。
         const char* labels[] = {"光照土壤温度", "阴影土壤温度", "光照叶片温度", "阴影叶片温度"};
         if (!config.componentsFile.empty()) {
             auto dataset = openRaster(config.componentsFile, "组分温度文件");
@@ -1044,11 +1167,14 @@ int runImage(const std::string& configPath)
             if (automaticBand) log("24 波段组分温度按 UTC 小时自动选用第 " + std::to_string(automaticBand) + " 波段");
         }
     }
+    // 组分温度有效性：不在 100–400 K 内的值置为 NaN（输入必须为 K）。
     if (needComponents)
         for (auto& band : components)
             // DEFERRED[低] 错误处理: RT 模式下若组分温度误给成 °C（如 25），会在这里静默变成 NaN，最后只体现为 thermalFailed 计数，没有任何单位提示；建议：统计被剔除的像元，大多数值落在 −50..60 时报错或警告"组分温度须为 K"
             for (auto& value : band) if (!(value >= 100 && value <= 400)) value = kNaN;
 
+    // 步骤 7：热红外反射天空项的下行长波 L↓（W m-2）。来源：配置的栅格/常数；EB 取过境时刻的 strd；
+    //         RT 的 auto 取 Swinbank 晴空公式。成像、反演、同化共用，且由背景状态一次确定。
     // ---------------- reflected sky ----------------
     // Downwelling longwave of the reflected-sky term of the thermal brightness (2026-11-20). One per-pixel field
     // shared by imaging, inversion and assimilation; it is fixed from the background state (not re-derived from
@@ -1086,6 +1212,8 @@ int runImage(const std::string& configPath)
         log("热红外反射天空项：下行长波来源 " + skySource + (count ? "，均值 " + format(sum / count, 1) + " W m⁻²" : "，无有效值"));
     }
 
+    // 步骤 8：成像准备：分配光学/热红外/太阳几何的输出缓冲，并为每个土壤地类建立
+    //         Hapke 方向发射率表（干端与饱和端各一张）。
     // ---------------- imaging ----------------
     std::vector<std::vector<float>> optical(config.opticalBands.size(), std::vector<float>(config.opticalEnabled ? pixels : 0, kNaN));
     std::vector<std::vector<float>> brightness(config.thermalBands.size(), std::vector<float>(config.thermalEnabled ? pixels : 0, kNaN));
@@ -1112,6 +1240,8 @@ int runImage(const std::string& configPath)
                 "（天底；半球值同比例变化，可用 energy.soilEmissivityWet 指定饱和值）");
         }
     }
+    // 步骤 9：LST/LSCT 反演（可选）。进度区间 [inversionStart, inversionStart+inversionSpan]；
+    //         先构造地形观测算子的 TerrainFields（反演、同化与成像共用）。
     // ---------------- inversion ----------------
     // LST / LSCT retrieval from the configured thermal observations. For LSCT the posterior component temperatures
     // replace the background for imaging, so the simulated bands are the forward image of the retrieved state.
@@ -1143,6 +1273,8 @@ int runImage(const std::string& configPath)
         }
     }
 
+    // 步骤 10：同化（可选，与反演互斥）。分析场替换组分温度（及作为控制量的 LAI、土壤水分），
+    //          背景场单独保留，以便输出与对比。
     // ---------------- assimilation ----------------
     // The analysis replaces the component temperatures (and LAI / soil moisture when they are controls), so every
     // simulated product of this run is the forward image of the analysed state; the background is kept separately.
@@ -1169,6 +1301,8 @@ int runImage(const std::string& configPath)
         }
     }
 
+    // 步骤 11：逐像元成像（按行并行）。进度区间 [imageStart, 90]。每个像元：检查输入 → 太阳位置 →
+    //          光学方向反射率（canopyReflectance）→ 热红外亮温与表面温度（thermalPixel）。
     long long invalidInput = 0, invalidType = 0, waterPixels = 0, nightPixels = 0, opticalPixels = 0, thermalPixels = 0, thermalFailed = 0, solarFailed = 0;
     std::atomic<int> rowsDone{0}; int progressMark = 0;  // FIX(2026-11-24 E2): main thread only; reports whenever it finishes a row after enough rows are done
     const int rowCount = endRow - startRow;
@@ -1207,6 +1341,7 @@ int runImage(const std::string& configPath)
 
             if (config.opticalEnabled) {
                 const float moisture = soilMoisture[pixel];
+                // 光学：水体/填充类不成像（只计数）；太阳在地平线以下的像元光学记为空值；土壤像元须有有效含水量。
                 if (waterOrFill) ++waterPixels;
                 else if (sza >= 90) ++nightPixels;
                 else if (entry->groundKind == GroundKind::Flat || std::isfinite(moisture)) {
@@ -1215,7 +1350,10 @@ int runImage(const std::string& configPath)
                     try {
                         for (size_t band = 0; band < config.opticalBands.size(); ++band) {
                             const double ground = entry->groundKind == GroundKind::Flat ? entry->groundReflectance : soilBandReflectance[moistureStep(moisture)][band];
+                            // 叶片透射率上限取 1 − 反射率，保证叶片吸收率非负。
                             const double lr = leafR[band], lt = std::min(leafT[band], 1.0 - leafR[band]);
+                            // 直/散分配比例：EB 取求解时记录的水平面比例，否则取配置值；配置为 −1（Erbs 反算）等越界值时，
+                            // 由 requestedDiffuseFraction 按过境时刻水平面短波和太阳天顶角反算。
                             double diffuse = eb && std::isfinite(diffuseFractionOut[pixel])
                                 ? diffuseFractionOut[pixel] : config.diffuseFraction;
                             if (!(diffuse >= 0.0 && diffuse <= 1.0))
@@ -1231,6 +1369,8 @@ int runImage(const std::string& configPath)
                 } else ++invalidInput;
             }
 
+            // 热红外：用与反演、同化共用的观测算子合成各波段亮温与发射率归一化表面温度；填充类不成像；
+            // 地形面元背向传感器或求值失败（如组分温度缺失）计入 thermalFailed。
             if (config.thermalEnabled && entry->surface != SurfaceKind::Fill) {
                 // Shared observation operator (app/thermal_view.cpp): the assimilation evaluates exactly this code on
                 // dual numbers, so a simulated image and the analysis operator can never drift apart. Facet slope
@@ -1266,6 +1406,8 @@ int runImage(const std::string& configPath)
     }
     errorsImaging.rethrow("逐像元成像");
 
+    // 步骤 12：写出结果。先写太阳几何；反演/同化的产品文件已由各自模块写出，这里只登记并并入 summary；
+    //          再写光学、热红外，EB 的 components / eb_forcing / eb_fluxes，最后写 scene_summary.json。
     // ---------------- outputs ----------------
     progress(92, "写出结果影像");
     const fs::path& outputDir = config.outputDir;
@@ -1345,8 +1487,11 @@ int runImage(const std::string& configPath)
         summary.Add("thermal", stats);
     }
     if (eb) {
+        // EB 产品：components.tif（EB 解，可直接作为 RT 的组分温度文件）、eb_forcing.tif、eb_fluxes.tif，
+        // 以及 temperature 摘要（起转、收敛、温度限值、冰雪融化、强迫元数据与说明）。
         const std::vector<std::string> componentNames{"Tss sunlit soil temperature (K)", "Tsh shaded soil temperature (K)",
                                                       "Tcs sunlit leaf temperature (K)", "Tch shaded leaf temperature (K)"};
+        // LSCT/同化用后验替换了 components 时，components.tif 仍写 EB 解（ebComponents）。
         const auto& solved = ebComponents[0].empty() ? components : ebComponents;
         std::vector<std::vector<float>> componentBands(solved.begin(), solved.end());
         writeTiff(outputDir / "components.tif", grid, componentBands, componentNames);
@@ -1375,9 +1520,11 @@ int runImage(const std::string& configPath)
         writeTiff(outputDir / "eb_fluxes.tif", grid, fluxOut, fluxNames);
         products.Add("eb_fluxes.tif");
         CPLJSONArray fluxStats;
+        // 摘要只统计 Rn、H、LE、G、u*、能量残差 六个通量波段（序号见上面 fluxNames）。
         for (const size_t index : {0, 1, 2, 3, 7, 9}) fluxStats.Add(bandStatistics(fluxNames[index], fluxOut[index]));
         summary.Add("fluxes", fluxStats);
 
+        // components.json：登记 components.tif 的来源与波段名，供 RT 模式引用。
         CPLJSONObject componentsInfo;
         componentsInfo.Add("kind", "stream-components");
         componentsInfo.Add("schemaVersion", 1);
@@ -1391,6 +1538,8 @@ int runImage(const std::string& configPath)
         componentsDocument.SetRoot(componentsInfo);
         if (!componentsDocument.Save(utf8FromPath(outputDir / "components.json"))) throw std::runtime_error("无法写出 components.json");
 
+        // temperature 摘要：数据包信息（era5，保持原样）、强迫元数据与标准化记录（forcing）、
+        // 节点序列与起转统计、收敛/限值/冰雪融化/水体等计数及说明（notes）。
         CPLJSONObject era5Info;
         era5Info.Add("product", pack.product());
         era5Info.Add("year", pack.year());

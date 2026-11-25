@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：inversion.h
+// 功能：LST（地表辐射温度）/ LSCT（四组分温度）反演的接口与 QA 质量位定义
+// 主要模块：
+//   1. QA 质量位常量（位 0–4、8、9 沿用 LS4T base/quality.py；位 10–12 为 STREAM 扩展）
+//   2. InversionInputs：反演所需的配置、栅格、地形与反射天空输入（引用，不拥有数据）
+//   3. InversionResult：LSCT 后验组分温度、产品文件名与 summary
+//   4. runInversion：执行反演并写出产品（实现见 inversion.cpp）
+// 数据流：image.cpp 组装 InversionInputs 与背景组分温度 → runInversion → 产品 GeoTIFF 与 summary；
+//         同化（assimilation.cpp）也复用这里的 QA 位常量，保证两者质量位定义一致
+// 约定：温度 K；亮温/辐亮度的观测算子见 thermal_view.h；组分顺序 [土壤光照, 土壤阴影, 叶片光照, 叶片阴影]
+//       QA 位含义与默认拒收掩膜（rejectQaBits）见 README“温度反演”一节
+// ==========================================================================
+
 #pragma once
 // LST / LSCT retrieval from thermal observations, using the forward thermal observation model of image.cpp
 // (TiRT four-component weights + hom3 multiple scattering + Hapke/moisture soil emissivity, top of canopy).
@@ -22,6 +36,7 @@
 
 namespace stream {
 
+// 模块：质量位（按位或写入 QA 波段）。位 5–7（LS4T 专用）STREAM 不设置，故此处没有对应常量。
 // Quality bits; 0-8 follow LS4T base/quality.py, bit 9 is a STREAM extension.
 constexpr unsigned kQaInputInvalid = 1u << 0;
 constexpr unsigned kQaCloud = 1u << 1;
@@ -44,6 +59,8 @@ constexpr unsigned kQaNoObservation = 1u << 12;
 constexpr unsigned kQaLineSearchStalled = 1u << 10;
 constexpr unsigned kQaNotUpdated = 1u << 11;
 
+// 模块：反演输入。所有 vector 为整景栅格（按 grid 行优先排列），只处理 [startRow,endRow) ×
+// [startColumn,endColumn) 范围；progressStart/progressSpan 为本阶段在总进度条中的起点与跨度（百分比）。
 struct InversionInputs {
     const ImageConfig& config;
     const ClassTable& classes;
@@ -69,6 +86,7 @@ struct InversionInputs {
     const TerrainFields* terrain = nullptr;
 };
 
+// 模块：反演结果。components 供成像使用（LSCT 无反演处保持背景）；summary 并入 scene_summary.json。
 struct InversionResult {
     // LSCT: posterior component temperatures (background where no retrieval was possible); LST: empty.
     std::array<std::vector<float>, 4> components;
@@ -76,6 +94,7 @@ struct InversionResult {
     CPLJSONObject summary;
 };
 
+// 入口：background 为 LSCT 的背景四组分温度（LST 不使用）。
 // Writes the retrieval products into config.outputDir.
 InversionResult runInversion(const InversionInputs& inputs, const std::array<std::vector<float>, 4>& background);
 

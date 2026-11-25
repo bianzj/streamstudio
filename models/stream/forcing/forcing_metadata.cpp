@@ -1,3 +1,24 @@
+// ==========================================================================
+// 文件：forcing_metadata.cpp
+// 功能：气象强迫元数据的内置预设、JSON 解析与校验、单位表以及湿度/气压/长波的物理换算
+// 主要模块：
+//   1. 内置预设：era5、era5-land、gldas-noah-0.25/1.0、station-csv（JSON 文本，支持 preset 继承）
+//   2. 单位表 kUnits 与单位查找 forcingUnit（别名规范化后匹配，换算为 SI）
+//   3. JSON 工具与 Parser：逐段读取 time/grid/station/variables/heightCorrection/spatial，
+//      未知字段给警告，错误累积到 ForcingIssues
+//   4. 入口函数：parseForcingMetadata、resolveForcingMetadata（预设名/文件/内联 JSON）、
+//      forcingMetadataForProduct（旧工程 era5.pack 的隐含元数据）
+//   5. 数据侧校验 checkForcingAgainstNames、era5Layout（判断是否恒等 ERA5 布局）、
+//      运行摘要 forcingMetadataSummaryJson
+//   6. 物理换算：饱和水汽压、露点、比湿/混合比 → 水汽压、海拔/海平面气压、Brutsaert 长波
+// 数据流：预设名/JSON → resolvePreset（继承合并）→ Parser → ForcingMetadata →
+//   era5.cpp / station_source.cpp 据此读取与标准化；摘要写入 scene_summary.json
+// 约定：SI 值 = (原始值 × scale + offset) × unitFactor + unitOffset；水汽压 hPa、气压 Pa、气温 K；
+//   饱和水汽压用水面 Tetens 公式（与能量平衡引擎一致）；风高度订正为中性对数律
+// 注意：元数据完全等同 ERA5 预设（era5Layout 为真）时读取端走原路径，不做任何算术，结果逐位不变
+// 与其他文件：forcing_metadata.h 声明；规格见 docs/forcing-metadata.md
+// ==========================================================================
+
 #include "forcing_metadata.h"
 
 #include "../physics/constants.h"
@@ -19,6 +40,7 @@ namespace {
 namespace fs = std::filesystem;
 constexpr double kNotANumber = std::numeric_limits<double>::quiet_NaN();
 
+// 作用：按 %g 格式化数字（缺省 6 位有效数字），用于拼接提示文字。
 std::string number(double value, int digits = 6)
 {
     char text[64];
@@ -26,6 +48,11 @@ std::string number(double value, int digits = 6)
     return text;
 }
 
+// 模块：内置预设（JSON 文本）。era5 是基底；era5-land 通过 "preset" 继承 era5，
+// 只把 ssrd/strd 改为自 00 UTC 累积（cumulative）；gldas-noah-* 与 station-csv 各自完整。
+// 继承规则：对象逐键递归合并、数组与标量整体替换（见 resolvePreset / mergeJson）。
+// GLDAS 预设按产品命名与文档推断，未经真实数据验证（高度、时间戳含义待用户确认，见 docs/forcing-metadata.md）。
+// station-csv 故意不写观测高度，运行时按缺省高度并给出警告。
 // ---------------------------------------------------------------- presets
 const char* const kPresetEra5 = R"JSON({
   "kind": "stream-forcing-metadata", "schemaVersion": 1, "name": "era5",
@@ -98,6 +125,7 @@ const char* const kPresetStation = R"JSON({
   "spatial": {"interpolation": "idw", "idwPower": 2, "maxStations": 4}
 })JSON";
 
+// 预设名 → JSON 文本的登记表；presetList 与 forcingPresetNames 据此列出可用预设。
 struct PresetEntry { const char* name; const char* text; };
 const PresetEntry kPresets[] = {{"era5", kPresetEra5}, {"era5-land", kPresetEra5Land}, {"gldas-noah", kPresetGldas},
                                 {"gldas-noah-0.25", kPresetGldas025}, {"gldas-noah-1.0", kPresetGldas10},
@@ -110,6 +138,12 @@ std::string presetList()
     return text;
 }
 
+// 模块：单位表。每行 {物理量类, 规范写法, 因子, 偏移, 别名列表}，换算为 SI：SI = 值 × 因子 + 偏移。
+// 例：degC → ×1 + 273.15；degF → ×5/9 + (273.15 − 32×5/9)；hPa → ×100（Pa）；
+// 湿度 % → ×0.01（化为小数）；风 kt = 1852/3600 m s-1；
+// orography 的 m（海拔）→ ×g，得到位势 m2 s-2（g=9.80665）。
+// 别名在 normaliseUnit 规范化后（小写、去空格/^/*/中点）比较，故 "W m^-2"、"W/m2" 等写法均可识别。
+// 辐射能量类单位（energy）用于 accumulated/cumulative，功率类（power）用于 interval_mean/instant。
 // ---------------------------------------------------------------- units
 struct UnitDef { const char* quantity; const char* canonical; double factor; double offset; const char* aliases; };
 constexpr double kPi = 3.14159265358979323846;
@@ -156,6 +190,8 @@ const UnitDef kUnits[] = {
     {"orography", "m", kForcingStandardGravity, 0.0, "m,metre,meter"},
 };
 
+// 作用：把单位文字规范化以便比较：去掉空格、^、*、制表符和中点（U+00B7），ASCII 字母转小写，
+// 保留度符号 °（UTF-8 0xC2 0xB0）。
 std::string normaliseUnit(const std::string& text)
 {
     std::string out;
@@ -177,6 +213,7 @@ bool aliasMatches(const char* aliases, const std::string& normalised)
     return false;
 }
 
+// 模块：JSON 小工具（数字判断、字符串/字符串数组读取、预设合并、解析）。
 // ---------------------------------------------------------------- JSON helpers
 using Json = CPLJSONObject;
 
@@ -195,6 +232,7 @@ std::vector<std::string> stringList(const Json& o)
     return out;
 }
 
+// 作用：把 over 合并进 base：两边都是对象的键递归合并，其余情形（含数组）整体用 over 替换。
 void mergeJson(Json& base, const Json& over)
 {
     for (const auto& child : over.GetChildren()) {
@@ -214,6 +252,8 @@ bool loadJson(const std::string& text, Json& root, std::string& reason)
     return true;
 }
 
+// 说明：继承深度超过 4 层即停止展开（防止循环引用）；合并后保留 "preset" 键记录基底预设名。
+// UTF-8 BOM 先去掉再解析。
 // Preset texts reference their base preset through "preset": merged recursively, the overrides win.
 bool resolvePreset(std::string text, Json& out, ForcingIssues& issues, int depth = 0)
 {
@@ -236,6 +276,9 @@ bool resolvePreset(std::string text, Json& out, ForcingIssues& issues, int depth
     return true;
 }
 
+// 模块：元数据解析器。把合并后的 JSON 逐段读入 ForcingMetadata（m），
+// 错误与警告写入 issues；未知字段给警告而不报错，便于以后扩展。
+// 辅助：unknownKeys 报未知键、readNumber 读数字、oneOf 校验枚举、channel 读取一个通道对象。
 struct Parser {
     ForcingMetadata& m;
     ForcingIssues& issues;
@@ -268,6 +311,11 @@ struct Parser {
     }
 
     // `quantities`: unit classes tried in order (radiation: power then energy).
+    // 作用：解析一个通道对象（source/unit/scale/offset/kind/stamp/resetHourUtc/stepHours/height_m/
+    // missing/range/thickness_m）到 c。quantities 为依次尝试的单位类（辐射：先功率后能量）。
+    // 步骤 1：读源名、scale、offset；步骤 2：识别单位并推出换算因子；
+    // 步骤 3：确定 kind 与 stamp（瞬时/保持 → 时刻戳，其余 → 时段终点戳）并校验 kind 与单位匹配：
+    // 累积/累计需能量单位，瞬时/时段平均需功率单位；步骤 4：读重置时刻、步长、高度、缺测值与范围。
     void channel(const Json& o, const std::string& path, const std::vector<std::string>& quantities, const std::string& defaultUnit,
                  const std::string& defaultKind, ForcingChannel& c, bool needSource = true)
     {
@@ -294,6 +342,8 @@ struct Parser {
             for (const auto& quantity : quantities) list += (list.empty() ? "" : "；") + forcingUnitList(quantity);
             error(path + ".unit", "\"" + unit + "\" 不能识别；该物理量可用单位：" + list);
         }
+        // kind 缺省：缺省为 interval_mean 的通道，若用户给的是能量单位，则自动改为 accumulated；
+        // 单位不能识别时（已报错）退回通道缺省 kind，避免连带产生误导性的第二条错误。
         c.kind = o.GetString("kind", c.energyUnit && defaultKind == "interval_mean" ? "accumulated" : defaultKind);
         if (o.GetObj("kind").IsValid() == false && !found) c.kind = defaultKind;
         oneOf(c.kind, {"instant", "previous", "interval_mean", "accumulated", "cumulative"}, path + ".kind");
@@ -334,6 +384,11 @@ struct Parser {
 
     void missingVariable(const std::string& key, const std::string& meaning) { error("variables." + key, "缺少（" + meaning + "）"); }
 
+    // 作用：解析整份元数据（根对象已合并预设继承）。
+    // 步骤 1：name/description/preset；kind、schemaVersion 缺省分别按 stream-forcing-metadata、1 处理并给警告，
+    // kind 或版本不符直接报错返回；步骤 2：form（gridded | station）；
+    // 步骤 3：time，以及网格的经纬度变量名或站点配置；步骤 4：variables；步骤 5：heightCorrection；
+    // 步骤 6：spatial。各步错误累积在 issues 中，由调用方统一抛出。
     void parse(const Json& root)
     {
         m.name = root.GetString("name", "");
@@ -364,6 +419,8 @@ struct Parser {
         parseSpatial(root.GetObj("spatial"));
     }
 
+    // 作用：解析 time 段：时间变量别名/单位覆盖（网格）、时间列与格式（站点）、
+    // stepHours、utcOffsetHours（限 ±14 h）、maxGapHours。步长与最大缺口须为正数。
     void parseTime(const Json& time)
     {
         if (!time.IsValid()) return;
@@ -381,6 +438,8 @@ struct Parser {
         if (readNumber(time, "maxGapHours", "time", value)) { if (value <= 0) error("time.maxGapHours", "须大于 0"); else m.maxGapHours = value; }
     }
 
+    // 作用：解析 station 段：分隔符（单字符，"\\t" 转为制表符）、注释前缀、列名映射、
+    // 站点登记表（每项需要 id 或 file，且必须有经纬度；海拔可选）。
     void parseStation(const Json& station)
     {
         if (!station.IsValid()) return;
@@ -417,6 +476,10 @@ struct Parser {
         }
     }
 
+    // 作用：解析 variables 段，逐物理量调用 channel 填充 ForcingMetadata。
+    // 必需：气温、湿度、气压（可写 type none）、风、向下短波；长波必需，除非声明 brutsaert 回退。
+    // 可选：skinTemperature、soilMoisture、orography；precipitation、directShortwave、diffuseShortwave
+    // 仅解析校验，EB 不使用，记入 ignored。未写 height_m 的气温/湿度在末尾按缺省 2 m 并给警告。
     void parseVariables(const Json& variables)
     {
         if (!variables.IsValid()) { error("variables", "缺少（物理量映射）"); return; }
@@ -434,6 +497,8 @@ struct Parser {
             m.humidityType = o.GetString("type", "");
             if (m.humidityType.empty()) error("variables.humidity.type", "必填；可选：dewpoint、specific、mixingRatio、relative、vapourPressure");
             else if (oneOf(m.humidityType, {"dewpoint", "specific", "mixingRatio", "relative", "vapourPressure"}, "variables.humidity.type")) {
+                // 按湿度类型确定单位类与缺省单位：露点 → 温度/K；相对湿度 → %；水汽压 → 压强/hPa；
+                // 比湿、混合比 → 无量纲比值/kg kg-1。
                 const std::string quantity = m.humidityType == "dewpoint" ? "temperature" : m.humidityType == "relative" ? "relativeHumidity"
                                            : m.humidityType == "vapourPressure" ? "pressure" : "fraction";
                 const std::string unit = m.humidityType == "dewpoint" ? "K" : m.humidityType == "relative" ? "%"
@@ -457,6 +522,8 @@ struct Parser {
         if (const Json o = variables.GetObj("longwaveDown"); o.IsValid()) {
             m.longwaveFallback = o.GetString("fallback", "none");
             oneOf(m.longwaveFallback, {"none", "brutsaert"}, "variables.longwaveDown.fallback");
+            // 长波：没有 source 且选择 brutsaert 回退时视为“未声明”，由标准化层用晴空参数化代替
+            // （不含云，阴天偏低，docs/forcing-metadata.md 4.6）。
             if (!o.GetObj("source").IsValid() && m.longwaveFallback == "brutsaert") m.longwaveDown.declared = false;
             else channel(o, "variables.longwaveDown", radiation, "W m-2", "interval_mean", m.longwaveDown);
         } else missingVariable("longwaveDown", "向下长波辐射；没有数据时写 {\"fallback\": \"brutsaert\"}");
@@ -465,6 +532,8 @@ struct Parser {
             channel(o, "variables.skinTemperature", {"temperature"}, "K", "instant", m.skinTemperature);
         if (const Json o = variables.GetObj("soilMoisture"); o.IsValid()) {
             channel(o, "variables.soilMoisture", {"soilMoisture"}, "m3 m-3", "instant", m.soilMoisture);
+            // 土壤水分单位为 kg m-2 时须给土层厚度 thickness_m：体积含水量 = 值 / (1000 × 厚度)，
+            // 因此把换算因子 unitFactor 改写为 1/(1000 × thickness_m)。
             if (m.soilMoisture.unit == "kg m-2") {
                 if (!(m.soilMoisture.thickness_m > 0)) error("variables.soilMoisture.thickness_m", "单位 kg m-2 时必须给出土层厚度（m），如 0.1");
                 else m.soilMoisture.unitFactor = 1.0 / (1000.0 * m.soilMoisture.thickness_m);
@@ -494,6 +563,8 @@ struct Parser {
         height(m.humidity, "humidity", 2.0);
     }
 
+    // 作用：解析 variables.wind：类型 components（u、v）、speedDirection（speed + direction + convention）、
+    // speed（仅风速）；height_m 写在 wind 上，未写时按 10 m 并给警告。
     void parseWind(const Json& o)
     {
         if (!o.IsValid()) { missingVariable("wind", "10 m 风"); return; }
@@ -521,6 +592,11 @@ struct Parser {
         }
     }
 
+    // 作用：解析 heightCorrection 并算出订正量，供读取端直接使用。
+    // 步骤 1：风——观测高度 h 与目标高度相差超过 0.01 m 且 mode=log 时，
+    // windFactor = ln(target/z0) / ln(h/z0)（中性对数律，要求 h、target 均大于 z0）；mode=none 只警告；
+    // 步骤 2：气温——mode=lapse 时 temperatureShiftK = −Γ × (target − h)（K）；否则只警告；
+    // 步骤 3：湿度高度不同只警告，不订正。
     void parseHeightCorrection(const Json& o)
     {
         if (o.IsValid()) {
@@ -565,6 +641,8 @@ struct Parser {
             issues.warning("气象强迫元数据 \"" + m.name + "\"：湿度高度 " + number(m.humidity.height_m) + " m 与引擎约定 " + number(m.temperatureTargetHeight_m) + " m 不同，湿度不做高度订正");
     }
 
+    // 作用：解析 spatial 段。缺省：站点 idw、网格 bilinear（网格只允许 bilinear）；
+    // maxStations 限 1–4（引擎权重槽数），lapseRateKPerKm 限 0–20（缺省 6.5，高程订正用）。
     void parseSpatial(const Json& o)
     {
         if (!o.IsValid()) { m.interpolation = m.form == "station" ? "idw" : "bilinear"; return; }
@@ -605,6 +683,7 @@ std::string ForcingIssues::errorText() const
     return text;
 }
 
+// 模块：对外接口实现——预设列表与输出、解析入口、校验、单位查表与物理换算。
 // ---------------------------------------------------------------- presets / units / conversions
 const std::vector<std::string>& forcingPresetNames()
 {
@@ -612,6 +691,8 @@ const std::vector<std::string>& forcingPresetNames()
     return names;
 }
 
+// 作用：返回预设展开继承后的 JSON 文本（去掉 preset 键，便于用户复制修改）。
+// 说明：基底 gldas-noah 仅作继承用，不对外提供；未知名称抛 runtime_error。
 std::string forcingPresetJson(const std::string& name)
 {
     for (const auto& entry : kPresets) {
@@ -625,6 +706,8 @@ std::string forcingPresetJson(const std::string& name)
     throw std::runtime_error("未知的气象强迫预设 \"" + name + "\"；可用：" + presetList());
 }
 
+// 作用：在单位表里查 quantity 类下写法为 spelling 的单位；找到返回 true 并给出规范写法、因子与偏移
+// （SI = 值 × factor + offset）；不认识的写法返回 false，由调用方报“单位不识别”。
 bool forcingUnit(const std::string& quantity, const std::string& spelling, std::string& canonical, double& factor, double& offset)
 {
     const std::string key = normaliseUnit(spelling);
@@ -638,6 +721,7 @@ bool forcingUnit(const std::string& quantity, const std::string& spelling, std::
     return false;
 }
 
+// 作用：列出某物理量类的规范单位名（用于错误提示）。
 std::string forcingUnitList(const std::string& quantity)
 {
     std::string text;
@@ -645,8 +729,11 @@ std::string forcingUnitList(const std::string& quantity)
     return text;
 }
 
+// 作用：饱和水汽压（hPa），水面 Tetens 公式 es = 6.107·10^(7.5 T/(237.3+T))，T 为摄氏度；
+// 与能量平衡引擎使用的公式一致（未区分冰面）。
 double forcingSaturationVapourPressure(double celsius) { return 6.107 * std::pow(10.0, 7.5 * celsius / (237.3 + celsius)); }
 
+// 作用：由水汽压（hPa）反解露点（K），是上面 Tetens 公式的反函数；水汽压 ≤ 0 返回 NaN。
 double forcingDewPointFromVapourPressure(double hPa)
 {
     if (!(hPa > 0.0)) return kNotANumber;
@@ -654,19 +741,28 @@ double forcingDewPointFromVapourPressure(double hPa)
     return 237.3 * l / (7.5 - l) + 273.15;
 }
 
+// 水汽压（hPa）换算：比湿 q（kg kg-1）：ea = q·p/(0.622 + 0.378 q)；混合比 r：ea = r·p/(0.622 + r)；
+// p 为地面气压（Pa，函数内转 hPa）。
 double forcingVapourPressureFromSpecific(double q, double pressurePa) { return q * (pressurePa / 100.0) / (0.622 + 0.378 * q); }
 double forcingVapourPressureFromMixingRatio(double r, double pressurePa) { return r * (pressurePa / 100.0) / (0.622 + r); }
+// 作用：标准大气下由海拔（m）估算气压（Pa）：p = 101325·(1 − 2.25577e-5 h)^5.25588；
+// 用于没有气压数据（pressure.type = none）时的估算。
 double forcingPressureFromAltitude(double altitudeM) { return 101325.0 * std::pow(1.0 - 2.25577e-5 * altitudeM, 5.25588); }
+// 作用：把海平面气压折算到海拔 h 处：p = p0·exp(−g h /(R_d·Ta))，R_d = 287.05 J kg-1 K-1，
+// Ta 取同时刻 2 m 气温（K）。
 double forcingPressureFromSeaLevel(double seaLevelPa, double altitudeM, double airTemperatureK)
 {
     return seaLevelPa * std::exp(-kForcingStandardGravity * altitudeM / (287.05 * airTemperatureK));
 }
+// 作用：Brutsaert（1975）晴空向下长波（W m-2）：LW = ε σ Ta^4，ε = 1.24 (ea/Ta)^(1/7)，
+// ea 单位 hPa、Ta 单位 K；ea 下限取 0.01 hPa 防止出现 0 或负值。不含云，阴天会偏低。
 double forcingBrutsaertLongwave(double airTemperatureK, double vapourPressureHPa)
 {
     const double emissivity = 1.24 * std::pow(std::max(vapourPressureHPa, 0.01) / airTemperatureK, 1.0 / 7.0);
     return emissivity * kStefanBoltzmann * std::pow(airTemperatureK, 4);
 }
 
+// 作用：name 是否为引擎内部标准量名（ERA5 短名）。
 bool forcingStandardQuantity(const std::string& name)
 {
     static const char* const names[] = {"t2m", "d2m", "sp", "u10", "v10", "ssrd", "strd", "skt", "swvl1", "z"};
@@ -674,6 +770,10 @@ bool forcingStandardQuantity(const std::string& name)
 }
 
 // ---------------------------------------------------------------- parsing
+// 作用：判断元数据是否与内置 era5 / era5-land 预设“恒等”：网格形态、无风/气温订正、
+// 源名 t2m d2m sp u10 v10、无缺测/范围/单位换算、湿度为露点、气压为 surface、步长 1 h，
+// ssrd/strd 为 J m-2 的 accumulated 或 00 UTC 重置的 cumulative（两者须同类）。
+// 为真时读取端沿用原 ERA5 路径，保证与引入元数据层之前结果逐位相同。
 bool ForcingMetadata::era5Layout() const
 {
     if (form != "gridded" || windFactor != 1.0 || temperatureShiftK != 0.0) return false;
@@ -693,6 +793,9 @@ bool ForcingMetadata::era5Layout() const
     return true;
 }
 
+// 作用：解析 JSON 文本为 ForcingMetadata：先展开 preset 继承，再逐段解析。
+// 输入：origin（preset | file | inline | pack）、文件路径（用于解析相对的站点文件）；
+// 错误与警告汇入 issues（警告同时存入 metadata.warnings，供运行记录）。
 ForcingMetadata parseForcingMetadata(const std::string& jsonText, const std::string& origin, const fs::path& path, ForcingIssues& issues)
 {
     ForcingMetadata metadata;
@@ -711,6 +814,9 @@ ForcingMetadata parseForcingMetadata(const std::string& jsonText, const std::str
     return metadata;
 }
 
+// 作用：把用户给的说明符解析为元数据。顺序：以 '{' 开头 → 内联 JSON；预设名 → 内置预设；
+// 否则当作文件路径（相对路径以 baseDir 为基准）。outer 为空时有错误即抛 runtime_error；
+// 不为空时错误交给调用方（forcing-check 命令用）。
 ForcingMetadata resolveForcingMetadata(const std::string& specifier, const fs::path& baseDir, ForcingIssues* outer)
 {
     ForcingIssues local;
@@ -739,6 +845,7 @@ ForcingMetadata resolveForcingMetadata(const std::string& specifier, const fs::p
     return metadata;
 }
 
+// 作用：旧工程只写 temperature.era5.pack 时隐含的元数据：product 为 era5-land 取该预设，其余取 era5。
 ForcingMetadata forcingMetadataForProduct(const std::string& product)
 {
     ForcingIssues issues;
@@ -747,6 +854,9 @@ ForcingMetadata forcingMetadataForProduct(const std::string& product)
     return metadata;
 }
 
+// 作用：数据侧校验——对每个已声明通道，检查其 source（含别名）中至少有一个出现在数据变量名/列名里。
+// 缺失的必需量报错，可选量（skt、swvl1、z；以及有 brutsaert 回退的长波）只给警告；
+// 错误信息列出已尝试的别名和数据里前 20 个名字，便于修改元数据。
 void checkForcingAgainstNames(const ForcingMetadata& m, const std::vector<std::string>& dataNames, ForcingIssues& issues)
 {
     const auto has = [&](const std::string& name) { return std::find(dataNames.begin(), dataNames.end(), name) != dataNames.end(); };
@@ -772,6 +882,9 @@ void checkForcingAgainstNames(const ForcingMetadata& m, const std::vector<std::s
         need(*pair.first, pair.second, false);
 }
 
+// 作用：生成写入 scene_summary.json（temperature.forcing.metadata）的规范化摘要：
+// 元数据名/来源/形态/步长，各通道的源变量、单位、kind、高度，风与气温的高度订正（系数/平移量），
+// 以及被忽略的量。
 std::string forcingMetadataSummaryJson(const ForcingMetadata& m)
 {
     Json root;

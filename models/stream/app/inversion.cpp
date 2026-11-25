@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：inversion.cpp
+// 功能：STREAM 热红外温度反演：LST（每像元一个辐射温度）与 LSCT（四组分温度），
+//       观测算子与正向成像共用 thermal_view.cpp 的四组分权重
+// 主要模块/步骤：
+//   1. 数值工具：Planck 导数、小矩阵求逆（Gauss-Jordan）、Sample 观测样本与 model 观测模型
+//   2. runInversion 步骤 1：读取观测栅格（亮温/LST、可选视角、掩膜）
+//   3. runInversion 步骤 2：逐像元准备样本（太阳位置、反射天空、四组分权重、QA 初值）
+//   4. runInversion 步骤 3a（LST）：加权 Gauss-Newton，发射率误差并入观测方差
+//   5. runInversion 步骤 3b（LSCT）：MAP Gauss-Newton + 回溯线搜索，可选 s×s 同地类窗口
+//   6. 写出 GeoTIFF 产品与 summary（计数、统计、停止原因），汇总日志
+// 数据流：image.cpp 构造 InversionInputs（栅格、地形、反射天空）与背景组分温度
+//         → runInversion → lst*.tif / lsct*.tif + summary；LSCT 的后验组分温度回传给成像
+// 约定：温度 K；波长 μm；Planck 辐亮度 W m-2 sr-1 μm-1；组分顺序 [Tss, Tsh, Tcs, Tch]
+//       （土壤光照/阴影、叶片光照/阴影）；QA 位定义见 inversion.h 与 README“温度反演”
+//       并行：OpenMP 按行并行，每行只由一个线程写入，行级统计量再按行序求和以保证结果可复现
+// ==========================================================================
+
 #include "inversion.h"
 #include "parallel_error.h"
 #include "../physics/brightness.h"
@@ -21,6 +39,8 @@ namespace stream {
 namespace {
 
 namespace fs = std::filesystem;
+// 常量：组分数；迭代的温度搜索域 150–400 K；产品有效范围 200–380 K（与 LS4T LSCT 一致）；
+// kAbsentWeight：窗口内某组分权重和低于此值时视为未被观测，不参与 LSCT 控制量。
 constexpr int kComponents = 4;
 constexpr double kMinTemperature = 150.0, kMaxTemperature = 400.0;    // search domain (K)
 constexpr double kValidLow = 200.0, kValidHigh = 380.0;               // product range (K), as LS4T LSCT
@@ -28,6 +48,7 @@ constexpr double kAbsentWeight = 1e-4;                                // summed 
 
 using Matrix = std::array<std::array<double, kComponents>, kComponents>;
 
+// 作用：输出进度行 `STREAM\tprogress\t<百分比>\t<阶段>`（服务端按此格式解析）。
 void progress(double percent, const std::string& stage)
 {
     std::cout << "STREAM\tprogress\t" << std::fixed << std::setprecision(1) << percent << '\t' << stage << '\n';
@@ -59,6 +80,7 @@ double planckDerivative(double temperature, double wavelength)
     return planck(temperature, wavelength) * x / temperature * e / (e - 1.0);
 }
 
+// 说明：奇异判据为相对阈值，主元 ≤ 1e-12 × 矩阵最大元即视为奇异（与同化一致）。
 // In-place inverse of the leading n x n block (Gauss-Jordan, partial pivoting). False when singular.
 bool invert(Matrix& a, int n)
 {
@@ -98,6 +120,9 @@ struct Sample {
     bool valid() const { return std::isfinite(value); }
 };
 
+// 说明：LST 观测的辐亮度除以固定地类发射率 fixedEmissivity（LST 产品约定），
+// 亮温观测则在辐亮度上加反射天空项 reflected；返回的 gradient 是模型亮温对各组分温度的偏导，
+// 即 w_k B'(T_k) / (divisor · B'(模型亮温))。组分温度非有限或权重为 0 的组分不贡献。
 // Model value of one sample for component temperatures `t` and its gradient d(model)/d(t_k).
 bool model(const Sample& sample, const double t[kComponents], double& value, double gradient[kComponents])
 {
@@ -117,6 +142,11 @@ bool model(const Sample& sample, const double t[kComponents], double& value, dou
 
 }  // namespace
 
+// 模块：温度反演主函数（LST 或 LSCT 由 config.inversion.target 决定）。
+// 输入：in（配置、地类表、栅格与地形、观测配置、反射天空设置）；background 为 LSCT 的背景四组分温度
+//       （RT 输入或 EB 解，NaN 表示该组分无背景）。
+// 输出：写入 config.outputDir 下的 GeoTIFF；返回 InversionResult（LSCT 的后验组分温度、产品名、summary）。
+// 副作用：向 stdout 写进度行与 [STREAM] 日志；并行区内异常经 ParallelError 汇总后重抛。
 InversionResult runInversion(const InversionInputs& in, const std::array<std::vector<float>, 4>& background)
 {
     const ImageConfig& config = in.config;
@@ -139,6 +169,8 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         log(std::string("反演的观测权重按与正向成像相同的地形观测算子计算（") +
             (in.terrain ? "单坡/面元按局地几何，山包/山脊按面元合成" : "警告：未提供地形场，按水平地表") + "）");
 
+    // 步骤 1：读取各观测的栅格（亮温/LST 值，可选逐观测视角天顶角/方位角）与云/无效掩膜；
+    //         观测未给视角时沿用场景的 vza/vaa。
     // ---------- observations ----------
     std::vector<std::vector<float>> values(observations), obsVza(observations), obsVaa(observations);
     for (size_t j = 0; j < observations; ++j) {
@@ -155,6 +187,8 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
     std::vector<unsigned> flags(regionPixels, 0);
     std::vector<char> usable(regionPixels, 0);
     long long outOfRangeValues = 0;
+    // 步骤 2：逐像元准备观测样本 Sample：太阳位置 → 反射天空温度 → 每个观测的四组分权重；
+    //         同时登记 QA 初值（云/掩膜、输入无效）与可用像元标记。范围外的观测值（不在 150–400 K）被剔除并计数。
     ParallelError errorsPrepare;
     #pragma omp parallel for schedule(dynamic, 4) reduction(+:outOfRangeValues)
     for (int row = in.startRow; row < in.endRow; ++row) {
@@ -166,6 +200,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
             const auto* entry = in.classes.find(in.type[pixel]);
             if (!entry || entry->surface == SurfaceKind::Fill) continue;
             if (!mask.empty() && std::isfinite(mask[pixel]) && mask[pixel] != 0.0f) { flags[local] |= kQaCloud; continue; }
+            // 非植被地类允许 LAI 无效，按 0 处理；植被地类 LAI 无效则下面标记为输入无效。
             float leafArea = in.lai[pixel];
             if (entry->surface != SurfaceKind::Vegetation && !validLai(leafArea)) leafArea = 0.0f;  // FIX(2026-11-24 M1)
             const float lat = in.latitude[pixel], lon = in.longitude[pixel];
@@ -238,6 +273,8 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
     errorsPrepare.rethrow("反演输入准备");
     if (outOfRangeValues) log("警告：" + std::to_string(outOfRangeValues) + " 个观测值不在 150–400 K（单位须为 K），已剔除");
 
+    // 步骤 3：反演。LST 与 LSCT 两个分支各自并行逐行处理；progressMark 仅主线程更新，
+    //         用于约每 5% 行数上报一次进度。
     // ---------- retrieval ----------
     const double span = in.progressSpan;
     progress(in.progressStart + 0.1 * span, lsct ? "组分温度反演" : "地表温度反演");
@@ -249,6 +286,8 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
     // longer depends on the OpenMP reduction order.
     std::vector<double> rowResidual(static_cast<size_t>(std::max(grid.height, 0)), 0.0), rowDfs(rowResidual.size(), 0.0);
 
+    // 分支 3a：LST。四组分取同一温度 t，对多个观测做加权 Gauss-Newton（标量问题）；
+    // 产品：lst.tif、lst_uncertainty.tif、lst_qa.tif（QA、残差 RMS、使用观测数、有效发射率）。
     if (!lsct) {
         std::vector<float> lst(grid.size(), kNaN), sd(grid.size(), kNaN), qa(grid.size(), kNaN), residual(grid.size(), kNaN),
             used(grid.size(), kNaN), emissivity(grid.size(), kNaN);
@@ -265,12 +304,15 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 unsigned flag = flags[local];
                 if (!usable[local]) { qa[pixel] = static_cast<float>(flag); continue; }
                 const Sample* own = &samples[local * observations];
+                // 初值：该像元所有有效观测值的平均。
                 double t = 0.0;
                 int count = 0;
                 for (size_t j = 0; j < observations; ++j) if (own[j].valid()) { t += own[j].value; ++count; }
                 t /= count;
                 bool converged = false, ok = true;
                 double information = 0.0;
+                // 迭代：t ← t + Σ g(y−h)/V ÷ Σ g²/V，其中 g 为模型对 t 的导数、V 为观测方差加发射率误差项；
+                // t 限制在搜索域 150–400 K；|步长| < tolerance 视为收敛，模型求值失败则标记失败。
                 for (int iteration = 0; iteration < inv.maxIterations && ok; ++iteration) {
                     double numerator = 0.0;
                     information = 0.0;
@@ -296,6 +338,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 }
                 if (!ok) { qa[pixel] = static_cast<float>(flag | kQaRetrievalFailed); ++failed; continue; }
                 if (!converged) { flag |= kQaNotConverged; ++notConverged; }
+                // 解处复算：残差 RMS、不确定度所用信息量、有效发射率（取首个有效观测的权重和）。
                 // Residual over all observations; effective emissivity of the first valid view.
                 // FIX(2026-11-21 S-3): the information (sum slope^2 / variance) is re-evaluated at the returned t, so
                 // the reported sigma belongs to the solution (it used to come from the iterate before the last update).
@@ -319,6 +362,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                     }
                 }
                 if (finalInformation > 0.0) information = finalInformation;
+                // 解超出产品有效范围（200–380 K）时不输出 LST，只写 QA 位 2。不确定度 σ = 1/√信息量。
                 if (t < kValidLow || t > kValidHigh) { qa[pixel] = static_cast<float>(flag | kQaOutOfRange); ++outOfRange; continue; }
                 lst[pixel] = static_cast<float>(t);
                 sd[pixel] = static_cast<float>(1.0 / std::sqrt(information));
@@ -336,6 +380,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         }
         for (size_t row = 0; row < rowResidual.size(); ++row) residualSum += rowResidual[row];
         errorsLst.rethrow("地表温度反演");
+        // 输出 LST 产品并登记统计量。
         const fs::path& dir = config.outputDir;
         writeTiff(dir / "lst.tif", grid, {lst}, {"LST (K)"});
         writeTiff(dir / "lst_uncertainty.tif", grid, {sd}, {"LST uncertainty 1-sigma (K)"});
@@ -348,6 +393,10 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         stats.Add(bandStatistics("residual RMS (K)", residual));
         result.summary.Add("statistics", stats);
     } else {
+        // 分支 3b：LSCT。以背景组分温度为先验的 MAP Gauss-Newton，每像元最多 4 个控制量（被观测到的组分），
+        // 可与同地类的 s×s 窗口内像元共享四个组分温度。
+        // 产品：lsct.tif、lsct_uncertainty.tif、lsct_qa.tif（含 MAP 代价）、lsct_fractions.tif、
+        // lsct_radiance_fractions.tif。
         // Background covariance B = sd^2 [(1 - r) I + r 1 1^T]; restricted to the observed components per pixel.
         const double variance = inv.priorSd * inv.priorSd;
         std::array<std::vector<float>, 4> posterior, sd;
@@ -376,6 +425,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 if (!entry || entry->surface == SurfaceKind::Fill) continue;
                 unsigned flag = flags[local];
                 if (!usable[local]) { qa[pixel] = static_cast<float>(flag); continue; }
+                // 步骤 3b-1：收集窗口内同地类的可用观测。
                 // Observations of the window: same class, usable, sharing the four component temperatures.
                 set.clear();
                 const float code = in.type[pixel];
@@ -389,6 +439,8 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                         if (sample.valid()) set.push_back(&sample);
                     }
                 }
+                // 步骤 3b-2：按权重和确定被观测到的组分（index），并取背景状态 xb 作为迭代初值；
+                //         被观测组分缺少背景值时无法反演，置位 0 与位 3。
                 // Observed components and the background state.
                 double weightSum[kComponents]{};
                 for (const Sample* sample : set) for (int k = 0; k < kComponents; ++k) weightSum[k] += sample->weights[k];
@@ -404,6 +456,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                     }
                 }
                 if (m == 0 || missingBackground) { qa[pixel] = static_cast<float>(flag | kQaInputInvalid | kQaRetrievalFailed); ++failed; continue; }
+                // 步骤 3b-3：背景协方差 B = σ²[(1−r)I + r11ᵀ] 取被观测组分子矩阵并求逆（此处先填 B 再原地求逆为 B⁻¹）。
                 Matrix backgroundInverse{};
                 for (int a = 0; a < m; ++a) for (int b = 0; b < m; ++b)
                     backgroundInverse[a][b] = variance * (a == b ? 1.0 : inv.priorCorrelation);
@@ -458,6 +511,8 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
                 int acceptedSteps = 0;
                 if (!cost(x, currentCost)) { ok = false; failureKind = 1; }
                 backgroundCost = currentCost;
+                // 步骤 3b-4：Gauss-Newton 迭代。步长 = H⁻¹g；最大分量 < tolerance（K）视为收敛；
+                //         否则按 1、1/2、1/4 回溯，仅接受使 MAP 代价下降的步长，无下降则按“停滞/未更新”结束。
                 for (; ok && iteration < inv.maxIterations; ++iteration) {
                     if (!normal(hessian, gradient, squares)) { ok = false; failureKind = 1; break; }
                     if (!invert(hessian, m)) { ok = false; failureKind = 2; break; }
@@ -559,6 +614,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         for (size_t row = 0; row < rowResidual.size(); ++row) { dfsSum += rowDfs[row]; residualSum += rowResidual[row]; }
         errorsLsct.rethrow("组分温度反演");
         const fs::path& dir = config.outputDir;
+        // 输出 LSCT 产品（波段名即上述组分顺序），并登记统计量。
         const std::vector<std::string> names{"Tss sunlit soil temperature (K)", "Tsh shaded soil temperature (K)",
                                              "Tcs sunlit leaf temperature (K)", "Tch shaded leaf temperature (K)"};
         writeTiff(dir / "lsct.tif", grid, {posterior.begin(), posterior.end()}, names);
@@ -587,6 +643,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         }
     }
 
+    // 步骤 4：汇总 summary：方法说明、观测列表、先验参数、像元计数与停止原因统计、均值残差/DFS。
     result.summary.Add("target", lsct ? "lsct" : "lst");
     result.summary.Add("method", lsct ? "MAP Gauss-Newton, background = run component temperatures" : "weighted Gauss-Newton, single radiometric temperature");
     result.summary.Add("observationModel", "STREAM forward thermal: TiRT four-component weights + hom3 multiple scattering, top of canopy, no atmosphere; brightness observations include the reflected sky (1 - effective emissivity) B(T_sky)");
@@ -621,6 +678,7 @@ InversionResult runInversion(const InversionInputs& in, const std::array<std::ve
         counts.Add("iterationLimitPixels", static_cast<GInt64>(stopIterationLimit));
         counts.Add("stepEvaluationFailedPixels", static_cast<GInt64>(stopStepFailed));
     }
+    // 云/掩膜与输入无效像元数取自步骤 2 的 flags（二者互斥计数，云优先）。
     long long cloud = 0, invalid = 0;
     for (const unsigned flag : flags) { if (flag & kQaCloud) ++cloud; else if (flag & kQaInputInvalid) ++invalid; }
     counts.Add("cloudPixels", static_cast<GInt64>(cloud));

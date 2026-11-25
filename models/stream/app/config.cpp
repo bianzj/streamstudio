@@ -1,3 +1,19 @@
+// ==========================================================================
+// 文件：config.cpp
+// 功能：解析 STREAM 运行配置 JSON（kind = stream-image-config，schemaVersion = 2），
+//   校验并填充 ImageConfig；任何不合法的配置都以 std::runtime_error 报告（中文提示）。
+// 主要模块/步骤：
+//   1. 匿名辅助函数：numberOr / integerOr（严格数值读取，类型错误时报错而非静默为 0）、
+//      readBands（读取光学/热红外波段并校验范围）
+//   2. readImageConfig 的解析顺序：
+//      基本路径与过境时刻 → surface（类型/LAI/土壤湿度/DEM/地形/土壤亮度/经纬度）→ view（vza/vaa）
+//      → region → optical/thermal 波段 → inversion → assimilation → temperature（RT 组分 / EB）
+//      → energy / 发射率 / 土壤热参数 / 反射天空 → 其他选项（线程、预热）
+// 数据流：配置 JSON 文件 → readImageConfig → ImageConfig（见 config.h）。
+// 约定：光学波段中心波长单位 nm（400–2400）；热红外波段单位 μm（3–20）；角度为度；
+//   overpass 为 UTC 秒（parseUtc）。许多缺省值用于兼容旧工程，见各处 FIX 注释。
+// ==========================================================================
+
 #include "config.h"
 #include "../forcing/forcing_metadata.h"
 #include "../forcing/utc.h"
@@ -11,6 +27,9 @@
 
 namespace {
 
+// 模块：严格读取数值字段的辅助函数（numberOr 读实数，integerOr 读整数）。
+// 缺省：键不存在或为 null 时返回 fallback；类型不是数值/不是整数时抛异常，
+// path 为用于报错的配置路径。
 // FIX(2026-11-24 C2/C3): GDAL's CPLJSONObject::GetDouble/GetInteger turn a string, bool or object into 0 without a word
 // (diffuseFraction "abc" became 0, minWindSpeed "x" became 0). Numeric configuration fields must be JSON numbers.
 double numberOr(const CPLJSONObject& parent, const std::string& key, double fallback, const std::string& path)
@@ -36,6 +55,10 @@ int integerOr(const CPLJSONObject& parent, const std::string& key, int fallback,
 namespace stream {
 namespace {
 
+// 作用：读取 section.bands 数组为 SpectralBand 列表并校验。
+// 输入：中心波长允许范围 [low, high]、单位文字 unit（仅用于报错）、label（光学/热红外）、
+//       thermal（热红外附加带宽检查）；最多 64 个波段。
+// 说明：波段名中的逗号、花括号、换行替换为空格，避免破坏下游 CSV/JSON 输出。
 std::vector<SpectralBand> readBands(const CPLJSONObject& section, double low, double high, const std::string& unit, const std::string& label, bool thermal)
 {
     std::vector<SpectralBand> bands;
@@ -48,6 +71,7 @@ std::vector<SpectralBand> readBands(const CPLJSONObject& section, double low, do
         if (!std::isfinite(band.center) || band.center < low || band.center > high)
             throw std::runtime_error(label + "波段 " + band.name + " 的中心波长须在 " + std::to_string(low) + "–" + std::to_string(high) + " " + unit);
         if (!std::isfinite(band.fwhm) || band.fwhm < 0) throw std::runtime_error(label + "波段 " + band.name + " 的带宽无效");
+        // 热红外带宽上限 2·(center − 0.1)（单位同波长），保证带宽下沿仍为正波长（待核对）。
         // 热红外按波段中心单色计算，半高宽只记录；仍限制在物理可解释范围内。
         if (thermal && band.fwhm > 2 * (band.center - 0.1))
             throw std::runtime_error(label + "波段 " + band.name + " 的带宽不能超过 " + std::to_string(2 * (band.center - 0.1)) + " " + unit);
@@ -59,8 +83,12 @@ std::vector<SpectralBand> readBands(const CPLJSONObject& section, double low, do
 
 }  // namespace
 
+// 作用：读取并校验运行配置，返回 ImageConfig。
+// 输入：配置 JSON 路径 path；输出：填充好的 ImageConfig；失败抛 std::runtime_error。
+// 说明：配置按节解析，各节的缺省值保持与旧工程一致，见下面各步骤。
 ImageConfig readImageConfig(const std::string& path)
 {
+    // 步骤 1：加载 JSON，检查 kind / schemaVersion，读取输出与数据目录（必须已存在）和过境时刻（UTC）。
     CPLJSONDocument document;
     if (!document.Load(path)) throw std::runtime_error("无法读取配置 JSON：" + path);
     const auto root = document.GetRoot();
@@ -73,11 +101,15 @@ ImageConfig readImageConfig(const std::string& path)
     if (config.dataDir.empty() || !std::filesystem::is_directory(config.dataDir)) throw std::runtime_error("STREAM 数据目录不存在");
     if (!parseUtc(root.GetString("overpass", ""), config.overpass)) throw std::runtime_error("过境时刻须为 UTC，格式 YYYY-MM-DDTHH:MM:SSZ");
 
+    // 步骤 2：读取 surface：类型（IGBP）、LAI、土壤湿度、DEM 等栅格场（readField 支持常数或文件）。
     const auto surface = root.GetObj("surface");
     config.type = readField(surface, "type");
     config.lai = readField(surface, "lai");
     config.soilMoisture = readField(surface, "soilMoisture");
     config.dem = readField(surface, "dem");
+    // 步骤 2a：地形辐射模式 none / single / facet(composite) / hill / ridge；
+    //         各模式检查必须提供的坡度、坡向、密度、DEM 栅格及取值范围（坡度 0–90°，
+    //         坡向 0–360°，山脊端面比例 0–0.5）。
     const auto terrain = surface.GetObj("terrain");
     if (terrain.IsValid() && terrain.GetType() == CPLJSONObject::Type::Object) {
         const auto terrainMode = terrain.GetString("mode", "none");
@@ -121,19 +153,23 @@ ImageConfig readImageConfig(const std::string& path)
             throw std::runtime_error("地形辐射模式须为 none、single、facet、composite、hill 或 ridge");
         }
     }
+    // 步骤 2b：BSM 土壤亮度；负值（缺省 -1）表示使用 classes.json；给定则须在 0.05–1.0。
     config.soilBrightness = surface.GetDouble("soilBrightness", -1.0);
     if (!std::isfinite(config.soilBrightness) || config.soilBrightness > 1.0 || (config.soilBrightness > 0.0 && config.soilBrightness < 0.05))
         throw std::runtime_error("地表土壤亮度 soilBrightness 须为 0.05–1.0 或省略（使用 classes.json）");
     config.latitude = readField(surface, "latitude");
     config.longitude = readField(surface, "longitude");
+    // 步骤 2c：记录不被模拟的冠层/行结构键（见 config.h ignoredStructureKeys），之后由主程序警告。
     // FIX(2026-11-21 C9): structure inputs that this engine does not simulate are reported instead of ignored silently.
     for (const char* key : {"treeStand", "canopyHeight", "crownShape", "crown", "rows", "cropRows", "canopyStructure"})
         if (surface.GetObj(key).IsValid()) config.ignoredStructureKeys.push_back(std::string("surface.") + key);
+    // 步骤 3：观测几何 vza / vaa（常数或栅格）；地表类型必须来自栅格文件。
     const auto view = root.GetObj("view");
     config.vza = readField(view, "vza");
     config.vaa = readField(view, "vaa");
     if (!config.type.fromFile()) throw std::runtime_error("缺少地表类型（IGBP）栅格");
 
+    // 步骤 4：可选的行列子区域（起止行列，缺省为 0；是否包含端点由使用方决定，待核对）。
     const auto region = root.GetObj("region");
     if (region.IsValid() && region.GetType() == CPLJSONObject::Type::Object) {
         config.region = true;
@@ -143,6 +179,7 @@ ImageConfig readImageConfig(const std::string& path)
         config.endColumn = region.GetInteger("endColumn", 0);
     }
 
+    // 步骤 5：光学（中心波长 400–2400 nm）与热红外（3–20 μm）波段；启用但无波段时报错。
     const auto optical = root.GetObj("optical");
     const auto thermal = root.GetObj("thermal");
     config.opticalEnabled = optical.GetBool("enabled", false);
@@ -152,6 +189,9 @@ ImageConfig readImageConfig(const std::string& path)
     if (config.opticalEnabled && config.opticalBands.empty()) throw std::runtime_error("已启用光学模拟但没有波段");
     if (config.thermalEnabled && config.thermalBands.empty()) throw std::runtime_error("已启用热红外模拟但没有波段");
 
+    // 步骤 6：反演设置。target = none / lst / lsct；启用时读取 1–32 个热红外观测
+    //         （波长 3–20 μm，σ 0–10 K）、掩膜、先验 sd（0.1–100 K）与相关系数（0–0.95）、
+    //         发射率误差（0–0.1）、窗口（1–9 的奇数）、最大迭代（1–100）。
     const auto inversion = root.GetObj("inversion");
     if (inversion.IsValid() && inversion.GetType() == CPLJSONObject::Type::Object) {
         const auto target = inversion.GetString("target", "none");
@@ -198,6 +238,11 @@ ImageConfig readImageConfig(const std::string& path)
         if (inv.window < 1 || inv.window > 9 || inv.window % 2 == 0) throw std::runtime_error("反演窗口须为 1–9 的奇数");
         if (inv.maxIterations < 1 || inv.maxIterations > 100) throw std::runtime_error("反演迭代次数须在 1–100");
     }
+    // 步骤 7：同化设置。observation = brightness / lst / components / none；
+    //         启用时必须给 data；不确定度（uncertainty）与协方差（covariance）二选一；
+    //         各 sigma 须为有限正数；lstWavelengthUm 须在 [3, 25] μm；
+    //         rejectQaBits 须为 uint16 位掩码；观测层级只支持 canopy（亮温）/ surface（其他），
+    //         不支持 TOA；sourceIds / priorSourceIds 为来源标识字符串数组。
     const auto assimilation = root.GetObj("assimilation");
     if (assimilation.IsValid() && assimilation.GetType() == CPLJSONObject::Type::Object) {
         auto& as = config.assimilation;
@@ -217,6 +262,7 @@ ImageConfig readImageConfig(const std::string& path)
             as.qa = assimilation.GetString("qa", "");
             as.opticalUncertainty = assimilation.GetString("opticalUncertainty", "");
             as.opticalQa = assimilation.GetString("opticalQa", "");
+            // 局部函数：读取必须为有限正数的 assimilation 字段，类型不是数值或值非正则抛异常。
             const auto positive = [&](const char* key, double fallback) {
                 const auto field = assimilation.GetObj(key);
                 if (field.IsValid() && field.GetType() != CPLJSONObject::Type::Integer &&
@@ -260,6 +306,8 @@ ImageConfig readImageConfig(const std::string& path)
             for (const auto& id : as.sourceIds)
                 if (std::find(as.priorSourceIds.begin(), as.priorSourceIds.end(), id) != as.priorSourceIds.end())
                     throw std::runtime_error("assimilation source IDs overlap the prior source IDs");
+            // 步骤 7a：附加观测视角（最多 16 个，仅用于亮温同化）；每个视角须给出亮温文件与 VZA/VAA，
+            //         且同一文件不得在多个视角中重复计入（以规范化路径和 equivalent 判重）。
             const auto views = assimilation.GetArray("views");
             std::vector<std::filesystem::path> observationFiles{std::filesystem::absolute(pathFromUtf8(as.data)).lexically_normal()};
             if (views.IsValid()) {
@@ -288,6 +336,7 @@ ImageConfig readImageConfig(const std::string& path)
                     as.views.push_back(view);
                 }
             }
+            // 步骤 7b：一致性检查：亮温同化需热红外波段；光学观测需光学波段；同化与反演互斥。
             if (as.observation == AssimilationObservation::Brightness && !config.thermalEnabled)
                 throw std::runtime_error("同化亮温需要启用热红外波段（观测文件每个波段对应一个热红外波段）");
             if (!as.optical.empty() && !config.opticalEnabled)
@@ -295,13 +344,19 @@ ImageConfig readImageConfig(const std::string& path)
             if (config.inversion.enabled()) throw std::runtime_error("同化与单独的温度反演（inversion）不能同时使用");
         }
     }
+    // 至少要有一项任务：光学模拟、热红外模拟、反演或同化。
     if (!config.opticalEnabled && !config.thermalEnabled && !config.inversion.enabled() && !config.assimilation.enabled())
         throw std::runtime_error("请至少启用光学、热红外模拟、反演或同化");
 
+    // 步骤 8：温度来源 temperature.mode：eb（能量平衡，读气象强迫与 energy 参数）
+    //         或 rt（直接给定四个组分温度）。
     const auto temperature = root.GetObj("temperature");
     const auto mode = temperature.GetString("mode", "rt");
     if (mode == "eb") {
         config.mode = TemperatureMode::Eb;
+        // 步骤 8a：EB 气象强迫：网格形态需要数据包（pack 或旧的 era5.pack），站点形态需要站点 CSV 或
+        //         元数据中登记的站点文件；元数据可为预设名、文件路径或内联 JSON 对象，
+        //         提前解析以便在读栅格之前就报错。
         // Weather forcing (docs/forcing-metadata.md 8): temperature.forcing {pack, files, metadata} or the older era5.pack;
         // temperature.forcingMetadata is shorthand for forcing.metadata.
         const auto forcing = temperature.GetObj("forcing");
@@ -328,10 +383,14 @@ ImageConfig readImageConfig(const std::string& path)
         }
         if (!stationForm && config.era5Pack.empty())
             throw std::runtime_error(config.forcingMetadata.empty() ? "EB 模式需要气象数据包" : "网格形态的气象强迫需要数据包（temperature.forcing.pack 或 temperature.era5.pack）");
+        // 土壤水分来源：era5（强迫包提供）或 user（用户给定的 surface.soilMoisture）；
+        // elevationCorrection 缺省开启（按 DEM 做高程订正，具体订正见使用方，待核对）。
         const auto source = temperature.GetObj("soilMoisture").GetString("source", "era5");
         if (source != "era5" && source != "user") throw std::runtime_error("土壤水分来源须为 era5 或 user");
         config.soilMoistureFromEra5 = source == "era5";
         config.elevationCorrection = temperature.GetBool("elevationCorrection", true);
+        // 步骤 8b：EB 预热（spin-up）时次数 spinupHours：缺省 7，范围 0–240；
+        //         非整数向上取整（减 1e-9 以免浮点误差多进一位）。
         // FIX(2026-11-21 B10, 2026-11-24): spin-up length = number of ERA5 hourly nodes before the overpass. Default 7:
         // the 2 m air temperature already constrains the result strongly, and 7 matches the 7 h surface heat history
         // TIRTEB keeps (so the history is full at the overpass). Counted in nodes relative to the overpass, never from a
@@ -345,6 +404,10 @@ ImageConfig readImageConfig(const std::string& path)
         if (!std::isfinite(spinupValue) || spinupValue < 0.0 || spinupValue > 240.0)
             throw std::runtime_error("temperature.spinupHours 须在 0–240 之间（起转时次个数，缺省 7）");
         config.spinupHours = static_cast<int>(std::ceil(spinupValue - 1e-9));
+        // 步骤 8c：energy 子节：方案固定为 tirt；土壤热通量方法 surface/depth/direct；
+        //         温度求解 robust/direct；漫射比例 diffuseFraction（-1 = Erbs 估算，否则 0–1）；
+        //         土壤阻抗（constant 或 sellers 依湿度）；各物理参数缺省值对齐 TIRTEB
+        //         （input_tirteb.csv），并做范围检查。
         const auto energy = temperature.GetObj("energy");
         const auto scheme = energy.GetString("scheme", "tirt");
         if (scheme != "tirt" && scheme != "tirt-analytic") throw std::runtime_error("能量平衡方案须为 tirt");
@@ -379,6 +442,10 @@ ImageConfig readImageConfig(const std::string& path)
                 throw std::runtime_error("soilResistance.value 须在 (0, 100000] s m⁻¹ 之间（土壤表面阻抗，TIRTEB 默认 200），当前为 " +
                                          std::to_string(config.soilResistance));
         }
+        // 以下参数缺省值：stomatalG0 0.01、minWindSpeed 0.05 m s-1、maxAerodynamicResistance 400 s m-1
+        // （<=0 表示不限幅）、referenceHeight 15 m、heatRoughnessKb -1（<=0 按地类）、
+        // 发射率 土壤 0.955 / 叶 0.985、土壤导热率 1.55、体积热容 1.298e6、soilHeatFraction 0.25、
+        // 光谱分组宽度 50 nm、最大迭代 50。
         config.stomatalG0 = numberOr(energy, "stomatalG0", 0.01, "temperature.energy.stomatalG0");
         config.minWindSpeed = numberOr(energy, "minWindSpeed", 0.05, "temperature.energy.minWindSpeed");
         config.maxAerodynamicResistance = numberOr(energy, "maxAerodynamicResistance", 400.0, "temperature.energy.maxAerodynamicResistance");
@@ -405,10 +472,13 @@ ImageConfig readImageConfig(const std::string& path)
         config.maxIterations = integerOr(energy, "maxIterations", 50, "temperature.energy.maxIterations");
         config.iceMelt = energy.GetBool("iceMelt", true);
         config.maxStabilityIterations = integerOr(energy, "maxStabilityIterations", 60, "temperature.energy.maxStabilityIterations");
+        // EB 参数的统一合法性检查（正数/范围）。
         if (!(config.stomatalG0 > 0) || !(config.minWindSpeed >= 0) || !(config.referenceHeight > 0) ||
             !(config.leafEmissivity > 0 && config.leafEmissivity <= 1) ||
             !(config.soilConductivity > 0) || !(config.soilVolumetricCapacity > 0) || config.maxIterations < 1)
             throw std::runtime_error("能量平衡参数超出有效范围");
+    // 步骤 8d：RT 模式——四个组分温度：一个多波段文件，或按 soilSunlit、soilShaded、leafSunlit、
+    //         leafShaded 四个字段分别给出（依次对应 Tss、Tsh、Tcs、Tch）。
     } else if (mode == "rt") {
         const auto components = temperature.GetObj("components");
         config.componentsFile = components.GetString("file", "");
@@ -417,6 +487,9 @@ ImageConfig readImageConfig(const std::string& path)
     } else {
         throw std::runtime_error("温度模式须为 rt 或 eb");
     }
+    // 步骤 9：EB 与 RT 共用的热红外发射设置（均位于 temperature.energy 下）：
+    //         土壤发射率（RT 才在此读取干土值及漫射比例；RT 无短波输入，不支持 -1/Erbs）、
+    //         饱和土壤发射率、Hapke 方向发射率开关与系数、地表温度归一化方式，并做一致性检查。
     // Thermal emission settings shared by EB and RT (2026-11-20: they used to be read only in EB mode, so RT imaging
     // and RT-background retrievals silently ran with the defaults). They stay under temperature.energy.
     {
@@ -450,6 +523,8 @@ ImageConfig readImageConfig(const std::string& path)
         if (config.soilEmissivityWet >= 0 && config.soilEmissivityWet < config.soilEmissivity)
             throw std::runtime_error("soilEmissivityWet 须不小于 soilEmissivity（饱和土壤发射率不能低于干土）");
     }
+    // 步骤 10：反射天空长波 skyLongwave：{mode: auto|none}、常数（0–700 W m-2）或栅格；
+    //          结果存入 skySource / skyLongwave（语义见 config.h）。
     // Reflected sky of the thermal brightness temperature.
     const auto sky = root.GetObj("skyLongwave");
     if (sky.IsValid() && sky.GetType() != CPLJSONObject::Type::Null && sky.GetType() != CPLJSONObject::Type::Object)
@@ -464,6 +539,8 @@ ImageConfig readImageConfig(const std::string& path)
             !(config.skyLongwave.value >= 0.0 && config.skyLongwave.value <= 700.0))
             throw std::runtime_error("skyLongwave 常数须在 0–700 W m⁻²（0 表示不计反射天空）");
     }
+    // 步骤 11：常数形式的几何输入范围检查：VZA 0–90°（不含 90）、VAA ±360°、纬度 ±90°、
+    //          经度 −180–360°；栅格输入不在此检查。
     // Constant geometry inputs: reject values outside the physical range instead of silently dropping every pixel.
     const auto constantRange = [](const Field& field, double low, double high, bool includeHigh, const char* label) {
         if (field.fromFile() || !std::isfinite(field.value)) return;
@@ -475,6 +552,7 @@ ImageConfig readImageConfig(const std::string& path)
     constantRange(config.vaa, -360.0, 360.0, true, "观测方位角 VAA ");
     constantRange(config.latitude, -90.0, 90.0, true, "纬度 ");
     constantRange(config.longitude, -180.0, 360.0, true, "经度 ");
+    // 线程数；缺省 0（由使用方决定，通常为自动，待核对）。
     config.threads = root.GetInteger("threads", 0);
     return config;
 }

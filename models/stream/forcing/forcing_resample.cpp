@@ -1,3 +1,24 @@
+// ==========================================================================
+// 文件：forcing_resample.cpp
+// 功能：气象强迫的时间标准化——把任意时间分辨率的记录重采样到逐小时整点，并合成引擎标准量
+// 主要模块：
+//   1. forcingMaxGap：瞬时量允许线性插值跨越的最大缺口
+//   2. resampleInstant：瞬时量在整点的线性插值（缺口过大或端点缺测则该小时缺测）
+//   3. fluxRecordsFrom：把通量通道的原始记录还原为“时段平均通量”（W m-2）
+//   4. distributeFlux：把时段平均通量分配到逐小时（短波按太阳天顶角余弦，长波按中点线性），
+//      保证每个时段的能量守恒
+//   5. standardiseQuantities：由各小时通道合成标准量 t2m d2m sp u10 v10 ssrd strd skt swvl1 z
+//      （湿度换算、气压估算、风分量、高度订正、Brutsaert 长波回退）
+//   6. forcingChannelKeys / recordsCover：标准量所需通道推导与记录覆盖检查（站点源使用）
+// 数据流：原始记录（时刻 + 数值）→ fluxRecordsFrom → distributeFlux / resampleInstant → 逐小时通道 →
+//   standardiseQuantities → 标准量（float）供 pixel_forcing 使用
+// 约定：时间为自 1970-01-01 UTC 起的小时数（可为小数）；缺测为 NaN；
+//   逐小时通量 out[h − first] 表示 (h − 1, h] 区间的平均通量（W m-2）
+// 注意：各时段的能量严格守恒；夜间且通量近 0 时权重全取 1，避免除零（见 distributeFlux）
+// 与其他文件：forcing_metadata.h（通道与元数据）、era5.cpp 与 station_source.cpp（调用方）、
+//   utc.h（时间格式）；approximateCosZenith 在别处定义（NOAA 近似式，待核对所在文件）
+// ==========================================================================
+
 #include "forcing_resample.h"
 
 #include "forcing_source.h"
@@ -10,15 +31,23 @@
 
 namespace stream {
 
+// 外部函数声明：近似太阳天顶角余弦（经纬度为度，时间为 Unix 秒）；
+// 定义在别的源文件中（待核对），用于把短波按太阳高度分配到逐小时。
 double approximateCosZenith(double latitudeDeg, double longitudeDeg, double unixSeconds);
 
 namespace {
 constexpr double kNotANumber = std::numeric_limits<double>::quiet_NaN();
+// distributeFlux 对时段内部取样的步长（小时）：5 min，与文档 4.5 中“按 5 min 采样平均”一致。
 constexpr double kSampleHours = 5.0 / 60.0;
 }  // namespace
 
+// 作用：瞬时量线性插值允许跨越的最大缺口（小时）。用户设置了 maxGapHours 就用它，
+// 否则取 max(6, 2×记录步长)。
 double forcingMaxGap(double maxGapHours, double stepHours) { return maxGapHours > 0 ? maxGapHours : std::max(6.0, 2.0 * stepHours); }
 
+// 作用：把记录（times 升序，单位小时）线性插值到整点 first…last，结果 out[h−first]。
+// 规则：恰在记录时刻直接取值；两侧记录相距不超过 maxGapHours 且都有效才插值；
+// 否则该小时为 NaN（不外推）。times 为空时全部缺测。
 void resampleInstant(const std::vector<double>& times, const std::vector<double>& values, int64_t first, int64_t last,
                      double maxGapHours, std::vector<double>& out)
 {
@@ -41,6 +70,14 @@ void resampleInstant(const std::vector<double>& times, const std::vector<double>
     }
 }
 
+// 作用：把通量通道的记录还原为时段平均通量 FluxRecord{start, end, mean(W m-2)}。
+// 时段终点 end 由戳语义决定：previous 或 interval_start 为 t+步长，interval_mid 为 t+步长/2，其余为 t；
+// start = end − 步长。数值含义由 kind 决定：
+//   accumulated：值（J m-2 等）÷ (步长×3600) 得平均通量；
+//   cumulative：时段起点恰在重置时刻（resetHourUtc）时，值本身即该时段累积；否则与前一条
+//   间隔恰好一个步长的记录差分，差为负（累计量回落，视为重置）时用值本身；
+//   其余（interval_mean / previous）：值即平均通量。
+// 结果截断为不小于 0（辐射非负），无效为 NaN。kind=instant 不属于时段数据，返回空。
 std::vector<FluxRecord> fluxRecordsFrom(const ForcingChannel& c, double step, const std::vector<double>& times, const std::vector<double>& values)
 {
     std::vector<FluxRecord> records;
@@ -71,6 +108,13 @@ std::vector<FluxRecord> fluxRecordsFrom(const ForcingChannel& c, double step, co
     return records;
 }
 
+// 作用：把时段平均通量分配到逐小时 out[h−first] = (h−1, h] 的平均通量（W m-2），不足覆盖处为 NaN。
+// 输入：shape=Solar（短波，权重取太阳天顶角余弦 μ，即晴空指数在时段内不变）或
+// Smooth（长波，在相邻时段中点之间线性变化）；latitude/longitude 为度，仅 Solar 使用。
+// 步骤 1：对每个有效时段，若恰为对齐整点的 1 h 记录，则直接赋给该小时；
+// 步骤 2：否则按 5 min 取样，样本权重 w（Solar：max(μ,0)；Smooth：中点线性插值并截断为 ≥0），
+// 按 w/Σw 把时段能量 mean×长度 分给样本所在小时；
+// 步骤 3：小时的覆盖时长超过 0.95 h 才输出能量/覆盖时长，由此每个时段的能量严格守恒。
 void distributeFlux(const std::vector<FluxRecord>& records, FluxShape shape, double latitude, double longitude, int64_t first,
                     int64_t last, std::vector<double>& out)
 {
@@ -116,6 +160,7 @@ void distributeFlux(const std::vector<FluxRecord>& records, FluxShape shape, dou
             weight[s] = w;
             total += w;
         }
+        // 权重和为 0（例如整个时段在夜间、μ≤0）时改为均匀分配，避免除以零；这种时段通量本应约为 0。
         if (!(total > 1e-12)) { std::fill(weight.begin(), weight.end(), 1.0); total = samples; }
         const double joules = record.mean * length;
         for (int s = 0; s < samples; ++s) {
@@ -131,6 +176,13 @@ void distributeFlux(const std::vector<FluxRecord>& records, FluxShape shape, dou
         if (covered[i] > 0.95) out[i] = energy[i] / covered[i];
 }
 
+// 作用：由逐小时通道数据合成标准量（见头文件说明），写入 data（name → [hour][cell] float；z 为 [cell]）。
+// 输入：hourly（通道键 → [hour][cell]，SI）、constant（不随时间的通道 → [cell]）、
+// hours、cells、需要的标准量 variables。
+// 要点：t2m 加上气温高度订正平移 temperatureShiftK；气压按 pressureType 取地面气压、由海平面气压
+// 折算或由海拔按标准大气估算；d2m 按 humidityType 先换为水汽压再反解露点；
+// 风按 components / speed / speedDirection 得到 u、v 再乘 windFactor；
+// 无长波数据时按 Brutsaert 晴空参数化并警告；换算过的量写入 report.derived。
 void standardiseQuantities(const ForcingMetadata& meta_, const std::map<std::string, std::vector<double>>& hourly,
                            const std::map<std::string, std::vector<double>>& constant, size_t hours, size_t cells,
                            const std::vector<std::string>& variables, ForcingReport& report, std::map<std::string, std::vector<float>>& data)
@@ -142,6 +194,7 @@ void standardiseQuantities(const ForcingMetadata& meta_, const std::map<std::str
         if (const auto found = constant.find(key); found != constant.end()) return found->second[cell];
         return kNotANumber;
     };
+    // 海拔 = 位势 z ÷ g（m）；气压为 seaLevel/none 时由它推出地面气压。
     const auto altitude = [&](size_t hour, size_t cell) { return value("z", hour, cell) / kForcingStandardGravity; };
     const auto temperature = [&](size_t hour, size_t cell) { return value("ta", hour, cell) + meta_.temperatureShiftK; };
     bool pressureWarned = false;
@@ -180,6 +233,8 @@ void standardiseQuantities(const ForcingMetadata& meta_, const std::map<std::str
             if (meta_.windType == "speed") { u = speed; v = 0.0; }
             else {
                 const double direction = value("dir", hour, cell) * 3.14159265358979323846 / 180.0;
+                // 风向换算：气象风向 "from"（风来自的方位，自北顺时针）时分量取负号：u = −speed·sin(dir)，
+                // v = −speed·cos(dir)；"to" 为风吹向的方位，取正号。u 向东、v 向北。
                 const double sign = meta_.windConvention == "from" ? -1.0 : 1.0;
                 u = sign * speed * std::sin(direction);
                 v = sign * speed * std::cos(direction);
@@ -221,6 +276,8 @@ void standardiseQuantities(const ForcingMetadata& meta_, const std::map<std::str
     }
 }
 
+// 作用：推出标准量 variables 需要读取的通道键（ta hum p u v speed dir sw lw skt swvl z），
+// 只保留 present(key) 为真的；映射规则与 era5.cpp 中 Pack::channelsFor 相同（待核对是否应合并）。
 std::vector<std::string> forcingChannelKeys(const ForcingMetadata& meta, const std::vector<std::string>& variables,
                                             const std::function<bool(const std::string&)>& present)
 {
@@ -255,6 +312,9 @@ std::vector<std::string> forcingChannelKeys(const ForcingMetadata& meta, const s
     return out;
 }
 
+// 作用：检查一个通道的记录能否覆盖 [first, last]，不能时 why 写出第一个问题。
+// 规则：通量类要求每个 (h−1, h] 都落在某条记录代表的时段内；瞬时类需要 first 及之前、
+// last 及之后各一条记录，且二者之间相邻记录的间隔不超过 maxGap。
 bool recordsCover(const ForcingChannel& channel, double step, const std::vector<double>& times, bool flux, double maxGap,
                   int64_t first, int64_t last, std::string& why)
 {

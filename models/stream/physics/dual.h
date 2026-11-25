@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：dual.h
+// 功能：前向模式自动微分类型 Dual<N>（别名 Ad）及其数学函数，供可微物理核心使用
+// 主要模块：
+//   1. Dual<N>：值 v + N 个偏导数 d，四则运算与比较运算符
+//   2. Ad / kAdSize：同化实际使用的 8 维版本
+//   3. ad:: 命名空间：exp/log/sqrt/pow 等数学函数，对 double 与 Dual 两种类型同名重载
+//   4. ad::min / max / clamp：与 std 版本相同的取舍规则，导数取被选中分支
+// 数据流：canopy、radiosity、soil_emissivity、shortwave、energy 等核心以标量类型为模板参数；
+//         正向成像用 double，同化/反演用 Ad 运行同一份代码，得到精确雅可比
+// 约定：导数只对被选中的分支有效（限幅处导数为 0、min/max 取较小/较大者的导数）；
+//       sqrt/cbrt/pow 在 0 处导数取 0 以避免产生 inf/NaN；ad:: 函数对 double 的行为与 std 完全一致
+// ==========================================================================
+
 #pragma once
 // Forward-mode automatic differentiation for the differentiable STREAM operators.
 //
@@ -55,12 +69,15 @@ struct Dual {
     friend bool operator!=(const Dual& a, const Dual& b) { return a.v != b.v; }
 };
 
+// 别名：同化的控制量个数上限为 8，Ad 即 8 维 Dual。
 // Controls of one pixel never exceed 8 (four component temperatures + soil moisture + Vcmax + LAI).
 constexpr int kAdSize = 8;
 using Ad = Dual<kAdSize>;
 
 namespace ad {
 
+// 工具：value 取出标量值；chain 按链式法则 d(f(x)) = f'(x)·dx 构造结果，
+//       各一元函数据此给出函数值 f 与导数 df。
 inline double value(double x) { return x; }
 template <int N> double value(const Dual<N>& x) { return x.v; }
 
@@ -112,6 +129,7 @@ template <int N> Dual<N> pow(double base, const Dual<N>& e)
     return chain(e, f, f * std::log(base));
 }
 
+// 判定：对 Dual 只检查值 v，不检查导数。
 inline bool isfinite(double x) { return std::isfinite(x); }
 template <int N> bool isfinite(const Dual<N>& x) { return std::isfinite(x.v); }
 

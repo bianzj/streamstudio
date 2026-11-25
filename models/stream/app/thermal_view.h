@@ -1,3 +1,21 @@
+// ==========================================================================
+// 文件：thermal_view.h
+// 功能：热红外观测几何与观测算子的声明，供正向成像（image.cpp）、同化（assimilation.cpp）
+//       和反演（inversion.cpp）共用，保证三者使用完全相同的四组分权重
+// 主要模块：
+//   1. 太阳位置（solarPosition，NREL SPA）
+//   2. 随含水量变化的土壤方向发射率（MoistureSoilEmissivity，Hapke 表干/湿两端混合）
+//   3. 四组分有效发射率权重（thermalWeights / thermalWeightsT，后者可对 LAI、土壤发射率求导）
+//   4. ThermalScene：单像元的热红外视角（几何、地形复合、发射率设置、反射天空）
+//   5. 天空等效温度（skyTemperatureFromLongwave、swinbankLongwave）
+//   6. thermalPixel：亮温与发射率归一化表面温度；thermalSceneWeights：线性形式的权重
+//   7. 地形：局地相对方位角、TerrainFields、thermalSceneAt、setThermalMaterial
+// 数据流：config + 类参数 → setThermalMaterial / thermalSceneAt 填 ThermalScene
+//         → thermalPixel（成像、同化）或 thermalSceneWeights（反演）→ 亮温/表面温度/权重
+// 约定：角度单位为度；温度 K；长波 W m-2；组分顺序 [土壤光照, 土壤阴影, 叶片光照, 叶片阴影]
+//       方位角自北起顺时针；实现在 thermal_view.cpp，模板核按标量类型（double 或 Ad）实例化
+// ==========================================================================
+
 #pragma once
 // Thermal observation geometry shared by forward imaging (image.cpp) and assimilation (assimilation.cpp).
 // Both must see exactly the same component weights, otherwise an analysis of a simulated image would not
@@ -17,11 +35,14 @@
 
 namespace stream {
 
+// 太阳位置：zenith/azimuth 为度，ok 表示计算有效。
 struct Sun { double zenith = 0, azimuth = 0; bool ok = false; };
 
 // NREL SPA geometric solar position (no refraction), degrees; azimuth clockwise from north.
 Sun solarPosition(double unixSeconds, double latitude, double longitude, double elevation);
 
+// 模块：随含水量变化的土壤方向发射率（干端与饱和端两张 Hapke 表按含水量权重混合）。
+// atT 为模板版本，可对含水量求导（同化用）。
 // Directional soil emissivity at a water content. The Hapke albedo solve is
 // anchored to the hemispherical emissivity, so one table is built at the dry
 // class value and one at saturation and the two are blended by the same
@@ -49,6 +70,7 @@ struct MoistureSoilEmissivity {
     }
 };
 
+// 模块：四组分有效发射率权重 w_k（TiRT 比例 × 发射率 + hom3 多次散射）。
 // Effective-emissivity weights of [soil sun, soil shade, leaf sun, leaf shade] for one view: TiRT standard
 // four-component fractions times the component emissivity, plus the hom3 multiple-scattering contribution.
 // The directional radiance of the pixel is sum_k w_k B(T_k); sum_k w_k is its effective emissivity.
@@ -61,6 +83,8 @@ std::array<T, 4> thermalWeightsT(const HomCanopyT<T>& nodes, const T& lai, doubl
                                  double viewZenithDeg, double relativeAzimuthDeg, double leafEmissivity,
                                  const T& soilEmissivity);
 
+// 模块：ThermalScene——单像元、单视角的热红外场景参数。
+// 字段单位：角度为度；slope/strike 为度，coverage/endFraction 为 0-1；skyTemperature 为 K。
 // Thermal view of one pixel: geometry, sub-pixel terrain composite and emissivity settings.
 enum class ThermalTerrain { Flat, Hill, Ridge };
 struct ThermalScene {
@@ -83,12 +107,14 @@ struct ThermalScene {
     double skyTemperature = std::numeric_limits<double>::quiet_NaN();
 };
 
+// 模块：反射天空项的来源换算（宽带下行长波 → 等效黑体天空温度；RT 缺省的 Swinbank 估计）。
 // Equivalent sky temperature of a broadband downwelling longwave flux [W m-2]; NaN when the flux is not positive.
 double skyTemperatureFromLongwave(double longwave);
 // Clear-sky downwelling longwave from the air temperature (Swinbank 1963, L↓ = 5.31e-13 Ta^6 W m-2); the RT
 // default when no L↓ is configured (the shaded component temperature stands in for the air temperature).
 double swinbankLongwave(double airTemperatureK);
 
+// 模块：单像元热红外观测算子（正向成像用 double，同化用 Ad 自动微分）。
 // Top-of-canopy brightness temperature and surface temperature product for each wavelength. The forward imaging
 // runs it with double; the assimilation runs it with Ad (derivatives with respect to the component temperatures,
 // LAI and soil moisture). Returns false when the radiance is invalid or a weighted component is missing.
@@ -112,6 +138,8 @@ bool thermalSceneWeights(const ThermalScene& scene, double lai, double moisture,
 double localRelativeAzimuth(double szaDeg, double saaDeg, double vzaDeg, double vaaDeg, double localSzaDeg,
                             double localVzaDeg);
 
+// 模块：地形字段与场景构造（面元 facet 用 slope/aspect，hill 用 coneSlope/coneDensity，
+// ridge 用 ridgeSlope/ridgeAspect/ridgeDensity；不使用的模式为空指针）。
 // Per-pixel terrain fields of the run (null / empty when the mode does not use them).
 struct TerrainFields {
     TerrainRadiation mode = TerrainRadiation::None;

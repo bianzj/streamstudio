@@ -1,3 +1,17 @@
+// ==========================================================================
+// 文件：era5.h
+// 功能：ERA5 / ERA5-Land 以及其他网格 NetCDF 强迫数据包（pack）的登记与读取接口
+// 主要模块：
+//   1. requiredVariables / optionalVariables：EB 需要/可选的标准量清单
+//   2. registerPack / registerForcingPack：扫描 NetCDF，写数据包索引 JSON
+//   3. Pack：ForcingSource 的网格实现（open → covers → load → weights → at/hourlyFlux）
+// 数据流：索引 JSON + NetCDF → Pack.load 按经纬窗口与小时范围读入内存 →
+//   pixel_forcing 用 weights 做双线性插值
+// 约定：时间为自 1970-01-01 UTC 起整小时数；ssrd/strd 的 hourlyFlux 返回 W m-2
+// 注意：ERA5 / ERA5-Land 恒等布局（generic_=false）走原读取路径，与引入元数据层前逐位一致
+// 与其他文件：era5.cpp 实现；元数据见 forcing_metadata.h；接口见 forcing_source.h
+// ==========================================================================
+
 #pragma once
 #include "forcing_metadata.h"
 #include "forcing_source.h"
@@ -26,6 +40,8 @@ bool registerForcingPack(const std::vector<std::string>& files, const std::files
 
 using Weights = ForcingWeights;
 
+// 模块：网格数据包。generic_ 为真时按元数据标准化（含时间重采样），
+// 否则为 ERA5 原路径；data_ 按变量存放窗口内 [hour][row][column] 的 float 数据。
 // One pack, read over a latitude/longitude window and a range of UTC hours (ERA5 implementation of ForcingSource).
 class Pack : public ForcingSource {
 public:

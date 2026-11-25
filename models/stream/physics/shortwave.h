@@ -1,3 +1,16 @@
+// ==========================================================================
+// 文件：shortwave.h
+// 功能：短波分配与吸收的接口声明：太阳谱分组 SolarBins、漫射份额函数、各组分吸收结果结构。
+// 主要模块：
+//   1. SolarBins / makeSolarBins / binSpectrum：1 nm 太阳谱分组与光谱组内平均
+//   2. OpticalSpectra：每组的叶片反射/透射与土壤反射率（指针，不拥有数据）
+//   3. ShortwaveAbsorption 与 absorbShortwave：double 版吸收结果与诊断量
+//   4. requestedDiffuseFraction / admissibleDiffuseFraction：Erbs 反算与晴空 DNI 上限限幅
+//   5. ShortwaveComponentsT / shortwaveComponents：任意标量类型（double 或 Ad）的组分吸收
+// 关系：实现在 shortwave.cpp，节点辐射度来自 radiosity.h；energy.cpp 与成像/同化代码调用。
+// 约定：吸收量为每单位组分面积的 W m-2；PAR 量为 μmol m-2 s-1；天顶角为度。
+// ==========================================================================
+
 #pragma once
 #include "dual.h"
 
@@ -6,6 +19,8 @@
 
 namespace stream {
 
+// 结构体：太阳光谱分组。direct/diffuse 为各组直射/天空光谱形状的积分权重，photon 为 PAR 组的
+// μmol J-1 换算系数（非 PAR 组为 0），directTotal/diffuseTotal 为全谱权重和（用于归一）。
 // Reference solar spectral shapes (fesun / fesky) integrated over contiguous bins of the 1 nm grid.
 // Leaf and soil spectra are averaged over the same bins before the node-radiosity solve.
 struct SolarBins {
@@ -16,6 +31,7 @@ struct SolarBins {
     size_t size() const { return range.size(); }
 };
 
+// 构造分组（binWidthNm = 1 为 1 nm 全谱，缺省配置 50 nm）；binSpectrum 把 1 nm 光谱按同分组取组内平均。
 SolarBins makeSolarBins(const std::vector<float>& fesun, const std::vector<float>& fesky, int binWidthNm);
 std::vector<float> binSpectrum(const SolarBins& bins, const std::vector<float>& spectrum);
 
@@ -26,6 +42,11 @@ struct OpticalSpectra {
     const std::vector<float>* soilReflectance = nullptr;
 };
 
+// 结果结构：字段含义（W m-2，PAR 为 μmol m-2 s-1）：soil/leafDirect 光照部分的直射吸收，
+// *DiffuseSun/Shade 光照/阴影组分的漫射吸收，*Mean 面积平均，par* 对应 PAR；
+// soilSunlitFraction 光照土壤面积份额，laiSunlit 光照叶面积；albedo 场景反照率；
+// diffuseFraction 实际使用的漫射份额（Requested 为请求值）；directNormal(Limit) 法向直射及其晴空上限；
+// clearnessIndex 晴空指数；partitionLimited 表示 DNI 上限使直射被转为漫射。
 // Absorbed shortwave per unit component area (soil per soil area, leaves per leaf area), as TIRTEB.
 struct ShortwaveAbsorption {
     double soilDirect = 0, leafDirect = 0;
@@ -50,6 +71,7 @@ double requestedDiffuseFraction(double globalShortwave, double szaDeg, double co
 double admissibleDiffuseFraction(double globalShortwave, double szaDeg, int dayOfYear, double configured,
                                  bool enforceLimit, double* limit = nullptr);
 
+// 作用：给定全球短波与几何，返回各组分吸收（double 版，实现见 shortwave.cpp）。
 ShortwaveAbsorption absorbShortwave(const SolarBins& sun, const OpticalSpectra& spectra, double lai,
                                     double globalShortwave, double szaDeg, int dayOfYear, double requestedFraction,
                                     bool enforceLimit, bool sunlit);

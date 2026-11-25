@@ -1,3 +1,16 @@
+// ==========================================================================
+// 文件：main.cpp
+// 功能：stream.exe 命令行入口：解析子命令并分发到各引擎功能
+// 主要模块/步骤：
+//   1. usePackagedProj / utf8FromWide：Windows 下 PROJ 数据库路径与宽字符参数转 UTF-8
+//   2. forcingCheck：校验气象强迫元数据（可选再打开数据核对变量、时间、站点）
+//   3. dispatch：run / forcing-preset / forcing-check / forcing-register / era5-register
+//   4. wmain/main：初始化 GDAL，捕获异常并以退出码返回
+// 数据流：命令行 → args（UTF-8）→ image.cpp 的 runImage（run）或 forcing/ 下的登记与校验函数
+// 退出码：0 成功；1 运行时异常；2 用法错误；3 校验失败或登记失败
+// 约定：全程路径与字符串为 UTF-8；进度输出由 image.cpp 写 stdout，日志行以 [STREAM] 开头
+// ==========================================================================
+
 // stream: STREAM remote-sensing image simulation for Stream Studio.
 //   stream run <config.json>
 //   stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...
@@ -27,8 +40,11 @@
 #include <windows.h>
 #endif
 
+// 匿名命名空间：仅本文件使用的辅助函数。
 namespace {
 
+// 模块：PROJ 数据库定位（仅 Windows）。
+// 说明：若可执行文件同目录下有 proj/proj.db，则覆盖 PROJ 的默认搜索路径；否则保持默认。
 // PROJ looks for proj.db in its build-time prefix, which does not exist on a customer machine; use the copy
 // deployed next to the executable.
 void usePackagedProj()
@@ -46,6 +62,8 @@ void usePackagedProj()
 #endif
 }
 
+// 模块：UTF-16（wchar_t）转 UTF-8，含代理对（surrogate pair）合并为单个码点。
+// 用于 Windows 的 wmain 参数转换，保证后续路径/JSON 处理统一为 UTF-8。
 std::string utf8FromWide(const wchar_t* text)
 {
     std::string out;
@@ -63,6 +81,9 @@ std::string utf8FromWide(const wchar_t* text)
     return out;
 }
 
+// 模块：stream forcing-check 子命令。
+// 输入：args[1] 为预设名/元数据文件/内联 JSON；可选 --data 后接数据包索引或站点 CSV；--json 输出 JSON。
+// 输出：返回 0 表示校验通过，3 表示有错误；错误、警告、信息分别输出。
 // stream forcing-check <preset|metadata.json|JSON> [--json]: parses and validates a forcing metadata document.
 int forcingCheck(const std::vector<std::string>& args)
 {
@@ -77,6 +98,8 @@ int forcingCheck(const std::vector<std::string>& args)
     }
     stream::ForcingIssues issues;
     const stream::ForcingMetadata metadata = stream::resolveForcingMetadata(specifier, std::filesystem::current_path(), &issues);
+    // 步骤 2：元数据本身无误且给出了 --data 时，再按元数据打开数据
+    // （站点 CSV 或网格数据包），把数据侧的警告并入 issues；步骤 1 为上方的元数据解析。
     if (issues.ok() && !dataFiles.empty()) {
         // Second step: open the data with the metadata (variables / columns present, time parsing, coverage).
         try {
@@ -117,6 +140,7 @@ int forcingCheck(const std::vector<std::string>& args)
     return issues.ok() ? 0 : 3;
 }
 
+// 作用：打印命令行用法到 stderr，返回 2（用法错误）。
 int usage()
 {
     std::cerr << "usage: stream run <config.json>\n"
@@ -127,6 +151,11 @@ int usage()
     return 2;
 }
 
+// 模块：子命令分发。args 不含程序名。
+//   run <config>：调用 runImage；forcing-preset：列出预设或输出某预设 JSON；
+//   forcing-check：校验元数据；forcing-register：以元数据登记任意网格强迫数据包；
+//   era5-register：登记 ERA5/ERA5-Land 数据包（--product 可指定产品）。
+// 其他参数组合返回 usage()。
 int dispatch(const std::vector<std::string>& args)
 {
     if (args.size() == 2 && args[0] == "run") return stream::runImage(args[1]);
@@ -144,6 +173,7 @@ int dispatch(const std::vector<std::string>& args)
             else files.push_back(args[index]);
         }
         if (spec.empty()) throw std::runtime_error("forcing-register 需要 --metadata <预设名|元数据.json>");
+        // 步骤：判断 spec 是预设名、内联 JSON（以 { 开头）还是文件；文件路径转为绝对路径后再登记。
         // A metadata file is stored by absolute path so the pack still finds it when moved next to the index.
         bool preset = spec.rfind("{", 0) == 0;
         for (const auto& name : stream::forcingPresetNames()) preset = preset || name == spec;
@@ -166,6 +196,7 @@ int dispatch(const std::vector<std::string>& args)
 }  // namespace
 
 #ifdef _WIN32
+// 程序入口：Windows 用 wmain 取得 UTF-16 参数并转为 UTF-8；其他平台用 main。
 int wmain(int argc, wchar_t* argv[])
 {
     std::vector<std::string> args;
@@ -175,11 +206,13 @@ int main(int argc, char* argv[])
 {
     std::vector<std::string> args(argv + 1, argv + argc);
 #endif
+    // 步骤 1：stdout/stderr 设为无缓冲，使进度行（STREAM\tprogress ...）能被服务端实时读取。
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
     if (args.empty()) return usage();
     // Paths are UTF-8 throughout; GDAL must interpret file names the same way.
     CPLSetConfigOption("GDAL_FILENAME_IS_UTF8", "YES");
+    // 步骤 2：注册 GDAL 驱动，并（Windows）指向随程序部署的 PROJ 数据库。
     GDALAllRegister();
     usePackagedProj();
     try {

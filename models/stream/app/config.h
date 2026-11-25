@@ -1,3 +1,20 @@
+// ==========================================================================
+// 文件：config.h
+// 功能：STREAM 遥感像元尺度引擎的运行配置结构体与配置读取入口 readImageConfig。
+// 主要模块：
+//   1. 光谱波段 SpectralBand、温度来源模式 TemperatureMode（Rt = 组分温度输入，Eb = 能量平衡）
+//   2. 反演配置：InversionObservation / InversionConfig（LST 与 LSCT 反演）
+//   3. 同化配置：AssimilationObservation / AssimilationView / AssimilationConfig
+//   4. 地形辐射模式 TerrainRadiation
+//   5. ImageConfig：一次成像运行的全部输入栅格、光学/热红外波段、EB 物理选项、
+//      反射天空长波、反演/同化子配置、线程数、EB 预热时长
+// 数据流：运行配置 JSON → config.cpp 的 readImageConfig → ImageConfig →
+//   主流程（成像、反演 inversion、同化 assimilation.cpp）读取。
+// 约定：Field 为栅格场（scene/raster.h）；角度单位为度；温度 K；波长 μm（光谱波段中心/半宽
+//   的单位见 config.cpp 的解析，待核对）；通量 W m-2；overpass 为自 1970-01-01 UTC 起的秒数。
+// 说明：部分字段带 FIX(日期) 标记，说明其来源于某次问题修复，保持默认值以兼容旧工程。
+// ==========================================================================
+
 #pragma once
 #include "../physics/energy.h"
 #include "../scene/raster.h"
@@ -9,15 +26,18 @@
 
 namespace stream {
 
+// 模块：一个光谱波段（名称、中心波长 center、半高全宽 fwhm）。
 struct SpectralBand {
     std::string name;
     double center = 0, fwhm = 0;
 };
 
+// 温度来源：Rt = 由配置提供四个组分温度（辐射传输成像）；Eb = 由能量平衡求解。
 enum class TemperatureMode { Rt, Eb };
 
 // One thermal observation used by the inversion: a brightness-temperature (or LST-product) band, its wavelength,
 // 1-sigma error and view geometry (absent VZA/VAA reuse the scene view geometry).
+// 反演观测种类：Brightness 亮温，Lst 地表温度产品；见上方 InversionObservation 说明。
 enum class ObservationKind { Brightness, Lst };
 struct InversionObservation {
     std::string name;
@@ -28,6 +48,9 @@ struct InversionObservation {
     Field vza, vaa;           // degrees
 };
 
+// 反演设置（InversionConfig）：目标 None / Lst（一个辐射温度）/ Lsct（四个组分温度 Tss/Tsh/Tcs/Tch）；
+// 先验标准差 priorSd（K）与组分相关系数、LST 发射率误差、LSCT 共享窗口 window（奇数）、
+// 最大迭代次数与收敛阈值 tolerance（K）。观测见 InversionObservation（亮温或 LST 产品）。
 // Retrieval of LST (one radiometric temperature) or LSCT (four component temperatures, MAP Gauss-Newton with the
 // temperature source of the run as background). The posterior replaces the component temperatures used for imaging.
 enum class InversionTarget { None, Lst, Lsct };
@@ -43,6 +66,9 @@ struct InversionConfig {
     double tolerance = 1e-3;       // K
     bool enabled() const { return target != InversionTarget::None; }
 };
+// 同化配置：AssimilationObservation 选择观测种类（None 不同化）；AssimilationView 为一个观测
+// 视角（数据、视角几何、可选不确定度与 QA 栅格）；AssimilationConfig 汇总观测数据、光学观测、
+// 默认观测误差（K 或反射率）、QA 剔除位、观测层级与来源标识。下面为英文原注释。
 // Run mode "同化": optional observation errors/QA override compatible defaults.
 //   brightness: brightness temperatures, one band per thermal band (scene view; optional extra views)
 //   lst       : one radiometric LST band (10.5 um, fixed class emissivity convention)
@@ -63,17 +89,24 @@ struct AssimilationConfig {
     std::string uncertainty, covariance, qa, opticalUncertainty, opticalQa;
     double sigmaBrightnessK = 0.5, sigmaLstK = 1.0, sigmaComponentK = 2.0, sigmaReflectance = 0.02;
     double lstWavelengthUm = 10.5;
+    // rejectQaBits = 895 = 二进制 1101111111：剔除 QA 第 0–6、8–9 位被置位的观测，第 7 位不剔除；
+    // 各位含义见行尾注释，位定义的来源（待核对）。
     unsigned rejectQaBits = 895;  // invalid/ill-conditioned/low-support/not-converged; bits 0-6,8-9 except bit 7
     std::string observationLevel;  // canopy (brightness), surface (LST/components); no TOA operator
     std::vector<std::string> sourceIds, priorSourceIds;
     bool enabled() const { return observation != AssimilationObservation::None; }
 };
 
+// 地形辐射模式：None 水平面；Single 全场景单一坡面；Facet 由 DEM 逐像元坡度/坡向；
+// Hill 统计山丘（亚像元锥形面元 + 密度）；Ridge 山脊（可带端面，见 terrainEndFraction）。
 // Surface orientation used by the shortwave forcing: none (horizontal), one plane for the whole scene,
 // a per-pixel slope/aspect facet field from the DEM (facet method), or a statistical hill composite
 // (sub-pixel cone facets + density).
 enum class TerrainRadiation { None, Single, Facet, Hill, Ridge };
 
+// 模块：一次成像运行的完整配置（输入栅格、波段、EB 物理选项、反演与同化子配置）。
+// 各字段分组：场景栅格 → 土壤亮度 → 分区范围 → 波段 → 温度来源 → EB 强迫与地形
+// → TIRTEB 对齐的能量平衡选项 → 发射率/土壤热参数 → 迭代与预热。
 struct ImageConfig {
     std::filesystem::path outputDir, dataDir;
     double overpass = 0;  // seconds since 1970-01-01 UTC
@@ -149,6 +182,8 @@ struct ImageConfig {
     InversionConfig inversion;
     AssimilationConfig assimilation;
     int threads = 0;
+    // 忽略的冠层/行结构键：配置中给出但模型不模拟；运行时仅警告，并在 scene_summary.json 中
+    // 按均匀冠层记录。
     // FIX(2026-11-21 C9): crown / row structure keys given in the run config (surface.*); not simulated, the run
     // warns and records a homogeneous canopy in scene_summary.json.
     std::vector<std::string> ignoredStructureKeys;
@@ -160,6 +195,7 @@ struct ImageConfig {
     int spinupHours = 7;
 };
 
+// 作用：读取运行配置 JSON（路径 path）并返回 ImageConfig；实现见 config.cpp。
 ImageConfig readImageConfig(const std::string& path);
 
 }  // namespace stream

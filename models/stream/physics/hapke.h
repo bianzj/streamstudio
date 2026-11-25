@@ -1,3 +1,18 @@
+// ==========================================================================
+// 文件：hapke.h
+// 功能：粗糙土壤的方向发射率（Hapke 形式，TiRT soilopt.hapke_emissivity）及其查表
+// 主要模块：
+//   1. hapkeEmissivity：给定观测天顶角、粗糙参数 K 与单次散射反照率 w 的方向发射率
+//   2. hapkeHemisphericalEmissivity：余弦加权半球平均（中点法 180 段）
+//   3. hapkeAlbedoForHemispherical：二分法反求使半球发射率等于地类给定值的 w
+//   4. hapkeDirectionalEmissivity：由半球发射率直接得到方向发射率
+//   5. SoilEmissivityTable：按观测天顶角（0.1° 间隔）的发射率查找表
+// 数据流：地类/配置给出土壤半球发射率（含水量插值后，见 soil_emissivity.h）→ 反求 w →
+//         热红外成像按观测方向取方向发射率；宽带能量平衡仍使用半球发射率
+// 约定：角度为度；发射率 0-1；K 为 Hapke 粗糙/几何参数（下限 1e-8 防除零）；
+//       w 限制在 [0, 0.999999]
+// ==========================================================================
+
 #pragma once
 #include "constants.h"
 
@@ -22,6 +37,7 @@ inline double hapkeEmissivity(double viewZenithDeg, double K, double albedo)
     return std::clamp(base * (1.0 + term) / (1.0 + term * base), 0.0, 1.0);
 }
 
+// 说明：半球平均 = ∫ e(z)·2μ dμ（μ = cos z），中点法，各段权重 2μ/段数。
 // Cosine-weighted hemispherical mean by a midpoint rule in mu = cos(zenith) (180 bands, error < 1e-5).
 inline double hapkeHemisphericalEmissivity(double K, double albedo)
 {
@@ -35,6 +51,8 @@ inline double hapkeHemisphericalEmissivity(double K, double albedo)
     return std::clamp(total, 0.0, 1.0);
 }
 
+// 说明：target 不小于 w = 0 时的半球发射率（即无法达到）时返回 0；否则二分 60 次，
+//       利用半球发射率随 w 单调下降的性质。
 // Single-scattering albedo whose hemispherical emissivity equals `target` (bisection; monotone decreasing).
 inline double hapkeAlbedoForHemispherical(double K, double target)
 {
@@ -48,11 +66,14 @@ inline double hapkeAlbedoForHemispherical(double K, double target)
     return 0.5 * (low + high);
 }
 
+// 作用：由半球发射率与 K 直接求某观测天顶角的方向发射率（每次都重新二分，批量调用请用下面的查表）。
 inline double hapkeDirectionalEmissivity(double viewZenithDeg, double K, double hemisphericalEmissivity)
 {
     return hapkeEmissivity(viewZenithDeg, K, hapkeAlbedoForHemispherical(K, hemisphericalEmissivity));
 }
 
+// 模块：方向发射率查找表。build 一次反求 w 并填表（0-90°、0.1° 步长）；
+//       at 按观测天顶角线性插值，输入非有限值时取天顶（0°）值。
 // View-zenith lookup: the albedo is solved once, then the table is filled with e(z) for that albedo.
 class SoilEmissivityTable {
 public:
