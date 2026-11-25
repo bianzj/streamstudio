@@ -1,0 +1,105 @@
+{
+  "kind": "stream-image-project",
+  "schemaVersion": 2,
+  "name": "北京 · Landsat 8/9 OLI + TIRS",
+  "description": "复用母工程（../project.json）EB 求得的组分温度（默认读 ../reference/components.tif，运行 run_all.mjs 时换成本次母工程输出），只做 Landsat 8/9 OLI + TIRS 的波段成像，天顶 0°。",
+  "scene": {
+    "name": "stream_beijing_300m_landsat89",
+    "locationSource": "georef",
+    "overpass": "2019-08-15T02:55:00Z",
+    "displayTimezone": 8,
+    "threads": 0,
+    "region": {
+      "enabled": false,
+      "startRow": 0,
+      "endRow": 1,
+      "startColumn": 0,
+      "endColumn": 1
+    },
+    "surface": {
+      "type": {
+        "file": "../inputs/type.tif"
+      },
+      "lai": {
+        "file": "../inputs/lai.tif"
+      },
+      "dem": {
+        "file": "../inputs/dem.tif"
+      }
+    },
+    "view": {
+      "vza": {
+        "value": 0
+      },
+      "vaa": {
+        "value": 0
+      }
+    },
+    "optical": {
+      "enabled": true,
+      "bands": [
+        {
+          "name": "B1",
+          "center": 443,
+          "fwhm": 16
+        },
+        {
+          "name": "B2",
+          "center": 482,
+          "fwhm": 60
+        },
+        {
+          "name": "B3",
+          "center": 561.5,
+          "fwhm": 57
+        },
+        {
+          "name": "B4",
+          "center": 654.5,
+          "fwhm": 37
+        },
+        {
+          "name": "B5",
+          "center": 865,
+          "fwhm": 28
+        },
+        {
+          "name": "B6",
+          "center": 1608.5,
+          "fwhm": 85
+        },
+        {
+          "name": "B7",
+          "center": 2200.5,
+          "fwhm": 187
+        }
+      ]
+    },
+    "thermal": {
+      "enabled": true,
+      "bands": [
+        {
+          "name": "B10",
+          "center": 10.895,
+          "fwhm": 0.59
+        },
+        {
+          "name": "B11",
+          "center": 12.005,
+          "fwhm": 1.01
+        }
+      ]
+    },
+    "temperature": {
+      "mode": "rt",
+      "components": {
+        "source": "package",
+        "file": "../reference/components.tif"
+      },
+      "energy": {
+        "diffuseFraction": 0.2
+      }
+    },
+    "outputRoot": "output"
+  }
+}

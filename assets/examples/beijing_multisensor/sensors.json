@@ -1,0 +1,573 @@
+{
+  "kind": "beijing-multisensor-sensors",
+  "schemaVersion": 1,
+  "description": "北京多传感器案例的传感器与波段表。光学 center/fwhm 单位 nm，热红外单位 μm（STREAM 约定）；STREAM 以 center/fwhm 的高斯近似光谱响应函数。",
+  "method": "凡官方给出波段范围 [lo, hi]，取 center = (lo+hi)/2、fwhm = hi − lo（等效矩形近似，范围保留在 range 字段）；官方给出中心波长与带宽时直接采用。",
+  "verifyMeaning": "verify=true 表示“待核对”：数值是标称值或检索摘要，未在官方原文上逐项核对，报告引用前请核对。",
+  "sensors": [
+    {
+      "id": "landsat89",
+      "name": "Landsat 8/9 OLI + TIRS",
+      "platform": "Landsat 8 / Landsat 9",
+      "variant": "variants/landsat89.json",
+      "opticalUnit": "nm",
+      "thermalUnit": "um",
+      "optical": [
+        {
+          "name": "B1",
+          "center": 443,
+          "fwhm": 16,
+          "range": [
+            435,
+            451
+          ],
+          "source": "https://landsat.gsfc.nasa.gov/wp-content/uploads/2013/01/BandpassesL7vL8_Jul20131.pdf",
+          "verify": false
+        },
+        {
+          "name": "B2",
+          "center": 482,
+          "fwhm": 60,
+          "range": [
+            452,
+            512
+          ],
+          "source": "https://landsat.gsfc.nasa.gov/wp-content/uploads/2013/01/BandpassesL7vL8_Jul20131.pdf",
+          "verify": false
+        },
+        {
+          "name": "B3",
+          "center": 561.5,
+          "fwhm": 57,
+          "range": [
+            533,
+            590
+          ],
+          "source": "https://landsat.gsfc.nasa.gov/wp-content/uploads/2013/01/BandpassesL7vL8_Jul20131.pdf",
+          "verify": false
+        },
+        {
+          "name": "B4",
+          "center": 654.5,
+          "fwhm": 37,
+          "range": [
+            636,
+            673
+          ],
+          "source": "https://landsat.gsfc.nasa.gov/wp-content/uploads/2013/01/BandpassesL7vL8_Jul20131.pdf",
+          "verify": false
+        },
+        {
+          "name": "B5",
+          "center": 865,
+          "fwhm": 28,
+          "range": [
+            851,
+            879
+          ],
+          "source": "https://landsat.gsfc.nasa.gov/wp-content/uploads/2013/01/BandpassesL7vL8_Jul20131.pdf",
+          "verify": false
+        },
+        {
+          "name": "B6",
+          "center": 1608.5,
+          "fwhm": 85,
+          "range": [
+            1566,
+            1651
+          ],
+          "source": "https://landsat.gsfc.nasa.gov/wp-content/uploads/2013/01/BandpassesL7vL8_Jul20131.pdf",
+          "verify": false
+        },
+        {
+          "name": "B7",
+          "center": 2200.5,
+          "fwhm": 187,
+          "range": [
+            2107,
+            2294
+          ],
+          "source": "https://landsat.gsfc.nasa.gov/wp-content/uploads/2013/01/BandpassesL7vL8_Jul20131.pdf",
+          "verify": false
+        }
+      ],
+      "thermal": [
+        {
+          "name": "B10",
+          "center": 10.895,
+          "fwhm": 0.59,
+          "range": [
+            10.6,
+            11.19
+          ],
+          "source": "https://www.usgs.gov/faqs/what-are-band-designations-landsat-satellites",
+          "verify": false,
+          "note": "TIRS 带 10 范围 10.60–11.19 μm"
+        },
+        {
+          "name": "B11",
+          "center": 12.005,
+          "fwhm": 1.01,
+          "range": [
+            11.5,
+            12.51
+          ],
+          "source": "https://www.usgs.gov/faqs/what-are-band-designations-landsat-satellites",
+          "verify": false,
+          "note": "TIRS 带 11 范围 11.50–12.51 μm；Landsat 9 TIRS-2 响应略有差别，此处不区分"
+        }
+      ]
+    },
+    {
+      "id": "modis",
+      "name": "MODIS（Terra）",
+      "platform": "Terra",
+      "variant": "variants/modis.json",
+      "optical": [
+        {
+          "name": "B1",
+          "center": 645,
+          "fwhm": 50,
+          "range": [
+            620,
+            670
+          ],
+          "source": "https://modis.gsfc.nasa.gov/about/specifications.php",
+          "verify": false
+        },
+        {
+          "name": "B2",
+          "center": 858.5,
+          "fwhm": 35,
+          "range": [
+            841,
+            876
+          ],
+          "source": "https://modis.gsfc.nasa.gov/about/specifications.php",
+          "verify": false
+        },
+        {
+          "name": "B3",
+          "center": 469,
+          "fwhm": 20,
+          "range": [
+            459,
+            479
+          ],
+          "source": "https://modis.gsfc.nasa.gov/about/specifications.php",
+          "verify": false
+        },
+        {
+          "name": "B4",
+          "center": 555,
+          "fwhm": 20,
+          "range": [
+            545,
+            565
+          ],
+          "source": "https://modis.gsfc.nasa.gov/about/specifications.php",
+          "verify": false
+        },
+        {
+          "name": "B5",
+          "center": 1240,
+          "fwhm": 20,
+          "range": [
+            1230,
+            1250
+          ],
+          "source": "https://modis.gsfc.nasa.gov/about/specifications.php",
+          "verify": false
+        },
+        {
+          "name": "B6",
+          "center": 1640,
+          "fwhm": 24,
+          "range": [
+            1628,
+            1652
+          ],
+          "source": "https://modis.gsfc.nasa.gov/about/specifications.php",
+          "verify": false
+        },
+        {
+          "name": "B7",
+          "center": 2130,
+          "fwhm": 50,
+          "range": [
+            2105,
+            2155
+          ],
+          "source": "https://modis.gsfc.nasa.gov/about/specifications.php",
+          "verify": false
+        }
+      ],
+      "thermal": [
+        {
+          "name": "B31",
+          "center": 11.03,
+          "fwhm": 0.5,
+          "range": [
+            10.78,
+            11.28
+          ],
+          "source": "https://modis.gsfc.nasa.gov/about/specifications.php",
+          "verify": false
+        },
+        {
+          "name": "B32",
+          "center": 12.02,
+          "fwhm": 0.5,
+          "range": [
+            11.77,
+            12.27
+          ],
+          "source": "https://modis.gsfc.nasa.gov/about/specifications.php",
+          "verify": true,
+          "note": "未能在官方页面上逐项核对，按标称范围 11.770–12.270 μm"
+        }
+      ]
+    },
+    {
+      "id": "sentinel2",
+      "name": "Sentinel-2 MSI（仅光学）",
+      "platform": "Sentinel-2A",
+      "variant": "variants/sentinel2.json",
+      "optical": [
+        {
+          "name": "B2",
+          "center": 492.4,
+          "fwhm": 66,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        },
+        {
+          "name": "B3",
+          "center": 559.8,
+          "fwhm": 36,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        },
+        {
+          "name": "B4",
+          "center": 664.6,
+          "fwhm": 31,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        },
+        {
+          "name": "B5",
+          "center": 704.1,
+          "fwhm": 15,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        },
+        {
+          "name": "B6",
+          "center": 740.5,
+          "fwhm": 15,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        },
+        {
+          "name": "B7",
+          "center": 782.8,
+          "fwhm": 20,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        },
+        {
+          "name": "B8",
+          "center": 832.8,
+          "fwhm": 106,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        },
+        {
+          "name": "B8A",
+          "center": 864.7,
+          "fwhm": 21,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        },
+        {
+          "name": "B11",
+          "center": 1613.7,
+          "fwhm": 91,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        },
+        {
+          "name": "B12",
+          "center": 2202.4,
+          "fwhm": 175,
+          "source": "https://step.esa.int/main/wp-content/help/versions/11.0.0/snap-toolboxes/eu.esa.opt.opttbx.s2msi.reader/Sentinel2Overview.html",
+          "verify": false
+        }
+      ],
+      "thermal": []
+    },
+    {
+      "id": "aster",
+      "name": "ASTER TIR",
+      "platform": "Terra",
+      "variant": "variants/aster.json",
+      "optical": [],
+      "thermal": [
+        {
+          "name": "B10",
+          "center": 8.3,
+          "fwhm": 0.35,
+          "range": [
+            8.125,
+            8.475
+          ],
+          "source": "https://ieeexplore.ieee.org/document/1542341",
+          "verify": false
+        },
+        {
+          "name": "B11",
+          "center": 8.65,
+          "fwhm": 0.35,
+          "range": [
+            8.475,
+            8.825
+          ],
+          "source": "https://asterweb.jpl.nasa.gov/characteristics.asp",
+          "verify": true,
+          "note": "检索摘要中该带范围被截断，按标称 8.475–8.825 μm"
+        },
+        {
+          "name": "B12",
+          "center": 9.1,
+          "fwhm": 0.35,
+          "range": [
+            8.925,
+            9.275
+          ],
+          "source": "https://asterweb.jpl.nasa.gov/characteristics.asp",
+          "verify": false
+        },
+        {
+          "name": "B13",
+          "center": 10.6,
+          "fwhm": 0.7,
+          "range": [
+            10.25,
+            10.95
+          ],
+          "source": "https://ieeexplore.ieee.org/document/1542341",
+          "verify": false
+        },
+        {
+          "name": "B14",
+          "center": 11.3,
+          "fwhm": 0.7,
+          "range": [
+            10.95,
+            11.65
+          ],
+          "source": "https://ieeexplore.ieee.org/document/1542341",
+          "verify": false
+        }
+      ]
+    },
+    {
+      "id": "ecostress",
+      "name": "ECOSTRESS",
+      "platform": "ISS",
+      "variant": "variants/ecostress.json",
+      "optical": [],
+      "thermal": [
+        {
+          "name": "TIR1",
+          "center": 8.285,
+          "fwhm": 0.4,
+          "source": "https://lpdaac.usgs.gov/documents/1321/ECO1B_PSD_V1.pdf",
+          "verify": true,
+          "note": "中心波长来自 L1B 产品规范 radiance_1；带宽为标称值，未核对"
+        },
+        {
+          "name": "TIR2",
+          "center": 8.785,
+          "fwhm": 0.4,
+          "source": "https://lpdaac.usgs.gov/documents/1321/ECO1B_PSD_V1.pdf",
+          "verify": true,
+          "note": "中心波长来自 L1B 产品规范 radiance_2；带宽为标称值，未核对"
+        },
+        {
+          "name": "TIR3",
+          "center": 9.06,
+          "fwhm": 0.4,
+          "source": "https://lpdaac.usgs.gov/documents/1321/ECO1B_PSD_V1.pdf",
+          "verify": true,
+          "note": "中心波长来自 L1B 产品规范 radiance_3（文献实测中心约 9.20 μm）；带宽为标称值，未核对"
+        },
+        {
+          "name": "TIR4",
+          "center": 10.522,
+          "fwhm": 0.6,
+          "source": "https://lpdaac.usgs.gov/documents/1321/ECO1B_PSD_V1.pdf",
+          "verify": true,
+          "note": "中心波长来自 L1B 产品规范 radiance_4（文献实测约 10.49 μm）；带宽为标称值，未核对"
+        },
+        {
+          "name": "TIR5",
+          "center": 12.001,
+          "fwhm": 1,
+          "source": "https://lpdaac.usgs.gov/documents/1321/ECO1B_PSD_V1.pdf",
+          "verify": true,
+          "note": "中心波长为 L1B 产品规范 radiance_5 标称值，文献实测约 12.09 μm；带宽为标称值，未核对"
+        }
+      ]
+    },
+    {
+      "id": "viirs",
+      "name": "VIIRS（Suomi NPP / NOAA-20）",
+      "platform": "Suomi NPP",
+      "variant": "variants/viirs.json",
+      "optical": [
+        {
+          "name": "M3",
+          "center": 488,
+          "fwhm": 19,
+          "source": "https://www.star.nesdis.noaa.gov/smcd/emb/viirs_aerosol/algorithm.php",
+          "verify": false
+        },
+        {
+          "name": "M4",
+          "center": 555,
+          "fwhm": 21,
+          "source": "https://www.star.nesdis.noaa.gov/smcd/emb/viirs_aerosol/algorithm.php",
+          "verify": false
+        },
+        {
+          "name": "M5",
+          "center": 672,
+          "fwhm": 20,
+          "source": "https://www.star.nesdis.noaa.gov/smcd/emb/viirs_aerosol/algorithm.php",
+          "verify": false
+        },
+        {
+          "name": "M7",
+          "center": 865,
+          "fwhm": 39,
+          "source": "https://www.star.nesdis.noaa.gov/smcd/emb/viirs_aerosol/algorithm.php",
+          "verify": false
+        },
+        {
+          "name": "M10",
+          "center": 1610,
+          "fwhm": 59,
+          "source": "https://www.star.nesdis.noaa.gov/smcd/emb/viirs_aerosol/algorithm.php",
+          "verify": false
+        },
+        {
+          "name": "M11",
+          "center": 2250,
+          "fwhm": 47,
+          "source": "https://www.star.nesdis.noaa.gov/smcd/emb/viirs_aerosol/algorithm.php",
+          "verify": false
+        }
+      ],
+      "thermal": [
+        {
+          "name": "M15",
+          "center": 10.763,
+          "fwhm": 0.989,
+          "source": "https://www.star.nesdis.noaa.gov/smcd/emb/viirs_aerosol/algorithm.php",
+          "verify": false
+        },
+        {
+          "name": "M16",
+          "center": 12.016,
+          "fwhm": 0.864,
+          "source": "https://www.star.nesdis.noaa.gov/smcd/emb/viirs_aerosol/algorithm.php",
+          "verify": false
+        }
+      ]
+    },
+    {
+      "id": "fy3d_mersi2",
+      "name": "FY-3D MERSI-II",
+      "platform": "FY-3D",
+      "variant": "variants/fy3d_mersi2.json",
+      "optical": [
+        {
+          "name": "CH1",
+          "center": 470,
+          "fwhm": 50,
+          "source": "https://space.oscar.wmo.int/instruments/view/mersi_2",
+          "verify": true,
+          "note": "标称中心/带宽，WMO OSCAR 页面未能取回通道表，待核对"
+        },
+        {
+          "name": "CH2",
+          "center": 550,
+          "fwhm": 50,
+          "source": "https://space.oscar.wmo.int/instruments/view/mersi_2",
+          "verify": true,
+          "note": "同上"
+        },
+        {
+          "name": "CH3",
+          "center": 650,
+          "fwhm": 50,
+          "source": "https://space.oscar.wmo.int/instruments/view/mersi_2",
+          "verify": true,
+          "note": "同上"
+        },
+        {
+          "name": "CH4",
+          "center": 865,
+          "fwhm": 50,
+          "source": "https://space.oscar.wmo.int/instruments/view/mersi_2",
+          "verify": true,
+          "note": "同上"
+        },
+        {
+          "name": "CH6",
+          "center": 1640,
+          "fwhm": 50,
+          "source": "https://space.oscar.wmo.int/instruments/view/mersi_2",
+          "verify": true,
+          "note": "标称值，待核对"
+        },
+        {
+          "name": "CH7",
+          "center": 2130,
+          "fwhm": 50,
+          "source": "https://space.oscar.wmo.int/instruments/view/mersi_2",
+          "verify": true,
+          "note": "标称值，待核对"
+        }
+      ],
+      "thermal": [
+        {
+          "name": "CH24",
+          "center": 10.8,
+          "fwhm": 1,
+          "range": [
+            10.3,
+            11.3
+          ],
+          "source": "https://essd.copernicus.org/preprints/essd-2022-27/essd-2022-27-typeset_manuscript-version2.pdf",
+          "verify": false,
+          "note": "范围 10.3–11.3 μm（文献：FY-3D MERSI-II 通道 24）"
+        },
+        {
+          "name": "CH25",
+          "center": 12,
+          "fwhm": 1,
+          "range": [
+            11.5,
+            12.5
+          ],
+          "source": "https://essd.copernicus.org/preprints/essd-2022-27/essd-2022-27-typeset_manuscript-version2.pdf",
+          "verify": false,
+          "note": "范围 11.5–12.5 μm（文献：FY-3D MERSI-II 通道 25）"
+        }
+      ]
+    }
+  ]
+}

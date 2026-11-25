@@ -1,0 +1,84 @@
+{
+  "kind": "stream-image-project",
+  "schemaVersion": 2,
+  "name": "北京 · ECOSTRESS",
+  "description": "复用母工程（../project.json）EB 求得的组分温度（默认读 ../reference/components.tif，运行 run_all.mjs 时换成本次母工程输出），只做 ECOSTRESS 的波段成像，天顶 0°。",
+  "scene": {
+    "name": "stream_beijing_300m_ecostress",
+    "locationSource": "georef",
+    "overpass": "2019-08-15T02:55:00Z",
+    "displayTimezone": 8,
+    "threads": 0,
+    "region": {
+      "enabled": false,
+      "startRow": 0,
+      "endRow": 1,
+      "startColumn": 0,
+      "endColumn": 1
+    },
+    "surface": {
+      "type": {
+        "file": "../inputs/type.tif"
+      },
+      "lai": {
+        "file": "../inputs/lai.tif"
+      },
+      "dem": {
+        "file": "../inputs/dem.tif"
+      }
+    },
+    "view": {
+      "vza": {
+        "value": 0
+      },
+      "vaa": {
+        "value": 0
+      }
+    },
+    "optical": {
+      "enabled": false,
+      "bands": []
+    },
+    "thermal": {
+      "enabled": true,
+      "bands": [
+        {
+          "name": "TIR1",
+          "center": 8.285,
+          "fwhm": 0.4
+        },
+        {
+          "name": "TIR2",
+          "center": 8.785,
+          "fwhm": 0.4
+        },
+        {
+          "name": "TIR3",
+          "center": 9.06,
+          "fwhm": 0.4
+        },
+        {
+          "name": "TIR4",
+          "center": 10.522,
+          "fwhm": 0.6
+        },
+        {
+          "name": "TIR5",
+          "center": 12.001,
+          "fwhm": 1
+        }
+      ]
+    },
+    "temperature": {
+      "mode": "rt",
+      "components": {
+        "source": "package",
+        "file": "../reference/components.tif"
+      },
+      "energy": {
+        "diffuseFraction": 0.2
+      }
+    },
+    "outputRoot": "output"
+  }
+}

@@ -1,0 +1,100 @@
+{
+  "kind": "stream-image-project",
+  "schemaVersion": 2,
+  "name": "北京 · FY-3D MERSI-II",
+  "description": "复用母工程（../project.json）EB 求得的组分温度（默认读 ../reference/components.tif，运行 run_all.mjs 时换成本次母工程输出），只做 FY-3D MERSI-II 的波段成像，天顶 0°。",
+  "scene": {
+    "name": "stream_beijing_300m_fy3d_mersi2",
+    "locationSource": "georef",
+    "overpass": "2019-08-15T02:55:00Z",
+    "displayTimezone": 8,
+    "threads": 0,
+    "region": {
+      "enabled": false,
+      "startRow": 0,
+      "endRow": 1,
+      "startColumn": 0,
+      "endColumn": 1
+    },
+    "surface": {
+      "type": {
+        "file": "../inputs/type.tif"
+      },
+      "lai": {
+        "file": "../inputs/lai.tif"
+      },
+      "dem": {
+        "file": "../inputs/dem.tif"
+      }
+    },
+    "view": {
+      "vza": {
+        "value": 0
+      },
+      "vaa": {
+        "value": 0
+      }
+    },
+    "optical": {
+      "enabled": true,
+      "bands": [
+        {
+          "name": "CH1",
+          "center": 470,
+          "fwhm": 50
+        },
+        {
+          "name": "CH2",
+          "center": 550,
+          "fwhm": 50
+        },
+        {
+          "name": "CH3",
+          "center": 650,
+          "fwhm": 50
+        },
+        {
+          "name": "CH4",
+          "center": 865,
+          "fwhm": 50
+        },
+        {
+          "name": "CH6",
+          "center": 1640,
+          "fwhm": 50
+        },
+        {
+          "name": "CH7",
+          "center": 2130,
+          "fwhm": 50
+        }
+      ]
+    },
+    "thermal": {
+      "enabled": true,
+      "bands": [
+        {
+          "name": "CH24",
+          "center": 10.8,
+          "fwhm": 1
+        },
+        {
+          "name": "CH25",
+          "center": 12,
+          "fwhm": 1
+        }
+      ]
+    },
+    "temperature": {
+      "mode": "rt",
+      "components": {
+        "source": "package",
+        "file": "../reference/components.tif"
+      },
+      "energy": {
+        "diffuseFraction": 0.2
+      }
+    },
+    "outputRoot": "output"
+  }
+}

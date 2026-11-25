@@ -1,0 +1,109 @@
+{
+  "kind": "stream-image-project",
+  "schemaVersion": 2,
+  "name": "北京 · Sentinel-2 MSI（仅光学）",
+  "description": "复用母工程（../project.json）EB 求得的组分温度（默认读 ../reference/components.tif，运行 run_all.mjs 时换成本次母工程输出），只做 Sentinel-2 MSI（仅光学） 的波段成像，天顶 0°。",
+  "scene": {
+    "name": "stream_beijing_300m_sentinel2",
+    "locationSource": "georef",
+    "overpass": "2019-08-15T02:55:00Z",
+    "displayTimezone": 8,
+    "threads": 0,
+    "region": {
+      "enabled": false,
+      "startRow": 0,
+      "endRow": 1,
+      "startColumn": 0,
+      "endColumn": 1
+    },
+    "surface": {
+      "type": {
+        "file": "../inputs/type.tif"
+      },
+      "lai": {
+        "file": "../inputs/lai.tif"
+      },
+      "dem": {
+        "file": "../inputs/dem.tif"
+      }
+    },
+    "view": {
+      "vza": {
+        "value": 0
+      },
+      "vaa": {
+        "value": 0
+      }
+    },
+    "optical": {
+      "enabled": true,
+      "bands": [
+        {
+          "name": "B2",
+          "center": 492.4,
+          "fwhm": 66
+        },
+        {
+          "name": "B3",
+          "center": 559.8,
+          "fwhm": 36
+        },
+        {
+          "name": "B4",
+          "center": 664.6,
+          "fwhm": 31
+        },
+        {
+          "name": "B5",
+          "center": 704.1,
+          "fwhm": 15
+        },
+        {
+          "name": "B6",
+          "center": 740.5,
+          "fwhm": 15
+        },
+        {
+          "name": "B7",
+          "center": 782.8,
+          "fwhm": 20
+        },
+        {
+          "name": "B8",
+          "center": 832.8,
+          "fwhm": 106
+        },
+        {
+          "name": "B8A",
+          "center": 864.7,
+          "fwhm": 21
+        },
+        {
+          "name": "B11",
+          "center": 1613.7,
+          "fwhm": 91
+        },
+        {
+          "name": "B12",
+          "center": 2202.4,
+          "fwhm": 175
+        }
+      ]
+    },
+    "thermal": {
+      "enabled": false,
+      "bands": []
+    },
+    "temperature": {
+      "mode": "rt",
+      "components": {
+        "source": "package",
+        "file": "../reference/components.tif"
+      },
+      "energy": {
+        "diffuseFraction": 0.2
+      }
+    },
+    "outputRoot": "output"
+  }
+}
