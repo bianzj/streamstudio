@@ -132,6 +132,10 @@
 
   开周期/不开周期耗时比：VoxelEB 森林 1.41 → 1.19，VoxelRT 森林 1.23 → 1.17。逐 pass（veb_forest_periodic，插桩版，2 节点合计）：长波漫射（TIR 迭代）2.81 → 1.70 s，所有 pass 合计 8.77 → 4.64 s。剩余的开周期开销：VoxelRT 全部是周期遍历的真实工作量；VoxelEB 约 0.4 s 为周期代码存在（运行时关闭时同一管线仍慢 7%），约 0.8 s 为多副本光线查询与积分。验证：36 个冻结算例（全部 VoxelEB/VoxelRT 算例，含 veb_forest_periodic、veb_lattice_periodic、veb_urban、vrt_ 开头的全部，另抽样 feb_crop、feb_urban、frt_crop）新旧引擎输出逐文件逐字节比较——除 `project.json`/`result.json`（路径与耗时）、`diagnostics/scattering_node=*.json`（`elapsedMs`，以及 GPU 浮点原子累加的 `absorbedShortwave` 等统计量，旧引擎自己重跑也在相对 10⁻⁷ 量级变化，如 3138682.456 / 3138682.065 / 新 3138678.651）、Facet 的运行时间戳 JSON 外，所有图像、体元/面元过程文件、能量平衡/生理诊断、统计 CSV 均逐字节相同；无任何结果变化，未使用放宽的容差。
 
+### 新增内置示例：北京多传感器对比（2026-11-25，不改引擎与数值）
+
+新增内置示例 `assets/examples/beijing_multisensor`（`assets/examples/catalog.json` 已登记，“区域遥感影像”类，精选示例）：同一个北京 300 m 场景（2019-08-15 02:55 UTC），母工程用 ERA5 能量平衡求一次组分温度，7 个传感器变体（Landsat 8/9、MODIS、Sentinel-2、ASTER、ECOSTRESS、VIIRS、FY-3D MERSI-II）与 16 个观测角变体（Landsat TIRS B10 与 MODIS 31，VZA 0/20/32/40/55°）复用该组分温度成像；`run_all.mjs` 一键运行 24 次（约 13 s）并汇总 300 m → 1 km 聚合统计，`reference/` 保留精简参考结果（约 14 MB）。配套分析报告 `docs/cases/beijing-multisensor/report.pdf`（13 页），由 `tools/build-beijing-multisensor-report.py` 与 `tools/plot-beijing-multisensor.py` 从仓库内数据重建。限制：高斯 SRF 近似、`sensors.json` 中 13 个波段（MODIS B32、ASTER B11、ECOSTRESS 全部、MERSI-II 光学）标“待核对”；结果是无大气冠层顶量，没有真实观测验证。只新增文件，不改引擎、服务端与前端，旧示例与算例结果不变；设计说明见 `docs/stream-examples.md` 示例 C。
+
 ### 新工程默认值（2026-11-22）
 
 - VoxelRT 辐射求解方法默认“光谱批处理加速”（与传统方法均值相同，快 1.1–1.6×）。
