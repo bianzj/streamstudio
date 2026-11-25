@@ -44,28 +44,28 @@
       "bands": [
         {
           "name": "TIR1",
-          "center": 8.285,
-          "fwhm": 0.4
+          "center": 8.29,
+          "fwhm": 0.354
         },
         {
           "name": "TIR2",
-          "center": 8.785,
-          "fwhm": 0.4
+          "center": 8.78,
+          "fwhm": 0.31
         },
         {
           "name": "TIR3",
-          "center": 9.06,
-          "fwhm": 0.4
+          "center": 9.2,
+          "fwhm": 0.396
         },
         {
           "name": "TIR4",
-          "center": 10.522,
-          "fwhm": 0.6
+          "center": 10.49,
+          "fwhm": 0.41
         },
         {
           "name": "TIR5",
-          "center": 12.001,
-          "fwhm": 1
+          "center": 12.09,
+          "fwhm": 0.611
         }
       ]
     },

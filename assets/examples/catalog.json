@@ -95,7 +95,7 @@
         "观测角",
         "300 m→1 km聚合"
       ],
-      "note": "母工程EB求组分温度，variants/复用并成像；run_all.mjs一键运行；部分波段参数标“待核对”见sensors.json",
+      "note": "母工程EB求组分温度，variants/复用并成像；run_all.mjs一键运行；各波段的数据依据与出处见sensors.json",
       "categoryLabel": "区域遥感影像"
     }
   ],
