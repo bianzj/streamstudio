@@ -1450,6 +1450,11 @@ export function createStreamWorkspace({ toast, onClose = () => {} }) {
       for (const event of buffered) handleEvent(event)
     } catch (error) {
       if (!isCurrent()) return
+      if (String(error.message || '').includes('模拟准备已取消')) {
+        setRunState('idle', '已取消', 0)
+        addLog('模拟准备已取消')
+        return
+      }
       setRunState('failed', '未能启动')
       addLog(error.message, 'error')
       toast('无法开始模拟', error.message, 'error')

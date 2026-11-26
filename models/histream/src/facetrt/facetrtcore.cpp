@@ -378,6 +378,8 @@ struct Scene {
     uint32_t periodicNeighborCount{};
     float periodicSizeX{1.0f};
     float periodicSizeZ{1.0f};
+    // control.facetVisibility (auto | raster | rayquery); HISTREAM_FACET_VISIBILITY overrides it.
+    facetvk::VisibilityBackend visibilityBackend{facetvk::VisibilityBackend::Auto};
 
     uint32_t facetCount() const { return static_cast<uint32_t>(vertices.size() / 3U); }
 };
@@ -512,6 +514,23 @@ struct RunResult {
     double sunlightMs{};
     double solveMs{};
     double totalMs{};
+    // Stage timing (ms) for facetrt.json "timing": setup = project/OBJ read + instance expansion
+    // (before the backend starts); gpuInit = Vulkan device + geometry upload (+ acceleration structure);
+    // opticsPrep = CPU packing/upload of the spectral inputs; outputRead = spectral output readback.
+    double setupMs{};
+    double gpuInitMs{};
+    double opticsPrepMs{};
+    double outputReadMs{};
+    double outputWriteMs{};
+    struct BandTiming {
+        uint32_t band{};
+        bool thermal{};
+        bool warmStart{};
+        uint32_t iterations{};
+        double ms{};
+    };
+    std::vector<BandTiming> bandTimings;
+    double diffuseBaselineMs{};
     bool gpuSpectral{};
     uint32_t spectralBandsChecked{};
     float spectralOpticsError{}, spectralRawError{}, spectralStatesError{}, spectralOutputError{};
@@ -577,6 +596,16 @@ double milliseconds(Clock::time_point begin, Clock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - begin).count();
 }
+
+// Scene-loading sub-stage times (ms), filled by loadProjectScene and reported in the result timing.
+struct SetupStages {
+    double objReadMs{};
+    double expandMs{};
+    double groundMs{};
+    double finalizeMs{};
+    uint64_t placements{};
+};
+SetupStages g_setupStages;
 
 // 作用：解析 OBJ 面记录中 v/vt/vn 的顶点位置索引，支持负数相对索引（-1 为最后一个顶点）。
 // 输出：0 基索引；缺失或越界时抛异常。
@@ -664,6 +693,18 @@ void appendTriangleInsideDomain(Scene& scene,
                                 const Vec3& maximum,
                                 uint32_t materialIndex)
 {
+    // Fast path (identical result): a triangle whose vertices are all inside the domain (same 1e-6
+    // tolerance as clipPolygonToPlane) is not changed by the six clips, so skip the polygon
+    // allocations that dominate large forest scenes.
+    const auto inside = [&](const Vec3& p) {
+        for (size_t axis = 0; axis < 3; ++axis)
+            if (!(p[axis] >= minimum[axis] - 1.0e-6f && p[axis] <= maximum[axis] + 1.0e-6f)) return false;
+        return true;
+    };
+    if (inside(a) && inside(b) && inside(c)) {
+        appendTriangle(scene, a, b, c, materialIndex);
+        return;
+    }
     std::vector<Vec3> polygon{a, b, c};
     for (size_t axis = 0; axis < 3 && polygon.size() >= 3U; ++axis) {
         polygon = clipPolygonToPlane(polygon, axis, minimum[axis], true);
@@ -2643,6 +2684,12 @@ CpuGraph buildCpuGraph(const Scene& scene, const Progress& progress)
     graph.diagnostics.directedEdgeCount = static_cast<uint32_t>(graph.edges.size());
     graph.diagnostics.fragmentOverflow = overflow;
     graph.diagnostics.maxClosureError = closureError;
+    for (uint32_t side = 0; side < surfaceCount; ++side) {
+        if (graph.groundCounts[side] == facetvk::kInactiveSide) continue;
+        ++graph.diagnostics.receivingSides;
+        if (graph.denominators[side] == 0U) ++graph.diagnostics.zeroSampleSides;
+    }
+    graph.diagnostics.visibilityBackend = "cpu-raster";
     // A-buffer 层数不够会丢片元、破坏闭合性，这里直接报错而不是静默返回错误的图。
     if (overflow != 0U) {
         throw std::runtime_error("CPU A-buffer overflow");
@@ -2964,6 +3011,19 @@ RunResult runCpu(const Scene& scene, const Progress& progress)
     const auto visibilityBegin = Clock::now();
     // 步骤 1：构建可见性图（进度 2–70%）。
     const CpuGraph graph = buildCpuGraph(scene, progress);
+    // Developer diagnostic: HISTREAM_FACET_DUMP_GRAPH=<file> writes the graph (see
+    // FacetrtVulkan::dumpGraph for the layout) for offline comparison of visibility backends.
+    if (const char* dump = std::getenv("HISTREAM_FACET_DUMP_GRAPH"); dump && *dump) {
+        std::ofstream file(dump, std::ios::binary);
+        const uint32_t header[2] = {static_cast<uint32_t>(graph.denominators.size()),
+                                    static_cast<uint32_t>(graph.edges.size())};
+        file.write(reinterpret_cast<const char*>(header), sizeof(header));
+        file.write(reinterpret_cast<const char*>(graph.denominators.data()), graph.denominators.size() * 4U);
+        file.write(reinterpret_cast<const char*>(graph.skyCounts.data()), graph.skyCounts.size() * 4U);
+        file.write(reinterpret_cast<const char*>(graph.groundCounts.data()), graph.groundCounts.size() * 4U);
+        file.write(reinterpret_cast<const char*>(graph.rowOffsets.data()), graph.rowOffsets.size() * 4U);
+        file.write(reinterpret_cast<const char*>(graph.edges.data()), graph.edges.size() * sizeof(Edge));
+    }
     const auto visibilityEnd = Clock::now();
     result.graph = graph.diagnostics;
     result.visibilityMs = milliseconds(visibilityBegin, visibilityEnd);
@@ -3081,7 +3141,9 @@ void reportHapkeEnergyClosure(const Scene& scene, const FacetRTParameters& param
 void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const FacetRTParameters& parameters,
                     const Progress& progress, RunResult& result)
 {
+    const auto opticsPrepBegin = Clock::now();
     prepareGpuSpectral(model, scene, result.sunlit, parameters);
+    result.opticsPrepMs = milliseconds(opticsPrepBegin, Clock::now());
     result.gpuSpectral = true;
     result.wavelengths = parameters.wavelengths;
     const char* auditFlag = std::getenv("HISTREAM_FACET_VALIDATE_SPECTRAL");
@@ -3109,8 +3171,11 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
             : bandSkyIrradiance(scene, parameters, band);
         progress(82 + static_cast<int>(15U * band / parameters.wavelengths.size()),
                  "GPU resident spectral solve " + std::to_string(band + 1U) + "/" + std::to_string(parameters.wavelengths.size()));
+        const auto bandBegin = Clock::now();
         const auto stats = model.solveSpectralBand(static_cast<uint32_t>(band), thermal, sky, scale,
                                                    parameters.acceleratedSolver, warm, false, beam);
+        result.bandTimings.push_back({static_cast<uint32_t>(band), thermal, warm && parameters.acceleratedSolver,
+                                      stats.iterations, milliseconds(bandBegin, Clock::now())});
         result.spectralIterations.push_back(stats.iterations);
         if (band == 0) {
             result.solution.iterations = stats.iterations; result.solution.maxDelta = stats.maxDelta;
@@ -3164,14 +3229,18 @@ void runGpuSpectral(facetvk::FacetrtVulkan& model, const Scene& scene, const Fac
         // 第 0 波段（光学）额外求一次“仅漫射”基线（solveSpectralBand 的 diffuse = true），
         // 供 readSpectralOutput 末段的 lightEnhancement 使用。
         if (band == 0 && !thermal) {
+            const auto diffuseBegin = Clock::now();
             model.solveSpectralBand(0, false, sky, scale, parameters.acceleratedSolver, false, true, beam);
+            result.diffuseBaselineMs = milliseconds(diffuseBegin, Clock::now());
         }
         previousThermal = thermal;
     }
     // 读回 GPU 输出，布局（n = 2·facetCount，B = 波段数，bandValues = n·B）：
     // [0, bandValues) 各波段辐射度；[bandValues, 3·bandValues) 各波段表面状态；
     // [3·bandValues, 末尾) 直射增强。第 0 波段的 n 个值同时作为 solution.radiosity。
+    const auto readBegin = Clock::now();
     const auto output = model.readSpectralOutput();
+    result.outputReadMs = milliseconds(readBegin, Clock::now());
     reportHapkeEnergyClosure(scene, parameters, result.sunlit, output);
     const size_t n = size_t(scene.facetCount()) * 2U, bandValues = n * parameters.wavelengths.size();
     result.solution.radiosity.assign(output.begin(), output.begin() + n);
@@ -3206,18 +3275,20 @@ RunResult runGpu(const Scene& scene,
     config.periodicNeighborCount = scene.periodicNeighborCount;
     config.periodicSizeX = scene.periodicSizeX;
     config.periodicSizeZ = scene.periodicSizeZ;
+    config.visibilityBackend = scene.visibilityBackend;
 
+    const auto gpuInitBegin = Clock::now();
     facetvk::FacetrtVulkan model;
     model.initialize(config, shaderDirectory);
     model.setGeometry(scene.vertices);
     model.setGroundFacets(scene.leafFacetCount);
-
-    // 步骤 2：GPU 构建半球方向的可见性图（进度 10–70%）。
+    result.gpuInitMs = milliseconds(gpuInitBegin, Clock::now());
     progress(10, "GPU visibility graph: 40 directions at " +
                      std::to_string(scene.visibilityRasterSize) + " x " +
                      std::to_string(scene.visibilityRasterSize));
     const auto visibilityBegin = Clock::now();
     result.graph = model.buildVisibilityGraph(makeHemisphereDirections());
+    if (const char* dump = std::getenv("HISTREAM_FACET_DUMP_GRAPH"); dump && *dump) model.dumpGraph(dump);
     const auto visibilityEnd = Clock::now();
     progress(70, groundEscapeLog(result.graph));
     result.visibilityMs = milliseconds(visibilityBegin, visibilityEnd);
@@ -3227,6 +3298,7 @@ RunResult runGpu(const Scene& scene,
     const auto sunlightBegin = Clock::now();
     result.sunlit = model.computeSunlitFraction(sunDirection(scene));
     fillUnsampledSunlit(scene, result.sunlit);
+    result.graph.visibilityBackend = model.visibilityBackendName();
     const auto sunlightEnd = Clock::now();
     result.sunlightMs = milliseconds(sunlightBegin, sunlightEnd);
 
@@ -3376,31 +3448,158 @@ RunResult runGpu(const Scene& scene,
     return result;
 }
 
+// 二进制旁路文件（control.facetOutputFormat = binary，格式见 docs/facet-binary-output.md）：
+// 长度 > 1024 的 float 数组写入与 JSON 同主名的 .bin（小端 float32，每个数组 16 字节对齐），
+// JSON 里该字段换成 {"file","offset","length","dtype","shape"} 描述符。
+class BinarySidecar {
+public:
+    static constexpr size_t kMinimumElements = 1024;
+    BinarySidecar(const std::string& jsonFile, bool enabled) : m_enabled(enabled)
+    {
+        if (!enabled) return;
+        std::filesystem::path path(jsonFile);
+        path.replace_extension(".bin");
+        m_name = path.filename().generic_string();
+        m_file.open(path, std::ios::binary | std::ios::trunc);
+        if (!m_file) throw std::runtime_error("Cannot write binary result: " + path.string());
+    }
+    bool enabled() const { return m_enabled; }
+    bool takes(size_t count) const { return m_enabled && count > kMinimumElements; }
+    const std::string& name() const { return m_name; }
+    uint64_t bytes() const { return m_position; }
+    // 写入 count 个 float，返回 JSON 描述符文本；shape 乘积与 count 不符时退化为一维。
+    std::string write(const float* data, size_t count, std::vector<size_t> shape)
+    {
+        std::string descriptor = begin(count, std::move(shape));
+        append(data, count);
+        return descriptor;
+    }
+    // 分块写入：先 begin（补齐对齐、返回描述符），再多次 append 共 count 个 float。
+    std::string begin(size_t count, std::vector<size_t> shape)
+    {
+        static const char zeros[16] = {};
+        const uint64_t pad = (16U - m_position % 16U) % 16U;
+        if (pad != 0U) m_file.write(zeros, static_cast<std::streamsize>(pad));
+        m_position += pad;
+        const uint64_t offset = m_position;
+        size_t product = 1;
+        for (size_t extent : shape) product *= extent;
+        if (shape.empty() || product != count) shape = {count};
+        std::ostringstream text;
+        text << "{\"file\":\"" << m_name << "\",\"offset\":" << offset << ",\"length\":" << count
+             << ",\"dtype\":\"float32\",\"shape\":[";
+        for (size_t i = 0; i < shape.size(); ++i) text << (i ? "," : "") << shape[i];
+        text << "]}";
+        return text.str();
+    }
+    void append(const float* data, size_t count)
+    {
+        m_file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(count * sizeof(float)));
+        m_position += uint64_t(count) * sizeof(float);
+    }
+    void close()
+    {
+        if (!m_enabled) return;
+        m_file.close();
+        if (!m_file) throw std::runtime_error("Cannot finish binary result " + m_name);
+    }
+private:
+    bool m_enabled{};
+    std::string m_name;
+    std::ofstream m_file;
+    uint64_t m_position{};
+};
+
+// 把顶点位置（每顶点 xyz）分块追加到旁路文件（避免复制整个数组）。
+void appendVertexPositions(BinarySidecar& sidecar, const Scene& scene)
+{
+    constexpr size_t kChunkVertices = 1U << 20;
+    std::vector<float> chunk;
+    chunk.reserve(kChunkVertices * 3U);
+    for (size_t index = 0; index < scene.vertices.size(); ++index) {
+        const float* p = scene.vertices[index].position;
+        chunk.push_back(p[0]);
+        chunk.push_back(p[1]);
+        chunk.push_back(p[2]);
+        if (chunk.size() == kChunkVertices * 3U) {
+            sidecar.append(chunk.data(), chunk.size());
+            chunk.clear();
+        }
+    }
+    if (!chunk.empty()) sidecar.append(chunk.data(), chunk.size());
+}
+
+// 在已打开的流里预留一个固定宽度的数字位置，写完整个文件后回填（用于“写出耗时”和“文件字节数”，
+// 它们只有写完才知道）。回填后仍是合法 JSON（数字前有空白）。
+struct NumberSlot {
+    std::streampos position{};
+    static constexpr int kWidth = 18;
+};
+
+NumberSlot reserveNumber(std::ofstream& out)
+{
+    NumberSlot slot{out.tellp()};
+    out << std::string(NumberSlot::kWidth, ' ');
+    return slot;
+}
+
+void patchNumber(std::ofstream& out, const NumberSlot& slot, double value, bool integer = false)
+{
+    char text[40];
+    if (integer) std::snprintf(text, sizeof(text), "%*llu", NumberSlot::kWidth, static_cast<unsigned long long>(value));
+    else std::snprintf(text, sizeof(text), "%*.3f", NumberSlot::kWidth, value);
+    const std::streampos end = out.tellp();
+    out.seekp(slot.position);
+    out.write(text, NumberSlot::kWidth);
+    out.seekp(end);
+}
+
 // 作用：把 RunResult 写成 Web 前端读取的 JSON 文件（UTF-8 文本，浮点保留 9 位有效数字）。
-// 内容：backend/quantity/units、执行位置（execution）、光谱校验统计、面元数与顶点位置、
-//       图诊断（graph）、耗时（timing）、迭代数与 maxDelta，以及数组字段
+// 内容：backend/quantity/units、执行位置（execution）、质量摘要（quality）、光谱校验统计、面元数与顶点位置、
+//       图诊断（graph）、分阶段耗时（timing）、迭代数与 maxDelta，以及数组字段
 //       wavelengths、sunlit、radiosity、lightEnhancement、bandRadiosity、bandStates。
 //       bandRadiosity/bandStates 为空时不写；数组中出现非有限值会抛 runtime_error。
+// binary = true：大数组写入旁路 .bin，JSON 只留元数据与描述符（见 BinarySidecar）。
 void writeWebResult(const std::string& fileName,
                     const Scene& scene,
-                    const RunResult& result)
+                    RunResult& result,
+                    bool binary = false)
 {
+    const auto writeBegin = Clock::now();
     std::ofstream output(fileName, std::ios::binary);
     if (!output) {
         throw std::runtime_error("Cannot write web result: " + fileName);
     }
-    output << std::setprecision(9)
-           << "{\n"
-           << "  \"backend\": \"" << result.backend << "\",\n"
+    BinarySidecar sidecar(fileName, binary);
+    NumberSlot binaryBytesSlot{};
+    output << std::setprecision(9) << "{\n";
+    if (binary) {
+        output << "  \"format\": \"binary\",\n  \"formatVersion\": 1,\n  \"binaryFile\": \"" << sidecar.name()
+               << "\",\n  \"binaryBytes\": ";
+        binaryBytesSlot = reserveNumber(output);
+        output << ",\n";
+    }
+    output << "  \"backend\": \"" << result.backend << "\",\n"
            << "  \"quantity\": \"" << result.quantity << "\",\n"
            << "  \"units\": \"" << result.units << "\",\n"
            << "  \"execution\": {\"radiation\":\"" << (result.backend == "Vulkan GPU" ? "gpu" : "cpu")
+           << "\",\"visibility\":\"" << (result.backend == "Vulkan GPU" ? result.graph.visibilityBackend : std::string("cpu-raster"))
+           << "\",\"graphBuild\":\"" << result.graph.graphBuild
+           << "\",\"outputFormat\":\"" << (binary ? "binary" : "json")
            << "\",\"spectralOptics\":\"" << (result.gpuSpectral ? "gpu" : "cpu")
            << "\",\"surfaceStates\":\"" << (result.gpuSpectral ? "gpu" : "cpu")
            << "\",\"bandNormalization\":\"" << (result.gpuSpectral ? "gpu" : "cpu")
            << "\",\"spectralStateDeviceResident\":" << (result.gpuSpectral ? "true" : "false")
            << ",\"spectralConvergence\":\"" << (result.gpuSpectral ? "gpu" : "cpu") << "\""
            << ",\"spectralTables\":\"cpu once per material and band\",\"resultWriting\":\"cpu\"},\n"
+           << "  \"quality\": {\"visibilityBackend\":\""
+           << (result.backend == "Vulkan GPU" ? result.graph.visibilityBackend : std::string("cpu-raster"))
+           << "\",\"receivingSides\":" << result.graph.receivingSides
+           << ",\"zeroVisibilitySampleSides\":" << result.graph.zeroSampleSides
+           << ",\"zeroVisibilitySamples\":"
+           << (result.graph.receivingSides != 0U
+                   ? static_cast<double>(result.graph.zeroSampleSides) / result.graph.receivingSides : 0.0)
+           << "},\n"
            << "  \"spectralVerification\": {\"enabled\":" << (result.spectralBandsChecked > 0 ? "true" : "false")
            << ",\"bandsChecked\":" << result.spectralBandsChecked
            << ",\"status\":\"" << (result.spectralBandsChecked > 0 ? "PASS" : "not_run") << "\""
@@ -3410,15 +3609,23 @@ void writeWebResult(const std::string& fileName,
            << ",\"sameGraphAndSunlit\":" << (result.spectralBandsChecked > 0 ? "true" : "false") << "},\n"
            << "  \"facetCount\": " << scene.facetCount() << ",\n"
            << "  \"leafFacetCount\": " << scene.leafFacetCount << ",\n"
-           << "  \"vertexPositions\": [";
-    for (size_t index = 0; index < scene.vertices.size(); ++index) {
-        if (index != 0U) {
-            output << ',';
+           << "  \"vertexPositions\": ";
+    if (binary) {
+        output << sidecar.begin(scene.vertices.size() * 3U, {scene.facetCount(), 3U, 3U});
+        appendVertexPositions(sidecar, scene);
+    } else {
+        output << '[';
+        for (size_t index = 0; index < scene.vertices.size(); ++index) {
+            if (index != 0U) {
+                output << ',';
+            }
+            const auto& vertex = scene.vertices[index];
+            output << vertex.position[0] << ',' << vertex.position[1] << ',' << vertex.position[2];
         }
-        const auto& vertex = scene.vertices[index];
-        output << vertex.position[0] << ',' << vertex.position[1] << ',' << vertex.position[2];
+        output << ']';
     }
-    output << "],\n"
+    const auto& graphDiagnostics = result.graph;
+    output << ",\n"
            << "  \"graph\": {"
            << "\"directedEdges\":" << result.graph.directedEdgeCount << ","
            << "\"closureError\":" << result.graph.maxClosureError << ","
@@ -3427,17 +3634,55 @@ void writeWebResult(const std::string& fileName,
            << "\"lowerBoundary\":" << groundEscapeJson(result.graph).dump() << "},\n"
            << "  \"timing\": {"
            << "\"totalMs\":" << result.totalMs << ","
+           << "\"setupMs\":" << result.setupMs << ","
+           << "\"setupStages\":{\"objReadMs\":" << g_setupStages.objReadMs
+           << ",\"instanceExpandMs\":" << g_setupStages.expandMs
+           << ",\"placements\":" << g_setupStages.placements
+           << ",\"groundMs\":" << g_setupStages.groundMs
+           << ",\"finalizeMs\":" << g_setupStages.finalizeMs << "},"
+           << "\"gpuInitMs\":" << result.gpuInitMs << ","
            << "\"visibilityMs\":" << result.visibilityMs << ","
+           << "\"visibilityStages\":{\"backend\":\"" << graphDiagnostics.visibilityBackend
+           << "\",\"accelerationBuildMs\":" << graphDiagnostics.accelerationBuildMs
+           << ",\"passesMs\":" << graphDiagnostics.visibilityPassesMs
+           << ",\"countReadbackMs\":" << graphDiagnostics.countReadbackMs
+           << ",\"graphBuild\":\"" << graphDiagnostics.graphBuild
+           << "\",\"csrBuildMs\":" << graphDiagnostics.graphBuildMs
+           << ",\"finalizeMs\":" << graphDiagnostics.graphFinalizeMs << "},"
            << "\"sunlightMs\":" << result.sunlightMs << ","
-           << "\"solveMs\":" << result.solveMs << "},\n"
+           << "\"opticsPrepMs\":" << result.opticsPrepMs << ","
+           << "\"solveMs\":" << result.solveMs << ","
+           << "\"diffuseBaselineMs\":" << result.diffuseBaselineMs << ","
+           << "\"outputReadMs\":" << result.outputReadMs << ","
+           << "\"bandSolves\":[";
+    for (size_t i = 0; i < result.bandTimings.size(); ++i) {
+        const auto& band = result.bandTimings[i];
+        output << (i ? "," : "") << "{\"band\":" << band.band << ",\"thermal\":" << (band.thermal ? "true" : "false")
+               << ",\"warmStart\":" << (band.warmStart ? "true" : "false") << ",\"iterations\":" << band.iterations
+               << ",\"ms\":" << band.ms << "}";
+    }
+    output << "],\"outputWriteMs\":";
+    const NumberSlot writeSlot = reserveNumber(output);
+    output << ",\"wallMs\":";
+    const NumberSlot wallSlot = reserveNumber(output);
+    output << "},\n"
            << "  \"iterations\": " << result.solution.iterations << ",\n"
            << "  \"maxDelta\": " << result.solution.maxDelta << ",\n";
 
-    // 写一个浮点数组字段：用 to_chars 批量序列化到 64 KiB 缓冲再写出（避免逐值的 ostream 开销）。
-    const auto writeArray = [&output](const char* name,
-                                      const std::vector<float>& values,
-                                      bool trailingComma) {
-        output << "  \"" << name << "\": [";
+    // 写一个浮点数组字段：用 to_chars 批量序列化到 64 KiB 缓冲再写出（避免逐值的 ostream 开销）；
+    // 二进制模式下长数组写旁路文件。
+    const auto writeArray = [&output, &sidecar](const char* name,
+                                                const std::vector<float>& values,
+                                                bool trailingComma,
+                                                std::vector<size_t> shape = {}) {
+        output << "  \"" << name << "\": ";
+        if (sidecar.takes(values.size())) {
+            for (float value : values)
+                if (!std::isfinite(value)) throw std::runtime_error("Non-finite FacetRT output field: " + std::string(name));
+            output << sidecar.write(values.data(), values.size(), std::move(shape)) << (trailingComma ? "," : "") << '\n';
+            return;
+        }
+        output << '[';
         // Keep nine significant digits, as setprecision(9) did, while avoiding
         // millions of locale-aware ostream conversions for dense spectra.
         std::array<char, 65536> buffer{};
@@ -3457,18 +3702,28 @@ void writeWebResult(const std::string& fileName,
         flush();
         output << ']' << (trailingComma ? "," : "") << '\n';
     };
+    const size_t sides = size_t(scene.facetCount()) * 2U;
+    const size_t bands = std::max<size_t>(result.wavelengths.size(), 1U);
     writeArray("wavelengths", result.wavelengths, true);
-    writeArray("sunlit", result.sunlit, true);
-    writeArray("radiosity", result.solution.radiosity, true);
+    writeArray("sunlit", result.sunlit, true, {sides});
+    writeArray("radiosity", result.solution.radiosity, true, {sides});
     writeArray("lightEnhancement", result.lightEnhancement,
-               !result.bandRadiosity.empty() || !result.bandStates.empty());
+               !result.bandRadiosity.empty() || !result.bandStates.empty(), {sides});
     if (!result.bandRadiosity.empty()) {
-        writeArray("bandRadiosity", result.bandRadiosity, !result.bandStates.empty());
+        writeArray("bandRadiosity", result.bandRadiosity, !result.bandStates.empty(), {bands, sides});
     }
     if (!result.bandStates.empty()) {
-        writeArray("bandStates", result.bandStates, false);
+        writeArray("bandStates", result.bandStates, false, {bands, sides, 2U});
     }
     output << "}\n";
+    sidecar.close();
+    const double writeMs = milliseconds(writeBegin, Clock::now());
+    if (binary) patchNumber(output, binaryBytesSlot, static_cast<double>(sidecar.bytes()), true);
+    patchNumber(output, writeSlot, writeMs);
+    patchNumber(output, wallSlot, result.setupMs + result.totalMs + writeMs);
+    output.close();
+    if (!output) throw std::runtime_error("Cannot finish web result: " + fileName);
+    result.outputWriteMs = writeMs;
 }
 
 } // namespace
@@ -3553,6 +3808,8 @@ std::string facetInputView(const std::string& path)
     xml << "<HiStreamProject><Control>"
         << "<outDir>" << xmlEscaped(project.outputDirectory().string()) << "</outDir>"
         << "<facetBackend>" << xmlEscaped(ProjectJson::string(control, "facetBackend", "gpu")) << "</facetBackend>"
+        << "<facetVisibility>" << xmlEscaped(ProjectJson::string(control, "facetVisibility", "auto")) << "</facetVisibility>"
+        << "<facetOutputFormat>" << xmlEscaped(ProjectJson::string(control, "facetOutputFormat", "json")) << "</facetOutputFormat>"
         << "<GPU>" << ProjectJson::integer(control, "gpu", 0) << "</GPU>"
         << "<rayTracingDepth>" << ProjectJson::integer(control, "depth", 4) << "</rayTracingDepth>"
         << "<periodicNeighborCount>"
@@ -4827,14 +5084,24 @@ void appendGeometry(Scene& scene,
                              -sceneDepth * 0.5f};
     const Vec3 domainMaximum{sceneWidth * 0.5f, sceneHeight,
                              sceneDepth * 0.5f};
+    // Geometric growth of the facet arrays (a forest adds ~16 M facets): reserve with slack instead of
+    // letting push_back reallocate and copy gigabytes repeatedly.
+    {
+        const size_t needed = scene.vertices.size() + geometry.triangles.size() * 3U;
+        if (scene.vertices.capacity() < needed) scene.vertices.reserve(std::max(needed, scene.vertices.capacity() * 3U / 2U));
+        const size_t neededMaterials = scene.materialIndices.size() + geometry.triangles.size();
+        if (scene.materialIndices.capacity() < neededMaterials)
+            scene.materialIndices.reserve(std::max(neededMaterials, scene.materialIndices.capacity() * 3U / 2U));
+    }
     for (size_t triangleIndex = 0;
          triangleIndex < geometry.triangles.size(); ++triangleIndex) {
         const auto& triangle = geometry.triangles[triangleIndex];
         uint32_t materialIndex =
             bindings.empty() ? 0U : bindings.front().materialIndex;
-        const std::string group =
+        static const std::string kNoGroup;
+        const std::string& group =
             triangleIndex < geometry.triangleGroups.size()
-            ? geometry.triangleGroups[triangleIndex] : std::string{};
+            ? geometry.triangleGroups[triangleIndex] : kNoGroup;
         for (const ObjectMaterialBinding& binding : bindings) {
             if (!binding.meshName.empty() &&
                 equalIgnoringCase(binding.meshName, group)) {
@@ -5337,9 +5604,11 @@ Scene loadProjectScene(const std::string& inputFile)
         if (modelFile.empty()) {
             modelFile = trim(firstXmlTag(objectXml, "objectfile"));
         }
+        const auto objReadBegin = Clock::now();
         const ObjGeometry geometry = modelFile.empty()
             ? cubeGeometry(objectXml)
             : readObjGeometry(resolveProjectAsset(inputPath, modelFile));
+        g_setupStages.objReadMs += milliseconds(objReadBegin, Clock::now());
         // 若该对象有任一材质 vehiclePart > 0，则视为车辆对象：每个摆放实例登记名字（objName#序号），
         // 并在 facetInstance 中记录面元所属实例编号（0 = 非车辆面元，实例编号从 1 起）。
         bool vehicleObject = false;
@@ -5347,6 +5616,7 @@ Scene loadProjectScene(const std::string& inputFile)
             if (binding.materialIndex < scene.materials.size() && scene.materials[binding.materialIndex].vehiclePart > 0)
                 vehicleObject = true;
         size_t placementIndex = 0;
+        const auto expandBegin = Clock::now();
         for (Placement placement :
              readPlacements(inputPath, objectXml, sceneWidth, sceneDepth)) {
             // 对象随地形抬升：摆放高度加上 DEM 在摆放点（场景坐标，未减域中心）处相对最低点的高度。
@@ -5362,10 +5632,13 @@ Scene loadProjectScene(const std::string& inputFile)
             }
             ++placementIndex;
         }
+        g_setupStages.expandMs += milliseconds(expandBegin, Clock::now());
+        g_setupStages.placements += placementIndex;
     }
 
     // 步骤 6：对象三角形全部加入后，其数目记为 leafFacetCount（对象面元数，地面在其后追加），
     // 再追加地面材质与地面三角网。
+    const auto groundBegin = Clock::now();
     scene.leafFacetCount = scene.facetCount();
     const uint32_t groundMaterialIndex =
         static_cast<uint32_t>(scene.materials.size());
@@ -5373,6 +5646,8 @@ Scene loadProjectScene(const std::string& inputFile)
     appendProjectGround(scene, sceneWidth, sceneDepth, voxelSize,
                         scene.visibilityRasterSize / 4U,
                         groundMaterialIndex, dem);
+    g_setupStages.groundMs = milliseconds(groundBegin, Clock::now());
+    const auto finalizeBegin = Clock::now();
     // 步骤 7：确定可见性栅格（A-buffer）层数：先按场景自适应，再允许环境变量
     // HISTREAM_FACET_RASTER_LAYERS 显式加深（仅 64/128/256，只升不降）。
     const uint32_t initialRasterLayers = scene.visibilityRasterLayers;
@@ -5408,6 +5683,7 @@ Scene loadProjectScene(const std::string& inputFile)
         }
     }
     finalizeReflectanceTextureFactors(scene);
+    g_setupStages.finalizeMs = milliseconds(finalizeBegin, Clock::now());
     return scene;
 }
 
@@ -5505,6 +5781,32 @@ std::string facetBackendFromInput(const std::string& xml)
     return backend == "cpu" || backend == "auto" ? backend : "gpu";
 }
 
+// 作用：可见性后端：control.facetVisibility（auto | raster | rayquery，缺省 auto）；
+// 环境变量 HISTREAM_FACET_VISIBILITY 在 FacetrtVulkan::initialize 中覆盖它。非法值报错。
+facetvk::VisibilityBackend visibilityBackendFromInput(const std::string& xml)
+{
+    std::string value = trim(firstXmlTag(xml, "facetVisibility"));
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value.empty() || value == "auto") return facetvk::VisibilityBackend::Auto;
+    if (value == "raster") return facetvk::VisibilityBackend::Raster;
+    if (value == "rayquery" || value == "ray-query") return facetvk::VisibilityBackend::RayQuery;
+    throw std::invalid_argument("control.facetVisibility must be auto, raster or rayquery");
+}
+
+// 作用：结果输出格式：control.facetOutputFormat（json | binary，缺省 json）；环境变量
+// HISTREAM_FACET_OUTPUT_FORMAT 覆盖。返回是否二进制。非法值报错。格式见 docs/facet-binary-output.md。
+bool binaryOutputFromInput(const std::string& xml)
+{
+    const char* environment = std::getenv("HISTREAM_FACET_OUTPUT_FORMAT");
+    std::string value = environment && *environment ? trim(environment) : trim(firstXmlTag(xml, "facetOutputFormat"));
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value.empty() || value == "json") return false;
+    if (value == "binary") return true;
+    throw std::invalid_argument("control.facetOutputFormat must be json or binary");
+}
+
 } // namespace
 
 // 模块：FacetRT（面元辐射）入口
@@ -5519,6 +5821,7 @@ try {
         throw std::invalid_argument("FacetRT requires project.json");
     }
     const std::string resultFile = outputFileFromInput(inputPath, outputFile, "facetrt.json");
+    const auto setupBegin = Clock::now();
     const std::filesystem::path input(inputPath);
     Scene scene = input.extension() == ".obj" || input.extension() == ".OBJ"
         ? loadTreeWithSoil(inputPath)
@@ -5526,10 +5829,13 @@ try {
     const std::string xml =
         input.extension() == ".obj" || input.extension() == ".OBJ"
         ? std::string{} : readTextFile(inputPath);
+    scene.visibilityBackend = visibilityBackendFromInput(xml);
+    const bool binaryOutput = binaryOutputFromInput(xml);
     FacetRTParameters parameters =
         xml.empty() ? FacetRTParameters{} : facetRTParametersFromInput(xml, input);
     // Same light source as FacetEB (Esun/Esky shapes, directScatteringRatio).
     configureFacetRTLight(xml, input, scene, parameters);
+    const double setupMs = milliseconds(setupBegin, Clock::now());
     const Progress progress = [](int value, const std::string& stage) {
         std::cout << "PROGRESS\t" << value << '\t' << stage << std::endl;
     };
@@ -5564,7 +5870,8 @@ try {
                         xml.empty() ? nullptr : &parameters);
     }
     std::filesystem::create_directories(std::filesystem::path(resultFile).parent_path());
-    writeWebResult(resultFile, scene, result);
+    result.setupMs = setupMs;
+    writeWebResult(resultFile, scene, result, binaryOutput);
     std::cout << "RESULT\t" << resultFile << std::endl;
     return 0;
 } catch (const std::exception& error) {
@@ -5587,6 +5894,20 @@ try {
     if (inputPath.empty()) {
         throw std::invalid_argument("FacetEB requires project.json");
     }
+    // Stage timing for faceteb_run.json "timing" (ms): setup (project/OBJ/meteo read, instance
+    // expansion), gpuInit (device + geometry upload), visibility (graph), sunlit (all nodes),
+    // radiation (all radiation solves/incident evaluations), per-node phases, output write, total.
+    const auto ebProcessBegin = Clock::now();
+    double ebSetupMs = 0.0, ebGpuInitMs = 0.0, ebVisibilityMs = 0.0, ebSunlitMs = 0.0, ebRadiationMs = 0.0;
+    uint32_t ebSunlitCalls = 0, ebRadiationCalls = 0;
+    struct EbNodeTiming { int node; double shortwaveMs, couplingMs, outputMs; };
+    std::vector<EbNodeTiming> ebNodeTimings;
+    struct StageTimer {
+        double& target;
+        Clock::time_point begin{Clock::now()};
+        explicit StageTimer(double& t) : target(t) {}
+        ~StageTimer() { target += milliseconds(begin, Clock::now()); }
+    };
 
     // MeteoStep：一行气象驱动。单位：气温 °C、水汽压 hPa（待核对）、气压 hPa（待核对）、
     // 风速 m s-1、短波/长波 W m-2；缺省值为文件缺列时的占位。
@@ -5609,6 +5930,7 @@ try {
     Scene scene = input.extension() == ".obj" || input.extension() == ".OBJ"
         ? loadTreeWithSoil(inputPath)
         : loadProjectScene(inputPath);
+    scene.visibilityBackend = visibilityBackendFromInput(xml);
     const std::string resultFile =
         outputFileFromInput(inputPath, outputFile, "faceteb.json");
     const std::filesystem::path outputDirectory =
@@ -5840,6 +6162,7 @@ try {
     config.periodicNeighborCount = scene.periodicNeighborCount;
     config.periodicSizeX = scene.periodicSizeX;
     config.periodicSizeZ = scene.periodicSizeZ;
+    config.visibilityBackend = scene.visibilityBackend;
     config.gpuIndex = static_cast<uint32_t>(std::max(
         0, static_cast<int>(std::lround(xmlFloat(xml, "GPU", 0.0f)))));
 
@@ -5871,13 +6194,19 @@ try {
         }
     };
     if (useCpuBackend) {
+        ebSetupMs = milliseconds(ebProcessBegin, Clock::now());
+        const StageTimer visibilityTimer(ebVisibilityMs);
         buildCpuBackend();
     } else {
         try {
+            ebSetupMs = milliseconds(ebProcessBegin, Clock::now());
+            const auto gpuInitBegin = Clock::now();
             model.initialize(config, shaderDirectory);
             model.setGeometry(scene.vertices);
             model.setGroundFacets(scene.leafFacetCount);
+            ebGpuInitMs = milliseconds(gpuInitBegin, Clock::now());
             std::cout << "PROGRESS\t10\t构建共享面元可见性图" << std::endl;
+            const StageTimer visibilityTimer(ebVisibilityMs);
             graph = model.buildVisibilityGraph(makeHemisphereDirections());
         } catch (const std::exception& gpuError) {
             if (requestedBackend != "auto") throw;
@@ -5894,6 +6223,7 @@ try {
                                     float skyRadiosity,
                                     uint32_t iterations,
                                     float relaxation) {
+        const StageTimer timer(ebRadiationMs); ++ebRadiationCalls;
         return useCpuBackend
             ? solveCpu(cpuGraph, optics, [](int, const std::string&) {},
                        skyRadiosity, iterations, relaxation)
@@ -5909,6 +6239,7 @@ try {
                                           float referenceIrradiance) {
         if (useCpuBackend)
             return solveRadiation(optics, skyRadiosity, kIterations, 1.0f);
+        const StageTimer timer(ebRadiationMs); ++ebRadiationCalls;
         const float tolerance = std::max(1.0e-6f, 1.0e-5f * referenceIrradiance);
         return model.solveAccelerated(optics, skyRadiosity, nullptr,
                                       kIterations, 8U, tolerance, 1.0f);
@@ -5916,11 +6247,13 @@ try {
     const auto incidentRadiation = [&](const facetvk::SolveResult& solution,
                                        const std::vector<facetvk::SurfaceOptics>& optics,
                                        float skyRadiosity) {
+        const StageTimer timer(ebRadiationMs);
         return useCpuBackend
             ? incidentIrradianceCpu(cpuGraph, solution, optics, skyRadiosity)
             : model.incidentIrradiance(solution, optics, skyRadiosity);
     };
     const auto computeSunlit = [&]() {
+        const StageTimer timer(ebSunlitMs); ++ebSunlitCalls;
         for (;;) {
             try {
                 std::vector<float> sunlit = useCpuBackend
@@ -5974,12 +6307,21 @@ try {
     if (!useCpuBackend && !cpuEnergy && !gpuEnergy)
         throw std::runtime_error("GPU FacetEB energy requires shaderFloat64 and energy.comp.spv; select the CPU or auto backend");
     runIndex.value["execution"] = {{"radiation", useCpuBackend ? "cpu" : "gpu"},
+        {"visibility", useCpuBackend ? "cpu-raster" : model.visibilityBackendName()},
         {"incidentIrradiance", !useCpuBackend && model.supportsGpuIncident() ? "gpu" : "cpu"},
         {"leafPhysiology", gpuEnergy ? "gpu" : "cpu"},
         {"energyBalance", gpuEnergy ? "gpu" : "cpu"},
         {"temperatureUpdate", gpuEnergy ? "gpu" : "cpu"},
         {"iterativeStateDeviceResident", gpuEnergy},
         {"soilColumnPreparation", "cpu once per node"}, {"stabilityAggregation", "cpu when enabled"}};
+    // Small quality summary for the server warning: receiving sides without a visibility sample are
+    // treated as open sky (sub-pixel facets).
+    runIndex.value["quality"] = {
+        {"visibilityBackend", useCpuBackend ? "cpu-raster" : model.visibilityBackendName()},
+        {"receivingSides", graph.receivingSides},
+        {"zeroVisibilitySampleSides", graph.zeroSampleSides},
+        {"zeroVisibilitySamples", graph.receivingSides != 0U
+            ? static_cast<double>(graph.zeroSampleSides) / graph.receivingSides : 0.0}};
     runIndex.write();
     std::cout << "PROGRESS\t10\t" << (gpuEnergy ? "GPU 能量平衡/叶片生理，迭代状态驻留显存" : "CPU 能量平衡对照路径") << std::endl;
 
@@ -8849,6 +9191,8 @@ try {
                 return std::chrono::duration<double>(b - a).count();
             };
             const auto nodeEnd = Clock::now();
+            ebNodeTimings.push_back({node, milliseconds(nodeBegin, shortwaveDone),
+                                     milliseconds(shortwaveDone, couplingDone), milliseconds(couplingDone, nodeEnd)});
             // Per-node phase timing (s): shortwave windows, RT-EB coupling,
             // band images + products. Parsed by the server for ETA/diagnostics.
             std::cout << "FACET_TIMING\t" << node << '\t'
@@ -8879,24 +9223,41 @@ try {
     latest.totalMs = milliseconds(totalBegin, Clock::now());
     latest.solveMs = latest.totalMs;
 
+    const auto ebWriteBegin = Clock::now();
+    const bool binaryOutput = binaryOutputFromInput(xml);
     std::ofstream output(resultFile, std::ios::binary | std::ios::trunc);
     if (!output) {
         throw std::runtime_error("FacetEB cannot write result: " + resultFile);
     }
-    output << std::setprecision(9)
-           << "{\n  \"backend\": \"" << latest.backend << "\",\n"
+    BinarySidecar sidecar(resultFile, binaryOutput);
+    NumberSlot binaryBytesSlot{};
+    output << std::setprecision(9) << "{\n";
+    if (binaryOutput) {
+        output << "  \"format\": \"binary\",\n  \"formatVersion\": 1,\n  \"binaryFile\": \"" << sidecar.name()
+               << "\",\n  \"binaryBytes\": ";
+        binaryBytesSlot = reserveNumber(output);
+        output << ",\n";
+    }
+    output << "  \"backend\": \"" << latest.backend << "\",\n"
            << "  \"componentFile\": \".facet_steps/components.bin\",\n"
            << "  \"facetCount\": " << scene.facetCount() << ",\n"
            << "  \"leafFacetCount\": " << scene.leafFacetCount << ",\n"
            << "  \"time\": \"" << latestTime << "\",\n"
-           << "  \"vertexPositions\": [";
-    for (size_t index = 0; index < scene.vertices.size(); ++index) {
-        if (index != 0U) output << ',';
-        const auto& vertex = scene.vertices[index];
-        output << vertex.position[0] << ',' << vertex.position[1] << ','
-               << vertex.position[2];
+           << "  \"vertexPositions\": ";
+    if (binaryOutput) {
+        output << sidecar.begin(scene.vertices.size() * 3U, {scene.facetCount(), 3U, 3U});
+        appendVertexPositions(sidecar, scene);
+    } else {
+        output << '[';
+        for (size_t index = 0; index < scene.vertices.size(); ++index) {
+            if (index != 0U) output << ',';
+            const auto& vertex = scene.vertices[index];
+            output << vertex.position[0] << ',' << vertex.position[1] << ','
+                   << vertex.position[2];
+        }
+        output << ']';
     }
-    output << "],\n"
+    output << ",\n"
            << "  \"graph\": {\"directedEdges\":"
            << latest.graph.directedEdgeCount
            << ",\"closureError\":" << latest.graph.maxClosureError
@@ -8915,9 +9276,15 @@ try {
            << "  \"iterationBudget\": " << maximumCouplingIterations << ",\n";
 
     // 作用：把逐面侧 float 数组写成一个 JSON 数组字段；comma 指示末尾是否加逗号。
-    const auto writeArray = [&output](
+    const auto writeArray = [&output, &sidecar, &scene](
         const char* name, const std::vector<float>& values, bool comma) {
-        output << "  \"" << name << "\": [";
+        output << "  \"" << name << "\": ";
+        if (sidecar.takes(values.size())) {
+            output << sidecar.write(values.data(), values.size(), {size_t(scene.facetCount()) * 2U})
+                   << (comma ? "," : "") << '\n';
+            return;
+        }
+        output << '[';
         // DEFERRED[低] 错误处理: 与 FacetRT 的 writeWebResult 不同，这里不检查非有限值，NaN/Inf 会被写成 nan/inf，生成非法 JSON 使前端解析失败；建议：写出前检查 std::isfinite 并报错或写 null。
         for (size_t index = 0; index < values.size(); ++index) {
             if (index != 0U) output << ',';
@@ -8944,12 +9311,42 @@ try {
     writeArray("storageHeat", latestStorageHeat, true);
     writeArray("photovoltaicPower", latestPhotovoltaicPower, false);
     output << "}\n";
+    sidecar.close();
+    if (binaryOutput) patchNumber(output, binaryBytesSlot, static_cast<double>(sidecar.bytes()), true);
 
     // 收尾：关闭结果文件，登记产品，状态记为 completed / non_converged，写完成时间；
     // 开启影子审计时把审计汇总打印到标准错误。
     output.close();
     if (!output) throw std::runtime_error("FacetEB cannot finish result output");
+    const double ebOutputWriteMs = milliseconds(ebWriteBegin, Clock::now());
     runIndex.value["products"].push_back(std::filesystem::path(resultFile).filename().generic_string());
+    if (binaryOutput) runIndex.value["products"].push_back(sidecar.name());
+    runIndex.value["execution"]["outputFormat"] = binaryOutput ? "binary" : "json";
+    {
+        // Per-stage timing (ms). nodes: shortwave windows / RT-EB coupling / band images + products.
+        double shortwave = 0.0, coupling = 0.0, nodeOutput = 0.0;
+        ProjectJson::Json nodes = ProjectJson::Json::array();
+        for (const auto& t : ebNodeTimings) {
+            shortwave += t.shortwaveMs; coupling += t.couplingMs; nodeOutput += t.outputMs;
+            nodes.push_back({{"node", t.node}, {"shortwaveMs", t.shortwaveMs}, {"couplingMs", t.couplingMs},
+                             {"outputMs", t.outputMs}});
+        }
+        const double wall = milliseconds(ebProcessBegin, Clock::now());
+        runIndex.value["timing"] = {
+            {"wallMs", wall}, {"setupMs", ebSetupMs},
+            {"setupStages", {{"objReadMs", g_setupStages.objReadMs}, {"instanceExpandMs", g_setupStages.expandMs},
+                             {"placements", g_setupStages.placements}, {"groundMs", g_setupStages.groundMs},
+                             {"finalizeMs", g_setupStages.finalizeMs}}},
+            {"gpuInitMs", ebGpuInitMs}, {"visibilityMs", ebVisibilityMs},
+            {"visibilityStages", {{"backend", graph.visibilityBackend}, {"accelerationBuildMs", graph.accelerationBuildMs},
+                                  {"passesMs", graph.visibilityPassesMs}, {"countReadbackMs", graph.countReadbackMs},
+                                  {"graphBuild", graph.graphBuild}, {"csrBuildMs", graph.graphBuildMs},
+                                  {"finalizeMs", graph.graphFinalizeMs}}},
+            {"sunlightMs", ebSunlitMs}, {"sunlightCalls", ebSunlitCalls},
+            {"radiationMs", ebRadiationMs}, {"radiationSolves", ebRadiationCalls},
+            {"nodeShortwaveMs", shortwave}, {"nodeCouplingMs", coupling}, {"nodeOutputMs", nodeOutput},
+            {"nodes", nodes}, {"finalOutputWriteMs", ebOutputWriteMs}};
+    }
     runIndex.value["status"] = allNodesConverged ? "completed" : "non_converged";
     runIndex.value["finishedAt"] = utcTimestamp();
     {

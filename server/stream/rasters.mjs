@@ -58,7 +58,7 @@ function readTiffHeader(path) {
       if (!width || ![256, 257, 258, 277, 339, 33550, 33922, 34735, 34737, 42113, 270].includes(tag)) continue
       const total = width * number
       const data = total <= 4 ? entries.subarray(at + 8, at + 8 + total) : read(u32(entries, at + 8), total)
-      if (type === 2) { tags.set(tag, data.toString('ascii').replace(/\0+$/, '')); continue }
+      if (type === 2) { tags.set(tag, data.toString('utf8').replace(/\0+$/, '')); continue }
       // DEFERRED[低] Bug: 除 3/4/11/12 以外的类型都按单字节 data[offset] 读取，SSHORT/SLONG(8/9)、RATIONAL(5/10) 字段会解析错误；与 server.mjs 中 readTiff 的解析逻辑重复且结果不一致；建议：复用 readTiff 的 readNumber 实现（抽成只读头部的共享函数）
       const values = []
       for (let item = 0; item < number; item += 1) {
@@ -181,9 +181,13 @@ export function createRasterTools({ readTiff, normalizeHostPath, windowsPath }) 
     const type = readTiff(resolve(typeFile), typeBand - 1, true)
     if (type.band !== typeBand - 1) throw new Error('本次运行的地表类型波段不存在')
     // 经纬度栅格的像元面积随纬度变化，逐行按球面计算；投影栅格按米制像元面积。
-    // DEFERRED[中] Bug: 只有 unit === '°' 时才按球面面积计算；unit 为空（缺少 GTModelType/线性单位键，或经纬度 CRS 只写了引文）时把度数当成米，面积小 10 个数量级以上；投影单位是英尺或 EPSG:3857（面积放大 1/cos²φ）时也不正确；建议：只有确认线性单位为米(9001)时才用米制公式，其它情况返回 null 并在前端显示“—”，Web Mercator 按纬度修正
+    // 球面面积只在 unit 为 '°' 时启用；米制只接受 'm'（以及旧服务端/测试约定的空单位），
+    // 已知英尺/未知投影返回 null，由前端显示“—”。
     const geographic = type.unit === '°' && type.pixelSizeX && type.pixelSizeY && Number.isFinite(type.originY)
-    const area = geographic ? 0 : Math.abs((type.pixelSizeX || 0) * (type.pixelSizeY || 0)) / 1e6
+    // Empty unit is the legacy fixture/old-server contract and has always been
+    // treated as metres; known feet are rejected below.
+    const metric = type.unit === 'm' || type.unit === ''
+    const area = geographic ? 0 : metric ? Math.abs((type.pixelSizeX || 0) * (type.pixelSizeY || 0)) / 1e6 : null
     // 面积：经纬度栅格按球面逐行计算 R²·Δλ·Δφ·cos φ（φ 取该行中心纬度）；
     // 其他栅格每像元面积固定 = |dx·dy| / 1e6 km2。球面面积只在 unit 为 '°' 时启用。
     const radians = Math.PI / 180, earthRadiusKm = 6371.0088

@@ -14,6 +14,7 @@
 //         setting.imageEnvironment 为 0 表示未分配，成像只保留单次散射。
 // ==========================================================================
 
+#include "../voxel_radindex.glsl"
 #ifndef HISTREAM_IMAGE_ENVIRONMENT_GLSL
 #define HISTREAM_IMAGE_ENVIRONMENT_GLSL
 
@@ -64,24 +65,24 @@ int imageEnvironmentBand(float wavelength)
 // 系数在 voxelRads 中的位置：位于前面 N×64 方向场与 N×64 天空缝隙透过率（每条目两个，
 // 合 N×32）之后，即偏移 N×(DIFFUSE_ANGLE_NUM×3/2)（假定 DIFFUSE_ANGLE_NUM=64，待核对），
 // 再按 (体元×n_wave + 波段)/2 索引。
-uint imageEnvironmentEntry(uint voxel, uint band)
+// 注意（2026-11-26）：下标按 64 位计算（见 voxel_radindex.glsl）：N×96 超过 2^32 条目时不再回绕。
+uint64_t imageEnvironmentEntry(uint voxel, uint band)
 {
-    uint k = voxel * uint(setting.n_wave) + band;
-    return uint(setting.voxelCount) * uint(DIFFUSE_ANGLE_NUM * 3 / 2) + (k >> 1);
+    uint64_t k = uint64_t(voxel) * uint64_t(setting.n_wave) + uint64_t(band);
+    return uint64_t(setting.voxelCount) * uint64_t(DIFFUSE_ANGLE_NUM * 3 / 2) + (k >> 1);
 }
 
 float loadImageEnvironment(uint voxel, uint band)
 {
-    uint entry = imageEnvironmentEntry(voxel, band);
-    return ((voxel * uint(setting.n_wave) + band) & 1u) == 0u
-        ? voxelRads[entry].cumulated : voxelRads[entry].induced;
+    uint64_t entry = imageEnvironmentEntry(voxel, band);
+    return (((uint64_t(voxel) * uint64_t(setting.n_wave) + uint64_t(band)) & uint64_t(1)) == uint64_t(0))
+        ? VOXEL_RAD(entry).cumulated : VOXEL_RAD(entry).induced;
 }
 
 void storeImageEnvironment(uint voxel, uint band, float value)
 {
-    uint entry = imageEnvironmentEntry(voxel, band);
-    if(((voxel * uint(setting.n_wave) + band) & 1u) == 0u) voxelRads[entry].cumulated = value;
-    else voxelRads[entry].induced = value;
+    uint64_t entry = imageEnvironmentEntry(voxel, band);
+    if(((uint64_t(voxel) * uint64_t(setting.n_wave) + uint64_t(band)) & uint64_t(1)) == uint64_t(0)) VOXEL_RAD(entry).cumulated = value;
+    else VOXEL_RAD(entry).induced = value;
 }
-
 #endif

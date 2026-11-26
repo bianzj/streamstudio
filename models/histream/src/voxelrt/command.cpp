@@ -21,8 +21,47 @@
 
 #include "command.h"
 #include "base/vkcheck.h"
+#include "base/voxelflags.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <iostream>
+
+namespace {
+// HISTREAM_VOXEL_PASS_TIMING=1: wall-clock time (record to fence) per stage (0 gap, 1 diffuse, 2 out).
+struct RtPassTiming {
+    std::array<double, 3> milliseconds{};
+    std::array<int, 3> calls{};
+    int stage{-1};
+    std::chrono::steady_clock::time_point start{};
+};
+RtPassTiming& rtPassTiming() { static RtPassTiming timing; return timing; }
+void beginRtPass(int stage)
+{
+    if (!voxelflags::passTimingEnabled()) return;
+    rtPassTiming().stage = stage;
+    rtPassTiming().start = std::chrono::steady_clock::now();
+}
+void endRtPass()
+{
+    RtPassTiming& timing = rtPassTiming();
+    if (!voxelflags::passTimingEnabled() || timing.stage < 0) return;
+    const int finished = timing.stage;
+    timing.milliseconds[finished] += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - timing.start).count();
+    ++timing.calls[finished];
+    timing.stage = -1;
+    static const char* names[] = {"gap", "diffuse", "out"};
+    if (finished == 2) {
+        // Printed after every out pass: the last line holds the run totals.
+        for (int s = 0; s < 3; ++s)
+            if (timing.calls[s] > 0)
+                std::cout << "PASS_TIMING\tmodel=voxelrt\tstage=" << names[s] << "\tcalls=" << timing.calls[s]
+                          << "\tms=" << timing.milliseconds[s] << std::endl;
+    }
+}
+}  // namespace
 
 
 
@@ -150,6 +189,7 @@ bool Command::runRTAccelerated(std::shared_ptr<VoxelrtIO>& modelio,
         modelio->setting.n_jump = firstBand;
         modelio->setting.spectralBatchSize = std::min(
             spectralBatchSize, modelio->n_wave - firstBand);
+        beginRtPass(1);
         recordCommandBuffer(
             commandBuffer, modelio->m_descSet,
             modelio->m_pipelineLayout,
@@ -189,7 +229,7 @@ void Command::submit(std::shared_ptr<VoxelrtIO> &modelio, VoxelRTStage stage, gl
     auto & setting = modelio->setting;
     auto & pipelineLayout = modelio->m_pipelineLayout;
     auto & pipeline = modelio->m_pipelines[stage];
-
+    beginRtPass(static_cast<int>(stage));
 
     auto & m_currentSemaphore = modelio->m_currentSemaphore;
     // Preparing for the compute shader
@@ -250,6 +290,7 @@ void Command::recordCommandBuffer(VkCommandBuffer cmdBuf, VkDescriptorSet descSe
 void Command::waitFence(std::shared_ptr<VoxelrtIO> &modelio)
 {
     vkCheck(vkWaitForFences(modelio->m_device, 1, &(modelio->m_fence), VK_TRUE, UINT64_MAX), "VoxelRT GPU execution");
+    endRtPass();
     vkResetFences(modelio->m_device, 1,  &(modelio->m_fence));
     modelio->m_genCmdBuf.destroy(m_inFlight);
     m_inFlight.clear();

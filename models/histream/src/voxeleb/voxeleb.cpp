@@ -35,6 +35,8 @@
 #include "src/base/atmosphere_lut.h"
 #include "src/base/energy_output.h"
 #include "src/base/shortwave_split.h"
+#include "src/base/voxelflags.h"
+#include "src/base/voxelmerge_stats.h"
 
 namespace {
 
@@ -157,6 +159,8 @@ bool Voxeleb::upload(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelebIO>
     // flag must be loaded before createPrimObjScene.
     uploadSetting(fileio, modelio);
     m_pScene->createPrimObjScene(fileio, modelio);
+    // HISTREAM_VOXEL_MERGE_STATS=1|only: read-only two-level (fixscale) potential table; no behaviour change.
+    voxelmerge::report(modelio, "VoxelEB");
     m_pGeometry->createGeometry(fileio,modelio);
 //    defineOPO(modelio);
     uploadMeteo(fileio,modelio);
@@ -196,6 +200,9 @@ bool Voxeleb::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
     modelio->shortwaveScatteringOrders =
         fileio->m_pVoxelebXml->settingxml.shortwaveScatteringOrders;
     modelio->setting.maxStep = fileio->m_pVoxelebXml->settingxml.radiationMaxSteps;
+    modelio->voxelFlags = voxelflags::resolve(fileio->m_pVoxelebXml->settingxml.voxelDirectionRotation,
+        fileio->m_pVoxelebXml->settingxml.voxelDirectionRotationBlock, fileio->m_pVoxelebXml->settingxml.voxelEmptySkip,
+        fileio->m_pVoxelebXml->settingxml.voxelProxyGeometry);
     modelio->diffuseFractionMode = fileio->m_pVoxelebXml->lightxml.diffuseFractionMode;
     // 固定直射比例限幅到 [0, 1]；nodeDirectFraction 初值同它，erbs 模式下逐节点更新。
     modelio->fixedDirectFraction = std::clamp(fileio->m_pVoxelebXml->lightxml.direct, 0.0f, 1.0f);
@@ -226,13 +233,15 @@ bool Voxeleb::updateSetting(std::shared_ptr<VoxelebIO> &modelio){
     modelio->setting.scale = modelio->stepsize_surface;
    // modelio->setting.isTemperature = modelio->isTemperature;
     modelio->setting.isDisplay = modelio->isDisplay;
+    // Voxel transport options from HISTREAM_VOXEL_DIRROT / HISTREAM_VOXEL_SKIP (src/base/voxelflags.h).
+    modelio->setting.voxelFlags = modelio->voxelFlags;
     modelio->setting.maxDepth = modelio->maxDepth;
     modelio->setting.n_sample = modelio->n_sample;
     modelio->setting.voxelSize = modelio->voxelSize_XZY;
     // Vertical cell count bounds the turbid-cell traversal in the shaders.
     modelio->setting.voxelSize.y = std::max(1, static_cast<int>(std::ceil(
         modelio->sceneSize_XYZ.z / std::max(0.01f, modelio->stepsize_surface))));
-    modelio->setting.voxelCount = modelio->n_voxel;
+    modelio->setting.voxelCount = voxelflags::testRadianceVoxels(modelio->n_voxel);
     modelio->setting.periodicNeighborCount = modelio->periodicNeighborCount;
     modelio->setting.skyboxEnabled = modelio->skyboxEnabled ? 1 : 0;
 

@@ -19,6 +19,11 @@
 
 #include "buffer.h"
 #include "base/outputsize.h"
+#include "base/voxellimits.h"
+#include "base/proxymesh.h"
+#include "base/voxelflags.h"
+#include <cstdlib>
+#include <iostream>
 
 
 
@@ -43,6 +48,15 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
 
     nvvk::CommandPool cmdGen(m_device, m_queue.familyIndex);
 
+    // Scene-size limits (explicit errors; before this check an oversize scene silently truncated or read out of bounds).
+    if (n_voxel > 0) {
+        const uint64_t voxels = static_cast<uint64_t>(n_voxel);
+        voxellimits::requireStorageRange(voxellstio->m_physicalDevice, "VoxelRT", "voxel link", voxels, sizeof(VoxelLink));
+        voxellimits::requireStorageRange(voxellstio->m_physicalDevice, "VoxelRT", "voxel direction", voxels, sizeof(VoxelDir));
+        voxellimits::requireStorageRange(voxellstio->m_physicalDevice, "VoxelRT", "voxel net radiation", voxels, sizeof(VoxelNetRad));
+        voxellimits::requireStorageRange(voxellstio->m_physicalDevice, "VoxelRT", "voxel temperature", voxels, sizeof(VoxelTempe));
+        voxellimits::requireDispatch(voxellstio->m_physicalDevice, "VoxelRT", voxels, GROUP_SIZEX);
+    }
     // 步骤 1：光谱参数缓冲（meshio->spectrals）；为空时上传 1 个零元素占位。
     // spectral
     if (meshio->spectrals.size() > 0)
@@ -72,13 +86,15 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
 //        cmdGen.submitAndWait(cmdBufSpectral);
 //    }
 
-    // 步骤 2：热参数缓冲（meshio->thermals）；仅在非空时创建，不上传占位（见下方 DEFERRED）。
-    // DEFERRED[中] Bug: thermal 为空时既不创建缓冲、createDescriptor 也不写该绑定，着色器静态使用该 binding 属未定义行为；但补占位会改变 voxelrt.cpp 中 thermalId < thermals.size() 的回退语义（空 thermal 从"无效索引"变为有效索引 0），需先确认物理语义，本轮不改。
-    if (meshio->thermals.size() > 0)
+    // 步骤 2：热参数缓冲（meshio->thermals）。即使工程没有热属性也必须创建
+    // 一个 300 K 占位元素：着色器静态声明并读取 thermalMaterials 绑定，空描述符
+    // 是未定义行为。mappedId 未命中时返回 0，正好落在占位元素上。
+    const std::vector<Thermal> thermalFallback{ Thermal{ 300.0f, 300.0f } };
+    const auto& thermals = meshio->thermals.empty() ? thermalFallback : meshio->thermals;
     {
         VkCommandBuffer cmdBufSpectral = cmdGen.createCommandBuffer();
         VkBufferUsageFlags usage_ = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        meshio->m_pBufferThermal = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufSpectral, meshio->thermals, usage_));
+        meshio->m_pBufferThermal = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufSpectral, thermals, usage_));
         cmdGen.submitAndWait(cmdBufSpectral);
     }
 
@@ -128,8 +144,22 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
     // 步骤 5：逐网格上传顶点/索引缓冲；带 SHADER_DEVICE_ADDRESS 与加速结构构建输入标志，
     //   既供构建 BLAS，也供着色器经设备地址访问。
     // obj models buffer
+    // Proxy-geometry vertex format (control.voxelProxyGeometry / HISTREAM_VOXEL_PROXY, src/base/proxymesh.h).
+    const int proxyMode = voxelflags::proxyMode(voxellstio->voxelFlags);
+    if (std::getenv("HISTREAM_VOXEL_PROXY_STATS"))
+        std::cout << "PROXY_GEOMETRY\tmodel=VoxelRT\tmode=" << proxymesh::modeName(proxyMode) << std::endl;
     for (int kmodel = 0; kmodel < meshio->primMeshes.size(); kmodel++)
     {
+        if (proxyMode != voxelflags::kProxyFull)
+        {
+            meshio->m_bufferMeshes.emplace_back(proxymesh::uploadPositionMesh(
+                *m_pAlloc, voxellstio->m_physicalDevice, m_device, m_queue.familyIndex, m_queue.queue,
+                "VoxelRT", static_cast<size_t>(kmodel), meshio->primMeshes[kmodel], proxyMode));
+            continue;
+        }
+        // Legacy 44-byte vertices: nvvk uploads each buffer through a staging buffer of the same size, so both must fit
+        // one allocation (an oversize mesh used to crash the driver without a message).
+        proxymesh::requireFullMeshFits(voxellstio->m_physicalDevice, "VoxelRT", static_cast<size_t>(kmodel), meshio->primMeshes[kmodel]);
         // DEFERRED[低] 性能: 每个网格都新建一个 nvvk::CommandPool 并 submitAndWait，网格数上千时创建/销毁池与同步开销显著；建议：复用外层 cmdGen，把所有网格上传录制进一个命令缓冲后统一提交。
         nvvk::CommandPool cmdBufGet(m_device, m_queue.familyIndex, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, m_queue.queue);
         VkCommandBuffer cmdBufModel = cmdBufGet.createCommandBuffer();
@@ -157,7 +187,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
     for (int kmodel = 0; kmodel < meshio->primMeshes.size(); kmodel++)
     {
         meshio->meshLinks[kmodel].vertexAddress = nvvk::getBufferDeviceAddress(m_device, meshio->m_bufferMeshes[kmodel].vertexBuffer.buffer);
-        meshio->meshLinks[kmodel].indexAddress = nvvk::getBufferDeviceAddress(m_device, meshio->m_bufferMeshes[kmodel].indexBuffer.buffer);
+        meshio->meshLinks[kmodel].indexAddress = meshio->m_bufferMeshes[kmodel].indexed
+            ? nvvk::getBufferDeviceAddress(m_device, meshio->m_bufferMeshes[kmodel].indexBuffer.buffer) : 0;
     }
     meshio->m_pBufferMeshLink = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufModelLink, meshio->meshLinks, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     cmdGen.submitAndWait(cmdBufModelLink);
@@ -234,6 +265,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
     ///  Accelerate properties
     ///--------------------------------------------------------------------
     // 步骤 9：依据网格与实例构建加速结构（BLAS/TLAS）。
+    m_pAccelStruct->m_physicalDevice = voxellstio->m_physicalDevice;  // explicit BLAS size checks (voxel modes only)
+    m_pAccelStruct->m_modelName = "VoxelRT";
     m_pAccelStruct->createAccelStruct(m_device,meshio,instanceio);
 
     ///--------------------------------------------------------------------
@@ -279,19 +312,20 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelrtIO> &voxellstio){
                                                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufDir);
 
-    // 步骤 12：辐射场缓冲 VoxelRad，总条数 n_voxel × (DIFFUSENUM + 2·n_wave)，全零初始化；
-    //   条目的具体索引顺序以着色器为准（待核对）。
+    // 步骤 12：辐射场缓冲 VoxelRad，总条数 n_voxel × 2·n_wave，全零初始化（2026-11-26 起不再有 64 个方向暂存槽，
+    //   每体元 8·2·n_wave 字节；布局见 voxelrt/voxelrad_diffuse_single.comp 的 voxelRadiationIndex）。
     // rads
     VkCommandBuffer cmdBufRads = cmdGen.createCommandBuffer();
-    // Keep the directional integration scratch space separate from the
-    // persistent per-band results. Otherwise every new band overwrites the
-    // results of the preceding bands (most visibly band 0). Per band: the
-    // accumulated environment, then a ping-pong pair holding the previous and
-    // current collision order of the iterative diffuse passes.
-    const size_t radiationStride = static_cast<size_t>(DIFFUSENUM) +
-                                   2U * static_cast<size_t>(voxellstio->n_wave);
+    // Per band: the accumulated environment, then a ping-pong pair holding the previous and
+    // current collision order of the iterative diffuse passes. The 64-direction integration
+    // scratch that used to precede them now lives in thread-private shader memory.
+    const size_t radiationStride = 2U * static_cast<size_t>(std::max(voxellstio->n_wave, 1));
+    // The buffer is a plain storage buffer: its size must fit maxStorageBufferRange and its element
+    // index the 32-bit shader arithmetic. Clear errors instead of silent truncation.
+    voxellimits::requireStorageRange(voxellstio->m_physicalDevice, "VoxelRT", "radiance (voxelRads)",
+        static_cast<uint64_t>(n_voxel), radiationStride * sizeof(VoxelRad));
+    voxellimits::requireIndex32("VoxelRT", "radiance (voxelRads)", static_cast<uint64_t>(n_voxel), radiationStride);
     std::vector<VoxelRad> voxelRads(static_cast<size_t>(n_voxel) * radiationStride, VoxelRad{0, 0});
-    // DEFERRED[高] GPU同步: 该缓冲大小为 n_voxel×(64+2×n_wave)×8 字节，城市/高光谱场景很容易超过 4 GiB，而 VoxelRT 仍以普通 SSBO 描述符(VK_WHOLE_SIZE)绑定，超过 maxStorageBufferRange 时着色器越界访问/结果截断（VoxelEB 为此已改用 buffer_reference）；另外还要在主机先分配同等大小的全零 vector 再上传；建议：检查 maxStorageBufferRange 后改用设备地址访问，并用 vkCmdFillBuffer 清零而非主机上传。
     voxelio->m_pRadsBuffer = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufRads, voxelRads,
                                                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
@@ -385,7 +419,7 @@ void Buffer::destroy(std::shared_ptr<VoxelrtIO> &voxellstio){
     for (int i = 0; i < meshio->m_bufferMeshes.size(); i++)
     {
         m_pAlloc->destroy((meshio->m_bufferMeshes[i].vertexBuffer));
-        m_pAlloc->destroy((meshio->m_bufferMeshes[i].indexBuffer));
+        if (meshio->m_bufferMeshes[i].indexBuffer.buffer) m_pAlloc->destroy((meshio->m_bufferMeshes[i].indexBuffer));
     }
 
 

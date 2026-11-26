@@ -921,16 +921,27 @@ float SegmentFractionInCell(vec3 start, vec3 delta, vec3 cellMin)
 //       光学厚度 τ = Σ 消光系数 × 路径长度；位置单位为“场景体元格”。
 #ifdef NANOVDB_INFO
 #define TURBID_GRID_AVAILABLE 1
+#include "voxel_flags.glsl"
 // 全局状态：turbidGridLink / turbidGridReady 保存待用的 NanoVDB 句柄，由 ConfigureTurbidGrid 设置。
 // VoxelRT: turbid cells are crossed planes, so an oblique ray can clip a cell
 // without hitting any of its planes. Integrate segments cell by cell instead.
 NanoVDBLink turbidGridLink;
 bool turbidGridReady = false;
+// Inclusive index bounding box of the occupied cells (NanoVDB root bbox), read once per
+// invocation by ConfigureTurbidGrid; turbidGridBoxValid is false for an empty grid.
+ivec3 turbidGridLo = ivec3(0);
+ivec3 turbidGridHi = ivec3(-1);
+bool turbidGridBoxValid = false;
 
 void ConfigureTurbidGrid(NanoVDBLink link)
 {
     turbidGridLink = link;
     turbidGridReady = true;
+    pnanovdb_coord_t lower = pnanovdb_root_get_bbox_min(link.buf, link.root);
+    pnanovdb_coord_t upper = pnanovdb_root_get_bbox_max(link.buf, link.root);
+    turbidGridLo = lower;
+    turbidGridHi = upper;
+    turbidGridBoxValid = all(greaterThanEqual(upper, lower));
 }
 
 // Top of the occupied grid in cell units (index bbox of the nanovdb root).
@@ -938,9 +949,65 @@ void ConfigureTurbidGrid(NanoVDBLink link)
 float TurbidGridTop()
 {
     if (!turbidGridReady) return 1.0e30;
-    pnanovdb_coord_t lower = pnanovdb_root_get_bbox_min(turbidGridLink.buf, turbidGridLink.root);
-    pnanovdb_coord_t upper = pnanovdb_root_get_bbox_max(turbidGridLink.buf, turbidGridLink.root);
-    return upper.y >= lower.y ? float(upper.y + 1) : 1.0e30;
+    return turbidGridHi.y >= turbidGridLo.y ? float(turbidGridHi.y + 1) : 1.0e30;
+}
+
+// DDA skipping (HDDA): clip the traversal box to the occupied bounding box and step over
+// whole empty NanoVDB nodes. Both only drop cells whose extinction is exactly 0, so the
+// optical depth is unchanged up to float rounding of the DDA state. Opt-in with
+// HISTREAM_VOXEL_SKIP=on (VOXEL_FLAG_HDDA); the default is the original per-cell loops.
+bool TurbidSkipEnabled()
+{
+    return turbidGridBoxValid && VoxelFlag(VOXEL_FLAG_HDDA);
+}
+
+// Ray parameter at which a ray leaves the dim-aligned empty block that holds `cell`.
+// `cell` is the (wrapped) lookup cell, `unwrapped` the DDA cell the ray is really in
+// (they differ by whole periods in x and z; pass the same value without periodic walks),
+// `wrapLimit` the period (x, z) or ivec2(0) when there is none: a block never extends
+// across a period edge. exitAxis/exitCell give the cell the ray enters on the exit face.
+float TurbidBlockExit(ivec3 cell, ivec3 unwrapped, int dim, vec3 a, vec3 dir, ivec2 wrapLimit,
+                      out int exitAxis, out int exitCell)
+{
+    float tExit = 1.0e30;
+    exitAxis = 1;
+    exitCell = unwrapped.y;
+    ivec3 shift = unwrapped - cell;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (abs(dir[axis]) < 1.0e-9) continue;
+        int base = cell[axis] & ~(dim - 1);
+        int edge;
+        if (dir[axis] > 0.0) {
+            edge = base + dim;
+            if (axis != 1 && wrapLimit[axis == 0 ? 0 : 1] > 0) edge = min(edge, wrapLimit[axis == 0 ? 0 : 1]);
+        } else {
+            edge = base;
+        }
+        edge += shift[axis];
+        float t = (float(edge) - a[axis]) / dir[axis];
+        if (t < tExit) {
+            tExit = t;
+            exitAxis = axis;
+            exitCell = dir[axis] > 0.0 ? edge : edge - 1;
+        }
+    }
+    return tExit;
+}
+
+// Resumes a unit-cell DDA at ray parameter t (just across the face of exitAxis): rebuilds
+// `cell` and the next-boundary parameters tMax. tMax never falls behind t.
+void TurbidDdaResume(vec3 a, vec3 dir, float t, int exitAxis, int exitCell,
+                     inout ivec3 cell, inout vec3 tMax)
+{
+    vec3 p = a + dir * t;
+    cell = ivec3(floor(p + dir * 1.0e-5));
+    cell[exitAxis] = exitCell;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (abs(dir[axis]) >= 1.0e-9) {
+            float boundary = float(cell[axis] + (dir[axis] > 0.0 ? 1 : 0));
+            tMax[axis] = max((boundary - a[axis]) / dir[axis], t);
+        }
+    }
 }
 
 // 作用：某体元沿 direction 的消光系数（每体元格长度）= 密度·G·聚集指数·setting.scale。
@@ -981,6 +1048,12 @@ float TurbidBoxSegmentOpticalDepth(vec3 start, vec3 end)
     vec3 dir = delta / len;
     vec3 lo = vec3(0.0);
     vec3 hi = vec3(setting.voxelSize);
+    // HDDA step 1: only the occupied bounding box of the grid can carry extinction.
+    bool skip = TurbidSkipEnabled();
+    if (skip) {
+        lo = max(lo, vec3(turbidGridLo));
+        hi = min(hi, vec3(turbidGridHi + ivec3(1)));
+    }
     float t0 = 0.0;
     float t1 = len;
     for (int axis = 0; axis < 3; ++axis) {
@@ -1012,7 +1085,25 @@ float TurbidBoxSegmentOpticalDepth(vec3 start, vec3 end)
     for (int i = 0; i < 1024 && t < t1; ++i) {
         float next = min(min(tMax.x, tMax.y), tMax.z);
         float segmentEnd = min(next, t1);
-        int bufferId = nanovdbGet(turbidGridLink, cell);
+        int bufferId;
+        if (skip) {
+            int dim;
+            bufferId = nanovdbGetDim(turbidGridLink, cell, dim);
+            if (bufferId < 0 && dim > 1) {
+                // HDDA step 2: the cell lies in an absent NanoVDB node; leave the whole block.
+                int exitAxis;
+                int exitCell;
+                float tExit = TurbidBlockExit(cell, cell, dim, a, dir, ivec2(0), exitAxis, exitCell);
+                if (tExit > t) {
+                    if (tExit >= t1) break;
+                    t = tExit;
+                    TurbidDdaResume(a, dir, t, exitAxis, exitCell, cell, tMax);
+                    continue;
+                }
+            }
+        } else {
+            bufferId = nanovdbGet(turbidGridLink, cell);
+        }
         tau += TurbidCellExtinction(bufferId, cell, dir) * max(segmentEnd - t, 0.0);
         t = segmentEnd;
         if (t >= t1) break;
@@ -1043,6 +1134,8 @@ struct TurbidPeriodicWalk
     ivec2 startTile;
     int limit;
     int remaining;
+    vec3 origin;       // ray start in grid coordinates (for HDDA block skipping)
+    vec3 direction;    // normalized ray direction
 };
 
 // 作用：由 setting.periodicNeighborCount 得到允许跨越周期边界的次数（>0 表示启用周期边界）。
@@ -1067,12 +1160,15 @@ bool TurbidPeriodicBegin(vec3 start, vec3 direction, out TurbidPeriodicWalk w)
     vec3 a = start + semi;
     vec3 dir = normalize(direction);
     float hiY = min(float(setting.voxelSize.y), TurbidGridTop());
+    float loY = 0.0;
+    // HDDA: nothing below the lowest occupied cell carries extinction either.
+    if (TurbidSkipEnabled()) loY = max(loY, float(turbidGridLo.y));
     float t0 = 0.0;
     float t1 = 1.0e30;
     if (abs(dir.y) < 1.0e-9) {
-        if (a.y < 0.0 || a.y > hiY) return false;
+        if (a.y < loY || a.y > hiY) return false;
     } else {
-        float ta = -a.y / dir.y;
+        float ta = (loY - a.y) / dir.y;
         float tb = (hiY - a.y) / dir.y;
         t0 = max(t0, min(ta, tb));
         t1 = min(t1, max(ta, tb));
@@ -1096,6 +1192,8 @@ bool TurbidPeriodicBegin(vec3 start, vec3 direction, out TurbidPeriodicWalk w)
     w.startTile = TurbidPeriodicTile(w.cell, w.period);
     w.limit = TurbidPeriodicLimit();
     w.remaining = 1024 * (1 + w.limit);
+    w.origin = a;
+    w.direction = dir;
     return true;
 }
 
@@ -1122,6 +1220,54 @@ bool TurbidPeriodicNext(inout TurbidPeriodicWalk w, out ivec3 lookup, out float 
     return true;
 }
 
+// TurbidPeriodicNext that also reads the cell value (bufferId) and, with HDDA skipping on,
+// leaves empty NanoVDB blocks (8 / 128 / 4096 cells) in one step instead of cell by cell.
+// Blocks never cross a period edge (the lookup is wrapped), so the tile accounting of the
+// walk stays exact. Returned cells have bufferId >= 0 or lie in a present leaf.
+bool TurbidPeriodicNextCell(inout TurbidPeriodicWalk w, out ivec3 lookup, out float segmentLength,
+                            out int bufferId)
+{
+    bufferId = -1;
+    if (!TurbidSkipEnabled()) {
+        if (!TurbidPeriodicNext(w, lookup, segmentLength)) return false;
+        bufferId = nanovdbGet(turbidGridLink, lookup);
+        return true;
+    }
+    for (int guard = 0; guard < 4096; ++guard) {
+        lookup = ivec3(0);
+        segmentLength = 0.0;
+        if (w.remaining <= 0 || w.t >= w.t1) return false;
+        ivec2 tile = TurbidPeriodicTile(w.cell, w.period);
+        if (abs(tile.x - w.startTile.x) + abs(tile.y - w.startTile.y) > w.limit) return false;
+        lookup = ivec3(w.cell.x - tile.x * w.period.x, w.cell.y,
+                       w.cell.z - tile.y * w.period.y);
+        int dim;
+        bufferId = nanovdbGetDim(turbidGridLink, lookup, dim);
+        if (bufferId < 0 && dim > 1) {
+            int exitAxis;
+            int exitCell;
+            float tExit = TurbidBlockExit(lookup, w.cell, dim, w.origin, w.direction, w.period,
+                                          exitAxis, exitCell);
+            if (tExit > w.t) {
+                --w.remaining;
+                if (tExit >= w.t1) { w.t = w.t1; return false; }
+                w.t = tExit;
+                TurbidDdaResume(w.origin, w.direction, tExit, exitAxis, exitCell, w.cell, w.tMax);
+                continue;
+            }
+        }
+        float segmentEnd = min(min(min(w.tMax.x, w.tMax.y), w.tMax.z), w.t1);
+        segmentLength = max(segmentEnd - w.t, 0.0);
+        w.t = segmentEnd;
+        --w.remaining;
+        if (w.tMax.x <= w.tMax.y && w.tMax.x <= w.tMax.z) { w.cell.x += w.stepCell.x; w.tMax.x += w.tDelta.x; }
+        else if (w.tMax.y <= w.tMax.z) { w.cell.y += w.stepCell.y; w.tMax.y += w.tDelta.y; }
+        else { w.cell.z += w.stepCell.z; w.tMax.z += w.tDelta.z; }
+        return true;
+    }
+    return false;
+}
+
 // 作用：从 start 沿 direction 逃逸（无终点）时的周期边界光学厚度；τ>50（透过率<2e-22）提前结束。
 float TurbidPeriodicOpticalDepth(vec3 start, vec3 direction)
 {
@@ -1131,8 +1277,8 @@ float TurbidPeriodicOpticalDepth(vec3 start, vec3 direction)
     float tau = 0.0;
     ivec3 cell;
     float segmentLength;
-    while (TurbidPeriodicNext(w, cell, segmentLength)) {
-        int bufferId = nanovdbGet(turbidGridLink, cell);
+    int bufferId;
+    while (TurbidPeriodicNextCell(w, cell, segmentLength, bufferId)) {
         tau += TurbidCellExtinction(bufferId, cell, dir) * segmentLength;
         if (tau > 50.0) break;  // transmittance below 2e-22
     }

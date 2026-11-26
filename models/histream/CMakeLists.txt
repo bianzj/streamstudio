@@ -220,7 +220,10 @@ if (HISTREAM_ENABLE_FACET)
             direct_resolve.comp
             radiosity.comp
             ground_mean.comp
-            incident.comp)
+            incident.comp
+            visibility_rayquery.comp
+            direct_rayquery.comp
+            graph_build.comp)
     foreach (FACET_KIND IN ITEMS facetrt faceteb)
         set(FACET_KIND_SHADER_FILES ${HISTREAM_FACET_SHADER_FILES})
         if(FACET_KIND STREQUAL "faceteb")
@@ -535,3 +538,14 @@ target_include_directories(histream_lumped_thermal_tests PRIVATE "${CMAKE_CURREN
 # Numerical check of the shared LIDF / G / Gamma code (shader/lidf_common.h).
 add_executable(histream_lidf_gamma_tests EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/test-lidf-gamma.cpp")
+
+# Offline ray-effect check of the 64-direction diffuse lattice and its hashed rotations
+# (shader/voxel_dirrot.glsl); no GPU needed.
+add_executable(histream_diffuse_directions_tests EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/test-diffuse-directions.cpp")
+
+# Scene-size limit guards (src/base/voxellimits.h): needs a Vulkan device to read its limits, allocates nothing.
+add_executable(histream_voxel_limits_tests EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/test-voxel-limits.cpp")
+target_include_directories(histream_voxel_limits_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(histream_voxel_limits_tests PRIVATE Vulkan::Vulkan)

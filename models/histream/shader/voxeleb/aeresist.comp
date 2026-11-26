@@ -47,6 +47,7 @@
 #include "../global.glsl"
 #include "../functions.glsl"
 #include "../nanovdb_info.glsl"
+#include "../voxel_flags.glsl"
 // fluid_coupling.glsl：局部风速、MOST 稳定度函数、stabilityCorrectionEnabled() 等。
 #include "fluid_coupling.glsl"
 
@@ -199,10 +200,22 @@ float columnCanopy(NanoVDBLink nanoVDBLink, ivec3 voxelId0, out float top, out f
     top = 0.0;
     leafwidth = 0.0;
     ivec3 voxelRes = ivec3(setting.voxelSize);
+    // HDDA: an empty NanoVDB block (8 / 128 / 4096 cells) holds no vegetation; skip to its end.
+    bool skip = VoxelFlag(VOXEL_FLAG_HDDA);
     for(int y = voxelId0.y + 1; y <= voxelId0.y + max(voxelRes.y, 1) + 1 && y - voxelId0.y < 2048; ++y)
     {
         ivec3 cell = ivec3(voxelId0.x, y, voxelId0.z);
-        int bufferId = nanovdbGet(nanoVDBLink, cell);
+        int bufferId;
+        if(skip) {
+            int dim;
+            bufferId = nanovdbGetDim(nanoVDBLink, cell, dim);
+            if(bufferId < 0 && dim > 1) {
+                y = (y & ~(dim - 1)) + dim - 1;
+                continue;
+            }
+        } else {
+            bufferId = nanovdbGet(nanoVDBLink, cell);
+        }
         if(bufferId < 0 || bufferId >= setting.voxelCount) continue;
         MeshLink link = meshLinks[instanceLinks[voxelLinks[bufferId].instanceId].meshId];
         if(link.type != TYPE_VEGETATION) continue;

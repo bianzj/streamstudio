@@ -1,0 +1,40 @@
+// ==========================================================================
+// 文件：faceteb/direct_rayquery.comp（FacetEB，硬件光线查询太阳可见比例）
+// 功能：direct_resolve.comp 的替代：沿太阳方向每像素一条射线，枚举全部交点
+//   （visibility_rayquery.glsl），每个中心瓦片片元累加 totalCounts，最近片元累加 visibleCounts。
+// 绑定（直射描述符集）：4 totalCounts，5 visibleCounts，6 statistics，8 加速结构，9 顶点缓冲。
+// 约定：同深度时取（深度, 侧编号）最小者，周期副本位使中心片元优先，与 direct_resolve.comp 相同。
+// ==========================================================================
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "visibility_rayquery.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 4) buffer TotalCounts {
+    uint totalCounts[];
+};
+layout(std430, set = 0, binding = 5) buffer VisibleCounts {
+    uint visibleCounts[];
+};
+
+void main()
+{
+    const uint pixel = gl_GlobalInvocationID.x;
+    if (pixel >= pc.raster.x * pc.raster.y) {
+        return;
+    }
+    const uint count = collectFragments(pixel);
+    if (count == 0u) {
+        return;
+    }
+    for (uint i = 0u; i < count; ++i) {
+        if ((localRecords[i].cameraSide & REPLICA_BIT) == 0u)
+            atomicAdd(totalCounts[localRecords[i].cameraSide], 1u);
+    }
+    // 已按（深度, 侧编号）排序：第 0 条即最近片元。
+    if ((localRecords[0].cameraSide & REPLICA_BIT) == 0u)
+        atomicAdd(visibleCounts[localRecords[0].cameraSide], 1u);
+}

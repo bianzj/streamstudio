@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from facet_document import read_document  # JSON / binary facet result reader (tools/facet_document.py)
 parser = argparse.ArgumentParser()
 parser.add_argument('root', type=Path)
 parser.add_argument('variants', nargs='+')
@@ -44,7 +45,7 @@ for variant in args.variants:
     folder = Path(read(args.root / variant / 'run.json')['outputDir'])
     manifest, index = read(folder / 'run-manifest.json'), read(folder / 'faceteb_run.json')
     assert manifest['status'] != 'running', f'{variant} still running'
-    geometry = read(folder / 'faceteb.json')
+    geometry = read_document(folder / 'faceteb.json', only={'vertexPositions'})  # JSON or binary result
     vertices = np.asarray(geometry['vertexPositions']).reshape(-1, 3, 3)
     # 面元面积 = |(v1-v0)×(v2-v0)|/2，用作温度面积加权均值的权重。
     area = np.linalg.norm(np.cross(vertices[:, 1] - vertices[:, 0],

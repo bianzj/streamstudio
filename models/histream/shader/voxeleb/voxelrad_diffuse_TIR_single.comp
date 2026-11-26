@@ -7,7 +7,7 @@
 //   1. isSolidVoxel：判定不透明体元（建筑/土壤/水体），用于终止漫射射线
 //   2. voxel_raytracing_diffuse：对一个接收体元逐方向、逐步追踪射线，
 //      命中植被（湍流介质/叶片）、不透明面元或逃逸到大气，把各项贡献原子累加到
-//      voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].induced
+//      VOXEL_RAD(VOXEL_RAD_FIELD(bufferId0, iangle)).induced
 //   3. main：每个线程处理一个体元；调用上面的追踪 → induced 复制到 cumulated →
 //      按方向权重求和（植被：叶倾角 G 加权；固体：余弦加权半球）→ 乘吸收率
 //      → 写入 voxelNetRads[].diffuseTrad
@@ -59,7 +59,9 @@
 #include "../functions.glsl"
 #include "../surface_brdf.glsl"
 #include "../shade_state_voxel.glsl"
+#include "../voxel_radindex.glsl"
 #include "fluid_coupling.glsl"
+#include "../voxel_dirrot.glsl"
 
 PtPayload        prd;
 ShadowHitPayload shadow_payload;
@@ -70,6 +72,15 @@ layout(local_size_x = GROUP_SIZEX) in;
 // #define DIFFUSE_ANGLE_NUM 32
 #define NUM_VNIR 2001 
 #define NUM_BAND 2002
+
+// 作用：第 k 个漫射方向。旧版：固定 64 方向格点；HISTREAM_VOXEL_DIRROT=rot：按体元哈希的三维随机旋转
+// （gDiffuseRotation，只取决于体元编号与面编号，不随能量平衡迭代变化——TIR 每次迭代都重算，
+// 方向集若变化会让温度不动点抖动）。
+vec3 tirDiffuseDirection(uint k)
+{
+    if(VoxelDirRotEnabled()) return gDiffuseRotation * DIFFUSE_DIRECTIONS[k];
+    return DIFFUSE_DIRECTIONS[k];
+}
 
 // Opaque cells end a diffuse ray; turbid vegetation planes and participating
 // media do not (a plane's front cell is its own vegetation voxel).
@@ -85,7 +96,7 @@ bool isSolidVoxel(int bufferId)
 // 模块：对一个接收体元追踪所有漫射方向，累计入射长波。
 // 输入：voxelPos0 体元（或面元）中心位置；bufferId0 接收体元索引；nanoVDBLink 体元查找；
 //       kband 波段号；Esun 水平面太阳直射（本 pass 为 0）；Esky 天空向下长波（W m-2）。
-// 输出：写 voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].induced（原子累加），返回值恒为 false。
+// 输出：写 VOXEL_RAD(VOXEL_RAD_FIELD(bufferId0, iangle)).induced（原子累加），返回值恒为 false。
 // 说明：（2026-11-25 删除了原来未使用的 kiter 迭代阶数参数；单遍近似，没有迭代）。每个方向最多推进 setting.maxStep 步，
 //       每步用 ClosestHit 找下一个交点，再判断它属于植被体元、实体面元还是大气。
 bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
@@ -144,7 +155,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
   // 步骤 1：逐漫射方向循环；每个方向独立追踪并累加到该方向的 induced。
   for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
   {
-    directioni0 = DIFFUSE_DIRECTIONS[iangle];
+    directioni0 = tirDiffuseDirection(iangle);
     directioni = normalize(directioni0);
     ConfigureCone(voxelPos0, directioni, 0.0, 0.0);
 
@@ -161,7 +172,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
     float lastLeafEmission = receiverLeafEmission;
 		// 先清零该方向 induced（由本线程独占写，后续用 atomicAdd 累加各项来源）。
 		// alpha_toVoxel 为沿射线到当前位置的累积透过率；lastLeafEmission 为最近一次穿过的叶片发射。
-		voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].induced = 0.0;
+		VOXEL_RAD(VOXEL_RAD_FIELD(bufferId0, iangle)).induced = 0.0;
     // A solid surface only receives radiance through its outer hemisphere.
     // Rays into the object interior would hit its own inner facets and add the
     // object's emission/reflection to its own incident environment.
@@ -173,8 +184,8 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
 
 
     //----------------------------------
-    //  uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
-    // atomicAdd(voxelRads[index].induced,
+    //  uint64_t index = VOXEL_RAD_FIELD(bufferId0, iangle);
+    // atomicAdd(VOXEL_RAD(index).induced,
     //     Esky,
     //     gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
     //     continue;
@@ -206,16 +217,16 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
         // 步骤 2a：射线未命中任何几何（逃逸到大气）。先计入最后一段穿越的湍流冠层
         // （吸收天空辐射并以最近叶片温度发射），再对向上方向加上天空向下长波 Esky。
         float escape = TurbidEscapeTransmittance(ray.origin, ray.direction);
-        uint escapeIndex = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
-        atomicAdd(voxelRads[escapeIndex].induced,
+        uint64_t escapeIndex = VOXEL_RAD_FIELD(bufferId0, iangle);
+        atomicAdd(VOXEL_RAD(escapeIndex).induced,
             alpha_toVoxel * (1.0 - escape) * lastLeafEmission,
             gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
         alpha_toVoxel *= escape;
         if(directioni0.y > 0.0)
         {
            float skyrad = alpha_toVoxel*Esky;
-          uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
-          atomicAdd(voxelRads[index].induced,
+          uint64_t index = VOXEL_RAD_FIELD(bufferId0, iangle);
+          atomicAdd(VOXEL_RAD(index).induced,
               skyrad,
               gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
         }
@@ -225,8 +236,8 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
 
 
       // float skyrad = 1;
-      // uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
-      // atomicAdd(voxelRads[index].induced,
+      // uint64_t index = VOXEL_RAD_FIELD(bufferId0, iangle);
+      // atomicAdd(VOXEL_RAD(index).induced,
       //     skyrad,
       //     gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
       //     break;
@@ -334,7 +345,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
             //////////////////////////////
             /// Save back
             /////////////////////////////
-            atomicAdd(voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].induced,radiance,
+            atomicAdd(VOXEL_RAD(VOXEL_RAD_FIELD(bufferId0, iangle)).induced,radiance,
                 gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
           alpha_toVoxel = alpha_toVoxel * alpha_voxel;
           if(alpha_toVoxel < 0.01) break; 
@@ -397,7 +408,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
           //       directionj0 = (DIFFUSE_DIRECTIONS[jangle]);
           //       bool inSameSide = isSameSide(directioni,directionj0,ffnormal);
           //       if(!inSameSide) continue;
-          //       float radiancej = voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].cumulated;
+          //       float radiancej = VOXEL_RAD(VOXEL_RAD_FIELD(bufferId0, iangle)).cumulated;
           //       radiance= radiance + radiancej * refl* alpha_toVoxel;  
           //   }
           //   radiance = radiance/DIFFUSE_ANGLE_NUM;
@@ -428,7 +439,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
           //////////////////////////////
           /// Save back
           /////////////////////////////
-          atomicAdd(voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].induced,radiance,
+          atomicAdd(VOXEL_RAD(VOXEL_RAD_FIELD(bufferId0, iangle)).induced,radiance,
               gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
 
           alpha_toVoxel = 0;
@@ -502,13 +513,15 @@ void main()
     // 注：Rli 为气象输入的天空向下长波辐射（W m-2）。（2026-11-25：删除了未使用的 Rin 变量，
     //   并改正 Rli 的行尾旧注释——原写成 wind speed，与含义不符。）
     float Rli = ubom.meteo.Rli;               // 天空向下长波 Rli（W m-2）
+    // rot 模式：体元固定的哈希旋转（salt 只含面编号，不含迭代号）。
+    SelectDiffuseRotation(voxelId0, uint(max(faceId, 0)));
 
     // reset the voxelRads in VNIR band
     // for(uint kband=NUM_VNIR;kband < NUM_BAND;kband++)
     //   for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
     //   {
     //     uint index = bufferId0*32*2162+kband*32+iangle;
-    //     voxelRads[index].cumulated=0.0;
+    //     VOXEL_RAD(index).cumulated=0.0;
     //   }
 
     //------------------------------------------------------------
@@ -538,8 +551,8 @@ void main()
 
             for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
             {
-                uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
-                voxelRads[index].cumulated = voxelRads[index].induced;
+                uint64_t index = VOXEL_RAD_FIELD(bufferId0, iangle);
+                VOXEL_RAD(index).cumulated = VOXEL_RAD(index).induced;
             }
         }
 
@@ -564,19 +577,54 @@ void main()
             bool leafWeighted = receiverCanopy.lidfValid != 0
                 && !isParticipatingMedium(receiverCanopy);
             float projectionSum = 0.0;
+            if(VoxelDirRotEnabled())
+            {
+                // Rotated set: |y| is not (2k+1)/64 any more, evaluate G of each rotated direction.
+                uint receiverCanopyId = meshLinks[meshId0].canopyId;
+                float rotatedG[DIFFUSE_ANGLE_NUM];
+                for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
+                {
+                    rotatedG[iangle] = leafWeighted
+                        ? CanopyG(receiverCanopyId, normalize(tirDiffuseDirection(iangle))) : 1.0;
+                    projectionSum += rotatedG[iangle];
+                }
+                for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
+                    compensatedAdd(rads, radsCorrection, finiteNonnegative(
+                        VOXEL_RAD(VOXEL_RAD_FIELD(bufferId0, iangle)).cumulated)
+                        * (leafWeighted ? 2.0 * rotatedG[iangle] / max(projectionSum, 1.0e-6)
+                                        : DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT));
+            }
+            else
+            {
             if(leafWeighted)
                 for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
                     projectionSum += CanopyDiffuseG(receiverCanopy, iangle);
             for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
                 compensatedAdd(rads, radsCorrection, finiteNonnegative(
-                    voxelRads[bufferId0*DIFFUSE_ANGLE_NUM+iangle].cumulated)
+                    VOXEL_RAD(VOXEL_RAD_FIELD(bufferId0, iangle)).cumulated)
                     * (leafWeighted ? 2.0 * CanopyDiffuseG(receiverCanopy, iangle)
                         / max(projectionSum, 1.0e-6) : DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT));
+            }
         }
         // 固体面（建筑/土壤/水体）：以表面法向 ffnormal0 的余弦为权，对外半球方向做加权平均。
         else
         {
         // Cosine-weighted hemisphere quadrature for incident longwave.
+        // The legacy loop is kept verbatim (default results stay bitwise identical); the rotated
+        // set (HISTREAM_VOXEL_DIRROT=rot) has its own copy.
+        if(VoxelDirRotEnabled())
+        {
+            for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
+            {
+                vec3 rotatedDirection = normalize(tirDiffuseDirection(iangle));
+                float rotatedCosine = max(dot0(rotatedDirection, ffnormal0), 0.0);
+                if(rotatedCosine <= 0.0) {continue;}
+                compensatedAdd(rads, radsCorrection, finiteNonnegative(
+                    VOXEL_RAD(VOXEL_RAD_FIELD(bufferId0, iangle)).cumulated) * rotatedCosine);
+                compensatedAdd(cosineWeight, cosineWeightCorrection, rotatedCosine);
+            }
+        }
+        else
         for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
         {
 
@@ -584,8 +632,8 @@ void main()
            vec3  directioni = normalize(directioni0);
            float abc = max(dot0(directioni, ffnormal0), 0.0);
            if(abc <= 0.0) {continue;}
-            uint index = bufferId0*DIFFUSE_ANGLE_NUM+iangle;
-            radtemp = voxelRads[index].cumulated;
+            uint64_t index = VOXEL_RAD_FIELD(bufferId0, iangle);
+            radtemp = VOXEL_RAD(index).cumulated;
             compensatedAdd(rads, radsCorrection, finiteNonnegative(radtemp) * abc);
             compensatedAdd(cosineWeight, cosineWeightCorrection, abc);
 

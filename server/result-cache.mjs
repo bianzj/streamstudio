@@ -97,12 +97,17 @@ export class ByteLru {
   resize(key, bytes) {
     const entry = this.entries.get(key)
     if (!entry) return
-    this.bytes += Math.max(0, Number(bytes) || 0) - entry.bytes
-    entry.bytes = Math.max(0, Number(bytes) || 0)
+    const previous = entry.bytes
+    const next = Math.max(0, Number(bytes) || 0)
+    this.bytes += next - previous
+    entry.bytes = next
     if (entry.bytes > this.limit) { this.delete(key); return }
-    while (this.bytes > this.limit && this.entries.size > 1) {
+    // Evict oldest entries; if the resized entry itself is the oldest it must
+    // also be dropped once it is the only one left, otherwise the cache stays
+    // above its byte limit (the previous code broke out on oldest === key).
+    while (this.bytes > this.limit && this.entries.size > 0) {
       const oldest = this.entries.keys().next().value
-      if (oldest === key) break
+      if (oldest === key && this.entries.size === 1) { this.delete(key); break }
       this.delete(oldest)
     }
   }

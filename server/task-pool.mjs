@@ -95,6 +95,12 @@ export function createTaskPool({ createWorker, runInline, size = 2, idleMs = 5 *
     slot.retired = true
     slot.dead = true
     if (slots[slot.index] === slot) slots[slot.index] = null
+    clearTimeout(slot.idleTimer)
+    // Never leave a caller's Promise pending forever when the pool is torn
+    // down or an idle thread is reclaimed with queued work.
+    const waiting = [...slot.pending.values()]
+    slot.pending.clear()
+    for (const pending of waiting) pending.reject(new Error('后台计算线程已回收，本次操作未完成，请重试'))
     void slot.worker.terminate().catch(() => {})
   }
 

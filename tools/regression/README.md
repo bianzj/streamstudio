@@ -33,5 +33,6 @@ python -I tools/regression/compare.py D:\histream-regression base new --toleranc
 ## 说明
 
 - 示例更新、或 `prepare.mjs` 规范化逻辑变化时，旧变体的结果与新输入不可比，需要重跑基线。
-- RayTracing 为蒙特卡洛结果，但随机序列固定，同一引擎重复运行逐位相同；改动采样逻辑后应比较统计量而非逐位一致。
+- RayTracing 为蒙特卡洛结果，但随机序列固定，同一引擎重复运行逐位相同；改动采样逻辑后应比较统计量而非逐位一致。2026-11-26 起 RayTracing 默认用 Owen 置乱 Sobol 采样（`control.sampler`，缺省 `sobol`），与此前的基线引擎相比所有 `rt_*` 算例的像元值都会在噪声量级内变化（场景均值差 < 0.01%）。需要和旧基线逐位比较时，运行时设 `$env:HISTREAM_RT_SAMPLER='legacy'`（`run.mjs` 会把环境变量传给引擎），此时输出与旧引擎逐位相同；同一算例的多种子方差统计用 `$env:HISTREAM_RT_SEED='<整数>'`，见 `docs/raytracing-variance-reduction.md`。
 - Facet 可见性栅格可用环境变量 `HISTREAM_FACET_RASTER_SIZE=2048/4096` 提高，用作采样偏差的参考解（显存受 4 GB 存储缓冲上限约束；CPU 后端 `HISTREAM_FACET_BACKEND=cpu` 配合 `HISTREAM_FACET_RASTER_LAYERS=256` 不受此限）。
+- VoxelRT / VoxelEB 体元网格的逐格 DDA 自 2026-11-26 起默认跳过空节点（`control.voxelEmptySkip`，缺省 `true`），与此前的基线引擎相比 `vrt_*`、`veb_*` 算例的结果在浮点舍入量级内变化（类均温 < 1e-5 K，影像波段均值 ≤ 4.5e-4 K；相对变化 ≤ 5e-6，`--tolerance 1e-4` 的门禁可以通过）。需要和旧基线逐位比较时设 `$env:HISTREAM_VOXEL_SKIP='off'`（`run.mjs` 会把环境变量传给引擎）。漫射方向旋转缺省仍为 `legacy`（逐位相同），`control.voxelDirectionRotation='rot'` / `HISTREAM_VOXEL_DIRROT=rot` 开启后结果在方向采样噪声量级内变化。详见 `docs/voxel-adaptive-and-direction.md`。

@@ -68,6 +68,8 @@ public:
     bool uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<RaytracingIO> &raytracingio);
     bool updateSetting(std::shared_ptr<RaytracingIO> &raytracingio);
 
+    // 一次完整追踪：常规为 Command::run；自适应采样时为“先导遍 → 读回 σ → 分配 → 细化遍”（见 raytracing.cpp）。
+    void trace(std::shared_ptr<RaytracingIO> &raytracingio);
 
   //  bool defineOPO(std::shared_ptr<RaytracingIO> &raytracingio);
 

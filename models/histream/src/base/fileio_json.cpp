@@ -268,6 +268,15 @@ void configureCommon(FileIO& io, const ProjectJson& project, Mode mode) {
     settings.periodicNeighborCount = std::clamp(ProjectJson::integer(
         control, "periodicTraversalCount", legacyTraversalCount), 0, 20);
     settings.skyboxEnabled = ProjectJson::boolean(control, "skyboxEnabled", false);
+    // RayTracing sampling options (optional; environment HISTREAM_RT_SEED /
+    // HISTREAM_RT_SAMPLER override them at run time). Absent = engine default (Sobol since 2026-11-26).
+    settings.rtSeed = ProjectJson::integer(control, "seed", 0);
+    settings.rtAdaptive = ProjectJson::boolean(control, "adaptiveSampling", false);
+    {
+        const std::string sampler = ProjectJson::string(
+            control, "sampler", kRaytracingDefaultSampler == 1 ? "sobol" : "legacy");
+        settings.rtSampler = sampler == "sobol" ? 1 : sampler == "legacy" ? 0 : kRaytracingDefaultSampler;
+    }
     settings.acceleratedRadiationSolver =
         ProjectJson::string(control, "radiationSolver", "traditional") == "accelerated";
     settings.spectralAccelerationWidth = std::clamp(
@@ -283,6 +292,27 @@ void configureCommon(FileIO& io, const ProjectJson& project, Mode mode) {
         ProjectJson::integer(control, "voxelCollisionOrders", 2), 2, 5);
     settings.radiationMaxSteps = std::clamp(
         ProjectJson::integer(control, "radiationMaxSteps", 64), 1, 4096);
+    // Voxel transport options (VoxelRT/VoxelEB; src/base/voxelflags.h). The HISTREAM_VOXEL_DIRROT,
+    // HISTREAM_VOXEL_DIRROT_BLOCK and HISTREAM_VOXEL_SKIP environment variables override these fields.
+    {
+        const std::string rotation = ProjectJson::string(control, "voxelDirectionRotation",
+            voxelflags::kDefaultDirectionRotation != 0 ? "rot" : "legacy");
+        if (rotation != "legacy" && rotation != "rot")
+            throw std::runtime_error("control.voxelDirectionRotation must be \"legacy\" or \"rot\"");
+        settings.voxelDirectionRotation = rotation == "rot" ? 1 : 0;
+        settings.voxelDirectionRotationBlock = 1 << voxelflags::blockShift(std::clamp(ProjectJson::integer(
+            control, "voxelDirectionRotationBlock", voxelflags::kDefaultDirectionRotationBlock), 1, 16));
+        settings.voxelEmptySkip = ProjectJson::boolean(control, "voxelEmptySkip", voxelflags::kDefaultEmptySkip);
+        // control.voxelProxyGeometry: vertex format of the voxel proxy meshes (HISTREAM_VOXEL_PROXY overrides).
+        const char* proxyDefault = voxelflags::kDefaultProxyGeometry == voxelflags::kProxyPositionNoIndex ? "positionNoIndex"
+            : voxelflags::kDefaultProxyGeometry == voxelflags::kProxyPosition ? "position" : "full";
+        std::string proxy = ProjectJson::string(control, "voxelProxyGeometry", proxyDefault);
+        std::transform(proxy.begin(), proxy.end(), proxy.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const int proxyMode = voxelflags::parseProxy(proxy, -1);
+        if (proxyMode < 0)
+            throw std::runtime_error("control.voxelProxyGeometry must be \"full\", \"position\" or \"positionNoIndex\"");
+        settings.voxelProxyGeometry = proxyMode;
+    }
     // UAV 巡航遍历仅在透视投影下有效：由 sensor.cruiseEnabled 或 control.uavTraverse 触发。
     const bool perspective = ProjectJson::string(sensor, "projection", "parallel") == "perspective";
     settings.isUAVtrave = perspective &&

@@ -34,6 +34,9 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from pv_case005 import ROOT,dump,sha
+import sys
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
+from facet_document import read_document  # JSON / binary facet result reader (tools/facet_document.py)
 warnings.filterwarnings('ignore',category=NotGeoreferencedWarning)
 font_manager.fontManager.addfont('C:/Windows/Fonts/msyh.ttc')
 plt.rcParams.update({'font.family':'Microsoft YaHei','font.size':11,'axes.unicode_minus':False,'axes.spines.top':False,'axes.spines.right':False,'figure.facecolor':'#f8fafc','axes.facecolor':'#f8fafc'})
@@ -57,7 +60,7 @@ def main():
         # 步骤 1：逐场景读取 faceteb.json（几何）与 faceteb_run.json（节点索引），要求 49 节点全部收敛；
         # 草叶 648 个三角面元总面积须为 324 m2；光伏场景的板面元（648–695）总面积 96 m2，
         # 且法线为 (-0.5, √3/2, 0)（HiStream 坐标，即朝上偏南 30°）。
-        base=ROOT/f'runs/{s}/output'; g=json.loads((base/'faceteb.json').read_text()); idx=json.loads((base/'faceteb_run.json').read_text())
+        base=ROOT/f'runs/{s}/output'; g=read_document(base/'faceteb.json',only={'vertexPositions'}); idx=json.loads((base/'faceteb_run.json').read_text())
         assert idx['status']=='completed' and len(idx['completed'])==49 and all(n['converged'] for n in idx['completed'])
         v=np.array(g['vertexPositions']).reshape(-1,3,3);a=np.linalg.norm(np.cross(v[:,1]-v[:,0],v[:,2]-v[:,0]),axis=1)/2
         assert abs(a[:648].sum()-324)<1e-4

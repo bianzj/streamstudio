@@ -13,6 +13,7 @@
     "build:engine": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-engine.ps1",
     "build:all": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-all.ps1",
     "start": "node server.mjs",
+    "test": "node --test tools/test-review-fixes-20261126.mjs tools/test-server-fixes-20261125.mjs tools/test-facet-binary-reader-20261126.mjs tools/test-usd-roundtrip-20261125.mjs",
     "validate:assets": "node tools/validate-obj-library.mjs",
     "lut:modtran": "node tools/modtran-lut.mjs",
     "desktop": "electron .",

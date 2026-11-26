@@ -159,6 +159,13 @@ public:
     int periodicNeighborCount{0};
     bool skyboxEnabled{false};
     int dispatchRowCount{0};
+    // RNG seed (-> RayRTSetting::frame) and sampler (0 legacy PCG, 1 Owen-scrambled Sobol).
+    int rtSeed{0};
+    int rtSampler{kRaytracingDefaultSampler};
+    // Variance-adaptive sampling (pilot pass + refinement pass, offline.rgen AdaptivePass).
+    bool rtAdaptive{false};
+    int adaptiveTile{1};   // HISTREAM_RT_ADAPTIVE_TILE (1 = per-pixel allocation; larger = coherent tiles)
+    float adaptiveScoutFraction{0.25f}; // HISTREAM_RT_ADAPTIVE_SCOUT: scout samples as a fraction of the budget
     bool isTemperature;
     bool isDisplay;
     bool isImage;

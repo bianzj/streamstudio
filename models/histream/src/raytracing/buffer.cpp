@@ -165,7 +165,11 @@ bool Buffer::createBuffer(std::shared_ptr<RaytracingIO> &raytracingio) {
     //  负责检查是否超出设备限制，待核对），初值为 0，结果由 raytracing.cpp 读回。
     VkCommandBuffer cmdBufStorage = cmdGen.createCommandBuffer();
     const size_t outputSize = checkedOutputImageElements(raytracingio->m_physicalDevice, raytracingio->imageSize.x, raytracingio->imageSize.y, raytracingio->n_wave);
-    std::vector<float> outputImage(outputSize, 0.0);
+    // 末尾多 1 个 float：offline.rgen 丢弃非有限样本的计数器（原子加；主机读回后报警），初值 0。
+    // Adaptive sampling needs two more planes (covered-sample count, pilot sigma) after a 16-float gap.
+    const size_t adaptiveExtra = raytracingio->rtAdaptive
+        ? 16 + 2 * static_cast<size_t>(raytracingio->imageSize.x) * raytracingio->imageSize.y : 0;
+    std::vector<float> outputImage(outputSize + 1 + adaptiveExtra, 0.0);
     virtualio->m_pBufferStorage = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufStorage, outputImage, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     cmdGen.submitAndWait(cmdBufStorage);
 

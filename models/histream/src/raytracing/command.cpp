@@ -67,6 +67,13 @@ bool Command::run(std::shared_ptr<RaytracingIO> &raytracingio){
     // the slab towards ~120 ms per submission.
     constexpr double targetMilliseconds = 120.0;
     int rowsPerSubmit = std::clamp((1 << 16) / imageWidth, 1, imageHeight);
+    // Never shrink a submission below ~32k pixels. With many samples per pixel one
+    // thread already runs for tens of milliseconds, so the 120 ms rule used to
+    // collapse the slab to a single row (1024 threads on a GPU that wants >100k):
+    // 1024 x 1024 px at 1024 spp took 5 s (legacy sampler) to 35 s (Sobol) instead
+    // of about 2 s, purely from submission latency. Results do not depend on the
+    // slab size (per-pixel seeds).
+    const int minRowsPerSubmit = std::clamp((1 << 15) / imageWidth, 1, imageHeight);
     // 步骤 2：逐块提交并同步。目标耗时 120 ms/块：下一块行数 = 本块行数 × clamp(120/实测毫秒, 0.25, 4)，
     // 并限制在 [1, imageHeight]；单块耗时下限取 1 ms 防止除零。
     for (int row = 0; row < imageHeight;) {
@@ -82,7 +89,7 @@ bool Command::run(std::shared_ptr<RaytracingIO> &raytracingio){
         const double scale = std::clamp(
             targetMilliseconds / std::max(elapsed, 1.0), 0.25, 4.0);
         rowsPerSubmit = std::clamp(
-            static_cast<int>(rows * scale), 1, imageHeight);
+            static_cast<int>(rows * scale), minRowsPerSubmit, imageHeight);
     }
     // 步骤 3：复位分块参数，使 dispatchRowCount = 0 表示“整幅图像”（见 recordCommandBuffer）。
     raytracingio->setting.imageOffsetY = 0;

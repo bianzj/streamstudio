@@ -29,7 +29,9 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -79,6 +81,28 @@ std::string utf8FromWide(const wchar_t* text)
         else { out += static_cast<char>(0xF0 | (code >> 18)); out += static_cast<char>(0x80 | ((code >> 12) & 0x3F)); out += static_cast<char>(0x80 | ((code >> 6) & 0x3F)); out += static_cast<char>(0x80 | (code & 0x3F)); }
     }
     return out;
+}
+
+// 从 UTF-8 文件读取一行一个的 NetCDF 路径。  Windows 命令行上限约 32767
+// 字符，按天/年登记的数据包无法把数百个路径直接放在命令行上。
+std::vector<std::string> readFileList(const std::string& listPath)
+{
+    std::ifstream input(stream::pathFromUtf8(listPath));
+    if (!input) throw std::runtime_error("无法打开文件列表：" + listPath);
+    std::vector<std::string> files;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) files.push_back(line);
+    }
+    if (!files.empty() && files.front().size() >= 3
+        && static_cast<unsigned char>(files.front()[0]) == 0xEF
+        && static_cast<unsigned char>(files.front()[1]) == 0xBB
+        && static_cast<unsigned char>(files.front()[2]) == 0xBF) {
+        files.front().erase(0, 3);
+    }
+    if (files.empty()) throw std::runtime_error("文件列表为空：" + listPath);
+    return files;
 }
 
 // 模块：stream forcing-check 子命令。
@@ -147,8 +171,8 @@ int forcingCheck(const std::vector<std::string>& args)
 int usage()
 {
     std::cerr << "usage: stream run <config.json>\n"
-                 "       stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>...\n"
-                 "       stream forcing-register <pack.json> --metadata <preset|metadata.json> <file.nc>...\n"
+                 "       stream era5-register <pack.json> [--product auto|era5|era5-land] <file.nc>... [--files-from <list>]\n"
+                 "       stream forcing-register <pack.json> --metadata <preset|metadata.json> <file.nc>... [--files-from <list>]\n"
                  "       stream forcing-preset [name]\n"
                  "       stream forcing-check <preset|metadata.json> [--data pack.json|station.csv ...] [--json]\n";
     return 2;
@@ -173,6 +197,9 @@ int dispatch(const std::vector<std::string>& args)
         std::vector<std::string> files;
         for (size_t index = 2; index < args.size(); ++index) {
             if (args[index] == "--metadata" && index + 1 < args.size()) spec = args[++index];
+            else if (args[index] == "--files-from" && index + 1 < args.size()) {
+                for (const auto& file : readFileList(args[++index])) files.push_back(file);
+            }
             else files.push_back(args[index]);
         }
         if (spec.empty()) throw std::runtime_error("forcing-register 需要 --metadata <预设名|元数据.json>");
@@ -189,6 +216,9 @@ int dispatch(const std::vector<std::string>& args)
         std::vector<std::string> files;
         for (size_t index = 2; index < args.size(); ++index) {
             if (args[index] == "--product" && index + 1 < args.size()) product = args[++index];
+            else if (args[index] == "--files-from" && index + 1 < args.size()) {
+                for (const auto& file : readFileList(args[++index])) files.push_back(file);
+            }
             else files.push_back(args[index]);
         }
         return stream::era5::registerPack(files, stream::pathFromUtf8(args[1]), product) ? 0 : 3;

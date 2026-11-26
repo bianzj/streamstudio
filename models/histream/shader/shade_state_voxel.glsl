@@ -18,6 +18,7 @@
 #include "compress.glsl"
 #include "parameters.h"
 #include "bindinglayout.h"
+#include "voxel_flags.glsl"  // VoxelProxyMode()（需要 bindinglayout.h 里的 setting）
 
 //---------------------------------------------------------------------
 //-----------------------------------------------------------------------
@@ -31,24 +32,46 @@ ShadeState GetShadeState(in PtPayload hstate)
   const vec3 bary   = vec3(1.0 - hstate.baryCoord.x - hstate.baryCoord.y, hstate.baryCoord.x, hstate.baryCoord.y);
 
 
-  // 步骤 1：实例 → 网格 → 顶点/索引缓冲区（设备地址），取命中三角形的三个顶点。
+  // 步骤 1：实例 → 网格 → 顶点/索引缓冲区（设备地址），取命中三角形的三个顶点位置。
+  // 代理网格格式（voxelFlags 第 12-13 位，与宿主 proxymesh.h 一致）：
+  //   full            44 B VertexAttribute + 索引缓冲（旧格式）
+  //   position        12 B 仅位置顶点 + 索引缓冲（同一三角形、同一顶点顺序）
+  //   positionNoIndex 12 B 仅位置三角形列表，第 p 个三角形的顶点是 3p、3p+1、3p+2
+  //                   （宿主按原索引顺序展开，因此位置、顶点顺序和重心坐标与另两种格式完全相同）
   int meshId = instanceLinks[instanceId].meshId;
-  // Primitive buffer addresses
-  Indices  indices  = Indices(meshLinks[meshId].indexAddress);
-  Vertices vertices = Vertices(meshLinks[meshId].vertexAddress);
-  // Indices of this triangle primitive.
-  uvec3 tri = indices.i[primitiveId];
+  const int proxyMode = VoxelProxyMode();
+  vec3 pos0, pos1, pos2;
+  if (proxyMode == VOXEL_PROXY_FULL)
+  {
+    // Primitive buffer addresses
+    Indices  indices  = Indices(meshLinks[meshId].indexAddress);
+    Vertices vertices = Vertices(meshLinks[meshId].vertexAddress);
+    // Indices of this triangle primitive.
+    uvec3 tri = indices.i[primitiveId];
 
-  // All vertex attributes of the triangle.
-  VertexAttribute attr0 = vertices.v[tri.x];
-  VertexAttribute attr1 = vertices.v[tri.y];
-  VertexAttribute attr2 = vertices.v[tri.z];
+    // All vertex attributes of the triangle.
+    VertexAttribute attr0 = vertices.v[tri.x];
+    VertexAttribute attr1 = vertices.v[tri.y];
+    VertexAttribute attr2 = vertices.v[tri.z];
+    pos0 = attr0.position.xyz;
+    pos1 = attr1.position.xyz;
+    pos2 = attr2.position.xyz;
+  }
+  else
+  {
+    PositionVertices vertices = PositionVertices(meshLinks[meshId].vertexAddress);
+    uvec3 tri;
+    if (proxyMode == VOXEL_PROXY_POSITION)
+      tri = Indices(meshLinks[meshId].indexAddress).i[primitiveId];
+    else
+      tri = uvec3(3u * primitiveId, 3u * primitiveId + 1u, 3u * primitiveId + 2u);
+    pos0 = vertices.v[tri.x];
+    pos1 = vertices.v[tri.y];
+    pos2 = vertices.v[tri.z];
+  }
 
   // Vertex of the triangle
   // 步骤 2：重心坐标插值物体系位置，并经 objectToWorld 变到世界系。
-  const vec3 pos0           = attr0.position.xyz;
-  const vec3 pos1           = attr1.position.xyz;
-  const vec3 pos2           = attr2.position.xyz;
   const vec3 position       = pos0 * bary.x + pos1 * bary.y + pos2 * bary.z;
   const vec3 world_position = vec3(hstate.objectToWorld * vec4(position, 1.0));
 

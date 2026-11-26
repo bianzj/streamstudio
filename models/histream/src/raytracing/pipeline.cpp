@@ -22,6 +22,10 @@
 //
 
 #include <io.h>
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdlib>
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
@@ -178,6 +182,28 @@ bool Pipeline::createPipeline(std::shared_ptr<RaytracingIO> &raytracingio)
     stage.module = rgen;
     stage.stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
     stages[eRaygen] = stage;
+    // Specialization constants of offline.rgen: 8 = sampler (sampler_qmc.glsl), 9 = RT_MAX_WAVE,
+    // the capacity of the per-thread Radiance/RadianceSum/Throughput arrays. The smallest of
+    // {16,32,64,128,800} >= n_wave keeps the arrays small enough to live in registers or a
+    // small local-memory block (800 floats x 3 = 9.6 KB per thread otherwise).
+    // Sampler 0 keeps the historical PCG code path (folded by the driver at pipeline creation).
+    struct RaygenSpecialization { int32_t samplerSobol; int32_t maxWave; int32_t adaptive; };
+    RaygenSpecialization raygenValues{ raytracingio->rtSampler != 0 ? 1 : 0, 800, raytracingio->rtAdaptive ? 1 : 0 };
+    for (const int32_t capacity : { 16, 32, 64, 128, 800 })
+    {
+        if (raytracingio->n_wave <= capacity) { raygenValues.maxWave = capacity; break; }
+    }
+    // Experiment override: HISTREAM_RT_MAX_WAVE=<n> forces the capacity (never below n_wave).
+    if (const char* forced = std::getenv("HISTREAM_RT_MAX_WAVE"); forced && *forced)
+        raygenValues.maxWave = std::clamp<int32_t>(static_cast<int32_t>(std::strtol(forced, nullptr, 10)),
+                                                   raytracingio->n_wave, 800);
+    const std::array<VkSpecializationMapEntry, 3> raygenEntries{ {
+        { 8, static_cast<uint32_t>(offsetof(RaygenSpecialization, samplerSobol)), sizeof(int32_t) },
+        { 9, static_cast<uint32_t>(offsetof(RaygenSpecialization, maxWave)), sizeof(int32_t) },
+        { 10, static_cast<uint32_t>(offsetof(RaygenSpecialization, adaptive)), sizeof(int32_t) } } };
+    const VkSpecializationInfo samplerSpecialization{ static_cast<uint32_t>(raygenEntries.size()), raygenEntries.data(),
+                                                      sizeof(raygenValues), &raygenValues };
+    stages[eRaygen].pSpecializationInfo = &samplerSpecialization;
 
     // emiss
     stage.module = nvvk::createShaderModule(m_device, nvh::loadFile(rayTracingRmissShader, true));

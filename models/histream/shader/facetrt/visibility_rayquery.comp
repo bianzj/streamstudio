@@ -1,0 +1,101 @@
+// ==========================================================================
+// 文件：facetrt/visibility_rayquery.comp（FacetRT，硬件光线查询可见性图）
+// 功能：visibility.vert/frag + visibility_resolve.comp 的替代：每线程一个像素（一条沿视线的
+//   射线），用 VK_KHR_ray_query 枚举全部交点（visibility_rayquery.glsl），再用与
+//   visibility_resolve.comp 完全相同的规则写入 edgeKeys/edgeCounts/denominators/skyCounts/
+//   groundCounts，因此主机端 CSR 构造与求解着色器无需改动。
+// 绑定：0/1（A-buffer）不使用；2 edgeKeys，3 edgeCounts，4 denominators，5 skyCounts，
+//   6 statistics，7 groundCounts，8 顶层加速结构，9 顶点缓冲（读法向）。
+// ==========================================================================
+
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+#define EMPTY_KEY 0xfffffffffffffffful
+
+#include "visibility_rayquery.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 2) buffer EdgeKeys {
+    uint64_t edgeKeys[];
+};
+layout(std430, set = 0, binding = 3) buffer EdgeCounts {
+    uint edgeCounts[];
+};
+layout(std430, set = 0, binding = 4) buffer Denominators {
+    uint denominators[];
+};
+layout(std430, set = 0, binding = 5) buffer SkyCounts {
+    uint skyCounts[];
+};
+layout(std430, set = 0, binding = 7) buffer GroundCounts {
+    uint groundCounts[];
+};
+
+uint hashKey(uint64_t key)
+{
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdul;
+    key ^= key >> 33;
+    return uint(key) ^ uint(key >> 32);
+}
+
+// 与 visibility_resolve.comp 的 addEdge 相同。
+void addEdge(uint sideA, uint sideB, uint weight)
+{
+    if (weight == 0u || sideA == sideB) {
+        return;
+    }
+    const uint lo = min(sideA, sideB);
+    const uint hi = max(sideA, sideB);
+    const uint64_t key = (uint64_t(lo) << 32) | uint64_t(hi);
+    const uint mask = pc.raster.w - 1u;
+    uint slot = hashKey(key) & mask;
+    const uint probes = min(pc.raster.w, 4096u);
+    for (uint probe = 0u; probe < probes; ++probe) {
+        const uint64_t previous = atomicCompSwap(edgeKeys[slot], EMPTY_KEY, key);
+        if (previous == EMPTY_KEY || previous == key) {
+            atomicAdd(edgeCounts[slot], weight);
+            return;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    atomicAdd(statistics[1], 1u);
+}
+
+uint sideOf(FragmentRecord record) { return record.cameraSide & ~REPLICA_BIT; }
+uint centralWeight(FragmentRecord record) { return (record.cameraSide & REPLICA_BIT) == 0u ? 1u : 0u; }
+
+void main()
+{
+    const uint pixel = gl_GlobalInvocationID.x;
+    if (pixel >= pc.raster.x * pc.raster.y) {
+        return;
+    }
+    const uint count = collectFragments(pixel);
+    if (count == 0u) {
+        return;
+    }
+
+    // 分母：只有中心瓦片片元是接收面，两侧各加权 2。
+    for (uint i = 0u; i < count; ++i) {
+        const uint weight = 2u * centralWeight(localRecords[i]);
+        if (weight == 0u) continue;
+        const uint cameraSide = sideOf(localRecords[i]);
+        atomicAdd(denominators[cameraSide], weight);
+        atomicAdd(denominators[cameraSide ^ 1u], weight);
+    }
+    // 最近片元朝向侧看到天空；最远片元背面看到下边界（地面）。
+    if (centralWeight(localRecords[0]) != 0u)
+        atomicAdd(skyCounts[sideOf(localRecords[0])], 2u);
+    if (centralWeight(localRecords[count - 1u]) != 0u)
+        atomicAdd(groundCounts[sideOf(localRecords[count - 1u]) ^ 1u], 2u);
+    // 相邻片元对建边：近片元背面 <-> 远片元朝向侧。
+    for (uint i = 0u; i + 1u < count; ++i) {
+        addEdge(sideOf(localRecords[i]) ^ 1u, sideOf(localRecords[i + 1u]),
+                centralWeight(localRecords[i]) + centralWeight(localRecords[i + 1u]));
+    }
+}

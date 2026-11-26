@@ -33,6 +33,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rasterio_lite import read_tiff  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from facet_document import read_document  # noqa: E402  (JSON / binary facet result reader)
 
 # 体元类型编号（voxel_scene_links.bin 第 5 列）对应的名称。
 TYPE_NAMES = {0: 'null', 1: 'soil', 2: 'veg', 3: 'bldg', 4: 'water'}
@@ -133,7 +135,7 @@ def facetrt(v, case):
     p = v.path(case, 'out', 'facetrt.json')
     if not os.path.isfile(p):
         return {}
-    d = json.load(open(p, encoding='utf-8'))
+    d = read_document(p, only={'bandRadiosity'})  # JSON or binary facet result (tools/facet_document.py)
     out = {'graphEdges': d.get('graph', {}).get('directedEdges')}
     if 'bandRadiosity' in d:
         n = 2 * d['facetCount']
@@ -159,10 +161,13 @@ def summary(v, case, mode):
     return s
 
 
-# 作用：相对变化 |b-a| / max(|a|, 1e-12)；任一方缺失按 0 处理（不触发门禁）。
+# 作用：相对变化 |b-a| / max(|a|, 1e-12)；任一方缺失不再按 0 处理，
+# 缺失意味着某个变体没有产出，--tolerance 门禁必须失败。
 def relative_change(a, b):
-    if a is None or b is None:
+    if a is None and b is None:
         return 0.0
+    if a is None or b is None:
+        return float('inf')
     return abs(b - a) / max(abs(a), 1e-12)
 
 
@@ -181,7 +186,13 @@ def main():
     args = parser.parse_args()
     A, B = Variant(args.work, args.a), Variant(args.work, args.b)
     # 只比较两个变体都有运行目录的算例。
-    cases = sorted(c for c in set(os.listdir(A.root)) & set(os.listdir(B.root)) if os.path.isdir(os.path.join(A.root, c)))
+    a_cases = {c for c in os.listdir(A.root) if os.path.isdir(os.path.join(A.root, c))}
+    b_cases = {c for c in os.listdir(B.root) if os.path.isdir(os.path.join(B.root, c))}
+    cases = sorted(a_cases & b_cases)
+    missing_cases = sorted(a_cases ^ b_cases)
+    gate_failed = bool(missing_cases)
+    if missing_cases:
+        print('missing cases in one variant (not comparable): ' + ', '.join(missing_cases))
     worst = 0.0
     report = {}
     # 不参与门禁、但变了就值得提醒的信息：FacetEB 收敛状态/迭代数、节点数；VoxelEB 迭代数。
@@ -193,6 +204,9 @@ def main():
         report[case] = {args.a: a, args.b: b}
         ra, rb = a['run'] or {}, b['run'] or {}
         print(f"\n## {case} [{mode}]: exit {ra.get('exitCode')} -> {rb.get('exitCode')}, time {ra.get('elapsedSec')} s -> {rb.get('elapsedSec')} s")
+        if ra.get('exitCode') != rb.get('exitCode'):
+            gate_failed = True
+            print('  exit code changed; --tolerance gate will fail')
         for key, x in a.get('tif', {}).items():
             y = b.get('tif', {}).get(key, {})
             worst = max(worst, relative_change(x.get('mean'), y.get('mean')))
@@ -237,8 +251,8 @@ def main():
             print('  ' + note)
         if len(notes) > 40:
             print(f"  ... {len(notes) - 40} more")
-    if args.tolerance is not None and worst > args.tolerance:
-        print(f"FAIL: exceeds tolerance {args.tolerance:g}")
+    if args.tolerance is not None and (gate_failed or worst > args.tolerance):
+        print(f"FAIL: exceeds tolerance {args.tolerance:g}" if not gate_failed else 'FAIL: missing case or exit-code change')
         sys.exit(1)
 
 

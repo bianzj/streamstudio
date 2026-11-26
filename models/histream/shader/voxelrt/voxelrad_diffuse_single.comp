@@ -58,6 +58,7 @@
 #include "../mwir_solar.glsl"
 #include "../water_brdf.glsl"
 #include "../shade_state_voxel.glsl"
+#include "../voxel_dirrot.glsl"
 
 // 全局：光线载荷与阴影载荷，供 traceray_comp.glsl 的 ClosestHit 使用。
 PtPayload        prd;
@@ -88,27 +89,27 @@ bool isSolidVoxel(int bufferId)
     return type == TYPE_BUILDING || type == TYPE_SOIL || type == TYPE_WATER;
 }
 
-// 作用：voxelRads 缓冲寻址。每个体元占 stride = DIFFUSE_ANGLE_NUM + 2*n_wave 个槽：
-//   [0, N)             ：各漫射方向的入射（induced）辐射；
-//   [N, N+n_wave)      ：各波段累计的环境辐射（cumulated，影像着色器读取）；
-//   [N+n_wave, N+2n_wave)：各波段按碰撞阶数交替存放的入射辐射（见 voxelOrderRadiationIndex）。
+// 作用：voxelRads 缓冲寻址。每个体元占 stride = 2*n_wave 个槽（2026-11-26 起；此前还有 64 个“漫射方向暂存槽”，
+// 现改为每个方向追踪结束时立刻并入求积和（见 voxel_raytracing_diffuse），因此每体元 560 → 48 B（n_wave=3））：
+//   [0, n_wave)          ：各波段累计的环境辐射（cumulated，影像着色器读取）；
+//   [n_wave, 2n_wave)    ：各波段按碰撞阶数交替存放的入射辐射（见 voxelOrderRadiationIndex）。
+// 主机端必须保证 n_voxel*2*n_wave 与总字节数不超过 uint 下标与 maxStorageBufferRange（voxelrt/buffer.cpp 有检查）。
 uint voxelRadiationIndex(uint bufferId, uint offset)
 {
-    return bufferId * (uint(DIFFUSE_ANGLE_NUM) + 2u * uint(setting.n_wave)) + offset;
+    return bufferId * (2u * uint(setting.n_wave)) + offset;
 }
 
 // 作用：某体元某波段“累计环境辐射”槽的下标（布局见 voxelRadiationIndex）。
 uint voxelBandRadiationIndex(uint bufferId, uint band)
 {
-    return voxelRadiationIndex(bufferId, uint(DIFFUSE_ANGLE_NUM) + band);
+    return voxelRadiationIndex(bufferId, band);
 }
 
 // Incident radiance of one collision order. Orders alternate between the two
 // fields so a pass reads order k-1 of other voxels while writing order k.
 uint voxelOrderRadiationIndex(uint bufferId, uint band)
 {
-    return voxelRadiationIndex(bufferId,
-        uint(DIFFUSE_ANGLE_NUM) + uint(setting.n_wave) + band);
+    return voxelRadiationIndex(bufferId, uint(setting.n_wave) + band);
 }
 
 // 作用：读第 order 阶的入射辐射；奇数阶存在 cumulated 字段，偶数阶存在 induced 字段，结果取非负有限值。
@@ -139,6 +140,24 @@ bool isThermalWavelength(float wavelength)
 // 前向声明：绕 y 轴旋转方向向量（定义见后）。
 vec3 rotateDiffuseAzimuth(vec3 direction, float angle);
 
+// 作用：第 k 个漫射方向（未归一化的格点方向经旋转）。旧版：绕 y 轴方位偏移 azimuthOffset；
+// HISTREAM_VOXEL_DIRROT=rot：当前 gDiffuseRotation（按体元哈希的完整三维旋转，见 voxel_dirrot.glsl）。
+vec3 diffuseDirection(uint k, float azimuthOffset)
+{
+    if(VoxelDirRotEnabled()) return gDiffuseRotation * DIFFUSE_DIRECTIONS[k];
+    return rotateDiffuseAzimuth(DIFFUSE_DIRECTIONS[k], azimuthOffset);
+}
+
+// 作用：为接收体 bufferId0 的第 set 个采样组选择旋转（仅 rot 模式）。salt 含碰撞阶数、采样组与面编号，
+// 使各阶、各组、建筑各面的方向集互相独立；波段不参与，保持光谱平滑。
+void SelectDiffuseSet(uint bufferId0, int set)
+{
+    if(!VoxelDirRotEnabled()) return;
+    uint salt = uint(setting.collisionOrder) * 4096u + uint(set) * 8u
+        + uint(max(voxelLinks[bufferId0].faceId, 0));
+    SelectDiffuseRotation(voxelLinks[bufferId0].voxelId, salt);
+}
+
 // Solid receivers integrate the incident field over the hemisphere of their
 // stored outward normal, cosine weighted (irradiance per facet area; equals
 // pi*L for an isotropic field), as VoxelEB's diffuse TIR / scattering do.
@@ -149,8 +168,7 @@ float solidHemisphereCosineSum(vec3 normal, float azimuthOffset)
 {
     float sum = 0.0;
     for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
-        sum += max(dot(normal, normalize(rotateDiffuseAzimuth(
-            DIFFUSE_DIRECTIONS[angle], azimuthOffset))), 0.0);
+        sum += max(dot(normal, normalize(diffuseDirection(angle, azimuthOffset))), 0.0);
     return max(sum, 1.0e-6);
 }
 
@@ -167,6 +185,12 @@ float leafReceiverProjectionSum(uint bufferId, float azimuthOffset)
     Canopy canopy = canopies[meshLinks[meshId].canopyId];
     if(canopy.lidfValid == 0 || isParticipatingMedium(canopy)) return 0.0;
     float sum = 0.0;
+    if(VoxelDirRotEnabled()) {
+        // Rotated set: |y| is no longer (2k+1)/64, evaluate G(|y|) of each rotated direction.
+        for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
+            sum += CanopyG(meshLinks[meshId].canopyId, normalize(gDiffuseRotation * DIFFUSE_DIRECTIONS[angle]));
+        return max(sum, 1.0e-6);
+    }
     for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
         sum += CanopyDiffuseG(canopy, angle); // rotation keeps |y|
     return max(sum, 1.0e-6);
@@ -184,6 +208,7 @@ float receiverQuadratureWeight(bool surfaceReceiver, vec3 normal,
         return max(dot(normal, normalize(direction)), 0.0) / cosineSum;
     if(leafProjectionSum <= 0.0) return DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT;
     uint canopyId = meshLinks[instanceLinks[voxelLinks[bufferId].instanceId].meshId].canopyId;
+    if(VoxelDirRotEnabled()) return 2.0 * CanopyG(canopyId, direction) / leafProjectionSum;
     // Quadrature directions have |y| = (k + 0.5)/32 (see CanopyDiffuseG).
     uint k = uint(clamp(floor(abs(normalize(direction).y) * 32.0), 0.0, 31.0));
     return 2.0 * canopies[canopyId].diffuseG[k] / leafProjectionSum;
@@ -270,11 +295,20 @@ void Scattering_phase_function_diffuse(float azimuthOffset)
     }
 }
 
+// 每个漫射方向的入射辐射不再写进 voxelRads（旧版用 64 个方向暂存槽 + 本线程独占的 atomicAdd），而是在该方向追踪结束时
+// 立刻按求积权重并入本组的 Kahan 和（方向升序，与旧版“先全部写完再按 iangle 升序求和”的顺序完全相同）。
+// 要点：被加数必须先舍入成 float 再相加，才与旧版逐位相同。普通 `+=` 会让编译器把 radiance 里最后一个乘法与这次
+// 加法融合成 fma（相差约 1 ulp）；roundBarrier 经一个编译器不可见的零（1D 派发时工作组 y 号恒为 0）绕一圈，
+// 使 radiance 先被物化为舍入后的 float。
+float roundBarrier(float value)
+{
+    return uintBitsToFloat(floatBitsToUint(value) | uint(gl_WorkGroupID.y));
+}
 // calculate the diffuse term.
 // 函数：voxel_raytracing_diffuse（单波段版本，逐波段调用；多波段版本见 voxel_raytracing_diffuse_packet）
 // 作用：从体元 bufferId0 的位置 voxelPos0 出发，沿 DIFFUSE_ANGLE_NUM 个漫射方向（带体元特定方位偏移）追踪，
 //       收集沿途的天空、植被（散射+热发射）和实体表面（反射+热发射）贡献，
-//       原子累加到该体元第 iangle 个方向的入射辐射 voxelRads[...].induced。
+//       累加到该方向的入射辐射 incoming，方向追踪结束时按求积权重并入 iterationRadiance（见 roundBarrier 的说明）。
 // 输入：kwave（波段下标）、Esun（垂直光束的太阳辐照度）、Esky（天空辐照度，对应 π·L）、azimuthOffset。
 //       （2026-11-25 删除了原 kiter 迭代阶数参数：多次散射代码早被注释掉，该参数从未使用；
 //       下面注释掉的 `if(kiter > 0)` 即其遗迹。）
@@ -285,8 +319,19 @@ void Scattering_phase_function_diffuse(float azimuthOffset)
 //   3. 命中天空：加天空辐射并结束；命中体元内植被：累加热发射与太阳单次散射；
 //   4. 命中实体（建筑/土壤/水体）：累加太阳反射与热发射并结束；否则偏移起点继续。
 bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
- int kwave,float Esun,float Esky, float azimuthOffset)
+ int kwave,float Esun,float Esky, float azimuthOffset,
+ float cosineSum0, float leafProjectionSum0, out float iterationRadiance)
 {
+  // 本组 64 个方向按求积权重加权后的入射辐射（Kahan 求和，方向升序）。
+  iterationRadiance = 0.0;
+  float iterationCorrection = 0.0;
+  // CanopyG 带一个“上次方向”缓存（mu 相差 1e-6 内即命中，命中时返回邻近 mu 的值，相差约 1 ulp）。旧版在 64 个方向
+  // 全部追踪完之后才逐方向算权重，权重序列只看到“权重自己的上一次调用”；现在权重在每个方向追踪结束时立即算，
+  // 若沿用追踪留下的缓存，命中模式会变、结果相差 1 ulp。所以权重单独维持一份缓存状态（wId/wMu/wValue，起点是调用者
+  // 算完 leafProjectionSum0 之后的状态，与旧版权重循环的起点相同），算权重前后与追踪缓存互换。
+  uint wId = canopyProjectionCacheId;
+  float wMu = canopyProjectionCacheMu;
+  float wValue = canopyProjectionCacheValue;
 
   float G,density;
   float scale = setting.scale;
@@ -332,8 +377,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
   // 步骤 2：逐漫射方向（带体元特定的方位偏移）发射射线。
   for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; iangle++)
   {
-    directioni0 = rotateDiffuseAzimuth(
-        DIFFUSE_DIRECTIONS[iangle], azimuthOffset);
+    directioni0 = diffuseDirection(iangle, azimuthOffset);
     directioni = normalize(directioni0);
     Ray ray = Ray(voxelPos0, directioni);
     ConfigureCone(voxelPos0, directioni, 0.0, 0.0);
@@ -342,14 +386,20 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
     // Leaf phase function sun -> receiver for the canopy last hit. Scattered
     // light propagates back along -directioni, i.e. directioni is the ray.
     uint gammaCanopyId = 0xffffffffu;
-	  // 先清零该方向的入射辐射，之后只通过 atomicAdd 累加。
-	  voxelRads[voxelRadiationIndex(bufferId0, iangle)].induced = 0.0;
+	  // 该方向的入射辐射从 0 开始累加。
+	  float incoming = 0.0;
 
     // A solid surface only receives radiance through the hemisphere of its
     // outward normal (walls and slopes included, not just +y). Rays into the
     // object interior would hit its own inner facets and add the object's
     // emission/reflection to its own incident environment.
-    if(surfaceReceiver && dot(directioni, receiverNormal) <= 0.0) continue;
+    if(surfaceReceiver && dot(directioni, receiverNormal) <= 0.0)
+    {
+      // 被跳过的方向入射为 0，但仍按旧版次序参与 Kahan 求和（补偿项会随之更新）。
+      // （其权重 max(n·ω,0)/Σ 恰为 0，所以加数就是 0。）
+      compensatedAdd(iterationRadiance, iterationCorrection, 0.0);
+      continue;
+    }
 
     /////////////////////////////////////////////////////
     /// Iteration in travel step
@@ -378,10 +428,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
            float skyrad = alpha_toVoxel*Esky;
            //skyrad = 1000;
           //skyrad = 0.5;
-          uint index = voxelRadiationIndex(bufferId0, iangle);
-          atomicAdd(voxelRads[index].induced,
-              skyrad,
-              gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+          incoming += roundBarrier(skyrad);
         }
         alpha_toVoxel = 0.001;
         break;
@@ -513,8 +560,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
               //////////////////////////////
               /// Save back
               /////////////////////////////
-              atomicAdd(voxelRads[voxelRadiationIndex(bufferId0, iangle)].induced,radiance,
-                  gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+              incoming += roundBarrier(radiance);
             // 累乘透过率；剩余透过率小于 0.01 时提前结束该方向（贡献可忽略）。
             alpha_toVoxel = alpha_toVoxel * alpha_voxel;
             if(alpha_toVoxel < 0.01) break; 
@@ -598,8 +644,7 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
           /// Save back
           /////////////////////////////
      
-          atomicAdd(voxelRads[voxelRadiationIndex(bufferId0, iangle)].induced,radiance,
-              gl_ScopeDevice,gl_StorageSemanticsBuffer,gl_SemanticsRelaxed);
+          incoming += roundBarrier(radiance);
 
           alpha_toVoxel = 0;
           break;
@@ -616,6 +661,24 @@ bool voxel_raytracing_diffuse(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVD
     // VoxelEB): keep the accumulated source terms and add sky only on an
     // actual upward miss above. The old fallback added Esky here even for
     // downward rays.
+    // Vegetation: fixed 2/N; solids: cosine weight over the outer hemisphere.
+    // 权重用独立的 CanopyG 缓存状态（见函数开头的说明）：先存下追踪缓存，换入权重缓存，算完再换回。
+    const uint traceId = canopyProjectionCacheId;
+    const float traceMu = canopyProjectionCacheMu;
+    const float traceValue = canopyProjectionCacheValue;
+    canopyProjectionCacheId = wId;
+    canopyProjectionCacheMu = wMu;
+    canopyProjectionCacheValue = wValue;
+    const float quadratureWeight = receiverQuadratureWeight(surfaceReceiver,
+        receiverNormal, cosineSum0, directioni0, bufferId0, leafProjectionSum0);
+    wId = canopyProjectionCacheId;
+    wMu = canopyProjectionCacheMu;
+    wValue = canopyProjectionCacheValue;
+    canopyProjectionCacheId = traceId;
+    canopyProjectionCacheMu = traceMu;
+    canopyProjectionCacheValue = traceValue;
+    compensatedAdd(iterationRadiance, iterationCorrection,
+        finiteNonnegative(incoming) * quadratureWeight);
   }
   return false;
 }
@@ -672,8 +735,7 @@ void voxel_raytracing_diffuse_packet(
       directionalCorrection[bandOffset] = 0.0;
     }
 
-    vec3 direction0 = rotateDiffuseAzimuth(
-        DIFFUSE_DIRECTIONS[iangle], azimuthOffset);
+    vec3 direction0 = diffuseDirection(iangle, azimuthOffset);
     vec3 direction = normalize(direction0);
     // Surface receivers integrate their outer (normal) hemisphere only.
     if(surfaceReceiver && dot(direction, receiverNormal) <= 0.0) continue;
@@ -901,7 +963,7 @@ void voxel_collision_order_packet(
 
   for(uint iangle = 0; iangle < DIFFUSE_ANGLE_NUM; ++iangle)
   {
-    vec3 direction0 = rotateDiffuseAzimuth(DIFFUSE_DIRECTIONS[iangle], azimuthOffset);
+    vec3 direction0 = diffuseDirection(iangle, azimuthOffset);
     vec3 direction = normalize(direction0);
     if(surfaceReceiver && dot(direction, receiverNormal) <= 0.0) continue;
     // 对每个漫射方向：沿射线逐个命中体元；植被取 w·0.5·incident，实体表面取 BRDF 权重·incident 后终止。
@@ -1020,7 +1082,7 @@ void runCollisionOrder(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
                        int firstBand, int bandCount, float azimuthOffset)
 {
   int order = setting.collisionOrder;
-  const int diffuseSampleSets = 5;
+  const int diffuseSampleSets = VOXEL_DIFFUSE_SETS;
   float sampled[SPECTRAL_PACKET_SIZE];
   float sampledTail[SPECTRAL_PACKET_SIZE];
   for(int bandOffset = 0; bandOffset < SPECTRAL_PACKET_SIZE; ++bandOffset) {
@@ -1030,6 +1092,7 @@ void runCollisionOrder(vec3 voxelPos0, uint bufferId0, NanoVDBLink nanoVDBLink,
   for(int kiter = 0; kiter < diffuseSampleSets; ++kiter) {
     float radiance[SPECTRAL_PACKET_SIZE];
     float tail[SPECTRAL_PACKET_SIZE];
+    SelectDiffuseSet(bufferId0, kiter);
     voxel_collision_order_packet(voxelPos0, bufferId0, nanoVDBLink, firstBand,
         bandCount, order, azimuthOffset + float(kiter) * 2.39996323, radiance, tail);
     for(int bandOffset = 0; bandOffset < bandCount; ++bandOffset) {
@@ -1129,9 +1192,10 @@ void main()
 
     // 5 组方位偏移采样（每组相差黄金角）取平均；热波段 Esun/Esky：Planck 天空 + 6 μm 以下的太阳束与散射天空，
     // 光学波段 Esun=lightSet.direct，Esky=lightSet.diffuse。结果写入 cumulated 与第 1 阶存储。
-    const int diffuseSampleSets = 5;
+    const int diffuseSampleSets = VOXEL_DIFFUSE_SETS;
     for(int kiter = 0; kiter < diffuseSampleSets; ++kiter) {
       float iterationOffset = azimuthOffset + float(kiter) * 2.39996323;
+      SelectDiffuseSet(bufferId0, kiter);
       float iterationRadiance[SPECTRAL_PACKET_SIZE];
       voxel_raytracing_diffuse_packet(
           voxelPos0, bufferId0, nanoVDBLink, kwave, bandCount,
@@ -1183,7 +1247,7 @@ void main()
           bool surfaceReceiver0 = isSolidVoxel(int(bufferId0));
           vec3 receiverNormal0 = surfaceReceiver0
               ? solidSurfaceNormal(int(bufferId0)) : vec3(0.0, 1.0, 0.0);
-          const int diffuseSampleSets = 5;
+          const int diffuseSampleSets = VOXEL_DIFFUSE_SETS;
           float sampledRadiance = 0.0;
           for(int kiter = 0; kiter < diffuseSampleSets; kiter++)
           {
@@ -1193,38 +1257,15 @@ void main()
               // increasing the existing ray count.
               float iterationOffset = azimuthOffset
                   + float(kiter) * 2.39996323;
-              voxel_raytracing_diffuse(voxelPos0, bufferId0, nanoVDBLink,
-                  kwave, Esun, Esky, iterationOffset);
-              // This invocation exclusively owns bufferId0's directional
-              // records. Other voxels supply read-only geometry/materials.
-              // Order SSBO accesses without synchronizing inactive lanes.
-              // （上一调用已写 induced：此处用缓冲屏障保证本线程读到自己写的值。）
-              memoryBarrierBuffer();
-
+              SelectDiffuseSet(bufferId0, kiter);
               float cosineSum0 = surfaceReceiver0
                   ? solidHemisphereCosineSum(receiverNormal0, iterationOffset) : 1.0;
               float leafProjectionSum0 = surfaceReceiver0
                   ? 0.0 : leafReceiverProjectionSum(bufferId0, iterationOffset);
-              float iterationRadiance = 0.0;
-              float iterationCorrection = 0.0;
-              for(uint iangle=0;iangle < DIFFUSE_ANGLE_NUM;iangle++)
-              {
-                  uint index = voxelRadiationIndex(bufferId0, iangle);
-                  // 同时把各方向的 induced 拷到 cumulated，再按求积权重对方向求和。
-                  // 说明（2026-11-25 核实）：这里的 index 在方向槽 [0, DIFFUSE_ANGLE_NUM) 内，而 cumulated
-                  //   字段的另两种用途——环境辐射槽（voxelBandRadiationIndex，N+band）与奇数阶碰撞阶数槽
-                  //   （voxelOrderRadiationIndex，N+n_wave+band）——下标都在方向槽之外，三者互不重叠，没有冲突；
-                  //   voxelrt 的后续着色器也不读取方向槽的 cumulated，该拷贝只是遗留/调试用途。
-                  voxelRads[index].cumulated = voxelRads[index].induced;
-                  // Vegetation: fixed 2/N; solids: cosine weight over the
-                  // outer hemisphere (skipped directions hold zero).
-                  float weight = receiverQuadratureWeight(surfaceReceiver0,
-                      receiverNormal0, cosineSum0, rotateDiffuseAzimuth(
-                          DIFFUSE_DIRECTIONS[iangle], iterationOffset),
-                      bufferId0, leafProjectionSum0);
-                  compensatedAdd(iterationRadiance, iterationCorrection,
-                      finiteNonnegative(voxelRads[index].induced) * weight);
-              }
+              float iterationRadiance;
+              voxel_raytracing_diffuse(voxelPos0, bufferId0, nanoVDBLink,
+                  kwave, Esun, Esky, iterationOffset,
+                  cosineSum0, leafProjectionSum0, iterationRadiance);
               sampledRadiance += iterationRadiance;
           }// for iteration
 

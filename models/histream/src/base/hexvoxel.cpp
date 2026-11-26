@@ -31,11 +31,14 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace hexvoxel {
@@ -870,6 +873,17 @@ HexResult compute(const HexScene& scene, const HexConfig& cfg,
     int gz = static_cast<int>(std::floor(scene.maxPos[2])) + 1;
     // 平铺场景 (如地面) 某维厚度 < 1 体元时仍保留 1 层
     if (gx < 1) gx = 1; if (gy < 1) gy = 1; if (gz < 1) gz = 1;
+    // Dense per-cell storage below is O(gx*gy*gz).  Without a guard a single
+    // outlier vertex or a large AABB can allocate tens of GB and get the
+    // process killed; fail with the requested grid instead.  A sparse/CSR
+    // implementation is the long-term fix.
+    constexpr std::uint64_t kMaxDenseHexCells = 25'000'000ULL;
+    const std::uint64_t denseCells = static_cast<std::uint64_t>(gx) * static_cast<std::uint64_t>(gy) * static_cast<std::uint64_t>(gz);
+    if (denseCells > kMaxDenseHexCells) {
+        throw std::runtime_error("Heterogeneous voxel grid is too large ("
+            + std::to_string(gx) + " x " + std::to_string(gy) + " x " + std::to_string(gz)
+            + " = " + std::to_string(denseCells) + " cells); increase the voxel size or disable heterogeneous voxels");
+    }
     result.gridX = gx; result.gridY = gy; result.gridZ = gz;
 
     Ctx c;

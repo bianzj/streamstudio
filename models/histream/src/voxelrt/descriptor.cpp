@@ -77,7 +77,7 @@ bool Descriptor::createDescriptor(std::shared_ptr<VoxelrtIO> &modelio){
 
 
     VkDescriptorBufferInfo dbiThermal{};
-    if (meshio->thermals.size() > 0)
+    if (meshio->m_pBufferThermal)
     {
         dbiThermal = {meshio->m_pBufferThermal->buffer, 0, VK_WHOLE_SIZE};
         updates.emplace_back(bindings.makeWrite(m_descSet, VoxelrtbindingInd::thermal, &dbiThermal));

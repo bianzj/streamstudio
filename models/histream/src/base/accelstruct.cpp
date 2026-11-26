@@ -16,8 +16,11 @@
 //
 
 #include "accelstruct.h"
+#include "voxellimits.h"
 
 #include <cstddef>
+#include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -43,14 +46,21 @@ nvvk::RaytracingBuilderKHR::BlasInput AccelStruct::objectToVkGeometryKHR(const V
     info.buffer = model.vertexBuffer.buffer;
     VkDeviceAddress vertexAddress = vkGetBufferDeviceAddress(device, &info);
     info.buffer = model.indexBuffer.buffer;
-    VkDeviceAddress indexAddress = vkGetBufferDeviceAddress(device, &info);
+    // Non-indexed voxel proxy meshes (MeshBuffer::indexed == false) have no index buffer.
+    VkDeviceAddress indexAddress = model.indexed ? vkGetBufferDeviceAddress(device, &info) : 0;
 
     VkAccelerationStructureGeometryTrianglesDataKHR triangles{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR };
     triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
     triangles.vertexData.deviceAddress = vertexAddress;
-    triangles.vertexStride = sizeof(Vertex);
-    triangles.indexType = VK_INDEX_TYPE_UINT32;
-    triangles.indexData.deviceAddress = indexAddress;
+    // The stride is the mesh's own (44 B VertexAttribute unless a voxel mode packs position-only vertices).
+    triangles.vertexStride = model.vertexStride;
+    if (model.indexed) {
+        triangles.indexType = VK_INDEX_TYPE_UINT32;
+        triangles.indexData.deviceAddress = indexAddress;
+    } else {
+        triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+        triangles.indexData.deviceAddress = 0;
+    }
     // DEFERRED[低] Bug: Vulkan 规范中 maxVertex 是“最大可寻址顶点索引”，应为 nbVertices-1；此处多 1 通常无害但会让驱动按越界范围预取；理由：改 maxVertex 与空网格跳过会改变 BLAS 构建范围/几何语义，且不属本轮允许的缺陷类别，未改。
     triangles.maxVertex = model.nbVertices;
 
@@ -64,7 +74,7 @@ nvvk::RaytracingBuilderKHR::BlasInput AccelStruct::objectToVkGeometryKHR(const V
     // 步骤 3：构建范围——整个索引缓冲，每 3 个索引一个三角形。
     VkAccelerationStructureBuildRangeInfoKHR offset{};
     offset.firstVertex = 0;
-    offset.primitiveCount = model.nbIndices / 3;
+    offset.primitiveCount = (model.indexed ? model.nbIndices : model.nbVertices) / 3;
     offset.primitiveOffset = 0;
     offset.transformOffset = 0;
 
@@ -97,6 +107,37 @@ bool AccelStruct::createAccelStruct(VkDevice device, std::shared_ptr<MeshIO> &me
     {
         auto blas = objectToVkGeometryKHR(device, model);
         allBlas.emplace_back(blas);
+    }
+
+    // Voxel modes: size every BLAS up front (the same query nvvk's buildBlas makes) so that a mesh whose acceleration
+    // structure or scratch buffer cannot be allocated fails with a clear message instead of crashing the driver.
+    if (m_physicalDevice) {
+        const bool printStats = std::getenv("HISTREAM_VOXEL_PROXY_STATS") != nullptr;
+        for (std::size_t i = 0; i < allBlas.size(); ++i) {
+            VkAccelerationStructureBuildGeometryInfoKHR buildInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+            buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+            buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+            buildInfo.flags = allBlas[i].flags | VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+                                                | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
+            buildInfo.geometryCount = static_cast<uint32_t>(allBlas[i].asGeometry.size());
+            buildInfo.pGeometries = allBlas[i].asGeometry.data();
+            const uint32_t primitives = allBlas[i].asBuildOffsetInfo.empty() ? 0 : allBlas[i].asBuildOffsetInfo[0].primitiveCount;
+            VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+            vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo,
+                                                    &primitives, &sizes);
+            if (printStats)
+                std::cout << "PROXY_BLAS\tmodel=" << m_modelName << "\tmesh=" << i << "\ttriangles=" << primitives
+                          << "\tvertexBytes=" << (uint64_t(meshio->m_bufferMeshes[i].nbVertices) * meshio->m_bufferMeshes[i].vertexStride)
+                          << "\tindexed=" << int(meshio->m_bufferMeshes[i].indexed)
+                          << "\tasBytes=" << sizes.accelerationStructureSize << "\tscratchBytes=" << sizes.buildScratchSize
+                          << std::endl;
+            const std::string name = std::string("mesh ") + std::to_string(i);
+            const char* hint = "Reduce the scene size or use a larger voxel edge (control.voxelProxyGeometry cannot shrink the acceleration structure).";
+            voxellimits::requireAllocation(m_physicalDevice, m_modelName,
+                (name + " acceleration structure").c_str(), sizes.accelerationStructureSize, primitives, "triangles", hint);
+            voxellimits::requireAllocation(m_physicalDevice, m_modelName,
+                (name + " acceleration-structure build scratch").c_str(), sizes.buildScratchSize, primitives, "triangles", hint);
+        }
     }
 
     // 偏向追踪速度而非构建速度；允许压缩以降低显存占用。

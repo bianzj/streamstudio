@@ -729,6 +729,33 @@ def voxel_structure(metadata_path: Path, metadata: dict) -> StructureData:
     return StructureData(metadata_path, "voxel", positions, fields, count, metadata, components)
 
 
+# 作用：读取 FacetRT/FacetEB 结果文档（facetrt.json / faceteb.json），兼容 JSON 与二进制两种格式
+#       （control.facetOutputFormat，规范见 docs/facet-binary-output.md）。
+# 说明：JSON 格式（无 format 字段）与原先的 json.loads 完全相同；二进制格式（"format": "binary"）中形如
+#       {file, offset, length, dtype, shape} 的描述符被替换为旁路 .bin 中读出的 numpy 数组（小端 float32，按 shape 重排）。
+#       only 只读取列出的字段、skip 跳过列出的字段，用于避免读取用不到的多 GB 数组（跳过的描述符保持原样）。
+def read_result_document(path: Path, only: Sequence[str] | None = None, skip: Sequence[str] = ()) -> dict:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("format") != "binary":
+        return payload
+    for key, value in list(payload.items()):
+        if not (isinstance(value, dict) and {"file", "offset", "length", "dtype"} <= value.keys()):
+            continue
+        if (only is not None and key not in only) or key in skip:
+            continue
+        name = str(value["file"])
+        if not name or Path(name).name != name:
+            raise ValueError(f"面元结果引用了无效的旁路文件名：{name}")
+        dtype = {"float32": "<f4"}.get(str(value["dtype"]))
+        if dtype is None:
+            raise ValueError(f"{key} 的数据类型 {value['dtype']} 不受支持")
+        array = np.fromfile(path.parent / name, dtype=dtype, count=int(value["length"]), offset=int(value["offset"]))
+        if array.size != int(value["length"]):
+            raise ValueError(f"{key} 数据不完整：{path.parent / name}")
+        payload[key] = array.reshape(tuple(value.get("shape") or [array.size]))
+    return payload
+
+
 # 作用：读取面元过程结果为 StructureData。每个面元有正反两面各一个值（记录数 = facetCount × 2）。
 # 几何：从 geometryFile（缺省 ../faceteb.json）读顶点 vertexPositions，每面元 3 个顶点（共 9 个数），取三顶点平均为中心。
 # side：front 取正面，back 取反面，其他（mean）取两面均值（忽略 NaN）。组分编码先找过程文件，找不到再找几何文件。
@@ -739,7 +766,7 @@ def facet_process_structure(metadata_path: Path, metadata: dict,
         raise ValueError("面元过程 JSON 缺少 facetCount")
     records = load_float_records(metadata_path, metadata, facet_count * 2)
     geometry_path = (metadata_path.parent / str(metadata.get("geometryFile", "../faceteb.json"))).resolve()
-    geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+    geometry = read_result_document(geometry_path, only=("vertexPositions",))
     vertices = np.asarray(geometry.get("vertexPositions", []), dtype=np.float64)
     if vertices.size != facet_count * 9:
         raise ValueError(f"面元几何数量与 facetCount 不一致：{geometry_path}")
@@ -774,7 +801,7 @@ def facet_result_structure(path: Path, payload: dict, side: str) -> StructureDat
     ignored = {"vertexPositions", "wavelengths"}
     fields: list[FieldData] = []
     for key, raw in payload.items():
-        if key in ignored or not isinstance(raw, list):
+        if key in ignored or not isinstance(raw, (list, np.ndarray)):
             continue
         values = np.asarray(raw)
         if not np.issubdtype(values.dtype, np.number):
@@ -793,7 +820,7 @@ def facet_result_structure(path: Path, payload: dict, side: str) -> StructureDat
 # 作用：按 JSON 内容判别类型并读取：kind 以“-process”结尾为过程结果（geometry 为 voxel 或 facet）；
 # 含 vertexPositions 的为面元结果；其他抛 ValueError。
 def read_structure(path: Path, facet_side: str) -> StructureData:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = read_result_document(path, skip=("bandRadiosity", "bandStates"))
     if str(payload.get("kind", "")).endswith("-process"):
         geometry = str(payload.get("geometry", ""))
         if geometry == "voxel":

@@ -434,7 +434,7 @@ $$
 - **方向相关的 G。** $G(\boldsymbol\Omega)=\sum_i f_i\,\psi(\theta_{L,i},\mu)$，$\psi$ 为单一倾角类方位平均投影的闭式（$\cot\theta_L\cot\theta\ge1$ 时为 $\cos\theta_L\mu$，否则 $\tfrac{2}{\pi}[(\beta-\tfrac{\pi}{2})\cos\theta_L\mu+\sin\beta\sin\theta_L\sin\theta]$，$\cos\beta=-\cot\theta_L\cot\theta$），即 SAIL 的 $k_s\cos\theta_s$。任意 LIDF 在全球面上 $\langle G\rangle=1/2$。沿线消光 $\tau_k(\boldsymbol\omega)$ 中的 $G$、太阳可见性、视线截获 $(1-\tau)/G$、VoxelEB 直射投影 $G(\Omega_s)/\cos\theta_s$ 都用对应方向的 $G$。
 - **Γ 与 G 同归一。** $\Gamma(\Omega'\!\to\!\Omega)=\rho\Gamma_R+\tau\Gamma_T$，$\Gamma_{R/T}$ 按倾角类用 SAIL `volscatt` 解析方位积分再按 $f_i$ 求和，满足 $\frac{1}{\pi}\int_{4\pi}\Gamma\,d\Omega=(\rho+\tau)G(\Omega')$，因此单次散射 $\Gamma/G$ 对任意 LIDF 能量守恒。球形分布的连续极限与 Ross 闭式 $\Gamma=\frac{\rho+\tau}{3\pi}(\sin\alpha-\alpha\cos\alpha)+\frac{\tau}{3}\cos\alpha$ 一致（误差 < 2×10⁻⁷）。
 - **热点。** Kuusk 联合间隙率改为 $P=\exp[-\rho_L(G_s l_s+G_v l_v)+\rho_L\sqrt{G_sG_v l_s l_v}\,(1-e^{-a})/a]$，$G_s,G_v$ 与定义 $l_s,l_v$ 的消光同源；无相关时严格等于 $T_sT_v$。
-- **漫射与多次散射。** 植被接收体对 64 个方向的入射权重由固定 $2/N$ 改为 $2G_i/\sum_j G_j$（各向同性场总量不变）；VoxelEB 多次散射核保留球形角形状，乘 $G(\Omega')/G(\Omega)$ 以保持对截获量的能量守恒（这是近似：漫射→漫射核未用精确 LIDF 形状），一次散射太阳源用精确 LIDF $\Gamma$ 并在离散方向上归一。
+- **漫射与多次散射。** 植被接收体对 64 个方向的入射权重由固定 $2/N$ 改为 $2G_i/\sum_j G_j$（各向同性场总量不变）；VoxelEB 多次散射核保留球形角形状，乘 $G(\Omega')/G(\Omega)$ 以保持对截获量的能量守恒（这是近似：漫射→漫射核未用精确 LIDF 形状），一次散射太阳源用精确 LIDF $\Gamma$ 并在离散方向上归一。2026-11-26 起，VoxelRT 漫射与 VoxelEB 热红外漫射的 64 方向集可选按体元（及碰撞阶、采样组）哈希做三维随机旋转（工程 `control.voxelDirectionRotation = "rot"` 或 `HISTREAM_VOXEL_DIRROT=rot`；缺省 `legacy` 为固定格点，与旧版逐位相同）：旋转后 $|y|$ 不再等于 $(2k+1)/64$，叶片 $G$、权重 $2G_i/\sum_j G_j$ 与固体的余弦权重都对旋转后的方向解析计算，各向同性场总量不变；VoxelEB 短波多次散射仍用固定格点。详见 `docs/voxel-adaptive-and-direction.md`。
 - **回退与球形极限。** 刚体、火焰/雾介质、`LIDFa = LIDFb = 0`（旧工程/预设表示未指定）以及超出 SAIL 定义域（$|a|+|b|>1$，引擎打印警告）时使用用户常数 $G$，$\Gamma$ 取球形形状并乘 $G/0.5$，保证 $\Gamma/G$ 守恒；`LIDFa > 1` 按 SCOPE 约定表示精确球形分布，$G=0.5$ 且使用原 Ross 闭式，结果与修正前一致（回归检验相对差 ≤ 5×10⁻⁷，仅浮点舍入）。默认 SAIL "球形" 参数 (−0.35, −0.15) 的 $G$ 在 0.490–0.505 之间随天顶角变化，因而默认工程有小幅数值变化。
 
 数值检验见 `tools/test-lidf-gamma.cpp`：13 区间频率、闭式 $G$ 与暴力方位积分及独立 PROSAIL 双精度转写的对比（平面型 a=1,b=0、直立型 a=−1,b=0 等，误差 < 2×10⁻⁷）、$\langle G\rangle=1/2$、$\Gamma$ 归一（相对误差 < 2×10⁻⁵）、$\Gamma$ 与暴力积分及球形极限。
@@ -1496,7 +1496,7 @@ L2LST 输出温度场、经纬度、QC 与不确定度；L2LSCT 按组分顺序�
 - Three.js 只负责场景预览，不代表实际计算精度；
 - Three.js 大场景最多抽样显示 5000 个实例，结果文件仍保存全部有效体元；
 - 局部计算域仅保留包围盒内几何，跨界对象的域外部分不会参与体元化或求解；
-- FacetRT/FacetEB 启动前按“OBJ 多边形三角化数 × 实例数”预估展开规模；超过 `1,000,000` 个三角面将直接阻止运行，应分别切换到 VoxelRT 或 Voxel RT–EB；
+- FacetRT/FacetEB 启动前按“OBJ 多边形三角化数 × 实例数”预估展开规模；超过安全上限将直接阻止运行（缺省 `20,000,000` 个三角面；可用环境变量 `STREAM_STUDIO_MAX_FACET_TRIANGLES` 或工程 `control.maxFacetTriangles` 调整，引擎本身没有面元数量限制，上限只是运行前的资源保护），应分别切换到 VoxelRT 或 Voxel RT–EB；
 - 影像分辨率、波段数、观测角数和过程输出共同决定连续数组大小；极端组合可能触发 `Array buffer allocation failed`，应先缩小输出规模，再评估场景复杂度；
 - 图像 2%–98% 拉伸和 colorbar 只影响显示，不改变原始 GeoTIFF；
 - 体元综合属性是尺度相关的，改变体元大小后应重新统计；

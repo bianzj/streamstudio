@@ -273,7 +273,19 @@ vec3 sampleHemisphereCosine(inout uint seed)
   cosPhi = cos(phi);
   sinPhi = sin(phi);
 	
+#ifdef RT_SAFE_COSINE_SAMPLING
+  // RayTracing (offline.rgen) defines this. For r = |r1| or |r2| within a few ulp
+  // of 1 (Rnd() can return exactly 1.0) the float evaluation of
+  // 1 - r*r*cosPhi*cosPhi - r*r*sinPhi*sinPhi is slightly negative, so the old
+  // sqrt() returned NaN, the NaN direction poisoned Throughput of every band,
+  // and the thermal sky term of the escaping ray then turned the whole pixel
+  // into NaN (replaced by a sky value at output). The exact z is sqrt(1-r*r) = 0
+  // there; the clamp only changes values that were NaN. Voxel shaders do not
+  // define the macro and keep their original code.
+  vec3 direction = vec3(r*cosPhi, r*sinPhi, sqrt(max(1-r*r*cosPhi*cosPhi-r*r*sinPhi*sinPhi, 0.0)));
+#else
   vec3 direction = vec3(r*cosPhi, r*sinPhi, sqrt(1-r*r*cosPhi*cosPhi-r*r*sinPhi*sinPhi));
+#endif
   return direction;
 }
 

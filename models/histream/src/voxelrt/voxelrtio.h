@@ -146,6 +146,8 @@ VoxelrtIO(){
     bool heterogeneousVoxel{false};
     bool acceleratedRadiationSolver{false};
     int collisionOrders{2};
+// Voxel transport options resolved from the project and environment (src/base/voxelflags.h).
+int voxelFlags{0};
     int periodicNeighborCount{0};
     bool skyboxEnabled{false};
 

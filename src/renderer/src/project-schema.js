@@ -960,6 +960,22 @@ export function createDefaultProject(options = {}) {
       // 运行控制节：采样数、深度、计算后端（gpu/cpu）、线程数、质量档位及各模式的迭代/步数上限。
       control: {
         depth: 4, raytracingDepth: 16, samples: 32, gpu: 0, specularEnabled: true,
+        // RayTracing 采样器与随机种子（2026-11-26）：'sobol' = Owen 置乱 Sobol（缺省），'legacy' = 旧 PCG 序列
+        // （与旧版逐位相同）。seed 只改变随机序列，用于重复运行取方差；GUI 暂不提供控件，直接改工程 JSON。
+        sampler: 'sobol', seed: 0,
+        // 新引擎字段（2026-11-26，GUI 暂无控件）：facetVisibility 面元可见性后端 auto|raster|rayquery；
+        // facetOutputFormat 面元结果格式 binary|json（缺省 binary，2026-11-26 起：元数据 JSON + float32 旁路 .bin，
+        // 写盘/读取快一个数量级、体积约 1/3；json = 旧的单个大 JSON，需要时在工程里写 "json"。引擎自身缺省仍为 json，
+        // 由工程字段决定，GUI/服务端总是写入该字段；规范见 docs/facet-binary-output.md）；
+        // voxelEmptySkip 体元空体元跳过；voxelDirectionRotation 体元方向旋转 legacy|rot（Block 为 1/2/4/8/16）；
+        // voxelProxyGeometry 体元代理网格顶点格式 positionNoIndex（缺省）|position|full（full = 旧 44 B 顶点 + 索引；
+        // position = 12 B 仅位置 + 索引；positionNoIndex = 12 B 仅位置、无索引；前两种分块上传，几何与结果与 full 逐位相同，
+        // 把单个网格的顶点缓冲从 44 B×6 降到 12 B×6，约 1626 万面片的单缓冲上限随之解除，上限转为加速结构约 4000 万面片）；
+        // adaptiveSampling RayTracing 自适应采样。
+        facetVisibility: 'auto', facetOutputFormat: 'binary',
+        voxelEmptySkip: true, voxelDirectionRotation: 'legacy', voxelDirectionRotationBlock: 1,
+        voxelProxyGeometry: 'positionNoIndex',
+        adaptiveSampling: false,
         facetBackend: 'gpu',
         computeBackend: 'gpu',
         cpuThreads: DEFAULT_CPU_THREADS,
@@ -1198,7 +1214,8 @@ export function normalizeProject(value = {}) {
       return normalized
     })
   // 步骤 5：以默认工程为底，依次覆盖 input 的顶层字段与各配置节，逐节规范化并限幅。
-  // DEFERRED[低] 兼容性: normalizeProject/parseProjectJson 不检查 value.schemaVersion（只有 validateProject 检查），高于 PROJECT_SCHEMA_VERSION 的工程被直接改写为 6 并在保存时降级（未知字段虽经 ...source 保留，但新语义可能被这里的迁移规则误改）；未修复：拒绝/只读打开更高版本涉及 schema 兼容策略，按要求保留待决策
+  // normalizeProject 仍供内部迁移使用，不检查版本；parseProjectJson 与
+  // server.mjs 的 readProject 会拒绝高于 PROJECT_SCHEMA_VERSION 的工程。
   return {
     ...defaults,
     ...source,
@@ -1283,6 +1300,23 @@ export function normalizeProject(value = {}) {
         raytracingDepth: Math.max(1, Math.min(64, Math.round(number(
           configuration.control?.raytracingDepth, 16
         )))),
+        sampler: configuration.control?.sampler === 'legacy' ? 'legacy' : 'sobol',
+        seed: Math.max(0, Math.min(2147483647, Math.round(number(configuration.control?.seed, 0)))),
+        // 面元/体元/自适应采样的新控制项（2026-11-26）；未知值回到缺省。
+        facetVisibility: ['auto', 'raster', 'rayquery'].includes(configuration.control?.facetVisibility)
+          ? configuration.control.facetVisibility : 'auto',
+        facetOutputFormat: ['json', 'binary'].includes(configuration.control?.facetOutputFormat)
+          ? configuration.control.facetOutputFormat : 'binary',
+        voxelEmptySkip: typeof configuration.control?.voxelEmptySkip === 'boolean'
+          ? configuration.control.voxelEmptySkip : true,
+        voxelDirectionRotation: ['legacy', 'rot'].includes(configuration.control?.voxelDirectionRotation)
+          ? configuration.control.voxelDirectionRotation : 'legacy',
+        voxelDirectionRotationBlock: [1, 2, 4, 8, 16].includes(Number(configuration.control?.voxelDirectionRotationBlock))
+          ? Number(configuration.control.voxelDirectionRotationBlock) : 1,
+        voxelProxyGeometry: ['full', 'position', 'positionNoIndex'].includes(configuration.control?.voxelProxyGeometry)
+          ? configuration.control.voxelProxyGeometry : 'positionNoIndex',
+        adaptiveSampling: typeof configuration.control?.adaptiveSampling === 'boolean'
+          ? configuration.control.adaptiveSampling : false,
         // Legacy projects used a separate switch plus periodicNeighborCount.
         // New projects use one 0..20 value, where zero means disabled.
         periodicBoundary: undefined,
@@ -1429,6 +1463,7 @@ export function parseProjectJson(content) {
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('project.json 根节点必须是对象')
   if (value.format && !isProjectFormat(value.format)) throw new Error(`不支持的工程格式：${value.format}`)
+  if (Number(value.schemaVersion ?? 1) > PROJECT_SCHEMA_VERSION) throw new Error(`工程版本 ${value.schemaVersion} 高于当前支持的 ${PROJECT_SCHEMA_VERSION}，请使用更新版本的 Stream Studio 打开`)
   return normalizeProject(value)
 }
 

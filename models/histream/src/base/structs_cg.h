@@ -96,13 +96,13 @@ struct alignas(16) RayRTSetting
 
     glm::ivec2 imageSize{1000, 1000 }; // ->Sensor.resolution
     //nvmath::vec2f sceneSize_XYZ{ 100.0, 100.0 };
-    int band1{ 1 };
-    int band2{ 2 };
-    int band3{ 3 };
+    int adaptiveMaxExtra{ 0 }; // adaptive sampling: per-pixel cap of extra samples (was unused band1)
+    int adaptiveTile{ 1 }; // adaptive sampling: tile side for the sigma average (was unused band2)
+    int adaptiveMinCount{ 0 }; // adaptive sampling pass 2: per-pixel minimum sample count (was unused band3)
     int isDisplay{ 0 };
     int isTemperature{ 0 };
-    float fireflyClampThreshold{ 0 };
-    int debugging_mode{ 0 };
+    float adaptiveScale{ 0 }; // adaptive sampling: extra samples per unit of pilot sigma (was unused fireflyClampThreshold)
+    int adaptivePass{ 0 }; // 0 normal, 1 adaptive pilot, 2 adaptive refinement (was unused debugging_mode)
     int periodicNeighborCount{ 0 };
     int skyboxEnabled{ 0 };
     int imageOffsetY{ 0 };
@@ -123,7 +123,9 @@ struct alignas(32)  VoxelLstSetting
 {
 
     int frame{0};
-    int maxIteration{3};
+    // Was the unused `maxIteration`. Bit flags of the voxel transport options
+    // (VOXEL_FLAG_* in shader/voxel_flags.glsl, voxelflags.h on the host).
+    int voxelFlags{0};
     int maxDepth{32};
     int maxStep{64};
     int n_sample{16};
@@ -230,7 +232,12 @@ struct alignas(32)  VoxelRTSetting
     int skyboxEnabled{0};
     int collisionOrders{2};
     int collisionOrder{1};
+    // Bit flags of the voxel transport options (VOXEL_FLAG_* in
+    // shader/voxel_flags.glsl, voxelflags.h on the host). Appended, so the
+    // offsets of the existing fields do not change.
+    int voxelFlags{0};
 };
+static_assert(sizeof(VoxelRTSetting) <= 128, "VoxelRTSetting must fit the 128-byte push-constant range");
 
 // 模块：大气辐射传输结果（与 MODTRAN 衔接）：按波长 wavelength 给出直射与散射辐照分量。
 // atmospheric radiative transfer linked to modtrain
@@ -325,7 +332,13 @@ struct MeshBuffer
     uint32_t nbVertices{ 0 };
     nvvk::Buffer   vertexBuffer;
     nvvk::Buffer   indexBuffer;
+    // Voxel proxy meshes only (src/base/proxymesh.h): bytes per vertex of vertexBuffer (the default is the 44-byte
+    // VertexAttribute every other mode uses) and whether an index buffer exists (false: triangle-list vertices,
+    // BLAS indexType NONE, nbIndices == nbVertices).
+    uint32_t       vertexStride{ 44 };
+    bool           indexed{ true };
 };
+static_assert(sizeof(VertexAttribute) == 44, "MeshBuffer::vertexStride default must equal the VertexAttribute size");
 
 // MeshLink：网格到材质/热/冠层/生化参数的索引（spectralId、thermalId、canopyId、bioId），
 // 以及顶点、索引缓冲的设备地址，供着色器按地址访问。

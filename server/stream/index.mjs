@@ -39,6 +39,10 @@ const PRODUCT_FILE = /\.(tif|json)$/i
 const PACK_KINDS = ['stream-era5-pack', 'stream-forcing-pack']
 const FORCING_CHECK_TIMEOUT_MS = 60_000
 const FORCING_QUICK_TIMEOUT_MS = 15_000
+// Hard per-job limit; the engine has no internal watchdog.  0 disables.
+const configuredJobTimeout = Number(process.env.STREAM_STUDIO_STREAM_TIMEOUT_MS)
+const JOB_TIMEOUT_MS = Number.isFinite(configuredJobTimeout) && configuredJobTimeout >= 0
+  ? configuredJobTimeout : 2 * 60 * 60 * 1000
 
 // FIX(2026-11-24 E4): netCDF opens files through the ANSI code page, so the engine reaches a non-ASCII ERA5 file only via its
 // 8.3 short name (forcing/era5.cpp) and fails when the volume has none. Check that at submission instead of in the queue.
@@ -96,6 +100,18 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   function emit(payload) {
     const line = `data: ${JSON.stringify(payload)}\n\n`
     for (const response of clients) response.write(line)
+  }
+
+  // 结束一个 stream.exe 进程树；taskkill 失败时退回 child.kill。
+  function killChildTree(child) {
+    if (!child || child.exitCode !== null) return
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
+        .on('error', () => { try { child.kill() } catch {} })
+        .on('close', (code) => { if (code !== 0) { try { child.kill() } catch {} } })
+    } else {
+      try { child.kill('SIGTERM') } catch {}
+    }
   }
 
   // 任务摘要：只暴露界面需要的字段（id、类型、状态、进度、阶段、输出目录、进程号、开始时间）。
@@ -175,6 +191,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     }
     let result = null
     try { result = job.collect?.(status) ?? null } catch (collectError) { error = error || collectError.message }
+    try { job.cleanup?.() } catch {}
     if (error) emit({ type: 'job-log', job: summary(job), level: 'error', text: error })
     emit({ type: 'job-closed', job: summary(job), status, code, elapsed: job.startedAt ? Date.now() - job.startedAt : 0, result })
     if (active === job) active = null
@@ -192,9 +209,22 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     job.startedAt = Date.now()
     job.stage = '启动引擎'
     const executable = assertEngine()
-    // DEFERRED[中] 资源泄漏: 引擎子进程没有任何超时/看门狗，引擎卡死（读网络盘、死循环等）会让串行队列永久阻塞，只能手动停止；建议：按任务类型设置最长运行时间，超时后走与 stop() 相同的 taskkill /T 流程并标记为 failed
     const child = spawn(executable, args, { cwd: dirname(executable), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     job.child = child
+    // A stuck engine (network share, dead loop) would otherwise block the
+    // serial queue forever.  Kill the process tree and let the close handler
+    // finalize the job as failed.
+    let watchdog = null
+    if (JOB_TIMEOUT_MS > 0) {
+      watchdog = setTimeout(() => {
+        if (job.finished || job.stopped) return
+        job.timedOut = true
+        emit({ type: 'job-log', job: summary(job), level: 'error', text: `STREAM 运行超过 ${Math.round(JOB_TIMEOUT_MS / 60000)} 分钟，已终止` })
+        killChildTree(child)
+      }, JOB_TIMEOUT_MS)
+      watchdog.unref?.()
+    }
+    const stopWatchdog = () => { if (watchdog) { clearTimeout(watchdog); watchdog = null } }
     emit({ type: 'job-started', job: summary(job) })
     createInterface({ input: child.stdout, crlfDelay: Infinity }).on('line', (line) => {
       const match = PROGRESS.exec(line)
@@ -210,10 +240,13 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
       emit({ type: 'job-log', job: summary(job), level: /^(ERROR|Warning) \d+: /.test(text) ? 'diagnostic' : 'error', text })
     })
     child.on('error', (error) => {
+      stopWatchdog()
       emit({ type: 'job-log', job: summary(job), level: 'error', text: error.message })
       if (!child.pid) finish(job, 'failed', null, error.message)
     })
     child.on('close', (code) => {
+      stopWatchdog()
+      if (job.timedOut) return finish(job, 'failed', code, `运行超过 ${Math.round(JOB_TIMEOUT_MS / 60000)} 分钟，已终止`)
       const status = job.stopped ? 'stopped' : job.successCodes.includes(code) ? 'completed' : 'failed'
       finish(job, status, code)
     })
@@ -228,6 +261,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     const queued = queue.findIndex((job) => job.id === target)
     if (queued >= 0) {
       const [job] = queue.splice(queued, 1)
+      try { job.cleanup?.() } catch {}
       emit({ type: 'job-closed', job: { ...summary(job), status: 'stopped' }, status: 'stopped', code: null, elapsed: 0 })
       return { stopped: true }
     }
@@ -387,7 +421,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   // 步骤：1) 校验文件（1–4096 个且都存在）；2) 判定是否通用来源：metadata（或 product）不是
   // era5/era5-land/auto 即走 forcing-register，内联对象会先存成 era5-packs/metadata/ 下的副本；
   // 3) 站点形态元数据不需要登记；4) 任务成功后若给了 label 则写回索引，失败则删除半成品索引与副本。
-  // successCodes 为 [0, 3]：退出码 3 的含义由引擎定义（待核对）。
+  // 注册任务的退出码 0 = 成功、3 = 校验/登记失败（main.cpp 的 registerPack 返回 false）。
   // ERA5 / ERA5-Land go through era5-register (unchanged); any other gridded source goes through forcing-register
   // with its metadata (a preset name, an inline object stored beside the index, or a metadata file).
   function registerPack(data) {
@@ -403,7 +437,12 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
     mkdirSync(era5Directory(), { recursive: true })
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
     const index = join(era5Directory(), `pack-${stamp}.json`)
-    let args, metadataCopy = null
+    let args, metadataCopy = null, listPath = ''
+    const cleanupList = () => {
+      if (!listPath) return
+      try { if (existsSync(listPath)) unlinkSync(listPath) } catch {}
+      listPath = ''
+    }
     if (generic) {
       if (typeof rawMetadata === 'string' && rawMetadata.trim().toLowerCase() === 'station-csv') throw new Error('气象站点 CSV 无需登记，请直接在气象强迫面板中选择 CSV 文件')
       const resolved = forcingRules.resolveMetadata(rawMetadata, { projectPath: data.projectPath, directories: [era5Directory(), forcingMetadataDirectory()] })
@@ -415,11 +454,21 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
         writeFileSync(metadataCopy, JSON.stringify({ kind: 'stream-forcing-metadata', schemaVersion: 1, ...resolved.metadata }, null, 2) + '\n', 'utf8')
         argument = metadataCopy
       }
-      args = ['forcing-register', index, '--metadata', String(argument), ...files.map(windowsPath)]
-    } else args = ['era5-register', index, '--product', product, ...files.map(windowsPath)]
+      args = ['forcing-register', index, '--metadata', String(argument)]
+    } else args = ['era5-register', index, '--product', product]
+    // Windows CreateProcess limits the command line to ~32767 chars.  A
+    // year of daily/hourly NetCDF files easily exceeds it, so switch to a
+    // file list understood by stream.exe (--files-from).
+    const fileArgs = files.map(windowsPath)
+    const inlineLength = [...args, ...fileArgs].reduce((sum, value) => sum + String(value).length + 3, 0)
+    if (inlineLength > 30_000) {
+      listPath = join(era5Directory(), `pack-${stamp}.files.txt`)
+      writeFileSync(listPath, files.join('\n') + '\n', 'utf8')
+      args = [...args, '--files-from', listPath]
+    } else args = [...args, ...fileArgs]
     const job = {
-      kind: 'era5', label: label || '气象数据包', successCodes: [0, 3],
-      // DEFERRED[中] Bug: 所有 NetCDF 路径直接作为命令行参数，Windows CreateProcess 命令行上限约 32767 字符，按天下载的一年数据（数百个长路径）会让 spawn 失败（ENAMETOOLONG），并落入 launch 中 error 后不一定触发 close 的问题；建议：把文件列表写入临时清单文件，用 --files-from <list> 之类的参数传给引擎
+      kind: 'era5', label: label || '气象数据包', successCodes: [0],
+      cleanup: cleanupList,
       start() { launch(job, args) },
       collect(status) {
         if (status !== 'completed') {
@@ -667,6 +716,7 @@ export function createStreamService({ resourceRoot, modelRoot, json, body, readT
   // 作用：服务退出前的收尾：清空队列，停止当前引擎进程（Windows 结束整个进程树）。
   // 进程随后就退出，等不到 close 事件，运行清单在这里同步写成 stopped。
   function shutdown() {
+    for (const job of queue) { try { job.cleanup?.() } catch {} }
     queue.length = 0
     const job = active
     if (!job?.child) return

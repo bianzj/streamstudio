@@ -120,7 +120,10 @@ void ObjLoader::loadModel(const std::string& filename)
 
         ShapeInfo     shapeInfo = {};
         shapeInfo.offset = m_indices.size();
-        shapeInfo.nbFacet = shape.mesh.num_face_vertices.size();
+        // nbFacet is the number of emitted triangles (not source polygons).
+        size_t triangleCount = 0;
+        for (const auto count : shape.mesh.num_face_vertices) triangleCount += count >= 3 ? count - 2 : 0;
+        shapeInfo.nbFacet = static_cast<uint32_t>(triangleCount);
         shapeInfo.matIndex = firstMaterialId(shape);
         shapeInfo.name = shape.name;
         m_shapeInfo.emplace_back(shapeInfo);
@@ -128,36 +131,33 @@ void ObjLoader::loadModel(const std::string& filename)
         m_vertices.reserve(shape.mesh.indices.size() + m_vertices.size());
         m_indices.reserve(shape.mesh.indices.size() + m_indices.size());
 
-        for (const auto& index : shape.mesh.indices)
+        // tinyobj stores polygons (triangles, quads, ...) as a flat index list
+        // plus num_face_vertices.  Fan-triangulate every polygon; the old loop
+        // emitted all indices verbatim, so a quad became an invalid 4-index
+        // "triangle" and every following face was shifted.
+        size_t faceOffset = 0;
+        for (const auto faceVertices : shape.mesh.num_face_vertices)
         {
-            VertexAttribute    vertex = {};
-
-            const float* vp = objVertex(attrib, index.vertex_index, filename);
-            // Unified right-handed convention: +X north, +Y up, +Z east.
-            vertex.pos = { *(vp + 0), *(vp + 1), *(vp + 2) };
-
-            if (minElevation > vertex.pos.y) minElevation = vertex.pos.y;
-
-            /* if(!attrib.normals.empty() && index.normal_index >= 0)
-             {
-               const float* np = &attrib.normals[3 * index.normal_index];
-               vertex.nrm      = {*(np + 0), *(np + 1), *(np + 2)};
-             }
-
-             if(!attrib.texcoords.empty() && index.texcoord_index >= 0)
-             {
-               const float* tp = &attrib.texcoords[2 * index.texcoord_index + 0];
-               vertex.texCoord = {*tp, 1.0f - *(tp + 1)};
-             }*/
-
-             /*if(!attrib.colors.empty())
-             {
-               const float* vc = &attrib.colors[3 * index.vertex_index];
-               vertex.color    = {*(vc + 0), *(vc + 1), *(vc + 2)};
-             }*/
-
-            m_vertices.push_back(vertex);
-            m_indices.push_back(static_cast<int>(m_indices.size()));
+            if (faceOffset + faceVertices > shape.mesh.indices.size())
+            {
+                std::cerr << "OBJ face index data is truncated in " << filename << '\n';
+                break;
+            }
+            for (size_t corner = 0; corner + 2 < faceVertices; ++corner)
+            {
+                for (const size_t vertexIndex : { faceOffset, faceOffset + corner + 1, faceOffset + corner + 2 })
+                {
+                    const auto& index = shape.mesh.indices[vertexIndex];
+                    VertexAttribute vertex = {};
+                    const float* vp = objVertex(attrib, index.vertex_index, filename);
+                    // Unified right-handed convention: +X north, +Y up, +Z east.
+                    vertex.pos = { *(vp + 0), *(vp + 1), *(vp + 2) };
+                    if (minElevation > vertex.pos.y) minElevation = vertex.pos.y;
+                    m_vertices.push_back(vertex);
+                    m_indices.push_back(static_cast<int>(m_indices.size()));
+                }
+            }
+            faceOffset += faceVertices;
         }
     }
     m_objmesh.nVertices = m_vertices.size();
@@ -231,7 +231,9 @@ void ObjLoader::loadMesh(const std::string& filename, const std::string& meshnam
         if (shape.mesh.indices.empty()) continue;
         ShapeInfo     shapeInfo = {};
         shapeInfo.offset = m_indices.size();
-        shapeInfo.nbFacet = shape.mesh.num_face_vertices.size();
+        size_t triangleCount = 0;
+        for (const auto count : shape.mesh.num_face_vertices) triangleCount += count >= 3 ? count - 2 : 0;
+        shapeInfo.nbFacet = static_cast<uint32_t>(triangleCount);
         shapeInfo.matIndex = firstMaterialId(shape);
         shapeInfo.name = shape.name;
         m_shapeInfo.emplace_back(shapeInfo);
@@ -239,35 +241,39 @@ void ObjLoader::loadMesh(const std::string& filename, const std::string& meshnam
         m_vertices.reserve(shape.mesh.indices.size() + m_vertices.size());
         m_indices.reserve(shape.mesh.indices.size() + m_indices.size());
 
-        for (const auto& index : shape.mesh.indices)
+        size_t faceOffset = 0;
+        for (const auto faceVertices : shape.mesh.num_face_vertices)
         {
-            VertexAttribute    vertex = {};
-
-            const float* vp = objVertex(attrib, index.vertex_index, filename);
-            // Keep mesh-specific loading identical to whole-OBJ loading.
-            vertex.pos = { *(vp + 0), *(vp + 1), *(vp + 2) };
-
-            /*if (!attrib.normals.empty() && index.normal_index >= 0)
+            if (faceOffset + faceVertices > shape.mesh.indices.size())
             {
-               const float* np = &attrib.normals[3 * index.normal_index];
-               vertex.nrm = { *(np + 0), *(np + 1), *(np + 2) };
-            }*/
-
-            if (index.texcoord_index >= 0
-                && static_cast<size_t>(index.texcoord_index) * 2 + 1 < attrib.texcoords.size())
-            {
-                const float* tp = &attrib.texcoords[static_cast<size_t>(index.texcoord_index) * 2];
-                vertex.texCoord = { *tp, 1.0f - *(tp + 1) };
+                std::cerr << "OBJ face index data is truncated in " << filename << '\n';
+                break;
             }
-
-            if (static_cast<size_t>(index.vertex_index) * 3 + 2 < attrib.colors.size())
+            for (size_t corner = 0; corner + 2 < faceVertices; ++corner)
             {
-                const float* vc = &attrib.colors[static_cast<size_t>(index.vertex_index) * 3];
-                vertex.color = { *(vc + 0), *(vc + 1), *(vc + 2) };
+                for (const size_t vertexIndex : { faceOffset, faceOffset + corner + 1, faceOffset + corner + 2 })
+                {
+                    const auto& index = shape.mesh.indices[vertexIndex];
+                    VertexAttribute vertex = {};
+                    const float* vp = objVertex(attrib, index.vertex_index, filename);
+                    // Keep mesh-specific loading identical to whole-OBJ loading.
+                    vertex.pos = { *(vp + 0), *(vp + 1), *(vp + 2) };
+                    if (index.texcoord_index >= 0
+                        && static_cast<size_t>(index.texcoord_index) * 2 + 1 < attrib.texcoords.size())
+                    {
+                        const float* tp = &attrib.texcoords[static_cast<size_t>(index.texcoord_index) * 2];
+                        vertex.texCoord = { *tp, 1.0f - *(tp + 1) };
+                    }
+                    if (static_cast<size_t>(index.vertex_index) * 3 + 2 < attrib.colors.size())
+                    {
+                        const float* vc = &attrib.colors[static_cast<size_t>(index.vertex_index) * 3];
+                        vertex.color = { *(vc + 0), *(vc + 1), *(vc + 2) };
+                    }
+                    m_vertices.push_back(vertex);
+                    m_indices.push_back(static_cast<int>(m_indices.size()));
+                }
             }
-
-            m_vertices.push_back(vertex);
-            m_indices.push_back(static_cast<int>(m_indices.size()));
+            faceOffset += faceVertices;
         }
     }
 

@@ -31,13 +31,14 @@ struct RayRTSetting
 	int n_wave;
 	ivec2 imageSize;  	// 1000*1000
 	// vec2 sceneSize;		// 100*100
-	int band1; 
-	int band2;
-	int band3;
+	int adaptiveMaxExtra; // adaptive sampling (RT_ADAPTIVE): per-pixel maximum sample count in pass 2
+
+	int adaptiveTile;     // adaptive sampling: side of the square tile whose mean sigma sets the extra samples (warp coherence)
+	int adaptiveMinCount; // adaptive sampling pass 2: per-pixel minimum sample count (adaptiveMaxExtra = maximum)
 	int isDisplay;
 	int isTemperature;
-	float fireflyClampThreshold;
-	int debugging_mode;
+	float adaptiveScale;   // adaptive sampling: samples per unit of scout sigma (pass 2)
+	int adaptivePass;     // 0 = normal, 1 = adaptive scout pass, 2 = adaptive estimate pass
 	int periodicNeighborCount;
 	int skyboxEnabled;
 	int imageOffsetY;
@@ -53,7 +54,7 @@ struct VoxellstSetting
 {
 
 	int frame;
-	int maxIteration; 
+	int voxelFlags;   // VOXEL_FLAG_* (shader/voxel_flags.glsl); was the unused maxIteration
 	int maxDepth;
 	int maxStep;
 	int n_sample;
@@ -108,6 +109,7 @@ struct VoxelrtSetting
 	int skyboxEnabled;
 	int collisionOrders; // explicit collision orders (diffuse passes)
 	int collisionOrder;  // current diffuse pass, 1-based
+	int voxelFlags;      // VOXEL_FLAG_* (shader/voxel_flags.glsl)
 };
 
 

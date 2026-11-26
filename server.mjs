@@ -31,14 +31,19 @@ import { createServer } from 'node:http'
 import { execFile, spawn, spawnSync } from 'node:child_process'
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads'
 import { createInterface } from 'node:readline'
-import { closeSync, copyFileSync, cpSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { closeSync, copyFileSync, cpSync, createReadStream, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { copyFile as copyFileAsync, cp as cpAsync } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { inflateSync } from 'node:zlib'
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { createDefaultProject, DEFAULT_SCENE_MODEL, normalizeProject, normalizeRunTimeoutMinutes, PROJECT_MODES, sensorBandValues, sensorViewAngles, stringifyProject, validateProject } from './src/renderer/src/project-schema.js'
+import {
+  MAX_RESULT_BYTES, THREE_DIMENSIONAL_FACET_SAMPLE_LIMIT, copyFacetSidecars, facetResultBytes, facetResultCount,
+  facetSidecarFiles, isFacetResultFile as isRadiosityResultFile, readFacetResult as readRadiosityResult,
+  readLargeFileSync, removeFacetResult, sampleFacetResult as sampleRadiosityResult
+} from './server/facet-result.mjs'
+import { createDefaultProject, DEFAULT_SCENE_MODEL, normalizeProject, normalizeRunTimeoutMinutes, PROJECT_MODES, PROJECT_SCHEMA_VERSION, sensorBandValues, sensorViewAngles, stringifyProject, validateProject } from './src/renderer/src/project-schema.js'
 import { applyHistreamToUnified, histreamProjectToUnified, isUnifiedProject, normalizeUnified, stringifyUnifiedProject, unifiedToHistreamProject } from './src/renderer/src/project-unified.js'
 import { prepareRuntimeSceneProject } from './tools/runtime-scene.mjs'
 import { generateTarpCover } from './tools/tarp-cover.mjs'
@@ -75,10 +80,30 @@ const MODEL_ROOT = join(PROJECT_ROOT, 'models')
 const DEFAULT_HISTREAM_PROXY_MANIFEST = ''
 const DEFAULT_HISTREAM_PROXY_RUNNER = ''
 const DEFAULT_HISTREAM_PROXY_PYTHON = ''
-const MAX_FACET_TRIANGLES = 5_000_000
+// 面元数量上限（2026-11-26 起可调）。引擎本身没有面元数量限制，这里只是运行前的资源保护：
+//   - 回归算例 forest 约 15.8 M 面元可在光线查询后端正常运行（加速结构约 808 MiB ≈ 53 B/三角形）；
+//   - 缺省 20 M：加速结构约 1 GiB、每侧缓冲约 2–3 GiB，常见 12–24 GiB 显存可容纳，且高于已验证的 15.8 M；
+//   - 超过 60 % 上限会给出警告（预检）。
+// 覆盖顺序：工程 control.maxFacetTriangles（正整数）> 环境变量 STREAM_STUDIO_MAX_FACET_TRIANGLES > 缺省。
+const DEFAULT_MAX_FACET_TRIANGLES = 20_000_000
+const parseTriangleLimit = (value) => {
+  const number = Math.floor(Number(value))
+  return Number.isFinite(number) && number >= 1000 ? number : 0
+}
+const MAX_FACET_TRIANGLES = parseTriangleLimit(process.env.STREAM_STUDIO_MAX_FACET_TRIANGLES) || DEFAULT_MAX_FACET_TRIANGLES
+const projectFacetLimit = (project) =>
+  parseTriangleLimit(project?.configuration?.control?.maxFacetTriangles) || MAX_FACET_TRIANGLES
+// 光线查询后端的显存估计：加速结构约 53 B/三角形（15.8 M → 808 MiB），再加每侧（正反各 1 侧）若干缓冲
+// （面积、法向、温度/辐射度等，粗估 2 × 24 B/三角形）。数值为粗估，用于预检提示，不用于拦截。
+const RAYQUERY_BYTES_PER_TRIANGLE = 53
+const RAYQUERY_SIDE_BYTES_PER_TRIANGLE = 48
+// 结果文件体积粗估（字节/三角形/个结果文件）：JSON 约 580 B（森林 1580 万面元的 facetrt.json 约 9.2 GB，
+// 见 docs/facet-binary-output.md；用户手册的 500 万面元约 2 GB 对应 400 B，取较大者）；
+// 二进制格式每个值存 4 字节 float32，JSON 约 12 字节，故约为 JSON 的 1/3。
+const FACET_OUTPUT_BYTES_PER_TRIANGLE = { json: 580, binary: 195 }
+const FACET_OUTPUT_WARN_BYTES = 8 * 1024 ** 3
 // 单次三维运行的硬上限：超时即终止整棵进程树；结果体积超过上限则跳过读取与结果处理。
 const RUN_TIMEOUT_MS = Number(process.env.STREAM_STUDIO_RUN_TIMEOUT_MS) || 15 * 60 * 1000
-const MAX_RESULT_BYTES = Number(process.env.STREAM_STUDIO_MAX_RESULT_BYTES) || 8 * 1024 * 1024 * 1024
 // 工程可用 control.runTimeoutMinutes（1–1440 分钟）覆盖；0/缺省用上面的服务端默认。
 const projectRunTimeoutMs = (project) => {
   const minutes = normalizeRunTimeoutMinutes(project?.configuration?.control?.runTimeoutMinutes)
@@ -91,7 +116,7 @@ const runTimeoutLabel = (ms = RUN_TIMEOUT_MS) => (ms >= 60000
 // 2 = "finished, some nodes non-converged, results kept"; usage errors moved to 64
 // so they are no longer mistaken for a non-converged run.
 // 退出码表需与 models/histream/src/main.cpp 保持一致；histreamResultCodes 给出“可视为成功并保留结果”的码。
-const HISTREAM_EXIT = Object.freeze({ ok: 0, failed: 1, facetNonConverged: 2, resources: 3, initialization: 4, usage: 64 })
+const HISTREAM_EXIT = Object.freeze({ ok: 0, failed: 1, facetNonConverged: 2, resources: 3, initialization: 4, deviceQuery: 5, usage: 64 })
 const histreamResultCodes = (mode) => mode === 'eFacetEB'
   ? [HISTREAM_EXIT.ok, HISTREAM_EXIT.facetNonConverged] : [HISTREAM_EXIT.ok]
 const defaultSceneAsset = join(RESOURCE_ROOT, 'assets', 'obj-library', 'building', 'house_a.obj')
@@ -110,6 +135,10 @@ const resultImageMime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'i
 // resettingProcesses 防止并发重置，projectFile/projectDir 为当前打开的工程，clients 为 SSE 连接集合。
 let child = null
 let runPreparing = false
+// Set by /api/stop or /api/reset while /api/run is still preparing its isolated
+// input directory.  The preparation sequence checks it after every await and
+// aborts before spawning the engine.
+let runPreparationCanceled = false
 let childExecutable = ''
 let resettingProcesses = false
 let histreamProxyRequestInFlight = false
@@ -315,6 +344,13 @@ async function createIsolatedRun(input, project, mode, engine) {
   // start = max(0, start), end = max(start + 1, end) — end <= start still runs one node.
   const meteoStart = Math.max(0, Math.round(Number(project.configuration.meteo?.start) || 0))
   const meteoEnd = Math.max(meteoStart + 1, Math.round(Number(project.configuration.meteo?.end) || 0))
+  // meteo.end has no upper bound in the project schema.  Budget the requested
+  // node list here so a malformed/edited project cannot allocate an unbounded
+  // array before the engine is spawned.
+  const MAX_REQUESTED_NODES = 100000
+  if (isEnergyBalanceMode(mode) && meteoEnd - meteoStart > MAX_REQUESTED_NODES) {
+    throw new Error(`请求的模拟节点数 ${meteoEnd - meteoStart} 超过上限 ${MAX_REQUESTED_NODES}；请缩小 meteo.start/end 范围`)
+  }
   const nodes = isEnergyBalanceMode(mode)
     ? Array.from({ length: meteoEnd - meteoStart }, (_, index) => meteoStart + index) : []
   const run = { runId, outputDir, manifest: {
@@ -481,7 +517,11 @@ async function sendCachedResult(request, response, dependencies, variant, job) {
 // 过程结果的缓存依赖：元数据 + 数据文件；面元几何另依赖 geometryFile（缺省 ../faceteb.json）。
 function processResultDependencies(metadataPath, metadata) {
   const dependencies = [metadataPath, resolve(dirname(metadataPath), String(metadata.dataFile || ''))]
-  if (metadata.geometry === 'facet') dependencies.push(resolve(dirname(metadataPath), String(metadata.geometryFile || '../faceteb.json')))
+  if (metadata.geometry === 'facet') {
+    const geometryPath = resolve(dirname(metadataPath), String(metadata.geometryFile || '../faceteb.json'))
+    // 二进制格式的几何数组在旁路 .bin 中，一并作为缓存依赖。
+    dependencies.push(geometryPath, ...facetSidecarFiles(geometryPath))
+  }
   return dependencies
 }
 
@@ -731,11 +771,16 @@ function isLoopbackHostname(value) {
 // The API can spawn executables and write files, so browsers on other sites
 // (CSRF) or rebinding DNS names must never reach it. A JSON Content-Type forces
 // a CORS preflight that this server never approves.
-// DEFERRED[中] 安全: 只校验 Host/Origin/Content-Type，没有会话令牌。同机任何进程或其他 Windows 用户都能调用全部 API（启动引擎、写文件、读任意路径）；<img>/<script> 发起的 GET 不带 Origin 头，可以绕过 Origin 检查（例如用 GET /api/devices?refresh=1 反复拉起引擎）；Sec-Fetch-Site 只在个别接口判断，而且只拦 cross-site，同为 localhost 的其他端口属于 same-site 会放行；建议：每次启动生成随机令牌，经 preload 或启动参数注入页面，所有 /api 请求都校验自定义头；GET 统一拒绝 Sec-Fetch-Site 不是 same-origin/none 的请求。
+// 安全说明：Host/Origin/Content-Type 与 Sec-Fetch-Site（仅 same-origin/none）已校验，
+// 结果读取也限制在工程输出/已识别运行目录；仍没有会话令牌，同机进程可调用 API。
 function foreignRequestReason(request) {
   if (!isLoopbackHostname(`http://${request.headers.host || ''}`)) return 'Host 不是本机地址'
   const origin = request.headers.origin
   if (origin !== undefined && !isLoopbackHostname(origin)) return '拒绝跨站请求'
+  // Browsers attach Sec-Fetch-Site to <img>/<script> GETs that carry no
+  // Origin.  Only allow same-origin or direct navigation.
+  const site = String(request.headers['sec-fetch-site'] || '')
+  if (site && site !== 'same-origin' && site !== 'none') return '拒绝跨站请求'
   if (request.method !== 'GET' && request.method !== 'HEAD'
       && !/^application\/json\b/i.test(request.headers['content-type'] || '')) return 'API 请求必须使用 application/json'
   return ''
@@ -1054,10 +1099,11 @@ function estimateFacetTriangles(project, baseDir) {
   return { total, details }
 }
 
-// 作用：面元总数超过 MAX_FACET_TRIANGLES 时抛错，并按模式建议改用对应的体元模式。
+// 作用：面元总数超过上限（projectFacetLimit：工程 > 环境变量 > 缺省）时抛错，并按模式建议改用对应的体元模式。
 function assertFacetScale(project, baseDir, mode) {
   const estimate = estimateFacetTriangles(project, baseDir)
-  if (estimate.total <= MAX_FACET_TRIANGLES) return estimate
+  const limit = projectFacetLimit(project)
+  if (estimate.total <= limit) return estimate
   const largest = estimate.details[0]
   const source = largest
     ? `最大来源：${largest.name}（${largest.triangles.toLocaleString('zh-CN')} 面 × ${largest.instances.toLocaleString('zh-CN')} 实例 = ${largest.expandedTriangles.toLocaleString('zh-CN')} 面）。`
@@ -1066,12 +1112,57 @@ function assertFacetScale(project, baseDir, mode) {
     ? '请切换到“体元辐射传输与能量平衡（Voxel RT–EB）”'
     : '请切换到“体元辐射传输（VoxelRT）”'
   throw new Error(
-    `面元规模预估为 ${estimate.total.toLocaleString('zh-CN')} 个三角面，超过安全上限 ${MAX_FACET_TRIANGLES.toLocaleString('zh-CN')}。` +
-    `${source}${recommendation}，或减少实例数量、简化 OBJ 后再运行。`)
+    `面元规模预估为 ${estimate.total.toLocaleString('zh-CN')} 个三角面，超过安全上限 ${limit.toLocaleString('zh-CN')}。` +
+    `${source}${recommendation}，或减少实例数量、简化 OBJ 后再运行；` +
+    `也可用环境变量 STREAM_STUDIO_MAX_FACET_TRIANGLES 或工程 control.maxFacetTriangles 调高上限（需有足够显存/内存）。`)
 }
 
 // 大气查找表缓存（按 (size, mtime) 失效）。
 const atmosphereLutCache = new Map()
+
+// 面元结果诊断：引擎在 faceteb_run.json / facetrt.json 中写入 zeroVisibilitySamples（没有任何可见性样本的接收面占比，0–1）。
+// 字段可能不存在（旧引擎）；二进制格式下 facetrt.json 只含元数据，JSON 格式下可能是数 GB，所以只读首尾各 256 KiB 做正则匹配，
+// 不整体解析。faceteb_run.json 很小，递归取各处出现的最大值（逐节点记录时取最差节点）。
+const ZERO_VISIBILITY_WARN_FRACTION = 0.05
+function findMaxNumericKey(value, key, depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 6) return undefined
+  let best
+  for (const [name, item] of Object.entries(value)) {
+    const candidate = name === key ? Number(item) : findMaxNumericKey(item, key, depth + 1)
+    if (Number.isFinite(candidate) && (best === undefined || candidate > best)) best = candidate
+  }
+  return best
+}
+function readZeroVisibilitySamples(outputDir, resultJsonPath) {
+  let best
+  const take = (value) => { if (Number.isFinite(value) && (best === undefined || value > best)) best = value }
+  try {
+    take(findMaxNumericKey(JSON.parse(readFileSync(join(outputDir, 'faceteb_run.json'), 'utf8')), 'zeroVisibilitySamples'))
+  } catch {}
+  if (resultJsonPath && existsSync(resultJsonPath)) {
+    let fd
+    try {
+      fd = openSync(resultJsonPath, 'r')
+      const size = fstatSizeOf(fd)
+      const chunk = 256 * 1024
+      const windows = size <= 2 * chunk ? [[0, size]] : [[0, chunk], [size - chunk, chunk]]
+      for (const [offset, length] of windows) {
+        const buffer = Buffer.alloc(length)
+        const read = readSync(fd, buffer, 0, length, offset)
+        for (const match of buffer.toString('utf8', 0, read).matchAll(/"zeroVisibilitySamples"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g)) take(Number(match[1]))
+      }
+    } catch {} finally { if (fd !== undefined) try { closeSync(fd) } catch {} }
+  }
+  return best
+}
+const fstatSizeOf = (fd) => fstatSync(fd).size
+// 作用：把 zeroVisibilitySamples 转成给用户的提示（> 5 % 才提示）；没有该字段返回空数组。
+function facetResultWarnings(outputDir, resultJsonPath) {
+  const fraction = readZeroVisibilitySamples(outputDir, resultJsonPath)
+  if (!(fraction > ZERO_VISIBILITY_WARN_FRACTION)) return []
+  return [`约 ${(fraction * 100).toFixed(1)} % 的接收面没有得到任何可见性样本（zeroVisibilitySamples），这些面被当作开阔天空，结果可能偏差；` +
+    '建议提高可见性栅格边长（raster size），或改用体元（Voxel）模式']
+}
 
 // 模块：运行前预检（runPreflight）及耗时标签。
 // Run preflight: scale, memory and duration estimates shown before a run.
@@ -1108,11 +1199,36 @@ function runPreflight(input, project, mode) {
     // 可见性栅格边长：大场景 2048，否则 1024（与 facetPixelRatioNote 保持一致）。aBufferMiB 为 A-buffer 显存粗估
     // （raster² × 64 层 × 8 字节，各系数含义待核对）。
     const raster = Math.max(Number(c.scene?.x) || 0, Number(c.scene?.y) || 0) >= 1000 ? 2048 : 1024
-    result.facet = { triangles: estimate.total, limit: MAX_FACET_TRIANGLES, raster,
-      largest: estimate.details[0] || null,
-      aBufferMiB: Math.round(raster * raster * 64 * 8 / 1048576) }
-    if (estimate.total > MAX_FACET_TRIANGLES) warnings.push(`面元约 ${estimate.total.toLocaleString('zh-CN')} 个，超过上限 ${MAX_FACET_TRIANGLES.toLocaleString('zh-CN')}，运行会被拒绝；请改用体元模式或简化模型`)
-    else if (estimate.total > MAX_FACET_TRIANGLES * 0.6) warnings.push(`面元约 ${estimate.total.toLocaleString('zh-CN')} 个，接近上限，可见性图与显存开销较大`)
+    const limit = projectFacetLimit(project)
+    // 可见性后端（control.facetVisibility：auto|raster|rayquery，缺省 auto）：raster 沿用 A-buffer 估计；
+    // 其余（auto 优先光线查询，不支持时回退光栅）按光线查询估计：加速结构 + 每侧缓冲，随三角形数线性增长。
+    const rawBackend = String(c.control?.facetVisibility ?? 'auto').trim().toLowerCase()
+    const backend = ['auto', 'raster', 'rayquery'].includes(rawBackend) ? rawBackend : 'auto'
+    result.facet = { triangles: estimate.total, limit, raster, backend,
+      largest: estimate.details[0] || null }
+    if (backend === 'raster') {
+      result.facet.aBufferMiB = Math.round(raster * raster * 64 * 8 / 1048576)
+    } else {
+      const accelerationMiB = Math.round(estimate.total * RAYQUERY_BYTES_PER_TRIANGLE / 1048576)
+      const sideBuffersMiB = Math.round(estimate.total * RAYQUERY_SIDE_BYTES_PER_TRIANGLE / 1048576)
+      result.facet.rayQueryMiB = accelerationMiB + sideBuffersMiB
+      result.facet.accelerationStructureMiB = accelerationMiB
+      result.facet.sideBuffersMiB = sideBuffersMiB
+    }
+    // 结果文件体积粗估：只估单个最终结果文件（facetrt.json / faceteb.json）；FacetEB 逐节点过程文件未计入。
+    const outputFormat = String(c.control?.facetOutputFormat ?? 'binary').trim().toLowerCase() === 'json' ? 'json' : 'binary'
+    const perFileBytes = estimate.total * FACET_OUTPUT_BYTES_PER_TRIANGLE[outputFormat]
+    const outputFiles = 1
+    result.facet.outputFormat = outputFormat
+    result.facet.outputEstimateGiB = Number((perFileBytes * outputFiles / 1024 ** 3).toFixed(2))
+    result.facet.outputPerFileGiB = Number((perFileBytes / 1024 ** 3).toFixed(2))
+    if (estimate.total > limit) warnings.push(`面元约 ${estimate.total.toLocaleString('zh-CN')} 个，超过上限 ${limit.toLocaleString('zh-CN')}，运行会被拒绝；请改用体元模式或简化模型，或调高 STREAM_STUDIO_MAX_FACET_TRIANGLES / control.maxFacetTriangles`)
+    else if (estimate.total > limit * 0.6) warnings.push(`面元约 ${estimate.total.toLocaleString('zh-CN')} 个，已超过上限 ${limit.toLocaleString('zh-CN')} 的 60 %，可见性图、显存${result.facet.rayQueryMiB ? `（光线查询约 ${(result.facet.rayQueryMiB / 1024).toFixed(1)} GiB）` : ''}与结果文件开销较大`)
+    if (perFileBytes * outputFiles > FACET_OUTPUT_WARN_BYTES) {
+      warnings.push(`面元结果文件预计约 ${result.facet.outputPerFileGiB} GiB（${outputFormat === 'binary' ? '二进制' : 'JSON'}格式，单个最终结果，粗估）` +
+        (outputFormat === 'json' ? '；可在工程 control.facetOutputFormat 设为 "binary" 以显著减小体积' : '') +
+        (outputFormat === 'json' && perFileBytes > MAX_RESULT_BYTES ? `；单个 JSON 文件超过 ${(MAX_RESULT_BYTES / 1024 ** 3).toFixed(0)} GB 时会跳过结果处理（二进制格式不受此限制，仅限制单个数组）` : ''))
+    }
     const periodic = Math.round(Number(c.control?.periodicTraversalCount) || 0)
     // 周期遍历次数向上取整到引擎支持的瓦片档位 4/8/12/20（档位定义以引擎为准，待核对）。
     if (periodic > 0) result.facet.periodicTiles = periodic <= 4 ? 4 : periodic <= 8 ? 8 : periodic <= 12 ? 12 : 20
@@ -1360,299 +1476,6 @@ function outputTiffName(mode, values = {}) {
   }
   return 'SZA=' + outputAngleToken(values.sza) + '_SAA=' + outputAngleToken(values.saa) +
     '_VZA=' + vza + '_VAA=' + vaa + suffix + '.tif'
-}
-
-// 模块：大文件读取与辐射结果（面元/体元 JSON）解析。
-// readFileSync 对超过 2 GiB 的文件会抛 ERR_FS_FILE_TOO_LARGE（与 Buffer 上限无关）。
-// 面元结果和三维过程数据可能达到数 GB，因此分块读入自行分配的 Buffer。
-function readLargeFileSync(path) {
-  const { size } = statSync(path)
-  if (!(size > 0)) return Buffer.alloc(0)
-  if (size > MAX_RESULT_BYTES) {
-    const label = (bytes) => (bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB`
-      : bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(0)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`)
-    throw new Error(`结果文件 ${label(size)} 超过上限 ${label(MAX_RESULT_BYTES)}，请减少面元数量或简化 OBJ`)
-  }
-  const buffer = Buffer.allocUnsafe(size)
-  const descriptor = openSync(path, 'r')
-  let offset = 0
-  try {
-    while (offset < size) {
-      const read = readSync(descriptor, buffer, offset, Math.min(size - offset, 1 << 30), offset)
-      if (read <= 0) break
-      offset += read
-    }
-  } finally {
-    closeSync(descriptor)
-  }
-  return offset === size ? buffer : buffer.subarray(0, offset)
-}
-
-// 作用：读取 FacetRT/FacetEB 引擎写出的面元结果 JSON（可达数 GB），返回类型化数组形式的完整结果。
-// 输入：jsonPath；geometryOnly=true 时只读几何（vertexPositions）和 wavelengths，用于逐步导出的几何文件。
-// 输出：{ facetCount, metrics:[[id,name,Float32Array]], vertexPositions(facetCount×9), backend, iterations,
-//       maxDelta, wavelengths, bandRadiosity, bandStates, quantity, units }。
-// 说明：不把整个文件转成 JS 字符串（受 V8 字符串长度上限限制），而是在 Buffer 上手工扫描键并逐个数字解析。
-//       每面元有正反两个面（surfaceCount = 2·facetCount），指标数组按 (面元, 面) 交错。
-function readRadiosityResult(jsonPath, geometryOnly = false) {
-  if (!existsSync(jsonPath)) throw new Error(`找不到面元结果：${jsonPath}`)
-  // 大场景/多波段面元结果 JSON 会超过 512 MB。若用 readFileSync(..., 'utf8') + JSON.parse，
-  // 会触发 V8 单字符串长度上限（0x1fffffe8 字符）：
-  //   Cannot create a string longer than 0x1fffffe8 characters
-  // 这里改为直接基于 Buffer 逐数字解析（与 sampleRadiosityResult 同一思路），
-  // 不把整个文件转换成 JS 字符串，因此不再受该上限限制。
-  // readFileSync 对超过 2 GiB 的文件会抛 ERR_FS_FILE_TOO_LARGE，而面元结果可达数 GB
-  // （约 750 万面元 ≈ 3.3 GB），因此统一用 readLargeFileSync 分块读入自行分配的 Buffer。
-  const source = readLargeFileSync(jsonPath)
-  const header = source.subarray(0, Math.min(source.length, 1 << 16)).toString('utf8')
-  const facetCount = Number(header.match(/"facetCount"\s*:\s*(\d+)/)?.[1])
-  if (!Number.isInteger(facetCount) || facetCount < 1) throw new Error('面元结果缺少有效的 facetCount')
-  const quantity = String(header.match(/"quantity"\s*:\s*"([^"]*)"/)?.[1] || '')
-  const units = String(header.match(/"units"\s*:\s*"([^"]*)"/)?.[1] || '')
-  const backend = String(header.match(/"backend"\s*:\s*"([^"]*)"/)?.[1] || '')
-  const surfaceCount = facetCount * 2
-
-  // 读取顶层标量（如 iterations、maxDelta）：找到键后读到下一个分隔符（, 换行 }）为止；缺失返回 undefined。
-  const readScalar = (key) => {
-    const keyOffset = source.indexOf('"' + key + '"')
-    if (keyOffset < 0) return undefined
-    const colon = source.indexOf(58, keyOffset)
-    if (colon < 0) return undefined
-    let end = colon + 1
-    while (end < source.length && ![44, 10, 13, 125].includes(source[end])) end += 1
-    const value = Number(source.toString('ascii', colon + 1, end).trim())
-    return Number.isFinite(value) ? value : undefined
-  }
-  const iterations = readScalar('iterations')
-  const maxDelta = readScalar('maxDelta')
-
-  // 顶层数值数组按固定顺序写入；用递增的 searchFrom 避免对超大文件反复全量扫描。
-  // findArray/readFixed/readDynamic：按引擎写出顺序依次定位数组；readFixed 要求元素个数恰为 count（Float32 存储），
-  // readDynamic 读到 ] 为止（用于元素个数不定的 wavelengths）。
-  let searchFrom = 0
-  const findArray = (key) => {
-    const keyOffset = source.indexOf('"' + key + '"', searchFrom)
-    if (keyOffset < 0) return -1
-    const arrayOffset = source.indexOf(91, keyOffset)
-    if (arrayOffset < 0) throw new Error('面元结果缺少 ' + key + ' 数组')
-    searchFrom = keyOffset + key.length + 2
-    return arrayOffset
-  }
-  const readFixed = (key, count) => {
-    const arrayOffset = findArray(key)
-    if (arrayOffset < 0) return null
-    const values = new Float32Array(count)
-    let position = arrayOffset + 1
-    for (let index = 0; index < count; index += 1) {
-      while (position < source.length && (source[position] === 32 || source[position] === 9 || source[position] === 10 || source[position] === 13 || source[position] === 44)) position += 1
-      if (position >= source.length) throw new Error(key + ' 数据不完整')
-      const numberStart = position
-      while (position < source.length && source[position] !== 44 && source[position] !== 93) position += 1
-      if (position === numberStart) throw new Error(key + ' 数据不完整')
-      const value = Number(source.toString('ascii', numberStart, position))
-      if (!Number.isFinite(value)) throw new Error(key + ' 包含无效数值')
-      values[index] = value
-    }
-    while (position < source.length && (source[position] === 32 || source[position] === 9 || source[position] === 10 || source[position] === 13)) position += 1
-    if (position >= source.length || source[position] !== 93) throw new Error(key + ' 数据不完整')
-    return values
-  }
-  const readDynamic = (key) => {
-    const arrayOffset = findArray(key)
-    if (arrayOffset < 0) return null
-    const values = []
-    let position = arrayOffset + 1
-    while (true) {
-      while (position < source.length && (source[position] === 32 || source[position] === 9 || source[position] === 10 || source[position] === 13 || source[position] === 44)) position += 1
-      if (position >= source.length || source[position] === 93) break
-      const numberStart = position
-      while (position < source.length && source[position] !== 44 && source[position] !== 93) position += 1
-      const value = Number(source.toString('ascii', numberStart, position))
-      if (!Number.isFinite(value)) throw new Error(key + ' 包含无效数值')
-      values.push(value)
-    }
-    return values
-  }
-
-  // 步骤 1：先读三角形顶点坐标（必须有）；geometryOnly 时顺带读写在其后的 wavelengths 就返回。
-  // 步骤 2：按文件内写入顺序依次读各指标数组（顺序错误会因 searchFrom 单向前进而找不到）。
-  const arrays = {}
-  arrays.vertexPositions = readFixed('vertexPositions', facetCount * 9)
-  if (!arrays.vertexPositions) throw new Error('面元结果缺少完整的三角形坐标')
-  if (geometryOnly) {
-    // The FacetEB step-sync geometry file may also carry the engine's actual
-    // band list ("wavelengths", written after vertexPositions); use it when present.
-    const geometryWavelengths = (readDynamic('wavelengths') || []).filter((value) => Number.isFinite(value) && value > 0)
-    return { facetCount, vertexPositions: arrays.vertexPositions, backend, metrics: [], bandRadiosity: new Float32Array(0), wavelengths: geometryWavelengths }
-  }
-  arrays.wavelengths = readDynamic('wavelengths')
-  // 文件内的写入顺序：sunlit, radiosity, lightEnhancement, temperature, ...
-  const metricKeys = ['sunlit', 'radiosity', 'lightEnhancement', 'temperature', 'netRadiation', 'sensibleHeat', 'latentHeat', 'storageHeat', 'photovoltaicPower']
-  for (const key of metricKeys) arrays[key] = readFixed(key, surfaceCount)
-  arrays.bandRadiosity = readFixed('bandRadiosity', surfaceCount * Math.max(1, (arrays.wavelengths || []).length))
-  // Per band and facet: front lit, front shaded, back lit, back shaded.
-  arrays.bandStates = readFixed('bandStates', facetCount * 4 * Math.max(1, (arrays.wavelengths || []).length))
-
-  const wavelengths = (arrays.wavelengths || []).filter((value) => Number.isFinite(value) && value > 0)
-  const bandRadiosity = arrays.bandRadiosity || new Float32Array(0)
-  if (bandRadiosity.length && bandRadiosity.length < surfaceCount * Math.max(1, wavelengths.length)) {
-    throw new Error('面元多波段辐亮度数据不完整')
-  }
-
-  // 步骤 3：整理指标清单 [id, 显示名, 是否必需]。quantity 为 spectral radiance 时 radiosity 的含义是光谱辐亮度。
-  // 必需项缺失即报错；能量平衡类指标（温度、热通量、光伏）仅在文件含有时输出。
-  const radianceResult = quantity.toLowerCase() === 'spectral radiance'
-  const metricDefinitions = [
-    ['radiosity', radianceResult ? '光谱辐亮度 [W m⁻² sr⁻¹ μm⁻¹]' : '辐射度', true],
-    ['lightEnhancement', '光照增强', true],
-    ['sunlit', '光照比例', true],
-    ['temperature', '温度 [K]', false],
-    ['netRadiation', '净辐射 [W m⁻²]', false],
-    ['sensibleHeat', '显热 [W m⁻²]', false],
-    ['latentHeat', '潜热 [W m⁻²]', false],
-    ['storageHeat', '储热 [W m⁻²]', false],
-    ['photovoltaicPower', '光伏功率 [W m⁻²]', false]
-  ]
-  const metrics = []
-  for (const [id, name, required] of metricDefinitions) {
-    const values = arrays[id]
-    if (required && !values) throw new Error('面元结果缺少 ' + id + ' 数组')
-    if (values) metrics.push([id, name, values])
-  }
-  return {
-    facetCount,
-    metrics,
-    vertexPositions: arrays.vertexPositions,
-    backend,
-    iterations,
-    maxDelta,
-    wavelengths,
-    bandRadiosity,
-    bandStates: arrays.bandStates || new Float32Array(0),
-    quantity,
-    units
-  }
-}
-
-// 三维显示的面元/体元采样上限（仅用于前端显示；磁盘上的结果保留全部面元）。
-const THREE_DIMENSIONAL_FACET_SAMPLE_LIMIT = 1000000
-
-// 作用：为三维显示读取面元结果的等间隔抽样（面元数超过 maximumFacets 时抽样），返回普通数组。
-// 输出：{ kind:'facet', facetCount(抽样后), sourceFacetCount, sampled, metrics:[{id,label,values}],
-//       vertexPositions, backend, iterations, maxDelta }。
-// 说明：单遍扫描数组，只解析落在被选面元范围内的数值，其余仅跳过，避免一次性解析数 GB 数据。
-//       抽样序号 = floor(i·N/n)（保持在 [0,N-1]）；每面元的指标有正反 2 个值。
-function sampleRadiosityResult(jsonPath, maximumFacets = THREE_DIMENSIONAL_FACET_SAMPLE_LIMIT, geometryOnly = false) {
-  if (!existsSync(jsonPath)) throw new Error('找不到面元结果：' + jsonPath)
-  const source = readLargeFileSync(jsonPath)
-  const header = source.subarray(0, Math.min(source.length, 65536)).toString('utf8')
-  const sourceFacetCount = Number(header.match(/"facetCount"\s*:\s*(\d+)/)?.[1])
-  if (!Number.isInteger(sourceFacetCount) || sourceFacetCount < 1) throw new Error('面元结果缺少有效的 facetCount')
-  const facetCount = Math.min(sourceFacetCount, maximumFacets)
-  const sourceFacets = new Uint32Array(facetCount)
-  for (let sampledFacet = 0; sampledFacet < facetCount; sampledFacet += 1) {
-    sourceFacets[sampledFacet] = facetCount === sourceFacetCount
-      ? sampledFacet
-      : Math.min(sourceFacetCount - 1, Math.floor(sampledFacet * sourceFacetCount / facetCount))
-  }
-
-  // sampleArray：顺序扫描数组，sourceValue 为当前元素序号，仅取 [targetStart,targetEnd) 内的值写入抽样结果。
-  const sampleArray = (key, valuesPerFacet) => {
-    const keyOffset = source.indexOf('"' + key + '"')
-    const arrayOffset = keyOffset < 0 ? -1 : source.indexOf(91, keyOffset)
-    if (arrayOffset < 0) throw new Error('面元结果缺少 ' + key + ' 数组')
-    const values = new Array(facetCount * valuesPerFacet)
-    let position = arrayOffset + 1
-    let sourceValue = 0
-    let sampledFacet = 0
-    let targetStart = sourceFacets[0] * valuesPerFacet
-    let targetEnd = targetStart + valuesPerFacet
-    while (position < source.length && sampledFacet < facetCount) {
-      while (position < source.length && (source[position] === 32 || source[position] === 9 || source[position] === 10 || source[position] === 13 || source[position] === 44)) position += 1
-      if (position >= source.length || source[position] === 93) break
-      const numberStart = position
-      while (position < source.length && source[position] !== 44 && source[position] !== 93) position += 1
-      if (sourceValue >= targetStart && sourceValue < targetEnd) {
-        const value = Number(source.toString('ascii', numberStart, position).trim())
-        if (!Number.isFinite(value)) throw new Error(key + ' 包含无效数值')
-        values[sampledFacet * valuesPerFacet + sourceValue - targetStart] = value
-      }
-      sourceValue += 1
-      if (sourceValue === targetEnd) {
-        sampledFacet += 1
-        if (sampledFacet < facetCount) {
-          targetStart = sourceFacets[sampledFacet] * valuesPerFacet
-          targetEnd = targetStart + valuesPerFacet
-        }
-      }
-    }
-    if (sampledFacet !== facetCount) throw new Error(key + ' 数据不完整')
-    return values
-  }
-  const scalar = (key) => {
-    const keyOffset = source.indexOf('"' + key + '"')
-    if (keyOffset < 0) return undefined
-    const colon = source.indexOf(58, keyOffset)
-    if (colon < 0) return undefined
-    let end = colon + 1
-    while (end < source.length && ![44, 10, 13, 125].includes(source[end])) end += 1
-    const value = Number(source.toString('ascii', colon + 1, end).trim())
-    return Number.isFinite(value) ? value : undefined
-  }
-  const backend = header.match(/"backend"\s*:\s*"([^"]*)"/)?.[1]
-  const quantity = header.match(/"quantity"\s*:\s*"([^"]*)"/)?.[1] || ''
-  const units = header.match(/"units"\s*:\s*"([^"]*)"/)?.[1] || ''
-  const radiosityLabel = quantity.toLowerCase() === 'spectral radiance'
-    ? '光谱辐亮度 [W m⁻² sr⁻¹ μm⁻¹]'
-    : `辐射度${units ? ` [${units.replaceAll('-2', '⁻²')}]` : ' [W m⁻²]'}`
-  const vertexPositions = sampleArray('vertexPositions', 9)
-  // 指标清单（第三项为必需）；geometryOnly 时不读任何指标。此处没有光伏功率项（与 readRadiosityResult 不同）。
-  const metricDefinitions = [
-    ['radiosity', radiosityLabel, true],
-    ['lightEnhancement', '光照增强 [-]', true],
-    ['sunlit', '光照比例 [-]', true],
-    ['temperature', '温度 [K]'],
-    ['netRadiation', '净辐射 [W m⁻²]'],
-    ['sensibleHeat', '显热 [W m⁻²]'],
-    ['latentHeat', '潜热 [W m⁻²]'],
-    ['storageHeat', '储热 [W m⁻²]']
-  ]
-  const metrics = metricDefinitions.filter(([key, , required]) => {
-    const exists = source.indexOf('"' + key + '"') >= 0
-    if (required && !exists && !geometryOnly) throw new Error('面元结果缺少 ' + key + ' 数组')
-    return exists && !geometryOnly
-  }).map(([id, label]) => ({ id, label, values: sampleArray(id, 2) }))
-
-  return {
-    kind: 'facet',
-    path: jsonPath,
-    facetCount,
-    sourceFacetCount,
-    sampled: facetCount < sourceFacetCount,
-    metrics,
-    vertexPositions,
-    backend,
-    iterations: scalar('iterations'),
-    maxDelta: scalar('maxDelta')
-  }
-}
-
-// 通过读前 64 KB 头部判断一个 JSON 是不是面元结果（含 backend、facetCount、vertexPositions）；出错返回 false。
-function isRadiosityResultFile(path) {
-  let descriptor
-  try {
-    descriptor = openSync(path, 'r')
-    const sample = Buffer.alloc(Math.min(65536, statSync(path).size))
-    readSync(descriptor, sample, 0, sample.length, 0)
-    const header = sample.toString('utf8')
-    return /"backend"\s*:/.test(header) &&
-      /"facetCount"\s*:\s*\d+/.test(header) &&
-      /"vertexPositions"\s*:\s*\[/.test(header)
-  } catch {
-    return false
-  } finally {
-    if (descriptor != null) closeSync(descriptor)
-  }
 }
 
 // 读取三维过程结果的元数据 JSON（≤ 1 MB 且 kind 以 -process 结尾），否则返回 null。
@@ -2510,6 +2333,8 @@ function writeRadiosityTiffForAngle(jsonPath, inputPath, mode, viewAngleOverride
       const endTime = timeForNode(endNode - 1).token
       const processDataPath = join(processDirectory, 'faceteb_T=' + (startTime === endTime ? startTime : startTime + '_to_' + endTime) + '.json')
       copyFileSync(jsonPath, processDataPath)
+      // 二进制格式：旁路 .bin 用文件名引用，需随副本放进同一目录。
+      copyFacetSidecars(jsonPath, processDirectory)
       for (let node = startNode; node < endNode; node += 1) {
         const time = timeForNode(node)
         const metadataPath = join(processDirectory, 'faceteb_T=' + time.token + '.meta.json')
@@ -2597,17 +2422,7 @@ function exportFacetStepOnce(running, jsonPath, inputPath, step) {
   })
 }
 
-// 只读前 4 KB 取 facetCount，用于决定走常驻 worker 还是一次性 worker；读不到返回 0。
-function facetResultCount(jsonPath) {
-  try {
-    const fd = openSync(jsonPath, 'r')
-    try {
-      const buffer = Buffer.alloc(4096)
-      const bytes = readSync(fd, buffer, 0, buffer.length, 0)
-      return Number(buffer.toString('utf8', 0, bytes).match(/"facetCount"\s*:\s*(\d+)/)?.[1]) || 0
-    } finally { closeSync(fd) }
-  } catch { return 0 }
-}
+// 面元数 facetResultCount（server/facet-result.mjs，兼容 JSON 与二进制格式）用于决定走常驻 worker 还是一次性 worker。
 
 // 作用：节点出图入口。面元数 > FACET_STEP_RESIDENT_FACETS 走一次性 worker；
 //       否则复用 running 上常驻的 facet-step-service worker（同一次运行内保持几何缓存），一次只处理一个请求。
@@ -2707,6 +2522,9 @@ function readProject(inputPath) {
     document = JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, ''))
   } catch (error) {
     throw new Error(`project.json 格式错误：${error.message}`)
+  }
+  if (!isUnifiedProject(document) && Number(document?.schemaVersion ?? 1) > PROJECT_SCHEMA_VERSION) {
+    throw new Error(`工程版本 ${document.schemaVersion} 高于当前支持的 ${PROJECT_SCHEMA_VERSION}，请使用更新版本的 Stream Studio 打开`)
   }
   if (isUnifiedProject(document)) {
     const unified = normalizeUnified(document)
@@ -3198,6 +3016,7 @@ function resultDirectoryAllowed(directory, scope = resultDeletionScope()) {
   if (child?.histreamRun?.outputDir && sameResolvedPath(directory, normalizeHostPath(child.histreamRun.outputDir))) return false
   if (scope.outputRoot && sameResolvedPath(scope.outputRoot, directory)) return true
   if (resultRunManifest(directory)) return true
+  if (['faceteb.json', 'facetrt.json', 'scene_summary.json'].some((name) => existsSync(join(directory, name)))) return true
   try {
     const runs = join(directory, 'runs')
     if (lstatSync(runs).isSymbolicLink()) return false
@@ -3207,6 +3026,35 @@ function resultDirectoryAllowed(directory, scope = resultDeletionScope()) {
     }
   } catch {}
   return false
+}
+
+// Result files may only be read from the current project's output tree, a
+// directory that has its own run-manifest, or (for a directly opened run) a
+// run directory whose parent is such a manifest directory.  This closes the
+// "resolveAsset accepts any absolute path" hole without changing the project
+// asset APIs.
+function resultFilePathAllowed(path) {
+  const resolved = resolve(path)
+  const scope = resultDeletionScope()
+  if (scope.outputRoot && realPathWithin(scope.outputRoot, resolved, true)) return true
+  const directory = dirname(resolved)
+  if (resultRunManifest(directory)) return true
+  if (resultRunManifest(dirname(directory))) return true
+  // A copied/exported run may no longer have a run-manifest but still carries
+  // the engine's own product files.  Recognize that narrow shape.
+  if (['faceteb.json', 'facetrt.json', 'scene_summary.json'].some((name) => existsSync(join(directory, name)))) return true
+  return false
+}
+
+// /api/open is a shell-open primitive: keep it inside the project, its output
+// tree, the shipped assets, or the default Stream Studio documents folder.
+function userOpenPathAllowed(path) {
+  const resolved = resolve(path)
+  if (projectDir && realPathWithin(projectDir, resolved, true)) return true
+  const scope = resultDeletionScope()
+  if (scope.outputRoot && realPathWithin(scope.outputRoot, resolved, true)) return true
+  if (realPathWithin(join(RESOURCE_ROOT, 'assets'), resolved, true)) return true
+  return realPathWithin(join(homedir(), 'Documents', 'Stream Studio'), resolved, true)
 }
 
 // CSV 单元格：始终加双引号，内部双引号按 RFC 4180 转义为两个双引号。
@@ -3312,7 +3160,9 @@ function writeFloatTiff(path, width, height, bands, values, bandNames = [], sola
   const extraSamplesValue = extraSamples.length ? shortArrayValue(extraSamples) : 0
   const names = Array.from({ length: bands }, (_, index) => String(bandNames[index] || 'Band ' + (index + 1)))
   // ImageDescription 里保存波段名列表，读取端（readTiff）据此恢复波段名。
-  const description = Buffer.from('HiStream image bands: {' + names.join(', ') + '}\0', 'ascii')
+  // TIFF ASCII 标签只是字节串；用 UTF-8 写入中文波段名（温度 [K] 等），否则
+  // Buffer.from(..., 'ascii') 会把每个非 ASCII 字符截成低字节，热红外波段识别失效。
+  const description = Buffer.from('HiStream image bands: {' + names.join(', ') + '}\0', 'utf8')
   const descriptionOffset = allocate(description, 1)
   // GDAL_METADATA (tag 42112) is read by GDAL/rasterio as dataset metadata.
   const gdalMetadata = hasSolar ? Buffer.from('<GDALMetadata>' +
@@ -3644,11 +3494,19 @@ function deleteThreeDimensionalResults(value) {
   const products = resultProductsForDeletion(directory, scope)
   const metadataPaths = [...products].filter(isThreeDimensionalResultFile)
   const paths = [...metadataPaths]
+  // 二进制面元结果：旁路 .bin 随 JSON 一并删除（同样要求属于可删除产物）。
+  const addSidecars = (jsonPath) => {
+    for (const sidecar of facetSidecarFiles(jsonPath)) if (products.has(sidecar) && !paths.includes(sidecar)) paths.push(sidecar)
+  }
+  for (const metadataPath of metadataPaths) addSidecars(metadataPath)
   for (const metadataPath of metadataPaths) {
     const metadata = processResultMetadata(metadataPath)
     if (!metadata?.dataFile) continue
     const dataPath = resolve(dirname(metadataPath), String(metadata.dataFile))
-    if (dirname(dataPath) === dirname(metadataPath) && products.has(dataPath)) paths.push(dataPath)
+    if (dirname(dataPath) === dirname(metadataPath) && products.has(dataPath)) {
+      if (!paths.includes(dataPath)) paths.push(dataPath)
+      if (extname(dataPath).toLowerCase() === '.json') addSidecars(dataPath)
+    }
   }
   for (const path of paths) unlinkSync(path)
   return { directory: windowsPath(directory), deleted: paths.length }
@@ -3744,7 +3602,7 @@ function listResults(value) {
         : kind === 'process'
           ? (process.processType === 'photovoltaic' ? '光伏热电耦合' : (processModelLabels[processModel] || processModel)) + ' · ' + String(process.time || '静态')
           : entry.name
-      return { name: displayName, path, size: info.size, modifiedAt: info.mtime.toISOString(), kind, resultType, ...observation, processTime: process.time, processType: process.processType, processModel, node: process.node,
+      return { name: displayName, path, size: kind === 'facet' ? facetResultBytes(path) : info.size, modifiedAt: info.mtime.toISOString(), kind, resultType, ...observation, processTime: process.time, processType: process.processType, processModel, node: process.node,
         runId: runMetadata.runId || '', runStatus: runMetadata.status || '', converged: process.converged }
     }))
     .filter((entry) => entry.kind !== 'file')
@@ -3809,13 +3667,17 @@ function tiffTypeSize(type) {
 
 // 模块：TIFF LZW 解压（MSB 优先位序，码长 9–12 位，256 = Clear，257 = EOI）。
 // 输入：压缩条带/分块字节；输出：解压后的 Buffer。字典无效时抛错。
-function unpackTiffLzw(source) {
+function unpackTiffLzw(source, maximumOutputLength = Infinity) {
   let bitOffset = 0
   let codeSize = 9
   let nextCode = 258
   let previous = null
   const dictionary = []
   const output = []
+  const append = (entry) => {
+    if (output.length + entry.length > maximumOutputLength) throw new Error('TIFF LZW 解压结果超过分块上限')
+    for (const value of entry) output.push(value)
+  }
   const readCode = () => {
     if (bitOffset + codeSize > source.length * 8) return null
     let code = 0
@@ -3833,7 +3695,7 @@ function unpackTiffLzw(source) {
     else if (code < nextCode && dictionary[code]) entry = dictionary[code]
     else if (code === nextCode && previous) entry = previous.concat(previous[0])
     else throw new Error('TIFF LZW 字典无效')
-    output.push(...entry)
+    append(entry)
     if (previous) {
       dictionary[nextCode] = previous.concat(entry[0])
       nextCode += 1
@@ -4032,7 +3894,7 @@ function readTiff(path, requestedBand = 0, includeValues = false) {
       if (type === 12) return littleEndian ? data.readDoubleLE(offset) : data.readDoubleBE(offset)
       throw new Error(`不支持 TIFF 字段类型 ${type}`)
     }
-    if (type === 2) return data.subarray(valueOffset, valueOffset + total).toString('ascii').replace(/\0+$/, '')
+    if (type === 2) return data.subarray(valueOffset, valueOffset + total).toString('utf8').replace(/\0+$/, '')
     return Array.from({ length: count }, (_, index) => readNumber(valueOffset + index * size))
   }
   for (let index = 0; index < entryCount; index += 1) {
@@ -4083,6 +3945,11 @@ function readTiff(path, requestedBand = 0, includeValues = false) {
   const offsets = (tiled ? tagValue(324, []) : tagValue(273, [])).map(Number)
   const byteCounts = (tiled ? tagValue(325, []) : tagValue(279, [])).map(Number)
   if (!offsets.length || offsets.length !== byteCounts.length) throw new Error('TIFF 缺少有效的图像数据分块')
+  if (!Number.isInteger(tileWidth) || tileWidth < 1 || !Number.isInteger(tileHeight) || tileHeight < 1) {
+    throw new Error(`TIFF 分块尺寸无效：${tileWidth} × ${tileHeight}`)
+  }
+  if (!Number.isInteger(samples) || samples < 1 || samples > 1024) throw new Error(`TIFF 每像素样本数无效：${samples}`)
+  if (!bitsPerSample.length || !bitsPerSample.every((bits) => Number.isInteger(bits) && bits > 0)) throw new Error('TIFF 缺少有效的 bits per sample')
   if (!bitsPerSample.every((bits) => [1, 8, 16, 32, 64].includes(bits))) throw new Error(`暂不支持 TIFF bits per sample ${bitsPerSample.join(',')}`)
   if (!sampleFormats.every((format) => [1, 2, 3].includes(format))) throw new Error(`暂不支持 TIFF sample format ${sampleFormats.join(',')}`)
 
@@ -4100,14 +3967,16 @@ function readTiff(path, requestedBand = 0, includeValues = false) {
     if (!Number.isInteger(offsets[index]) || !Number.isInteger(byteCounts[index]) || offsets[index] < 0 || byteCounts[index] < 0 || offsets[index] + byteCounts[index] > data.length) throw new Error('TIFF 图像数据分块越界')
     const source = data.subarray(offsets[index], offsets[index] + byteCounts[index])
     let decoded = source
-    if (compression === 5) decoded = unpackTiffLzw(source)
+    if (compression === 5) decoded = unpackTiffLzw(source, Number.isSafeInteger(maxChunkBytes) && maxChunkBytes > 0 ? maxChunkBytes : Infinity)
     if (compression === 8 || compression === 32946) decoded = Number.isSafeInteger(maxChunkBytes) && maxChunkBytes > 0 ? inflateSync(source, { maxOutputLength: maxChunkBytes }) : inflateSync(source)
     if (compression === 32773) {
       const output = []
+      const limit = Number.isSafeInteger(maxChunkBytes) && maxChunkBytes > 0 ? maxChunkBytes : Infinity
       for (let offset = 0; offset < source.length;) {
         const control = source[offset++]
         if (control <= 127) for (let count = 0; count < control + 1 && offset < source.length; count += 1) output.push(source[offset++])
         else if (control >= 129 && offset < source.length) { const value = source[offset++]; for (let count = 0; count < 257 - control; count += 1) output.push(value) }
+        if (output.length > limit) throw new Error('TIFF PackBits 解压结果超过分块上限')
       }
       decoded = Buffer.from(output)
     }
@@ -4254,7 +4123,7 @@ function readTiff(path, requestedBand = 0, includeValues = false) {
   const dataType = `${sampleFormat === 3 ? 'Float' : sampleFormat === 2 ? 'Int' : 'UInt'}${bits}`
   const coordinateType = modelType === 1 ? '投影坐标' : modelType === 2 ? '经纬度坐标' : '未声明坐标系'
   const crs = projectedCode && projectedCode !== 32767 ? `EPSG:${projectedCode}` : geoAscii || coordinateType
-  const unit = linearUnit === 9001 ? 'm' : modelType === 2 ? '°' : ''
+  const unit = linearUnit === 9001 ? 'm' : (linearUnit === 9002 || linearUnit === 9003) ? 'ft' : modelType === 2 ? '°' : ''
   // 地形粗网格：最长边不超过 96，等间距采样；缺测值输出 null，供前端三维地形显示。
   const terrainScale = Math.min(1, 96 / Math.max(outputWidth, outputHeight))
   const terrainWidth = Math.max(2, Math.round(outputWidth * terrainScale))
@@ -5037,6 +4906,9 @@ async function api(request, response, url) {
     try {
       const data = await body(request)
       const path = resolveProjectFile(data.path || projectFile)
+      // Save (not Save As) must stay inside the currently opened project folder;
+      // Save As is the explicit route for choosing a new folder.
+      if (projectDir && !realPathWithin(projectDir, path, true)) throw new Error('只能保存到当前工程目录；请使用“另存为”更改位置')
       let candidate = data.project
       if (!candidate) {
         try { candidate = JSON.parse(String(data.content || '')) }
@@ -5066,6 +4938,8 @@ async function api(request, response, url) {
       const stored = readProject(input)
       const project = stored.project ? normalizeStoredProjectPaths(stored.project, dirname(input)) : null
       if (!project) throw new Error('无法读取工程配置')
+      const validation = validateProject(project)
+      if (!validation.valid) throw new Error(`工程配置不合法：${validation.errors.join('；')}`)
       // 三角面统计要整读 OBJ，历史耗时要遍历 runs/：在后台线程执行。
       json(response, 200, toJsonBytes(await heavyTasks.run('run-preflight', { input, project, mode: data.mode })))
     } catch (error) {
@@ -5094,7 +4968,14 @@ async function api(request, response, url) {
       if (child) throw new Error('已有模拟任务正在运行')
       // 准备阶段含异步哈希/复制，期间第二个 /api/run 不能穿过上面的 child 检查。
       if (runPreparing) throw new Error('已有模拟任务正在准备')
+      runPreparationCanceled = false
       runPreparing = ownsPreparation = true
+      // /api/stop and /api/reset set runPreparationCanceled while the input
+      // directory is being frozen/copied.  Check it after every await so the
+      // engine is never spawned for a canceled run.
+      const assertPreparationActive = () => {
+        if (runPreparationCanceled) throw new Error('模拟准备已取消')
+      }
       if (!modes.has(data.mode)) throw new Error('不支持的计算模式')
       const input = resolveProjectFile(data.inputPath || projectFile)
       projectFile = input
@@ -5104,18 +4985,22 @@ async function api(request, response, url) {
       // Normalize path storage only in this invocation's in-memory copy.
       const project = stored.project ? normalizeStoredProjectPaths(stored.project, projectDir) : null
       if (!project) throw new Error('无法读取工程配置')
+      const validation = validateProject(project)
+      if (!validation.valid) throw new Error(`工程配置不合法：${validation.errors.join('；')}`)
       // 步骤 2：引擎路径只允许白名单内的 histream 可执行文件。
       const engine = allowedEngine(data.executable)
       if (!existsSync(engine)) throw new Error(`找不到 HiStream：${windowsPath(engine)}`)
       // 步骤 3：为本次运行创建独立运行目录并写 run-manifest（输入文件身份/哈希等细节见 createIsolatedRun）；
       // 随后把运行用工程副本的 outDir 与气象路径改写为该运行目录内的路径，使每次运行的输出互不覆盖。
       run = await createIsolatedRun(input, project, data.mode, engine)
+      assertPreparationActive()
       const runProject = structuredClone(project)
       runProject.configuration.outDir = run.outputDir
       if (run.manifest.meteorology) runProject.configuration.meteo.path = run.meteoPath
       // 读 OBJ、实例筛选与预裁切、DEM 高程在后台线程执行（暂存目录由线程写出，cleanup 在本线程删除）。
       // 步骤 4：生成运行时场景；暂存目录名必须以 .histream-runtime- 开头且不在目标目录内，防止误复制。
       runtimeScene = await prepareRuntimeSceneInWorker(input, runProject, projectDir)
+      assertPreparationActive()
       // Preserve generated placements and clipped OBJ files with the input;
       // cleanup removes only the temporary staging directory.
       const inputDirectory = join(run.outputDir, 'input')
@@ -5125,6 +5010,7 @@ async function api(request, response, url) {
       }
       // 裁切后的 OBJ 与纹理可能很大：异步复制，避免长时间阻塞事件循环（SSE 进度、其他请求）。
       await cpAsync(stagingDirectory, inputDirectory, { recursive: true })
+      assertPreparationActive()
       const runInput = join(inputDirectory, 'project.json')
       if (run.manifest.meteorology) {
         const frozenMeteo = join(inputDirectory, 'meteo.txt')
@@ -5138,6 +5024,7 @@ async function api(request, response, url) {
         }
       }
       writeRunManifest(run, { runtimeInput: await fileIdentityAsync(runInput), inputDirectory })
+      assertPreparationActive()
       emit({
         type: 'stdout',
         text: `实例边界筛选：原始 ${runtimeScene.total.toLocaleString('zh-CN')} 个，保留 ${runtimeScene.kept.toLocaleString('zh-CN')} 个，完整包围盒在域外跳过 ${runtimeScene.excluded.toLocaleString('zh-CN')} 个；跨界对象仅计算域内部分${runtimeScene.clippedObjects ? `；预裁切 ${runtimeScene.clippedObjects} 个单实例 OBJ，三角面 ${runtimeScene.sourceTriangles.toLocaleString('zh-CN')} → ${runtimeScene.retainedTriangles.toLocaleString('zh-CN')}` : ''}${runtimeScene.invalid ? `，忽略无效记录 ${runtimeScene.invalid.toLocaleString('zh-CN')} 条` : ''}${runtimeScene.grounded ? `；${runtimeScene.grounded} 个车辆实例已落地` : ''}`
@@ -5178,6 +5065,10 @@ async function api(request, response, url) {
         args = [data.mode, histreamRuntimePath(runInput, engine)]
       }
       const startedAt = Date.now()
+      // Last cancellation point before the engine process exists.  /api/stop
+      // during preparation only flips runPreparationCanceled; no child PID is
+      // available to kill yet.
+      assertPreparationActive()
       // 启动引擎。FacetEB 使用管道 stdin 与引擎握手（HISTREAM_FACET_STEP_SYNC=1，引擎每个节点后等待 ACK），
       // 其他模式不需要 stdin。running.histreamRun 保存运行标识，供 /api/events 状态与停止/重置使用。
       const workingDirectory = facetMode ? dirname(engine) : projectDir
@@ -5201,8 +5092,16 @@ async function api(request, response, url) {
         if (running.histreamTimedOut) return
         running.histreamTimedOut = true
         emit({ type: 'error', text: `运行超过 ${runTimeoutLabel(runTimeoutMs)}，已终止` })
-        try { spawn('taskkill', ['/pid', String(running.pid), '/T', '/F'], { windowsHide: true }).on('error', () => running.kill('SIGKILL')) }
-        catch { try { running.kill('SIGKILL') } catch {} }
+        const forceKill = () => { try { if (!running.histreamFinished) running.kill('SIGKILL') } catch {} }
+        try {
+          if (process.platform === 'win32') {
+            // taskkill can exit non-zero (already gone, denied); fall back to
+            // killing the direct child instead of leaving it running.
+            spawn('taskkill', ['/pid', String(running.pid), '/T', '/F'], { windowsHide: true })
+              .on('error', forceKill)
+              .on('close', (code) => { if (code !== 0) forceKill() })
+          } else forceKill()
+        } catch { forceKill() }
       }
       const resumeRunTimer = () => {
         if (runTimer || running.histreamTimedOut || running.histreamFinished) return
@@ -5310,6 +5209,12 @@ async function api(request, response, url) {
           stepOutputError = new Error(`引擎参数用法错误（退出码 ${HISTREAM_EXIT.usage}）：请检查引擎版本是否支持模式 ${data.mode}`)
           emit({ type: 'error', text: stepOutputError.message })
         }
+        // 面元结果诊断必须在 JSON 被清理（非保留三维结果时）之前读取。
+        let runWarnings = []
+        if (resultCodes.includes(code) && radiosityJsonPath) {
+          try { runWarnings = facetResultWarnings(run.outputDir, radiosityJsonPath) } catch {}
+          for (const warning of runWarnings) emit({ type: 'stdout', text: `提示：${warning}` })
+        }
         if (resultCodes.includes(code) && radiosityJsonPath && !streamedSteps && !stepOutputError) {
           try {
             verifyFrozenRunInputs(run.manifest, runInput)
@@ -5326,11 +5231,11 @@ async function api(request, response, url) {
             stepOutputError = running.histreamStopped ? new Error('结果影像生成已被停止') : error
             if (!running.histreamReset) emit({ type: 'error', text: running.histreamStopped ? stepOutputError.message : `结果影像生成失败：${stepOutputError.message}` })
           } finally {
-            if (!keepThreeDimensionalResults && existsSync(radiosityJsonPath)) unlinkSync(radiosityJsonPath)
+            if (!keepThreeDimensionalResults && existsSync(radiosityJsonPath)) removeFacetResult(radiosityJsonPath)
           }
           if (running.histreamReset) return finishReset()
         }
-        if (streamedSteps && resultCodes.includes(code) && !keepThreeDimensionalResults && existsSync(radiosityJsonPath)) unlinkSync(radiosityJsonPath)
+        if (streamedSteps && resultCodes.includes(code) && !keepThreeDimensionalResults && existsSync(radiosityJsonPath)) removeFacetResult(radiosityJsonPath)
         // 步骤 3：非面元模式（体元/射线追踪）的结果为 ENVI，需要转换为 TIFF。
         let conversionWarnings = []
         if (resultCodes.includes(finalCode) && !radiosityJsonPath) {
@@ -5362,9 +5267,11 @@ async function api(request, response, url) {
         writeRunManifest(run, { status, finishedAt: new Date().toISOString(), exitCode: finalCode, signal,
           ...(running.histreamTimedOut ? { error: `运行超过 ${runTimeoutLabel(runTimeoutMs)}，已终止` } : {}),
           ...(conversionWarnings.length ? { warnings: conversionWarnings } : {}),
+          ...(runWarnings.length ? { runWarnings } : {}),
           ...(stepOutputError ? { error: stepOutputError.message } : {}), completed: { ...run.manifest.completed, products: runProductPaths(run.outputDir) } })
         emit({ type: 'closed', code: finalCode, signal, status, runId: run.runId, outputDir: windowsPath(run.outputDir), elapsed: Date.now() - startedAt,
-          ...(conversionWarnings.length ? { warnings: conversionWarnings } : {}) })
+          ...(conversionWarnings.length ? { warnings: conversionWarnings } : {}),
+          ...(runWarnings.length ? { runWarnings } : {}) })
         runtimeScene?.cleanup()
         if (child === running) { child = null; childExecutable = '' }
       }
@@ -5372,12 +5279,37 @@ async function api(request, response, url) {
       running.on('close', (code, signal) => {
         // 结果后处理在后台线程中进行；完成前 child 仍指向本次运行（界面显示运行中，拒绝新的运行与删除结果）。
         completeHistreamRun(code, signal)
-          .catch((error) => { try { emit({ type: 'error', text: `结果处理失败：${error.message}` }) } catch {} })
+          .catch((error) => {
+            // A throw inside completeHistreamRun (e.g. a worker/read exception)
+            // must not leave the UI in "running" forever: publish the terminal
+            // event and mark the manifest failed if it was not finalized.
+            try {
+              if (run.manifest.status === 'running') {
+                writeRunManifest(run, { status: 'failed', finishedAt: new Date().toISOString(), error: `结果处理失败：${error.message}` })
+              }
+            } catch {}
+            try { emit({ type: 'error', text: `结果处理失败：${error.message}` }) } catch {}
+            try {
+              if (run.manifest.status !== 'completed' && run.manifest.status !== 'non_converged' && run.manifest.status !== 'stopped' && run.manifest.status !== 'timeout') {
+                emit({ type: 'closed', code: 1, signal: null, status: 'failed', runId: run.runId, outputDir: windowsPath(run.outputDir), elapsed: Date.now() - startedAt })
+              }
+            } catch {}
+            try { runtimeScene?.cleanup() } catch {}
+          })
           .finally(() => { if (child === running) { child = null; childExecutable = '' } })
       })
       return json(response, 200, { pid: running.pid, inputPath: windowsPath(input), runId: run.runId, outputDir: windowsPath(run.outputDir) })
     } catch (error) {
       runtimeScene?.cleanup()
+      if (run) {
+        try {
+          writeRunManifest(run, {
+            status: runPreparationCanceled ? 'stopped' : 'failed',
+            finishedAt: new Date().toISOString(),
+            error: runPreparationCanceled ? '模拟准备已取消' : error.message
+          })
+        } catch {}
+      }
       // 启动流程中途失败：若本次运行的引擎已经起来，先终止其进程树并标记 stopped，避免遗留后台进程。
       if (child && run && child.histreamRun?.runId === run.runId) {
         const stale = child
@@ -5395,6 +5327,14 @@ async function api(request, response, url) {
   // 停止当前运行：标记 histreamStopped（后处理据此跳过/报告“已停止”）并终止面元出图线程；
   // 引擎已退出、只剩后处理时不再按 PID 杀进程（PID 可能已被复用）；否则 Windows 用 taskkill /T /F。
   if (request.method === 'POST' && url.pathname === '/api/stop') {
+    // A run can spend seconds/minutes in the preparation phase (hashing, OBJ
+    // clipping, copying) before `child` exists.  Signal the preparation loop
+    // instead of ignoring the click.  If the engine was already spawned, kill
+    // it even though runPreparing may still be true until the handler returns.
+    if (!child && runPreparing) {
+      runPreparationCanceled = true
+      return json(response, 200, { stopped: true, preparing: true })
+    }
     if (!child) return json(response, 200, { stopped: false })
     child.histreamStopped = true
     if (child.facetWorker) void child.facetWorker.terminate()
@@ -5411,6 +5351,10 @@ async function api(request, response, url) {
   // 重置模拟环境：终止遗留的引擎进程（见 resetSimulationProcesses）。
   if (request.method === 'POST' && url.pathname === '/api/reset') {
     try {
+      if (!child && runPreparing) {
+        runPreparationCanceled = true
+        return json(response, 200, { activePid: null, terminated: [], preparationCanceled: true })
+      }
       return json(response, 200, await resetSimulationProcesses())
     } catch (error) {
       return json(response, 500, { error: error.message })
@@ -5430,12 +5374,13 @@ async function api(request, response, url) {
     }
   }
   // 列出结果目录内容（listResults，递归 runs/），在后台线程执行。
-  // DEFERRED[低] 安全: 可以列出任意目录（并递归 runs/），会泄露文件名和元数据；建议：和读取接口一样限制在工程/运行结果目录内。
   if (request.method === 'POST' && url.pathname === '/api/results/list') {
     try {
       const data = await body(request)
+      const directory = resolveAsset(data.path)
+      if (!resultDirectoryAllowed(directory)) throw new Error('只能列出当前工程输出目录或已识别运行目录中的结果')
       // 递归遍历 runs/ 并读取每个结果文件头，在后台线程执行。
-      return json(response, 200, toJsonBytes(await heavyTasks.run('results-list', { path: resolveAsset(data.path) })))
+      return json(response, 200, toJsonBytes(await heavyTasks.run('results-list', { path: directory })))
     } catch (error) {
       return json(response, 400, { error: error.message })
     }
@@ -5445,12 +5390,13 @@ async function api(request, response, url) {
   //   面元结果 .json → facet；过程结果 .json → process（依赖多个文件）；
   //   图像 → 以 base64 返回（<= 32MB）；文本类（<= 4MB）→ 文本，统计 CSV 附带观测条件；其余只回路径。
   // TIFF/ENVI/面元/过程经 sendCachedResult 走结果缓存，variant 区分波段或类型。
-  // DEFERRED[中] 安全: resolveAsset 接受任意绝对路径，这里（以及 /api/results/change）能读取磁盘上任何 .txt/.csv/.json/.log/.dat/图像/TIFF，不像 /api/project/read 那样用 realPathWithin 限制范围；建议：限制在 projectDir 或 resultDirectoryAllowed 认可的目录内。（大面元 JSON/TIFF 的读取解析已于 2026-11-23 移到后台计算线程。）
+  // 读取结果文件：限制在工程输出/已识别运行目录（见 resultFilePathAllowed）。
   if (request.method === 'POST' && url.pathname === '/api/results/read') {
     try {
       const data = await body(request)
       const path = resolveAsset(data.path)
       if (!existsSync(path) || !statSync(path).isFile()) throw new Error(`找不到模拟结果：${path}`)
+      if (!resultFilePathAllowed(path)) throw new Error('只能读取当前工程输出目录或已识别运行目录中的结果文件')
       const extension = extname(path).toLowerCase()
       const band = Math.max(0, Math.floor(Number(data.band) || 0))
       if (extension === '.hdr') {
@@ -5461,7 +5407,7 @@ async function api(request, response, url) {
         return await sendCachedResult(request, response, [path], wind ? 'wind' : `tiff:${band}`, { kind: wind ? 'wind' : 'tiff', path, band })
       }
       if (extension === '.json' && isRadiosityResultFile(path)) {
-        return await sendCachedResult(request, response, [path], 'facet', { kind: 'facet', path, band })
+        return await sendCachedResult(request, response, [path, ...facetSidecarFiles(path)], 'facet', { kind: 'facet', path, band })
       }
       const processMetadata = extension === '.json' ? processResultMetadata(path) : null
       if (processMetadata) {
@@ -5490,6 +5436,7 @@ async function api(request, response, url) {
       const secondPath = resolveAsset(data.secondPath)
       for (const path of [firstPath, secondPath]) {
         if (!existsSync(path) || !statSync(path).isFile()) throw new Error(`找不到模拟结果：${path}`)
+        if (!resultFilePathAllowed(path)) throw new Error('只能比较当前工程输出目录或已识别运行目录中的结果文件')
         if (!['.tif', '.tiff'].includes(extname(path).toLowerCase())) throw new Error('变化分析目前仅支持 TIFF 图像')
       }
       return json(response, 200, toJsonBytes(await heavyTasks.run('results-change',
@@ -5506,7 +5453,10 @@ async function api(request, response, url) {
     const path = resolve(requested)
     if (/^[\\/]{2}/.test(path)) return json(response, 400, { error: '不支持打开网络（UNC）路径' })
     if (!existsSync(path)) return json(response, 400, { error: `找不到路径：${path}` })
-    if (process.platform === 'win32') spawn('explorer.exe', statSync(path).isFile() ? ['/select,', path] : [path], { detached: true, windowsHide: true }).on('error', () => {}).unref()
+    if (process.platform === 'win32') {
+      if (!userOpenPathAllowed(path)) return json(response, 400, { error: '只能打开当前工程、输出目录或 Stream Studio 资源目录中的路径' })
+      spawn('explorer.exe', statSync(path).isFile() ? ['/select,', path] : [path], { detached: true, windowsHide: true }).on('error', () => {}).unref()
+    }
     return json(response, 200, { ok: true, path: windowsPath(path) })
   }
   return false
@@ -5671,9 +5621,11 @@ else if (workerData?.kind === 'facet-step-service') {
   parentPort.on('message', ({ jsonPath, inputPath, step }) => {
     try {
       const info = statSync(jsonPath)
-      if (!cache || cache.path !== jsonPath || cache.size !== info.size || cache.mtimeMs !== info.mtimeMs) {
+      // 二进制格式：几何在旁路 .bin 中，其 (size, mtime) 也要计入缓存键。
+      const sidecarStamp = facetSidecarFiles(jsonPath).map((path) => { const stat = statSync(path); return `${stat.size}:${stat.mtimeMs}` }).join('|')
+      if (!cache || cache.path !== jsonPath || cache.size !== info.size || cache.mtimeMs !== info.mtimeMs || cache.sidecarStamp !== sidecarStamp) {
         cache = null
-        cache = { path: jsonPath, size: info.size, mtimeMs: info.mtimeMs, geometry: readRadiosityResult(jsonPath, true) }
+        cache = { path: jsonPath, size: info.size, mtimeMs: info.mtimeMs, sidecarStamp, geometry: readRadiosityResult(jsonPath, true) }
       }
       parentPort.postMessage({ ok: true, result: writeRadiosityTiff(jsonPath, inputPath, 'eFacetEB', step, cache.geometry) })
     } catch (error) {

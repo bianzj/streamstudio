@@ -162,6 +162,7 @@ void main()
                 vec2 stored = sunlitStateTransfer(
                     vec2(voxelTlasts[TlastId+i].sunlit, voxelTlasts[TlastId+i].shaded),
                     storedSolar, currentSolar);
+                if (isnan(stored.x) || isinf(stored.x) || isnan(stored.y) || isinf(stored.y)) stored = vec2(Ta);
                 voxelTlasts[TlastId+i].sunlit = stored.x;
                 voxelTlasts[TlastId+i].shaded = stored.y;
             }
@@ -195,12 +196,12 @@ void main()
             float Tsunlit,Tshaded;
             Tsunlit = voxelTempes[bufferId].sunlit;
             Tshaded = voxelTempes[bufferId].shaded;
-            if(Tsunlit > TMAX_THRESHOLD || Tshaded > TMAX_THRESHOLD)
+            if(isnan(Tsunlit) || isinf(Tsunlit) || Tsunlit > TMAX_THRESHOLD || Tshaded > TMAX_THRESHOLD)
             {
                 Tsunlit = Ta+2.0+273.15;
                 Tshaded = Ta+1.0+273.15;
             }
-            if(Tsunlit < TMIN_THRESHOLD || Tshaded < TMIN_THRESHOLD)
+            if(isnan(Tshaded) || isinf(Tshaded) || Tsunlit < TMIN_THRESHOLD || Tshaded < TMIN_THRESHOLD)
             {
                 Tsunlit = Ta+2.0+273.15;
                 Tshaded = Ta+1.0+273.15;
@@ -226,6 +227,7 @@ void main()
                     voxelTlasts[TlastId + kdepth].shaded,
                     voxelTlasts[TlastId + kdepth].sunlit,
                     sunlitFraction);
+                if (isnan(ToldProfile[kdepth]) || isinf(ToldProfile[kdepth])) ToldProfile[kdepth] = Ta;
                 TnewProfile[kdepth] = 0.0;
                 Mprofile[kdepth] = soilMoistureFraction(
                     localSoilMoisture(bufferId, bioId), soilSets[bioId].SatWater);

@@ -36,6 +36,7 @@
 #include "nvvk/resourceallocator_vk.hpp"
 #include "structs_cg.h"
 #include "terrain_environment.h"
+#include "voxelflags.h"
 #include "src/thirdparty/magic_enum.hpp"
 #include "src/thirdparty/NanoVDB.h"
 #include "src/thirdparty/nanoutil/GridBuilder.h"
@@ -347,6 +348,11 @@ struct AtmosphereXml
 };
 
 
+// RayTracing sampler used when neither the project (control.sampler) nor the
+// environment (HISTREAM_RT_SAMPLER) selects one: 0 = legacy PCG (bitwise
+// identical to older engines), 1 = Owen-scrambled Sobol. The only place to change the default.
+inline constexpr int kRaytracingDefaultSampler = 1;
+
 // 结构：运行设置：GPU 序号与计算后端（gpu/cpu/auto）、采样数与最大深度、体元异质/周期邻域、
 // 天空盒、辐射加速求解器、散射阶数、植被温度方法（0 Ball-Berry / 1 Farquhar）、稳定度修正等。
 struct SettingXml
@@ -376,6 +382,21 @@ struct SettingXml
     int vegetationTemperatureMethod{0};
     // VoxelEB Monin-Obukhov stability iteration (control.stabilityCorrection).
     bool stabilityCorrection{false};
+    // RayTracing sampling (control.seed / control.sampler): seed feeds the
+    // per-pixel RNG (0 = historical sequence); sampler 0 = legacy PCG, 1 = Owen-scrambled Sobol.
+    int rtSeed{0};
+    int rtSampler{kRaytracingDefaultSampler};
+    // RayTracing variance-adaptive per-pixel sampling (control.adaptiveSampling / HISTREAM_RT_ADAPTIVE); opt-in.
+    bool rtAdaptive{false};
+    // Voxel transport options (VoxelRT/VoxelEB), project control.voxelDirectionRotation ("legacy" = 0,
+    // "rot" = 1), control.voxelDirectionRotationBlock (1/2/4/8/16), control.voxelEmptySkip; the
+    // HISTREAM_VOXEL_DIRROT / _DIRROT_BLOCK / _SKIP environment variables override them (src/base/voxelflags.h).
+    int voxelDirectionRotation{voxelflags::kDefaultDirectionRotation};
+    int voxelDirectionRotationBlock{voxelflags::kDefaultDirectionRotationBlock};
+    bool voxelEmptySkip{voxelflags::kDefaultEmptySkip};
+    // Voxel proxy-mesh vertex format (control.voxelProxyGeometry: "full" = 0, "position" = 1,
+    // "positionNoIndex" = 2; HISTREAM_VOXEL_PROXY overrides).
+    int voxelProxyGeometry{voxelflags::kDefaultProxyGeometry};
 
 
 

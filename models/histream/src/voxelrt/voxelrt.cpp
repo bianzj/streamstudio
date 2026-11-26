@@ -25,6 +25,8 @@
 
 #include "voxelrt.h"
 #include "src/base/atmosphere_lut.h"
+#include "src/base/voxelflags.h"
+#include "src/base/voxelmerge_stats.h"
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -162,6 +164,8 @@ bool Voxelrt::upload(std::shared_ptr<FileIO> &fileio, std::shared_ptr<VoxelrtIO>
     // UI option never reached the heterogeneous voxel path.
     uploadSetting(fileio, modelio);
     m_pScene->createPrimObjScene(fileio, modelio);
+    // HISTREAM_VOXEL_MERGE_STATS=1|only: read-only two-level (fixscale) potential table; no behaviour change.
+    voxelmerge::report(modelio, "VoxelRT");
     m_pGeometry->createGeometry(fileio,modelio);
 //    defineOPO(modelio);
    // uploadMeteo(fileio,modelio);
@@ -192,6 +196,9 @@ bool Voxelrt::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
     modelio->acceleratedRadiationSolver =
         fileio->m_pVoxelrtXml->settingxml.acceleratedRadiationSolver;
     modelio->collisionOrders = fileio->m_pVoxelrtXml->settingxml.voxelCollisionOrders;
+    modelio->voxelFlags = voxelflags::resolve(fileio->m_pVoxelrtXml->settingxml.voxelDirectionRotation,
+        fileio->m_pVoxelrtXml->settingxml.voxelDirectionRotationBlock, fileio->m_pVoxelrtXml->settingxml.voxelEmptySkip,
+        fileio->m_pVoxelrtXml->settingxml.voxelProxyGeometry);
 
     return true;
 }
@@ -213,6 +220,8 @@ bool Voxelrt::updateSetting(std::shared_ptr<VoxelrtIO> &modelio){
     modelio->setting.scale = modelio->stepsize_surface;
     modelio->setting.isTemperature = modelio->isTemperature ? 1 : 0;
     modelio->setting.isDisplay = modelio->isDisplay;
+    // Voxel transport options from HISTREAM_VOXEL_DIRROT / HISTREAM_VOXEL_SKIP (src/base/voxelflags.h).
+    modelio->setting.voxelFlags = modelio->voxelFlags;
     modelio->setting.maxDepth = modelio->maxDepth;
     // Dense vegetation can require hundreds of ordered triangle crossings.
     // Tie the limit to ray depth and keep it within a practical GPU range.
@@ -348,14 +357,13 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
     }
 
     // 步骤 1：从 GPU 回读每体元的方向数据（VoxelDir，含 solar 日照比例）与辐射缓冲（VoxelRad）。
-    //         辐射缓冲每体元步长 = DIFFUSENUM（方向暂存区）+ 2*n_wave；
-    //         环境项（cumulated）位于 DIFFUSENUM + band 处（布局以 buffer.cpp 为准，待核对）。
+    //         辐射缓冲每体元步长 = 2*n_wave（2026-11-26 起不再有 64 槽方向暂存区）；
+    //         环境项（cumulated）位于 band 处（布局见 voxelrt/buffer.cpp）。
     const size_t voxelCount = static_cast<size_t>(modelio->n_voxel);
     const int bandCount = modelio->n_wave;
-    const size_t radiationStride = static_cast<size_t>(DIFFUSENUM) +
-                                   2U * static_cast<size_t>(modelio->n_wave);
+    const size_t radiationStride = 2U * static_cast<size_t>(std::max(modelio->n_wave, 1));
     std::vector<VoxelDir> directions(voxelCount);
-    // DEFERRED[低] 内存: 整个 rads 缓冲（含 64 方向暂存区，n_voxel×(64+2n_wave)×8 B）连同等大的 host-visible staging 一起回读，而这里只用到每体元 n_wave 个环境项；大场景可占用数 GB 主机内存；建议：用带偏移/步长的 vkCmdCopyBuffer 区域只回读所需的 DIFFUSENUM..DIFFUSENUM+n_wave 段。
+    // DEFERRED[低] 内存: 整个 rads 缓冲（n_voxel×2n_wave×8 B）连同等大的 host-visible staging 一起回读，而这里只用到每体元前 n_wave 个环境项；大场景可占用主机内存；建议：用带步长的 vkCmdCopyBuffer 区域只回读所需的段。
     std::vector<VoxelRad> radiosities(voxelCount * radiationStride);
     const auto download = [&](const nvvk::Buffer& source, void* destination, VkDeviceSize size) {
         nvvk::Buffer staging = modelio->m_pAlloc->createBuffer(
@@ -406,8 +414,7 @@ void Voxelrt::outputRadiationProcess(std::shared_ptr<VoxelrtIO>& modelio) {
             }
         }
         for (int band = 0; band < bandCount; ++band) {
-            const size_t environmentIndex = voxel * radiationStride +
-                static_cast<size_t>(DIFFUSENUM) + static_cast<size_t>(band);
+            const size_t environmentIndex = voxel * radiationStride + static_cast<size_t>(band);
             const float environmentValue = radiosities[environmentIndex].cumulated;
             // 环境项非有限值（NaN/Inf）一律置 0，并截断为非负，防止污染输出文件。
             const float environmentRadiance =
@@ -623,7 +630,10 @@ void Voxelrt::outputPos(std::shared_ptr<VoxelrtIO> &modelio, std::shared_ptr<Fil
     modelio->m_pAlloc->unmap(pixelBuffer);
     modelio->m_pAlloc->destroy(pixelBuffer);
 
-    Angle angle = modelio->angles[0];
+    // 透视多角度时调用方已把当前角度写入 k_angle；此前固定用 angles[0]
+    // 会让每个角度覆盖同一 TIFF，并使用角度 0 的天空/大气参数。
+    const int angleIndex = std::clamp(modelio->k_angle, 0, std::max(0, static_cast<int>(modelio->angles.size()) - 1));
+    Angle angle = modelio->angles[static_cast<size_t>(angleIndex)];
     const float sensorHeight = kpos >= 0 && kpos < static_cast<int>(modelio->uavposes.size())
         ? modelio->uavposes[kpos].z : fileio->m_pVoxelrtXml->sensorxml.position.z;
     const size_t imageElements = static_cast<size_t>(width) * height;

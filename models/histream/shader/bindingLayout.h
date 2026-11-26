@@ -181,6 +181,8 @@ layout(binding = B_SOILMEMORY) buffer _bufferSoilMemory { vec2 soilMemories[]; }
 
 layout(buffer_reference, scalar) buffer Vertices { VertexAttribute v[]; };
 layout(buffer_reference, scalar) buffer Indices { uvec3 i[]; };
+// 体元代理网格的仅位置顶点（control.voxelProxyGeometry = position / positionNoIndex，12 B 一个）。
+layout(buffer_reference, scalar) buffer PositionVertices { vec3 v[]; };
 // push constant：VOXELLST 的运行参数 VoxellstSetting（含 radianceAddress 等物理地址）。
 layout(push_constant) uniform _RtxState
 {
@@ -242,6 +244,8 @@ layout(binding = B_WATERSET) buffer _bufferWater { WaterSet waterSets[]; };
 
 layout(buffer_reference, scalar) buffer Vertices { VertexAttribute v[]; };
 layout(buffer_reference, scalar) buffer Indices { uvec3 i[]; };
+// 体元代理网格的仅位置顶点（control.voxelProxyGeometry = position / positionNoIndex，12 B 一个）。
+layout(buffer_reference, scalar) buffer PositionVertices { vec3 v[]; };
 // push constant：VoxelRT 的运行参数 VoxelrtSetting。
 layout(push_constant) uniform _RtxState
 {

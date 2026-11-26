@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace facetvk
@@ -52,6 +53,28 @@ struct RasterLayerOverflow : std::runtime_error
               "restore the retained CPU rasterizer")
     {
     }
+};
+
+// Per-pixel hit list of the ray-query backend exceeded the shader limit (256
+// hits on one line). Recoverable: the raster backend takes over.
+struct RayQueryOverflow : std::runtime_error
+{
+    RayQueryOverflow()
+        : std::runtime_error("Ray-query visibility: more than 256 hits on one line; "
+                             "falling back to the raster backend")
+    {
+    }
+};
+
+// Visibility backend. Raster = A-buffer rasterization (default, reference);
+// RayQuery = VK_KHR_ray_query over a BLAS/TLAS of the facets; Auto = ray query when the device
+// supports it, raster otherwise (default). Config default from control.facetVisibility; overridden by
+// HISTREAM_FACET_VISIBILITY=raster|rayquery|auto.
+enum class VisibilityBackend
+{
+    Raster,
+    RayQuery,
+    Auto
 };
 
 // Geometry is uploaded as a non-indexed triangle list. The three vertices of
@@ -97,6 +120,7 @@ struct Config
     uint32_t periodicNeighborCount{0};
     float periodicSizeX{1.0f};
     float periodicSizeZ{1.0f};
+    VisibilityBackend visibilityBackend{VisibilityBackend::Auto};
 };
 
 // 可见性图的诊断信息：面元/side/有向边数量，A-buffer 与哈希表溢出计数，
@@ -121,6 +145,33 @@ struct GraphDiagnostics
     float groundEscapeMaxFraction{};    // largest per-side fraction
     float groundEscapeGroundFraction{}; // same for the upward ground sides
     float skyFraction{};                // sum(sky) / sum(denominator), object sides
+    // Backend that produced the graph ("raster" or "ray-query"), acceleration-structure build
+    // time and, with HISTREAM_FACET_VALIDATE_VISIBILITY=1, the largest differences between the
+    // two backends (counts relative to the per-side denominator).
+    std::string visibilityBackend{"raster"};
+    // Graph construction: "gpu" (graph_build.comp) or "cpu", its wall time (hash table -> CSR, ms)
+    // and, with HISTREAM_FACET_VALIDATE_GRAPH=1, whether the GPU CSR equals the CPU CSR bit for bit.
+    std::string graphBuild{"cpu"};
+    // Stage times of the visibility graph (ms): backend passes (raster/ray query dispatches), per-side
+    // count readback, hash table -> CSR (graphBuildMs), and the rest (lower boundary, count upload,
+    // solve-resource creation).
+    float visibilityPassesMs{};
+    float countReadbackMs{};
+    float graphFinalizeMs{};
+    // Receiving sides (ground back sides excluded) without any visibility sample: sub-pixel facets,
+    // treated as fully open to the sky by the solvers. Falls with a finer raster.
+    uint32_t zeroSampleSides{};
+    uint32_t receivingSides{};
+    float graphBuildMs{};
+    bool graphValidated{};
+    bool graphIdentical{};
+    float accelerationBuildMs{};
+    bool visibilityValidated{};
+    float validateMaxSkyDiff{};
+    float validateMaxGroundDiff{};
+    float validateMaxDenominatorDiff{};
+    float validateMaxEdgeDiff{};
+    float validateMeanEdgeDiff{};
 };
 
 // Marks a side that is not a receiving surface (the soil-facing back side of a
@@ -222,7 +273,10 @@ std::vector<DeviceCandidate> rankDevices(VkInstance instance);
 // 2. A compute pass depth-sorts each pixel and records adjacent oriented sides.
 // 3. The visibility graph is compacted once to CSR.
 // 4. Two-sided reflection/transmission is solved by GPU Jacobi iterations.
-// No acceleration structure, ray query, or ray-tracing pipeline is created.
+// Optional ray-query backend (HISTREAM_FACET_VISIBILITY=rayquery|auto): steps 1-2 are replaced by
+// one compute dispatch per direction that enumerates all hits with VK_KHR_ray_query over a
+// BLAS/TLAS of the facets (periodic replicas are TLAS instances). It writes the same hash/count
+// buffers, so steps 3-4 are unchanged. The raster path remains the default and the fallback.
 class FacetrtVulkan
 {
   public:
@@ -287,6 +341,17 @@ class FacetrtVulkan
 
     void destroy();
 
+    // Developer diagnostic: writes the last visibility graph (after the lower boundary) as raw
+    // little-endian uint32: surfaceCount, edgeCount, denominators[n], sky[n], ground[n],
+    // rowOffsets[n+1], then edgeCount x {neighbor, count}.
+    void dumpGraph(const std::string &fileName) const;
+
+    // Backend that built the last visibility graph / sunlit raster: "raster" or "ray-query".
+    [[nodiscard]] std::string visibilityBackendName() const
+    {
+        return m_primaryRayQuery ? "ray-query" : "raster";
+    }
+
     [[nodiscard]] bool initialized() const noexcept
     {
         return m_device != VK_NULL_HANDLE;
@@ -343,7 +408,7 @@ class FacetrtVulkan
     void createVisibilityResources();
     void createVisibilityDescriptors();
     void createVisibilityPipelines();
-    void createSolveResources(uint32_t directedEdgeCount);
+    void createSolveResources(uint32_t directedEdgeCount, bool csrOnDevice = false);
     void createSolveDescriptors();
     void createSolvePipeline();
     void createEnergyResources();
@@ -386,10 +451,43 @@ class FacetrtVulkan
     void endCommands(VkCommandBuffer commandBuffer) const;
     [[nodiscard]] VkShaderModule loadShader(const std::string &fileName) const;
     [[nodiscard]] std::array<float, 16> makeProjection(const Direction &direction) const;
+    // Depth tolerance (0..1 depth units) for ties/duplicates in the ray-query shaders: 1e-6, tightened
+    // for very large scenes so it never exceeds ~5 mm of geometry (floor 1.5e-7).
+    [[nodiscard]] float rayTieDepth() const;
     [[nodiscard]] uint32_t chooseHashCapacity() const;
     [[nodiscard]] uint32_t maximumHashCapacity() const;
     [[nodiscard]] uint32_t nextPowerOfTwo(uint32_t value) const;
     GraphDiagnostics buildVisibilityGraphOnce(const std::vector<Direction> &directions);
+
+    // Raw result of one visibility pass over all directions, before the lower boundary:
+    // per-side counts and the undirected edge list (key = (lo << 32) | hi, value = ray count).
+    struct RawGraph
+    {
+        std::vector<uint32_t> denominators, skyCounts, groundCounts;
+        std::vector<std::pair<uint64_t, uint32_t>> edges;
+    };
+    // Runs the passes with the raster (A-buffer) or the ray-query backend and reads the counts
+    // back. Throws RasterLayerOverflow / RayQueryOverflow / EdgeHashOverflow.
+    RawGraph buildRawGraph(const std::vector<Direction> &directions, bool rayQuery, bool extractEdges = true);
+    // Reads the hash table back and collects its occupied slots as undirected edges (CPU path).
+    void readHashEdges(std::vector<std::pair<uint64_t, uint32_t>> &edges) const;
+    // CPU CSR construction (sorted symmetric edge table) from the undirected edges.
+    void buildHostCsr(std::vector<std::pair<uint64_t, uint32_t>> edges, std::vector<uint32_t> &rowOffsets,
+                      std::vector<CsrEdge> &csr) const;
+    // GPU CSR construction directly from the hash table (graph_build.comp): fills m_rowOffsets and
+    // m_edges on the device and returns the per-row edge-count sums (closure diagnostic). Returns
+    // false (after logging, with all partial resources released) when the device path cannot be used.
+    bool buildCsrOnGpu(uint32_t &directedEdgeCount, std::vector<uint64_t> &rowSums);
+    // Copies a device-built CSR to m_rowOffsetsCpu / m_edgesCpu when the host needs it.
+    void ensureHostCsr() const;
+    void destroyGraphBuild();
+    std::vector<float> computeSunlitFractionBackend(const Direction &sunDirection, bool rayQuery);
+    // Ray-query backend: device capability probe, acceleration structure and cleanup.
+    [[nodiscard]] bool probeRayQuerySupport(VkPhysicalDevice device) const;
+    void resolveVisibilityBackend();
+    void createAccelerationStructure();
+    void destroyAccelerationStructure();
+    void fallBackToRaster(const char *reason);
 
     void require(VkResult result, const char *operation) const;
     void validateGeometry(const std::vector<Vertex> &vertices) const;
@@ -434,8 +532,42 @@ class FacetrtVulkan
     VkPipeline m_rasterPipeline{VK_NULL_HANDLE};
     VkPipeline m_resolvePipeline{VK_NULL_HANDLE};
 
-    std::vector<uint32_t> m_rowOffsetsCpu;
-    std::vector<CsrEdge> m_edgesCpu;
+    // Visibility backend state. m_wantRaster / m_wantRayQuery say which resources exist;
+    // m_primaryRayQuery selects the backend that produces the graph (the other one is built
+    // only for HISTREAM_FACET_VALIDATE_VISIBILITY=1).
+    VisibilityBackend m_requestedBackend{VisibilityBackend::Raster};
+    bool m_validateVisibility{false};
+    bool m_rayQuerySupported{false};
+    bool m_wantRaster{true};
+    bool m_wantRayQuery{false};
+    bool m_primaryRayQuery{false};
+    bool m_backendLogged{false};
+    VkAccelerationStructureKHR m_blas{VK_NULL_HANDLE};
+    VkAccelerationStructureKHR m_tlas{VK_NULL_HANDLE};
+    Buffer m_blasBuffer, m_tlasBuffer, m_tlasInstances;
+    float m_accelerationBuildMs{};
+    double m_lastPassMs{};      // GPU passes of the last buildRawGraph (all directions, wall clock)
+    double m_lastReadbackMs{};  // hash/count readback + edge extraction of the last buildRawGraph
+    VkPipeline m_rqVisibilityPipeline{VK_NULL_HANDLE};
+    VkPipeline m_rqDirectPipeline{VK_NULL_HANDLE};
+    PFN_vkCreateAccelerationStructureKHR m_vkCreateAccelerationStructure{};
+    PFN_vkDestroyAccelerationStructureKHR m_vkDestroyAccelerationStructure{};
+    PFN_vkGetAccelerationStructureBuildSizesKHR m_vkGetAccelerationStructureBuildSizes{};
+    PFN_vkCmdBuildAccelerationStructuresKHR m_vkCmdBuildAccelerationStructures{};
+    PFN_vkGetAccelerationStructureDeviceAddressKHR m_vkGetAccelerationStructureDeviceAddress{};
+
+    mutable std::vector<uint32_t> m_rowOffsetsCpu;
+    mutable std::vector<CsrEdge> m_edgesCpu;
+    // GPU graph build (HISTREAM_FACET_GRAPH_BUILD=gpu|cpu, HISTREAM_FACET_VALIDATE_GRAPH=1).
+    bool m_graphBuildGpu{true};
+    bool m_validateGraph{false};
+    bool m_csrOnDevice{false};          // m_rowOffsets / m_edges were built on the device
+    uint32_t m_directedEdgeCount{0};
+    VkDescriptorSetLayout m_graphSetLayout{VK_NULL_HANDLE};
+    VkPipelineLayout m_graphPipelineLayout{VK_NULL_HANDLE};
+    VkPipeline m_graphPipeline{VK_NULL_HANDLE};
+    double m_graphBuildMs{0.0};
+    double m_graphStageMs[3]{};   // GPU graph build: count+allocation, compact/scan/stats, scatter/sort/row sums
     VkDescriptorSet m_directDescriptorSet{VK_NULL_HANDLE};
     VkPipeline m_directResolvePipeline{VK_NULL_HANDLE};
     std::vector<uint32_t> m_denominatorCpu;

@@ -22,7 +22,7 @@
 
 // STREAM image project (stream-image-project v2) and engine configuration (stream-image-config v2).
 // STREAM projects are independent of HiStream: inputs are never merged into the 3D project.json.
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { isUnifiedProject } from '../../src/renderer/src/project-unified.js'
 import { createForcingRules, looksLikeMetadataPath } from './forcing.mjs'
@@ -249,7 +249,15 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     }
     mkdirSync(baseDir, { recursive: true })
     const project = { kind: 'stream-image-project', schemaVersion: 2, name: String(data.name || basename(baseDir)), description: String(data.description || ''), scene: stored }
-    writeFileSync(target, JSON.stringify(project, null, 2) + '\n', 'utf8')
+    // Atomic replace: a crash/ENOSPC must not leave a half-written project.
+    const temporary = `${target}.${process.pid}.tmp`
+    try {
+      writeFileSync(temporary, JSON.stringify(project, null, 2) + '\n', 'utf8')
+      renameSync(temporary, target)
+    } catch (error) {
+      try { if (existsSync(temporary)) unlinkSync(temporary) } catch {}
+      throw error
+    }
     return readProjectFile(target)
   }
 
@@ -443,7 +451,10 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
     const surface = { type: inputField(surfaceInput.type, '地表类型（IGBP）栅格', { constant: false, required: true }) }
     for (const [key, label, required] of [['lai', '叶面积指数 LAI', true], ['soilMoisture', '土壤水分 SM', false], ['dem', '高程 DEM', false]]) {
       if (key === 'soilMoisture' && mode === 'eb' && temperatureInput.soilMoisture?.source !== 'user') continue
-      const field = inputField(surfaceInput[key], label, { required })
+      // EB + source=user means the raster is the actual driver; do not let the
+      // engine silently fall back to 0.25 when it is missing.
+      const requiredForField = key === 'soilMoisture' && mode === 'eb' && temperatureInput.soilMoisture?.source === 'user' ? true : required
+      const field = inputField(surfaceInput[key], label, { required: requiredForField })
       if (field) surface[key] = field
     }
     if (scene.locationSource === 'input') {
@@ -521,7 +532,7 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
       // EB：土壤水分来源只有 'user'（取自上面的栅格）或 'era5'（取自强迫数据）两种。
       // energy 中数值型覆盖项只在界面给出有效数字时才写入，未写的字段由引擎采用其缺省值。
       const source = temperatureInput.soilMoisture?.source === 'user' ? 'user' : 'era5'
-      // DEFERRED[低] 错误处理: 这里的校验比引擎 config.cpp 宽松：soilHeatMethod/temperatureMethod 原样透传任意字符串，diffuseFraction 不限 [-1,1]，spectralBinNm 不限 1–100 的整数，heatRoughnessKb 不限 ≤20，soilEmissivityK 允许 ≤0；这些错误要等任务出队、建好输出目录后才由引擎报出；建议：在提交时按引擎相同规则校验（白名单 + 范围）
+      // 提交时按 validateEnergy 校验引擎会拒绝的取值；未知字段不阻断旧工程，只由 sceneWarnings 报告。
       temperature = { mode: 'eb', ...forcingRules.buildForcing(temperatureInput, { projectPath: input.projectPath, directories: forcingDirectories() }), soilMoisture: { source },
         elevationCorrection: temperatureInput.elevationCorrection !== false,
         // EB spin-up = number of whole-hour ERA5 nodes before the overpass (engine default 7 when omitted; 0–240; the
@@ -566,11 +577,26 @@ export function createProjectStore({ normalizeHostPath, windowsPath, forcingDire
       // LSCT inversion and the RT assimilation need the component temperatures as background even without thermal imaging.
       if (thermalEnabled || inversionTarget === 'lsct' || assimilation !== 'none') {
         const input = temperatureInput.components || {}
-        // DEFERRED[中] 错误处理: 组分温度常数要求 K，但不校验范围；用户按 °C 输入 25 会被当成 25 K，热红外结果完全错误而无提示；建议：常数限定在约 150–400 K，低于 150 时提示“是否误填为 °C”
+        // 组分温度常数按 K 校验（150–400 K）；见下列循环。
         if (input.source === 'package') components.file = existingFile(input.file, '组分温度文件（components.tif）')
-        else for (const key of COMPONENT_KEYS) components[key] = inputField(input[key], `${COMPONENT_LABELS[key]}（K）`, { required: true })
+        else for (const key of COMPONENT_KEYS) {
+          const field = inputField(input[key], `${COMPONENT_LABELS[key]}（K）`, { required: true })
+          // 常数必须按开尔文给出；25 之类的摄氏度输入会让热红外结果完全错误。
+          if (field && field.value !== undefined && (field.value < 150 || field.value > 400)) {
+            throw new Error(`${COMPONENT_LABELS[key]}常数须在 150–400 K 之间（请确认没有把 ℃ 当 K 填写）`)
+          }
+          components[key] = field
+        }
       }
-      temperature = { mode: 'rt', components, energy: emission(temperatureInput.energy) }
+      // RT 模式没有短波辐射输入，只接受固定直散比（-1/Erbs 仅 EB 可用）。
+      // 之前完全没把 energy.diffuseFraction 传给引擎，工作台的 C5 修复不可达。
+      const rtEnergy = emission(temperatureInput.energy)
+      if (hasNumber(temperatureInput.energy?.diffuseFraction)) {
+        const diffuseFraction = Number(temperatureInput.energy.diffuseFraction)
+        if (!(diffuseFraction >= 0 && diffuseFraction <= 1)) throw new Error('RT 模式的 diffuseFraction 须为 0–1（-1/Erbs 仅 EB 模式可用）')
+        rtEnergy.diffuseFraction = diffuseFraction
+      }
+      temperature = { mode: 'rt', components, energy: rtEnergy }
     }
 
     // 步骤 6：汇总配置。threads 限制在 0–256 的整数（0 的含义由引擎决定，待核对）；

@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 from osgeo import gdal
 from PIL import Image
+from facet_document import read_document  # JSON / binary facet result reader (tools/facet_document.py)
 
 
 # 把 Windows 路径（C:\...）转成 WSL 路径（/mnt/c/...），其余路径原样返回。
@@ -78,7 +79,7 @@ def main():
     manifest = json.loads((out / 'export-manifest.json').read_text())
     source = host_path(manifest['sourceRun'])
     project = json.loads((source / 'project.json').read_text())['configuration']
-    geo = json.loads((source / 'output/faceteb.json').read_text())
+    geo = read_document(source / 'output/faceteb.json', only={'vertexPositions'})  # JSON or binary result
     # 步骤 1：每个面元 3 个顶点；面元面积 = 叉积范数/2。对象按工程顺序依次占据面元序列，
     # 最后 2 个三角形是原生底层土壤列（background），顺序不符时报错。
     vertices = np.asarray(geo['vertexPositions'], dtype=float).reshape(-1, 3, 3)

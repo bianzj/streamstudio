@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -36,6 +37,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace facetvk {
 namespace {
@@ -46,6 +48,8 @@ constexpr uint64_t kEmptyEdgeKey = std::numeric_limits<uint64_t>::max();
 // Highest per-pixel fragment count the visibility shaders can resolve
 // (MAX_FRAGMENTS in visibility_resolve.comp / direct_resolve.comp).
 constexpr uint32_t kMaximumRasterLayers = 256;
+// Default of HISTREAM_FACET_GRAPH_BUILD: build the CSR on the GPU (graph_build.comp).
+constexpr bool kGraphBuildDefaultGpu = true;
 
 // Destroys a shader module on scope exit, including pipeline-creation failures.
 struct ShaderModuleGuard {
@@ -295,8 +299,100 @@ void FacetrtVulkan::initialize(const Config& config, const std::string& shaderDi
     }
     m_config = config;
     m_shaderDirectory = shaderDirectory;
+    // Visibility backend: Config default, overridden by HISTREAM_FACET_VISIBILITY.
+    m_requestedBackend = config.visibilityBackend;
+    if (const char* requested = std::getenv("HISTREAM_FACET_VISIBILITY")) {
+        const std::string value = requested;
+        if (value == "raster") m_requestedBackend = VisibilityBackend::Raster;
+        else if (value == "rayquery" || value == "ray-query") m_requestedBackend = VisibilityBackend::RayQuery;
+        else if (value == "auto") m_requestedBackend = VisibilityBackend::Auto;
+        else if (!value.empty())
+            throw std::invalid_argument("HISTREAM_FACET_VISIBILITY must be raster, rayquery or auto");
+    }
+    const char* validate = std::getenv("HISTREAM_FACET_VALIDATE_VISIBILITY");
+    m_validateVisibility = validate != nullptr && *validate != '\0' && std::strcmp(validate, "0") != 0;
+    m_backendLogged = false;
+    // Graph construction: HISTREAM_FACET_GRAPH_BUILD=gpu|cpu (default gpu); HISTREAM_FACET_VALIDATE_GRAPH=1
+    // builds both and compares them bit for bit.
+    m_graphBuildGpu = kGraphBuildDefaultGpu;
+    if (const char* requested = std::getenv("HISTREAM_FACET_GRAPH_BUILD")) {
+        const std::string value = requested;
+        if (value == "gpu") m_graphBuildGpu = true;
+        else if (value == "cpu") m_graphBuildGpu = false;
+        else if (!value.empty()) throw std::invalid_argument("HISTREAM_FACET_GRAPH_BUILD must be gpu or cpu");
+    }
+    const char* validateGraph = std::getenv("HISTREAM_FACET_VALIDATE_GRAPH");
+    m_validateGraph = validateGraph != nullptr && *validateGraph != '\0' && std::strcmp(validateGraph, "0") != 0;
     createContext();
+    resolveVisibilityBackend();
     createCommandPool();
+}
+
+// 作用：探测设备是否支持光线查询后端：Vulkan 1.2、VK_KHR_acceleration_structure /
+// VK_KHR_ray_query / VK_KHR_deferred_host_operations，以及 accelerationStructure、rayQuery、
+// bufferDeviceAddress 特性。
+bool FacetrtVulkan::probeRayQuerySupport(VkPhysicalDevice device) const
+{
+    // Test hook: pretend the device lacks ray query (exercises the raster fallback).
+    if (const char* forced = std::getenv("HISTREAM_FACET_FORCE_NO_RAYQUERY");
+        forced != nullptr && *forced != '\0' && std::strcmp(forced, "0") != 0)
+        return false;
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(device, &properties);
+    if (properties.apiVersion < VK_API_VERSION_1_2) return false;
+    uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> available(count);
+    vkEnumerateDeviceExtensionProperties(device, nullptr, &count, available.data());
+    for (const char* name : {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME,
+                             VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME}) {
+        if (std::none_of(available.begin(), available.end(),
+                         [name](const VkExtensionProperties& e) { return std::strcmp(e.extensionName, name) == 0; }))
+            return false;
+    }
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQuery{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accel{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    VkPhysicalDeviceVulkan12Features vulkan12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &vulkan12;
+    vulkan12.pNext = &accel;
+    accel.pNext = &rayQuery;
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    return rayQuery.rayQuery == VK_TRUE && accel.accelerationStructure == VK_TRUE &&
+           vulkan12.bufferDeviceAddress == VK_TRUE && vulkan12.shaderBufferInt64Atomics == VK_TRUE;
+}
+
+// 作用：由请求的后端、设备能力与 ray-query 着色器文件是否存在，确定实际资源与主后端：
+// m_wantRayQuery / m_wantRaster 决定创建哪些资源，m_primaryRayQuery 决定产生可见性图的后端。
+// 请求了 rayquery 但不可用时打印警告并回退光栅；auto 不可用时静默使用光栅。
+void FacetrtVulkan::resolveVisibilityBackend()
+{
+    const bool shadersPresent = std::ifstream(m_shaderDirectory + "/visibility_rayquery.comp.spv").good() &&
+                                std::ifstream(m_shaderDirectory + "/direct_rayquery.comp.spv").good();
+    const bool usable = m_rayQuerySupported && shadersPresent;
+    const bool wanted = m_requestedBackend != VisibilityBackend::Raster || m_validateVisibility;
+    if (wanted && !usable &&
+        (m_requestedBackend == VisibilityBackend::RayQuery || m_validateVisibility)) {
+        std::cerr << "facetrt: ray-query visibility requested but "
+                  << (!m_rayQuerySupported ? "the device lacks VK_KHR_ray_query/acceleration_structure/bufferDeviceAddress"
+                                           : "visibility_rayquery.comp.spv is missing")
+                  << "; using the raster backend" << std::endl;
+    }
+    m_primaryRayQuery = usable && m_requestedBackend != VisibilityBackend::Raster;
+    m_wantRayQuery = usable && (m_primaryRayQuery || m_validateVisibility);
+    m_wantRaster = !m_primaryRayQuery || (m_validateVisibility && usable);
+}
+
+// 作用：光线查询路径遇到不可恢复的问题（单线交点过多）时回退到光栅后端。
+// 调用者随后用 setGeometry 重建资源（光栅需要 A-buffer 与图形管线）。
+void FacetrtVulkan::fallBackToRaster(const char* reason)
+{
+    std::cerr << "facetrt: " << reason << "; using the raster visibility backend" << std::endl;
+    m_primaryRayQuery = false;
+    m_backendLogged = false;
+    m_wantRaster = true;
+    m_wantRayQuery = false;
 }
 
 // 作用：创建 Vulkan 1.2 实例（可选校验层）、选择物理设备、创建逻辑设备与单个队列。
@@ -379,8 +475,54 @@ void FacetrtVulkan::createContext()
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.pEnabledFeatures = &features;
+
+    // Optional hardware ray query (VK_KHR_ray_query + acceleration structure): enabled only when
+    // a ray-query visibility backend was requested and the device supports it. Features go
+    // through VkPhysicalDeviceFeatures2; the 64-bit buffer atomics then come from the
+    // Vulkan 1.2 feature struct (it must not be combined with the stand-alone atomic64 struct).
+    m_rayQuerySupported = (m_requestedBackend != VisibilityBackend::Raster || m_validateVisibility) &&
+                          probeRayQuerySupport(m_physicalDevice);
+    VkPhysicalDeviceVulkan12Features vulkan12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationFeatures{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    const std::array<const char*, 3> rayQueryExtensions{VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+                                                       VK_KHR_RAY_QUERY_EXTENSION_NAME,
+                                                       VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME};
+    if (m_rayQuerySupported) {
+        vulkan12.bufferDeviceAddress = VK_TRUE;
+        vulkan12.shaderBufferInt64Atomics = VK_TRUE;
+        accelerationFeatures.accelerationStructure = VK_TRUE;
+        rayQueryFeatures.rayQuery = VK_TRUE;
+        features2.features = features;
+        features2.pNext = &vulkan12;
+        vulkan12.pNext = &accelerationFeatures;
+        accelerationFeatures.pNext = &rayQueryFeatures;
+        deviceInfo.pNext = &features2;
+        deviceInfo.pEnabledFeatures = nullptr;
+        deviceInfo.enabledExtensionCount = static_cast<uint32_t>(rayQueryExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = rayQueryExtensions.data();
+    }
     require(vkCreateDevice(m_physicalDevice, &deviceInfo, nullptr, &m_device), "vkCreateDevice");
     vkGetDeviceQueue(m_device, m_queueFamily, 0, &m_queue);
+    if (m_rayQuerySupported) {
+        const auto load = [this](const char* name) { return vkGetDeviceProcAddr(m_device, name); };
+        m_vkCreateAccelerationStructure = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
+            load("vkCreateAccelerationStructureKHR"));
+        m_vkDestroyAccelerationStructure = reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(
+            load("vkDestroyAccelerationStructureKHR"));
+        m_vkGetAccelerationStructureBuildSizes = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
+            load("vkGetAccelerationStructureBuildSizesKHR"));
+        m_vkCmdBuildAccelerationStructures = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
+            load("vkCmdBuildAccelerationStructuresKHR"));
+        m_vkGetAccelerationStructureDeviceAddress = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
+            load("vkGetAccelerationStructureDeviceAddressKHR"));
+        if (!m_vkCreateAccelerationStructure || !m_vkDestroyAccelerationStructure ||
+            !m_vkGetAccelerationStructureBuildSizes || !m_vkCmdBuildAccelerationStructures ||
+            !m_vkGetAccelerationStructureDeviceAddress)
+            m_rayQuerySupported = false;
+    }
 }
 
 // 作用：创建命令池（transient + 可单独复位），所有一次性命令缓冲都由 beginCommands() 从中分配。
@@ -427,6 +569,10 @@ FacetrtVulkan::Buffer FacetrtVulkan::createBuffer(VkDeviceSize size,
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(m_device, result.buffer, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        // Buffers addressed by the acceleration-structure build need device-address memory.
+        VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        if ((usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0U) allocation.pNext = &allocateFlags;
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits, properties);
         require(vkAllocateMemory(m_device, &allocation, nullptr, &result.memory), "vkAllocateMemory");
@@ -530,13 +676,35 @@ void FacetrtVulkan::downloadBuffer(const Buffer& source,
     if (size > source.size) {
         throw std::out_of_range("Download exceeds Vulkan buffer size");
     }
-    Buffer staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    // Prefer host-cached memory: reading GPU results from uncached (write-combined) host-visible
+    // memory runs at ~0.2 GB/s (a 2.4 GB spectral output took 12 s); cached memory reads at memcpy speed.
+    Buffer staging{};
+    bool coherent = true;
+    try {
+        staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    } catch (const std::exception&) {
+        try {
+            staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            coherent = false;
+        } catch (const std::exception&) {
+            staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        }
+    }
     try {
         copyBuffer(source.buffer, staging.buffer, size);
         void* mapped = nullptr;
         require(vkMapMemory(m_device, staging.memory, 0, size, 0, &mapped), "vkMapMemory");
+        if (!coherent) {
+            VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+            range.memory = staging.memory;
+            range.offset = 0;
+            range.size = VK_WHOLE_SIZE;
+            vkInvalidateMappedMemoryRanges(m_device, 1, &range);
+        }
         std::memcpy(data, mapped, static_cast<size_t>(size));
         vkUnmapMemory(m_device, staging.memory);
     } catch (...) {
@@ -756,8 +924,30 @@ void FacetrtVulkan::setGeometry(const std::vector<Vertex>& vertices)
     m_hashCapacity = chooseHashCapacity();
     createVisibilityResources();
     uploadBuffer(m_vertices, vertices.data(), vertices.size() * sizeof(Vertex));
+    if (m_wantRayQuery) createAccelerationStructure();
     createVisibilityDescriptors();
     createVisibilityPipelines();
+}
+
+// 作用：光线查询着色器的深度并列/重复命中容差（深度已归一到 [0,1]，覆盖含周期副本的外接球直径 2r）。
+// 缺省 1e-6；外接球很大时收紧到几何距离不超过约 5 mm（下限 1.5e-7，约 2 个 float ulp），
+// 使它不会把厚 1 cm 的地面与其上的物体混为同深度。普通场景（2r < 5 km）结果不变。
+float FacetrtVulkan::rayTieDepth() const
+{
+    std::array<float, 3> extendedMin = m_boundsMin;
+    std::array<float, 3> extendedMax = m_boundsMax;
+    const uint32_t neighborCount = std::min(m_config.periodicNeighborCount, 20U);
+    for (uint32_t tileIndex = 1U; tileIndex <= neighborCount; ++tileIndex) {
+        const auto tile = periodicTileOffset(tileIndex);
+        extendedMin[0] = std::min(extendedMin[0], m_boundsMin[0] + float(tile[0]) * m_config.periodicSizeX);
+        extendedMax[0] = std::max(extendedMax[0], m_boundsMax[0] + float(tile[0]) * m_config.periodicSizeX);
+        extendedMin[2] = std::min(extendedMin[2], m_boundsMin[2] + float(tile[1]) * m_config.periodicSizeZ);
+        extendedMax[2] = std::max(extendedMax[2], m_boundsMax[2] + float(tile[1]) * m_config.periodicSizeZ);
+    }
+    const std::array<float, 3> diagonal{extendedMax[0] - extendedMin[0], extendedMax[1] - extendedMin[1],
+                                        extendedMax[2] - extendedMin[2]};
+    const float depthRange = std::max(std::sqrt(dot3(diagonal, diagonal)) * 1.001f, 2.0e-4f); // 2r
+    return std::clamp(5.0e-3f / depthRange, 1.5e-7f, 1.0e-6f);
 }
 
 // 作用：为一个可见性方向构造正交投影矩阵（列主序，视图×投影合一）。
@@ -834,6 +1024,173 @@ std::array<float, 16> FacetrtVulkan::makeProjection(const Direction& direction) 
     return matrix;
 }
 
+// 模块：光线查询后端的加速结构。
+// BLAS：m_vertices 的非索引三角形列表（步长 sizeof(Vertex)，每面元一个图元，gl_PrimitiveID = 面元号）；
+// 几何不设 opaque（rayQuery 对每个候选三角形各返回一次，从不 Confirm，即枚举沿线全部交点），
+// 带 NO_DUPLICATE_ANY_HIT。TLAS：实例 0 为中心瓦片（单位变换），实例 1..N 为周期副本
+// （平移 tile * periodicSize，与 periodicTileOffset 同序；instanceCustomIndex = 瓦片序号，0 即中心），
+// 关闭背面剔除（双面面元）。地面面元与其他面元一样在 BLAS 中。
+void FacetrtVulkan::createAccelerationStructure()
+{
+    const auto begin = std::chrono::steady_clock::now();
+    const VkMemoryPropertyFlags deviceLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    const VkBufferUsageFlags addressUsage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationProperties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+    VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties2.pNext = &accelerationProperties;
+    vkGetPhysicalDeviceProperties2(m_physicalDevice, &properties2);
+    const VkDeviceSize scratchAlignment =
+        std::max<VkDeviceSize>(accelerationProperties.minAccelerationStructureScratchOffsetAlignment, 1U);
+    const auto bufferAddress = [this](const Buffer& buffer) {
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = buffer.buffer;
+        return vkGetBufferDeviceAddress(m_device, &info);
+    };
+
+    // BLAS
+    VkAccelerationStructureGeometryKHR blasGeometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    blasGeometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    blasGeometry.flags = VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
+    auto& triangles = blasGeometry.geometry.triangles;
+    triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    triangles.vertexData.deviceAddress = bufferAddress(m_vertices);
+    triangles.vertexStride = sizeof(Vertex);
+    triangles.maxVertex = m_facetCount * 3U - 1U;
+    triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+    VkAccelerationStructureBuildGeometryInfoKHR blasInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    blasInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    blasInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    blasInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    blasInfo.geometryCount = 1;
+    blasInfo.pGeometries = &blasGeometry;
+    VkAccelerationStructureBuildSizesInfoKHR blasSizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    m_vkGetAccelerationStructureBuildSizes(m_device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &blasInfo,
+                                           &m_facetCount, &blasSizes);
+    m_blasBuffer = createBuffer(blasSizes.accelerationStructureSize,
+                                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | addressUsage, deviceLocal);
+    VkAccelerationStructureCreateInfoKHR blasCreate{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+    blasCreate.buffer = m_blasBuffer.buffer;
+    blasCreate.size = blasSizes.accelerationStructureSize;
+    blasCreate.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    require(m_vkCreateAccelerationStructure(m_device, &blasCreate, nullptr, &m_blas), "vkCreateAccelerationStructureKHR(BLAS)");
+    VkAccelerationStructureDeviceAddressInfoKHR blasAddressInfo{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+    blasAddressInfo.accelerationStructure = m_blas;
+    const VkDeviceAddress blasAddress = m_vkGetAccelerationStructureDeviceAddress(m_device, &blasAddressInfo);
+
+    // TLAS instances: central tile plus the periodic replicas.
+    const uint32_t instanceCount = std::min(m_config.periodicNeighborCount, 20U) + 1U;
+    std::vector<VkAccelerationStructureInstanceKHR> instances(instanceCount);
+    for (uint32_t index = 0; index < instanceCount; ++index) {
+        const auto tile = periodicTileOffset(index);
+        VkAccelerationStructureInstanceKHR& instance = instances[index];
+        instance = {};
+        instance.transform.matrix[0][0] = 1.0f;
+        instance.transform.matrix[1][1] = 1.0f;
+        instance.transform.matrix[2][2] = 1.0f;
+        instance.transform.matrix[0][3] = static_cast<float>(tile[0]) * m_config.periodicSizeX;
+        instance.transform.matrix[2][3] = static_cast<float>(tile[1]) * m_config.periodicSizeZ;
+        instance.instanceCustomIndex = index;
+        instance.mask = 0xFFU;
+        instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        instance.accelerationStructureReference = blasAddress;
+    }
+    m_tlasInstances = createBuffer(instances.size() * sizeof(VkAccelerationStructureInstanceKHR),
+                                   VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                                       addressUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, deviceLocal);
+    uploadBuffer(m_tlasInstances, instances.data(), instances.size() * sizeof(VkAccelerationStructureInstanceKHR));
+
+    VkAccelerationStructureGeometryKHR tlasGeometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    tlasGeometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlasGeometry.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tlasGeometry.geometry.instances.arrayOfPointers = VK_FALSE;
+    tlasGeometry.geometry.instances.data.deviceAddress = bufferAddress(m_tlasInstances);
+    VkAccelerationStructureBuildGeometryInfoKHR tlasInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    tlasInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tlasInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    tlasInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    tlasInfo.geometryCount = 1;
+    tlasInfo.pGeometries = &tlasGeometry;
+    VkAccelerationStructureBuildSizesInfoKHR tlasSizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    m_vkGetAccelerationStructureBuildSizes(m_device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tlasInfo,
+                                           &instanceCount, &tlasSizes);
+    m_tlasBuffer = createBuffer(tlasSizes.accelerationStructureSize,
+                                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | addressUsage, deviceLocal);
+    VkAccelerationStructureCreateInfoKHR tlasCreate{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+    tlasCreate.buffer = m_tlasBuffer.buffer;
+    tlasCreate.size = tlasSizes.accelerationStructureSize;
+    tlasCreate.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    require(m_vkCreateAccelerationStructure(m_device, &tlasCreate, nullptr, &m_tlas), "vkCreateAccelerationStructureKHR(TLAS)");
+
+    // One scratch buffer serves both builds (a barrier separates them).
+    Buffer scratch = createBuffer(std::max(blasSizes.buildScratchSize, tlasSizes.buildScratchSize) + scratchAlignment,
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | addressUsage, deviceLocal);
+    const VkDeviceAddress scratchBase = bufferAddress(scratch);
+    const VkDeviceAddress scratchAddress = (scratchBase + scratchAlignment - 1U) / scratchAlignment * scratchAlignment;
+    blasInfo.dstAccelerationStructure = m_blas;
+    blasInfo.scratchData.deviceAddress = scratchAddress;
+    tlasInfo.dstAccelerationStructure = m_tlas;
+    tlasInfo.scratchData.deviceAddress = scratchAddress;
+    const VkAccelerationStructureBuildRangeInfoKHR blasRange{m_facetCount, 0, 0, 0};
+    const VkAccelerationStructureBuildRangeInfoKHR tlasRange{instanceCount, 0, 0, 0};
+    const VkAccelerationStructureBuildRangeInfoKHR* blasRanges = &blasRange;
+    const VkAccelerationStructureBuildRangeInfoKHR* tlasRanges = &tlasRange;
+    try {
+        VkCommandBuffer commandBuffer = beginCommands();
+        m_vkCmdBuildAccelerationStructures(commandBuffer, 1, &blasInfo, &blasRanges);
+        VkMemoryBarrier buildBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        buildBarrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        buildBarrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                                     VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                             VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &buildBarrier, 0, nullptr,
+                             0, nullptr);
+        m_vkCmdBuildAccelerationStructures(commandBuffer, 1, &tlasInfo, &tlasRanges);
+        VkMemoryBarrier useBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        useBarrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        useBarrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &useBarrier, 0, nullptr, 0, nullptr);
+        endCommands(commandBuffer);
+    } catch (...) {
+        destroyBuffer(scratch);
+        throw;
+    }
+    destroyBuffer(scratch);
+    m_accelerationBuildMs = static_cast<float>(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+}
+
+// 作用：开发诊断：把最近一次可见性图（已应用下边界）写成原始二进制，布局见头文件。
+void FacetrtVulkan::dumpGraph(const std::string& fileName) const
+{
+    std::ofstream file(fileName, std::ios::binary);
+    if (!file) throw std::runtime_error("Cannot write graph dump: " + fileName);
+    ensureHostCsr();
+    const uint32_t header[2] = {surfaceCount(), m_directedEdgeCount};
+    file.write(reinterpret_cast<const char*>(header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(m_denominatorCpu.data()), m_denominatorCpu.size() * 4U);
+    file.write(reinterpret_cast<const char*>(m_skyCountsCpu.data()), m_skyCountsCpu.size() * 4U);
+    file.write(reinterpret_cast<const char*>(m_groundCountsCpu.data()), m_groundCountsCpu.size() * 4U);
+    file.write(reinterpret_cast<const char*>(m_rowOffsetsCpu.data()), m_rowOffsetsCpu.size() * 4U);
+    file.write(reinterpret_cast<const char*>(m_edgesCpu.data()), m_edgesCpu.size() * sizeof(CsrEdge));
+}
+
+// 作用：释放 BLAS/TLAS 及其缓冲（可重复调用）。
+void FacetrtVulkan::destroyAccelerationStructure()
+{
+    if (m_device == VK_NULL_HANDLE) return;
+    if (m_tlas != VK_NULL_HANDLE && m_vkDestroyAccelerationStructure) m_vkDestroyAccelerationStructure(m_device, m_tlas, nullptr);
+    if (m_blas != VK_NULL_HANDLE && m_vkDestroyAccelerationStructure) m_vkDestroyAccelerationStructure(m_device, m_blas, nullptr);
+    m_tlas = VK_NULL_HANDLE;
+    m_blas = VK_NULL_HANDLE;
+    destroyBuffer(m_tlasBuffer);
+    destroyBuffer(m_blasBuffer);
+    destroyBuffer(m_tlasInstances);
+}
+
 // 模块：可见性阶段的设备端缓冲（全部 device-local 的 storage buffer）。
 // m_fragments：A-buffer，像素数 × maxFragmentsPerPixel × 8 字节；m_pixelCounts：每像素片元数；
 // m_edgeKeys/m_edgeCounts：边哈希表（uint64 键 = 一对相邻 oriented side，计数 uint32）；
@@ -846,8 +1203,18 @@ void FacetrtVulkan::createVisibilityResources()
                                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                              VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const VkMemoryPropertyFlags deviceLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    const uint64_t pixelCount = uint64_t(m_config.rasterWidth) * m_config.rasterHeight;
-    const uint64_t fragmentCount = pixelCount * m_config.maxFragmentsPerPixel;
+    // The ray-query backend needs no A-buffer: keep one-element placeholders (the descriptors
+    // still bind them) so up to hundreds of MB of fragment storage are not allocated.
+    const uint64_t pixelCount = m_wantRaster ? uint64_t(m_config.rasterWidth) * m_config.rasterHeight : 1ULL;
+    // The ray-query visibility path still rasterizes the same image dimensions but
+    // stores no A-buffer.  Each visible-side sample contributes twice (two sides)
+    // and the GPU counters are uint32; reject a configuration that can wrap.
+    constexpr uint64_t kHemisphereDirections = 40ULL;
+    const uint64_t visibilityPixels = uint64_t(m_config.rasterWidth) * m_config.rasterHeight;
+    if (visibilityPixels > 0 && visibilityPixels > (std::numeric_limits<uint32_t>::max() / (2ULL * kHemisphereDirections))) {
+        throw std::runtime_error("Facet visibility raster is too large for 32-bit counters; reduce HISTREAM_FACET_RASTER_SIZE or the periodic neighbor count");
+    }
+    const uint64_t fragmentCount = m_wantRaster ? pixelCount * m_config.maxFragmentsPerPixel : 1ULL;
     if (fragmentCount > std::numeric_limits<VkDeviceSize>::max() / 8ULL) {
         throw std::overflow_error("Visibility A-buffer size overflow");
     }
@@ -868,10 +1235,14 @@ void FacetrtVulkan::createVisibilityResources()
     requireStorageRange(VkDeviceSize(m_hashCapacity) * sizeof(uint32_t),
                         "Visibility edge-count buffer");
 
-    m_vertices = createBuffer(VkDeviceSize(m_facetCount) * 3U * sizeof(Vertex),
-                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                              deviceLocal);
+    // Ray-query backend: the vertex buffer is also the BLAS input (device address) and is read
+    // as a storage buffer for the facet normals.
+    VkBufferUsageFlags vertexUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (m_wantRayQuery) {
+        vertexUsage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                       VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    }
+    m_vertices = createBuffer(VkDeviceSize(m_facetCount) * 3U * sizeof(Vertex), vertexUsage, deviceLocal);
     m_fragments = createBuffer(fragmentCount * 8ULL, deviceStorage, deviceLocal);
     m_pixelCounts = createBuffer(pixelCount * sizeof(uint32_t), deviceStorage, deviceLocal);
     m_edgeKeys = createBuffer(VkDeviceSize(m_hashCapacity) * sizeof(uint64_t),
@@ -898,12 +1269,17 @@ void FacetrtVulkan::createVisibilityResources()
 //     directTotal/directVisible。绑定编号必须与 visibility*.comp / direct_resolve.comp 一致。
 void FacetrtVulkan::createVisibilityDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
-    for (uint32_t index = 0; index < bindings.size(); ++index) {
+    // Bindings 0-7: storage buffers. Ray-query backend adds 8 = top-level acceleration structure
+    // and 9 = vertex buffer (facet normals), both compute-only.
+    const uint32_t bindingCount = m_wantRayQuery ? 10U : 8U;
+    std::vector<VkDescriptorSetLayoutBinding> bindings(bindingCount);
+    for (uint32_t index = 0; index < bindingCount; ++index) {
         bindings[index].binding = index;
-        bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[index].descriptorType = index == 8U ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+                                                     : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[index].descriptorCount = 1;
-        bindings[index].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[index].stageFlags = index >= 8U ? VK_SHADER_STAGE_COMPUTE_BIT
+                                                 : (VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
     }
     VkDescriptorSetLayoutCreateInfo layoutInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -913,12 +1289,13 @@ void FacetrtVulkan::createVisibilityDescriptors()
                                         &m_visibilitySetLayout),
             "vkCreateDescriptorSetLayout(visibility)");
 
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                  static_cast<uint32_t>(bindings.size() * 2U)};
+    std::vector<VkDescriptorPoolSize> poolSizes{
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (m_wantRayQuery ? 9U : 8U) * 2U}};
+    if (m_wantRayQuery) poolSizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2U});
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 2;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
     require(vkCreateDescriptorPool(m_device, &poolInfo, nullptr,
                                    &m_visibilityDescriptorPool),
             "vkCreateDescriptorPool(visibility)");
@@ -969,6 +1346,32 @@ void FacetrtVulkan::createVisibilityDescriptors()
     }
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(directWrites.size()),
                            directWrites.data(), 0, nullptr);
+
+    if (m_wantRayQuery) {
+        // Bindings 8 (TLAS) and 9 (vertex buffer) of both sets.
+        VkWriteDescriptorSetAccelerationStructureKHR accelerationInfo{
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+        accelerationInfo.accelerationStructureCount = 1;
+        accelerationInfo.pAccelerationStructures = &m_tlas;
+        const VkDescriptorBufferInfo vertexInfo{m_vertices.buffer, 0, m_vertices.size};
+        std::array<VkWriteDescriptorSet, 4> extra{};
+        for (uint32_t set = 0; set < 2U; ++set) {
+            const VkDescriptorSet target = set == 0U ? m_visibilityDescriptorSet : m_directDescriptorSet;
+            extra[set * 2U] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            extra[set * 2U].pNext = &accelerationInfo;
+            extra[set * 2U].dstSet = target;
+            extra[set * 2U].dstBinding = 8;
+            extra[set * 2U].descriptorCount = 1;
+            extra[set * 2U].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            extra[set * 2U + 1U] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            extra[set * 2U + 1U].dstSet = target;
+            extra[set * 2U + 1U].dstBinding = 9;
+            extra[set * 2U + 1U].descriptorCount = 1;
+            extra[set * 2U + 1U].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            extra[set * 2U + 1U].pBufferInfo = &vertexInfo;
+        }
+        vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(extra.size()), extra.data(), 0, nullptr);
+    }
 }
 
 // 模块：可见性管线。1) 光栅管线（visibility.vert/frag）：无颜色/深度附件，不剔除背面，
@@ -990,6 +1393,25 @@ void FacetrtVulkan::createVisibilityPipelines()
     require(vkCreatePipelineLayout(m_device, &layoutInfo, nullptr,
                                    &m_visibilityPipelineLayout),
             "vkCreatePipelineLayout(visibility)");
+
+    // Ray-query backend: two compute pipelines on the same layout (bindings 8/9 extend the set).
+    if (m_wantRayQuery) {
+        const auto createCompute = [&](const char* file, VkPipeline& pipeline) {
+            VkShaderModule module = loadShader(file);
+            const ShaderModuleGuard guard{m_device, module};
+            VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            info.stage.module = module;
+            info.stage.pName = "main";
+            info.layout = m_visibilityPipelineLayout;
+            require(vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline),
+                    "vkCreateComputePipelines(ray query)");
+        };
+        createCompute("visibility_rayquery.comp.spv", m_rqVisibilityPipeline);
+        createCompute("direct_rayquery.comp.spv", m_rqDirectPipeline);
+    }
+    if (!m_wantRaster) return;
 
     // 渲染通道没有任何附件：光栅阶段只为产生片元，结果通过 storage buffer 输出。
     VkSubpassDescription subpass{};
@@ -1105,15 +1527,18 @@ void FacetrtVulkan::createVisibilityPipelines()
 // CSR 行偏移与边（CsrEdge{neighbor, count}）、逐 side 的光学参数 / 两份 ping-pong 辐射度 /
 // 入射辐照度，以及等效地面的 side 索引、权重和均值（4 个 float，初始为 0）。
 // 无边或无地面时分配最小占位缓冲，避免零长度。
-void FacetrtVulkan::createSolveResources(uint32_t directedEdgeCount)
+void FacetrtVulkan::createSolveResources(uint32_t directedEdgeCount, bool csrOnDevice)
 {
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const VkMemoryPropertyFlags memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    m_rowOffsets = createBuffer(m_rowOffsetsCpu.size() * sizeof(uint32_t), usage, memory);
-    m_edges = createBuffer(std::max<size_t>(directedEdgeCount, 1U) * sizeof(CsrEdge),
-                           usage, memory);
+    // GPU graph build: m_rowOffsets / m_edges already hold the CSR (see buildCsrOnGpu).
+    if (!csrOnDevice) {
+        m_rowOffsets = createBuffer(m_rowOffsetsCpu.size() * sizeof(uint32_t), usage, memory);
+        m_edges = createBuffer(std::max<size_t>(directedEdgeCount, 1U) * sizeof(CsrEdge),
+                               usage, memory);
+    }
     m_optics = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(SurfaceOptics), usage, memory);
     m_radiosityA = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(float), usage, memory);
     m_radiosityB = createBuffer(VkDeviceSize(surfaceCount()) * sizeof(float), usage, memory);
@@ -1130,6 +1555,7 @@ void FacetrtVulkan::createSolveResources(uint32_t directedEdgeCount)
     const std::array<float, 4> noGround{};
     uploadBuffer(m_groundMean, noGround.data(), sizeof(noGround));
 
+    if (csrOnDevice) return;
     uploadBuffer(m_rowOffsets, m_rowOffsetsCpu.data(),
                  m_rowOffsetsCpu.size() * sizeof(uint32_t));
     if (!m_edgesCpu.empty()) {
@@ -1275,31 +1701,32 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraph(
             if (!growRasterLayers()) throw;
             const std::vector<Vertex> geometry = m_geometry;
             setGeometry(geometry);
+        } catch (const RayQueryOverflow&) {
+            // More than 256 hits on one line: the shader cannot hold them. Rebuild with the
+            // raster backend (A-buffer resources), which can grow its layer count.
+            fallBackToRaster("ray-query hit list overflow");
+            const std::vector<Vertex> geometry = m_geometry;
+            destroyVisibilityResources();
+            setGeometry(geometry);
         }
     }
 }
 
-// 作用：构建一次可见性图（不含溢出重试，重试见 buildVisibilityGraph）。
-// 输入：一组等立体角权重的方向（指向虚拟相机）；输出：GraphDiagnostics，
-// 并把 CSR 边表、逐 side 分母/天空/地面计数和等效地面保存在成员中，同时建好求解资源。
-// 步骤：1) 准备 push constant；2) 清零计数与哈希表；3) 逐方向光栅 + 解析；
-// 4) 回读哈希表/计数并检查溢出；5) 取出无向边；6) 展开为有向边并建 CSR；
-// 7) 应用下边界并回传计数；8) 计算闭合误差诊断；9) 创建求解资源/描述符/管线。
-// 溢出时抛 RasterLayerOverflow 或 EdgeHashOverflow（片元溢出优先）。
-GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
-    const std::vector<Direction>& directions)
+// 作用：对全部方向跑一遍可见性（光栅或光线查询），回读计数并取出无向边（步骤 1–5）。
+// 光栅：每方向 A-buffer 光栅 + visibility_resolve；光线查询：每方向一次 visibility_rayquery。
+// 两者写入同样的缓冲（边哈希、分母、天空、地面计数），溢出时抛
+// RasterLayerOverflow / RayQueryOverflow / EdgeHashOverflow（片元溢出优先）。
+FacetrtVulkan::RawGraph FacetrtVulkan::buildRawGraph(
+    const std::vector<Direction>& directions, bool rayQuery, bool extractEdges)
 {
-    if (m_rasterPipeline == VK_NULL_HANDLE || m_facetCount == 0U) {
+    if (rayQuery ? (m_rqVisibilityPipeline == VK_NULL_HANDLE) : (m_rasterPipeline == VK_NULL_HANDLE)) {
         throw std::logic_error("setGeometry() must be called before buildVisibilityGraph()");
     }
-    if (directions.empty()) {
-        throw std::invalid_argument("At least one visibility direction is required");
-    }
-    destroySolveResources();
 
     // 步骤 1：push constant：光栅尺寸、每像素最大层数、哈希容量，以及周期域尺寸与邻接瓦片数。
     // viewProjection/viewDirection 在每个方向的循环里填写。
     VisibilityPush push{};
+    const auto passStart = std::chrono::steady_clock::now();
     push.raster[0] = m_config.rasterWidth;
     push.raster[1] = m_config.rasterHeight;
     push.raster[2] = m_config.maxFragmentsPerPixel;
@@ -1307,6 +1734,7 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     push.periodic[0] = m_config.periodicSizeX;
     push.periodic[1] = m_config.periodicSizeZ;
     push.periodic[2] = static_cast<float>(m_config.periodicNeighborCount);
+    push.periodic[3] = rayTieDepth();
 
     VkCommandBuffer commandBuffer = beginCommands();
     // 步骤 2：清零累积缓冲；边键填 0xFFFFFFFF（即 kEmptyEdgeKey，表示空槽），
@@ -1354,6 +1782,26 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
         push.viewDirection[1] = direction[1];
         push.viewDirection[2] = direction[2];
         push.viewDirection[3] = 0.0f;
+
+        if (rayQuery) {
+            // 光线查询：一次计算调度替代光栅 + 解析；无 A-buffer。
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rqVisibilityPipeline);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    m_visibilityPipelineLayout, 0, 1, &m_visibilityDescriptorSet, 0, nullptr);
+            vkCmdPushConstants(commandBuffer, m_visibilityPipelineLayout, kVisibilityPushStages, 0,
+                               sizeof(push), &push);
+            const uint64_t rayCount = uint64_t(m_config.rasterWidth) * m_config.rasterHeight;
+            vkCmdDispatch(commandBuffer, static_cast<uint32_t>((rayCount + 63ULL) / 64ULL), 1, 1);
+            VkMemoryBarrier rayToNext{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            rayToNext.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            rayToNext.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                      VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                 1, &rayToNext, 0, nullptr, 0, nullptr);
+            endCommands(commandBuffer);
+            continue;
+        }
 
         vkCmdFillBuffer(commandBuffer, m_pixelCounts.buffer, 0, m_pixelCounts.size, 0U);
         // 每个方向前清零每像素片元计数 pixelCounts。
@@ -1413,39 +1861,42 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
 
     // 步骤 4：回读哈希表、各 side 计数与统计量。statistics[0] = A-buffer 溢出，
     // [1] = 哈希表溢出，[2] = 溢出时观察到的最深片元列表长度（用于下次扩层）。
-    // DEFERRED[中] 内存: 整张边哈希表（容量可达 maxStorageBufferRange/8，即最多 ~512M 项 → 4 GiB 键 + 2 GiB 计数）一次性回读到主机，另外 downloadBuffer 还要分配同样大小的 host-visible staging，容易耗尽内存；建议：在 GPU 上先压缩非空槽（prefix-sum/compaction）再回读，或分块回读。
-    std::vector<uint64_t> edgeKeys(m_hashCapacity);
-    std::vector<uint32_t> edgeCounts(m_hashCapacity);
+    m_lastPassMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - passStart).count();
+    const auto readbackStart = std::chrono::steady_clock::now();
     std::array<uint32_t, 4> statistics{};
-    m_denominatorCpu.resize(surfaceCount());
-    m_skyCountsCpu.resize(surfaceCount());
-    downloadBuffer(m_edgeKeys, edgeKeys.data(), edgeKeys.size() * sizeof(uint64_t));
-    downloadBuffer(m_edgeCounts, edgeCounts.data(), edgeCounts.size() * sizeof(uint32_t));
-    downloadBuffer(m_denominator, m_denominatorCpu.data(),
-                   m_denominatorCpu.size() * sizeof(uint32_t));
-    downloadBuffer(m_skyCounts, m_skyCountsCpu.data(),
-                   m_skyCountsCpu.size() * sizeof(uint32_t));
-    m_groundCountsCpu.resize(surfaceCount());
-    downloadBuffer(m_groundCounts, m_groundCountsCpu.data(),
-                   m_groundCountsCpu.size() * sizeof(uint32_t));
+    RawGraph raw;
+    raw.denominators.resize(surfaceCount());
+    raw.skyCounts.resize(surfaceCount());
+    raw.groundCounts.resize(surfaceCount());
+    downloadBuffer(m_denominator, raw.denominators.data(), raw.denominators.size() * sizeof(uint32_t));
+    downloadBuffer(m_skyCounts, raw.skyCounts.data(), raw.skyCounts.size() * sizeof(uint32_t));
+    downloadBuffer(m_groundCounts, raw.groundCounts.data(), raw.groundCounts.size() * sizeof(uint32_t));
     downloadBuffer(m_visibilityStats, statistics.data(), sizeof(statistics));
 
-    GraphDiagnostics diagnostics{};
-    diagnostics.facetCount = m_facetCount;
-    diagnostics.surfaceCount = surfaceCount();
-    diagnostics.fragmentOverflow = statistics[0];
-    diagnostics.hashOverflow = statistics[1];
-    if (diagnostics.fragmentOverflow != 0U) {
+    if (statistics[0] != 0U) {
+        if (rayQuery) throw RayQueryOverflow();
         m_requiredRasterLayers = std::max(m_requiredRasterLayers, statistics[2]);
         throw RasterLayerOverflow();
     }
-    if (diagnostics.hashOverflow != 0U) {
+    if (statistics[1] != 0U) {
         throw EdgeHashOverflow();
     }
 
-    // 步骤 5：收集非空槽为无向边：键高 32 位为 sideA，低 32 位为 sideB，值为射线计数；
-    // side 下标越界说明 GPU 结果损坏，直接报错。
-    std::vector<std::pair<uint64_t, uint32_t>> undirectedEdges;
+    // 步骤 5：收集非空槽为无向边（CPU 路径；GPU 图构建时由 buildCsrOnGpu 直接处理哈希表）。
+    if (extractEdges) readHashEdges(raw.edges);
+    m_lastReadbackMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readbackStart).count();
+    return raw;
+}
+
+// 作用：回读整张边哈希表并收集非空槽为无向边：键高 32 位为 sideA，低 32 位为 sideB，值为射线计数；
+// side 下标越界说明 GPU 结果损坏，直接报错。
+void FacetrtVulkan::readHashEdges(std::vector<std::pair<uint64_t, uint32_t>>& undirectedEdges) const
+{
+    std::vector<uint64_t> edgeKeys(m_hashCapacity);
+    std::vector<uint32_t> edgeCounts(m_hashCapacity);
+    downloadBuffer(m_edgeKeys, edgeKeys.data(), edgeKeys.size() * sizeof(uint64_t));
+    downloadBuffer(m_edgeCounts, edgeCounts.data(), edgeCounts.size() * sizeof(uint32_t));
+    undirectedEdges.clear();
     undirectedEdges.reserve(std::min<uint32_t>(m_hashCapacity / 16U, 1U << 20U));
     for (uint32_t slot = 0; slot < m_hashCapacity; ++slot) {
         if (edgeKeys[slot] == kEmptyEdgeKey || edgeCounts[slot] == 0U) {
@@ -1458,32 +1909,475 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
         }
         undirectedEdges.emplace_back(edgeKeys[slot], edgeCounts[slot]);
     }
+}
 
-    // 步骤 6：把无向边展开为双向的有向边并建 CSR：先统计每行度数并前缀和得到行偏移，
-    // 再按键排序后填充，使浮点累加顺序可复现。
-    m_rowOffsetsCpu.assign(surfaceCount() + 1U, 0U);
+// 作用：CPU 构造 CSR：把无向边展开为双向的有向边：先统计每行度数并前缀和得到行偏移，
+// 再按键排序后填充，使浮点累加顺序可复现（每行邻居升序）。
+void FacetrtVulkan::buildHostCsr(std::vector<std::pair<uint64_t, uint32_t>> undirectedEdges,
+                                 std::vector<uint32_t>& rowOffsets, std::vector<CsrEdge>& csr) const
+{
+    rowOffsets.assign(surfaceCount() + 1U, 0U);
     for (const auto& entry : undirectedEdges) {
         const uint32_t sideA = static_cast<uint32_t>(entry.first >> 32U);
         const uint32_t sideB = static_cast<uint32_t>(entry.first);
-        ++m_rowOffsetsCpu[sideA + 1U];
-        ++m_rowOffsetsCpu[sideB + 1U];
+        ++rowOffsets[sideA + 1U];
+        ++rowOffsets[sideB + 1U];
     }
-    std::partial_sum(m_rowOffsetsCpu.begin(), m_rowOffsetsCpu.end(),
-                     m_rowOffsetsCpu.begin());
-    m_edgesCpu.assign(m_rowOffsetsCpu.back(), {});
+    std::partial_sum(rowOffsets.begin(), rowOffsets.end(), rowOffsets.begin());
+    csr.assign(rowOffsets.back(), {});
     // Hash-slot placement depends on concurrent insertion; canonical edge order
     // makes CSR floating-point accumulation reproducible between paired runs.
-    std::sort(undirectedEdges.begin(),undirectedEdges.end(),
-        [](const auto& a,const auto& b){return a.first<b.first;});
-    std::vector<uint32_t> cursor = m_rowOffsetsCpu;
+    std::sort(undirectedEdges.begin(), undirectedEdges.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<uint32_t> cursor = rowOffsets;
     for (const auto& entry : undirectedEdges) {
         const uint32_t sideA = static_cast<uint32_t>(entry.first >> 32U);
         const uint32_t sideB = static_cast<uint32_t>(entry.first);
         const uint32_t count = entry.second;
-        m_edgesCpu[cursor[sideA]++] = {sideB, count};
-        m_edgesCpu[cursor[sideB]++] = {sideA, count};
+        csr[cursor[sideA]++] = {sideB, count};
+        csr[cursor[sideB]++] = {sideA, count};
     }
-    diagnostics.directedEdgeCount = static_cast<uint32_t>(m_edgesCpu.size());
+}
+
+// 作用：GPU 图构建：用 graph_build.comp 把边哈希表直接压缩成设备端 CSR
+// （m_rowOffsets + m_edges{neighbor,count}），结果与 buildHostCsr 逐位相同：
+// 非空槽 → 两个有向条目 → 度数直方图 + 前缀和得行偏移 → 散布 → 行内按邻居名次排序（O(d²)，
+// 每个条目数出同行更小的邻居数）。只回读 3 个计数字段与每行边计数和（用于闭合误差）。
+// 失败（缺少着色器、超出 maxStorageBufferRange / 显存、行内排序代价过大等）时记录日志、释放所有
+// 部分资源并返回 false，调用者回退到 CPU 路径（哈希表保持不变）。
+bool FacetrtVulkan::buildCsrOnGpu(uint32_t& directedEdgeCount, std::vector<uint64_t>& rowSums)
+{
+    const auto begin = std::chrono::steady_clock::now();
+    const auto fail = [](const std::string& reason) {
+        std::cerr << "facetrt: GPU graph build unavailable (" << reason << "); using the CPU graph build" << std::endl;
+        return false;
+    };
+    // 1) 管线（首次使用时创建）。
+    if (m_graphPipeline == VK_NULL_HANDLE) {
+        if (!std::ifstream(m_shaderDirectory + "/graph_build.comp.spv").good())
+            return fail("graph_build.comp.spv is missing");
+        try {
+            std::array<VkDescriptorSetLayoutBinding, 12> bindings{};
+            for (uint32_t index = 0; index < bindings.size(); ++index) {
+                bindings[index].binding = index;
+                bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                bindings[index].descriptorCount = 1;
+                bindings[index].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            }
+            VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+            layoutInfo.pBindings = bindings.data();
+            require(vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_graphSetLayout),
+                    "vkCreateDescriptorSetLayout(graph build)");
+            const VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8U * sizeof(uint32_t)};
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            pipelineLayoutInfo.setLayoutCount = 1;
+            pipelineLayoutInfo.pSetLayouts = &m_graphSetLayout;
+            pipelineLayoutInfo.pushConstantRangeCount = 1;
+            pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+            require(vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_graphPipelineLayout),
+                    "vkCreatePipelineLayout(graph build)");
+            VkShaderModule module = loadShader("graph_build.comp.spv");
+            const ShaderModuleGuard guard{m_device, module};
+            VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            info.stage.module = module;
+            info.stage.pName = "main";
+            info.layout = m_graphPipelineLayout;
+            require(vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &info, nullptr, &m_graphPipeline),
+                    "vkCreateComputePipelines(graph build)");
+        } catch (const std::exception& error) {
+            destroyGraphBuild();
+            return fail(error.what());
+        }
+    }
+
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
+    const uint64_t maxRange = properties.limits.maxStorageBufferRange;
+    const uint32_t sides = surfaceCount();
+    const uint64_t scanCount = uint64_t(sides) + 1U;
+    const uint64_t scanBlocks = (scanCount + 1023U) / 1024U;
+    if (scanBlocks > 65535U) return fail("too many sides for the block scan");
+    if ((scanCount * 4U > maxRange) || (uint64_t(sides) * 8U > maxRange))
+        return fail("per-side arrays exceed maxStorageBufferRange");
+
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const VkMemoryPropertyFlags deviceLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    struct Control
+    {
+        uint32_t occupied, errorFlag, maxDegree, entryCursor;
+        uint64_t sumSquares;
+    };
+    struct GraphPush
+    {
+        uint32_t phase, hashCapacity, sides, entries, scanCount, scanBlocks, pad0, pad1;
+    };
+    Buffer control, entRow, entNbr, entCnt, cursor, tmp, blockSums, rowSumsBuffer;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    const auto release = [&](bool dropCsr) {
+        if (pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(m_device, pool, nullptr);
+        pool = VK_NULL_HANDLE;
+        for (Buffer* buffer : {&control, &entRow, &entNbr, &entCnt, &cursor, &tmp, &blockSums, &rowSumsBuffer})
+            destroyBuffer(*buffer);
+        if (dropCsr) {
+            destroyBuffer(m_rowOffsets);
+            destroyBuffer(m_edges);
+        }
+    };
+    try {
+        control = createBuffer(sizeof(Control), usage, deviceLocal);
+        m_rowOffsets = createBuffer(scanCount * sizeof(uint32_t), usage, deviceLocal);
+        cursor = createBuffer(uint64_t(sides) * sizeof(uint32_t), usage, deviceLocal);
+        rowSumsBuffer = createBuffer(uint64_t(sides) * sizeof(uint64_t), usage, deviceLocal);
+        blockSums = createBuffer(scanBlocks * sizeof(uint32_t), usage, deviceLocal);
+
+        VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12U};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        require(vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool(graph build)");
+        VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocation.descriptorPool = pool;
+        allocation.descriptorSetCount = 1;
+        allocation.pSetLayouts = &m_graphSetLayout;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        require(vkAllocateDescriptorSets(m_device, &allocation, &set), "vkAllocateDescriptorSets(graph build)");
+        const auto writeBindings = [&](const std::vector<std::pair<uint32_t, const Buffer*>>& items) {
+            std::vector<VkDescriptorBufferInfo> infos(items.size());
+            std::vector<VkWriteDescriptorSet> writes(items.size());
+            for (size_t i = 0; i < items.size(); ++i) {
+                infos[i] = {items[i].second->buffer, 0, items[i].second->size};
+                writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                writes[i].dstSet = set;
+                writes[i].dstBinding = items[i].first;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[i].pBufferInfo = &infos[i];
+            }
+            vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        };
+        writeBindings({{0, &m_edgeKeys}, {1, &m_edgeCounts}, {5, &m_rowOffsets}, {6, &cursor}, {9, &blockSums},
+                       {10, &control}, {11, &rowSumsBuffer}});
+
+        VkMemoryBarrier toShader{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        toShader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        toShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        VkMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        const auto barrier = [&](VkCommandBuffer cmd, const VkMemoryBarrier& b, VkPipelineStageFlags dst) {
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dst, 0, 1,
+                                 &b, 0, nullptr, 0, nullptr);
+        };
+        const auto bindAll = [&](VkCommandBuffer cmd) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_graphPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_graphPipelineLayout, 0, 1, &set, 0, nullptr);
+        };
+        uint32_t entryCount = 0;
+        const auto run = [&](VkCommandBuffer cmd, uint32_t phase, uint64_t items, bool exactGroups) {
+            const GraphPush push{phase, m_hashCapacity, sides, entryCount, static_cast<uint32_t>(scanCount),
+                                 static_cast<uint32_t>(scanBlocks), 0U, 0U};
+            vkCmdPushConstants(cmd, m_graphPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            const uint64_t groups = exactGroups ? items : std::min<uint64_t>(65535U, std::max<uint64_t>(1U, (items + 255U) / 256U));
+            vkCmdDispatch(cmd, static_cast<uint32_t>(groups), 1, 1);
+            barrier(cmd, toShader, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        };
+
+        // 2) 统计非空槽。
+        VkCommandBuffer cmd = beginCommands();
+        vkCmdFillBuffer(cmd, control.buffer, 0, control.size, 0U);
+        vkCmdFillBuffer(cmd, m_rowOffsets.buffer, 0, m_rowOffsets.size, 0U);
+        vkCmdFillBuffer(cmd, cursor.buffer, 0, cursor.size, 0U);
+        barrier(cmd, toShader, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        bindAll(cmd);
+        run(cmd, 0U, m_hashCapacity, false);
+        barrier(cmd, toTransfer, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        endCommands(cmd);
+        Control state{};
+        downloadBuffer(control, &state, sizeof(state));
+        if (state.errorFlag != 0U) {
+            release(true);
+            return fail("hash table contains an invalid surface index");
+        }
+        const uint64_t entries = uint64_t(state.occupied) * 2U;
+        if (entries > std::numeric_limits<uint32_t>::max() / 2U) {
+            release(true);
+            return fail("too many directed edges");
+        }
+        entryCount = static_cast<uint32_t>(entries);
+        const uint64_t entrySize = std::max<uint64_t>(entries, 1U);
+        if (entrySize * 8U > maxRange) {
+            release(true);
+            return fail("edge table exceeds maxStorageBufferRange");
+        }
+
+        // 3) 条目缓冲、压缩、前缀和、度数统计。
+        const auto stageTwo = std::chrono::steady_clock::now();
+        m_graphStageMs[0] = std::chrono::duration<double, std::milli>(stageTwo - begin).count();
+        entRow = createBuffer(entrySize * sizeof(uint32_t), usage, deviceLocal);
+        entNbr = createBuffer(entrySize * sizeof(uint32_t), usage, deviceLocal);
+        entCnt = createBuffer(entrySize * sizeof(uint32_t), usage, deviceLocal);
+        tmp = createBuffer(entrySize * sizeof(uint64_t), usage, deviceLocal);
+        m_edges = createBuffer(entrySize * sizeof(CsrEdge), usage, deviceLocal);
+        writeBindings({{2, &entRow}, {3, &entNbr}, {4, &entCnt}, {7, &tmp}, {8, &m_edges}});
+        cmd = beginCommands();
+        bindAll(cmd);
+        run(cmd, 1U, m_hashCapacity, false);
+        run(cmd, 6U, scanBlocks, true);
+        run(cmd, 7U, 1U, true);
+        run(cmd, 8U, scanBlocks, true);
+        run(cmd, 5U, sides, false);
+        barrier(cmd, toTransfer, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        endCommands(cmd);
+        downloadBuffer(control, &state, sizeof(state));
+        if (state.entryCursor != entryCount) {
+            release(true);
+            return fail("entry count mismatch");
+        }
+        // 行内排序为 O(d²)：度数平方和超限（极端的超大行）时回退。
+        constexpr uint64_t kMaximumSortWork = 200000000000ULL;
+        if (state.sumSquares > kMaximumSortWork) {
+            release(true);
+            return fail("row degrees too large for the in-row rank sort (max degree " +
+                        std::to_string(state.maxDegree) + ")");
+        }
+
+        // 4) 散布、行内排序、行边计数和。
+        const auto stageThree = std::chrono::steady_clock::now();
+        m_graphStageMs[1] = std::chrono::duration<double, std::milli>(stageThree - stageTwo).count();
+        cmd = beginCommands();
+        bindAll(cmd);
+        run(cmd, 2U, entries, false);
+        run(cmd, 3U, entries, false);
+        run(cmd, 4U, sides, false);
+        barrier(cmd, toTransfer, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        endCommands(cmd);
+        rowSums.assign(sides, 0U);
+        downloadBuffer(rowSumsBuffer, rowSums.data(), rowSums.size() * sizeof(uint64_t));
+        m_graphStageMs[2] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageThree).count();
+        directedEdgeCount = entryCount;
+    } catch (const std::exception& error) {
+        release(true);
+        return fail(error.what());
+    }
+    release(false);
+    m_graphBuildMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    return true;
+}
+
+// 作用：GPU 构造的 CSR 回读到 m_rowOffsetsCpu / m_edgesCpu（CPU 版入射辐照度、诊断转储需要）。
+void FacetrtVulkan::ensureHostCsr() const
+{
+    if (!m_csrOnDevice || !m_rowOffsetsCpu.empty()) return;
+    m_rowOffsetsCpu.resize(size_t(surfaceCount()) + 1U);
+    downloadBuffer(m_rowOffsets, m_rowOffsetsCpu.data(), m_rowOffsetsCpu.size() * sizeof(uint32_t));
+    m_edgesCpu.resize(m_directedEdgeCount);
+    if (m_directedEdgeCount != 0U)
+        downloadBuffer(m_edges, m_edgesCpu.data(), m_edgesCpu.size() * sizeof(CsrEdge));
+}
+
+// 作用：释放 GPU 图构建的管线与布局（可重复调用）。
+void FacetrtVulkan::destroyGraphBuild()
+{
+    if (m_device == VK_NULL_HANDLE) return;
+    if (m_graphPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_graphPipeline, nullptr);
+    if (m_graphPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_device, m_graphPipelineLayout, nullptr);
+    if (m_graphSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(m_device, m_graphSetLayout, nullptr);
+    m_graphPipeline = VK_NULL_HANDLE;
+    m_graphPipelineLayout = VK_NULL_HANDLE;
+    m_graphSetLayout = VK_NULL_HANDLE;
+}
+
+// 作用：构建一次可见性图（不含溢出重试，重试见 buildVisibilityGraph）。
+// 输入：一组等立体角权重的方向（指向虚拟相机）；输出：GraphDiagnostics，
+// 并把 CSR 边表、逐 side 分母/天空/地面计数和等效地面保存在成员中，同时建好求解资源。
+// 步骤：1–5) buildRawGraph（光栅或光线查询）；HISTREAM_FACET_VALIDATE_VISIBILITY=1 时再用另一
+// 后端算一遍并比较；6) 展开为有向边并建 CSR；7) 应用下边界并回传计数；
+// 8) 计算闭合误差诊断；9) 创建求解资源/描述符/管线。
+GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
+    const std::vector<Direction>& directions)
+{
+    if ((m_primaryRayQuery ? m_rqVisibilityPipeline : m_rasterPipeline) == VK_NULL_HANDLE || m_facetCount == 0U) {
+        throw std::logic_error("setGeometry() must be called before buildVisibilityGraph()");
+    }
+    if (directions.empty()) {
+        throw std::invalid_argument("At least one visibility direction is required");
+    }
+    destroySolveResources();
+
+    const auto passBegin = std::chrono::steady_clock::now();
+    const bool compareBackends = m_validateVisibility && m_wantRaster && m_wantRayQuery;
+    // The CPU edge list is only needed for the CPU graph build and for the validation switches.
+    const bool wantHostEdges = !m_graphBuildGpu || m_validateGraph || compareBackends;
+    RawGraph raw = buildRawGraph(directions, m_primaryRayQuery, wantHostEdges);
+    const double passMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - passBegin).count();
+    const double primaryPassMs = m_lastPassMs;
+    const double primaryReadbackMs = m_lastReadbackMs;
+
+    GraphDiagnostics diagnostics{};
+    diagnostics.facetCount = m_facetCount;
+    diagnostics.surfaceCount = surfaceCount();
+    diagnostics.visibilityBackend = visibilityBackendName();
+    diagnostics.accelerationBuildMs = m_primaryRayQuery ? m_accelerationBuildMs : 0.0f;
+    if (!m_backendLogged) {
+        std::cout << "facetrt: visibility backend " << diagnostics.visibilityBackend;
+        if (m_primaryRayQuery)
+            std::cout << " (VK_KHR_ray_query, " << std::min(m_config.periodicNeighborCount, 20U) + 1U
+                      << " TLAS instances, acceleration structure "
+                      << double(m_blasBuffer.size + m_tlasBuffer.size) / (1024.0 * 1024.0) << " MiB built in "
+                      << m_accelerationBuildMs << " ms)";
+        std::cout << ", " << directions.size() << " directions " << m_config.rasterWidth << "x"
+                  << m_config.rasterHeight << " in " << passMs << " ms (passes " << m_lastPassMs
+                  << " ms, " << (m_graphBuildGpu ? "per-side count readback" : "hash readback + edge extraction") << " "
+                  << m_lastReadbackMs << " ms)" << std::endl;
+        m_backendLogged = true;
+    }
+
+    // GPU 图构建：直接把哈希表压缩成设备端 CSR（须在第二个后端的自检覆盖哈希表之前）。
+    // 不可用或失败时回退 CPU 路径（哈希表此时仍完好）。
+    bool csrOnDevice = false;
+    uint32_t deviceEdgeCount = 0;
+    std::vector<uint64_t> deviceRowSums;
+    double graphBuildMs = 0.0;
+    if (m_graphBuildGpu) {
+        csrOnDevice = buildCsrOnGpu(deviceEdgeCount, deviceRowSums);
+        graphBuildMs = m_graphBuildMs;
+        if (!csrOnDevice && !wantHostEdges) {
+            const auto readBegin = std::chrono::steady_clock::now();
+            readHashEdges(raw.edges);
+            m_lastReadbackMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readBegin).count();
+        }
+    }
+    std::vector<uint32_t> hostRowOffsets;
+    std::vector<CsrEdge> hostCsr;
+    if (m_validateGraph && csrOnDevice) {
+        // 自检：CPU 构造一份 CSR，与设备端 CSR 逐位比较（行偏移、边表、行边计数和）。
+        buildHostCsr(raw.edges, hostRowOffsets, hostCsr);
+        std::vector<uint32_t> gpuOffsets(surfaceCount() + 1U);
+        std::vector<CsrEdge> gpuCsr(deviceEdgeCount);
+        downloadBuffer(m_rowOffsets, gpuOffsets.data(), gpuOffsets.size() * sizeof(uint32_t));
+        if (deviceEdgeCount != 0U) downloadBuffer(m_edges, gpuCsr.data(), gpuCsr.size() * sizeof(CsrEdge));
+        bool identical = gpuOffsets == hostRowOffsets && deviceEdgeCount == hostCsr.size();
+        uint64_t firstBad = 0;
+        if (identical) {
+            for (size_t i = 0; i < hostCsr.size(); ++i)
+                if (gpuCsr[i].neighbor != hostCsr[i].neighbor || gpuCsr[i].count != hostCsr[i].count) {
+                    identical = false;
+                    firstBad = i;
+                    break;
+                }
+        }
+        if (identical) {
+            for (uint32_t side = 0; side < surfaceCount() && identical; ++side) {
+                uint64_t sum = 0;
+                for (uint32_t k = hostRowOffsets[side]; k < hostRowOffsets[side + 1U]; ++k) sum += hostCsr[k].count;
+                if (sum != deviceRowSums[side]) { identical = false; firstBad = side; }
+            }
+        }
+        diagnostics.graphValidated = true;
+        diagnostics.graphIdentical = identical;
+        std::cout << "facetrt: graph validation (GPU CSR vs CPU CSR): "
+                  << (identical ? "IDENTICAL" : "MISMATCH") << " (" << surfaceCount() << " sides, " << deviceEdgeCount
+                  << " directed edges" << (identical ? "" : ", first difference at index " + std::to_string(firstBad))
+                  << ")" << std::endl;
+        if (!identical) {
+            // Keep the CPU graph.
+            destroyBuffer(m_rowOffsets);
+            destroyBuffer(m_edges);
+            csrOnDevice = false;
+        }
+    }
+
+    // 自检：用另一个后端再算一遍同一张图，报告最大差异（计数相对每侧分母）。
+    if (compareBackends) {
+        RawGraph other = buildRawGraph(directions, !m_primaryRayQuery);
+        const RawGraph& rayGraph = m_primaryRayQuery ? raw : other;
+        const RawGraph& rasterGraph = m_primaryRayQuery ? other : raw;
+        // Differences are reported (a) as global fractions (sum |d| / sum of the raster counts) and
+        // (b) as maxima over well-sampled sides (raster denominator >= 256 samples): sub-pixel facets
+        // with a handful of samples differ by whole samples and would dominate a plain maximum.
+        constexpr double kWellSampled = 256.0;
+        double maxSky = 0.0, maxGround = 0.0, maxDenominator = 0.0, maxEdge = 0.0, edgeDiffSum = 0.0, edgeWeight = 0.0;
+        double sumDenominator = 0.0, diffDenominator = 0.0, diffSky = 0.0, diffGround = 0.0;
+        uint32_t wellSampledSides = 0;
+        for (uint32_t side = 0; side < surfaceCount(); ++side) {
+            const double rasterDenominator = rasterGraph.denominators[side];
+            const double dDen = std::abs(double(rayGraph.denominators[side]) - rasterDenominator);
+            const double dSky = std::abs(double(rayGraph.skyCounts[side]) - rasterGraph.skyCounts[side]);
+            const double dGround = std::abs(double(rayGraph.groundCounts[side]) - rasterGraph.groundCounts[side]);
+            sumDenominator += rasterDenominator;
+            diffDenominator += dDen;
+            diffSky += dSky;
+            diffGround += dGround;
+            if (rasterDenominator >= kWellSampled) {
+                ++wellSampledSides;
+                maxDenominator = std::max(maxDenominator, dDen / rasterDenominator);
+                maxSky = std::max(maxSky, dSky / rasterDenominator);
+                maxGround = std::max(maxGround, dGround / rasterDenominator);
+            }
+        }
+        std::unordered_map<uint64_t, std::pair<double, double>> merged; // key -> (ray, raster)
+        for (const auto& e : rayGraph.edges) merged[e.first].first = e.second;
+        for (const auto& e : rasterGraph.edges) merged[e.first].second = e.second;
+        for (const auto& entry : merged) {
+            const double a = entry.second.first, b = entry.second.second;
+            const double rasterDenominator = rasterGraph.denominators[uint32_t(entry.first >> 32U)];
+            if (rasterDenominator >= kWellSampled) maxEdge = std::max(maxEdge, std::abs(a - b) / rasterDenominator);
+            edgeDiffSum += std::abs(a - b);
+            edgeWeight += std::max(a, b);
+        }
+        diagnostics.visibilityValidated = true;
+        diagnostics.validateMaxSkyDiff = static_cast<float>(maxSky);
+        diagnostics.validateMaxGroundDiff = static_cast<float>(maxGround);
+        diagnostics.validateMaxDenominatorDiff = static_cast<float>(maxDenominator);
+        diagnostics.validateMaxEdgeDiff = static_cast<float>(maxEdge);
+        diagnostics.validateMeanEdgeDiff = edgeWeight > 0.0 ? static_cast<float>(edgeDiffSum / edgeWeight) : 0.0f;
+        const double perDen = sumDenominator > 0.0 ? 1.0 / sumDenominator : 0.0;
+        std::cout << "facetrt: visibility validation (ray query vs raster), global: sum|d den|/sum den = "
+                  << diffDenominator * perDen << ", sky = " << diffSky * perDen << ", ground = " << diffGround * perDen
+                  << ", edges sum|d|/sum = " << diagnostics.validateMeanEdgeDiff << "; max over " << wellSampledSides
+                  << " sides with >=256 samples (relative to den): den " << maxDenominator << ", sky " << maxSky
+                  << ", ground " << maxGround << ", edge " << maxEdge << "; edge count " << rayGraph.edges.size()
+                  << " vs " << rasterGraph.edges.size() << std::endl;
+    }
+    m_denominatorCpu = std::move(raw.denominators);
+    m_skyCountsCpu = std::move(raw.skyCounts);
+    m_groundCountsCpu = std::move(raw.groundCounts);
+    std::vector<std::pair<uint64_t, uint32_t>> undirectedEdges = std::move(raw.edges);
+
+    // 步骤 6：CSR。GPU 路径：m_rowOffsets / m_edges 已在设备上（主机不再保留副本，需要时由
+    // ensureHostCsr 回读）；CPU 路径：展开为双向有向边，行偏移 + 按键排序后填充。
+    if (csrOnDevice) {
+        m_rowOffsetsCpu.clear();
+        m_edgesCpu.clear();
+        m_csrOnDevice = true;
+        m_directedEdgeCount = deviceEdgeCount;
+        diagnostics.directedEdgeCount = deviceEdgeCount;
+        diagnostics.graphBuild = "gpu";
+    } else {
+        const auto csrBegin = std::chrono::steady_clock::now();
+        if (hostCsr.empty() && hostRowOffsets.empty()) buildHostCsr(std::move(undirectedEdges), hostRowOffsets, hostCsr);
+        m_rowOffsetsCpu = std::move(hostRowOffsets);
+        m_edgesCpu = std::move(hostCsr);
+        m_csrOnDevice = false;
+        m_directedEdgeCount = static_cast<uint32_t>(m_edgesCpu.size());
+        diagnostics.directedEdgeCount = m_directedEdgeCount;
+        diagnostics.graphBuild = "cpu";
+        graphBuildMs = primaryReadbackMs + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - csrBegin).count();
+    }
+    diagnostics.graphBuildMs = static_cast<float>(graphBuildMs);
+    diagnostics.visibilityPassesMs = static_cast<float>(primaryPassMs);
+    diagnostics.countReadbackMs = diagnostics.graphBuild == "gpu" ? static_cast<float>(primaryReadbackMs) : 0.0f;
+    std::cout << "facetrt: graph build " << diagnostics.graphBuild << ": hash table -> CSR " << graphBuildMs << " ms";
+    if (diagnostics.graphBuild == "gpu")
+        std::cout << " (count " << m_graphStageMs[0] << ", compact/scan " << m_graphStageMs[1]
+                  << ", scatter/sort/sums " << m_graphStageMs[2] << " ms)";
+    std::cout << ", " << diagnostics.directedEdgeCount << " directed edges" << std::endl;
+    const auto finalizeBegin = std::chrono::steady_clock::now();
     // 步骤 7：没有任何 side 有采样则无法求解（报错）；之后应用下边界，
     // 并把调整后的分母/天空/地面计数写回 GPU。
     if (std::none_of(m_denominatorCpu.begin(), m_denominatorCpu.end(), [](uint32_t n){return n>0;}))
@@ -1497,6 +2391,19 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     // sweeps are then exactly those of a scene without a lower boundary.
     m_groundUsed = std::any_of(m_groundCountsCpu.begin(), m_groundCountsCpu.end(),
                                [](uint32_t n) { return n != 0U && n != kInactiveSide; });
+    uint32_t receivingSides = 0;
+    for (uint32_t side = 0; side < surfaceCount(); ++side) {
+        if (m_groundCountsCpu[side] == kInactiveSide) continue;
+        ++receivingSides;
+        if (m_denominatorCpu[side] == 0U) ++diagnostics.zeroSampleSides;
+    }
+    diagnostics.receivingSides = receivingSides;
+    if (diagnostics.zeroSampleSides != 0U) {
+        std::cout << "facetrt: " << diagnostics.zeroSampleSides << " of " << receivingSides << " receiving sides ("
+                  << 100.0 * diagnostics.zeroSampleSides / std::max(1U, receivingSides)
+                  << "%) have no visibility sample (sub-pixel facets, treated as open sky); a finer "
+                     "HISTREAM_FACET_RASTER_SIZE reduces this" << std::endl;
+    }
     uploadBuffer(m_denominator, m_denominatorCpu.data(), m_denominatorCpu.size() * sizeof(uint32_t));
     uploadBuffer(m_skyCounts, m_skyCountsCpu.data(), m_skyCountsCpu.size() * sizeof(uint32_t));
     uploadBuffer(m_groundCounts, m_groundCountsCpu.data(), m_groundCountsCpu.size() * sizeof(uint32_t));
@@ -1507,9 +2414,13 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     for (uint32_t side = 0; side < surfaceCount(); ++side) {
         if (m_groundCountsCpu[side] == kInactiveSide) continue;
         uint64_t visibleCount = uint64_t(m_skyCountsCpu[side]) + m_groundCountsCpu[side];
-        for (uint32_t index = m_rowOffsetsCpu[side];
-             index < m_rowOffsetsCpu[side + 1U]; ++index) {
-            visibleCount += m_edgesCpu[index].count;
+        if (m_csrOnDevice) {
+            visibleCount += deviceRowSums[side];
+        } else {
+            for (uint32_t index = m_rowOffsetsCpu[side];
+                 index < m_rowOffsetsCpu[side + 1U]; ++index) {
+                visibleCount += m_edgesCpu[index].count;
+            }
         }
         // DEFERRED[中] 物理: 没有任何栅格样本的面（亚像素小面元）被直接跳过，不计入闭合误差；而 incidentIrradiance/incident.comp 中此类面直接取 skyRadiosity（视为全开阔天空），对冠层内部被遮挡的小面元会系统性高估入射辐射；建议：统计并报告 denominator==0 的面元数，对其用邻近面/抖动多采样估计，而不是默认全天空。
         if (m_denominatorCpu[side] == 0U) {
@@ -1522,9 +2433,11 @@ GraphDiagnostics FacetrtVulkan::buildVisibilityGraphOnce(
     diagnostics.maxClosureError = maxClosureError;
 
     // 步骤 9：用新的 CSR 数据创建求解缓冲、描述符与管线。
-    createSolveResources(diagnostics.directedEdgeCount);
+    createSolveResources(diagnostics.directedEdgeCount, m_csrOnDevice);
     createSolveDescriptors();
     createSolvePipeline();
+    diagnostics.graphFinalizeMs = static_cast<float>(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - finalizeBegin).count());
     return diagnostics;
 }
 
@@ -1546,17 +2459,51 @@ std::vector<float> FacetrtVulkan::computeSunlitFraction(const Direction& sunDire
                 const std::vector<Direction> directions = m_visibilityDirections;
                 buildVisibilityGraph(directions);
             }
+        } catch (const RayQueryOverflow&) {
+            // Too many hits on one (grazing) sun line for the shader: raster takes over.
+            fallBackToRaster("ray-query sunlight hit list overflow");
+            const std::vector<Vertex> geometry = m_geometry;
+            setGeometry(geometry);
+            if (!m_visibilityDirections.empty()) {
+                const std::vector<Direction> directions = m_visibilityDirections;
+                buildVisibilityGraph(directions);
+            }
         }
     }
 }
 
-// 作用：沿 sunDirection（指向太阳）做一次直射可见性光栅，返回长度 2×面元数的比例数组：
+// 作用：用主后端算太阳可见比例；HISTREAM_FACET_VALIDATE_VISIBILITY=1 时再用另一后端算一遍，
+// 打印逐 side 比例差（仅两者都有样本的 side）。
+std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sunDirection)
+{
+    std::vector<float> primary = computeSunlitFractionBackend(sunDirection, m_primaryRayQuery);
+    if (m_validateVisibility && m_wantRaster && m_wantRayQuery) {
+        const std::vector<float> other = computeSunlitFractionBackend(sunDirection, !m_primaryRayQuery);
+        double maxDiff = 0.0, sumDiff = 0.0;
+        uint32_t compared = 0, onlyOne = 0;
+        for (size_t side = 0; side < primary.size(); ++side) {
+            const bool a = !std::isnan(primary[side]), b = !std::isnan(other[side]);
+            if (a != b) ++onlyOne;
+            if (!a || !b) continue;
+            const double diff = std::abs(double(primary[side]) - other[side]);
+            maxDiff = std::max(maxDiff, diff);
+            sumDiff += diff;
+            ++compared;
+        }
+        std::cout << "facetrt: sunlit validation (ray query vs raster): sides compared " << compared
+                  << ", max |d sunlit| = " << maxDiff << ", mean = " << (compared ? sumDiff / compared : 0.0)
+                  << ", sampled by only one backend = " << onlyOne << std::endl;
+    }
+    return primary;
+}
+
+// 作用：沿 sunDirection（指向太阳）做一次直射可见性光栅或光线查询，返回长度 2×面元数的比例数组：
 // visible/total，其中 total 为落在该 side 上的样本数，visible 为其中最近（未被遮挡）的样本数。
 // 无样本的 side 返回 NaN，由调用者用邻近面估计。
 // 为了让小于一个像素的面元也有样本，对栅格做 4×4 的亚像素抖动，共 16 次累加。
-std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sunDirection)
+std::vector<float> FacetrtVulkan::computeSunlitFractionBackend(const Direction& sunDirection, bool rayQuery)
 {
-    if (m_directResolvePipeline == VK_NULL_HANDLE || m_facetCount == 0U) {
+    if ((rayQuery ? m_rqDirectPipeline : m_directResolvePipeline) == VK_NULL_HANDLE || m_facetCount == 0U) {
         throw std::logic_error("setGeometry() must be called before computeSunlitFraction()");
     }
     const std::array<float, 3> direction =
@@ -1574,6 +2521,7 @@ std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sun
     push.periodic[0] = m_config.periodicSizeX;
     push.periodic[1] = m_config.periodicSizeZ;
     push.periodic[2] = static_cast<float>(m_config.periodicNeighborCount);
+    push.periodic[3] = rayTieDepth();
 
     VkCommandBuffer commandBuffer = beginCommands();
     // 步骤 1：清零直射计数与统计量，16 次抖动的结果累加在同一缓冲中。
@@ -1599,6 +2547,21 @@ std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sun
             static_cast<float>(kSunJitter) - 0.5f) * 2.0f / static_cast<float>(m_config.rasterHeight);
         push.viewProjection[12] = projection[12] + offsetX * projection[15];
         push.viewProjection[13] = projection[13] + offsetY * projection[15];
+
+        if (rayQuery) {
+            // 光线查询：每次抖动一个调度；各次累加到同一 total/visible 缓冲，调度间加屏障。
+            VkMemoryBarrier toCompute{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            toCompute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            toCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &toCompute, 0, nullptr, 0, nullptr);
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_rqDirectPipeline);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_visibilityPipelineLayout, 0, 1,
+                                    &m_directDescriptorSet, 0, nullptr);
+            vkCmdPushConstants(commandBuffer, m_visibilityPipelineLayout, kVisibilityPushStages, 0, sizeof(push), &push);
+            vkCmdDispatch(commandBuffer, static_cast<uint32_t>((pixels + 63ULL) / 64ULL), 1, 1);
+            continue;
+        }
 
         VkMemoryBarrier clearBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         clearBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
@@ -1667,6 +2630,7 @@ std::vector<float> FacetrtVulkan::computeSunlitFractionOnce(const Direction& sun
     downloadBuffer(m_directVisible, visible.data(), visible.size() * sizeof(uint32_t));
     downloadBuffer(m_visibilityStats, statistics.data(), sizeof(statistics));
     if (statistics[0] != 0U) {
+        if (rayQuery) throw RayQueryOverflow();
         m_requiredRasterLayers = std::max(m_requiredRasterLayers, statistics[2]);
         throw RasterLayerOverflow();
     }
@@ -2205,9 +3169,12 @@ std::vector<float> FacetrtVulkan::incidentIrradiance(
     const std::vector<SurfaceOptics>& optics,
     float skyRadiosity) const
 {
+    // A GPU-built CSR lives on the device; the CPU evaluation below needs it on the host.
+    const bool haveIncident = solution.incident.size() == surfaceCount();
+    if (!haveIncident) ensureHostCsr();
     if (solution.radiosity.size() != surfaceCount() ||
         optics.size() != surfaceCount() ||
-        m_rowOffsetsCpu.size() != surfaceCount() + 1U ||
+        (!haveIncident && m_rowOffsetsCpu.size() != surfaceCount() + 1U) ||
         m_denominatorCpu.size() != surfaceCount() ||
         m_skyCountsCpu.size() != surfaceCount()) {
         throw std::invalid_argument(
@@ -2507,6 +3474,14 @@ void FacetrtVulkan::destroySolveResources()
     destroyBuffer(m_residual);
     m_rowOffsetsCpu.clear();
     m_edgesCpu.clear();
+    m_csrOnDevice = false;
+    m_directedEdgeCount = 0;
+    // Solve resources (and their ping-pong contents) are gone.  Reset the
+    // generations so the next evaluateEnergy() does a cold solve instead of
+    // warm-starting from an uninitialized buffer.
+    m_solveGeneration = 0;
+    m_energyWarmGeneration = 0;
+    m_energyRadiosityPing = 0;
 }
 
 // 作用：释放可见性阶段的管线、渲染通道、描述符与缓冲，并清空 CPU 侧计数副本。
@@ -2518,6 +3493,12 @@ void FacetrtVulkan::destroyVisibilityResources()
     if (m_resolvePipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(m_device, m_resolvePipeline, nullptr);
     }
+    if (m_rqVisibilityPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_rqVisibilityPipeline, nullptr);
+    if (m_rqDirectPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_rqDirectPipeline, nullptr);
+    m_rqVisibilityPipeline = VK_NULL_HANDLE;
+    m_rqDirectPipeline = VK_NULL_HANDLE;
+    destroyGraphBuild();
+    destroyAccelerationStructure();
     if (m_directResolvePipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(m_device, m_directResolvePipeline, nullptr);
     }

@@ -1,4 +1,4 @@
-# ==========================================================================
+﻿# ==========================================================================
 # 文件：build-engine.ps1
 # 功能：用 CMake 构建 HiStream 引擎（models/histream）和 STREAM 遥感引擎（models/stream），
 #       并写出构建清单。
@@ -43,12 +43,16 @@ if (-not $CmakeCommand) {
 }
 
 # 步骤 3：HiStream 配置参数。
-$ConfigureArguments = @('-S', $SourceDirectory, '-B', $BuildDirectory)
+$RuntimeDirectory = Join-Path $ProjectRoot 'models\bin_x64'
+$BaseDirectory = Join-Path $ProjectRoot 'models'
+if (-not (Test-Path -LiteralPath (Join-Path $BaseDirectory 'nvpro_core\cmake\setup.cmake'))) {
+    throw "Missing local nvpro_core sources under $BaseDirectory"
+}
+$ConfigureArguments = @('-S', $SourceDirectory, '-B', $BuildDirectory,
+    "-DBASE_DIRECTORY:PATH=$BaseDirectory", "-DOUTPUT_PATH:PATH=$RuntimeDirectory")
 # Release 构建强制要求 USD（缺失则配置失败）；Debug 不强制。
 if ($Configuration -eq 'Release') { $ConfigureArguments += '-DHISTREAM_REQUIRE_USD=ON' }
-# The product engine is the core only. Out-of-tree extensions (e.g. STREAM IMAGING's scene animation,
-# built by C:/work/streamimaging/scripts/build-animation-engine.ps1 into its own directory) are never
-# part of it; clear any cached extension list so an old build directory cannot pick one up.
+# Clear any extension list cached by a separate experimental build.
 $ConfigureArguments += '-DHISTREAM_EXTENSION_DIRS='
 if ($VcpkgRoot) {
     $ToolchainFile = Join-Path $VcpkgRoot 'scripts\buildsystems\vcpkg.cmake'
@@ -65,7 +69,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # 步骤 4：STREAM 引擎，沿用同一个 vcpkg 工具链（若有）。
 # STREAM remote-sensing image engine (stream.exe), an independent CMake project.
-$StreamArguments = @('-S', (Join-Path $ProjectRoot 'models\stream'), '-B', (Join-Path $ProjectRoot 'build\stream'))
+$StreamArguments = @('-S', (Join-Path $ProjectRoot 'models\stream'), '-B', (Join-Path $ProjectRoot 'build\stream'),
+    "-DSTREAM_RUNTIME_DIR:PATH=$RuntimeDirectory")
 if ($ToolchainFile) { $StreamArguments += "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile" }
 & $CmakeExecutable @StreamArguments
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

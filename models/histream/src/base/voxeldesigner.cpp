@@ -494,14 +494,19 @@ PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
         !std::isfinite(stepSize) || !std::isfinite(shape.width) || !std::isfinite(shape.height) || !std::isfinite(shape.length)) {
         return voxelTriModel;
     }
+    // 唯一的取整规则：格数 = ceil(size/step - eps)，外表面坐标也取该整数。
+    // 否则浮点外表面会落在最后一格内部，与 voxelIds 错位。
+    const int nLength = std::max(1, static_cast<int>(std::ceil(shape.length / stepSize - 1.0e-6f)));
+    const int nWidth = std::max(1, static_cast<int>(std::ceil(shape.width / stepSize - 1.0e-6f)));
+    const int nHeight = std::max(1, static_cast<int>(std::ceil(shape.height / stepSize - 1.0e-6f)));
 
     // 步骤 1：依次生成每个体元的 z=k（x-y）、x=i（y-z）、y=j（x-z）三个方向的面。
     // 绘制每一层x,y平面
-    for (int k = 0; k < shape.height / stepSize-1; k++) //height,绘制每一层的面
+    for (int k = 0; k < nHeight - 1; k++) //height,绘制每一层的面
     {
-        for (int i = 0; i < shape.length / stepSize; i++)
+        for (int i = 0; i < nLength; i++)
         {
-            for (int j = 0; j < shape.width / stepSize; j++)
+            for (int j = 0; j < nWidth; j++)
             {
                 glm::vec3 points[4];
                 points[0].x = i;
@@ -537,11 +542,11 @@ PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
     }
 
     // 绘制每一层y,z平面
-    for (int k = 0; k < shape.height / stepSize-1; k++) //height,绘制每一层的面
+    for (int k = 0; k < nHeight - 1; k++) //height,绘制每一层的面
     {
-        for (int i = 0; i < shape.length / stepSize; i++)
+        for (int i = 0; i < nLength; i++)
         {
-            for (int j = 0; j < shape.width / stepSize; j++)
+            for (int j = 0; j < nWidth; j++)
             {
                 glm::vec3 points[4];
                 points[0].x = i;
@@ -577,11 +582,11 @@ PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
     }
 
     // 绘制每一层x,z平面
-    for (int k = 0; k < shape.height / stepSize-1; k++) //height,绘制每一层的面
+    for (int k = 0; k < nHeight - 1; k++) //height,绘制每一层的面
     {
-        for (int i = 0; i < shape.length / stepSize; i++)
+        for (int i = 0; i < nLength; i++)
         {
-            for (int j = 0; j < shape.width / stepSize; j++)
+            for (int j = 0; j < nWidth; j++)
             {
                 glm::vec3 points[4];
                 points[0].x = i;
@@ -620,27 +625,26 @@ PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
     }
 
 
-    // 步骤 2：补 x 最大面（y-z 平面）与 y 最大面（x-z 平面），使墙体外表面封闭（见下方 DEFERRED）。
-    // 绘制y,z最大面
-    // DEFERRED[中] Bug: 外侧最大面直接放在 shape.length/stepSize（未取整的浮点），而 i/j 循环按 ceil 生成格子；尺寸不是步长整数倍时外墙落在最后一列体元内部（如 2.5），墙面不封闭且与 voxelIds 错位；墙体各层 k < height/step-1 也与 roof 的 k=int(height/step)-1 取整规则不同，可能缺层或重叠；建议：统一用 n=ceil(size/step)（或 round）作为格数与外表面坐标。
-    for (int k = 0; k < shape.height / stepSize-1; k++) //height,绘制每一层的面
+    // 步骤 2：补 x 最大面（y-z 平面）与 y 最大面（x-z 平面），使墙体外表面封闭。
+    // 外表面坐标与格数使用同一 ceil 规则（nLength/nWidth）。
+    for (int k = 0; k < nHeight - 1; k++) //height,绘制每一层的面
     {
-        for (int j = 0; j < shape.width / stepSize; j++)
+        for (int j = 0; j < nWidth; j++)
         {
             glm::vec3 points[4];
-            points[0].x = shape.length/stepSize;
+            points[0].x = nLength;
             points[0].y = j;
             points[0].z = k;
 
-            points[1].x = shape.length/ stepSize;
+            points[1].x = nLength;
             points[1].y = (j + 1);
             points[1].z = k;
 
-            points[2].x = shape.length/ stepSize;
+            points[2].x = nLength;
             points[2].y = (j + 1);
             points[2].z = (k + 1);
 
-            points[3].x = shape.length/ stepSize;
+            points[3].x = nLength;
             points[3].y = j;
             points[3].z = (k + 1);
 
@@ -660,25 +664,25 @@ PrimMesh VoxelDesigner::createTriCube_wall(Shape shape, float stepSize)
     }
 
     // 绘制x,z最大面
-    for (int k = 0; k < shape.height / stepSize-1; k++) //height,绘制每一层的面
+    for (int k = 0; k < nHeight - 1; k++) //height,绘制每一层的面
     {
-        for (int i = 0; i < shape.length / stepSize; i++)
+        for (int i = 0; i < nLength; i++)
         {
             glm::vec3 points[4];
             points[0].x = i;
-            points[0].y = shape.width/ stepSize;
+            points[0].y = nWidth;
             points[0].z = k;
 
             points[1].x = (i + 1);
-            points[1].y = shape.width/ stepSize;
+            points[1].y = nWidth;
             points[1].z = k;
 
             points[2].x = (i + 1);
-            points[2].y = shape.width/ stepSize;
+            points[2].y = nWidth;
             points[2].z = (k + 1);
 
             points[3].x = i;
-            points[3].y = shape.width/ stepSize;
+            points[3].y = nWidth;
             points[3].z = (k + 1);
 
             int list[] = {0, 1, 2, 0, 2, 3};
@@ -717,14 +721,17 @@ PrimMesh VoxelDesigner::createTriCube_roof(Shape shape, float stepSize)
         !std::isfinite(stepSize) || !std::isfinite(shape.width) || !std::isfinite(shape.height) || !std::isfinite(shape.length)) {
         return voxelTriModel;
     }
+    const int nLength = std::max(1, static_cast<int>(std::ceil(shape.length / stepSize - 1.0e-6f)));
+    const int nWidth = std::max(1, static_cast<int>(std::ceil(shape.width / stepSize - 1.0e-6f)));
+    const int nHeight = std::max(1, static_cast<int>(std::ceil(shape.height / stepSize - 1.0e-6f)));
 
     // 步骤 1：为最顶层每个 (i, j) 体元生成一张水平顶面，并登记该体元的 voxelId。
     // 绘制顶面(x,y)
-    // DEFERRED[中] 数值: float→int 截断；height<stepSize 时 k=-1，屋顶 voxelIds 的 z 为负（插入 NanoVDB 时落在地面以下/越界），height 不是步长整数倍时屋顶高度被向下取整而墙体按 ceil 计层；建议：k=max(0, (int)std::ceil(height/step)-1) 并与墙体统一取整。
-    int k = shape.height/stepSize - 1;
-    for (int i = 0; i < shape.length / stepSize; i++)
+    // 与墙体使用同一 ceil 规则；height < step 时至少保留 1 层。
+    int k = nHeight - 1;
+    for (int i = 0; i < nLength; i++)
     {
-        for (int j = 0; j < shape.width / stepSize; j++)
+        for (int j = 0; j < nWidth; j++)
         {
             glm::vec3 points[4];
             points[0].x = i;

@@ -27,6 +27,8 @@
 
 #include "command.h"
 #include "base/vkcheck.h"
+#include "base/voxelflags.h"
+#include "base/voxellimits.h"
 #include <cstdlib>
 #include <stdexcept>
 #include <algorithm>
@@ -42,6 +44,31 @@
 // 模块 A：文件内部辅助函数（匿名命名空间）。多数函数各自新建临时 nvvk::CommandPool，
 // 录入一次填充/拷贝命令并 submitAndWait 同步执行；主流程 Command::runEB 见后文。
 namespace {
+
+// HISTREAM_VOXEL_PASS_TIMING=1: wall-clock time (submit to fence) summed per stage over the whole run.
+// Printed as PASS_TIMING lines when the run's last node ends (see Command::runEB) so that the
+// per-pass effect of shader changes can be compared without a GPU profiler.
+struct PassTiming {
+    std::array<double, 24> milliseconds{};
+    std::array<int, 24> calls{};
+    std::array<double, 24> minimum{};   // fastest single call: the least disturbed by other GPU users
+    int pendingStage{-1};
+    std::chrono::steady_clock::time_point start{};
+};
+PassTiming& passTiming() { static PassTiming timing; return timing; }
+
+void printPassTiming()
+{
+    static const char* names[] = {"gap", "directVNIR", "directTIR", "scatteringVNIR", "diffuseTIR", "bio",
+        "aero", "evapo", "budget", "updateL", "updateTp", "fluidLbm", "fluidCommit", "out", "scatteringTrace",
+        "scatTrace_s1_sky", "scatTrace_s2", "scatTrace_s3_order", "scatTrace_s4_skycache"};
+    PassTiming& timing = passTiming();
+    for (size_t stage = 0; stage < 19; ++stage) {
+        if (timing.calls[stage] == 0) continue;
+        std::cout << "PASS_TIMING\tstage=" << names[stage] << "\tcalls=" << timing.calls[stage]
+                  << "\tms=" << timing.milliseconds[stage] << "\tminCallMs=" << timing.minimum[stage] << std::endl;
+    }
+}
 
 // 多次散射统计的 CPU 端汇总（uint64/double 累加），与 GPU 端 ScatteringOrderStats（32 字节，
 // uint32/float）字段一一对应；按光谱分组读回后累加，以避免 GPU 计数溢出和精度损失。
@@ -85,9 +112,10 @@ void clearShortwaveFields(const std::shared_ptr<VoxelebIO>& modelio)
         && modelio->m_voxelio->m_pRadsBuffer->buffer) {
         // 步骤 3：光学成像用的多次散射环境项存放在辐射场缓冲 1.5×DIFFUSENUM×体元数 的偏移之后，
         // 每个 VoxelRad 容纳 2 个 float，所以字节数按 (floats+1)/2 向上取整（布局见 buffer.cpp，待核对）。
-        const VkDeviceSize environmentOffset = voxelCount * DIFFUSENUM * 3 / 2 * sizeof(VoxelRad);
+        const VkDeviceSize layoutVoxels = static_cast<VkDeviceSize>(voxelflags::testRadianceVoxels(modelio->n_voxel));
+        const VkDeviceSize environmentOffset = layoutVoxels * DIFFUSENUM * 3 / 2 * sizeof(VoxelRad);
         const VkDeviceSize environmentFloats =
-            voxelCount * static_cast<VkDeviceSize>(std::max(modelio->n_wave, 0));
+            layoutVoxels * static_cast<VkDeviceSize>(std::max(modelio->n_wave, 0));
         vkCmdFillBuffer(command, modelio->m_voxelio->m_pRadsBuffer->buffer, environmentOffset,
                         (environmentFloats + 1) / 2 * sizeof(VoxelRad), 0U);
     }
@@ -535,7 +563,9 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
 
     const auto shortwaveBegin = std::chrono::steady_clock::now();
     if (uint64_t(modelio->n_voxel) * 64 > UINT32_MAX) {
-        throw std::runtime_error("One spectral group exceeds the scattering diagnostic counter capacity");
+        throw std::runtime_error("VoxelEB: " + voxellimits::grouped(uint64_t(modelio->n_voxel))
+            + " voxels exceed the 32-bit scattering diagnostic counters of one spectral group (at most "
+            + voxellimits::grouped(UINT32_MAX / 64) + " voxels). Reduce the scene size.");
     }
     // 步骤 3.3：多次散射。scatteringStage 取值：0 清零漫射吸收累加量；1 追踪未碰撞天空场并缓存
     // 间隙透过率；4 复用缓存、仅按本组天空辐照缩放；2 构造第 order 阶散射源；3 追踪第 order 阶
@@ -799,6 +829,7 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     submit(modelio, VoxelEBStage::updateTp, voxelSize1D, std::nullopt, std::nullopt);
     waitFence(modelio);
 
+    if (voxelflags::passTimingEnabled()) printPassTiming();
     return true;
 }
 
@@ -968,6 +999,10 @@ void Command::submit(std::shared_ptr<VoxelebIO> &modelio, VoxelEBStage stage, gl
     // 步骤 1：取出本阶段的管线（m_pipelines 为 std::map，operator[] 对未创建的阶段会得到空句柄）。
     auto & pipeline = modelio->m_pipelines[stage];
     if (std::getenv("HISTREAM_GPU_DIAGNOSTICS")) std::cout << "GPU_STAGE\t" << static_cast<int>(stage) << std::endl;
+    if (voxelflags::passTimingEnabled()) {
+        passTiming().pendingStage = stage == VoxelEBStage::scatteringTrace && setting.scatteringStage >= 1 && setting.scatteringStage <= 4 ? 14 + setting.scatteringStage : static_cast<int>(stage);
+        passTiming().start = std::chrono::steady_clock::now();
+    }
 
 
     auto & m_currentSemaphore = modelio->m_currentSemaphore;
@@ -1086,6 +1121,16 @@ void Command::waitFence(std::shared_ptr<VoxelebIO> &modelio)
 {
     const VkResult result = vkWaitForFences(modelio->m_device, 1, &(modelio->m_fence), VK_TRUE, UINT64_MAX);
     if (result != VK_SUCCESS) throw std::runtime_error("VoxelEB GPU execution failed: " + std::to_string(result));
+    if (voxelflags::passTimingEnabled() && passTiming().pendingStage >= 0) {
+        PassTiming& timing = passTiming();
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - timing.start).count();
+        timing.milliseconds[timing.pendingStage] += elapsed;
+        if (timing.calls[timing.pendingStage] == 0 || elapsed < timing.minimum[timing.pendingStage])
+            timing.minimum[timing.pendingStage] = elapsed;
+        ++timing.calls[timing.pendingStage];
+        timing.pendingStage = -1;
+    }
     vkResetFences(modelio->m_device, 1,  &(modelio->m_fence));
     modelio->m_genCmdBuf.destroy(m_inFlight);
     m_inFlight.clear();

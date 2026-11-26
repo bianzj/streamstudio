@@ -47,6 +47,9 @@
 #include "../parameters.h"
 #include "../global.glsl"
 #include "../nanovdb_info.glsl"
+// bsdf.glsl -> sampling.glsl: clamp the sqrt argument of the cosine sampler (sampleHemisphereCosine) so it can never return NaN.
+// The voxel passes do not call SampleBSDF (fixed/rotated direction sets), so this is a no-op for the compiled SPIR-V; it keeps a future call safe.
+#define RT_SAFE_COSINE_SAMPLING 1
 #include "../bsdf.glsl"
 #include "../functions.glsl"
 #include "../shade_state_voxel.glsl"

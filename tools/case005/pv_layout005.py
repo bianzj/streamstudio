@@ -19,7 +19,9 @@
 # ==========================================================================
 
 """Editorial layout and native 0.25 m spatial figure for Case 005."""
-import csv,html,json,pathlib,shutil
+import csv,html,json,pathlib,shutil,sys
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
+from facet_document import read_document  # JSON / binary facet result reader (tools/facet_document.py)
 import numpy as np
 from PIL import Image
 import matplotlib
@@ -53,7 +55,7 @@ def spatial():
         folder=ROOT/'refinement-025m'/s
         run=json.loads((folder/'output/faceteb_run.json').read_text(encoding='utf8'))
         assert len(run['completed'])==37 and all(n['converged'] for n in run['completed'])
-        meta=json.loads((folder/'output/faceteb.json').read_text(encoding='utf8'))
+        meta=read_document(folder/'output/faceteb.json',only={'vertexPositions'})  # JSON or binary result
         v=np.asarray(meta['vertexPositions']).reshape(-1,3,3);area=np.linalg.norm(np.cross(v[:,1]-v[:,0],v[:,2]-v[:,0]),axis=1)/2
         assert abs(area[:count].sum()-324)<1e-5
         # 步骤 2：取第 36 节点（第二天 12:00；前 24 个节点为预热）的能量状态二进制，
@@ -65,7 +67,7 @@ def spatial():
         # Only average the two native triangles of each actual 0.25 m square.
         # No spatial interpolation, smoothing or synthetic temperatures.
         fields[s]=values.reshape(72,72,2).mean(axis=2)
-        audit[s]=dict(nodes=37,converged_nodes=37,grass_cell_m=.25,grass_facets=count,grass_area_m2=float(area[:count].sum()),mean_grass_C=float(values.mean()),max_energy_residual_W_m2=max(t['energyResidual'] for t in run['completed']),native_geometry_sha256=sha(folder/'output/faceteb.json'),native_noon_state_sha256=sha(folder/f'output/.facet_steps/energy_T={n["token"]}.bin'))
+        audit[s]=dict(nodes=37,converged_nodes=37,grass_cell_m=.25,grass_facets=count,grass_area_m2=float(area[:count].sum()),mean_grass_C=float(values.mean()),max_energy_residual_W_m2=max(t['energyResidual'] for t in run['completed']),native_geometry_sha256=sha(folder/'output/faceteb.bin' if (folder/'output/faceteb.bin').exists() else folder/'output/faceteb.json'),native_noon_state_sha256=sha(folder/f'output/.facet_steps/energy_T={n["token"]}.bin'))
     # 步骤 3：画三联图——无光伏温度、光伏草叶温度、配对温差；
     # 温度图共用色标（至少 26–42 °C，必要时取整外扩），温差图色标以 0 为中心对称。
     delta=fields['pv_grass']-fields['grass']

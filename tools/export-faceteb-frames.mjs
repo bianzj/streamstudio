@@ -31,6 +31,8 @@ if (!nodes.length || nodes.some(n => !n.converged)) throw new Error('Missing or 
 const rasterDir = path.join(out, 'tiff');
 fs.mkdirSync(path.join(rasterDir, '.facet_steps'), { recursive: true });
 fs.copyFileSync(path.join(source, 'faceteb.json'), path.join(rasterDir, 'faceteb.json'));
+// control.facetOutputFormat = binary: the geometry arrays live in faceteb.bin next to the JSON.
+{ const { copyFacetSidecars } = await import(new URL('../server/facet-result.mjs', import.meta.url)); copyFacetSidecars(path.join(source, 'faceteb.json'), rasterDir); }
 fs.copyFileSync(path.join(source, '.facet_steps', 'components.bin'), path.join(rasterDir, '.facet_steps', 'components.bin'));
 const project = JSON.parse(fs.readFileSync(path.join(run, 'project.json')));
 Object.assign(project.configuration.sensor, { image: true, temperature: true, process: false, radiationProcess: false, energyProcess: false, principalPlane: false, hemisphere: false });

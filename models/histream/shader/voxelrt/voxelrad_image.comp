@@ -46,6 +46,9 @@
 #include "../parameters.h"
 #include "../global.glsl"
 #include "../nanovdb_info.glsl"
+// bsdf.glsl -> sampling.glsl: clamp the sqrt argument of the cosine sampler (sampleHemisphereCosine) so it can never return NaN.
+// The voxel passes do not call SampleBSDF (fixed/rotated direction sets), so this is a no-op for the compiled SPIR-V; it keeps a future call safe.
+#define RT_SAFE_COSINE_SAMPLING 1
 #include "../bsdf.glsl"
 #include "../functions.glsl"
 #include "../background_hapke.glsl"
@@ -77,14 +80,13 @@ float RadianceSum[MAXBAND];
 float sampleCoverage = 1.0;
 
 // 作用：voxelRads 缓冲中某体元某波段环境辐射 cumulated 的下标。
-// 布局：每个体元占 stride = DIFFUSE_ANGLE_NUM + 2*n_wave 个槽，前 DIFFUSE_ANGLE_NUM 个为角度项，
-//       随后 n_wave 个槽为各波段累计的环境辐射（本函数取第 band 个）；最后 n_wave 个槽是各波段按碰撞阶数
-//       交替存放的入射辐射（voxelrad_diffuse_single.comp 的 voxelOrderRadiationIndex，奇数阶用 cumulated 字段、
-//       偶数阶用 induced 字段），影像着色器不读取。
+// 布局（2026-11-26 起）：每个体元占 stride = 2*n_wave 个槽，前 n_wave 个槽为各波段累计的环境辐射（本函数取第 band 个）；
+//       后 n_wave 个槽是各波段按碰撞阶数交替存放的入射辐射（voxelrad_diffuse_single.comp 的 voxelOrderRadiationIndex，
+//       奇数阶用 cumulated 字段、偶数阶用 induced 字段），影像着色器不读取。此前每体元还有 64 个方向暂存槽（已取消）。
 uint voxelBandRadiationIndex(uint bufferId, uint band)
 {
-    uint stride = uint(DIFFUSE_ANGLE_NUM) + 2u * uint(setting.n_wave);
-    return bufferId * stride + uint(DIFFUSE_ANGLE_NUM) + band;
+    uint stride = 2u * uint(setting.n_wave);
+    return bufferId * stride + band;
 }
 
 // Global horizontal irradiance used to normalize optical output (HDRF).

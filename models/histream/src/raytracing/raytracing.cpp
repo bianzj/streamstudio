@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <limits>
 #include <stdexcept>
@@ -238,6 +239,16 @@ float sceneTopHeight(const RaytracingIO& io)
     if (!std::isfinite(top)) return 1.0e30f;
     return top + std::max(0.01f, 1.0e-4f * std::abs(top));
 }
+
+// 作用：offline.rgen 把非有限（NaN/Inf）路径样本丢弃时，在输出缓冲末尾（图像平面之后）的计数器上加 1；
+//   这里读回后若 > 0 就报警（正常运行应为 0；采样修正后实测 rt_crop / rt_urban 都是 0）。
+void reportDroppedSamples(float count)
+{
+    if (count >= 1.0f)
+        std::cerr << "WARNING raytracing: " << static_cast<long long>(count)
+                  << " non-finite path sample(s) were dropped by the shader; "
+                     "please report this scene (see docs/raytracing-variance-reduction.md)" << std::endl;
+}
 }
 
 
@@ -323,7 +334,14 @@ bool Raytracing::upload(std::shared_ptr<FileIO> &fileio,std::shared_ptr<Raytraci
 // 管线（含 SBT）→ 命令 → 把设置写入推送常量。
 bool Raytracing::create(std::shared_ptr<RaytracingIO> &raytracingio) {
 
-
+    // An empty scene used to reach accelstruct/BLAS creation with an empty
+    // instance list, producing a driver error before the friendly path.
+    if (!raytracingio || !raytracingio->m_meshio || !raytracingio->m_instanceio
+        || raytracingio->m_instanceio->instances.empty()
+        || (raytracingio->m_meshio->objMeshes.empty() && raytracingio->m_meshio->primMeshes.empty())) {
+        std::cerr << "RayTracing: scene has no mesh instance to trace" << std::endl;
+        return false;
+    }
     m_pBuffer->createBuffer(raytracingio);
     m_pDescriptor->createDescriptor(raytracingio);
     m_pPipeline->createPipeline(raytracingio);
@@ -368,6 +386,32 @@ bool Raytracing::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<
         fileio->m_pRaytracingXml->settingxml.skyboxEnabled;
     raytracingio->sceneSize =
         fileio->m_pRaytracingXml->scenexml.background.sceneSize;
+    raytracingio->rtSeed = fileio->m_pRaytracingXml->settingxml.rtSeed;
+    raytracingio->rtSampler = fileio->m_pRaytracingXml->settingxml.rtSampler;
+    raytracingio->rtAdaptive = fileio->m_pRaytracingXml->settingxml.rtAdaptive;
+    if (const char* adaptive = std::getenv("HISTREAM_RT_ADAPTIVE"); adaptive && *adaptive)
+        raytracingio->rtAdaptive = std::string(adaptive) != "0";
+    if (const char* scout = std::getenv("HISTREAM_RT_ADAPTIVE_SCOUT"); scout && *scout)
+        raytracingio->adaptiveScoutFraction = std::clamp(static_cast<float>(std::atof(scout)), 0.05f, 1.0f);
+    if (const char* tile = std::getenv("HISTREAM_RT_ADAPTIVE_TILE"); tile && *tile)
+        raytracingio->adaptiveTile = std::max(1, static_cast<int>(std::strtol(tile, nullptr, 10)));
+    // Environment overrides (experiments / variance measurements).
+    if (const char* seed = std::getenv("HISTREAM_RT_SEED"); seed && *seed)
+        raytracingio->rtSeed = static_cast<int>(std::strtol(seed, nullptr, 10));
+    if (const char* sampler = std::getenv("HISTREAM_RT_SAMPLER"); sampler && *sampler) {
+        const std::string name(sampler);
+        if (name == "sobol") raytracingio->rtSampler = 1;
+        else if (name == "legacy") raytracingio->rtSampler = 0;
+        else throw std::runtime_error("HISTREAM_RT_SAMPLER must be 'legacy' or 'sobol', got: " + name);
+    }
+    // The legacy sampler pins sample 0 to the pixel centre, which biases per-pixel sample counts that
+    // differ from pixel to pixel (measured +0.2% at 16 spp): adaptive sampling needs the Sobol sampler.
+    if (raytracingio->rtAdaptive && raytracingio->rtSampler == 0) {
+        std::cerr << "WARNING raytracing: adaptive sampling requires the sobol sampler; ignored" << std::endl;
+        raytracingio->rtAdaptive = false;
+    }
+    // Fewer than 8 samples per pixel leave no room for a pilot pass: run the normal path.
+    if (raytracingio->rtAdaptive && fileio->m_pRaytracingXml->settingxml.n_sample < 8) raytracingio->rtAdaptive = false;
 
     return true;
 }
@@ -392,6 +436,11 @@ bool Raytracing::updateSetting(std::shared_ptr<RaytracingIO> &raytracingio){
         std::max(0.01f, raytracingio->sceneSize.x),
         std::max(0.01f, raytracingio->sceneSize.y)};
     raytracingio->setting.sceneTop = sceneTopHeight(*raytracingio);
+    raytracingio->setting.frame = raytracingio->rtSeed;
+    if (raytracingio->rtSeed != 0 || raytracingio->rtSampler != 0)
+        std::cout << "raytracing: sampler "
+                  << (raytracingio->rtSampler != 0 ? "sobol" : "legacy")
+                  << ", seed " << raytracingio->rtSeed << std::endl;
     if (raytracingio->setting.periodicNeighborCount > 0)
         std::cout << "raytracing: periodic boundaries, traversal count "
                   << raytracingio->setting.periodicNeighborCount << ", domain "
@@ -403,12 +452,114 @@ bool Raytracing::updateSetting(std::shared_ptr<RaytracingIO> &raytracingio){
 }
 
 
+// 作用：一次完整追踪。常规：Command::run。自适应采样（rtAdaptive，可选，默认关闭）：
+//   1) 侦察遍：每像元 n0 ≈ 25% 预算（HISTREAM_RT_ADAPTIVE_SCOUT 可改）个样本，用与正式样本不同的种子，只产生单样本相对标准差 σ；
+//   2) 读回 σ，求缩放系数 s，使每像元样本数 clamp(round(s·σ), 预算/4, 预算·4) 的平均等于预算；
+//   3) 正式遍：每像元 n_i 个样本（常规种子，Sobol 序号 0 … n_i-1 连续），侦察样本不进入结果，因此分配对估计无偏。
+//   总开销 = 预算 + 侦察样本（约 +25% 样本）。
+void Raytracing::trace(std::shared_ptr<RaytracingIO> &io)
+{
+    if (!io->rtAdaptive) {
+        m_pCommand->run(io);
+        return;
+    }
+    const int total = io->n_sample;
+    const int scout = std::clamp(static_cast<int>(std::lround(io->adaptiveScoutFraction * total)), 4, total);
+    const int minCount = std::max(2, total / 4);
+    const int maxCount = 4 * total;
+    const size_t pixels = static_cast<size_t>(io->imageSize.x) * io->imageSize.y;
+    const size_t auxBase = pixels * static_cast<size_t>(io->n_wave) + 16;
+
+    io->setting.n_sample = scout;
+    io->setting.adaptivePass = 1;
+    m_pCommand->run(io);
+
+    // 读回 σ 平面（辅助平面 1）。
+    const VkDeviceSize readBytes = (auxBase + 2 * pixels) * sizeof(float);
+    VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    nvvk::Buffer readback = io->m_pAlloc->createBuffer(readBytes, usage,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    m_pVirtual->bufferToBuffer(io, *(io->m_virtualio->m_pBufferStorage), readBytes, readback);
+    const float* mapped = static_cast<const float*>(io->m_pAlloc->map(readback));
+    std::vector<float> sigma(mapped + auxBase + pixels, mapped + auxBase + 2 * pixels);
+    io->m_pAlloc->unmap(readback);
+    io->m_pAlloc->destroy(readback);
+
+    // tile 平均 σ（与着色器一致）：同一 tile 内的像元样本数相同，保持 warp 内线程负载均衡。
+    const int tile = std::max(1, io->adaptiveTile);
+    if (tile > 1) {
+        const int w = io->imageSize.x, h = io->imageSize.y;
+        std::vector<float> averaged(sigma.size());
+        for (int ty0 = 0; ty0 < h; ty0 += tile)
+            for (int tx0 = 0; tx0 < w; tx0 += tile) {
+                double sum = 0.0; int count = 0;
+                for (int y = ty0; y < std::min(ty0 + tile, h); ++y)
+                    for (int x = tx0; x < std::min(tx0 + tile, w); ++x) { sum += sigma[static_cast<size_t>(y) * w + x]; ++count; }
+                const float mean = static_cast<float>(sum / count);
+                for (int y = ty0; y < std::min(ty0 + tile, h); ++y)
+                    for (int x = tx0; x < std::min(tx0 + tile, w); ++x) averaged[static_cast<size_t>(y) * w + x] = mean;
+            }
+        sigma.swap(averaged);
+    }
+    // 二分求 s：Σ clamp(floor(s·σ + 0.5), 最小, 最大) ≥ 目标（最小的 s）。
+    const double target = static_cast<double>(total) * static_cast<double>(pixels);
+    const auto countOf = [&](double scale, float value) {
+        return std::clamp(std::floor(scale * value + 0.5), static_cast<double>(minCount), static_cast<double>(maxCount));
+    };
+    const auto countTotal = [&](double scale) {
+        double sum = 0.0;
+        for (const float value : sigma) sum += countOf(scale, value);
+        return sum;
+    };
+    double low = 0.0, high = 1.0e7;
+    for (int iteration = 0; iteration < 80; ++iteration) {
+        const double mid = 0.5 * (low + high);
+        if (countTotal(mid) >= target) high = mid; else low = mid;
+    }
+    const double scale = high;
+    int smallest = maxCount, largest = 0;
+    double sum = 0.0;
+    for (const float value : sigma) {
+        const int count = static_cast<int>(countOf(scale, value));
+        smallest = std::min(smallest, count); largest = std::max(largest, count); sum += count;
+    }
+    std::cout << "raytracing: adaptive sampling, scout " << scout << " + " << sum / static_cast<double>(std::max<size_t>(1, pixels))
+              << " samples per pixel on average (min " << smallest << ", max " << largest << "), budget " << total << std::endl;
+
+    io->setting.n_sample = total;
+    io->setting.adaptivePass = 2;
+    io->setting.adaptiveScale = static_cast<float>(scale);
+    io->setting.adaptiveMinCount = minCount;
+    io->setting.adaptiveMaxExtra = maxCount;
+    io->setting.adaptiveTile = tile;
+    m_pCommand->run(io);
+    io->setting.adaptivePass = 0;
+    io->setting.adaptiveScale = 0.0f;
+    io->setting.adaptiveMinCount = 0;
+    io->setting.adaptiveMaxExtra = 0;
+}
 // 模块：run——主循环。两种观测方式：
 //   - UAV 巡航（isUAVTrave 且 n_pos > 0）：逐航点更新传感器位置，运行并输出（中心投影）；
 //   - 常规：逐观测角 kangle 更新角度，运行并按投影类型输出 TIFF，必要时输出 albedo.txt。
 // 输出：标准输出的 PROGRESS（百分比 5→10→…→100）与 OBSERVATION 行，结果文件由 output* 写出。
 bool Raytracing::run(std::shared_ptr<RaytracingIO> &raytracingio, std::shared_ptr<FileIO> &fileio) {
 
+    if (!raytracingio || !fileio) {
+        std::cerr << "RayTracing: input/output objects are missing" << std::endl;
+        return false;
+    }
+    const bool uavTraverse = raytracingio->isUAVTrave && raytracingio->n_pos > 0;
+    if (uavTraverse) {
+        if (raytracingio->uavposes.empty()) {
+            std::cerr << "RayTracing: UAV traverse has no camera positions" << std::endl;
+            return false;
+        }
+    } else if (raytracingio->n_angle <= 0) {
+        // Both loops below would be empty, yet the function used to print
+        // PROGRESS 100 and return true -> exit code 0 with no TIFF.
+        std::cerr << "RayTracing: no observation angle or camera position is configured" << std::endl;
+        return false;
+    }
     std::cout << "PROGRESS\t5\t加载光线追踪场景与观测参数" << std::endl;
 
     // 步骤 1：若要输出 albedo，先清空旧的 albedo.txt（outputAlbedo 之后以追加方式写）。
@@ -427,7 +578,7 @@ bool Raytracing::run(std::shared_ptr<RaytracingIO> &raytracingio, std::shared_pt
 
 
     // 步骤 2：按观测方式循环；进度条 10%~95% 之间按航点/观测角均分。
-    if (raytracingio->isUAVTrave && raytracingio->n_pos > 0)
+    if (uavTraverse)
     {
         raytracingio->kangle = 0;
         for (int kpos = 0; kpos < raytracingio->n_pos; ++kpos) {
@@ -437,7 +588,7 @@ bool Raytracing::run(std::shared_ptr<RaytracingIO> &raytracingio, std::shared_pt
             std::cout << "OBSERVATION\t航点 " << (kpos + 1) << "/" << raytracingio->n_pos
                       << " X=" << position.x << " Y=" << position.y
                       << " H=" << position.z << std::endl;
-            m_pCommand->run(raytracingio);
+            trace(raytracingio);
             if (raytracingio->isImage || raytracingio->isOrth)
                 output(raytracingio, fileio, 0, kpos);
             std::cout << "PROGRESS\t" << 10 + 85 * (kpos + 1) / std::max(1, raytracingio->n_pos)
@@ -452,7 +603,7 @@ bool Raytracing::run(std::shared_ptr<RaytracingIO> &raytracingio, std::shared_pt
                       << (kangle + 1) << "/" << raytracingio->n_angle << std::endl;
             raytracingio->kangle = kangle;
             m_pGeometry->updateAngle(raytracingio,kangle);
-            m_pCommand->run(raytracingio);
+            trace(raytracingio);
 
             if (raytracingio->isImage || raytracingio->isOrth) {
                 if (fileio->m_pRaytracingXml->sensorxml.projection == Projection::PERSPECTIVE)
@@ -499,10 +650,12 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
     VkDeviceSize bufferSize = total_elements * sizeof(float);
 
     // 步骤 1：分配主机可见缓冲，把 GPU 存储缓冲拷贝进来，再深拷贝为 CPU 数组（见下方修正说明）。
-    nvvk::Buffer pixelBuffer = modelio->m_pAlloc->createBuffer(bufferSize, usage,
+    // 末尾多读 1 个 float：offline.rgen 丢弃的非有限样本计数（见 reportDroppedSamples）。
+    const VkDeviceSize readSize = bufferSize + sizeof(float);
+    nvvk::Buffer pixelBuffer = modelio->m_pAlloc->createBuffer(readSize, usage,
                                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    m_pVirtual->bufferToBuffer(modelio, *(modelio->m_virtualio->m_pBufferStorage), bufferSize, pixelBuffer);
+    m_pVirtual->bufferToBuffer(modelio, *(modelio->m_virtualio->m_pBufferStorage), readSize, pixelBuffer);
 
     // map memory
     void *data = modelio->m_pAlloc->map(pixelBuffer);
@@ -511,13 +664,11 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
     // 这是解决 0xc0000005 崩溃的核心：将显存数据拷贝到 CPU，使其脱离 Vulkan 生命周期
     // 用 std::vector 持有副本：new[] 分配失败会抛 std::bad_alloc 而不会返回空指针，原先的空指针判断没有作用；
     // 改为 vector 后析构时自动释放，也不再需要手工 delete[]。
-    std::vector<float> cpuDataStorage(total_elements);
+    std::vector<float> cpuDataStorage(total_elements + 1);
     float* pCpuData = cpuDataStorage.data();
     // 使用 memcpy 高速拷贝
-    std::memcpy(pCpuData, data, bufferSize);
-
-    // --- 此时数据已安全在 pCpuData 中，不再依赖 pData/data 指针 ---
-
+    std::memcpy(pCpuData, data, readSize);
+    reportDroppedSamples(pCpuData[total_elements]);
     // 【修正3】现在可以安全销毁 Vulkan 资源了
     modelio->m_pAlloc->unmap(pixelBuffer);
     modelio->m_pAlloc->destroy(pixelBuffer);
@@ -609,10 +760,13 @@ VkBufferUsageFlags usage{VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TR
 
 
     // 步骤 5：写多波段 TIFF；启用大气校正时模型后缀为 "_a"，波段名见 raytracingBandNames。
-    fileio->writeTIFData(
+    if (!fileio->writeTIFData(
         modelio->projectDir, pData_orth, width, height, n_wave,
         angle, -1.0f, fileio->m_pRaytracingXml->atmospherexml.enabled ? "_a" : "", kpos, false,
-        raytracingBandNames(waves, modelio->isTemperature));
+        raytracingBandNames(waves, modelio->isTemperature))) {
+        delete[] pData_orth;
+        throw std::runtime_error("RayTracing: failed to write output TIFF");
+    }
 
     // 释放内存
     // pCpuData 由 cpuDataStorage 持有，函数结束时自动释放。
@@ -635,10 +789,11 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
     VkDeviceSize bufferSize = total_elements * sizeof(float);
 
     // 步骤 1：GPU 存储缓冲 → 主机可见缓冲 → CPU 副本（同 outputOrth）。
-    nvvk::Buffer pixelBuffer = modelio->m_pAlloc->createBuffer(bufferSize, usage,
+    const VkDeviceSize readSize = bufferSize + sizeof(float);
+    nvvk::Buffer pixelBuffer = modelio->m_pAlloc->createBuffer(readSize, usage,
                                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    m_pVirtual->bufferToBuffer(modelio, *(modelio->m_virtualio->m_pBufferStorage), bufferSize, pixelBuffer);
+    m_pVirtual->bufferToBuffer(modelio, *(modelio->m_virtualio->m_pBufferStorage), readSize, pixelBuffer);
 
     // map memory
     void *data = modelio->m_pAlloc->map(pixelBuffer);
@@ -647,10 +802,11 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
     // 这是解决 0xc0000005 崩溃的核心：将显存数据拷贝到 CPU，使其脱离 Vulkan 生命周期
     // 用 std::vector 持有副本：new[] 分配失败会抛 std::bad_alloc 而不会返回空指针，原先的空指针判断没有作用；
     // 改为 vector 后析构时自动释放，也不再需要手工 delete[]。
-    std::vector<float> cpuDataStorage(total_elements);
+    std::vector<float> cpuDataStorage(total_elements + 1);
     float* pCpuData = cpuDataStorage.data();
     // 使用 memcpy 高速拷贝
-    std::memcpy(pCpuData, data, bufferSize);
+    std::memcpy(pCpuData, data, readSize);
+    reportDroppedSamples(pCpuData[total_elements]);
 
     // --- 此时数据已安全在 pCpuData 中，不再依赖 pData/data 指针 ---
 
@@ -707,10 +863,12 @@ void Raytracing::output(std::shared_ptr<RaytracingIO>& modelio, std::shared_ptr<
     }
 
     // 步骤 5：写多波段 TIFF（参数同 outputOrth）。
-    fileio->writeTIFData(
+    if (!fileio->writeTIFData(
         modelio->projectDir, pCpuData, width, height, n_wave,
         angle, -1.0f, fileio->m_pRaytracingXml->atmospherexml.enabled ? "_a" : "", kpos, false,
-        raytracingBandNames(waves, modelio->isTemperature));
+        raytracingBandNames(waves, modelio->isTemperature))) {
+        throw std::runtime_error("RayTracing: failed to write output TIFF");
+    }
 
     // 释放内存
     // pCpuData 由 cpuDataStorage 持有，函数结束时自动释放。
@@ -792,15 +950,20 @@ void Raytracing::outputAlbedo(std::shared_ptr<RaytracingIO>& modelio, std::share
 bool Raytracing::destroy( std::shared_ptr<RaytracingIO> &raytracingio)
 {
 
-    m_pBuffer->destroy(raytracingio);
-    m_pDescriptor->destroy(raytracingio);
+    // Wait before destroying anything that may still be referenced by an
+    // in-flight command buffer.
+    vkDeviceWaitIdle(raytracingio->m_device);
+    // Pipeline (and its pipeline layout) references the descriptor-set layout;
+    // destroy it before the descriptor module, otherwise the layout outlives
+    // its last reference.
     m_pPipeline->destroy(raytracingio);
+    m_pDescriptor->destroy(raytracingio);
+    m_pBuffer->destroy(raytracingio);
     m_pCommand->destroy(raytracingio);
 
     raytracingio->m_sbtWrapper.destroy();
     raytracingio->m_pAccelStruct->m_rtBuilder.destroy();
 
-    vkDeviceWaitIdle(raytracingio->m_device);
     raytracingio->m_genCmdBuf.deinit();
 //    vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
 //    vkDestroyCommandPool(m_device, m_cmdPool, nullptr);

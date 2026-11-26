@@ -22,6 +22,9 @@
 
 #include "buffer.h"
 #include "base/outputsize.h"
+#include "base/voxellimits.h"
+#include "base/voxelflags.h"
+#include "base/proxymesh.h"
 
 #include <algorithm>
 #include <array>
@@ -56,6 +59,28 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
 
     // 步骤 1：光谱、固定光谱、热参数与冠层表，非空时才上传为存储缓冲。
     nvvk::CommandPool cmdGen(m_device, m_queue.familyIndex);
+
+    // Scene-size limits: every per-voxel table below is a descriptor-bound storage buffer (<= maxStorageBufferRange)
+    // and the 1D dispatches need ceil(N/64) work groups. Explicit errors with the voxel count and the limit; before
+    // this check an oversize scene was truncated or read out of bounds without any message. The radiance buffer
+    // (voxelRads) is addressed by device address with 64-bit element indices (shader/voxel_radindex.glsl), so only
+    // the VRAM of the machine limits it.
+    if (n_voxel > 0) {
+        const uint64_t voxels = static_cast<uint64_t>(n_voxel);
+        const VkPhysicalDevice device = voxellstio->m_physicalDevice;
+        voxellimits::requireStorageRange(device, "VoxelEB", "voxel link", voxels, sizeof(VoxelLink));
+        voxellimits::requireStorageRange(device, "VoxelEB", "voxel direction", voxels, sizeof(VoxelDir));
+        voxellimits::requireStorageRange(device, "VoxelEB", "voxel temperature", voxels, sizeof(VoxelTempe));
+        voxellimits::requireStorageRange(device, "VoxelEB", "voxel net radiation", voxels, sizeof(VoxelNetRad));
+        voxellimits::requireStorageRange(device, "VoxelEB", "voxel PAR", voxels, sizeof(VoxelPnet));
+        voxellimits::requireStorageRange(device, "VoxelEB", "aerodynamic resistance", voxels, sizeof(VoxelRaa));
+        voxellimits::requireStorageRange(device, "VoxelEB", "surface resistance", voxels, sizeof(VoxelRss));
+        voxellimits::requireStorageRange(device, "VoxelEB", "leaf air state", voxels, sizeof(VoxelAir));
+        voxellimits::requireStorageRange(device, "VoxelEB", "heat flux", voxels, sizeof(VoxelHeatflux));
+        voxellimits::requireStorageRange(device, "VoxelEB", "temperature history (TLAST)", voxels,
+                                         static_cast<uint64_t>(TLASTNUM) * sizeof(TLAST));
+        voxellimits::requireDispatch(device, "VoxelEB", voxels, GROUP_SIZEX);
+    }
 
     // spectral
     if (meshio->spectrals.size() > 0)
@@ -518,8 +543,21 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     ///  Scene properties
     ///--------------------------------------------------------------------
     // obj models buffer
+    // Proxy-geometry vertex format (control.voxelProxyGeometry / HISTREAM_VOXEL_PROXY, src/base/proxymesh.h).
+    const int proxyMode = voxelflags::proxyMode(voxellstio->voxelFlags);
+    if (std::getenv("HISTREAM_VOXEL_PROXY_STATS"))
+        std::cout << "PROXY_GEOMETRY\tmodel=VoxelEB\tmode=" << proxymesh::modeName(proxyMode) << std::endl;
     for (int kmodel = 0; kmodel < meshio->primMeshes.size(); kmodel++)
     {
+        if (proxyMode != voxelflags::kProxyFull)
+        {
+            meshio->m_bufferMeshes.emplace_back(proxymesh::uploadPositionMesh(
+                *m_pAlloc, voxellstio->m_physicalDevice, m_device, m_queue.familyIndex, m_queue.queue,
+                "VoxelEB", static_cast<size_t>(kmodel), meshio->primMeshes[kmodel], proxyMode));
+            continue;
+        }
+        // Legacy 44-byte vertices: both buffers and their same-size staging buffers must fit one allocation.
+        proxymesh::requireFullMeshFits(voxellstio->m_physicalDevice, "VoxelEB", static_cast<size_t>(kmodel), meshio->primMeshes[kmodel]);
         nvvk::CommandPool cmdBufGet(m_device, m_queue.familyIndex, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, m_queue.queue);
         VkCommandBuffer cmdBufModel = cmdBufGet.createCommandBuffer();
         MeshBuffer model;
@@ -545,7 +583,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     for (int kmodel = 0; kmodel < meshio->primMeshes.size(); kmodel++)
     {
         meshio->meshLinks[kmodel].vertexAddress = nvvk::getBufferDeviceAddress(m_device, meshio->m_bufferMeshes[kmodel].vertexBuffer.buffer);
-        meshio->meshLinks[kmodel].indexAddress = nvvk::getBufferDeviceAddress(m_device, meshio->m_bufferMeshes[kmodel].indexBuffer.buffer);
+        meshio->meshLinks[kmodel].indexAddress = meshio->m_bufferMeshes[kmodel].indexed
+            ? nvvk::getBufferDeviceAddress(m_device, meshio->m_bufferMeshes[kmodel].indexBuffer.buffer) : 0;
     }
     meshio->m_pBufferMeshLink = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(cmdBufModelLink, meshio->meshLinks, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
     cmdGen.submitAndWait(cmdBufModelLink);
@@ -588,6 +627,8 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     ///--------------------------------------------------------------------
     ///  Accelerate properties
     ///--------------------------------------------------------------------
+    m_pAccelStruct->m_physicalDevice = voxellstio->m_physicalDevice;  // explicit BLAS size checks (voxel modes only)
+    m_pAccelStruct->m_modelName = "VoxelEB";
     m_pAccelStruct->createAccelStruct(m_device,meshio,instanceio);
 
     // 步骤 6：观测/光源几何缓冲：传感器、光源 uniform；波长、大气条件存储缓冲；再建体元方向缓冲。
@@ -640,28 +681,40 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
     // groups reuse the first group's uncollided-sky trace
     // (voxelrad_scattering_VNIR.comp stage 4), then the optical image's
     // multiple-scattering environment (N x n_wave floats,
-    // shader/voxeleb/image_environment.glsl). The shaders index the buffer
-    // with 32-bit VoxelRad entries; the environment is left out (image keeps
-    // single scattering) if its entries would not fit.
-    const VkDeviceSize fieldEntries = static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * 3 / 2;
+    // shader/voxeleb/image_environment.glsl). The shaders address the buffer by
+    // device address with 64-bit element indices (shader/voxel_radindex.glsl), so the
+    // former 2^32-entry limit (44.7 M voxels, silently wrapping the sky cache and
+    // dropping the environment slots) is gone; only the available VRAM limits it.
+    // (voxelflags::testRadianceVoxels: test knob that pretends a larger voxel count for the layout, normally == n_voxel.)
+    const VkDeviceSize layoutVoxels = static_cast<VkDeviceSize>(voxelflags::testRadianceVoxels(n_voxel));
     const VkDeviceSize environmentFloats =
-        static_cast<VkDeviceSize>(n_voxel) * static_cast<VkDeviceSize>(std::max(voxellstio->n_wave, 0));
-    const bool imageEnvironment = environmentFloats > 0
-        && fieldEntries + (environmentFloats + 1) / 2 <= VkDeviceSize(UINT32_MAX);
+        layoutVoxels * static_cast<VkDeviceSize>(std::max(voxellstio->n_wave, 0));
+    const bool imageEnvironment = environmentFloats > 0;
     voxellstio->setting.imageEnvironment = imageEnvironment ? 1 : 0;
     // 总字节数 = 辐射场 + 各方向天空间隙透射率 + （可选）图像多次散射环境；
     // 环境部分每个 VoxelRad 容纳 2 个 float，故按 (n+1)/2 个条目计。
-    const VkDeviceSize radianceBytes = static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(VoxelRad)
-        + static_cast<VkDeviceSize>(n_voxel) * DIFFUSENUM * sizeof(float)
+    const VkDeviceSize radianceBytes = layoutVoxels * DIFFUSENUM * sizeof(VoxelRad)
+        + layoutVoxels * DIFFUSENUM * sizeof(float)
         + (imageEnvironment ? (environmentFloats + 1) / 2 * sizeof(VoxelRad) : 0);
     auto& radianceAllocator = voxellstio->m_radianceAllocator;
     // 辐射场缓冲很大，用单独的专用分配器分配并由 VoxelebIO 持有（具体原因待核对）。
     radianceAllocator = std::make_unique<nvvk::ResourceAllocatorDedicated>(
         m_device, voxellstio->m_physicalDevice);
-    voxelio->m_pRadsBuffer = std::make_shared<nvvk::Buffer>(radianceAllocator->createBuffer(
-        radianceBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-    if (!voxelio->m_pRadsBuffer->buffer) throw std::runtime_error("Cannot allocate voxel radiance buffer");
+    const auto radianceFailure = [&](const std::string& reason) {
+        return std::runtime_error("VoxelEB: cannot allocate the radiance buffer for " + voxellimits::grouped(static_cast<uint64_t>(layoutVoxels))
+            + " voxels (" + voxellimits::grouped(radianceBytes) + " bytes, "
+            + std::to_string(radianceBytes / std::max<VkDeviceSize>(layoutVoxels, 1))
+            + " B per voxel at n_wave=" + std::to_string(std::max(voxellstio->n_wave, 0)) + "): " + reason
+            + ". Reduce the scene size, the voxel count or the number of sensor bands.");
+    };
+    try {
+        voxelio->m_pRadsBuffer = std::make_shared<nvvk::Buffer>(radianceAllocator->createBuffer(
+            radianceBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+    } catch (const std::exception& error) {
+        throw radianceFailure(error.what());
+    }
+    if (!voxelio->m_pRadsBuffer->buffer) throw radianceFailure("the allocation returned no buffer (out of device memory)");
     vkCmdFillBuffer(cmdBufRads, voxelio->m_pRadsBuffer->buffer, 0, radianceBytes, 0);
     cmdGen.submitAndWait(cmdBufRads);
     voxellstio->setting.radianceAddress =
@@ -876,6 +929,10 @@ bool Buffer::createBuffer(std::shared_ptr<VoxelebIO> &voxellstio){
             soilMemoryUsed = soilMemoryUsed || (soil.method == 1 && soil.inertiaHistory == 1);
         const size_t memoryElements = soilMemoryUsed
             ? static_cast<size_t>(n_voxel) * static_cast<size_t>(SOIL_MEMORY_MODES) : 1U;
+        if (soilMemoryUsed)
+            voxellimits::requireStorageRange(voxellstio->m_physicalDevice, "VoxelEB", "soil inertia history",
+                                             static_cast<uint64_t>(n_voxel),
+                                             static_cast<uint64_t>(SOIL_MEMORY_MODES) * sizeof(glm::vec2));
         std::vector<glm::vec2> soilMemory(memoryElements, glm::vec2(0.0f));
         auto cmdBufSoilMemory = cmdGen.createCommandBuffer();
         voxelio->m_pSoilMemoryBuffer = std::make_shared<nvvk::Buffer>(m_pAlloc->createBuffer(
@@ -996,7 +1053,7 @@ void Buffer::destroy(std::shared_ptr<VoxelebIO> &voxellstio){
     for (int i = 0; i < meshio->m_bufferMeshes.size(); i++)
     {
         m_pAlloc->destroy((meshio->m_bufferMeshes[i].vertexBuffer));
-        m_pAlloc->destroy((meshio->m_bufferMeshes[i].indexBuffer));
+        if (meshio->m_bufferMeshes[i].indexBuffer.buffer) m_pAlloc->destroy((meshio->m_bufferMeshes[i].indexBuffer));
     }
 
     if (voxellstio->atomconds.size() > 0)

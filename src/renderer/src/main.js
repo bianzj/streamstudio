@@ -3109,10 +3109,12 @@ function syncSensorSamplingXml() {
 function bindInspector() {
   const c = state.config
   if (!c) return
-  // DEFERRED[中|Bug]: sceneX/sceneY/sceneHeight/voxelSize/rayDepth/couplingIterations/sensorX/sensorY 等只校验“有限数”，不校验 min（HTML min 属性不阻止 change 提交），0 或负值会写进 project.json 交给引擎（体元 0 m、分辨率 0、尺寸负数）；预览侧 generateWorld 用 Math.max 兜底掩盖了问题；建议：为这些字段传入带下限/取整的 converter，与 project-schema 的 normalize 规则保持一致 —— bindValue 已能拦住空串/非有限值（回退原值），但“下限”需要为每个字段新增数值约束并与服务端 normalize 对齐，本轮禁止新增/修改数值常量
+  // 场景/采样数值在 bindValue 的 converter 中限幅（下限/取整），与 validateProject 保持一致。
   // 场景尺寸与体元大小：修改后需重建场景，并让 VoxelEB 的步数上限随质量档位重算。
-  bindValue('sceneX', (v) => followQualityPresetScene(() => c.scene.x = v), Number, true); bindValue('sceneY', (v) => followQualityPresetScene(() => c.scene.y = v), Number, true)
-  bindValue('sceneHeight', (v) => followQualityPresetScene(() => c.scene.height = v), Number, true); bindValue('voxelSize', (v) => followQualityPresetScene(() => c.scene.voxel = v)); bindValue('voxelFillThreshold', (v) => c.scene.voxelFillThreshold = Math.min(1, Math.max(0, v)))
+  // 下限与 validateProject 保持一致，避免 0/负数写进 project.json 后才在保存时失败。
+  const positiveScene = (value) => Math.max(0.01, Number(value) || 0.01)
+  bindValue('sceneX', (v) => followQualityPresetScene(() => c.scene.x = v), positiveScene, true); bindValue('sceneY', (v) => followQualityPresetScene(() => c.scene.y = v), positiveScene, true)
+  bindValue('sceneHeight', (v) => followQualityPresetScene(() => c.scene.height = v), (value) => Math.max(0, Number(value) || 0), true); bindValue('voxelSize', (v) => followQualityPresetScene(() => c.scene.voxel = v), (value) => Math.max(0.0001, Number(value) || 0.0001)); bindValue('voxelFillThreshold', (v) => c.scene.voxelFillThreshold = Math.min(1, Math.max(0, v)))
   // 计算域偏移：输入过程中实时更新边界辅助框，并用 280 ms 防抖重建实际场景；
   // change 提交时取消待执行的防抖（bindValue 已做完整重建）。
   for (const [id, key] of [['sceneOffsetX', 'offsetX'], ['sceneOffsetY', 'offsetY'], ['sceneOffsetZ', 'offsetZ']]) {
@@ -3162,7 +3164,7 @@ function bindInspector() {
   bindSwitch('heterogeneousVoxelSwitch', () => Boolean(c.control.heterogeneousVoxel), (v) => c.control.heterogeneousVoxel = v)
   bindValue('voxelCollisionOrders', (v) => { c.control.voxelCollisionOrders = v; markQualityCustom('voxelCollisionOrders') }, (value) => Math.max(2, Math.min(5, Math.round(Number(value)) || 2)))
   bindValue('radiationSolver', (v) => c.control.radiationSolver = v, (value) => value === 'accelerated' ? 'accelerated' : 'traditional')
-  bindValue('couplingIterations', (v) => { c.control.couplingIterations = v; markQualityCustom('couplingIterations') })
+  bindValue('couplingIterations', (v) => { c.control.couplingIterations = v; markQualityCustom('couplingIterations') }, (value) => Math.max(1, Math.min(100, Math.round(Number(value) || 20))))
   // 质量档位与单次运行上限。
   $('#qualityPreset')?.addEventListener('change', (event) => applyQualityPreset(event.target.value))
   // 留空或 0 = 服务端默认；其他值取整并限制在 1–1440 分钟。
@@ -3177,8 +3179,8 @@ function bindInspector() {
   })
   // RT–EB 耦合与温度方法：光谱加速宽度限幅 1–1000 nm；土壤方法同时写入所有 Soil 物化属性的 params.method。
   bindValue('spectralAccelerationWidth', (v) => c.control.spectralAccelerationWidth = Math.max(1, Math.min(1000, v)), (value) => Math.max(1, Math.min(1000, Number(value) || 100)))
-  bindValue('temperatureTolerance', (v) => c.control.temperatureTolerance = v)
-  bindValue('temperatureRelaxation', (v) => c.control.temperatureRelaxation = v)
+  bindValue('temperatureTolerance', (v) => c.control.temperatureTolerance = v, (value) => Math.max(0.001, Math.min(100, Number(value) || 0.05)))
+  bindValue('temperatureRelaxation', (v) => c.control.temperatureRelaxation = v, (value) => Math.max(0.05, Math.min(1, Number(value) || 0.8)))
   bindValue('stabilityCorrection', (v) => c.control.stabilityCorrection = v === 1)
   bindValue('soilTemperatureMethod', (v) => {
     c.control.soilTemperatureMethod = Math.max(0, Math.min(2, Math.round(v)))
@@ -3273,7 +3275,15 @@ function bindInspector() {
   })
   angularStrengthInput?.addEventListener('change', () => refreshFromState(false))
   // 太阳天顶/方位角输入；方位角变化且启用主平面采样时需同步传感器采样设置。
-  const bindAngle = (id, key) => $(`#${id}`)?.addEventListener('change', (event) => { const value = finiteInputNumber(event.target); if (value === null) { event.target.value = String(c.light[key] ?? ''); return } c.light[key] = value; syncProjectText(); if (key === 'azimuth' && c.sensor.principalPlane) syncSensorSamplingXml(); refreshFromState(false) })
+  const bindAngle = (id, key) => $(`#${id}`)?.addEventListener('change', (event) => {
+    const value = finiteInputNumber(event.target)
+    if (value === null) { event.target.value = String(c.light[key] ?? ''); return }
+    // 天顶角 0–180°，方位角 -360–360°；与引擎的角度定义一致
+    c.light[key] = key === 'zenith' ? Math.max(0, Math.min(180, value)) : Math.max(-360, Math.min(360, value))
+    syncProjectText()
+    if (key === 'azimuth' && c.sensor.principalPlane) syncSensorSamplingXml()
+    refreshFromState(false)
+  })
   bindAngle('sunZenith', 'zenith'); bindAngle('sunAzimuth', 'azimuth')
   // 直射/漫射比例联动：二者之和恒为 1，拖动滑块时实时预览太阳光，释放后才刷新场景。
   const bindLightFraction = (id, sourceKey) => {
@@ -3297,10 +3307,10 @@ function bindInspector() {
     syncProjectText()
     refreshFromState(false)
   })
-  bindValue('skyTemperature', (v) => c.light.skyTemperature = v)
+  bindValue('skyTemperature', (v) => c.light.skyTemperature = v, (value) => Math.max(0, Math.min(1000, Number(value) || 250)))
   bindValue('shortwaveIrradiance', (v) => c.light.shortwaveIrradiance = Math.max(0, Math.min(2000, v)))
   // 传感器：图像分辨率、波段、投影方式、位置/视场角与航点巡航参数。
-  bindValue('sensorX', (v) => c.sensor.x = v); bindValue('sensorY', (v) => c.sensor.y = v)
+  bindValue('sensorX', (v) => c.sensor.x = v, (value) => Math.max(1, Math.round(Number(value) || 1))); bindValue('sensorY', (v) => c.sensor.y = v, (value) => Math.max(1, Math.round(Number(value) || 1)))
   $('#sensorBands')?.addEventListener('change', (event) => { c.sensor.bands = event.target.value; syncSensorSamplingXml(); renderInspector() })
   const bindSensorNumber = (id, key, minimum = -Infinity) => $(`#${id}`)?.addEventListener('change', (event) => {
     const value = finiteInputNumber(event.target)
@@ -3476,7 +3486,17 @@ async function loadActualScene(config) {
 // 作用：把打开工程/示例得到的结果装载进界面（名字沿用旧的 XML 时代，现为 project.json）。
 // 输入：result（path/content/project/projectPath 等，来自后端）。
 // 说明：影像模拟（STREAM）工程交给 streamWorkspace，不走三维流程；模拟运行中拒绝切换工程。
-function loadXml(result) {
+// 作用：切换工程/新建工程前确认未保存修改。返回 false 表示用户取消。
+function confirmDiscardChanges(action = '继续') {
+  if (!state.xmlDirty) return true
+  return window.confirm(`当前工程有未保存的修改，${action}将放弃这些修改。是否继续？`)
+}
+
+function loadXml(result, confirm = true) {
+  // Opening/reloading a project replaces the whole editor state.  Ask before
+  // silently discarding unsaved changes (the dirty flag was previously only
+  // used by the window title).
+  if (confirm && !confirmDiscardChanges('打开其他工程')) return
   if (result?.streamProject) {
     Promise.resolve(streamWorkspace.openProject(result.streamProject))
       .catch((error) => toast('无法打开影像模拟工程', error?.message || String(error), 'error'))
@@ -6647,14 +6667,32 @@ function handleSimulationEvent(event) {
       if (tail) addLog(tail)
     }
     const success = event.code === 0
-    state.progress = success ? 100 : state.progress
-    state.progressStage = success ? '模拟完成' : event.status === 'non_converged' ? '模拟未收敛，结果已保留' : '模拟异常结束'
-    addLog(success ? `模拟完成，耗时 ${(event.elapsed / 1000).toFixed(2)} 秒` : `模拟已结束，退出码 ${event.code}${event.signal ? `，信号 ${event.signal}` : ''}`, success ? 'success' : 'error')
+    const retained = event.status === 'non_converged'
+    const stopped = event.status === 'stopped'
+    const timedOut = event.status === 'timeout'
+    state.progress = success || retained ? 100 : state.progress
+    state.progressStage = success ? '模拟完成'
+      : retained ? '模拟未收敛，结果已保留'
+      : stopped ? '模拟已停止'
+      : timedOut ? '模拟超时终止'
+      : '模拟异常结束'
+    addLog(success ? `模拟完成，耗时 ${(event.elapsed / 1000).toFixed(2)} 秒`
+      : retained ? `模拟未收敛，结果已保留（耗时 ${(event.elapsed / 1000).toFixed(2)} 秒）`
+      : stopped ? '模拟已停止'
+      : timedOut ? '模拟超时终止'
+      : `模拟已结束，退出码 ${event.code}${event.signal ? `，信号 ${event.signal}` : ''}`,
+      success || retained ? 'success' : stopped ? '' : 'error')
     // Non-fatal output problems (e.g. ENVI results that could not be converted to TIFF).
     for (const warning of event.warnings || []) addLog(`结果转换提示：${warning}`, 'warning')
+    // 引擎结果诊断（如面元 zeroVisibilitySamples 占比过高）；不影响运行状态。
+    for (const warning of event.runWarnings || []) addLog(`结果质量提示：${warning}`, 'warning')
+    if (success && event.runWarnings?.length) toast('模拟完成（有质量提示）', event.runWarnings[0], 'warning')
     if (success && event.warnings?.length) toast('模拟完成', `${event.warnings.length} 个结果文件未能转换为 TIFF，详见日志`, 'warning')
-    // DEFERRED[低|可维护性]: 下一行 if (!success) 只作用于 toast，setRunning(false)/renderRunProgress 实际无条件执行，但写在同一行极易被误读或在后续修改时误改为条件执行；建议：拆成多行并为 if 加花括号 —— 行为本身正确，只是换行/加花括号的格式调整，本轮明确不做格式化
-    if (!success) toast('模拟结束', event.status === 'non_converged' ? '部分节点未达到收敛容差，结果已保留' : '退出码：' + event.code, 'error'); setRunning(false); renderRunProgress(event.elapsed)
+    if (!success && !retained) {
+      toast('模拟结束', stopped ? '模拟已停止' : timedOut ? '模拟超时终止' : '退出码：' + event.code, stopped ? '' : 'error')
+    }
+    setRunning(false)
+    renderRunProgress(event.elapsed)
     const qualityLines = runQualitySummary(state.runQuality)
     for (const line of qualityLines) addLog(line.text, line.kind)
     if (success && qualityLines.some((line) => line.kind === 'warning')) toast('模拟完成（有质量提示）', qualityLines.find((line) => line.kind === 'warning').text, 'warning')
@@ -8815,13 +8853,14 @@ async function saveProjectAs(event) {
 // 作用：按“新建工程”表单（名称、目录、模式）创建工程，成功后记住目录并加载。
 async function createProject(event) {
   event.preventDefault()
+  if (!confirmDiscardChanges('新建工程')) return
   const submit = $('#projectForm button[type="submit"]')
   const values = Object.fromEntries(new FormData($('#projectForm')).entries())
   try {
     submit.disabled = true
     const result = await api.createProject(values)
     appStorage.setItem('histreamProjectDirectory', values.directory)
-    loadXml(result)
+    loadXml(result, false)
     hideProjectDialog()
     addLog(`已创建工程：${result.projectDir}`, 'success')
     toast('工程创建成功', result.project.name)

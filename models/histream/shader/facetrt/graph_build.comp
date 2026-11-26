@@ -1,0 +1,169 @@
+// ==========================================================================
+// 文件：facetrt/graph_build.comp（FacetRT / FacetEB，GPU 端可见性图压缩为 CSR）
+// 功能：把可见性阶段写好的 64 位边哈希表（edgeKeys/edgeCounts，键 = (lo<<32)|hi）直接变成
+//   求解着色器使用的 CSR（rowOffsets + {neighbor,count} 边表），不再整表回读主机。
+//   结果与主机端 buildVisibilityGraphOnce 的 CPU 构造逐位相同：每行按邻居编号升序，
+//   无向边在两个方向各出现一次，边计数相同。
+// 阶段（推送常量 phase，每个阶段一次调度，调度之间有屏障；全部为网格步进循环）：
+//   0 count    统计非空槽（并检查 side 下标）
+//   1 compact  每个非空槽写出两个有向条目（entRow/entNbr/entCnt），并在 rowOffsets[row+1] 累计度数
+//   6/7/8      对 rowOffsets 做原位包含式前缀和（块内扫描 / 块和扫描 / 加块偏移）
+//   5 stats    最大度数与度数平方和（用于判断行内 O(d^2) 排序的代价）
+//   2 scatter  按行偏移把（邻居, 计数）散布到 tmp（行内顺序不定）
+//   3 sort     每个条目数出同行中邻居编号更小的条目数 = 它在行内的位置，写入 outEdges
+//              （邻居编号在行内唯一，所以名次唯一）
+//   4 rowsums  每行边计数之和（uint64），主机据此计算闭合误差
+// 绑定：0 edgeKeys，1 edgeCounts，2 entRow，3 entNbr，4 entCnt，5 rowOffsets（sides+1），
+//   6 cursor（sides），7 tmp，8 outEdges，9 blockSums，10 control，11 rowSums。
+// ==========================================================================
+
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+
+#define EMPTY_KEY 0xfffffffffffffffful
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer EdgeKeys { uint64_t edgeKeys[]; };
+layout(std430, set = 0, binding = 1) readonly buffer EdgeCounts { uint edgeCounts[]; };
+layout(std430, set = 0, binding = 2) buffer EntRow { uint entRow[]; };
+layout(std430, set = 0, binding = 3) buffer EntNbr { uint entNbr[]; };
+layout(std430, set = 0, binding = 4) buffer EntCnt { uint entCnt[]; };
+layout(std430, set = 0, binding = 5) buffer RowOffsets { uint rowOffsets[]; };
+layout(std430, set = 0, binding = 6) buffer Cursor { uint cursor[]; };
+layout(std430, set = 0, binding = 7) buffer Tmp { uvec2 tmp[]; };
+layout(std430, set = 0, binding = 8) buffer OutEdges { uvec2 outEdges[]; };
+layout(std430, set = 0, binding = 9) buffer BlockSums { uint blockSums[]; };
+layout(std430, set = 0, binding = 10) buffer Control {
+    uint occupied;
+    uint errorFlag;
+    uint maxDegree;
+    uint entryCursor;
+    uint64_t sumSquares;
+} control;
+layout(std430, set = 0, binding = 11) buffer RowSums { uint64_t rowSums[]; };
+
+layout(push_constant) uniform Push {
+    uint phase;
+    uint hashCapacity;
+    uint sides;
+    uint entries;
+    uint scanCount;
+    uint scanBlocks;
+    uint pad0;
+    uint pad1;
+} pc;
+
+shared uint scanShared[256];
+
+// 256 个线程的包含式扫描（Hillis-Steele），所有线程必须同时进入。
+void scanWorkgroup()
+{
+    const uint t = gl_LocalInvocationID.x;
+    for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+        const uint add = t >= offset ? scanShared[t - offset] : 0u;
+        barrier();
+        scanShared[t] += add;
+        barrier();
+    }
+}
+
+void main()
+{
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint t = gl_LocalInvocationID.x;
+
+    if (pc.phase == 0u || pc.phase == 1u) {
+        for (uint slot = gid; slot < pc.hashCapacity; slot += stride) {
+            const uint64_t key = edgeKeys[slot];
+            const uint count = edgeCounts[slot];
+            if (key == EMPTY_KEY || count == 0u) continue;
+            const uint a = uint(key >> 32);
+            const uint b = uint(key);
+            if (a >= pc.sides || b >= pc.sides) {
+                atomicOr(control.errorFlag, 1u);
+                continue;
+            }
+            if (pc.phase == 0u) {
+                atomicAdd(control.occupied, 1u);
+            } else {
+                const uint pos = atomicAdd(control.entryCursor, 2u);
+                entRow[pos] = a;      entNbr[pos] = b;      entCnt[pos] = count;
+                entRow[pos + 1u] = b; entNbr[pos + 1u] = a; entCnt[pos + 1u] = count;
+                atomicAdd(rowOffsets[a + 1u], 1u);
+                atomicAdd(rowOffsets[b + 1u], 1u);
+            }
+        }
+    } else if (pc.phase == 6u) {
+        // 块内扫描：每个工作组 1024 个元素，每个线程 4 个连续元素。
+        const uint base = gl_WorkGroupID.x * 1024u + t * 4u;
+        uint v[4];
+        uint total = 0u;
+        for (uint k = 0u; k < 4u; ++k) {
+            v[k] = base + k < pc.scanCount ? rowOffsets[base + k] : 0u;
+            total += v[k];
+        }
+        scanShared[t] = total;
+        barrier();
+        scanWorkgroup();
+        uint running = scanShared[t] - total;
+        for (uint k = 0u; k < 4u; ++k) {
+            running += v[k];
+            if (base + k < pc.scanCount) rowOffsets[base + k] = running;
+        }
+        if (t == 255u) blockSums[gl_WorkGroupID.x] = scanShared[255];
+    } else if (pc.phase == 7u) {
+        // 块和扫描：单工作组，按 256 个一组带进位。
+        uint carry = 0u;
+        for (uint tile = 0u; tile < pc.scanBlocks; tile += 256u) {
+            const uint index = tile + t;
+            scanShared[t] = index < pc.scanBlocks ? blockSums[index] : 0u;
+            barrier();
+            scanWorkgroup();
+            if (index < pc.scanBlocks) blockSums[index] = carry + scanShared[t];
+            const uint tileTotal = scanShared[255];
+            barrier();
+            carry += tileTotal;
+        }
+    } else if (pc.phase == 8u) {
+        if (gl_WorkGroupID.x > 0u) {
+            const uint add = blockSums[gl_WorkGroupID.x - 1u];
+            const uint base = gl_WorkGroupID.x * 1024u + t * 4u;
+            for (uint k = 0u; k < 4u; ++k) {
+                if (base + k < pc.scanCount) rowOffsets[base + k] += add;
+            }
+        }
+    } else if (pc.phase == 5u) {
+        for (uint row = gid; row < pc.sides; row += stride) {
+            const uint degree = rowOffsets[row + 1u] - rowOffsets[row];
+            atomicMax(control.maxDegree, degree);
+            atomicAdd(control.sumSquares, uint64_t(degree) * uint64_t(degree));
+        }
+    } else if (pc.phase == 2u) {
+        for (uint i = gid; i < pc.entries; i += stride) {
+            const uint row = entRow[i];
+            const uint position = rowOffsets[row] + atomicAdd(cursor[row], 1u);
+            tmp[position] = uvec2(entNbr[i], entCnt[i]);
+        }
+    } else if (pc.phase == 3u) {
+        for (uint i = gid; i < pc.entries; i += stride) {
+            const uint row = entRow[i];
+            const uint begin = rowOffsets[row];
+            const uint end = rowOffsets[row + 1u];
+            const uint neighbor = entNbr[i];
+            uint rank = 0u;
+            for (uint j = begin; j < end; ++j) {
+                rank += tmp[j].x < neighbor ? 1u : 0u;
+            }
+            outEdges[begin + rank] = uvec2(neighbor, entCnt[i]);
+        }
+    } else if (pc.phase == 4u) {
+        for (uint row = gid; row < pc.sides; row += stride) {
+            uint64_t sum = 0ul;
+            for (uint j = rowOffsets[row]; j < rowOffsets[row + 1u]; ++j) sum += uint64_t(outEdges[j].y);
+            rowSums[row] = sum;
+        }
+    }
+}

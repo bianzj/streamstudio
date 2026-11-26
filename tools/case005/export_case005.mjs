@@ -33,6 +33,8 @@ for (const scenario of ['grass','pv_grass']) {
     const out=path.join(root,'sensor',scenario,group);
     fs.mkdirSync(path.join(out,'.facet_steps'),{recursive:true});
     fs.copyFileSync(path.join(source,'faceteb.json'),path.join(out,'faceteb.json'));
+    // control.facetOutputFormat=binary: geometry arrays are in faceteb.bin next to the JSON.
+    (await import(pathToFileURL(path.join(process.env.STREAMSTUDIO_ROOT || 'C:/work/streamstudio','server/facet-result.mjs')))).copyFacetSidecars(path.join(source,'faceteb.json'),out);
     fs.copyFileSync(path.join(source,'.facet_steps/components.bin'),path.join(out,'.facet_steps/components.bin'));
     const project=JSON.parse(fs.readFileSync(path.join(root,'scenarios',scenario,'project.json')));
     // 传感器设置：96 x 96 像元，只出温度图（image/temperature），关闭过程量输出；

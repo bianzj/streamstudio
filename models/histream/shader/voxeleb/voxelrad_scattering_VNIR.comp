@@ -50,6 +50,7 @@
 #include "../functions.glsl"
 #include "../surface_brdf.glsl"
 #include "../shade_state_voxel.glsl"
+#include "../voxel_radindex.glsl"
 #include "scatter_stats.glsl"
 #include "image_environment.glsl"
 
@@ -152,7 +153,7 @@ float groupIllumination(bool direct) {
 #ifndef SCATTER_TRACE_STAGE
 // 模块（stage 2）：为体元 voxel 构造第 scatteringOrder 阶的散射源 induced[出射方向]。
 // 输入：上一阶（或未碰撞）入射场 cumulated、光谱组光学特性、日照比例 voxelDirs.solar。
-// 输出：voxelRads[voxel*N + outgoing].induced。
+// 输出：VOXEL_RAD(voxel*N + outgoing).induced。
 // 步骤：1 非植被直接拷贝入射场；2 植被：预处理 G 投影、介质相函数归一化；
 //       3 一阶时加入太阳束一次散射（LIDF 用精确 Gamma，介质用 HG，球叶用球形相函数）；
 //       4 对每个出射方向累加 Σ 入射×散射核（Kahan 补偿求和）。
@@ -161,8 +162,8 @@ void buildSource(uint voxel, uint mesh) {
         // OBJ surface normals belong to the actual intersection, not to a
         // cell. Keep incoming data; the terminal surface hit integrates BRDF.
         for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle) {
-            uint index = voxel*DIFFUSE_ANGLE_NUM + angle;
-            voxelRads[index].induced = checkedScatteringRadiance(voxelRads[index].cumulated);
+            uint64_t index = VOXEL_RAD_FIELD(voxel, angle);
+            VOXEL_RAD(index).induced = checkedScatteringRadiance(VOXEL_RAD(index).cumulated);
         }
         return;
     }
@@ -184,7 +185,7 @@ void buildSource(uint voxel, uint mesh) {
         projection[angle] = leafLidf
             ? max(CanopyDiffuseG(canopy, angle), 1.0e-6) : 1.0;
     for(uint incoming = 0; incoming < DIFFUSE_ANGLE_NUM; ++incoming) {
-        incident[incoming] = checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + incoming].cumulated);
+        incident[incoming] = checkedScatteringRadiance(VOXEL_RAD(VOXEL_RAD_FIELD(voxel, incoming)).cumulated);
         if(medium) {
             float sum = 0.0;
             for(uint outgoing = 0; outgoing < DIFFUSE_ANGLE_NUM; ++outgoing)
@@ -268,7 +269,7 @@ void buildSource(uint voxel, uint mesh) {
             // Fields are pi*L; DeltaOmega=4*pi/N, so pi*p = (N/4)*probability.
             source += primary * (float(DIFFUSE_ANGLE_NUM) / 4.0) * kernel;
         }
-        voxelRads[voxel*DIFFUSE_ANGLE_NUM + outgoing].induced = checkedScatteringRadiance(source);
+        VOXEL_RAD(VOXEL_RAD_FIELD(voxel, outgoing)).induced = checkedScatteringRadiance(source);
     }
 }
 
@@ -292,7 +293,7 @@ float surfaceSource(uint voxel, uint mesh, vec3 outgoing, vec3 normal) {
         float weight = surfaceReflectanceWeight(type, bio, reflectance, wi,
             outgoing, n, meshLinks[mesh].angularEffectStrength);
         compensatedAdd(result, correction,
-            checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + incoming].induced)
+            checkedScatteringRadiance(VOXEL_RAD(VOXEL_RAD_FIELD(voxel, incoming)).induced)
                 * weight * cosine * (4.0 / float(DIFFUSE_ANGLE_NUM)));
     }
     vec3 solar = normalize(lightSet.direction);
@@ -332,16 +333,29 @@ float escapeSegmentSource(vec3 start, vec3 direction, uint angle, bool transmitt
     // （周期边界只裁剪竖直方向，非周期最长 4096）。
     vec3 a = start + semi;
     vec3 dir = normalize(direction);
+    vec3 lo = vec3(0.0);
     vec3 hi = vec3(setting.voxelSize);
+    // HDDA (functions.glsl, TurbidSkipEnabled): clip to the occupied bounding box of the NanoVDB
+    // grid and step over empty NanoVDB blocks. Periodic walks only clip the vertical range
+    // (x and z wrap); the dropped cells carry no extinction, hence no source either.
+    bool skip = TurbidSkipEnabled();
+    if(skip) {
+        lo.y = max(lo.y, float(turbidGridLo.y));
+        if(!periodic) {
+            lo.xz = max(lo.xz, vec2(turbidGridLo.xz));
+            hi.xz = min(hi.xz, vec2(turbidGridHi.xz + ivec2(1)));
+        }
+        hi.y = min(hi.y, float(turbidGridHi.y + 1));
+    }
     if(periodic) hi.y = min(hi.y, TurbidGridTop());
     float t0 = 0.0;
     float t1 = periodic ? 1.0e30 : 4096.0;
     for(int axis = 0; axis < 3; ++axis) {
         if(periodic && axis != 1) continue;
         if(abs(dir[axis]) < 1.0e-9) {
-            if(a[axis] < 0.0 || a[axis] > hi[axis]) return 0.0;
+            if(a[axis] < lo[axis] || a[axis] > hi[axis]) return 0.0;
         } else {
-            float ta = -a[axis] / dir[axis];
+            float ta = (lo[axis] - a[axis]) / dir[axis];
             float tb = (hi[axis] - a[axis]) / dir[axis];
             t0 = max(t0, min(ta, tb));
             t1 = min(t1, max(ta, tb));
@@ -379,12 +393,31 @@ float escapeSegmentSource(vec3 start, vec3 direction, uint angle, bool transmitt
             lookup.x -= tile.x * period.x;
             lookup.z -= tile.y * period.y;
         }
-        int id = nanovdbGet(turbidGridLink, lookup);
+        int id;
+        if(skip) {
+            int dim;
+            id = nanovdbGetDim(turbidGridLink, lookup, dim);
+            if(id < 0 && dim > 1) {
+                // Empty NanoVDB block: no extinction, no source. Leave it in one step.
+                int exitAxis;
+                int exitCell;
+                float tExit = TurbidBlockExit(lookup, cell, dim, a, dir,
+                                              periodic ? period : ivec2(0), exitAxis, exitCell);
+                if(tExit > t) {
+                    if(tExit >= t1) break;
+                    t = tExit;
+                    TurbidDdaResume(a, dir, t, exitAxis, exitCell, cell, tMax);
+                    continue;
+                }
+            }
+        } else {
+            id = nanovdbGet(turbidGridLink, lookup);
+        }
         float extinction = TurbidCellExtinction(id, lookup, dir);
         if(extinction > 0.0 && segmentEnd > t) {
             float transmittance = exp(-extinction * (segmentEnd - t));
             if(!transmittanceOnly) {
-                float source = voxelRads[uint(id)*DIFFUSE_ANGLE_NUM + (angle ^ 1u)].induced;
+                float source = VOXEL_RAD(VOXEL_RAD_FIELD(uint(id), (angle ^ 1u))).induced;
                 compensatedAdd(incoming, correction,
                     throughput * (1.0 - transmittance) * checkedScatteringRadiance(source));
             }
@@ -453,7 +486,7 @@ float traceIncoming(uint voxel0, uint angle, vec3 origin, NanoVDBLink nano,
                 transmittance = clamp(transmittance, 0.0, 1.0);
                 if(!transmittanceOnly) {
                     // Ray travels toward the source, photons travel oppositely.
-                    float source = voxelRads[uint(voxel)*DIFFUSE_ANGLE_NUM + (angle ^ 1u)].induced;
+                    float source = VOXEL_RAD(VOXEL_RAD_FIELD(uint(voxel), (angle ^ 1u))).induced;
                     compensatedAdd(incoming, correction,
                         throughput * (1.0 - transmittance) * checkedScatteringRadiance(source));
                 }
@@ -542,7 +575,7 @@ void accumulateAbsorption(uint voxel, uint mesh) {
                 projectionSum += CanopyDiffuseG(receiverCanopy, angle);
         for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
             compensatedAdd(radiation, correction,
-                checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + angle].cumulated)
+                checkedScatteringRadiance(VOXEL_RAD(VOXEL_RAD_FIELD(voxel, angle)).cumulated)
                 * (leafWeighted ? 2.0 * CanopyDiffuseG(receiverCanopy, angle)
                     / max(projectionSum, 1.0e-6) : DIFFUSE_HEMISPHERE_AVERAGE_WEIGHT));
     } else {
@@ -553,7 +586,7 @@ void accumulateAbsorption(uint voxel, uint mesh) {
             float cosine = dot(normal, DIFFUSE_DIRECTIONS[angle]);
             if(cosine <= 0.0) continue;
             compensatedAdd(radiation, correction, cosine *
-                checkedScatteringRadiance(voxelRads[voxel*DIFFUSE_ANGLE_NUM + angle].cumulated));
+                checkedScatteringRadiance(VOXEL_RAD(VOXEL_RAD_FIELD(voxel, angle)).cumulated));
             cosineSum += cosine;
         }
         radiation = cosineSum > 0.0 ? radiation / cosineSum : 0.0;
@@ -605,16 +638,16 @@ void accumulateAbsorption(uint voxel, uint mesh) {
 // field in the same buffer (buffer.cpp allocates N*64 extra floats), two
 // directions per VoxelRad entry.
 float skyTransmittanceAt(uint voxel, uint angle) {
-    uint k = voxel*DIFFUSE_ANGLE_NUM + angle;
-    uint entry = uint(setting.voxelCount)*DIFFUSE_ANGLE_NUM + (k >> 1);
-    return (k & 1u) == 0u ? voxelRads[entry].cumulated : voxelRads[entry].induced;
+    uint64_t k = VOXEL_RAD_FIELD(voxel, angle);
+    uint64_t entry = uint64_t(setting.voxelCount)*uint64_t(DIFFUSE_ANGLE_NUM) + (k >> 1);
+    return (k & uint64_t(1)) == uint64_t(0) ? VOXEL_RAD(entry).cumulated : VOXEL_RAD(entry).induced;
 }
 
 void storeSkyTransmittance(uint voxel, uint angle, float value) {
-    uint k = voxel*DIFFUSE_ANGLE_NUM + angle;
-    uint entry = uint(setting.voxelCount)*DIFFUSE_ANGLE_NUM + (k >> 1);
-    if((k & 1u) == 0u) voxelRads[entry].cumulated = value;
-    else voxelRads[entry].induced = value;
+    uint64_t k = VOXEL_RAD_FIELD(voxel, angle);
+    uint64_t entry = uint64_t(setting.voxelCount)*uint64_t(DIFFUSE_ANGLE_NUM) + (k >> 1);
+    if((k & uint64_t(1)) == uint64_t(0)) VOXEL_RAD(entry).cumulated = value;
+    else VOXEL_RAD(entry).induced = value;
 }
 
 
@@ -658,7 +691,7 @@ void main() {
         // the group's sky irradiance changes. Bitwise identical to retracing.
         float sky = groupIllumination(false);
         for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle)
-            voxelRads[voxel*DIFFUSE_ANGLE_NUM + angle].cumulated
+            VOXEL_RAD(VOXEL_RAD_FIELD(voxel, angle)).cumulated
                 = checkedScatteringRadiance(skyTransmittanceAt(voxel, angle) * sky);
         accumulateAbsorption(voxel, mesh);
         return;
@@ -668,7 +701,7 @@ void main() {
     ConfigureTurbidGrid(nano);
     for(uint angle = 0; angle < DIFFUSE_ANGLE_NUM; ++angle) {
         float skyTransmittance;
-        voxelRads[voxel*DIFFUSE_ANGLE_NUM + angle].cumulated
+        VOXEL_RAD(VOXEL_RAD_FIELD(voxel, angle)).cumulated
             = traceIncoming(voxel, angle, origin, nano, skyTransmittance);
         if(setting.scatteringStage == 1) storeSkyTransmittance(voxel, angle, skyTransmittance);
     }

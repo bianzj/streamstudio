@@ -59,6 +59,20 @@ int nanovdbGet(inout NanoVDBLink nanoVDBLink, ivec3 pos)
 	return data;
 }
 
+// Value and edge length (cells) of the NanoVDB node/tile that holds pos, from ONE tree walk:
+// 1 = the cell is stored in a leaf; 8 / 128 / 4096 = pos lies in an absent leaf / lower node /
+// upper node (or outside the root tiles), so the whole dim-aligned block holds the background
+// value -1 (this grid only ever calls setValue, there are no active tiles). A DDA can step over
+// such a block in one go (HDDA, see TurbidBoxSegmentOpticalDepth in functions.glsl).
+int nanovdbGetDim(inout NanoVDBLink nanoVDBLink, ivec3 pos, out int dim)
+{
+	pnanovdb_coord_t ijk = pos;
+	pnanovdb_uint32_t level;
+	pnanovdb_address_t address = pnanovdb_readaccessor_get_value_address_and_level(PNANOVDB_GRID_TYPE_INT32, nanoVDBLink.buf, nanoVDBLink.accessor, ijk, level);
+	dim = level == 0u ? 1 : (level == 1u ? 8 : (level == 2u ? 128 : 4096));
+	return pnanovdb_read_int32(nanoVDBLink.buf, address);
+}
+
 
 
 #endif

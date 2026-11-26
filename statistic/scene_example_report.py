@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-from histream_statistics import colorize, draw_colorbar, load_font, read_structure
+from histream_statistics import colorize, draw_colorbar, load_font, read_result_document, read_structure
 
 
 # 作用：完整的报告流程（读取结果 → 统计 → 绘图 → 写文件），见文件头步骤 1-4。
@@ -50,7 +50,7 @@ def main() -> None:
         temperature = fields['temperature'] - 273.15
         # 几何文件路径来自结果元数据，缺省回退到上一级的 faceteb.json（兼容缺该字段的结果）。
         geometry_path = files[0].parent / structure.metadata.get('geometryFile', '../faceteb.json')
-        geometry = json.loads(geometry_path.read_text(encoding='utf-8'))
+        geometry = read_result_document(geometry_path, only=('vertexPositions',))  # JSON or binary result
         # 顶点数组按（三角形, 3 个顶点, xyz）重排；其数量必须与面元数一致。
         triangles = np.asarray(geometry['vertexPositions']).reshape(-1, 3, 3)
         assert len(triangles) == len(temperature) == len(structure.components)

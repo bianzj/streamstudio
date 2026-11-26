@@ -57,6 +57,16 @@
 
 namespace {
 
+// 体元坐标是否落在计算域 [0,N) 内。竖直方向用与 OBJ 路径相同的
+// sceneSize.z/stepsize_surface 计算层数（voxelSize_XZY.y 在此处并未赋值）。
+template <typename IO>
+bool insideVoxelDomain(const IO& io, const glm::ivec3& id) {
+    const int height = std::max(1, static_cast<int>(std::ceil(
+        io.sceneSize_XYZ.z / std::max(0.01f, io.stepsize_surface))));
+    return id.x >= 0 && id.y >= 0 && id.z >= 0
+        && id.x < io.voxelSize_XZY.x && id.y < height && id.z < io.voxelSize_XZY.z;
+}
+
 // DEM 高程场缓存：path 为请求的文件路径；values 为 width×height 的行主序高程（m，
 // 无效像元已替换为最小值）；minimum 为有效高程的最小值；valid 表示读取成功。
 struct DemHeightField {
@@ -1696,9 +1706,10 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
                 ? -1 : meshIdByProperty[meshIndex];
             instance.object2worldMatrix = objectTransform;
             instance.world2objectMatrix =
-                glm::transpose(glm::inverse(objectTransform));
+                glm::inverse(objectTransform);
             instanceIdByProperty[meshIndex] = instanceCount + addedInstanceCount;
-            // DEFERRED[低] 可维护性: 字段名为 world2objectMatrix，实际存放的是 inverse 的转置（法向矩阵）；全文件一致如此，但若任一着色器/CPU 代码按名字用它把世界坐标点变换到物体空间，平移分量会落在第 4 行而得到错误结果；建议：改名为 normalMatrix，或另存真正的 inverse。
+            // world2objectMatrix stores the true inverse of objectTransform;
+            // shaders transform normals with transpose(mat3(world2objectMatrix)).
             instanceio->instances.emplace_back(instance);
 
             InstanceLink instanceLink{};
@@ -1948,7 +1959,7 @@ bool createObjFilledVoxels(Scene* scene, PrimEntity& entity,
         Instance instance{};
         instance.meshId = proxyMeshId;
         instance.object2worldMatrix = proxyTransform;
-        instance.world2objectMatrix = glm::transpose(glm::inverse(proxyTransform));
+        instance.world2objectMatrix = glm::inverse(proxyTransform);
         instanceio->instances.emplace_back(instance);
         InstanceLink instanceLink{};
         instanceLink.meshId = static_cast<uint32_t>(proxyMeshId);
@@ -2063,7 +2074,7 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
     glm::vec3 bgScale = glm::vec3{1.0, 1.0, 1.0};
     glm::mat4 bgMat = glm::scale(bgunit, bgScale) * glm::translate(bgunit,bgShift);
     bgInstance.object2worldMatrix = bgMat;
-    bgInstance.world2objectMatrix = glm::transpose(glm::inverse(bgMat));
+    bgInstance.world2objectMatrix = glm::inverse(bgMat);
     instanceio->instances.emplace_back(bgInstance);
 
 
@@ -2210,7 +2221,7 @@ bool Scene::createObjScene(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Rayt
                 glm::mat4 rotation = glm::rotate(unit, glm::radians(-angle0), glm::vec3(0.0, 1.0, 0.0));
                 glm::mat4 mat = glm::translate(unit, shift) * rotation * glm::scale(unit, scale);
                 instance.object2worldMatrix = mat;
-                instance.world2objectMatrix = glm::transpose(glm::inverse(mat));
+                instance.world2objectMatrix = glm::inverse(mat);
                 instanceio->instances.emplace_back(instance);
 
                 /// ------------------------------------
@@ -2434,7 +2445,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
         Instance instance1{};
         instance1.meshId = static_cast<uint32_t>(n_modelmesh);
         instance1.object2worldMatrix = mat;
-        instance1.world2objectMatrix = glm::transpose(glm::inverse(mat));
+        instance1.world2objectMatrix = glm::inverse(mat);
         instanceio->instances.emplace_back(instance1);
         // voxel Instance Link
         InstanceLink instancelink1{};
@@ -2458,6 +2469,10 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
                                               modelio->stepsize_surface)) continue;
             if (isParticipatingMedium) mediumVoxelCount++;
             glm::ivec3 Id = shift0 + localVoxel;
+            // Primitive/base entities must be clipped to [0,N) exactly like
+            // the OBJ path; otherwise out-of-domain cells enter NanoVDB and
+            // periodic wrap maps them onto unrelated cells.
+            if (!insideVoxelDomain(*modelio, Id)) continue;
             int test = acc.getValue(nanovdb::Coord(Id.x, Id.y, Id.z));
 
             // the first bufferid;
@@ -2617,7 +2632,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
             Instance instance1{};
             instance1.meshId = static_cast<uint32_t>(n_modelmesh);
             instance1.object2worldMatrix = mat;
-            instance1.world2objectMatrix = glm::transpose(glm::inverse(mat));
+            instance1.world2objectMatrix = glm::inverse(mat);
             instanceio->instances.emplace_back(instance1);
             // voxel Instance Link
             InstanceLink instancelink1{};
@@ -2631,6 +2646,9 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
                 // this is what we did in the shader;
                 // glm::ivec3 pos =  mat * glm::vec4(currentVoxelModel.voxelIds[kvoxel],1.0);
                 glm::ivec3 Id = shift0 + glm::ivec3(currentVoxelModel1.voxelIds[kvoxel]);
+            // Keep primitive/base voxels inside the computational domain (see
+            // the OBJ clipping path); out-of-range cells must not enter NanoVDB.
+            if (!insideVoxelDomain(*modelio, Id)) continue;
                 int test = acc.getValue(nanovdb::Coord(Id.x, Id.y, Id.z));
 
                 // the first bufferid;
@@ -2798,7 +2816,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
         Instance instance1{};
         instance1.meshId = static_cast<uint32_t>(n_modelmesh);
         instance1.object2worldMatrix = mat;
-        instance1.world2objectMatrix = glm::transpose(glm::inverse(mat));
+        instance1.world2objectMatrix = glm::inverse(mat);
         instanceio->instances.emplace_back(instance1);
         // voxel Instance Link
         InstanceLink instancelink1{};
@@ -2808,7 +2826,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
         Instance instance2{};
         instance2.meshId = static_cast<uint32_t>(n_modelmesh + 1);
         instance2.object2worldMatrix = mat;
-        instance2.world2objectMatrix = glm::transpose(glm::inverse(mat));
+        instance2.world2objectMatrix = glm::inverse(mat);
         instanceio->instances.emplace_back(instance2);
         // voxel Instance Link
         InstanceLink instancelink2{};
@@ -2827,6 +2845,9 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
                 // this is what we did in the shader;
                 // glm::ivec3 pos =  mat * glm::vec4(currentVoxelModel.voxelIds[kvoxel],1.0);
                 glm::ivec3 Id = shift0 + glm::ivec3(currentVoxelModel1.voxelIds[kvoxel]);
+            // Keep primitive/base voxels inside the computational domain (see
+            // the OBJ clipping path); out-of-range cells must not enter NanoVDB.
+            if (!insideVoxelDomain(*modelio, Id)) continue;
                 int test = acc.getValue(nanovdb::Coord(Id.x, Id.y, Id.z));
 
                 // the first bufferid;
@@ -3009,7 +3030,7 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     glm::vec3 bgScale = glm::vec3{1.0, 1.0, 1.0};
     glm::mat4 bgMat = glm::scale(bgunit, bgScale) * glm::translate(bgunit, bgShift);
     bgInstance.object2worldMatrix = bgMat;
-    bgInstance.world2objectMatrix = glm::transpose(glm::inverse(bgMat));
+    bgInstance.world2objectMatrix = glm::inverse(bgMat);
     instanceio->instances.emplace_back(bgInstance);
 
 
@@ -3253,7 +3274,7 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
         Instance instance1{};
         instance1.meshId = static_cast<uint32_t>(n_modelmesh);
         instance1.object2worldMatrix = mat;
-        instance1.world2objectMatrix = glm::transpose(glm::inverse(mat));
+        instance1.world2objectMatrix = glm::inverse(mat);
         instanceio->instances.emplace_back(instance1);
         // voxel Instance Link
         InstanceLink instancelink1{};
@@ -3277,6 +3298,10 @@ bool Scene::createPrimObj_Crown(PrimEntity & voxelEntity,nanovdb::GridBuilder<in
                                               modelio->stepsize_surface)) continue;
             if (isParticipatingMedium) mediumVoxelCount++;
             glm::ivec3 Id = shift0 + localVoxel;
+            // Primitive/base entities must be clipped to [0,N) exactly like
+            // the OBJ path; otherwise out-of-domain cells enter NanoVDB and
+            // periodic wrap maps them onto unrelated cells.
+            if (!insideVoxelDomain(*modelio, Id)) continue;
             int test = acc.getValue(nanovdb::Coord(Id.x, Id.y, Id.z));
 
             // the first bufferid;
@@ -3433,7 +3458,7 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
             Instance instance1{};
             instance1.meshId = static_cast<uint32_t>(n_modelmesh);
             instance1.object2worldMatrix = mat;
-            instance1.world2objectMatrix = glm::transpose(glm::inverse(mat));
+            instance1.world2objectMatrix = glm::inverse(mat);
             instanceio->instances.emplace_back(instance1);
             // voxel Instance Link
             InstanceLink instancelink1{};
@@ -3447,6 +3472,9 @@ bool Scene::createPrimObj_Crowns(PrimEntity & voxelEntity,nanovdb::GridBuilder<i
                 // this is what we did in the shader;
                 // glm::ivec3 pos =  mat * glm::vec4(currentVoxelModel.voxelIds[kvoxel],1.0);
                 glm::ivec3 Id = shift0 + glm::ivec3(currentVoxelModel1.voxelIds[kvoxel]);
+            // Keep primitive/base voxels inside the computational domain (see
+            // the OBJ clipping path); out-of-range cells must not enter NanoVDB.
+            if (!insideVoxelDomain(*modelio, Id)) continue;
                 int test = acc.getValue(nanovdb::Coord(Id.x, Id.y, Id.z));
 
                 // the first bufferid;
@@ -3597,7 +3625,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
         Instance instance1{};
         instance1.meshId = static_cast<uint32_t>(n_modelmesh);
         instance1.object2worldMatrix = mat;
-        instance1.world2objectMatrix = glm::transpose(glm::inverse(mat));
+        instance1.world2objectMatrix = glm::inverse(mat);
         instanceio->instances.emplace_back(instance1);
         // voxel Instance Link
         InstanceLink instancelink1{};
@@ -3607,7 +3635,7 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
         Instance instance2{};
         instance2.meshId = static_cast<uint32_t>(n_modelmesh + 1);
         instance2.object2worldMatrix = mat;
-        instance2.world2objectMatrix = glm::transpose(glm::inverse(mat));
+        instance2.world2objectMatrix = glm::inverse(mat);
         instanceio->instances.emplace_back(instance2);
         // voxel Instance Link
         InstanceLink instancelink2{};
@@ -3626,6 +3654,9 @@ bool Scene::createPrimObj_Building(PrimEntity & voxelEntity,nanovdb::GridBuilder
                 // this is what we did in the shader;
                 // glm::ivec3 pos =  mat * glm::vec4(currentVoxelModel.voxelIds[kvoxel],1.0);
                 glm::ivec3 Id = shift0 + glm::ivec3(currentVoxelModel1.voxelIds[kvoxel]);
+            // Keep primitive/base voxels inside the computational domain (see
+            // the OBJ clipping path); out-of-range cells must not enter NanoVDB.
+            if (!insideVoxelDomain(*modelio, Id)) continue;
                 int test = acc.getValue(nanovdb::Coord(Id.x, Id.y, Id.z));
 
                 // the first bufferid;
@@ -3803,7 +3834,7 @@ bool Scene::createPrimObj_Background(Background & background,nanovdb::GridBuilde
     glm::vec3 bgScale = glm::vec3{1.0, 1.0, 1.0};
     glm::mat4 bgMat = glm::scale(bgunit, bgScale) * glm::translate(bgunit, bgShift);
     bgInstance.object2worldMatrix = bgMat;
-    bgInstance.world2objectMatrix = glm::transpose(glm::inverse(bgMat));
+    bgInstance.world2objectMatrix = glm::inverse(bgMat);
     instanceio->instances.emplace_back(bgInstance);
 
 

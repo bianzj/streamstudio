@@ -13,6 +13,8 @@
 //   原子写入）；closestHit.rchit 填 PtPayload，shade_state.glsl 还原几何。
 // 约定：波长 > 50 视为 nm，换算为 µm；≤2.5 µm 为短波（输出 HDRF = π·L/E_ref，
 //   E_ref = direct·cos(太阳天顶角) + 0.5·diffuse），> 2.5 µm 为热红外；场景长度单位为 m，y 轴向上。
+// 采样器：默认 legacy（PCG，与旧版逐位一致）；特化常量 RT_SAMPLER_SOBOL = 1 时对像元抖动、前两个散射顶点的
+//   天空 NEE/散射方向/轮盘赌/反射透射选择用 Owen 置乱 Sobol（见 sampler_qmc.glsl 与 docs/raytracing-variance-reduction.md）。
 // ==========================================================================
 
 #version 460
@@ -38,6 +40,8 @@
 
 // RAYTRACING 宏：让共用头文件（bindinglayout.h 等）选择 RayTracing 模式的绑定与结构。
 #define RAYTRACING 1
+// 余弦半球采样的 z 分量取 sqrt(max(·,0))：r 贴近 1 时浮点误差使根号内为微小负数，原先得到 NaN 方向（见 sampling.glsl）。
+#define RT_SAFE_COSINE_SAMPLING 1
 
 #include "../global.glsl"
 #include "../parameters.h"
@@ -49,6 +53,18 @@
 #include "../shade_state.glsl"
 #include "../bindinglayout.h"
 #include "../periodic_walk.glsl"
+#include "sampler_qmc.glsl"
+
+// 路径中是否存在热红外波段（> 2.5 µm）；主函数一次性计算。有热红外波段时太阳阴影射线还决定向阳/背阴温度，不能省略。
+bool gHasThermal = false;
+
+// 作用：材料（按 band0 的材料索引）是否在任一波段有透射（T > 0）。
+bool MaterialTransmitsAnyBand(uint matIndex0)
+{
+  for(int kBand = 0; kBand < setting.n_wave; kBand++)
+    if(spectralMaterials[matIndex0 + kBand].transmittance > 0.0) return true;
+  return false;
+}
 
 // 光线负载：location 0 为主光线（命中信息），location 1 为阴影光线（是否被遮挡）。
 layout(location = 0) rayPayloadEXT PtPayload prd;
@@ -56,9 +72,16 @@ layout(location = 1) rayPayloadEXT ShadowHitPayload shadow_payload;
 
 // 每个波段的逐路径累计量（线程私有数组，容量 800 > n_wave 上限；超出会越界，待核对上限检查）：
 //   Radiance 当前样本辐亮度，RadianceSum 所有样本之和，Throughput 路径吞吐量（BSDF·cos/pdf 的累乘）。
-float Radiance[800];
-float RadianceSum[800];
-float Throughput[800];
+// 数组容量由特化常量 9（RT_MAX_WAVE）给定：主机端（pipeline.cpp）取 {8,16,32,64,128,800} 中不小于 n_wave 的最小值，
+// 默认 800 = 工程允许的波段数上限；缺省（不设特化常量）与旧版相同。循环仍用 setting.n_wave。
+layout(constant_id = 9) const int RT_MAX_WAVE = 800;
+float Radiance[RT_MAX_WAVE];
+float RadianceSum[RT_MAX_WAVE];
+float Throughput[RT_MAX_WAVE];
+// 自适应采样（特化常量 10 = RT_ADAPTIVE，主机端按 control.adaptiveSampling / HISTREAM_RT_ADAPTIVE 设置；
+// 为 0 时下面的 AdaptivePass 与 main 里的调用被折叠掉，常规路径的生成代码不变）。
+layout(constant_id = 10) const int RT_ADAPTIVE = 0;
+float RadianceSumSq[RT_MAX_WAVE];
 
 // Physical-texture factor of the current hit triangle (1 = untextured).
 // 全局状态：当前命中三角形的物理纹理系数；specularPathEncountered 记录路径是否遇到镜面材料。
@@ -291,7 +314,12 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
   vec3 ffnormal = dot(sstate.normal, emitterWiWorld) <= 0.0 ? -sstate.normal : sstate.normal;
   vec3 origin = OffsetRay(position, ffnormal);
   Ray shadowRay = Ray(origin, emitterWiWorld);
-  bool inLightShadow = AnyHit(shadowRay, OUTER);
+  // 太阳在表面背侧、材料各波段都不透光、且没有热红外波段（向阳/背阴温度要用阴影结果）时，
+  // 太阳项在每个波段都恰为 0（bsdf = |bsdf0|·T = 0），阴影射线不影响结果，省略；此时按“被遮挡”处理，
+  // 下面的太阳块被跳过，累加的本来就是 +0.0，结果逐位不变。
+  bool inLightShadow = true;
+  if(gHasThermal || IsSameSide(woWorld, emitterWiWorld, ffnormal) || MaterialTransmitsAnyBand(matIndex0))
+    inLightShadow = AnyHit(shadowRay, OUTER);
   
   // sun distribution
   // Next-event estimation is evaluated at every path vertex.  Throughput
@@ -384,6 +412,8 @@ bool DirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth)
     float emitterBsdf0, emitterPr;
     vec3 upWorld = {0, 1, 0};
     SampleBSDF(prd.seed, emitterWi, emitterBsdf0, emitterPr);
+    if(qmcActive(kDepth))
+      emitterWi = qmcCosineHemisphere(qmcPair(1u + 3u * uint(kDepth)));
 
     vec3 emitterWiWorld = Tangent2World(sstate.normal, sstate.tangent, sstate.binormal, emitterWi);
     emitterWiWorld = dot(upWorld, emitterWiWorld) <= 0.0 ? -emitterWiWorld : emitterWiWorld;
@@ -429,7 +459,15 @@ bool InDirectLighting(vec3 position, vec3 woWorld, ShadeState sstate, int kDepth
   float bsdf0, pr;
   vec3 wi;
   vec3 upWorld = {0, 1, 0};
+  // 原 PCG 采样始终执行（保持随机序列与旧版逐位一致，也让 legacy 路径的生成代码不变）；
+  // Sobol 模式下再用该顶点的 Sobol 点对覆盖：方向取点对 2+3d，反射/透射选择取点对 3+3d 的第二个分量。
   SampleBSDF(prd.seed, wi, bsdf0, pr);
+  if(qmcActive(kDepth))
+  {
+    wi = qmcCosineHemisphere(qmcPair(2u + 3u * uint(kDepth)));
+    bsdf0 = qmcPair(3u + 3u * uint(kDepth)).y >= 0.5 ? -InvPI : InvPI;
+    pr = ProbabilityOfBSDF(wi);
+  }
 
   float cosTheta = CosThetaTangent(wi);
   uint matIndex0 = sstate.spectralId * setting.n_wave;
@@ -502,7 +540,9 @@ bool PathTrace(Ray r)
         }
       }
       float pSurvive = clamp(maxPathThroughput, 0.05, 1.0);
-      if(rand(prd.seed) >= pSurvive) break;
+      float rrSample = rand(prd.seed);
+      if(qmcActive(kDepth)) rrSample = qmcPair(3u + 3u * uint(kDepth)).x;
+      if(rrSample >= pSurvive) break;
       for(int kBand = 0; kBand < setting.n_wave; kBand++)
       {
         Throughput[kBand] /= pSurvive;
@@ -625,6 +665,143 @@ bool SamplePixel(vec2 subPixel_jitter, ivec2 imageCoords, ivec2 imageResolution)
 
 }
 
+// ==========================================================================
+// 自适应采样（可选，RT_ADAPTIVE = 1）：两遍，分配只用“侦察”样本，估计不用它们（因此对分配无偏）。
+//   第 1 遍（setting.adaptivePass = 1，侦察）：每像元 n_sample（= 侦察样本数）个样本，用与正式样本不同的种子（独立的点集和随机流），
+//     只在辅助平面写单样本相对标准差 σ（各波段相对标准差的均方根，再并入未覆盖比例的 Bernoulli 项）；这些样本不进入结果。
+//   主机端读回 σ，求缩放系数 scale，使每像元样本数 clamp(round(scale·σ), 最小, 最大) 的平均等于预算。
+//   第 2 遍（adaptivePass = 2）：每像元样本数 n_i 由 tile（边长 adaptiveTile）内的平均 σ 决定，用常规种子取样本 0 … n_i-1
+//     （Sobol 序号连续，分层保持；n_i 均匀时与常规路径逐位相同），均值 = 和 / 覆盖数。
+// 辅助平面位置：auxBase = n_pixel·n_wave + 16（之前是计数器与填充）；平面 1 = σ（平面 0 未用）。
+// ==========================================================================
+void AdaptivePass(ivec2 imageCoords, ivec2 imageRes)
+{
+  uint n_pixel = uint(imageRes.x * imageRes.y);
+  uint pixel = uint(imageCoords.y * imageRes.x + imageCoords.x);
+  uint auxBase = n_pixel * uint(setting.n_wave) + 16u;
+  bool scout = setting.adaptivePass == 1;
+  int count = setting.n_sample;
+  int coveredSamples = 0;
+
+  // 侦察遍换一组种子（PCG 与 Sobol 都换），保证与正式样本独立。
+  uint frameMix = scout ? uint(setting.frame) + 0x9e3779b9u : uint(setting.frame);
+  prd.seed = initRandom(uvec2(imageRes), uvec2(imageCoords), frameMix);
+  gQmcIndex = 0u;
+  if(RT_QMC_ENABLED)
+    gQmcSeed = tea(uint(imageCoords.y * imageRes.x + imageCoords.x) ^ 0x5bd1e995u,
+                   (scout ? uint(setting.frame) + 0x3c6ef372u : uint(setting.frame)) + 0x2545f491u);
+  gHasThermal = false;
+  for(int kBand = 0; kBand < setting.n_wave; kBand++)
+  {
+    float bandWavelength = waveSets[kBand];
+    if(bandWavelength > 50) bandWavelength = bandWavelength / 1000.0;
+    if(bandWavelength > 2.5) gHasThermal = true;
+    Radiance[kBand] = 0.0;
+    RadianceSum[kBand] = 0.0;
+    RadianceSumSq[kBand] = 0.0;
+  }
+  if(!scout)
+  {
+    // 同一 tile 内的像元取相同的样本数：σ 取 tile 内平均（逐像元分配会让同一 warp 的线程样本数差别很大，整体按最慢线程计时）。
+    int tile = max(setting.adaptiveTile, 1);
+    ivec2 tileOrigin = (imageCoords / tile) * tile;
+    float sigmaSum = 0.0;
+    int sigmaCount = 0;
+    for(int ty = tileOrigin.y; ty < min(tileOrigin.y + tile, imageRes.y); ty++)
+      for(int tx = tileOrigin.x; tx < min(tileOrigin.x + tile, imageRes.x); tx++)
+      {
+        sigmaSum += outImage[auxBase + n_pixel + uint(ty * imageRes.x + tx)];
+        ++sigmaCount;
+      }
+    float sigma = sigmaSum / float(sigmaCount);
+    count = clamp(int(floor(setting.adaptiveScale * sigma + 0.5)), setting.adaptiveMinCount, setting.adaptiveMaxExtra);
+  }
+  for(int kSample = 0; kSample < count; kSample++)
+  {
+    vec2 subPixel_jitter;
+    if(RT_QMC_ENABLED)
+    {
+      gQmcIndex = uint(kSample);
+      subPixel_jitter = qmcPair(0u);
+    }
+    else
+      subPixel_jitter = kSample == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
+    if(!SamplePixel(subPixel_jitter, imageCoords, imageRes)) continue;
+    bool finiteSample = true;
+    for(int kBand = 0; kBand < setting.n_wave; kBand++)
+      if(isnan(Radiance[kBand]) || isinf(Radiance[kBand])) finiteSample = false;
+    if(!finiteSample)
+    {
+      atomicAdd(outImage[n_pixel * uint(setting.n_wave)], 1.0);
+      continue;
+    }
+    ++coveredSamples;
+    for(int kBand = 0; kBand < setting.n_wave; kBand++)
+    {
+      RadianceSum[kBand] += Radiance[kBand];
+      RadianceSumSq[kBand] += Radiance[kBand] * Radiance[kBand];
+    }
+  }
+
+  if(scout)
+  {
+    // σ：各波段单样本相对标准差的均方根；再并入“样本落空”的伯努利方差；全落空的像元给 0.5（边缘，需要更多样本）。
+    float n = float(coveredSamples);
+    float relVar = 0.0;
+    int used = 0;
+    if(coveredSamples >= 2)
+    {
+      for(int kBand = 0; kBand < setting.n_wave; kBand++)
+      {
+        float mean = RadianceSum[kBand] / n;
+        if(mean > 1.0e-6)
+        {
+          float variance = max((RadianceSumSq[kBand] - RadianceSum[kBand] * RadianceSum[kBand] / n) / (n - 1.0), 0.0);
+          relVar += variance / (mean * mean);
+          ++used;
+        }
+      }
+      if(used > 0) relVar /= float(used);
+    }
+    float missed = 1.0 - n / float(count);
+    float sigma = coveredSamples == 0 ? 0.5 : sqrt(relVar + missed * (1.0 - missed));
+    atomicStore(outImage[auxBase + n_pixel + pixel], sigma, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+    return;
+  }
+
+  // 第 2 遍收尾：与 main 相同的边缘补采样与后处理。
+  if(coveredSamples == 0)
+  {
+    for(int k = 0; k < 16; ++k)
+    {
+      gQmcIndex = uint(count + k);
+      vec2 subPixel_jitter = (vec2(k % 4, k / 4) + 0.5) / 4.0;
+      if(!SamplePixel(subPixel_jitter, imageCoords, imageRes)) continue;
+      ++coveredSamples;
+      for(int kBand = 0; kBand < setting.n_wave; kBand++)
+        RadianceSum[kBand] += Radiance[kBand];
+    }
+  }
+  for(int kBand = 0; kBand < setting.n_wave; kBand++)
+  {
+    Radiance[kBand] = coveredSamples > 0 ? RadianceSum[kBand] / float(coveredSamples) : 0.0;
+    float wavelength = waveSets[kBand];
+    if(wavelength > 50) wavelength = wavelength / 1000.0;
+    if(wavelength <= 2.5)
+    {
+      float cosSolarZenith = max(normalize(lightSet.direction).y, 0.0);
+      float referenceIrradiance = lightSet.direct * cosSolarZenith + lightSet.diffuse * 0.5;
+      float hdrf = referenceIrradiance > EPSION ? M_PI * Radiance[kBand] / referenceIrradiance : 0.0;
+      Radiance[kBand] = (isnan(hdrf) || isinf(hdrf)) ? 0.0 : max(hdrf, 0.0);
+    }
+    else if(setting.isTemperature == 1)
+    {
+      Radiance[kBand] = Radiance[kBand] > EPSION ? InvPlanck(wavelength, Radiance[kBand]) : 0.0;
+    }
+  }
+  for(int kBand = 0; kBand < setting.n_wave; kBand++)
+    atomicStore(outImage[n_pixel * uint(kBand) + pixel], Radiance[kBand], gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+}
 // 入口：每个线程负责一个像素（可按 imageOffsetY 分块），对 n_sample 个子像素样本取平均并输出各波段结果。
 // 步骤：1) 初始化随机种子；2) 逐样本调用 SamplePixel，首个样本在像素中心，其余随机抖动，未覆盖场景的样本不计入平均；
 //   3) 全部样本都落空的边缘像素补做 4×4 分层采样；4) 后处理：≤2.5 µm 转为表观反射率 HDRF = π·L/E_ref，
@@ -639,8 +816,26 @@ void main()
 		+ ivec2(0, setting.imageOffsetY);
 	if(any(greaterThanEqual(imageCoords, imageRes))) return;
 	
+  if(RT_ADAPTIVE != 0 && setting.adaptivePass != 0)
+  {
+    AdaptivePass(imageCoords, imageRes);
+    return;
+  }
+
   prd.seed = initRandom(uvec2(imageRes), uvec2(imageCoords), setting.frame);
   uint n_pixel = imageRes.x * imageRes.y;
+
+  // 采样器选择由特化常量 RT_SAMPLER_SOBOL 决定（见 sampler_qmc.glsl）；Sobol 种子独立于 PCG 种子，同样随 frame（主机端 seed）变化。
+  gQmcIndex = 0u;
+  if(RT_QMC_ENABLED)
+    gQmcSeed = tea(uint(imageCoords.y * imageRes.x + imageCoords.x) ^ 0x5bd1e995u, uint(setting.frame) + 0x2545f491u);
+  gHasThermal = false;
+  for(int kBand = 0; kBand < setting.n_wave; kBand++)
+  {
+    float bandWavelength = waveSets[kBand];
+    if(bandWavelength > 50) bandWavelength = bandWavelength / 1000.0;
+    if(bandWavelength > 2.5) gHasThermal = true;
+  }
 
 
 
@@ -659,8 +854,28 @@ void main()
   int coveredSamples = 0;
   for(int kSample = 0; kSample <  setting.n_sample; kSample++)
   {
-    vec2 subPixel_jitter = kSample == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
+    vec2 subPixel_jitter;
+    if(RT_QMC_ENABLED)
+    {
+      // Sobol：序号即样本编号，像素内位置取点对 0（不再固定第 0 个样本在像素中心）。
+      gQmcIndex = uint(kSample);
+      subPixel_jitter = qmcPair(0u);
+    }
+    else
+      subPixel_jitter = kSample == 0 ? vec2(0.5f, 0.5f) : vec2(rand(prd.seed), rand(prd.seed));
     if(!SamplePixel(subPixel_jitter, imageCoords, imageRes)) continue;
+    // 最后一道防线：某个波段辐亮度为 NaN/Inf 的路径样本会毒化整个像元（输出端把它当天空值替换）。
+    // 已知的根因（余弦采样的 sqrt 负数 → NaN 方向）在 sampling.glsl 里用 RT_SAFE_COSINE_SAMPLING 修掉，
+    // 此后 rt_crop / rt_urban 实测没有这类样本；万一仍出现，丢弃该样本并在输出缓冲末尾的计数器上加 1，
+    // 主机端读回后报警（raytracing.cpp: reportDroppedSamples）。无此类样本时结果不变。
+    bool finiteSample = true;
+    for(int kBand = 0; kBand <  setting.n_wave; kBand++)
+      if(isnan(Radiance[kBand]) || isinf(Radiance[kBand])) finiteSample = false;
+    if(!finiteSample)
+    {
+      atomicAdd(outImage[n_pixel * uint(setting.n_wave)], 1.0);
+      continue;
+    }
     ++coveredSamples;
 
     for(int kBand = 0; kBand <  setting.n_wave; kBand++)
@@ -676,6 +891,7 @@ void main()
   {
     for(int k = 0; k < 16; ++k)
     {
+      gQmcIndex = uint(setting.n_sample + k);
       vec2 subPixel_jitter = (vec2(k % 4, k / 4) + 0.5) / 4.0;
       if(!SamplePixel(subPixel_jitter, imageCoords, imageRes)) continue;
       ++coveredSamples;

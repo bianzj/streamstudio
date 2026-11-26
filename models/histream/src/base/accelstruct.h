@@ -41,6 +41,12 @@ public:
 
     nvvk::RaytracingBuilderKHR     m_rtBuilder;
 
+    // Voxel modes only (null = no check, RayTracing/Facet behaviour unchanged): when set, createAccelStruct asks the
+    // driver for every BLAS's acceleration-structure and scratch size before building and throws a clear error if one
+    // exceeds maxMemoryAllocationSize (src/base/voxellimits.h); HISTREAM_VOXEL_PROXY_STATS=1 also prints the sizes.
+    VkPhysicalDevice               m_physicalDevice{VK_NULL_HANDLE};
+    const char*                    m_modelName{"voxel"};
+
 };
 
 

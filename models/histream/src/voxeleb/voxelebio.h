@@ -121,6 +121,8 @@ VoxelebIO(){
 
     // 模块 4：运行设置与诊断量；n_pipeline 为管线个数（待核对）。
     // setting infor
+    // Voxel transport options resolved from the project and environment (src/base/voxelflags.h).
+    int voxelFlags = 0;
     int n_pipeline = 15;
     int n_wave;
     int n_angle;
