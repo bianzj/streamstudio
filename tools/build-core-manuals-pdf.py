@@ -71,6 +71,8 @@ pdfmetrics.registerFontFamily(
 
 # 模块：页面尺寸与配色（深蓝/蓝/青 + 正文/弱化文字色 + 分隔线与浅底色）。
 PAGE_W, PAGE_H = A4
+# Content-weighted table column widths (enabled for the runtime manual only).
+WEIGHTED_TABLES = False
 NAVY = colors.HexColor("#10273D")
 BLUE = colors.HexColor("#2674D9")
 CYAN = colors.HexColor("#3BB4C1")
@@ -204,7 +206,32 @@ def inline_markup(value: str) -> str:
 
 # 作用：把 Markdown 表格的一行（| a | b |）切成去除首尾空白的单元格列表。
 def split_table_row(line: str) -> list[str]:
-    return [part.strip() for part in line.strip().strip("|").split("|")]
+    # Split on `|` except inside `code` spans or when escaped as `\|`.
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|") and not text.endswith("\\|"):
+        text = text[:-1]
+    cells: list[str] = []
+    current: list[str] = []
+    in_code = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text) and text[index + 1] == "|":
+            current.append("|")
+            index += 2
+            continue
+        if char == "`":
+            in_code = not in_code
+        if char == "|" and not in_code:
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    cells.append("".join(current).strip())
+    return cells
 
 
 # 模块：手册的文档模板。A4、四周边距约 17-18 mm，单一正文 Frame。
@@ -407,7 +434,10 @@ def code_box(lines: list[str], styles, math_mode: bool = False) -> Table:
         lines = [re.sub(r"\s+", " ", expression).strip()]
     for line in lines:
         line = line.replace("\t", "    ")
-        cleaned.append(symbol_markup(html.escape(line, quote=False)) if line else "&#160;")
+        # Paragraph collapses runs of spaces; keep indentation/alignment of
+        # code and text diagrams by turning every space of a run into NBSP.
+        escaped = re.sub(r" {2,}|^ ", lambda m: "&#160;" * len(m.group(0)), html.escape(line, quote=False))
+        cleaned.append(symbol_markup(escaped) if line else "&#160;")
     paragraph = Paragraph("<br/>".join(cleaned), styles["code"])
     table = Table([[paragraph]], colWidths=[174 * mm], hAlign="LEFT")
     table.setStyle(
@@ -438,7 +468,19 @@ def markdown_table(lines: list[str], styles) -> Table:
     for row_index, row in enumerate(normalized):
         style = styles["table_head"] if row_index == 0 else styles["table"]
         data.append([Paragraph(inline_markup(cell), style) for cell in row])
-    table = Table(data, colWidths=[width / columns] * columns, repeatRows=1, hAlign="LEFT")
+    col_widths = [width / columns] * columns
+    if WEIGHTED_TABLES:
+        # Column width follows content length (clamped), so short key columns
+        # stay narrow and description columns get the room.
+        def weight(index: int) -> float:
+            longest = max(len(re.sub(r"[`*]", "", row[index])) for row in normalized)
+            return min(max(longest, 6), 60) ** 0.8
+        weights = [weight(i) for i in range(columns)]
+        total = sum(weights)
+        col_widths = [max(19 * mm, width * w / total) for w in weights]
+        scale = width / sum(col_widths)
+        col_widths = [w * scale for w in col_widths]
+    table = Table(data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
     table.setStyle(
         TableStyle(
             [
@@ -493,7 +535,9 @@ def markdown_story(source: Path, styles):
             flush_paragraph()
             flush_table()
             if in_code:
-                story.append(code_box(code_lines.copy(), styles))
+                # A one-cell Table cannot split across pages: cut long blocks.
+                for start in range(0, max(len(code_lines), 1), 38):
+                    story.append(code_box(code_lines[start:start + 38], styles))
                 story.append(Spacer(1, 2.5 * mm))
                 code_lines.clear()
             in_code = not in_code
@@ -672,8 +716,29 @@ def build_manual(source: Path, output: Path, title: str, subtitle: str):
     doc.multiBuild(story)
 
 
-# 入口：依次生成使用手册与理论与方法两本 PDF，并打印输出路径。
+def build_runtime_manual(kind: str = "runtime"):
+    global WEIGHTED_TABLES
+    WEIGHTED_TABLES = True
+    specs = {
+        "runtime": ("runtime-principles.md", "Stream_Studio_Runtime_Principles_CN.pdf",
+                    "Stream Studio 运行原理说明", "从工程文件到结果文件：平台、数据流、引擎与质量保障"),
+        "modules": ("code-modules.md", "Stream_Studio_Code_Modules_CN.pdf",
+                    "Stream Studio 代码模块说明", "应用层、前端、HiStream 与 STREAM 引擎的文件职责、接口与修改指南"),
+    }
+    source, name, title, subtitle = specs[kind]
+    output = OUTPUT_DIR / name
+    build_manual(ROOT / "docs" / source, output, title, subtitle)
+    WEIGHTED_TABLES = False
+    print(output)
+
+
+# 入口：默认生成使用手册与理论与方法两本 PDF；参数 runtime / modules 只生成《运行原理说明》/《代码模块说明》。
 def main():
+    import sys
+    for kind in ("runtime", "modules"):
+        if kind in sys.argv[1:]:
+            build_runtime_manual(kind)
+            return
     build_manual(
         ROOT / "docs" / "user-manual.md",
         OUTPUT_DIR / "Stream_Studio_User_Manual_CN.pdf",
