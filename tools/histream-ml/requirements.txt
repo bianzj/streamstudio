@@ -1,0 +1,6 @@
+numpy
+scipy
+onnx
+onnxruntime
+onnxscript
+# torch 另装（见 README.md 中的 CPU 版索引）
