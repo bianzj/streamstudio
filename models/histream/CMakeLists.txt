@@ -535,6 +535,9 @@ add_executable(histream_lumped_thermal_tests EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/test-facet-lumped-thermal.cpp")
 target_include_directories(histream_lumped_thermal_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+add_executable(histream_urban_aerodynamics_tests EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/test-urban-aerodynamics.cpp")
+
 # Numerical check of the shared LIDF / G / Gamma code (shader/lidf_common.h).
 add_executable(histream_lidf_gamma_tests EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/test-lidf-gamma.cpp")

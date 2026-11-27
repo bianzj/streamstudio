@@ -642,8 +642,15 @@ void Compo::bsm(const OptCoeff& bsmCoeff,BSMParam bsm,std::vector<Spectral>& spe
         float p = 1-calctav(90,nw_[k])/nw_[k]/nw_[k];
         float Rw = 1-calctav(40,nw_[k]);
         float   Radd   = (1-Rw) * (1-p) * rbac /(1 - p * rbac);
-        // DEFERRED[中] 物理: SCOPE BSM 在 mu<=0（土壤含水量 <5%）时直接取 rwet=rdry；这里未处理，SMC<0.05 时 mu<0 → fdry=exp(-mu)>1、1-fdry<0，湿土反射率被外推成非物理值；理由：mu<=0 时取 rwet=rdry 属物理语义变更，明确禁止本轮修改。
+        // SCOPE BSM: mu <= 0 (soil moisture at or below 5 %) keeps the dry spectrum, rwet = rdry.
+        // Without this, mu < 0 gives fdry = exp(-mu) > 1 and 1 - fdry < 0, so the "wet" soil was
+        // extrapolated brighter than dry soil (2026-11-27; STREAM clamps the same way, optics.cpp).
+        // 含水量 ≤ 5% 时取干土光谱（与 SCOPE BSM、STREAM 一致）；否则按下式混合。
         float     mu  = (SMC - 0.05)/ SMCp;
+        if (mu <= 0.0f) {
+            spectrals.push_back(Spectral{rdry, 0});
+            continue;
+        }
         float fdry = exp(-mu);
         float  fmul = (exp(tw * mu) - 1) * fdry;
         float rwet = rdry * fdry + Rw * (1 - fdry) + Radd * fmul;

@@ -1403,6 +1403,10 @@ SettingXml FileIO::readSettingXML(TiXmlNode *controlNode, Mode mode){
         const char* text = controlNode->FirstChildElement("stabilityCorrection")->GetText();
         settingxml.stabilityCorrection = text != nullptr && std::atof(text) > 0.5;
     }
+    if (controlNode->FirstChildElement("urbanBuildingHeight") || controlNode->FirstChildElement("urbanStreetWidth"))
+        settingxml.urbanCanyon = urban::canyonGeometry(
+            requiredChildFloat(controlNode, "urbanBuildingHeight", "<Control>"),
+            requiredChildFloat(controlNode, "urbanStreetWidth", "<Control>"));
     if (sonExists("vegetationTemperatureMethod", controlNode->ToElement())) {
         settingxml.vegetationTemperatureMethod = std::clamp(
             requiredChildInt(controlNode, "vegetationTemperatureMethod", "<Control>"), 0, 1);

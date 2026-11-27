@@ -117,10 +117,14 @@ void main()
     // Ta 为体元局部气温（°C）。船体吃水线以下的建筑体元改用水温作为交换温度，
     // 且不叠加自由对流（exchangeType 置 TYPE_NULL），与 evapo.comp 保持一致。
     float Ta = localAirTemperatureC(bufferId);
+    // City surfaces (aeresist.comp urbanSurface): 1 road, 2 wall, 3 roof, 4 street-tree leaves and
+    // ground under street trees, whose sensible-heat reference is the canyon air (as in evapo.comp).
+    const int urbanSurface = voxelRaas[bufferId].urbanSurface;
     // Ship hull below its waterline: water-side exchange against the scene
     // water temperature, no free-convection add-on (see evapo.comp).
     const bool shipWet = typeId == TYPE_BUILDING && shipSubmerged(bufferId, bioId);
-    const float TaH = shipWet ? shipWaterTemperatureC(Ta) : Ta;
+    const float TaH = shipWet ? shipWaterTemperatureC(Ta)
+        : (urbanSurface == 4 ? fluidParameters.urbanExchange.w - 273.15 : Ta);
     const uint exchangeType = shipWet ? uint(TYPE_NULL) : typeId;
     // 步骤 4：上一轮温度若为 NaN/Inf 或超出 [TMIN, TMAX] 阈值（如首轮未初始化），
     // 回退到气温 +2 K（阳）/ +1 K（阴）作为起点，防止异常值传入迭代。
@@ -235,6 +239,12 @@ void main()
     // ground surfaces warmer than the air; vegetation unchanged).
     float raaSunlit = groundExchangeRaa(raa, TsunlitOld, TaH, exchangeType);
     float raaShaded = groundExchangeRaa(raa, TshadedOld, TaH, exchangeType);
+    // A road exchanges with the canyon through the wall/road coefficient (evapo.comp): the same
+    // resistance rho cp / h serves sensible and latent heat.
+    if (urbanSurface == 1) {
+        raaSunlit = (RHOA * CP) / fluidParameters.urbanExchange.y;
+        raaShaded = raaSunlit;
+    }
     float rss_sunlit = voxelRsss[bufferId].sunlit;
     float rss_shaded = voxelRsss[bufferId].shaded;
     if(typeId == TYPE_VEGETATION)
@@ -283,6 +293,11 @@ void main()
     // 步骤 9：各通量对表面温度的斜率（W m-2 K-1），用于牛顿分母：
     // 显热 ρ·cp/ra（地面在 groundFreeConvectionApplies 时再加自由对流增量）；
     // 潜热 ρ·λ·e_to_q·s/(ra+rss)，s 为饱和水汽压对温度的斜率，e_to_q 把 hPa 换成比湿。
+    if (urbanSurface > 0 && urbanSurface < 4) {
+        sensibleDerivativeSunlit = urbanSurface == 3 ? fluidParameters.urbanExchange.z
+            : fluidParameters.urbanExchange.y;
+        sensibleDerivativeShaded = sensibleDerivativeSunlit;
+    }
     float latentDerivativeSunlit = RHOA * lambdas_sunlit * e_to_q *
         max(s_sunlit, 0.0) / max(raaSunlit + max(rss_sunlit, 0.0), 1.0);
     float latentDerivativeShaded = RHOA * lambdas_shaded * e_to_q *
@@ -482,6 +497,24 @@ void main()
     // 步骤 15：写回温度。水体体元还统计相对场景水温的偏差（0.01 K 定点、限幅 ±20 K）与个数，
     // 用于船体吃水线以下水侧交换的场景水温更新。
     voxelTempes[bufferId].sunlit = Tsunlit;
+    if (urbanSurface == 1 || urbanSurface == 2) {
+        uint bin = bufferId & uint(EB_STATE_BINS - 1);
+        float sunlit = clamp(voxelDirs[bufferId].solar, 0.0, 1.0);
+        float surfaceTemperature = mix(Tshaded, Tsunlit, sunlit);
+        float offset = surfaceTemperature - (ubom.meteo.Ta + 273.15);
+        if (urbanSurface == 1)
+            atomicAdd(ebState.urbanRoad[bin], 1, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+        else
+            atomicAdd(ebState.urbanWall[bin], 1, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+        atomicAdd(ebState.urbanTemperature[bin], int(round(100.0 * offset)), gl_ScopeDevice,
+                  gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+        // Sensible heat of the road and wall surfaces into the canyon (0.1 W m-2 per voxel face): the
+        // host forms the canyon heat flux Q0 for the convective velocity w* (SURFEX eq. 3.23).
+        float canyonHeat = fluidParameters.urbanExchange.y * (surfaceTemperature - fluidParameters.urbanExchange.w);
+        if (!(isnan(canyonHeat) || isinf(canyonHeat)))
+            atomicAdd(ebState.urbanHeat[bin], int(round(10.0 * clamp(canyonHeat, -2000.0, 2000.0))),
+                      gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelaxed);
+    }
     voxelTempes[bufferId].shaded = Tshaded;
     if(typeId == TYPE_WATER && fluidParameters.localExchange.w > 1.0)
     {

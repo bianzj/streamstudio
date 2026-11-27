@@ -444,6 +444,7 @@ struct VoxelPnet
 struct VoxelRaa
 {
     float raa;  // aerodynamic resistance
+    int32_t urbanSurface{}; // 0 other, 1 road, 2 wall, 3 roof
 };
 
 
@@ -513,8 +514,12 @@ struct EBState
     // temperatures in 0.01 K (fixed point, deterministic).
     int32_t waterCount;
     int32_t waterTemperature;
+    int32_t urbanRoad[kEnergyStateBins];
+    int32_t urbanWall[kEnergyStateBins];
+    int32_t urbanTemperature[kEnergyStateBins]; // sum of surface temperature offsets, 0.01 K
+    int32_t urbanHeat[kEnergyStateBins];        // sensible heat of road/wall faces into the canyon, 0.1 W m-2 per face
 };
-static_assert(sizeof(EBState) == 8 + 3 * 4 * kEnergyStateBins + 8);
+static_assert(sizeof(EBState) == 16 + 7 * 4 * kEnergyStateBins);
 
 // 模块：流体网格单元元数据：surfaceIndex 为所属表面索引（-1 无），kind 为单元类型，lad 为叶面积密度。
 struct alignas(16) FluidCellMeta
@@ -540,10 +545,12 @@ struct alignas(16) FluidParameters
     // correction (control.stabilityCorrection); z is the current scene 1/L
     // [m-1] used by aeresist.comp; w reserved.
     glm::vec4 localExchange{0.0f};
+    glm::vec4 urbanExchange{0.0f}; // enabled, road/wall h, roof h, canyon temperature K
 };
-static_assert(sizeof(FluidParameters) == 128);
+static_assert(sizeof(FluidParameters) == 144);
 static_assert(offsetof(FluidParameters, heightProfile) == 96);
 static_assert(offsetof(FluidParameters, localExchange) == 112);
+static_assert(offsetof(FluidParameters, urbanExchange) == 128);
 
 
 // 模块：叶片生化/光合参数（Vcmax、Ball-Berry 气孔参数、温度响应参数、非光化学淬灭速率等）。

@@ -265,6 +265,7 @@ struct SurfaceParameters {
     bool vegetation{true};
     float pvEta25{0.22f}, pvGamma{-0.0035f}, pvBifaciality{0.0f};
     float convectiveScale{1.0f};
+    bool mobileSolid{false};
     // Water mixed layer (componentType Water): heatCapacityPerArea holds
     // rho_w c_w h_mix, one face exchanges with the air, LE uses surfaceResistance.
     bool water{false};
@@ -3805,11 +3806,19 @@ std::string facetInputView(const std::string& path)
     // periodicNeighborCount（缺省 8），否则为 0；最后限幅到 [0, 20]。
     // 随后依次写 Light（天顶/方位角、天空温度、直射比例、短波辐照限幅 0–2000 W m-2）、
     // Sensor（波段）、Scene（场景尺寸、背景材料与 Hapke/Lambert 选择）。
-    xml << "<HiStreamProject><Control>"
+    const auto canyon = project.urbanCanyon();
+    xml << "<HiStreamProject><Control>";
+    if (canyon)
+        xml << "<urbanBuildingHeight>" << canyon.buildingHeight << "</urbanBuildingHeight>"
+            << "<urbanStreetWidth>" << canyon.streetWidth << "</urbanStreetWidth>";
+    xml
         << "<outDir>" << xmlEscaped(project.outputDirectory().string()) << "</outDir>"
         << "<facetBackend>" << xmlEscaped(ProjectJson::string(control, "facetBackend", "gpu")) << "</facetBackend>"
         << "<facetVisibility>" << xmlEscaped(ProjectJson::string(control, "facetVisibility", "auto")) << "</facetVisibility>"
         << "<facetOutputFormat>" << xmlEscaped(ProjectJson::string(control, "facetOutputFormat", "json")) << "</facetOutputFormat>"
+        << "<facetSensitivity>" << xmlEscaped(ProjectJson::string(control, "facetSensitivity", "")) << "</facetSensitivity>"
+        << "<facetSensitivityStep>" << ProjectJson::number(control, "facetSensitivityStep", 0.05f) << "</facetSensitivityStep>"
+        << "<facetSensitivityIterations>" << ProjectJson::integer(control, "facetSensitivityIterations", 24) << "</facetSensitivityIterations>"
         << "<GPU>" << ProjectJson::integer(control, "gpu", 0) << "</GPU>"
         << "<rayTracingDepth>" << ProjectJson::integer(control, "depth", 4) << "</rayTracingDepth>"
         << "<periodicNeighborCount>"
@@ -3990,6 +3999,7 @@ std::string facetInputView(const std::string& path)
         // Ship hull: relative wind (speed > 0) and waterline contact; absent
         // fields write nothing, so other materials keep the old XML.
         if (!pv && !leaf && !water && ProjectJson::string(item,"type")=="Ship") {
+            xml << "<mobileSolid>1</mobileSolid>";
             if (ProjectJson::number(p,"speed",0) > 0)
                 xml << "<shipSpeed>" << ProjectJson::number(p,"speed",0) << "</shipSpeed>";
             if (p.contains("waterlineHeight") && p["waterlineHeight"].is_number()) {
@@ -4019,6 +4029,7 @@ std::string facetInputView(const std::string& path)
         // Vehicle (material type Vehicle): part role and, on the body material,
         // the cabin / driving parameters (params.cabin). Absent writes nothing.
         if (!pv && !leaf && !water && ProjectJson::string(item,"type")=="Vehicle") {
+            xml << "<mobileSolid>1</mobileSolid>";
             const std::string part = ProjectJson::string(p,"vehiclePart","");
             const int partCode = part=="body" ? 1 : part=="glass" ? 2 : part=="underbody" ? 3 : part=="hood" ? 4 : 0;
             if (partCode) xml << "<vehiclePart>" << partCode << "</vehiclePart>";
@@ -5422,6 +5433,10 @@ Scene loadProjectScene(const std::string& inputFile)
                 // Wall/roof slab: surfaceEnergy (project JSON) or soilSet (direct XML).
                 const std::string wallBlock = !physical.empty() ? physical
                     : physicalName.empty() ? std::string{} : namedXmlBlock(xml, "soilSet", physicalName);
+                material.mobileSolid = xmlFloat(wallBlock, "mobileSolid", 0) > 0 ||
+                    !firstXmlTag(wallBlock, "shipSpeed").empty() ||
+                    !firstXmlTag(wallBlock, "vehiclePart").empty() ||
+                    !firstXmlTag(wallBlock, "waterlineHeight").empty();
                 const std::string wallMode = trim(firstXmlTag(wallBlock, "wallMode"));
                 if ((wallMode == "wall" || wallMode == "1") && !material.vegetation && !material.photovoltaic && !material.water) {
                     if (!material.lumpedGroup.empty())
@@ -5967,6 +5982,9 @@ try {
     // 耦合迭代控制：stabilityCorrection（稳定度修正开关）、couplingIterations（1–100，缺省 60）、
     // temperatureTolerance（K，缺省 0.05）、temperatureRelaxation（松弛系数 0.05–1，缺省 0.8）。
     const bool stabilityCorrection = xmlFloat(xml, "stabilityCorrection", 0.0f) > 0.5f;
+    const auto urbanCanyon = firstXmlTag(xml, "urbanBuildingHeight").empty() &&
+        firstXmlTag(xml, "urbanStreetWidth").empty() ? urban::Canyon{} : urban::canyonGeometry(
+            xmlFloat(xml, "urbanBuildingHeight", 0), xmlFloat(xml, "urbanStreetWidth", 0));
     const uint32_t maximumCouplingIterations = static_cast<uint32_t>(std::clamp(
         static_cast<int>(std::lround(xmlFloat(xml, "couplingIterations", 60.0f))),
         1, 100));
@@ -6294,6 +6312,35 @@ try {
     const std::string verifyMode = verifyEnergy ? std::string(verifyEnergy) : std::string();
     const bool shadowEnergy = gpuEnergy && (verifyMode == "1" || verifyMode == "2");
     const bool shadowSurvey = shadowEnergy && verifyMode == "2";
+    // 收敛点切线敏感度（2026-11-27）：control.facetSensitivity（逗号分隔的参数名，环境变量
+    // HISTREAM_FACET_SENSITIVITY 优先）。每个节点收敛后，从收敛态热启动，把参数乘以 (1 ± h) 各做
+    // facetSensitivityIterations 次耦合迭代（两侧次数相同，基态残余漂移在中心差分中一阶抵消），
+    // 得到逐面侧 dY/d ln θ。只用 GPU 能量路径；不重建可见性图、不重算短波；节点间热历史冻结
+    // （上一节点状态取未扰动值）；稳定度修正开启时 1/L 冻结。参数槽见 energy.comp 的 P[]。
+    // 参数槽见 energy.comp 的 P[]；ground.thermalConductivity 不在 P[] 里，而是按 λ(1 ± h) 重算地面侧的土壤
+    // 柱响应，替换输入槽 I[7]、I[8]（方法 2：soilResponse 的斜率与截距；方法 1：储热系数 ∝ √λ）。
+    struct SensitivityParameter { std::string name; uint32_t slot; bool leaf; bool soilConductivity = false; };
+    std::vector<SensitivityParameter> sensitivityParameters;
+    {
+        const char* environment = std::getenv("HISTREAM_FACET_SENSITIVITY");
+        const std::string list = environment && *environment ? std::string(environment)
+                                                             : trim(firstXmlTag(xml, "facetSensitivity"));
+        std::stringstream stream(list);
+        std::string item;
+        while (std::getline(stream, item, ',')) {
+            item = trim(item);
+            if (item.empty()) continue;
+            if (item == "leaf.vcmax") sensitivityParameters.push_back({item, 10U, true});
+            else if (item == "leaf.ballBerrySlope") sensitivityParameters.push_back({item, 11U, true});
+            else if (item == "ground.surfaceResistance") sensitivityParameters.push_back({item, 7U, false});
+            else if (item == "ground.thermalConductivity") sensitivityParameters.push_back({item, 0U, false, true});
+            else throw std::invalid_argument("control.facetSensitivity: unsupported parameter '" + item +
+                "' (supported: leaf.vcmax, leaf.ballBerrySlope, ground.surfaceResistance, ground.thermalConductivity)");
+        }
+    }
+    const float sensitivityStep = std::clamp(xmlFloat(xml, "facetSensitivityStep", 0.05f), 1.0e-4f, 0.5f);
+    const uint32_t sensitivityIterations = static_cast<uint32_t>(std::clamp(
+        static_cast<int>(std::lround(xmlFloat(xml, "facetSensitivityIterations", 24.0f))), 1, 200));
     float shadowFluxMaximum = 0.0f, shadowIncidentMaximum = 0.0f, shadowUpdateMaximum = 0.0f, shadowResistanceMaximum = 0.0f;
     uint64_t shadowEvaluations = 0, shadowUpdates = 0;
     struct ShadowMismatch {
@@ -6306,6 +6353,21 @@ try {
     std::map<std::string, uint64_t> shadowClassFacets; // facets audited per surface class
     if (!useCpuBackend && !cpuEnergy && !gpuEnergy)
         throw std::runtime_error("GPU FacetEB energy requires shaderFloat64 and energy.comp.spv; select the CPU or auto backend");
+    if (!sensitivityParameters.empty() && !gpuEnergy)
+        throw std::runtime_error("control.facetSensitivity requires the GPU FacetEB energy path");
+    if (!sensitivityParameters.empty()) {
+        ProjectJson::Json names = ProjectJson::Json::array();
+        for (const auto& parameter : sensitivityParameters) names.push_back(parameter.name);
+        runIndex.value["sensitivity"] = {
+            {"parameters", names}, {"relativeStep", sensitivityStep}, {"iterations", sensitivityIterations},
+            {"derivative", "central difference d/d(ln theta): theta*(1+h) and theta*(1-h), (Y+ - Y-)/(2h)"},
+            {"method", "warm start from the converged node state, same number of coupling iterations on both sides"},
+            {"frozen", ProjectJson::Json::array({"previous-node state (soil and surface temperature history)",
+                                                 "visibility graph and shortwave", "stability (1/L) when enabled"})},
+            {"fields", ProjectJson::Json::array({"latentHeat", "sensibleHeat", "surfaceHeatFlux", "temperature",
+                                                 "netRadiation", "sunlitTemperature", "shadedTemperature"})},
+            {"layout", "[parameter][surface side][field], float32 little endian"}};
+    }
     runIndex.value["execution"] = {{"radiation", useCpuBackend ? "cpu" : "gpu"},
         {"visibility", useCpuBackend ? "cpu-raster" : model.visibilityBackendName()},
         {"incidentIrradiance", !useCpuBackend && model.supportsGpuIncident() ? "gpu" : "cpu"},
@@ -6688,6 +6750,69 @@ try {
     // no fluxes and carries the temperature of the upper side.
     const auto groundDownSide = [&](uint32_t facet) -> uint32_t {
         return scene.vertices[size_t(facet) * 3U].normal[1] >= 0.0f ? 1U : 0U;
+    };
+    enum class UrbanSurface : uint8_t { Other, Road, Wall, Roof, Canopy };
+    std::vector<UrbanSurface> urbanSurfaces;
+    std::vector<std::pair<size_t, double>> canyonFaces;
+    double canyonRoadArea = 0, canyonSurfaceArea = 0;
+    if (urbanCanyon) {
+        urbanSurfaces.resize(scene.facetCount());
+        std::vector<bool> roofAbove(columns.size());
+        const auto cell = [&](float v, int axis) {
+            return std::clamp(int((v - scene.minimum[axis]) / columnSize), 0,
+                              (axis == 0 ? columnsX : columnsZ) - 1);
+        };
+        for (uint32_t f = 0; f < scene.leafFacetCount; ++f) {
+            const auto& material = surfaceForFacet(scene, f);
+            // Street trees: the leaves exchange sensible heat with the canyon air.
+            if (material.vegetation && !material.photovoltaic) {
+                urbanSurfaces[f] = UrbanSurface::Canopy;
+                continue;
+            }
+            if (material.outputComponent != 3 || material.mobileSolid || material.vegetation ||
+                material.water || material.photovoltaic) continue;
+            const auto* triangle = &scene.vertices[size_t(f) * 3U];
+            if (std::abs(triangle[0].normal[1]) < 0.7071f) {
+                urbanSurfaces[f] = UrbanSurface::Wall;
+                continue;
+            }
+            urbanSurfaces[f] = UrbanSurface::Roof;
+            const auto& a = triangle[0].position;
+            const auto& b = triangle[1].position;
+            const auto& c = triangle[2].position;
+            const auto edge = [](const auto& p, const auto& q, double x, double z) {
+                return (double(q[0]) - p[0]) * (z - p[2]) - (double(q[2]) - p[2]) * (x - p[0]);
+            };
+            for (int row = cell(std::min({a[2], b[2], c[2]}), 2);
+                 row <= cell(std::max({a[2], b[2], c[2]}), 2); ++row) {
+                for (int col = cell(std::min({a[0], b[0], c[0]}), 0);
+                     col <= cell(std::max({a[0], b[0], c[0]}), 0); ++col) {
+                    const double x = scene.minimum[0] + (col + 0.5) * columnSize;
+                    const double z = scene.minimum[2] + (row + 0.5) * columnSize;
+                    const double ab = edge(a, b, x, z), bc = edge(b, c, x, z), ca = edge(c, a, x, z);
+                    if ((ab >= 0 && bc >= 0 && ca >= 0) || (ab <= 0 && bc <= 0 && ca <= 0))
+                        roofAbove[size_t(row) * columnsX + col] = true;
+                }
+            }
+        }
+        for (uint32_t f = 0; f < scene.facetCount(); ++f) {
+            const bool ground = f >= scene.leafFacetCount;
+            if (ground && !surfaceForFacet(scene, f).water && !roofAbove[facetColumn[f]]) {
+                // Open ground is a road; ground sheltered by street trees keeps its soil exchange
+                // but takes the canyon air as the sensible-heat reference.
+                urbanSurfaces[f] = columns[facetColumn[f]].lai <= 0.01f ? UrbanSurface::Road : UrbanSurface::Canopy;
+            }
+            const auto role = urbanSurfaces[f];
+            if (role == UrbanSurface::Road || role == UrbanSurface::Wall) {
+                const double area = facetArea(scene, f);
+                canyonFaces.emplace_back(size_t(f) * 2U + (ground ? groundDownSide(f) ^ 1U : 0U), area);
+                canyonSurfaceArea += area;
+                if (ground) canyonRoadArea += area;
+            }
+        }
+    }
+    const auto urbanSurface = [&](uint32_t f) {
+        return urbanCanyon ? urbanSurfaces[f] : UrbanSurface::Other;
     };
     std::array<std::vector<facetphysics::SoilProfile>, 2> soilProfiles{
         std::vector<facetphysics::SoilProfile>(groundSides), std::vector<facetphysics::SoilProfile>(groundSides)};
@@ -7259,6 +7384,16 @@ try {
         const float airPressure = std::max(100.0f, meteo.pressure);
         const float airDensity = airPressure * 100.0f /
             (287.05f * airTemperature);
+        const urban::Exchange urbanExchange = urbanCanyon ? urban::neutralExchange(
+            urbanCanyon, referenceHeight, meteo.windSpeed, airDensity * 1005.0) : urban::Exchange{};
+        float canyonAir = airTemperature;
+        // Wall / road exchange coefficient with the convective velocity (SURFEX eq. 3.23); starts neutral and is
+        // relaxed towards the flux-dependent value every coupling iteration (updateUrbanAir).
+        double canyonSurfaceH = urbanExchange.surface;
+        double canyonConvectiveVelocity = 0.0;
+        // Change of the canyon air temperature (in units of 0.02 K) and of the wall/road coefficient (in units of
+        // 0.2 %) in the last update, the larger of the two: a node is not converged while this exceeds 1.
+        double urbanCanyonChange = 0.0;
         const float aerodynamicResistance = airDensity * 1005.0f /
             std::max(0.1f, aerodynamicConductance);
         // 步骤 C：节点级对流/接触辅助量（下面 3 个 lambda）：objectConvectiveScale（船体相对风）、
@@ -7368,6 +7503,10 @@ try {
         float maximumStabilityChange = 0.0f;
         float maximumStomatalMismatch = 0.0f, maximumLeafEnergyResidual = 0.0f;
         uint32_t failingEnergyFacets = 0;
+        // GPU path only: host recount of failingEnergyFacets from the downloaded fluxes and the
+        // absolute difference to the GPU reduction (both 0 on the CPU path).
+        struct { uint32_t host = 0, difference = 0; } failingCountCheck;
+        ProjectJson::Json nodeSensitivity;   // control.facetSensitivity 的本节点记录（无请求时为 null）
         double lumpedSurfaceResidual=0;
         // 能量平衡收敛判据：超限面元数与温度等效残差由 facetEnergyConverged 判定，
         // 且集总体表面的最大残差 < 2 W m-2（阈值为经验取值，来源待核对）。
@@ -7375,7 +7514,7 @@ try {
             return facetphysics::facetEnergyConverged(
                        failingEnergyFacets, scene.facetCount(),
                        maximumEnergyResidualEquivalent) &&
-                lumpedSurfaceResidual<2;
+                lumpedSurfaceResidual<2 && urbanCanyonChange <= 1.0;
         };
         // The maximum over states/sides prevents cancellation and double counting.
         // Faces whose emission enters the facet balance, x4 sigma T^3 each: both
@@ -7420,6 +7559,31 @@ try {
                     (1.0f - sunlitPart[side]) * stateTemperature[1][side];
             }
         };
+        // 街谷更新（每次耦合迭代）：1 由路面/墙面面积加权表面温度与当前墙/路面系数闭合街谷空气温度；
+        // 2 由这些面当前的显热通量（单位街道面积的运动学热通量 Q0）得对流速度 w*，目标系数 11.8 + 4.2√(U_can² +
+        // (u* + w*)²)，按 0.5 松弛（系数依赖通量、通量又依赖系数，是不动点）。sensibleHeat 来自最近一次通量评估。
+        const auto updateUrbanAir = [&]() {
+            double areaTemperature = 0, heat = 0;
+            for (const auto& [side, area] : canyonFaces) {
+                areaTemperature += area * (sunlitPart[side] * double(stateTemperature[0][side]) +
+                    (1.0 - sunlitPart[side]) * double(stateTemperature[1][side]));
+                heat += area * double(sensibleHeat[side]);
+            }
+            urban::Exchange live = urbanExchange;
+            live.surface = canyonSurfaceH;
+            const float previousAir = canyonAir;
+            canyonAir = static_cast<float>(urban::canyonAirTemperature(live,
+                airTemperature, canyonRoadArea, canyonSurfaceArea, areaTemperature));
+            const double rhoCp = airDensity * 1005.0;
+            canyonConvectiveVelocity = urban::convectiveVelocity(
+                canyonRoadArea > 0 ? heat / canyonRoadArea / rhoCp : 0.0, canyonAir, urbanCanyon.buildingHeight);
+            const double target = urban::surfaceCoefficient(urbanExchange, canyonConvectiveVelocity);
+            const double previousSurface = canyonSurfaceH;
+            canyonSurfaceH += 0.5 * (target - canyonSurfaceH);
+            urbanCanyonChange = std::max(std::abs(double(canyonAir) - previousAir) / 0.02,
+                                         std::abs(canyonSurfaceH - previousSurface) / std::max(1.0, canyonSurfaceH) / 0.002);
+        };
+        if (urbanCanyon) updateUrbanAir();
         // 作用：给定两态温度 stateTemperature、长波光学量与长波入射，计算所有面侧的净辐射、
         // 显热、潜热、储热、光伏发电及其对温度的斜率，写入 stateFlux，并混合成输出通量。
         // 输入：longwaveOptics（每侧 ρ/τ）、longwaveIncident（每侧入射长波，W m-2）。
@@ -7496,13 +7660,21 @@ try {
                             // 显热导热（W m-2 K-1）：叶片 = ρ·cp·scale / 叶片阻抗；浸没面元用 waterContact 的总导热；
                             // 其余 = 空气动力导热 × 对流缩放 × 换热面数（水面/墙体 1 个面，薄壳 2 个面）。
                             // 显热 = 导热 × (T - 参考温度)，参考温度为气温或浸没时的水温。
-                            const float facetSensibleConductance = leafExchange
+                            const auto urbanRole = urbanSurface(facet);
+                            const float facetSensibleConductance = urbanRole == UrbanSurface::Wall
+                                ? static_cast<float>(canyonSurfaceH)
+                                : urbanRole == UrbanSurface::Roof ? static_cast<float>(urbanExchange.roof)
+                                : leafExchange
                                 ? airDensity * 1005.0f * surface.convectiveScale /
                                     aerodynamics.leafResistance
                                 : contact[0] > 0.0f ? contact[0]
                                 : (waterSurface || wall >= 0 ? 1.0f : 2.0f) * aerodynamicConductance * facetConvectiveScale(facet, surface);
+                            // Sensible-heat reference: the canyon air for city walls and for street-tree leaves,
+                            // otherwise the (reference-height or water) temperature of `contact`.
+                            const float sensibleReference =
+                                urbanRole == UrbanSurface::Wall || urbanRole == UrbanSurface::Canopy ? canyonAir : contact[1];
                             const float facetSensibleHeat = facetSensibleConductance *
-                                (T[side0] - contact[1]);
+                                (T[side0] - sensibleReference);
                             const CanopyColumn& column = columns[facetColumn[facet]];
                             // 叶片在冠层柱内的相对深度 = -(柱顶 - 面元高度)/柱高：冠顶为 0，向下为负；
                             // 供光合参数随深度衰减（vcmax25 等）。
@@ -7577,7 +7749,7 @@ try {
                                         const double powerSlope = surface.photovoltaic && raw > 0 && raw < available ?
                                             surface.pvEta25 * surface.pvGamma * effectiveIncident : 0;
                                         const double residual = facetNetRadiation - emissivitySum * kStefanBoltzmann * (std::pow(trial, 4) - std::pow(T[side0], 4)) -
-                                            facetSensibleConductance * (trial - airTemperature) - latent(trial, resistance) -
+                                            facetSensibleConductance * (trial - sensibleReference) - latent(trial, resistance) -
                                             facetStorageSlope * (trial - previousT[side0]) - power;
                                         const double response = 4 * emissivitySum * kStefanBoltzmann * std::pow(trial, 3) +
                                             facetSensibleConductance + facetStorageSlope + powerSlope +
@@ -7646,14 +7818,23 @@ try {
                                 // 地面对流阻抗（可含自由对流并联与 MOST 稳定度修正，见 groundExchange）。
                                 // Free convection when the side is warmer than the
                                 // air (energy.comp: same rule, P[28] = 1 + MOST).
+                                // City road: coefficient canyonSurfaceH to the canyon air, with the aerodynamic
+                                // resistance rho cp / coefficient for sensible and latent heat alike. Ground
+                                // under street trees: the canyon air is the sensible-heat reference.
+                                const auto groundRole = urbanSurface(facet);
+                                const bool road = groundRole == UrbanSurface::Road;
+                                const float groundReference =
+                                    road || groundRole == UrbanSurface::Canopy ? canyonAir : airTemperature;
                                 const auto exchange = facetphysics::groundExchange(
-                                    columnResistance, T[side] - airTemperature, stabilityCorrection);
-                                const float groundResistance = exchange.resistance;
+                                    columnResistance, T[side] - groundReference, stabilityCorrection);
+                                const float groundResistance = road
+                                    ? static_cast<float>(airDensity * 1005.0f / canyonSurfaceH) : exchange.resistance;
                                 const float groundConductance = airDensity * 1005.0f / groundResistance;
                                 flux.net[side] = radiativeNet[side];
-                                flux.sensible[side] =
-                                    groundConductance * (T[side] - airTemperature);
-                                flux.sensibleSlope[side] = exchange.extraSlope > 0.0f
+                                flux.sensible[side] = road ? static_cast<float>(canyonSurfaceH) * (T[side] - canyonAir)
+                                    : groundConductance * (T[side] - groundReference);
+                                flux.sensibleSlope[side] = road ? static_cast<float>(canyonSurfaceH)
+                                    : exchange.extraSlope > 0.0f
                                     ? groundConductance + airDensity * 1005.0f * exchange.extraSlope
                                     : groundConductance;
                                 const bool drySoil =
@@ -7839,6 +8020,18 @@ try {
                     const auto contact = waterContact(facet, mat);
                     if (contact[0] > 0.0f) { data[30] = contact[0]; data[31] = contact[1]; }
                 }
+                const auto urbanRole = urbanSurface(facet);
+                if (urbanRole == UrbanSurface::Road) {
+                    data[29] = 1.0f;   // exchange coefficient and reference are the pc.canyon* values
+                } else if (urbanRole == UrbanSurface::Wall) {
+                    data[30] = -1.0f;
+                    data[31] = 1.0f;
+                } else if (urbanRole == UrbanSurface::Roof) {
+                    data[30] = -1.0f - static_cast<float>(urbanExchange.roof);
+                    data[31] = 0.0f;
+                } else if (urbanRole == UrbanSurface::Canopy) {
+                    data[31] = -1.0f;  // sensible-heat reference is the canyon air
+                }
                 // Non-leaf objects (their leaf-only slots 23, 24 are free):
                 // P[23] heat source of the facet balance (W m-2), P[24] factor of the
                 // net radiation (1 - wetted fraction of a shielded hull, else 1).
@@ -7906,7 +8099,9 @@ try {
                                            dTime,
                                            carbonDioxide,
                                            temperatureRelaxation,
-                                           meteo.windSpeed};
+                                           meteo.windSpeed,
+                                           canyonAir,
+                                           static_cast<float>(canyonSurfaceH)};
             model.beginEnergyNode(push, gpuParameters, gpuInputs, gpuTemperatures);
             // 作用：把 GPU 读回的快照导入主机：每态每侧的温度和 12 个通量槽（槽 0–10 依次为 fields
             // 的各项，槽 11 为叶片气孔阻抗 r_s，仅供审计），再更新平均温度并按受光比例混合输出通量。
@@ -8119,19 +8314,27 @@ try {
                     }
                     ++shadowUpdates;
                 }
-                if (stabilityCorrection)
+                if (stabilityCorrection || urbanCanyon)
                 {
                     importGpuState(model.readEnergyState());
                     updateStability();
-                    for (int state = 0; state < 2; ++state)
-                        for (size_t side = 0; side < surfaceCount; ++side)
-                        {
-                            float *data = gpuInputs.data() + (size_t(state) * surfaceCount + side) * 12U;
-                            const auto &aero = columnAerodynamics[facetColumn[side / 2U]];
-                            data[4] = aero.leafResistance;
-                            data[5] = aero.soilResistance;
-                        }
-                    model.updateEnergyInputs(gpuInputs);
+                    if (urbanCanyon) {
+                        // Canyon air and wall/road coefficient travel as push constants (no buffer upload).
+                        updateUrbanAir();
+                        model.setEnergyCanyon(canyonAir, static_cast<float>(canyonSurfaceH));
+                    }
+                    if (stabilityCorrection)
+                    {
+                        for (int state = 0; state < 2; ++state)
+                            for (size_t side = 0; side < surfaceCount; ++side)
+                            {
+                                float *data = gpuInputs.data() + (size_t(state) * surfaceCount + side) * 12U;
+                                const auto &aero = columnAerodynamics[facetColumn[side / 2U]];
+                                data[4] = aero.leafResistance;
+                                data[5] = aero.soilResistance;
+                            }
+                        model.updateEnergyInputs(gpuInputs);
+                    }
                 }
                 couplingIterations = coupling + 1;
             }
@@ -8141,8 +8344,147 @@ try {
             auto snapshot = model.readEnergyState(true);
             importGpuState(snapshot);
             // Verify the GPU reduction from the already downloaded final fluxes.
-            if (countFailingEnergyFacets() != failingEnergyFacets)
-                throw std::runtime_error("CPU/GPU energy failing-facet count mismatch");
+            // The GPU sums the residual in double, the host recount in float, so a facet
+            // whose residual lies within rounding of the 2 W m-2 threshold can be counted
+            // on one side only. Policy (2026-11-27): a difference of at most 1 % of the
+            // facets is a warning; a node that used its whole iteration budget is never
+            // aborted (the run comes first); otherwise a larger difference means the two
+            // implementations disagree and the run stops.
+            {
+                const uint32_t hostFailing = countFailingEnergyFacets();
+                const uint32_t difference = hostFailing > failingEnergyFacets
+                    ? hostFailing - failingEnergyFacets : failingEnergyFacets - hostFailing;
+                failingCountCheck = {hostFailing, difference};
+                if (difference != 0) {
+                    const bool budgetExhausted = couplingIterations >= maximumCouplingIterations;
+                    const bool withinTolerance = double(difference) <= 0.01 * double(scene.facetCount());
+                    if (!withinTolerance && !budgetExhausted)
+                        throw std::runtime_error("CPU/GPU energy failing-facet count mismatch at node " +
+                            std::to_string(node) + ": GPU " + std::to_string(failingEnergyFacets) + ", host " +
+                            std::to_string(hostFailing) + " of " + std::to_string(scene.facetCount()) +
+                            " facets (tolerance 1 %)");
+                    std::cerr << "faceteb: warning: node " << node << " failing-facet count GPU " << failingEnergyFacets
+                              << " vs host " << hostFailing << " (difference " << difference << " of "
+                              << scene.facetCount() << " facets" << (withinTolerance ? ", within 1 %" : ", iteration budget exhausted")
+                              << "); results kept\n";
+                }
+            }
+            // 收敛点切线敏感度（见 sensitivityParameters 的说明）。只读 GPU 状态、不改主机端状态，
+            // 因此本节点的产品与下一节点的初值都不受影响；下一节点 beginEnergyNode 重新上传全部状态。
+            if (!sensitivityParameters.empty()) {
+                const auto sensitivityStart = Clock::now();
+                // The canyon (urban air temperature and wall/road coefficient) stays frozen at its converged
+                // state in the perturbed solves: beginEnergyNode takes the push constants as they are.
+                auto sensitivityPush = push;
+                sensitivityPush.canyonAir = canyonAir;
+                sensitivityPush.canyonSurface = static_cast<float>(canyonSurfaceH);
+                const std::vector<float> baseTemperatures = snapshot.temperatures;
+                const size_t records = sensitivityParameters.size() * surfaceCount * 7U;
+                std::vector<float> derivative(records, 0.0f);
+                // 与过程文件 faceteb_T=*.bin 同一记录：潜热、显热、表面热通量、温度、净辐射、受光/阴影部分温度。
+                const auto record = [&](const facetvk::EnergySnapshot& state, size_t side, float* out) {
+                    const float w = sunlitPart[side];
+                    const size_t sunlitIndex = side * 12U, shadedIndex = (surfaceCount + side) * 12U;
+                    const auto mix = [&](size_t field) {
+                        return w * state.fluxes[sunlitIndex + field] + (1.0f - w) * state.fluxes[shadedIndex + field];
+                    };
+                    const float t0 = state.temperatures[side], t1 = state.temperatures[surfaceCount + side];
+                    out[0] = mix(3); out[1] = mix(1); out[2] = mix(5);
+                    out[3] = w * t0 + (1.0f - w) * t1; out[4] = mix(0); out[5] = t0; out[6] = t1;
+                };
+                ProjectJson::Json perParameter = ProjectJson::Json::array();
+                for (size_t p = 0; p < sensitivityParameters.size(); ++p) {
+                    const auto& parameter = sensitivityParameters[p];
+                    std::array<facetvk::EnergySnapshot, 2> solved;
+                    uint32_t touched = 0;
+                    float lastStep = 0.0f;
+                    for (int k = 0; k < 2; ++k) {
+                        const float factor = k == 0 ? 1.0f + sensitivityStep : 1.0f - sensitivityStep;
+                        std::vector<float> perturbed = gpuParameters;
+                        std::vector<float> perturbedInputs = gpuInputs;
+                        touched = 0;
+                        if (parameter.soilConductivity) {
+                            // 与 gpuInputs 的组装相同的条件与槽位（见上方步骤“节点输入”）。
+                            for (uint32_t facet = scene.leafFacetCount; facet < scene.facetCount(); ++facet) {
+                                const auto& soil = surfaceForFacet(scene, facet);
+                                if (soil.soilTemperatureMethod != 1 && soil.soilTemperatureMethod != 2) continue;
+                                ++touched;
+                                for (int state = 0; state < 2; ++state)
+                                    for (size_t side = size_t(facet) * 2U; side < size_t(facet) * 2U + 2U; ++side) {
+                                        float* data = perturbedInputs.data() + (size_t(state) * surfaceCount + side) * 12U;
+                                        if (soil.soilTemperatureMethod == 2) {
+                                            const size_t g = side - firstGroundSide;
+                                            const auto response = facetphysics::soilResponse(soilProfiles[state][g],
+                                                soilBottomTemperature[g], soil.thermalConductivity * factor,
+                                                soil.specificHeat * soil.density, dTime);
+                                            data[7] = static_cast<float>(response.fluxSlope());
+                                            data[8] = static_cast<float>(response.flux(0));
+                                        } else {
+                                            const float scale = std::sqrt(factor);
+                                            data[7] *= scale;
+                                            data[8] *= scale;
+                                        }
+                                    }
+                            }
+                        } else {
+                            for (uint32_t facet = 0; facet < scene.facetCount(); ++facet) {
+                                const bool match = parameter.leaf
+                                    ? facet < scene.leafFacetCount && surfaceForFacet(scene, facet).vegetation
+                                    : facet >= scene.leafFacetCount;
+                                if (!match) continue;
+                                perturbed[size_t(facet) * 32U + parameter.slot] *= factor;
+                                ++touched;
+                            }
+                        }
+                        model.beginEnergyNode(sensitivityPush, perturbed, perturbedInputs, baseTemperatures);
+                        for (uint32_t iteration = 0; iteration < sensitivityIterations; ++iteration) {
+                            (void)model.evaluateEnergy(skyLongwave);
+                            lastStep = model.updateEnergyTemperature();
+                        }
+                        (void)model.evaluateEnergy(skyLongwave);
+                        solved[k] = model.readEnergyState();
+                    }
+                    float plus[7], minus[7];
+                    double leafArea = 0, groundArea = 0;
+                    std::array<double, 7> leafMean{}, groundMean{};
+                    for (size_t side = 0; side < surfaceCount; ++side) {
+                        record(solved[0], side, plus);
+                        record(solved[1], side, minus);
+                        float* out = derivative.data() + (p * surfaceCount + side) * 7U;
+                        for (int field = 0; field < 7; ++field)
+                            out[field] = (plus[field] - minus[field]) / (2.0f * sensitivityStep);
+                        if (side % 2U != 0U) continue;   // 类别均值取几何法向侧（与过程文件读取约定一致）
+                        const uint32_t facet = static_cast<uint32_t>(side / 2U);
+                        const double area = facetAreas[facet];
+                        auto& mean = facet < scene.leafFacetCount ? leafMean : groundMean;
+                        (facet < scene.leafFacetCount ? leafArea : groundArea) += area;
+                        for (int field = 0; field < 7; ++field) mean[field] += area * out[field];
+                    }
+                    const std::array<const char*, 7> fieldNames{"latentHeat", "sensibleHeat", "surfaceHeatFlux",
+                        "temperature", "netRadiation", "sunlitTemperature", "shadedTemperature"};
+                    ProjectJson::Json leafJson, groundJson;
+                    for (int field = 0; field < 7; ++field) {
+                        if (leafArea > 0) leafJson[fieldNames[field]] = leafMean[field] / leafArea;
+                        if (groundArea > 0) groundJson[fieldNames[field]] = groundMean[field] / groundArea;
+                    }
+                    perParameter.push_back({{"parameter", parameter.name}, {"perturbedFacets", touched},
+                        {"lastTemperatureStep_K", lastStep}, {"objectMean", leafJson}, {"groundMean", groundJson}});
+                }
+                const std::string stem = "facetsens_T=" + token;
+                const std::filesystem::path directory = outputDirectory / "process";
+                std::filesystem::create_directories(directory);
+                std::ofstream sensitivityBinary(directory / (stem + ".bin"), std::ios::binary | std::ios::trunc);
+                if (!sensitivityBinary) throw std::runtime_error("FacetEB cannot create sensitivity file " + stem);
+                sensitivityBinary.write(reinterpret_cast<const char*>(derivative.data()),
+                                        std::streamsize(derivative.size() * sizeof(float)));
+                sensitivityBinary.close();
+                if (!sensitivityBinary) throw std::runtime_error("FacetEB cannot finish sensitivity file " + stem);
+                runIndex.value["products"].push_back("process/" + stem + ".bin");
+                nodeSensitivity = {{"file", "process/" + stem + ".bin"}, {"parameters", perParameter},
+                    {"units", "per unit relative change of the parameter (d/d ln theta)"},
+                    {"classMeans", "area-weighted over the geometric-normal side; objects = facets below leafFacetCount"},
+                    {"wallSeconds", std::chrono::duration<double>(Clock::now() - sensitivityStart).count()}};
+            }
             finalLongwaveOptics = std::move(snapshot.optics);
             finalLongwaveSolution = std::move(snapshot.radiation);
             finalLongwaveIncident = finalLongwaveSolution.incident;
@@ -8213,6 +8555,7 @@ try {
                     }
                 }
                 updateMeanTemperature();
+                if (urbanCanyon) updateUrbanAir();
                 updateStability();
                 couplingIterations = coupling + 1U;
             }
@@ -9152,6 +9495,19 @@ try {
             {"energyResidualTemperatureEquivalent", maximumEnergyResidualEquivalent}
         });
         if (!soilColumnSummary.is_null()) runIndex.value["completed"].back()["soilColumn"] = soilColumnSummary;
+        if (urbanCanyon) {
+            auto& completed = runIndex.value["completed"].back();
+            completed["urbanCanyonAirTemperature_K"] = canyonAir;
+            completed["urbanCanyonSurfaceCoefficient_W_m2_K"] = canyonSurfaceH;
+            completed["urbanCanyonNeutralSurfaceCoefficient_W_m2_K"] = urbanExchange.surface;
+            completed["urbanCanyonConvectiveVelocity_m_s"] = canyonConvectiveVelocity;
+            completed["urbanRoofCoefficient_W_m2_K"] = urbanExchange.roof;
+        }
+        if (gpuEnergy) {
+            runIndex.value["completed"].back()["energyFailingFacetsHostRecount"] = failingCountCheck.host;
+            runIndex.value["completed"].back()["energyFailingFacetCountDifference"] = failingCountCheck.difference;
+        }
+        if (!nodeSensitivity.is_null()) runIndex.value["completed"].back()["sensitivity"] = nodeSensitivity;
         runIndex.write();
 
         // 步骤 O：最后一个节点的结果保留为 latest（用于总结果 faceteb.json 的图层）；

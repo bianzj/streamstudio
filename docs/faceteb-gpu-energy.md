@@ -47,6 +47,7 @@ GPU 能量路径需要 Vulkan `shaderFloat64`。缺少能力或匹配的 `energy
 
 - 材质：32 个 float/面元；0–9 为植被/光伏标记、储热/对流/PV/土壤参数；10–17 为 Vcmax、Ball–Berry、生化类型与温度修正；18–22 为 Collatz 温度参数；23–26 为 Tyear、beta、qLs、kNPQs。
 - 节点输入：12 个 float/状态/侧；依次为上一节点温度、短波吸收、PAR、短波入射、叶片/土壤气动阻力、相对冠层深度、土壤热通量斜率与截距、TIR 反射/透射、受光比例。
+  - **城市街谷显热（2026-11-27，`control.urbanAerodynamics`）**：不再借用输入槽 I[6]；街谷空气温度 T_can 与墙/路面换热系数 h_s 随耦合迭代变化，作为 push constant 的 `canyonAir`、`canyonSurface`（`EnergyPush` 56 字节，主机每次迭代后 `setEnergyCanyon`）。材料槽：墙 P[30] = −1、P[31] = 1（导度 h_s，参考 T_can）；屋顶 P[30] = −1 − 屋顶系数、P[31] = 0（参考气温）；道路（地面）P[29] > 0.5（导度 h_s，参考 T_can，阻抗 ρc_p/h_s 同时用于潜热）；街谷内的叶片与树下地面 P[31] = −1（显热参考 T_can）。未开启时这些槽与 push 字段不被读取。公式与验证见理论手册、发布草稿。
 - 通量：12 个 float/状态/侧；依次为净辐射、显热及斜率、潜热及斜率、储热及斜率、光伏功率及斜率、叶温更新、气孔对数失配、保留字段。
 - 归约：7 个 uint32；前五项为非负 float 的位表示（热残差、等效温差、气孔失配、叶片残差、温度更新最大值），第六项为错误标志，第七项为能量残差未达标（|残差| ≥ 2 W/m²）的面元计数，供收敛判据使用。非有限状态或无效生理根直接报错。
 
@@ -71,3 +72,9 @@ GPU 能量路径需要 Vulkan `shaderFloat64`。缺少能力或匹配的 `energy
   同时，空的 bioNames 不再误取第一个 `surfaceEnergy` 块。
 - **初始土温。** 工程 JSON 未设置 `meteo.Tsold`（缺省或 null）时，不再写出 `initialSoilTemperature`，地面初温取首个气象节点气温。运行索引 `initialSoilTemperature.source` 记录实际来源。
 - **能量快照读取。** `readEnergyState(true)` 按最近一次能量求解实际所在的 ping-pong 缓冲读取辐射度，迭代数取实际值，不再固定为 `m_radiosityA` 和 64。
+
+## 2026-11-27 修正与新增
+
+- **未收敛面元计数自检改为容差比较。** 每个节点结束时，主机按下载的通量重数一遍“|残差| ≥ 2 W m⁻²”的面元数，与 GPU 归约的计数比较。GPU 用双精度累加残差、主机用单精度，残差恰在阈值附近的面元可能只被一侧计入；此前差 1 个就以退出码 1 终止整个运行（`feb_crop` 某参数组合可复现）。现在：差值 ≤ 面元总数的 1 % 只在 stderr 警告；节点用满迭代预算时无论差多少都不终止（以运行为先）；其余情况（节点提前收敛且差值 > 1 %）仍报错，因为这说明两份实现不一致、收敛判定本身不可信。每个节点在 `faceteb_run.json` 的 `completed[]` 里记录 `energyFailingFacetsHostRecount` 与 `energyFailingFacetCountDifference`。差值为 0 时输出与此前逐位相同。
+- **收敛点切线敏感度（`control.facetSensitivity`）。** 逗号分隔的参数名，环境变量 `HISTREAM_FACET_SENSITIVITY` 优先；目前支持 `leaf.vcmax`（P[10]，全部植被面元）、`leaf.ballBerrySlope`（P[11]）、`ground.surfaceResistance`（P[7]，全部地面面元）、`ground.thermalConductivity`（不在 P[] 里：按 λ(1 ± h) 重算地面侧土壤柱响应，替换输入槽 I[7]、I[8]；方法 2 用 `soilResponse` 的斜率与截距，方法 1 的储热系数按 √λ 缩放）。每个节点收敛后，从收敛态热启动，把参数乘以 (1 ± h)（`facetSensitivityStep`，缺省 0.05）各做 `facetSensitivityIterations`（缺省 24）次耦合迭代——两侧次数相同，所以基态本身残余的收敛漂移在中心差分里一阶抵消；若沿用收敛判据，扰动解会在第 0 步就满足判据，导数为 0。结果写 `process/facetsens_T=<token>.bin`（[参数][面侧][7]，float32，字段同 `faceteb_T=*.bin`：潜热、显热、表面热通量、温度、净辐射、受光/阴影部分温度），单位为 d/d ln θ；`completed[].sensitivity` 给出面积加权类别均值与耗时，`faceteb_run.json` 顶层 `sensitivity` 记录设置。只用 GPU 能量路径；不重建可见性图、不重算短波；**节点间热历史冻结**（上一节点状态取未扰动值），稳定度修正开启时 1/L 冻结。敏感度只读 GPU 状态、不改主机端状态，开启后原有产品与关闭时逐位相同（`feb_crop` 含影像 10 个产品文件核对，4 个参数全开再核对一次）。验证数字见 `docs/differentiable-inversion-and-surrogate.md`。
+- **BSM 土壤光谱在含水量 ≤ 5 % 时取干土光谱**（`compo.cpp`，与 SCOPE BSM、STREAM 一致），此前 μ < 0 时被外推成比干土更亮；含水量 > 5 % 的结果逐位不变。

@@ -284,6 +284,7 @@ void configureCommon(FileIO& io, const ProjectJson& project, Mode mode) {
     settings.vegetationTemperatureMethod = std::clamp(ProjectJson::integer(control, "vegetationTemperatureMethod", 0), 0, 1);
     // Missing field = neutral (same compatibility rule as FacetEB).
     settings.stabilityCorrection = ProjectJson::boolean(control, "stabilityCorrection", false);
+    settings.urbanCanyon = project.urbanCanyon();
     // 短波散射阶数只允许 1~3，超出范围直接报错（不静默截断）。
     settings.shortwaveScatteringOrders = ProjectJson::integer(control, "shortwaveScatteringOrders", 1);
     if (settings.shortwaveScatteringOrders < 1 || settings.shortwaveScatteringOrders > 3)
@@ -793,6 +794,7 @@ bool FileIO::readJson(const std::string& path, Mode mode) {
             //       各项都校验范围，越界直接报错。
             if (value.type == Type::BUILDING && (typeName == "Ship" || typeName == "ship")) {
                 SoilSet& hull = value.soilset;
+                hull.thermalClass = 2;
                 const float speed = ProjectJson::number(params, "speed", 0.0f);
                 if (!std::isfinite(speed) || speed < 0.0f || speed > 100.0f)
                     throw std::runtime_error("Ship speed must be 0-100 m/s: " + value.name);

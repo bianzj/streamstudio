@@ -211,6 +211,7 @@ bool Voxeleb::uploadSetting(std::shared_ptr<FileIO> &fileio, std::shared_ptr<Vox
     // The local-exchange closure replaces the surface-layer profile by a
     // local-wind bulk formula, so it has no scene surface layer to correct.
     modelio->stabilityCorrection = fileio->m_pVoxelebXml->settingxml.stabilityCorrection;
+    modelio->urbanCanyon = fileio->m_pVoxelebXml->settingxml.urbanCanyon;
     if (modelio->stabilityCorrection && modelio->fluid.localExchange) {
         std::cout << "STABILITY_CORRECTION\tdisabled\treason=fluid.localExchange uses a local-wind bulk closure" << std::endl;
         modelio->stabilityCorrection = false;
@@ -1157,6 +1158,10 @@ void Voxeleb::outputVoxel(std::shared_ptr<VoxelebIO> &modelio, std::shared_ptr<F
             << ",\"budgetResidualToleranceWm2\":2"
             << ",\"budgetStatesOutsideTolerance\":" << modelio->energyFinalUnconvergedStateCount
             << ",\"stabilityCorrection\":" << (modelio->stabilityCorrection ? "true" : "false");
+        if (modelio->urbanCanyon)
+            balanceDiagnostic << ",\"urbanCanyonAirTemperature_K\":" << modelio->fluidParameters.urbanExchange.w
+                              << ",\"urbanCanyonSurfaceCoefficient_W_m2_K\":" << modelio->fluidParameters.urbanExchange.y
+                              << ",\"urbanCanyonConvectiveVelocity_m_s\":" << modelio->urbanConvectiveVelocity;
         if (modelio->stabilityCorrection) {
             balanceDiagnostic << ",\"stability\":{\"available\":" << (modelio->stabilityAvailable ? "true" : "false")
                 << ",\"inverseObukhovLength\":" << modelio->inverseObukhov

@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include "urban_aerodynamics.h"
 
 #include "nvvk/resourceallocator_vk.hpp"
 #include "structs_cg.h"
@@ -382,6 +383,7 @@ struct SettingXml
     int vegetationTemperatureMethod{0};
     // VoxelEB Monin-Obukhov stability iteration (control.stabilityCorrection).
     bool stabilityCorrection{false};
+    urban::Canyon urbanCanyon{};
     // RayTracing sampling (control.seed / control.sampler): seed feeds the
     // per-pixel RNG (0 = historical sequence); sampler 0 = legacy PCG, 1 = Owen-scrambled Sobol.
     int rtSeed{0};

@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
+#include "urban_aerodynamics.h"
 
 // 类：project.json 的持有者。root() 为整个文件，configuration() 为其中的 configuration 子树。
 class ProjectJson {
@@ -34,6 +35,7 @@ public:
     const Json& light() const;
     const Json& sensor() const;
     const Json& control() const;
+    urban::Canyon urbanCanyon() const;
     const Json& objects() const;
     const Json& spectra() const;
     const Json& canopies() const;

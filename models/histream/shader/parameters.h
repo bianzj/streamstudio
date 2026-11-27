@@ -303,6 +303,7 @@ struct VoxelAir
 struct VoxelRaa
 {
 	float raa;
+	int urbanSurface;
 };
 
 struct VoxelRss
@@ -354,7 +355,6 @@ struct VoxelTlast
 // Keep in sync with EBState in src/base/structs_cg.h. The neutral VoxelEB
 // pipelines only address the leading count (pre-MOST declaration).
 #define EB_STATE_BINS 128
-#ifdef VOXELEB_MOST
 struct EBState
 {
 	int count;
@@ -364,21 +364,11 @@ struct EBState
 	int height[EB_STATE_BINS];       // sum of z - d, 0.01 m
 	int waterCount;                  // scene water voxels (ship waterline contact)
 	int waterTemperature;            // sum of water voxel temperatures, 0.01 K
+	int urbanRoad[EB_STATE_BINS];
+	int urbanWall[EB_STATE_BINS];
+	int urbanTemperature[EB_STATE_BINS]; // K relative to the reference air, scaled by 100
+	int urbanHeat[EB_STATE_BINS];        // sensible heat of road and wall faces into the canyon, 0.1 W m-2 per face
 };
-#else
-struct EBState
-{
-	int count;
-	// Only count and the ship water sums are used by the neutral pipelines;
-	// the middle lanes keep the offsets of the MOST declaration.
-	int groundCount;
-	int sensible[EB_STATE_BINS];
-	int ustar[EB_STATE_BINS];
-	int height[EB_STATE_BINS];
-	int waterCount;
-	int waterTemperature;
-};
-#endif
 
 // 模块：流体（风场/烟气）网格单元元数据与全局参数。
 struct FluidCellMeta
@@ -402,6 +392,7 @@ struct FluidParameters
     vec4 couplingSpacing; // xyz spacing, w terrain soil enabled
     vec4 heightProfile; // enabled, K/m lapse, reference height [m], vapor scale [m]
     vec4 localExchange; // x enables local leaf/soil exchange, yzw reserved (VoxelEB MOST: y on, z scene 1/L)
+    vec4 urbanExchange; // enabled, road/wall h, roof h, canyon temperature K
 };
 
 

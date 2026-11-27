@@ -562,6 +562,12 @@ function parseXml(content, mode = state.mode) {
       temperatureTolerance: Number(xmlValue(doc, 'Control temperatureTolerance', base.control.temperatureTolerance)),
       temperatureRelaxation: Number(xmlValue(doc, 'Control temperatureRelaxation', base.control.temperatureRelaxation)),
       stabilityCorrection: xmlValue(doc, 'Control stabilityCorrection', '0') === '1',
+      ...(doc.querySelector('Control urbanBuildingHeight, Control urbanStreetWidth') ? {
+        urbanAerodynamics: {
+          buildingHeight: Number(xmlValue(doc, 'Control urbanBuildingHeight', '0')),
+          streetWidth: Number(xmlValue(doc, 'Control urbanStreetWidth', '0'))
+        }
+      } : {}),
       soilTemperatureMethod: Math.max(0, Math.min(2, Math.round(Number(xmlValue(
         doc, 'Control soilTemperatureMethod',
         materials.find((item) => item.type === 'Soil')?.params?.method ?? base.control.soilTemperatureMethod
@@ -2954,7 +2960,9 @@ function renderInspector() {
       : state.mode === 'eFacetEB'
       ? `${stabilityControl}${field('最大耦合迭代', `<input class="input" id="couplingIterations" type="number" min="1" max="100" value="${escapeHtml(c.control.couplingIterations)}">`)}${field('温度松弛系数', `<input class="input" id="temperatureRelaxation" type="number" min="0.05" max="1" step="0.05" value="${escapeHtml(c.control.temperatureRelaxation)}">`)}`
       : ''
-    const coupling = couplingGeometry ? `<div class="property-group"><h3>${couplingGeometry} RT–EB 耦合</h3>${spectralAcceleration}${facetCouplingControls}<div class="notice">${couplingNotice}场景几何和${couplingGeometry}辐射结构只初始化一次。${state.mode === 'eFacetEB' ? '松弛系数默认 0.8；出现振荡（运行质量中迭代用满）时再调小。' : ''}</div></div>` : ''
+    const canyon = c.control.urbanAerodynamics
+    const canyonControls = canyon ? `${field('平均建筑高度', inputUnit('urbanBuildingHeight', canyon.buildingHeight, 'm', 'type="number" min="0.01" step="any"'))}${field('代表街宽', inputUnit('urbanStreetWidth', canyon.streetWidth, 'm', 'type="number" min="0.01" step="any"'))}<div class="notice">气象风速参考高度须高于平均建筑高度。</div>` : ''
+    const coupling = couplingGeometry ? `<div class="property-group"><h3>${couplingGeometry} RT–EB 耦合</h3>${spectralAcceleration}${facetCouplingControls}${switchRow('TEB 街谷显热', 'urbanCanyonSwitch', Boolean(canyon))}${canyonControls}<div class="notice">${couplingNotice}场景几何和${couplingGeometry}辐射结构只初始化一次。${state.mode === 'eFacetEB' ? '松弛系数默认 0.8；出现振荡（运行质量中迭代用满）时再调小。' : ''}</div></div>` : ''
     const temperatureMethods = energyBalanceOutput ? `<div class="property-group"><h3>温度模拟方法</h3>${field('土壤温度', `<select class="select" id="soilTemperatureMethod"><option value="0" ${c.control.soilTemperatureMethod === 0 ? 'selected' : ''}>0 · 瞬时能量平衡</option><option value="1" ${c.control.soilTemperatureMethod === 1 ? 'selected' : ''}>1 · 热惯性动态模型</option><option value="2" ${c.control.soilTemperatureMethod === 2 ? 'selected' : ''}>2 · 温度廓线传导模型（默认）</option></select>`)}${field('方法 1 热历史', `<select class="select" id="soilInertiaHistory"><option value="full" ${c.control.soilInertiaHistory === 'full' ? 'selected' : ''}>完整历史（8 节点 + 指数模态，新建默认）</option><option value="truncated" ${c.control.soilInertiaHistory !== 'full' ? 'selected' : ''}>仅最近 8 个节点（旧工程）</option></select>`)}${field('植被温度', `<select class="select" id="vegetationTemperatureMethod"><option value="0" ${c.control.vegetationTemperatureMethod === 0 ? 'selected' : ''}>经验法 · Ball–Berry</option><option value="1" ${c.control.vegetationTemperatureMethod === 1 ? 'selected' : ''}>机制法 · Farquhar</option></select>`)}<div class="notice">初始温度只作为求解初值；能量平衡各时刻均由所选方法动态更新。土壤方法会同步应用到全部土壤物化属性。</div></div>` : ''
     // 拼装 simulation 面板：运行质量/时限 → 模拟产出 → 计算控制 → 温度方法 → RT–EB 耦合。
     html = `<div class="property-group"><h3>运行质量与时限</h3>${qualityPresetControl(c)}${runTimeoutControl(c)}</div><div class="property-group"><h3>模拟产出</h3>${switchRow(imageOutputLabel, 'imageSwitch', c.sensor.image)}${processOutputSwitches}${processOutputNotice}${switchRow('输出温度', 'temperatureSwitch', c.sensor.temperature)}${switchRow('输出反照率', 'albedoSwitch', c.sensor.albedo)}</div><div class="property-group"><h3>计算控制</h3>${depthControl}${samplingControl}${periodicBoundaryControl}${heterogeneousVoxelControl}${radiationSolverControl}${collisionOrdersControl}${backendNotice}</div>${temperatureMethods}${coupling}${builtinNotice()}`
@@ -3182,6 +3190,14 @@ function bindInspector() {
   bindValue('temperatureTolerance', (v) => c.control.temperatureTolerance = v, (value) => Math.max(0.001, Math.min(100, Number(value) || 0.05)))
   bindValue('temperatureRelaxation', (v) => c.control.temperatureRelaxation = v, (value) => Math.max(0.05, Math.min(1, Number(value) || 0.8)))
   bindValue('stabilityCorrection', (v) => c.control.stabilityCorrection = v === 1)
+  $('#urbanCanyonSwitch')?.addEventListener('click', () => {
+    if (c.control.urbanAerodynamics) delete c.control.urbanAerodynamics
+    else c.control.urbanAerodynamics = { buildingHeight: Math.max(0.1, (c.meteo.z || 10) * 0.6), streetWidth: 20 }
+    syncProjectText()
+    renderInspector()
+  })
+  bindValue('urbanBuildingHeight', (v) => { c.control.urbanAerodynamics.buildingHeight = v }, positiveScene)
+  bindValue('urbanStreetWidth', (v) => { c.control.urbanAerodynamics.streetWidth = v }, positiveScene)
   bindValue('soilTemperatureMethod', (v) => {
     c.control.soilTemperatureMethod = Math.max(0, Math.min(2, Math.round(v)))
     c.materials.filter((item) => item.type === 'Soil').forEach((item) => { item.params.method = c.control.soilTemperatureMethod })

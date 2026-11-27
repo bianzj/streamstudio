@@ -172,17 +172,10 @@ uint32_t readEnergyState(const std::shared_ptr<VoxelebIO>& modelio,
     return count;
 }
 
-// 作用：把 MOST 稳定度修正开关（enabled）与场景 1/L（inverseL，单位 m-1）写入 GPU 上的
-//       FluidParameters UBO 的预留分量 localExchange.y/.z，供 budget/evapo/aeresist 的
-//       _most 版本读取；关闭时两个分量都写 0。副作用：同步提交 vkCmdUpdateBuffer。
-// Publish the MOST switch and the current scene 1/L to the shaders through
-// the reserved localExchange.y/z lanes of FluidParameters.
-void uploadStability(const std::shared_ptr<VoxelebIO>& modelio, bool enabled, double inverseL)
+void uploadExchangeParameters(const std::shared_ptr<VoxelebIO>& modelio)
 {
-    modelio->fluidParameters.localExchange.y = enabled ? 1.0f : 0.0f;
-    modelio->fluidParameters.localExchange.z = enabled ? static_cast<float>(inverseL) : 0.0f;
     if (!modelio->m_pFluidParameters)
-        throw std::runtime_error("VoxelEB stability correction needs the FluidParameters buffer");
+        throw std::runtime_error("VoxelEB air exchange needs the FluidParameters buffer");
     nvvk::CommandPool commandPool(modelio->m_device, modelio->m_queueIndex);
     vk::CommandBuffer command = commandPool.createCommandBuffer();
     vkCmdUpdateBuffer(command, modelio->m_pFluidParameters->buffer, 0,
@@ -195,6 +188,13 @@ void uploadStability(const std::shared_ptr<VoxelebIO>& modelio, bool enabled, do
     commandPool.submitAndWait(command);
 }
 
+void uploadStability(const std::shared_ptr<VoxelebIO>& modelio, bool enabled, double inverseL)
+{
+    modelio->fluidParameters.localExchange.y = enabled ? 1.0f : 0.0f;
+    modelio->fluidParameters.localExchange.z = enabled ? static_cast<float>(inverseL) : 0.0f;
+    uploadExchangeParameters(modelio);
+}
+
 // 作用：把船体水线接触用的场景水温（kelvin，K）写入 FluidParameters 的 localExchange.w，
 //       0 表示尚未设置。与 uploadStability 一样用 vkCmdUpdateBuffer 上传整个结构体。
 // Ship waterline contact: publish the scene water temperature [K] to the
@@ -203,18 +203,7 @@ void uploadStability(const std::shared_ptr<VoxelebIO>& modelio, bool enabled, do
 void uploadShipWaterTemperature(const std::shared_ptr<VoxelebIO>& modelio, double kelvin)
 {
     modelio->fluidParameters.localExchange.w = static_cast<float>(kelvin);
-    if (!modelio->m_pFluidParameters)
-        throw std::runtime_error("VoxelEB ship waterline needs the FluidParameters buffer");
-    nvvk::CommandPool commandPool(modelio->m_device, modelio->m_queueIndex);
-    vk::CommandBuffer command = commandPool.createCommandBuffer();
-    vkCmdUpdateBuffer(command, modelio->m_pFluidParameters->buffer, 0,
-                      sizeof(FluidParameters), &modelio->fluidParameters);
-    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-    commandPool.submitAndWait(command);
+    uploadExchangeParameters(modelio);
 }
 
 // 作用：由场景显热 H 与摩擦速度 u* 估计目标 1/L：1/L = -κ g H / (ρ cp Ta u*³)。
@@ -666,6 +655,17 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
     // 限幅：至少 1 列，避免后面除零。
     const int domainColumns = std::max(1, modelio->setting.voxelSize.x * modelio->setting.voxelSize.z);
     const double airTemperatureK = modelio->meteo.Ta + 273.15;
+    const bool urbanCanyon = static_cast<bool>(modelio->urbanCanyon);
+    urban::Exchange urbanExchange;
+    if (urbanCanyon) {
+        urbanExchange = urban::neutralExchange(modelio->urbanCanyon, modelio->meteo.z,
+                                               modelio->meteo.u, 1.2047 * 1004.0);
+        modelio->fluidParameters.urbanExchange = {
+            1.0f, static_cast<float>(urbanExchange.surface),
+            static_cast<float>(urbanExchange.roof), static_cast<float>(airTemperatureK)};
+        if (!stability) uploadExchangeParameters(modelio);
+        modelio->urbanConvectiveVelocity = 0.0;   // each node starts from the neutral coefficient
+    }
     double inverseL = 0.0; // each node starts neutral (reproducible per node)
     modelio->stabilityAvailable = false;
     modelio->stabilityAeroUpdates = 0;
@@ -754,25 +754,56 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
         submit(modelio, VoxelEBStage::budget, voxelSize1D, std::nullopt, std::nullopt);
         waitFence(modelio);
         modelio->energyIterations = kiter + 1;
+        EBState state{};
+        const bool updateMost = stability && modelio->stabilityAvailable;
+        const bool needsExchangeState = urbanCanyon || modelio->shipWaterline || updateMost;
+        const uint32_t outside = (needsExchangeState || kiter >= 2)
+            ? readEnergyState(modelio, stateReadback, needsExchangeState ? &state : nullptr) : 0U;
+        bool canyonConverged = true;
+        if (urbanCanyon) {
+            int64_t road = 0, walls = 0, temperature = 0, heat = 0;
+            for (int bin = 0; bin < kEnergyStateBins; ++bin) {
+                road += state.urbanRoad[bin];
+                walls += state.urbanWall[bin];
+                temperature += state.urbanTemperature[bin];
+                heat += state.urbanHeat[bin];
+            }
+            const double area = double(road + walls); // common voxel face area cancels
+            // Live wall/road coefficient (it carries the convective velocity of the previous pass).
+            urban::Exchange live = urbanExchange;
+            live.surface = modelio->fluidParameters.urbanExchange.y;
+            const float next = static_cast<float>(urban::canyonAirTemperature(
+                live, airTemperatureK, double(road), area,
+                area * airTemperatureK + 0.01 * double(temperature)));
+            // Canyon heat flux per street plan area Q0 (kinematic, K m s-1) -> w* -> wall/road coefficient
+            // (SURFEX eq. 3.23), relaxed by 0.5 like the canyon air temperature closure above.
+            const double kinematicHeat = road > 0 ? 0.1 * double(heat) / double(road) / (1.2047 * 1004.0) : 0.0;
+            const double wStar = urban::convectiveVelocity(kinematicHeat, next, modelio->urbanCanyon.buildingHeight);
+            const double previousSurface = modelio->fluidParameters.urbanExchange.y;
+            const double nextSurface = previousSurface +
+                0.5 * (urban::surfaceCoefficient(urbanExchange, wStar) - previousSurface);
+            canyonConverged = std::abs(next - modelio->fluidParameters.urbanExchange.w) <= 0.02f &&
+                std::abs(nextSurface - previousSurface) <= 0.002 * std::max(1.0, nextSurface);
+            modelio->fluidParameters.urbanExchange.w = next;
+            modelio->fluidParameters.urbanExchange.y = static_cast<float>(nextSurface);
+            modelio->urbanConvectiveVelocity = wStar;
+            uploadExchangeParameters(modelio);
+        }
         // 7.5 船体水线：budget 把水体体元数与水温偏差（0.01 K 定点数）累计进 EBState，
         // 这里取均值累加到场景水温 shipWaterK，并上传给下一次迭代（语义见 budget.comp 文件头）。
         if (modelio->shipWaterline) {
             // Scene mean water temperature after this pass for the next one.
-            EBState waterState{};
-            readEnergyState(modelio, stateReadback, &waterState);
-            if (waterState.waterCount > 0) {
-                modelio->shipWaterVoxels = waterState.waterCount;
-                modelio->shipWaterK += 0.01 * double(waterState.waterTemperature) / waterState.waterCount;
+            if (state.waterCount > 0) {
+                modelio->shipWaterVoxels = state.waterCount;
+                modelio->shipWaterK += 0.01 * double(state.waterTemperature) / state.waterCount;
                 uploadShipWaterTemperature(modelio, modelio->shipWaterK);
             }
         }
         // 7.6 MOST 稳定度更新：由本次 pass 的场景显热（EBState.sensible 以 0.1 W m-2 定点累加，
         // 除以水平格数得单位面积显热）与 u* 求目标 1/L；以 |Δ(z/L)| 判断是否收敛，
         // 未收敛则 1/L 按 0.5 欠松弛逼近目标并重新评估气动阻抗（FacetEB 用同一系数）。
-        if (stability && modelio->stabilityAvailable) {
+        if (updateMost) {
             // Fluxes of this pass (evapo at the pre-update temperatures).
-            EBState state{};
-            const uint32_t outside = readEnergyState(modelio, stateReadback, &state);
             int64_t sensibleSum = 0;
             for (int bin = 0; bin < kEnergyStateBins; ++bin) sensibleSum += state.sensible[bin];
             const double sensible = 0.1 * double(sensibleSum) / domainColumns;
@@ -783,7 +814,7 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
             modelio->stabilityChange = std::abs(desired - inverseL) * height;
             const bool stabilityConverged =
                 modelio->stabilityChange <= stabilityTolerance(desired * height);
-            if (kiter >= 2 && outside == 0U && stabilityConverged) break;
+            if (kiter >= 2 && outside == 0U && stabilityConverged && canyonConverged) break;
             if (!stabilityConverged) {
                 // Under-relaxed fixed point (FacetEB uses the same 0.5).
                 inverseL += 0.5 * (desired - inverseL);
@@ -791,7 +822,7 @@ bool Command::runEB(std::shared_ptr<VoxelebIO> &modelio){
                 evaluateAerodynamics();
             }
         // 中性（或无地面列）情形：迭代 ≥ 3 次且无未收敛状态即收敛退出。
-        } else if(kiter >= 2 && readEnergyState(modelio, stateReadback) == 0U) {
+        } else if(kiter >= 2 && outside == 0U && canyonConverged) {
             break;
         }
 

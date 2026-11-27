@@ -187,6 +187,8 @@ VoxelebIO(){
     uint64_t fluidCellCount{1};
     int fluidSubsteps{1};
     FluidParameters fluidParameters{};
+    urban::Canyon urbanCanyon{};
+    double urbanConvectiveVelocity{0.0}; // canyon convective velocity w* of the last pass, m s-1
 
     // 模块 5：子 IO 结构、推送常量设置与 GPU 缓冲句柄。
     std::shared_ptr<MeshIO> m_meshio;

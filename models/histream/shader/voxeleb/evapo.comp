@@ -171,11 +171,23 @@ void main()
         lambda = (2.501 - 0.002361*(Tc-273.15))*1E6;
         
         if(raa < 1) raa = 1;
+        // City surfaces (aeresist.comp urbanSurface): 1 road, 2 wall, 3 roof, 4 street-tree leaves and
+        // ground under street trees (sensible-heat reference is the canyon air).
+        int urbanSurface = voxelRaas[bufferId].urbanSurface;
+        vec4 urbanExchange = fluidParameters.urbanExchange;
+        float referenceC = shipWet ? shipWaterC
+            : (urbanSurface == 4 ? urbanExchange.w - 273.15 : Ta);
         // Ground surfaces add free convection when warmer than the air
-        // (budget.comp uses the same effective resistance per state).
-        raa = groundExchangeRaa(raa, Tc, Ta, shipWet ? uint(TYPE_NULL) : typeId);
+        // (budget.comp uses the same effective resistance per state). A road exchanges with the
+        // canyon through the wall/road coefficient: one resistance rho cp / h for sensible and latent heat.
+        if (urbanSurface == 1) raa = (RHOA * CP) / urbanExchange.y;
+        else raa = groundExchangeRaa(raa, Tc, referenceC, shipWet ? uint(TYPE_NULL) : typeId);
         // H = raa;
-        H = (RHOA * CP) / raa * (Tc-273.15 - (shipWet ? shipWaterC : Ta));
+        H = (RHOA * CP) / raa * (Tc-273.15 - referenceC);
+        if (urbanSurface > 0 && urbanSurface < 4) {
+            H = urbanSurface == 3 ? urbanExchange.z * (Tc - (ubom.meteo.Ta + 273.15))
+                : urbanExchange.y * (Tc - urbanExchange.w);
+        }
         LE = RHOA / (raa + rss) * lambda * (qi - qa);
 
         // 按类别修正潜热：水体乘蒸发系数（限制在 [0,1]）；建筑和体积含水量 < 0.03 的干土无蒸发。

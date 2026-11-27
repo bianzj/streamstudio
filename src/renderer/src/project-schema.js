@@ -1348,6 +1348,9 @@ export function normalizeProject(value = {}) {
           configuration.control?.radiationMaxSteps, 64
         )))),
         stabilityCorrection: configuration.control?.stabilityCorrection === true,
+        ...(configuration.control?.urbanAerodynamics != null ? {
+          urbanAerodynamics: { ...configuration.control.urbanAerodynamics }
+        } : {}),
         soilTemperatureMethod: Math.max(0, Math.min(2, Math.round(number(
           configuration.control?.soilTemperatureMethod,
           configuration.materials?.find((item) => item.type === 'Soil')?.params?.method ?? 2
@@ -1864,6 +1867,7 @@ export function projectToXml(value, paths = {}) {
     <couplingIterations>${number(c.control.couplingIterations, project.mode === 'eFacetEB' ? 60 : 20)}</couplingIterations>
     <temperatureTolerance>${number(c.control.temperatureTolerance, 0.05)}</temperatureTolerance>
     <stabilityCorrection>${c.control.stabilityCorrection === true ? 1 : 0}</stabilityCorrection>
+    ${c.control.urbanAerodynamics ? `<urbanBuildingHeight>${number(c.control.urbanAerodynamics.buildingHeight, 0)}</urbanBuildingHeight><urbanStreetWidth>${number(c.control.urbanAerodynamics.streetWidth, 0)}</urbanStreetWidth>` : ''}
     <temperatureRelaxation>${number(c.control.temperatureRelaxation, 0.8)}</temperatureRelaxation>
     <soilTemperatureMethod>${Math.max(0, Math.min(2, Math.round(number(c.control.soilTemperatureMethod, 2))))}</soilTemperatureMethod>${c.control.soilInertiaHistory === 'full' ? '\n    <soilInertiaHistory>1</soilInertiaHistory>' : ''}
     <shortwaveScatteringOrders>${c.control.shortwaveScatteringOrders}</shortwaveScatteringOrders>

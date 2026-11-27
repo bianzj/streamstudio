@@ -122,6 +122,12 @@ const ProjectJson::Json& ProjectJson::scene() const { return objectMember(m_conf
 const ProjectJson::Json& ProjectJson::light() const { return objectMember(m_configuration, "light"); }
 const ProjectJson::Json& ProjectJson::sensor() const { return objectMember(m_configuration, "sensor"); }
 const ProjectJson::Json& ProjectJson::control() const { return objectMember(m_configuration, "control"); }
+urban::Canyon ProjectJson::urbanCanyon() const {
+    const auto& settings = control();
+    const auto it = settings.find("urbanAerodynamics");
+    if (it == settings.end() || it->is_null()) return {};
+    return urban::canyonGeometry(number(*it, "buildingHeight", 0), number(*it, "streetWidth", 0));
+}
 const ProjectJson::Json& ProjectJson::objects() const { return arrayMember(objectMember(m_configuration, "objects"), "items"); }
 const ProjectJson::Json& ProjectJson::spectra() const { return arrayMember(m_configuration, "spectra"); }
 const ProjectJson::Json& ProjectJson::canopies() const { return arrayMember(m_configuration, "canopies"); }

@@ -223,11 +223,12 @@ float physiology(uint f,double t,double rs,float par,float rb,float depth) {
 // 作用：给定气孔阻力 rs，求叶片温度（K）。方程：
 //   net − εσ(T⁴ − T0⁴) − g(T − Tair) − LE(T) − storage·(T − Tprev) = 0，T0 = initial 为
 //   计算 net 时所用温度。用带区间 [220, 360] K 的牛顿法，牛顿步越界则二分，最多 32 步，
-//   步长 ≤ 0.01 K 即收敛。eps 为两面发射率之和（叶片两面各发射），conductance 为显热导度。
-double thermal(float initial,double rs,float rb,float net,double eps,float conductance,float storage,float previous) {
+//   步长 ≤ 0.01 K 即收敛。eps 为两面发射率之和（叶片两面各发射），conductance 为显热导度，
+//   air 为显热的参考空气温度（缺省 pc.air；城市街谷内的叶片为街谷空气温度）。
+double thermal(float initial,double rs,float rb,float net,double eps,float conductance,float storage,float previous,float air) {
     double lower=220.0lf,upper=360.0lf,t=clamp(double(initial),lower,upper);
     for(int i=0;i<32;++i) {
-        double residual=double(net)-eps*double(SIGMA)*(fourth(t)-fourth(double(initial)))-double(conductance)*(t-double(pc.air))-
+        double residual=double(net)-eps*double(SIGMA)*(fourth(t)-fourth(double(initial)))-double(conductance)*(t-double(air))-
             double(latent(float(t),rb,float(rs)))-double(storage)*(t-double(previous));
         double response=4.0lf*eps*double(SIGMA)*t*t*t+double(conductance)+double(storage)+double(latentSlope(float(t),rb,float(rs)));
         double correction=residual/max(1.0lf,response);

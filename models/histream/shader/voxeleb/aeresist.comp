@@ -194,11 +194,13 @@ float phstar(float z,float zr,float d,float L)
 //   同时输出冠顶高度 top（相对该体元，m）与列内最大叶宽 leafwidth（m）。
 // 说明：只计非参与介质（isParticipatingMedium 为假）的植被体元；最多扫描 2048 格；
 //   叶面积指数 = Σ 体元叶面积密度 × 体元尺度（累加纵向积分）。
-float columnCanopy(NanoVDBLink nanoVDBLink, ivec3 voxelId0, out float top, out float leafwidth)
+float columnCanopy(NanoVDBLink nanoVDBLink, ivec3 voxelId0, bool trackBuildings,
+                   out float top, out float leafwidth, out bool covered)
 {
     float lai = 0.0;
     top = 0.0;
     leafwidth = 0.0;
+    covered = false;
     ivec3 voxelRes = ivec3(setting.voxelSize);
     // HDDA: an empty NanoVDB block (8 / 128 / 4096 cells) holds no vegetation; skip to its end.
     bool skip = VoxelFlag(VOXEL_FLAG_HDDA);
@@ -218,6 +220,8 @@ float columnCanopy(NanoVDBLink nanoVDBLink, ivec3 voxelId0, out float top, out f
         }
         if(bufferId < 0 || bufferId >= setting.voxelCount) continue;
         MeshLink link = meshLinks[instanceLinks[voxelLinks[bufferId].instanceId].meshId];
+        if (trackBuildings && link.type == TYPE_BUILDING && soilSets[link.bioId].thermalClass == 0)
+            covered = true;
         if(link.type != TYPE_VEGETATION) continue;
         Canopy columnCanopy = canopies[link.canopyId];
         if(isParticipatingMedium(columnCanopy)) continue;
@@ -289,6 +293,15 @@ void main()
         meshLink = meshLinks[instanceLink.meshId];
         canopyId = meshLink.canopyId; 
         typeId = meshLink.type; 
+        voxelRaas[bufferId0].urbanSurface = 0;
+        bool urban = fluidParameters.urbanExchange.x > 0.5;
+        if (urban && typeId == TYPE_BUILDING && soilSets[meshLink.bioId].thermalClass == 0) {
+            VoxelLink link = voxelLinks[bufferId0];
+            bool roof = link.faceId == 5 || (link.faceId == 0 &&
+                (abs(link.normalY) >= 0.7071 ||
+                 length(vec3(link.normalX, link.normalY, link.normalZ)) < 0.5));
+            voxelRaas[bufferId0].urbanSurface = roof ? 3 : 2;
+        }
 
 
         aerotype = aeroConds[aeroId].type;
@@ -316,7 +329,22 @@ void main()
         // Optional local-air closure. Never pass an in-canopy resolved speed
         // through the above-canopy wind profile again. The same closure can
         // use prescribed local air with fluid.enabled=false for paired runs.
-        if (fluidParameters.localExchange.x > 0.5 &&
+        bool localExchange = fluidParameters.localExchange.x > 0.5;
+        float columnLai = 0.0, columnTop, columnLeafwidth;
+        if ((typeId == TYPE_SOIL && (urban || !localExchange)) || typeId == TYPE_WATER) {
+            bool covered;
+            columnLai = columnCanopy(nanoVDBLink, voxelId0, urban && typeId == TYPE_SOIL,
+                                     columnTop, columnLeafwidth, covered);
+            if (urban && typeId == TYPE_SOIL && !covered && columnLai <= 0.01)
+                voxelRaas[bufferId0].urbanSurface = 1;
+            // Ground sheltered by street trees keeps its soil exchange but refers to the canyon air.
+            else if (urban && typeId == TYPE_SOIL && !covered)
+                voxelRaas[bufferId0].urbanSurface = 4;
+        }
+        // Street-tree leaves exchange sensible heat with the canyon air (urbanSurface 4).
+        if (urban && typeId == TYPE_VEGETATION)
+            voxelRaas[bufferId0].urbanSurface = 4;
+        if (localExchange &&
             (typeId == TYPE_VEGETATION || typeId == TYPE_SOIL)) {
             float speed = max(localWindSpeed(bufferId0), 0.05);
             if (typeId == TYPE_VEGETATION) {
@@ -341,8 +369,6 @@ void main()
             //   （冠顶高度、LAI、叶宽）；列内无植被且气动条目未指定 LAI 时视为裸地（hcmax=0）。
             // Ground cells are sheltered by the vegetation actually above them,
             // not by the canopy entry of their own material; open ground is bare.
-            float columnTop, columnLeafwidth;
-            float columnLai = columnCanopy(nanoVDBLink, voxelId0, columnTop, columnLeafwidth);
             if(columnLai > 0.01)
             {
                 hcmax = columnTop;

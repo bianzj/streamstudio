@@ -169,6 +169,35 @@
 - **分阶段耗时与质量字段。** `facetrt.json` 的 `timing` 增加 `wallMs`、`setupMs`（`setupStages`）、`gpuInitMs`、`visibilityStages`、`opticsPrepMs`、逐波段 `bandSolves`（迭代数、耗时、热启动）、`outputReadMs`、`outputWriteMs`；`faceteb_run.json` 增加 `timing`（含逐节点短波/耦合/输出）。顶层 `quality`（FacetRT）与 `faceteb_run.json` 的 `quality`/`execution` 给出实际可见性后端、`zeroVisibilitySamples`（无可见性样本的接收侧占比；森林 1024² 为 82%、作物 2.6%、城市 0.05%，这类面元被当作开阔天空，占比高时提高 `HISTREAM_FACET_RASTER_SIZE`）。森林整次（二进制输出）118 s → 12 s（JSON 输出 86 s，写出占 76 s）；GPU 求解只占 0.5 s。`radiationSolver="accelerated"` 不是多波段批量读图，而是相邻波段热启动 + 每 8 次迭代查收敛（作物 6 波段 384 → 72 次迭代）。
 - **分辨率研究（只给建议，未改缺省）。** 作物 FacetRT 逐面元误差（对 4096²）：1024² 约 2–5%（受光比例）、场景均值偏差 ≤ 0.15%，2048² 减半；FacetEB 面元温度平均误差 0.23 K（1024²）→ 0.10 K（2048²）；城市可忽略；森林 1024² 有 82% 接收侧无样本、物体侧偏高约 30%（按面元采样才能根治）。建议按面元数自适应栅格边长（1024–4096）。
 
+### FacetEB/VoxelEB：城市街谷显热（Masson TEB，2026-11-27，改变数值，仅开启时）
+
+- **新增可选项** `control.urbanAerodynamics = { buildingHeight, streetWidth }`（米，均须为正；`meteo.z` 须高于 `buildingHeight`，否则报错）。界面：FacetEB / VoxelEB 的“RT–EB 耦合 → TEB 街谷显热”开关，开启后给出“平均建筑高度”“代表街宽”；工程缺该字段时一切照旧。内置示例 `urban_block` 默认开启（31 m、31.5 m），同时把 `meteo.z` 15 → 45 m（理想化风强迫，须高于代表屋顶高度）、`couplingIterations` 20 → 60，见该示例的 README。
+- **做法**（Masson 2000 §2.9.3–2.9.7，公式见理论手册“城市街谷显热”）：
+  - **屋顶**与参考气温交换，h_roof = ρc_p κ²U/ln²((z−h)/z₀,roof)（中性）。
+  - **道路与墙面**共用一个街谷空气温度 T_can，交换系数 h_s = 11.8 + 4.2√(U_can² + (u* + w*)²)（Rowley，含对流速度 w* = (g/T_can · Q0 · h)^(1/3)，Q0 为道路与墙面单位街道面积的运动学显热通量，SURFEX 文档式 3.23；w* 与 h_s 互相依赖，每次耦合迭代按 0.5 松弛更新）。T_can 由街谷与上空的显热闭合 Σ Aᵢ h_s (Tᵢ − T_can) = A_road h_top (T_can − T_ref) 在每次迭代中重算。
+  - **道路的潜热**与显热用同一个阻抗 ρc_p/h_s（此前潜热仍用 z₀ = 0.01 m 裸土对数廓线的阻抗）。
+  - **行道树叶片与树下地面**的显热参考温度改为 T_can（此前是参考高度气温，正午差约 8 K）；叶片对流导度、潜热的水汽压仍取参考值（街谷水汽量未建模）。
+  - 分类：FacetEB 的屋顶/墙取建筑固体（`outputComponent == 3`）三角面，法向 |n_y| ≥ 0.7071 为屋顶、其余为墙；道路取不在屋顶之下、LAI ≤ 0.01、非水面的地面面元；植被叶片（非光伏）与上方有树（LAI > 0.01）的地面为“街谷内植被”，权重为三角面面积。VoxelEB 用同样的规则（建筑体元面朝向、土壤体元上方有无建筑与 LAI），权重为体元面面积。水面、车辆、船舶、树干等其余表面保持原公式；辐射、导热、潜热的其余部分不变。节点只有在街谷空气温度变化 ≤ 0.02 K 且 h_s 变化 ≤ 0.2 % 时才算收敛（VoxelEB 原有，FacetEB 新增）。
+  - 街谷量写进运行记录：FacetEB `faceteb_run.json` 的 `completed[]`（`urbanCanyonAirTemperature_K`、`urbanCanyonSurfaceCoefficient_W_m2_K`、`urbanCanyonNeutralSurfaceCoefficient_W_m2_K`、`urbanCanyonConvectiveVelocity_m_s`、`urbanRoofCoefficient_W_m2_K`）；VoxelEB `energy_balance_node=*.json`（前三项同名）。
+- **接口改动**：FacetEB 的 GPU 推送常量 `EnergyPush` 由 48 → 56 字节，增加随迭代更新的 `canyonAir`、`canyonSurface`（`FacetrtVulkan::setEnergyCanyon`，不再借用输入槽 I[6]）；`energy.comp` 的面元参数 P[30] < 0 表示城市固体（墙 P[31] = 1，屋顶 −P[30]−1 为系数且 P[31] = 0），地面 P[29] > 0.5 为道路，叶片与树下地面 P[31] = −1 表示参考街谷空气；`thermal()` 增加参考气温参数。VoxelEB 的 `FluidParameters.urbanExchange`（开关、路/墙系数、屋顶系数、街谷温度）、`VoxelRaa.urbanSurface`（1 路、2 墙、3 屋顶、4 街谷内植被）、`EBState` 增加道路/墙面计数、温度与显热累加槽——**`EBState` 的中性与 `VOXELEB_MOST` 两种声明合并为一个**，所有 VoxelEB 着色器共用。`urban_aerodynamics.h` 增加 `convectiveVelocity`、`surfaceCoefficient`。C++ 与着色器须同时更新（`histream` 与 `histream_runtime_resources` 一起构建）。单元测试目标 `histream_urban_aerodynamics_tests`（`tools/test-urban-aerodynamics.cpp`，默认不构建）覆盖街谷风、屋顶交换、显热闭合与 w*。
+- **验证**（`urban_block`，RTX PRO 6000，修改前引擎为 2026-11-26 构建）：
+  - **关闭时逐位不变**：FacetEB 全天 48 节点与 VoxelEB 节点 23–24 在去掉 `urbanAerodynamics` 后与修改前引擎逐位相同；`feb_crop` 逐位不变；部署后的引擎与沙箱构建逐位相同。
+  - **FacetEB CPU/GPU 一致性**（`HISTREAM_FACET_VALIDATE_ENERGY=2`，开启城市模式，2 节点）：通过，通量最大差 9.5×10⁻⁴ W m⁻²、温度更新最大差 3×10⁻⁵ K。
+  - **FacetEB 开启（31 m / 31.5 m，全天 48 节点）**，正午（12:00）类别均值，关闭 → 开启：屋顶 T 313.8 → 323.6 K、H 238 → 79 W m⁻²；墙 T 303.8 → 309.5 K、H 69 → 13；地面 T 310.6 → 311.4 K、H 86 → 77；行道树 T 307.8 → 310.5 K、H 8.4 → 1.9、LE 61 → 69 W m⁻²。白天（节点 18–36）平均温差：屋顶 +9.7 K、墙 +6.7 K、树 +3.0 K、地面 +1.3 K。街谷空气温度正午 308.5 K（参考气温 299.8 K），h_s 12.0–15.7（中性约 12，正午 14.4），w* 最大 0.70 m s⁻¹。相对不含“树/道路潜热/w*”三项修改的上一版：树白天 +1.1 K、H −9.3 W m⁻²，其余 ≤ 0.1 K。未收敛节点（60 次迭代内）41 / 48，与上一版相同，其中多数在关闭城市模式时同样未收敛（个别面元在 2 W m⁻² 阈值附近振荡，不是本项引入）。
+  - **VoxelEB 开启**（节点 23–24）：街谷空气温度 302.9 / 304.8 K，h_s 13.9 / 14.0，w* 0.39 / 0.43 m s⁻¹（FacetEB 11:50 为 303.5 K、14.0、0.42，两个独立实现接近）；短波反射率不变；10.5 µm 平均亮温关闭 → 开启 306.6 → 307.7 K（11:50）、310.1 → 311.6 K（12:20）；迭代数 24 / 16。
+- **已知局限（没有改，需要决定）**：① 屋顶与街谷出口仍是**中性**：屋顶系数 ∝ U，无风时为 0，而旧公式（5.8 + 4.1√U 每面）有常数项；`urban_block` 的气象风速 0.06–3.5 m s⁻¹（中位 0.89），U = 0.43 m s⁻¹ 时屋顶系数约 3.3 对旧的约 17 W m⁻² K⁻¹，弱风时屋顶明显更热（正午 +10 K），自由对流下限没有加。② **街谷水汽量没有建模**：道路与树的潜热仍对参考水汽压；TEB 有街谷湿度 q_can 与路面积水。③ 道路用的是背景土壤材料（`rss` 2000 s m⁻¹），会像湿土一样蒸发（正午约 46 W m⁻²）；示例没改材料。④ 没有人为热排放与建筑内部空调。⑤ 街谷几何（高度、宽度）是整景一个值，不从三维场景推算；街谷风只用 Masson 的 2/π 因子（浅街谷 h/W < 1 的 Lemonsu 2004 修正未做）。⑥ 没有与实测屋顶/墙面/街谷温度比较，上面的数字只是新旧公式的差别，不是精度验证。⑦ 收敛点切线敏感度（`control.facetSensitivity`）与城市模式同时开启时，街谷量在扰动求解中冻结在收敛值，没有跟随耦合。
+
+### FacetEB：收敛点切线敏感度、自检容差、BSM 干端钳位（2026-11-27，BSM 钳位改变 SMC < 5% 的数值）
+
+- **收敛点切线敏感度（新，可选）。** 工程字段 `control.facetSensitivity`（逗号分隔：`leaf.vcmax`、`leaf.ballBerrySlope`、`ground.surfaceResistance`、`ground.thermalConductivity`；环境变量 `HISTREAM_FACET_SENSITIVITY` 优先），`facetSensitivityStep`（缺省 0.05）、`facetSensitivityIterations`（缺省 24）。每个节点收敛后从收敛态热启动，参数 ×(1 ± h) 各做相同次数的耦合迭代，输出逐面侧 d/d ln θ（`process/facetsens_T=<token>.bin`，字段同能量过程文件）和类别均值（`faceteb_run.json` 的 `completed[].sensitivity`）。节点间热历史冻结；只用 GPU 能量路径。开启与否原有产品逐位相同。首节点与外部整次重跑差分相差 0.1–4%，且不受外部差分的“停止误差”影响；`feb_crop` 每参数每节点约 2.3 s。详见 `docs/faceteb-gpu-energy.md`、`docs/differentiable-inversion-and-surrogate.md`。
+- **未收敛面元计数自检改为容差。** 主机重数与 GPU 归约的计数差 ≤ 面元总数 1% 只警告；节点用满迭代预算时不终止；其余情况仍报错。`completed[]` 记录 `energyFailingFacetsHostRecount`、`energyFailingFacetCountDifference`。此前差 1 个即以退出码 1 终止（`feb_crop` 某参数组合可复现）。不改数值。
+- **BSM 土壤光谱在含水量 ≤ 5% 时取干土光谱**（`compo.cpp`，与 SCOPE、STREAM 一致）。此前 μ < 0 时被外推成比干土更亮。**兼容**：SMC < 5% 的工程短波吸收与温度改变（`feb_crop` SMC 2% 的地面 Rn 471.5 → 478.5 W m⁻²）；SMC ≥ 5% 的工程逐位不变。SMC ≤ 1 按小数（1 = 饱和）的约定未改。
+
+### HiStream 三维可微反演与神经代理原型（2026-11-27，研究原型）
+
+- 新增 `tools/histream-ml/`：对 FacetEB 的 `feb_crop` 算例训练 MLP 神经代理（两节点，独立测试集：温度 RMSE 中位 0.056 K，通量 0.62 W m⁻²，通量未达 0.25 目标），用代理自动微分或引擎内切线敏感度给梯度做 MAP 反演；代理路线以引擎校正迭代收尾，另有只用引擎的 Gauss–Newton。代理误差改用训练集交叉验证残差的协方差；统计 OSSE（64 真值 × 3 噪声）检验了 Laplace 后验的覆盖率。命令行使用，未接入服务端与工作台，不进安装包。设计、验证数字、局限与后续路线见 `docs/differentiable-inversion-and-surrogate.md`。
+- 发现：工程里有两个互不关联的 SMC。热学材料 `materials[soilset].params.SMC` 在 FacetEB 里只判断“是否过干（<3%）”，对结果无影响；BSM 光谱 `spectra[soil].params.SMC` 进入反射率与 TIR 发射率，影响很大（25→10：地面 Rn −19 W m⁻²）。
+
 ### FacetRT/FacetEB：服务端面元规模上限可调、后端感知的预检、缺省写二进制结果（2026-11-26，不改数值）
 
 - **面元数量上限可调，缺省 500 万 → 2000 万。** 引擎本身没有面元数量限制，服务端的上限只是运行前的资源保护。缺省 `20,000,000`（回归森林 1580 万面元已可运行；光线查询加速结构约 53 B/三角形，2000 万约 1 GiB）；环境变量 `STREAM_STUDIO_MAX_FACET_TRIANGLES` 或工程 `control.maxFacetTriangles`（后者优先）覆盖。手册中过时的“100 万 / 500 万”说法已改正。

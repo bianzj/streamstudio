@@ -2802,10 +2802,10 @@ void FacetrtVulkan::recordIncident(VkCommandBuffer commandBuffer, uint32_t ping,
 //   0 参数 P（每面元 32 float）、1 输入 I（每（状态,侧）12 float，状态 0=日照 1=阴影）、
 //   2 温度 T（每（状态,侧）1 float）、3 通量 F（每（状态,侧）12 float）、
 //   4 optics 与 5 incident（与求解阶段共用）、6 stats（7 个 uint32，主机可见，用于读回）。
-// push constant 为 EnergyPush（48 字节）。
+// push constant 为 EnergyPush（56 字节）。
 void FacetrtVulkan::createEnergyResources()
 {
-    static_assert(sizeof(EnergyPush) == 48);
+    static_assert(sizeof(EnergyPush) == 56);
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const auto device = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -2905,7 +2905,7 @@ void FacetrtVulkan::beginEnergyNode(const EnergyPush &push, const std::vector<fl
         inputs.size() != size_t(surfaceCount()) * 2 * 12 || temperatures.size() != size_t(surfaceCount()) * 2 ||
         push.facets != m_facetCount || push.objects > m_facetCount || push.method > 1 ||
         !std::isfinite(push.air + push.rho + push.pressure + push.vapor + push.dt + push.co2 + push.relaxation +
-                       push.wind) ||
+                       push.wind + push.canyonAir + push.canyonSurface) ||
         push.dt <= 0 || push.pressure <= 0 || push.relaxation <= 0)
         throw std::invalid_argument("Invalid GPU energy node inputs");
     for (const auto *values : {&parameters, &inputs, &temperatures})
@@ -2923,6 +2923,14 @@ void FacetrtVulkan::updateEnergyInputs(const std::vector<float> &inputs)
     if (inputs.size() != size_t(surfaceCount()) * 2 * 12)
         throw std::invalid_argument("GPU energy input dimensions");
     uploadBuffer(m_energyInputs, inputs.data(), inputs.size() * sizeof(float));
+}
+// 作用：更新城市街谷空气温度与墙/路面换热系数（push constant 的 canyonAir、canyonSurface）。
+void FacetrtVulkan::setEnergyCanyon(float air, float surfaceCoefficient)
+{
+    if (!std::isfinite(air) || !std::isfinite(surfaceCoefficient) || air <= 0 || surfaceCoefficient <= 0)
+        throw std::invalid_argument("Invalid GPU energy canyon state");
+    m_energyPush.canyonAir = air;
+    m_energyPush.canyonSurface = surfaceCoefficient;
 }
 // 作用：录制一次 energy.comp 调度（每线程一个面元），phase 取值：
 // 0 = 计算通量与残差统计，1 = 牛顿更新温度，2 = 由当前温度更新长波光学参数。

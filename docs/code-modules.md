@@ -1275,6 +1275,7 @@ void Engine::destroy();              // 释放后端；非 Facet 模式再 appSe
 | `radiation_spectrum.h` | 79 | 入射光谱读取与短波归一化系数 | `readIncidentSpectrum`、`normalizedShortwaveCoefficient` |
 | `shortwave_split.h` | 127 | 气象节点总短波拆分直射与散射（fixed 或 Erbs） | `shortwave_split::parseMode/split` |
 | `soil_tir_emissivity.h` | 92 | 由土壤含水量修正热红外反射率 | `soiloptics::tirReflectance` |
+| `urban_aerodynamics.h` | 78 | 城市街谷显热（Masson 2000 中性子集）：屋顶/道路墙面/街谷出口交换系数与街谷空气温度闭合；FacetEB 与 VoxelEB 共用，由 `control.urbanAerodynamics` 开启 | `urban::Canyon`、`urban::neutralExchange`、`urban::convectiveVelocity`、`urban::surfaceCoefficient`、`urban::canyonAirTemperature` |
 | `reflectance_texture.h` / `.cpp` | 61 / 312 | 反射率扰动纹理加载、三平面采样、强度换算 | `loadReflectanceVarianceTexture`、`sampleReflectanceVarianceTriplanar`、`physicalTextureScale` |
 
 #### 4.3.6 体元运行选项与规模限制
@@ -3016,6 +3017,7 @@ OpenMP 并行区内抛出的异常会触发 `std::terminate`。本引擎的统�
 | tools/regression | HiStream 引擎冻结输入回归 | 否 | 入库 |
 | tools/case005 | 案例 005（光伏草场）的运行、发布、校验脚本 | 否 | 入库 |
 | tools/stream-inverse | STREAM 单像元可微反演原型，含 vendor 的 autograd 1.9.1 | 否 | 入库 |
+| tools/histream-ml | HiStream FacetEB 神经代理（PyTorch MLP 集成，导出 ONNX）与基于代理梯度的参数反演原型；设计与验证见 docs/differentiable-inversion-and-surrogate.md | 否 | 入库（数据与模型不入库） |
 | statistic | 独立结果统计工具（Python） | 是，复制到 resources/statistic | 入库 |
 | assets | 内置示例与各类资源库 | 经 stage 精简后复制 | 入库（output 与 `__pycache__` 忽略） |
 | .packaging | assets 的打包暂存副本 | 是 | 忽略（.gitignore:14） |
@@ -3213,6 +3215,7 @@ prepareRuntimeSceneProject
 | --- | --- | --- |
 | tools/case005（11 个文件） | pv_case005.py 准备与运行两个 eFacetEB 场景；pv_media005.py、pv_layout005.py、refine_spatial005.py 出图与 0.25 m 补算；export_case005.mjs 补渲染热红外 TIFF；publish、compact、verify、finalize 四个发布与校验脚本；case005_resources.py 与 case005.* 为网页资源 | 一次性案例脚本，数据根为仓库外 `D:/cases/StreamStudio/case005`，不可在干净检出上直接运行 |
 | tools/stream-inverse | stream_inverse.py（465 行）：autograd 可微单像元热红外正向链与 Gauss–Newton 反演；命令行 `--demo`、`--export-sample`、`--sample`；样本 JSON 结构见其 README | 研究原型，尚未并入 stream.exe |
+| tools/histream-ml（`hsml/` 四个模块 + 六个入口脚本） | `params.py` 参数空间（v1/v2）与写入工程/气象文件；`engine.py` 运行 `histream.exe eFacetEB`、压成类别均值观测向量、读引擎内切线敏感度（`control.facetSensitivity`）为雅可比；`surrogate.py` MLP 集成训练/评估、交叉验证残差与收缩协方差、ONNX 导出；`inversion.py` 白化 MAP、Laplace 后验、信赖域引擎校正、只用引擎的 Levenberg–Marquardt；入口 `gen_dataset.py`、`train_surrogate.py`、`check_gradients.py`、`invert.py`、`osse_stats.py`、`osse_engine.py` | 研究原型，只覆盖 `feb_crop`；不接服务端；需要独立 venv 安装 PyTorch，见其 README |
 | tools/facet_result.py、facet_document.py | FacetRT 与 FacetEB 结果读取：`facet_result.load(path, mmap)` 读 JSON 或二进制，`facet_document.read_document(path, only, mmap)` 读结果文档，格式见 docs/facet-binary-output.md | 被 regression/compare.py 引用（compare.py:36-37） |
 
 `validate-obj-library.mjs`（53 行）与 `check-facet-par-output.py`（45 行）属检查类：前者逐个 catalog 模型核对文件存在、顶点与三角形非零、三角形数（每个 f 行按边数减 2 累计）与 catalog 一致（validate-obj-library.mjs:22-36），并检查 `defaultSets` 引用的模型存在且 `recommended` 为真（行 39-46），失败时退出码为 1（行 48-51）；后者检查 `process/facetpar_T=*.json` 的格式与物理边界。`compare-facet-outer-stomata.py`（121 行）对比同一 144 株作物场景的多次 FacetEB 运行，场景常量硬编码（958 面元每株、中心 9 株、面元 62764、正午 token）。
@@ -3265,6 +3268,7 @@ C++ 类（单文件可执行程序，输出 PASS 与 FAIL 并以退出码报告�
 | --- | --- | --- |
 | test-facet-lumped-thermal.cpp | 集总热体解析解、能量闭合、输入校验 | CMake 目标 `histream_lumped_thermal_tests`（models/histream/CMakeLists.txt:534-537） |
 | test-lidf-gamma.cpp | 叶倾角分布、G 函数与 Gamma 函数数值自检 | 目标 `histream_lidf_gamma_tests`（CMakeLists.txt:539） |
+| test-urban-aerodynamics.cpp | 城市街谷风、屋顶交换系数与显热闭合的数值自检（仅依赖 `urban_aerodynamics.h`） | 目标 `histream_urban_aerodynamics_tests` |
 | test-diffuse-directions.cpp | 漫射 64 方向格点的射线效应评估，不需 GPU | 目标 `histream_diffuse_directions_tests`（CMakeLists.txt:544） |
 | test-voxel-limits.cpp | 体元规模上限检查，需 Vulkan 设备 | 目标 `histream_voxel_limits_tests`，链接 Vulkan（CMakeLists.txt:548-551） |
 | test-facet-energy-convergence.cpp、test-facet-nested-budget.cpp、test-facet-sparse-aerodynamics.cpp | 能量收敛判据边界、耦合求解器工作量预算、稀疏冠层空气动力学 | 仅依赖 energyphysics.h；CMake 中未发现对应目标，构建命令待核实 |

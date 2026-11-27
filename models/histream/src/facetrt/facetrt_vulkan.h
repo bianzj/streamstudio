@@ -210,15 +210,17 @@ struct SolveResult
     float groundRadiosity{};
 };
 
-// GPU 能量平衡的 push constant（48 字节，与 faceteb/energy.comp 一致）：
+// GPU 能量平衡的 push constant（56 字节，与 faceteb/energy.comp 一致）：
 // facets 面元数；objects 物体面元数（其余为地面）；method 气孔模型（0 Collatz，其他 Farquhar）；
 // phase 阶段（0 通量/残差，1 温度更新，2 长波光学参数）；air 气温（K）；rho 空气密度；
 // pressure 气压（hPa）；vapor 水汽压（hPa）；dt 时间步（s）；co2（ppm）；
-// relaxation 温度松弛因子；wind 风速（m/s，对应 shader 的 reserved 字段）。
+// relaxation 温度松弛因子；wind 风速（m/s，对应 shader 的 reserved 字段）；
+// canyonAir 城市街谷空气温度（K）、canyonSurface 街谷墙/路面换热系数（W m-2 K-1），二者随耦合迭代更新
+// （setEnergyCanyon），未开启城市街谷显热时不被读取。
 struct EnergyPush
 {
     uint32_t facets{}, objects{}, method{}, phase{};
-    float air{}, rho{}, pressure{}, vapor{}, dt{}, co2{}, relaxation{}, wind{};
+    float air{}, rho{}, pressure{}, vapor{}, dt{}, co2{}, relaxation{}, wind{}, canyonAir{}, canyonSurface{};
 };
 // 能量平衡状态快照：temperatures（K，每（状态,侧）一个）、fluxes（每（状态,侧）12 个 float）；
 // optics 与 radiation 仅在 readEnergyState(true) 时填充。
@@ -335,6 +337,8 @@ class FacetrtVulkan
     void beginEnergyNode(const EnergyPush &push, const std::vector<float> &parameters, const std::vector<float> &inputs,
                          const std::vector<float> &temperatures);
     void updateEnergyInputs(const std::vector<float> &inputs);
+    // 更新随耦合迭代变化的城市街谷量（街谷空气温度 K、墙/路面换热系数 W m-2 K-1），只改 push constant。
+    void setEnergyCanyon(float air, float surfaceCoefficient);
     EnergyStatistics evaluateEnergy(float skyRadiosity);
     float updateEnergyTemperature();
     EnergySnapshot readEnergyState(bool includeRadiation = false);

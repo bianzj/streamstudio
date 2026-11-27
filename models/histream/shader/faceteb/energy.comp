@@ -17,6 +17,10 @@
 //   [8] 土壤干燥标志、[9] 土壤温度方法、[10..26] 叶片生化参数、[27] 地面土壤侧标记（1+局部侧号）、
 //   [28] 模式（物体：0 薄壳/1 水体混合层/2 墙板；地面：1 中性/2 MOST）、[29] 水体蒸发系数或墙外侧、
 //   [30][31] 水下船体总导度与参考温度；非叶物体 [23] 热源 (W m-2)、[24] 净辐射系数。
+//   城市街谷显热（control.urbanAerodynamics）：墙 P[30] = −1、P[31] = 1（导度 pc.canyonSurface，参考 pc.canyonAir）；
+//   屋顶 P[30] = −1 − 导度、P[31] = 0（参考 pc.air）；道路（地面）P[29] = 1（导度 pc.canyonSurface，阻抗 ρ·cp/导度，
+//   参考 pc.canyonAir）；街谷内的叶片与树下地面 P[31] = −1（显热参考 pc.canyonAir）。
+//   pc.canyonAir、pc.canyonSurface 由主机每次耦合迭代更新，不开启时不读取。
 //   I[12]：[0] 上步温度、[1] 吸收短波、[2] 吸收 PAR 光量子、[3] 入射短波、[4] 叶阻力 rb、[5] 土壤阻力、
 //   [6] 冠层相对深度、[7][8] 土壤/墙导热斜率与偏移、[9][10] 反射/透射率、[11] 日照比例 w。
 //   F[12]：[0] 净辐射、[1] 显热、[2] 显热斜率、[3] 潜热、[4] 潜热斜率、[5] 储热/导热、[6] 其斜率、
@@ -44,10 +48,11 @@ layout(std430,binding=5) readonly buffer Incident { float H[]; };
 layout(std430,binding=6) buffer Statistics { uint stats[]; };
 // 推送常量：facets 面元数；objects 物体（叶/墙/水等）面元数，其余为地面；method 气孔模型
 // （0 Collatz，其它 Farquhar）；phase 阶段；air 气温 K；rho 空气密度；pressure 气压 hPa；
-// vapor 水汽压 hPa；dt 时间步 s；co2 ppm；relax 温度松弛因子；reserved 实际存放风速 m/s。
+// vapor 水汽压 hPa；dt 时间步 s；co2 ppm；relax 温度松弛因子；reserved 实际存放风速 m/s；
+// canyonAir 街谷空气温度 K、canyonSurface 街谷墙/路面换热系数 W m-2 K-1（城市街谷显热）。
 layout(push_constant) uniform EnergyPush {
     uint facets,objects,method,phase;
-    float air,rho,pressure,vapor,dt,co2,relax,reserved;
+    float air,rho,pressure,vapor,dt,co2,relax,reserved,canyonAir,canyonSurface;
 } pc;
 // Stefan–Boltzmann 常数（W m-2 K-4）；energy_math.glsl 依赖 SIGMA、P、pc。
 const float SIGMA=5.670374419e-8;
@@ -125,10 +130,17 @@ void main() {
             float conductance=leaf?pc.rho*1005.0*P[p+3u]/rb:(water||wall?1.0:2.0)*(5.8+4.1*sqrt(max(.1,pc.reserved)))*P[p+3u];
             // P[30] > 0: ship-hull facet below the waterline, total sensible
             // conductance P[30] towards the reference temperature P[31] (host).
+            // P[30] < 0: city solid, roof conductance −P[30]−1 towards the reference air; with
+            // P[31] > 0.5 a wall (pc.canyonSurface towards pc.canyonAir). P[31] < −0.5 on a leaf:
+            // sensible reference is the canyon air.
             bool submerged=!leaf&&P[p+30u]>0.0;
+            bool urban=!leaf&&P[p+30u]<0.0;
+            bool urbanWall=urban&&P[p+31u]>0.5;
+            float reference=(urbanWall||P[p+31u]<-0.5)?pc.canyonAir:pc.air;
             if(submerged) conductance=P[p+30u];
+            if(urban) conductance=urbanWall?pc.canyonSurface:-P[p+30u]-1.0;
             // 显热 h = 导度 × (温度 − 参考温度)；储热 = 热容/dt × (T − 上步 T)，墙板用导热斜率与偏移。
-            float h=conductance*(temp-(submerged?P[p+31u]:pc.air)),ss=wall?I[b+7u]:max(0.0,P[p+2u])/pc.dt;
+            float h=conductance*(temp-(submerged?P[p+31u]:reference)),ss=wall?I[b+7u]:max(0.0,P[p+2u])/pc.dt;
             float storage=wall?ss*(temp-previous)+I[b+8u]:ss*(temp-previous);
             // 光伏：入射 = 正面入射 + 双面系数 × 背面入射；原始发电 = η25·(1+γ(T−298.15))·入射，
             //   限幅在 [0, 两侧吸收短波]；ps 为未限幅时对 T 的斜率。
@@ -154,7 +166,7 @@ void main() {
                 bool stomatalConverged=false;
                 for(int k=0;k<LEAF_STOMATAL_MAX_ITERATIONS;++k) {
                     double mid=.5lf*(lo+hi);
-                    rs=dexp(mid); trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
+                    rs=dexp(mid); trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous,reference);
                     double target=double(physiology(f,trial,rs,par,rb,depth));
                     if(isnan(target)||isinf(target)||target<=0.0lf) atomicOr(stats[5],2u);
                     if(abs(mid-dlog(target))<=LEAF_STOMATAL_LOG_TOLERANCE) {
@@ -164,7 +176,7 @@ void main() {
                     if(mid>dlog(target)) hi=mid; else lo=mid;
                 }
                 if(!stomatalConverged) {
-                    rs=dexp(.5lf*(lo+hi)); trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous);
+                    rs=dexp(.5lf*(lo+hi)); trial=thermal(temp,rs,rb,rn,eps,conductance,ss,previous,reference);
                 }
                 // 叶温步长：向 trial 靠拢，限幅 ±5 K，乘松弛因子；mismatch 为当前 T 下 ln(rs/rs目标) 的绝对值。
                 step=pc.relax*float(clamp(trial-double(temp),-5.0lf,5.0lf));
@@ -184,9 +196,19 @@ void main() {
                 if(P[p+27u]>0.5&&side==uint(P[p+27u]+0.5)-1u) continue;
                 uint k=index+side,j=k*12u;float temp=T[k],extra;
                 // Free convection of a side warmer than the air (P[28]: 1 neutral, 2 MOST).
+                // City road (P[29] > 0.5): exchange coefficient pc.canyonSurface with the canyon air,
+                // aerodynamic resistance rho cp / coefficient for sensible and latent heat alike.
+                // Ground under street trees (P[31] < −0.5): the canyon air is the reference.
                 // 地面显热阻力 = groundExchange(土壤阻力 I[5], 比气温暖的 excess, 模式 P[28])。
-                float rb=groundExchange(I[j+5u],temp-pc.air,P[p+28u],extra),conductance=pc.rho*1005.0/rb;
-                F[j]=net[side]; F[j+1u]=conductance*(temp-pc.air); F[j+2u]=extra>0.0?conductance+pc.rho*1005.0*extra:conductance;
+                bool road=P[p+29u]>0.5;
+                float reference=(road||P[p+31u]<-0.5)?pc.canyonAir:pc.air;
+                float rb=groundExchange(I[j+5u],temp-reference,P[p+28u],extra),conductance=pc.rho*1005.0/rb;
+                F[j]=net[side]; F[j+1u]=conductance*(temp-reference); F[j+2u]=extra>0.0?conductance+pc.rho*1005.0*extra:conductance;
+                if(road) {
+                    rb=pc.rho*1005.0/pc.canyonSurface;
+                    F[j+1u]=pc.canyonSurface*(temp-reference);
+                    F[j+2u]=pc.canyonSurface;
+                }
                 // 土壤很干（P[8]=1）时不蒸发；否则潜热用 rb 与表面阻力 P[7]。
                 F[j+3u]=P[p+8u]>.5?0.0:latent(temp,rb,P[p+7u]);
                 F[j+4u]=P[p+8u]>.5?0.0:latentSlope(temp,rb,P[p+7u]);
